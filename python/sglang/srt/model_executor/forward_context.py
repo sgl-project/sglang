@@ -99,8 +99,7 @@ def forward_context(
         ctx = replace(
             ctx,
             moe_num_token_non_padded=forward_batch.moe_num_token_non_padded,
-            # Unit tests pass lightweight batch stand-ins without a mode.
-            forward_mode=getattr(forward_batch, "forward_mode", None),
+            forward_mode=forward_batch.forward_mode,
         )
     elif ctx.moe_num_token_non_padded is None and _current is not None:
         ctx = replace(

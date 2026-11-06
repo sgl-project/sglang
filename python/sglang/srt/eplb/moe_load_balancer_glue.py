@@ -14,6 +14,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     get_forward_context,
     has_forward_context,
@@ -21,15 +22,13 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.runtime_context import get_context, get_exec
 
 _FORWARD_MODE_TO_STAGE = {
-    "EXTEND": "prefill",
-    "SPLIT_PREFILL": "prefill",
-    "DLLM_EXTEND": "prefill",
-    "DECODE": "decode",
-    "MIXED": "mixed",
-    "IDLE": "idle",
-    "TARGET_VERIFY": "speculative",
-    "DRAFT_EXTEND": "speculative",
-    "DRAFT_EXTEND_V2": "speculative",
+    ForwardMode.EXTEND: "prefill",
+    ForwardMode.DLLM_EXTEND: "prefill",
+    ForwardMode.DECODE: "decode",
+    ForwardMode.MIXED: "mixed",
+    ForwardMode.IDLE: "idle",
+    ForwardMode.TARGET_VERIFY: "speculative",
+    ForwardMode.DRAFT_EXTEND_V2: "speculative",
 }
 
 
@@ -100,11 +99,7 @@ def _current_stage() -> Optional[str]:
     """Routing stage of the active forward (ForwardContext.forward_mode)."""
     if not has_forward_context():
         return None
-    forward_mode = get_forward_context().forward_mode
-    if forward_mode is None:
-        return None
-    name = getattr(forward_mode, "name", None) or str(forward_mode).upper()
-    return _FORWARD_MODE_TO_STAGE.get(name)
+    return _FORWARD_MODE_TO_STAGE.get(get_forward_context().forward_mode)
 
 
 def get_configured_moe_load_balancer_pipeline():

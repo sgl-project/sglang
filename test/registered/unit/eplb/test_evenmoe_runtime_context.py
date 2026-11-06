@@ -404,6 +404,30 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
         self.assertIs(result.topk_weights, output.topk_weights)
         self.assertIs(result.router_logits, output.router_logits)
 
+    def test_routing_stage_follows_active_forward_mode(self):
+        """The routing stage is looked up from the live ForwardMode member.
+
+        A stage map keyed by anything else (e.g. mode names) silently hands
+        EvenMoE stage=None for every real forward.
+        """
+        from sglang.srt.eplb import moe_load_balancer_glue as glue
+        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
+
+        for mode, stage in (
+            (ForwardMode.EXTEND, "prefill"),
+            (ForwardMode.DECODE, "decode"),
+            (ForwardMode.TARGET_VERIFY, "speculative"),
+        ):
+            with (
+                self.subTest(mode=mode.name),
+                forward_context(ForwardContext(attn_backend=None, forward_mode=mode)),
+            ):
+                self.assertEqual(glue._current_stage(), stage)
+
     @unittest.skipUnless(
         importlib.util.find_spec("evenmoe"),
         "evenmoe is not installed",
