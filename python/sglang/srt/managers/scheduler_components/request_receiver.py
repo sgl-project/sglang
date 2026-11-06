@@ -75,7 +75,7 @@ class SchedulerRequestReceiver:
     get_last_batch: Callable[[], Any]
     # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
     # listener's ring rather than received over zmq.
-    rust_server_mode: bool
+    rust_server_mode: bool = False
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
