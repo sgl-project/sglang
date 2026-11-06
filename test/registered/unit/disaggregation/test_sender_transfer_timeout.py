@@ -3,8 +3,10 @@
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.disaggregation.base.conn import KVPoll
+from sglang.srt.disaggregation.common import conn as common_conn
 from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -45,11 +47,13 @@ def make_sender(status, *, last_chunk_sent=True, wait_start=None, waiting_timeou
 class TestSenderTransferTimeout(unittest.TestCase):
     def test_transfer_the_decode_never_completed_times_out(self):
         sender, statuses, failures = make_sender(KVPoll.Transferring, wait_start=0.0)
-        self.assertEqual(sender.poll(), KVPoll.Failed)
+        with patch.object(common_conn.logger, "warning_once") as warn:
+            self.assertEqual(sender.poll(), KVPoll.Failed)
         self.assertEqual(statuses[ROOM], KVPoll.Failed)
         self.assertEqual(sender.conclude_state, KVPoll.Failed)
         self.assertEqual(len(failures), 1)
         self.assertIn("KVPoll.Transferring", failures[0])
+        warn.assert_called_once()
 
     def test_last_chunk_queued_but_not_yet_picked_up_also_times_out(self):
         sender, _, failures = make_sender(KVPoll.WaitingForInput, wait_start=0.0)
@@ -95,6 +99,55 @@ class TestSenderTransferTimeout(unittest.TestCase):
         sender, _, failures = make_sender(KVPoll.Success, wait_start=0.0)
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.assertEqual(failures, [])
+
+    def test_a_success_concluded_during_the_poll_is_not_overwritten(self):
+        # The transfer worker concludes the room between poll()'s status read
+        # (Transferring, past the deadline) and the deadline's write: the Success
+        # must stand, and no "decode went away" warning is logged for it.
+        sender, statuses, failures = make_sender(KVPoll.Transferring, wait_start=0.0)
+        reads = []
+
+        def check_status(room):
+            reads.append(room)
+            if len(reads) == 2:
+                statuses[room] = KVPoll.Success
+            return statuses[room]
+
+        sender.kv_mgr.check_status = check_status
+        with patch.object(common_conn.logger, "warning_once") as warn:
+            self.assertEqual(sender.poll(), KVPoll.Transferring)
+        self.assertEqual(statuses[ROOM], KVPoll.Success)
+        self.assertEqual(failures, [])
+        warn.assert_not_called()
+
+    def test_a_failure_concluded_during_the_poll_keeps_its_cause(self):
+        # Same race, but the worker failed the room with its own reason: the
+        # deadline must not replace it, and the next poll concludes on it.
+        sender, statuses, failures = make_sender(KVPoll.Transferring, wait_start=0.0)
+        reads = []
+
+        def check_status(room):
+            reads.append(room)
+            if len(reads) == 2:
+                failures.append("transfer failed: transport error")
+                statuses[room] = KVPoll.Failed
+            return statuses[room]
+
+        sender.kv_mgr.check_status = check_status
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        self.assertEqual(failures, ["transfer failed: transport error"])
+        self.assertEqual(sender.poll(), KVPoll.Failed)
+
+    def test_pp_consensus_poll_fails_a_room_rank0_alone_finished(self):
+        # PP > 1: rank 0 polls with the PP consensus (the lowest status across
+        # stages). Its own local Success must not keep a room whose later stage
+        # is still Transferring to a dead decode from timing out.
+        sender, statuses, failures = make_sender(KVPoll.Success, wait_start=0.0)
+        sender.kv_mgr.check_status_pp_consensus = lambda room: KVPoll.Transferring
+        self.assertEqual(sender.poll_pp_consensus(), KVPoll.Failed)
+        self.assertEqual(statuses[ROOM], KVPoll.Failed)
+        self.assertEqual(len(failures), 1)
+        self.assertIn("KVPoll.Transferring", failures[0])
 
 
 if __name__ == "__main__":

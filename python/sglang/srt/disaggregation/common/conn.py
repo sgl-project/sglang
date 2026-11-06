@@ -2422,7 +2422,7 @@ class CommonKVSender(BaseKVSender):
             if timeout_status is not None:
                 status = timeout_status
         elif status in (KVPoll.WaitingForInput, KVPoll.Transferring):
-            timeout_status = self._check_transfer_timeout(status)
+            timeout_status = self._check_transfer_timeout(status, check_status)
             if timeout_status is not None:
                 status = timeout_status
         if status in (KVPoll.Success, KVPoll.Failed):
@@ -2462,7 +2462,9 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
         return KVPoll.Failed
 
-    def _check_transfer_timeout(self, status: KVPoll) -> Optional[KVPoll]:
+    def _check_transfer_timeout(
+        self, status: KVPoll, check_status=None
+    ) -> Optional[KVPoll]:
         """Fail a transfer the decode never completed after the last chunk was
         handed over.
 
@@ -2478,6 +2480,8 @@ class CommonKVSender(BaseKVSender):
         under ``prefill_complete``, is never failed here), and runs on the same
         ``SGLANG_DISAGGREGATION_WAITING_TIMEOUT`` as the decode's: a live decode
         that is merely slow started its deadline earlier and aborts us first.
+        ``check_status`` is the function the caller polled with, so that under
+        pipeline parallelism the re-read below sees the PP consensus.
         """
         if not self._last_chunk_sent:
             return None
@@ -2487,6 +2491,14 @@ class CommonKVSender(BaseKVSender):
             return None
         elapsed = now - self._transfer_wait_start
         if elapsed < self.kv_mgr.waiting_timeout:
+            return None
+        # The transfer worker may have concluded the room between the caller's
+        # status read and this point: leave a Success alone (as
+        # _handle_bootstrap_message does), and a Failed too, so the worker's
+        # own failure reason is not overwritten by the deadline's.
+        if check_status is None:
+            check_status = self.kv_mgr.check_status
+        if check_status(self.bootstrap_room) in (KVPoll.Success, KVPoll.Failed):
             return None
         logger.warning_once(
             "Some requests fail to receive the KV Cache transfer done signal after sending their last chunk, "
