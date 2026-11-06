@@ -108,6 +108,9 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
         topk_length: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention import flash_mla_interface
+        from sglang.srt.models.deepseek_v4_flashinfer_wo_a import (
+            flashinfer_wo_a_enabled,
+        )
 
         data, scale, _, _ = flash_mla_interface.flash_mla_mega_prefill(
             q,
@@ -119,5 +122,7 @@ class DeepseekV4MegaAttnBackend(DeepseekV4AttnBackend):
             attn_sink=attn_sink,
             topk_length=topk_length,
             use_legacy=not self._swa_interleaved,
+            out_sf_flashinfer_layout=self._swa_interleaved
+            and flashinfer_wo_a_enabled(q.shape[0], q.device),
         )
         return data, scale

@@ -183,6 +183,11 @@ from sglang.srt.models.deepseek_common.utils import (
     is_wint4afp8_or_wint4a16_config,
     quant_blocks_shared_experts_fusion,
 )
+from sglang.srt.models.deepseek_v4_flashinfer_wo_a import (
+    flashinfer_wo_a_einsum,
+    scales_in_flashinfer_layout,
+    wo_a_scale_to_flashinfer,
+)
 from sglang.srt.models.deepseek_v4_mhc import MHC_POST_MULT_VALUE
 from sglang.srt.models.deepseek_v4_platform_stage import (
     NonCudaDecoderMixin,
@@ -1521,6 +1526,7 @@ class MQALayer(MqaAttentionBase):
 
             self.mega_cos_sin_cache = precompute_cos_sin_table(**self.rope_kwargs)
         self.mega_wo_a = None
+        self._mega_wo_a_flashinfer_scale = None
         self.mega_wq_b_permuted = False
         if self.use_mega_attention:
             self.wo_b.deepgemm_mxfp8_input = (
@@ -1601,6 +1607,7 @@ class MQALayer(MqaAttentionBase):
                 method.weight_block_size = [16, block_k]
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         self.mega_wo_a = quantize_wo_a(interleave_output_columns(wo_a))
+        self._mega_wo_a_flashinfer_scale = None
 
     def accepts_deepgemm_mxfp8_input(self) -> bool:
         return self.fuse_wqa_wkv and self.wqkv_a.deepgemm_mxfp8_input
@@ -1685,6 +1692,19 @@ class MQALayer(MqaAttentionBase):
                 data.device,
                 flashinfer=deepgemm_pair_takes_flashinfer(),
             )
+        if scales_in_flashinfer_layout(o_s):
+            if self._mega_wo_a_flashinfer_scale is None:
+                self._mega_wo_a_flashinfer_scale = wo_a_scale_to_flashinfer(
+                    *self.mega_wo_a
+                )
+            if out is None:
+                out = o_fp8.new_empty(
+                    (rows, groups, self.o_lora_rank), dtype=torch.bfloat16
+                )
+            flashinfer_wo_a_einsum(
+                o_fp8, o_s, self.mega_wo_a[0], self._mega_wo_a_flashinfer_scale, out
+            )
+            return deepgemm_mxfp8_linear_input(*out) if isinstance(out, tuple) else out
         if isinstance(out, tuple):
             y, y_sf = out
             _fp8_wo_a_einsum(
