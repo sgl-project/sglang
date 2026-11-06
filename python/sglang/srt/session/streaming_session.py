@@ -11,11 +11,13 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.utils.common import ceil_align, is_npu
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+    from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import DocReuse
 
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,9 @@ class StreamingSession:
     cache whether to run its own path.
     """
 
+    # Set by UnifiedRadixCache.enable_uocr_doc_reuse for Unlimited-OCR v2.
+    uocr_doc_reuse: Optional[DocReuse] = None
+
     def __init__(self, cache: UnifiedRadixCache):
         self.cache = cache
         self.slots: Dict[str, SessionSlot] = {}
@@ -98,6 +103,10 @@ class StreamingSession:
     def try_match_prefix(self, params: MatchPrefixParams) -> Optional[MatchResult]:
         """Returns a MatchResult iff the request hits an active session slot;
         otherwise None (caller falls back to its raw match)."""
+        if self.uocr_doc_reuse is not None:
+            reuse = self.uocr_doc_reuse.try_match_prefix(params)
+            if reuse is not None:
+                return reuse
         slot = self.find_active_slot(params.req)
         if slot is None:
             return None
@@ -159,10 +168,15 @@ class StreamingSession:
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
         last finished request next turn."""
+        if (
+            self.uocr_doc_reuse is not None
+            and self.uocr_doc_reuse.on_cache_finished_req(req)
+        ):
+            return True
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        from sglang.srt.managers.req_types import FINISH_ABORT
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"

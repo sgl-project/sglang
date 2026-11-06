@@ -14,12 +14,14 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
 )
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
     SchedulerMetricsCollector,
     SchedulerStats,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -33,12 +35,14 @@ def _transfer_req(fill_len, *, swa_tail_len=None, host_staged=False):
     kv = ReqKvInfo(kv_allocated_len=fill_len, kv_committed_len=fill_len)
     if swa_tail_len is not None:
         kv.set_evicted_seqlen(ComponentType.SWA, fill_len - swa_tail_len)
-    return SimpleNamespace(req=SimpleNamespace(kv=kv), host_staged=host_staged)
+    return SimpleNamespace(req=FakeReq(kv=kv), host_staged=host_staged)
 
 
 def _queue(reqs):
     queue = object.__new__(DecodePreallocQueue)
-    queue.transfer_queue = SimpleNamespace(queue=reqs)
+    queue.transfer_queue = SimpleNamespace(
+        queue=decode_queue(ListKind.PD_RECEIVING, reqs)
+    )
     queue.token_to_kv_pool_allocator = SimpleNamespace(page_size=PAGE)
     return queue
 
