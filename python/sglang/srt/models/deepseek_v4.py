@@ -64,6 +64,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -120,6 +121,8 @@ from sglang.srt.layers.quantization.mxfp8_input import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -208,17 +211,14 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     log_info_on_rank0,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -417,26 +417,23 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _wo_a_aiter_gemm_eligible(
-    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
-) -> bool:
+def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
-    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
-    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    Folds the global ``SGLANG_USE_AITER`` switch and the HIP/gfx95 platform
+    gates into one predicate. Evaluated once at import (see
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(flag and use_aiter and is_hip and is_gfx95)
+    return bool(use_aiter and is_hip and is_gfx95)
 
 
-# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# Resolve eligibility and import the aiter kernel ONCE at module import: the
 # decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
-# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
-# path is eligible but the kernel import fails, disable it here and fall back to
-# the einsum for the process (logged once) instead of retrying every step.
+# not pay a function-local import on every call. If the path is eligible but
+# the kernel import fails, disable it here and fall back to the einsum for the
+# process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
-    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
@@ -483,12 +480,9 @@ if _is_hip:
     if is_wo_a_fp8_mxscale_supported():
         _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
         _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
-        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
-        # bind it when both the flatmm and the fused aiter op are available.
-        if (
-            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
-            and is_wo_a_fp8_fused_invrope_supported()
-        ):
+        # Fused inverse-RoPE + quant front end, bound when both the flatmm and
+        # the fused aiter op are available.
+        if is_wo_a_fp8_fused_invrope_supported():
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
         _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
@@ -1541,7 +1535,6 @@ class MQALayer(MqaAttentionBase):
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
-            and envs.SGLANG_DSV41_FUSED_WO_A.get()
             and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
             and not self.use_npu_arch35_mxfp8_wo_a
@@ -2940,6 +2933,16 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        o = self._project_wo_a(
+            o,
+            positions=positions,
+            forward_batch=forward_batch,
+            inv_rope=inv_rope,
+            wo_a_quant_freqs=wo_a_quant_freqs,
+        )
+        return self._project_wo_b(o, defer_all_reduce)
+
+    def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
@@ -3112,7 +3115,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return o
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -3513,6 +3516,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not _is_hip
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (

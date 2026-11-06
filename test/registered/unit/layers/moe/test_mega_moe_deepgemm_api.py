@@ -36,6 +36,8 @@ from sglang.srt.runtime_context import (
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+_UNCACHED_MEGA_MOE_MAX_NUM_SMS = mega_moe._mega_moe_max_num_sms.__wrapped__
+
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
@@ -141,6 +143,16 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIs(buffers[2], buffers[3])
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
+
+    def test_decode_reserved_sms_applies_to_sm107_decode_only(self):
+        max_num_sms = _UNCACHED_MEGA_MOE_MAX_NUM_SMS
+        props = SimpleNamespace(multi_processor_count=212)
+        with patch.object(torch.cuda, "get_device_properties", return_value=props):
+            for device_sm, decode in ((107, 194), (100, 210)):
+                with self.subTest(device_sm=device_sm):
+                    with patch.object(mega_moe, "_device_sm", device_sm):
+                        self.assertEqual(max_num_sms(False), 210)
+                        self.assertEqual(max_num_sms(True), decode)
 
     def test_buffer_cache_separates_activation_contracts(self):
         self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
@@ -453,9 +465,10 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     ids = torch.tensor([7, 99, 99])
                     hidden = torch.ones((3, 4))
                     batch = SimpleNamespace(
+                        forward_mode=ForwardMode.EXTEND,
                         moe_num_token_non_padded=lambda: torch.tensor(
                             2, dtype=torch.int32
-                        )
+                        ),
                     )
 
                     def run_experts(_experts, x, topk_ids, weights, **kwargs):
