@@ -1743,7 +1743,9 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler.tp_rank = 0
         handler._room_to_decode_req = {room: SimpleNamespace(_chunk_events=[])}
         handler._room_to_receiver = {room: receiver}
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         handler._room_tokens = {room: object()}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
@@ -1787,8 +1789,11 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler.tp_rank = 0
         handler._room_to_decode_req = {room: decode_req}
         handler._room_to_receiver = {room: receiver}
+        handler._completed_chunks = {}
         handler._writer_counts = {room: {}}
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         token = object()
         handler._room_tokens = {room: token}
         handler._inflight_submits = {}
@@ -1848,10 +1853,13 @@ class TestStagingScatterLifecycle(CustomTestCase):
                 room_receivers={room: receiver}, room_bootstrap={room: object()}
             )
         )
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         handler._room_to_decode_req = {room: request}
         handler._room_to_receiver = {room: receiver}
         handler._room_tokens = {room: object()}
+        handler._completed_chunks = {}
         handler._writer_counts = {}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
@@ -1872,7 +1880,7 @@ class TestStagingScatterLifecycle(CustomTestCase):
         stream = Mock()
         handler.flush_pending_scatters(stream)
         handler._scatter_region.assert_called_once_with(
-            4096, 0, 3, request, receiver, stream
+            4096, 0, 3, request, receiver, stream, None
         )
         event = make_event.return_value
         event.record.assert_called_once_with(stream)

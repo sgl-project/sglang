@@ -533,7 +533,7 @@ class AttentionBackend(ABC):
             if get_parallel().cp_strategy == "zigzag"
             else "round-robin-split"
         )
-        self.kv_index_translator = runner.kv_index_translator
+        self.runner_ids = runner.runner_ids
         self.max_context_len = runner.model_config.context_len
         if get_moe_tensor_parallel_world_size() > 1 or get_exec().moe.enable_mxfp4_mega:
             self.residual_exchange = runner.cp_residual_exchange or TokenExchangeStream(
@@ -625,7 +625,7 @@ class AttentionBackend(ABC):
                 local_kv = metadata.route("attention", "kv")(local_kv)
             write_slots = metadata.kv_write_slots
             if write_slots.numel():
-                pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     KVWriteLoc(write_slots, physical=True),
                     local_kv[:, 0],
@@ -633,11 +633,15 @@ class AttentionBackend(ABC):
                     layer.k_scale,
                     layer.v_scale,
                 )
-        key = pool.get_key_buffer(layer.layer_id).index_select(
-            0, metadata.kv_read_slots
+        key = (
+            pool.layer_router.read(layer.layer_id)
+            .key()
+            .index_select(0, metadata.kv_read_slots)
         )
-        value = pool.get_value_buffer(layer.layer_id).index_select(
-            0, metadata.kv_read_slots
+        value = (
+            pool.layer_router.read(layer.layer_id)
+            .value()
+            .index_select(0, metadata.kv_read_slots)
         )
         k_descale = v_descale = None
         if pool.dtype == torch.float8_e4m3fn:

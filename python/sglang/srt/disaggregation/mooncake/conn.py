@@ -233,7 +233,9 @@ class KVArgsRegisterInfo:
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19, layout_index=21),
+            staging=StagingRegisterInfo.from_zmq_fields(
+                msg, 15, slot_ids_index=19, layout_index=21
+            ),
         )
 
 
@@ -710,6 +712,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 executor,
             )
         if ret == 0:
+            writer_index, slots = (
+                self._staging_writer_metadata(target_info)
+                if staged
+                else (
+                    self.attn_cp_rank if self.ring_cp_sharded else self.attn_tp_rank,
+                    [],
+                )
+            )
             self.send_chunk_ready(
                 room=req.room,
                 chunk_idx=chunk_idx,
@@ -718,8 +728,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 writer_id=req.mooncake_session_id,
                 targets=[(req.endpoint, req.dst_port)],
                 staged=staged,
-                writer_index=self._staging_writer_metadata(target_info)[0] if staged else (self.attn_cp_rank if self.ring_cp_sharded else self.attn_tp_rank),
-                slot_indices=self._staging_writer_metadata(target_info)[1] if staged else [],
+                writer_index=writer_index,
+                slot_indices=slots,
             )
         return (ret, False)
 
@@ -2966,7 +2976,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     chunked_dst_kv_indice,
                                     executor,
                                     queue,
-                                    prefill_unique_rank,
                                 )
                                 if deferred:
                                     staging_deferred = True
@@ -3570,9 +3579,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             staging_total_size_str = b""
         staging_slots = getattr(self, "kv_buffer_tensors", None) or {}
         packed_staging_layout = (
-            StagingRegisterInfo(layout_version=1, slot_ids=staging_slots["slot_ids"],
-                                slot_item_lens=staging_slots["slot_item_lens"]).layout_bytes()
-            if staging_slots.get("slot_ids") else b""
+            StagingRegisterInfo(
+                layout_version=1,
+                slot_ids=staging_slots["slot_ids"],
+                slot_item_lens=staging_slots["slot_item_lens"],
+            ).layout_bytes()
+            if staging_slots.get("slot_ids")
+            else b""
         )
         packed_staging_slot_layer_ids = b"".join(
             struct.pack("Q", layer_id)

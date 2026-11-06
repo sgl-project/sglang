@@ -110,6 +110,12 @@ class TestMambaPathStateCap(unittest.TestCase):
                         mamba_allocator=allocator, mamba_ckpt_pool=None
                     ),
                 )
+                storage = SimpleNamespace(
+                    quantizes_checkpoints=lambda _: False,
+                    available_units=lambda _: allocator.available_size(),
+                    take_state_slots=lambda _, count: allocator.alloc(count),
+                )
+                component._state = lambda: (storage, "state")
                 component.tree_core = object()
                 req = SimpleNamespace(
                     kv=SimpleNamespace(mamba_pending_checkpoints=[]),

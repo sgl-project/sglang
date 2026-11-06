@@ -98,7 +98,7 @@ def _resolve_sharded_hybrid_cp(server_args):
     """Validate GDN CP and the full-attention storage/layout contract."""
     import torch
 
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.model_override_base import attention_backends_of
     from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 
     cfg = resolving_view(server_args)
@@ -147,7 +147,6 @@ def _resolve_sharded_hybrid_cp(server_args):
         cfg.speculative_algorithm is not None
         or cfg.enable_lora
         or cfg.enable_hierarchical_cache
-        or cfg.enable_pdmux
         or cfg.enable_unified_memory
         or cfg.enable_int8_mamba_checkpoint
         or cfg.enable_linear_replayssm
@@ -158,7 +157,7 @@ def _resolve_sharded_hybrid_cp(server_args):
         or not cfg.max_running_requests
     ):
         raise ValueError(
-            "Sharded CP requires BF16, a page size divisible by CP, explicit max-running-requests, and ordinary KV/Mamba pools without speculation, LoRA, HiCache, PD-mux or state compression"
+            "Sharded CP requires BF16, a page size divisible by CP, explicit max-running-requests, and ordinary KV/Mamba pools without speculation, LoRA, HiCache or state compression"
         )
     prefill = attention_backends_of(cfg)[0]
     if not cfg.enable_cp_tp_group_sharing and prefill not in ("fa3", "trtllm_mha"):

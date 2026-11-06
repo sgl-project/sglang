@@ -370,6 +370,7 @@ class PrefillBootstrapQueue:
             storage,
             self.draft_token_to_kv_pool if transfer_draft_cache else None,
             self.scheduler.model_config.num_hidden_layers,
+            mamba_pool=getattr(self.scheduler.req_to_token_pool, "mamba_pool", None),
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)

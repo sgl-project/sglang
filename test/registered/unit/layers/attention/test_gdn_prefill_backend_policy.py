@@ -99,7 +99,8 @@ class TestGDNPrefillGraphExtend(CustomTestCase):
         backend.enable_mis = enable_mis
         backend._mamba_chunk_size = 64
         backend.kernel_dispatcher = SimpleNamespace(
-            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel)
+            extend_kernel=TritonGDNKernel.__new__(TritonGDNKernel),
+            use_context_parallel=False,
         )
         cache = SimpleNamespace(conv=[torch.zeros(2, 3)], temporal=torch.zeros(2, 3))
         backend.state_pool = SimpleNamespace(mamba_cache=cache)
@@ -695,6 +696,7 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
                     mamba_pool=SimpleNamespace(synchronize=lambda: None),
                     get_mamba_indices=lambda indices: indices + 5,
                 )
+                linear.state_pool = linear.req_to_token_pool.mamba_pool
                 hybrid = object.__new__(HybridLinearAttnBackend)
                 hybrid.full_attn_backend = full
                 hybrid.linear_attn_backend = linear

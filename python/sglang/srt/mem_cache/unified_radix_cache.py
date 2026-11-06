@@ -1475,7 +1475,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
             if result.mamba_exist:
-                self.req_to_token_pool.mamba_allocator.free(slot)
+                self.components[ComponentType.MAMBA]._free_mamba_value(slot)
         req.kv.mamba_pending_checkpoints = []
 
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:

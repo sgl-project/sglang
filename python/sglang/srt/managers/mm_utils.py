@@ -533,7 +533,9 @@ def embed_mm_inputs(
                     direct_h2d_merges.append((indices, segments))
                     continue
 
-            pad_values = sorted(value for item in items for value in item.padding_values())
+            pad_values = sorted(
+                value for item in items for value in item.padding_values()
+            )
             if input_ids.device.type == "cuda":
                 # Pinned staging keeps the placeholder copy asynchronous on CUDA.
                 placeholder_cpu = torch.tensor(

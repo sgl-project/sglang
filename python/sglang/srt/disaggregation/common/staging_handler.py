@@ -140,7 +140,9 @@ class DecodeStagingHandler:
         self._closing_rooms: set[int] = set()
         self._defer_scatter = envs.SGLANG_PLB_SCATTER_DEFER.get()
         # Keep each queued chunk tied to its original room generation.
-        self._pending_scatters: deque[tuple[object, int, int, int, int, object]] = deque()
+        self._pending_scatters: deque[tuple[object, int, int, int, int, object]] = (
+            deque()
+        )
 
         k_buffers = kv_buffer_info["k_buffers"]
         assert k_buffers, "k_buffers must not be empty"
@@ -389,7 +391,13 @@ class DecodeStagingHandler:
                 return False
             alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
             if staging_offset == STAGING_MEMORY_UNAVAILABLE:
-                chunk_infos[chunk_idx] = (-1, StagingAllocator.CHUNK_SCATTERED, 0, -1, 0)
+                chunk_infos[chunk_idx] = (
+                    -1,
+                    StagingAllocator.CHUNK_SCATTERED,
+                    0,
+                    -1,
+                    0,
+                )
                 return True
             claim = (token, chunk_idx)
             if staging_offset < 0 or alloc_id < 0 or claim in self._claimed_chunks:
@@ -399,7 +407,13 @@ class DecodeStagingHandler:
 
         try:
             ok = self._scatter_region(
-                staging_offset, page_start, num_pages, decode_req, receiver, stream, writer_slot_mask
+                staging_offset,
+                page_start,
+                num_pages,
+                decode_req,
+                receiver,
+                stream,
+                writer_slot_mask,
             )
             if ok:
                 event = create_device_event(self.device)
@@ -501,8 +515,12 @@ class DecodeStagingHandler:
 
         if submit_now:
             self.submit_chunk_scatter(
-                room, chunk_idx, page_start, num_pages,
-                room_token=room_token, writer_slot_mask=mask,
+                room,
+                chunk_idx,
+                page_start,
+                num_pages,
+                room_token=room_token,
+                writer_slot_mask=mask,
             )
         return True
 
@@ -1065,7 +1083,9 @@ def init_staging_buffers(
     return buffers
 
 
-def init_staging_allocator(register_fn, kv_args, *, device_type: str, allow_oom_fallback: bool = False):
+def init_staging_allocator(
+    register_fn, kv_args, *, device_type: str, allow_oom_fallback: bool = False
+):
     """Create decode-side staging ring-buffer allocator and register with transport.
 
     ``register_fn`` is called as ``register_fn(ptr, size)`` to hand the region to

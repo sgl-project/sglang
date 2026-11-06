@@ -538,7 +538,7 @@ class TestNextNBulkKVStaging(CustomTestCase):
                 writer, slots = manager._staging_writer_metadata(target_info)
                 arrivals.append(("peer", rank, staged, writer, slots))
 
-            manager._send_chunk_ready = ready
+            manager.send_chunk_ready = ready
             chunk = SimpleNamespace(
                 prefill_kv_indices=src_pages, index_slice=slice(0, len(src_pages))
             )
@@ -661,6 +661,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
         manager = MooncakeKVManager.__new__(MooncakeKVManager)
         manager.enable_staging = True
         manager.enable_trace = False
+        manager.customized_info_enabled = False
         manager.enable_deferred_decode_kv_release = False
         manager.state_layout_rejections = {}
         manager.failure_lock = threading.Lock()
@@ -671,7 +672,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
         manager._staging_ctx = SimpleNamespace(
             prefetch_requested=set(), prefetched_rooms=set()
         )
-        manager.kv_args = SimpleNamespace(kv_data_ptrs=[100])
+        manager.kv_args = SimpleNamespace(kv_data_ptrs=[100], aux_item_lens=[8])
         manager._get_dsa_cache_transfer_skip_flags = Mock(return_value=(False, False))
         manager.poison_deferred_ack_room = Mock()
         manager._poison_unsettled_send = Mock()
@@ -719,6 +720,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 staging=None if missing_peer_staging and room == 12 else object(),
                 requires_dcp_relayout=False,
                 dst_aux_ptrs=[100],
+                dst_aux_item_lens=None,
                 dst_state_data_ptrs=[200],
             )
             chunks.append(
@@ -731,6 +733,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                     prefill_aux_index=0,
                     staging_counted=False,
                     wait_event=None,
+                    indices_event=None,
                 )
             )
         if missing_peer_staging:
@@ -795,6 +798,8 @@ class TestBulkStagingProtocol(unittest.TestCase):
         events = []
         manager = SimpleNamespace(
             pp_size=1,
+            attn_tp_rank=0,
+            _staging_writer_metadata=lambda peer: (0, [0, 1]),
             ring_cp_sharded=False,
             _staging_ctx=SimpleNamespace(
                 watermark_cv=threading.Condition(),
@@ -802,7 +807,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 prefetched_rooms=set(),
             ),
             _prefetch_staging_reqs=lambda room: events.append(("allocate", room)),
-            _send_chunk_ready=lambda *a, **kw: events.append(("ready", kw["staged"])),
+            send_chunk_ready=lambda *a, **kw: events.append(("ready", kw["staged"])),
         )
         strategy = SimpleNamespace(
             check_ready=Mock(side_effect=[(False, 0, -1, 0, -1), (True, 0, 0, 0, 32)]),
@@ -810,9 +815,11 @@ class TestBulkStagingProtocol(unittest.TestCase):
         )
         chunk = SimpleNamespace(index_slice=slice(0, 2), prefill_kv_indices=[2, 0])
         peer = SimpleNamespace(staging=SimpleNamespace(total_size=128, base_ptr=100))
-        req = SimpleNamespace(room=12, mooncake_session_id="peer")
+        req = SimpleNamespace(
+            room=12, mooncake_session_id="peer", endpoint="127.0.0.1", dst_port=12345
+        )
         queue = SimpleNamespace(put=lambda item: events.append(("retry", item)))
-        args = (manager, strategy, chunk, req, peer, [0, 1], None, queue, 0)
+        args = (manager, strategy, chunk, req, peer, [0, 1], None, queue)
         self.assertEqual(MooncakeKVManager._do_staging_transfer(*args), (-1, True))
         self.assertEqual(events, [("allocate", 12), ("retry", chunk)])
         self.assertEqual(MooncakeKVManager._do_staging_transfer(*args), (0, False))
@@ -821,6 +828,10 @@ class TestBulkStagingProtocol(unittest.TestCase):
     def test_cp_fan_in_deduplicates_and_excludes_direct_writer(self):
         h = handler.DecodeStagingHandler.__new__(handler.DecodeStagingHandler)
         h._lock = threading.RLock()
+        h._staging_lifecycle = threading.Condition(h._lock)
+        h._room_tokens = {12: object()}
+        h._defer_scatter = False
+        h._pending_scatters = deque()
         receiver = SimpleNamespace(
             prefill_info=SimpleNamespace(
                 attn_cp_size=4, ring_cp_sharded=True, attn_tp_size=1, pp_size=1
@@ -833,7 +844,9 @@ class TestBulkStagingProtocol(unittest.TestCase):
         h.kv_manager = SimpleNamespace(pp_size=1)
         h.kv_buffer_info = {"k_buffers": [None, None]}
         submitted = []
-        h.submit_chunk_scatter = lambda *args: submitted.append(args) or True
+        h.submit_chunk_scatter = lambda *args, **kwargs: (
+            submitted.append(kwargs["writer_slot_mask"]) or True
+        )
         for rank in [2, 2, 0, 3]:
             self.assertFalse(
                 h.handle_chunk_arrived(
@@ -853,7 +866,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 12, 0, 0, 8, "1", writer_index=1, slot_indices=[0, 1, 2, 3]
             )
         )
-        self.assertEqual(submitted[0][-1], [[False] * 4] + [[True] * 4] * 3)
+        self.assertEqual(submitted[0], [[False] * 4] + [[True] * 4] * 3)
         self.assertFalse(
             h.handle_chunk_arrived(
                 12, 0, 0, 8, "1", writer_index=1, slot_indices=[0, 1, 2, 3]
@@ -868,6 +881,8 @@ class TestBulkStagingProtocol(unittest.TestCase):
             events = []
             manager = SimpleNamespace(
                 pp_size=1,
+                attn_tp_rank=0,
+                _staging_writer_metadata=lambda peer: (0, [0, 1]),
                 ring_cp_sharded=False,
                 _staging_ctx=SimpleNamespace(
                     watermark_cv=threading.Condition(),
@@ -876,7 +891,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 ),
             )
             manager._send_direct_kvcache = lambda *a: events.append("direct") or 0
-            manager._send_chunk_ready = lambda *a, **kw: events.append(
+            manager.send_chunk_ready = lambda *a, **kw: events.append(
                 ("ready", kw["staged"])
             )
             strategy = SimpleNamespace(
@@ -890,12 +905,16 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 manager,
                 strategy,
                 chunk,
-                SimpleNamespace(mooncake_session_id="peer"),
+                SimpleNamespace(
+                    room=12,
+                    mooncake_session_id="peer",
+                    endpoint="127.0.0.1",
+                    dst_port=12345,
+                ),
                 peer,
                 [0, 1],
                 None,
                 None,
-                0,
             )
             self.assertFalse(deferred)
             self.assertEqual(rc, -1 if ret == -1 else 0)
@@ -908,6 +927,8 @@ class TestBulkStagingProtocol(unittest.TestCase):
         events = []
         manager = SimpleNamespace(
             pp_size=1,
+            attn_tp_rank=0,
+            _staging_writer_metadata=lambda peer: (0, [0, 1]),
             ring_cp_sharded=False,
             _send_direct_kvcache=lambda *a: events.append("direct") or 0,
         )
@@ -916,7 +937,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
         )
         self.assertEqual(
             MooncakeKVManager._do_staging_transfer(
-                manager, None, None, None, peer, None, None, None, 0
+                manager, None, None, None, peer, None, None, None
             ),
             (0, False),
         )
@@ -925,6 +946,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
     def _transfer_fixture(self, *, pp_size=1, cp_size=1, tp_rank=0):
         manager = MooncakeKVManager.__new__(MooncakeKVManager)
         manager.pp_size = pp_size
+        manager.pp_rank = 0
         manager.attn_tp_size, manager.attn_tp_rank = 2, tp_rank
         manager.attn_cp_size, manager.attn_cp_rank = cp_size, 0
         manager.ring_cp_sharded = cp_size > 1
@@ -963,6 +985,10 @@ class TestBulkStagingProtocol(unittest.TestCase):
     def test_pp_direct_fallback_keeps_completion_without_scatter_slots(self):
         h = handler.DecodeStagingHandler.__new__(handler.DecodeStagingHandler)
         h._lock = threading.RLock()
+        h._staging_lifecycle = threading.Condition(h._lock)
+        h._room_tokens = {12: object()}
+        h._defer_scatter = False
+        h._pending_scatters = deque()
         h.decode_tp = 1
         h.kv_manager = SimpleNamespace(pp_size=1)
         h.kv_buffer_info = {"k_buffers": [None, None]}
@@ -981,7 +1007,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 manager, peer, req, chunk, strategy = self._transfer_fixture(
                     pp_size=2, tp_rank=tp_rank
                 )
-                unique_rank = tp_rank * 2 + pp_rank
+                manager.pp_rank = pp_rank
                 strategy.check_ready.return_value = (
                     False,
                     0,
@@ -991,7 +1017,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 )
                 self.assertEqual(
                     manager._do_staging_transfer(
-                        strategy, chunk, req, peer, [4, 5], None, None, unique_rank
+                        strategy, chunk, req, peer, [4, 5], None, None
                     ),
                     (0, False),
                 )
@@ -1017,7 +1043,12 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 )
         self.assertEqual(arrivals, [False, False, False, True])
         h.submit_chunk_scatter.assert_called_once_with(
-            12, 0, 0, 2, [[False] * 4, [False] * 4]
+            12,
+            0,
+            0,
+            2,
+            room_token=h._room_tokens[12],
+            writer_slot_mask=[[False] * 4, [False] * 4],
         )
 
     def test_pp_strict_bulk_uses_negotiated_layer_slots(self):
@@ -1026,7 +1057,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
         with patch.object(self.args, "disaggregation_require_bulk", True):
             self.assertEqual(
                 manager._do_staging_transfer(
-                    strategy, chunk, req, peer, [4, 5], None, None, 1
+                    strategy, chunk, req, peer, [4, 5], None, None
                 ),
                 (0, False),
             )
@@ -1054,7 +1085,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 with patch.object(self.args, "disaggregation_require_bulk", False):
                     self.assertEqual(
                         manager._do_staging_transfer(
-                            strategy, chunk, req, peer, [4, 5], None, None, 3
+                            strategy, chunk, req, peer, [4, 5], None, None
                         ),
                         (0, False),
                     )
@@ -1069,7 +1100,7 @@ class TestBulkStagingProtocol(unittest.TestCase):
         with patch.object(self.args, "disaggregation_require_bulk", True):
             self.assertEqual(
                 manager._do_staging_transfer(
-                    strategy, chunk, req, peer, [4, 5], None, None, 1
+                    strategy, chunk, req, peer, [4, 5], None, None
                 ),
                 (0, False),
             )
@@ -1087,7 +1118,12 @@ class TestBulkStagingProtocol(unittest.TestCase):
                 side_effect=torch.OutOfMemoryError("injected GPU OOM"),
             ):
                 buffers = handler.init_staging_buffers(
-                    lambda *a: None, args, 2, 64, allow_oom_fallback=True
+                    lambda *a: None,
+                    args,
+                    2,
+                    64,
+                    allow_oom_fallback=True,
+                    device_type="cuda",
                 )
                 self.assertEqual(buffers, [None, None])
             with patch(
@@ -1100,7 +1136,12 @@ class TestBulkStagingProtocol(unittest.TestCase):
 
                 with self.assertRaisesRegex(RuntimeError, "RDMA registration"):
                     handler.init_staging_buffers(
-                        failed_registration, args, 1, 64, allow_oom_fallback=True
+                        failed_registration,
+                        args,
+                        1,
+                        64,
+                        allow_oom_fallback=True,
+                        device_type="cuda",
                     )
 
     def test_cp_uses_logical_page_grid(self):
@@ -1139,6 +1180,10 @@ class TestBulkStagingProtocol(unittest.TestCase):
         # nor the destination KV may be reused until scatter's CUDA event fires.
         h = handler.DecodeStagingHandler.__new__(handler.DecodeStagingHandler)
         h._lock = threading.RLock()
+        h._staging_lifecycle = threading.Condition(h._lock)
+        h._room_tokens = {12: object()}
+        h._defer_scatter = False
+        h._pending_scatters = deque()
         h._pending_watermarks = {}
         receiver = SimpleNamespace(chunk_staging_infos=[(7, 0, 0, 128, 2)])
         req = SimpleNamespace(
@@ -1202,7 +1247,15 @@ class TestBulkStagingProtocol(unittest.TestCase):
         manager = SimpleNamespace(
             _staging_ctx=SimpleNamespace(room_receivers={}, room_bootstrap={})
         )
-        h = DecodeStagingHandler(manager, allocator, {}, 1, 1, 0, None)
+        h = DecodeStagingHandler(
+            manager,
+            allocator,
+            {"k_buffers": [SimpleNamespace(device=torch.device("cuda:0"))]},
+            1,
+            1,
+            0,
+            None,
+        )
         lock = threading.Lock()
         socket = Mock()
         socket.send_multipart.side_effect = zmq.Again()
@@ -1296,6 +1349,7 @@ class TestStagingTransferCompletion(unittest.TestCase):
             prefill_aux_index=0,
             staging_counted=False,
             wait_event=None,
+            indices_event=None,
         )
 
     def manager(self):
@@ -1313,8 +1367,10 @@ class TestStagingTransferCompletion(unittest.TestCase):
         manager = SimpleNamespace(
             enable_staging=True,
             enable_trace=False,
+            customized_info_enabled=False,
             enable_deferred_decode_kv_release=False,
             defer_decode_allocation=False,
+            reports_transfer_latency=False,
             state_layout_rejections={},
             req_to_decode_prefix_len={},
             failure_lock=threading.Lock(),
@@ -1322,7 +1378,7 @@ class TestStagingTransferCompletion(unittest.TestCase):
             deferred_bootstrap=None,
             send_kv_status_message=Mock(),
             poison_deferred_ack_room=Mock(),
-            kv_args=SimpleNamespace(kv_data_ptrs=[100]),
+            kv_args=SimpleNamespace(kv_data_ptrs=[100], aux_item_lens=[8]),
             _get_dsa_cache_transfer_skip_flags=lambda peer: (False, False),
             ring_cp_sharded=True,
             attn_tp_size=1,
@@ -1340,6 +1396,7 @@ class TestStagingTransferCompletion(unittest.TestCase):
                 "peer": SimpleNamespace(
                     staging=SimpleNamespace(base_ptr=10000, total_size=100000),
                     dst_aux_ptrs=[42],
+                    dst_aux_item_lens=None,
                     requires_dcp_relayout=False,
                 )
             },
@@ -1354,7 +1411,8 @@ class TestStagingTransferCompletion(unittest.TestCase):
             bootstrap_port=1234,
             record_failure=Mock(),
             _is_watermark_ready=Mock(return_value=True),
-            _send_chunk_ready=Mock(),
+            send_chunk_ready=Mock(),
+            _staging_writer_metadata=lambda peer: (0, [0, 1]),
             send_aux=Mock(return_value=0),
             sync_status_to_decode_endpoint=Mock(),
         )
@@ -1364,6 +1422,7 @@ class TestStagingTransferCompletion(unittest.TestCase):
             "_do_staging_transfer",
             "_prefill_unique_rank",
             "conclude_transfer",
+            "validate_aux_buffers",
         ):
             setattr(
                 manager, name, MethodType(getattr(MooncakeKVManager, name), manager)
@@ -1423,7 +1482,11 @@ class TestStagingTransferCompletion(unittest.TestCase):
             [list(range(128, 256)), list(range(128))],
         )
         self.assertEqual(
-            [call.args[1] for call in manager._send_chunk_ready.call_args_list], [1, 0]
+            [
+                call.kwargs["chunk_idx"]
+                for call in manager.send_chunk_ready.call_args_list
+            ],
+            [1, 0],
         )
         self.assertEqual(dict(manager._staging_outstanding), {})
         self.assertNotIn(12, manager.transfer_infos)
@@ -1460,15 +1523,17 @@ class TestStagingTransferCompletion(unittest.TestCase):
                         manager, queue, None, staging_buffer=object()
                     )
                 self.assertEqual(dict(manager._staging_outstanding), {})
-                manager._send_chunk_ready.assert_not_called()
+                manager.send_chunk_ready.assert_not_called()
                 manager.send_aux.assert_not_called()
 
     def test_non_staging_success_without_outstanding_chunks(self):
         manager = SimpleNamespace(
             enable_staging=False,
             check_status=Mock(return_value=4),
+            request_status={12: mooncake_conn.KVPoll.Success},
             _staging_outstanding={},
             defer_decode_allocation=False,
+            reports_transfer_latency=False,
         )
         sender = object.__new__(mooncake_conn.MooncakeKVSender)
         sender.conclude_state = None

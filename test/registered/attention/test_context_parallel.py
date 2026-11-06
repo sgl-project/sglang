@@ -49,7 +49,7 @@ from sglang.srt.layers.layer_boundary.row_transport import (
     launch_cp_residual_exchange,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, mock_parallel_groups
 
@@ -1339,7 +1339,7 @@ class TestContextParallelMetadata(unittest.TestCase):
             mamba_pool=SimpleNamespace(synchronize=unittest.mock.Mock()),
         )
         checkpoints = (((256, mapping[:1]),), (), ((0, mapping[1:2]),))
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -1456,7 +1456,7 @@ class TestContextParallelMetadata(unittest.TestCase):
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_runner_prepares_then_backend_only_binds_metadata(self):
         from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.model_executor.model_runner import ModelRunner
 
         table = torch.arange(1024, dtype=torch.int32, device="cuda").reshape(2, 512) * 2
@@ -2097,7 +2097,7 @@ class TestCPDecoderParticipation(unittest.TestCase):
     def test_empty_shards_enter_attention_only_when_cp_is_active(self):
         from contextlib import contextmanager
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models.qwen3_5 import (
             Qwen3_5AttentionDecoderLayer,
             Qwen3_5LinearDecoderLayer,

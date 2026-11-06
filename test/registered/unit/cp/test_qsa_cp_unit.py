@@ -241,9 +241,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         index_qk_proj=lambda value: (torch.cat([value, value], dim=-1), None),
         q_layernorm=lambda value: value,
         apply_rope=Mock(side_effect=lambda positions, value, **kwargs: value),
-        _use_fused_prep=Mock(
-            return_value=False
-        ),
+        _use_fused_prep=Mock(return_value=False),
         update_key_state_and_compress=Mock(
             side_effect=lambda *args, **kwargs: events.append("compress")
         ),
@@ -566,3 +564,39 @@ def test_indexer_rope_uses_host_bound_without_device_scalar_read(monkeypatch):
         )
     rotary._ensure_cos_sin_cache_length.assert_called_once_with(7)
     torch.testing.assert_close(actual, value)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_interleave_attention_inputs_follow_global_query_rows(monkeypatch, rank):
+    module = qwen_sparse_attn_backend
+    monkeypatch.setattr(module, "is_cp_active", lambda batch: True)
+    monkeypatch.setattr(
+        module,
+        "get_cp_strategy",
+        lambda: SimpleNamespace(
+            kind=ContextParallelStrategyKind.INTERLEAVE, cp_size=4, cp_rank=rank
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value: value)
+    extend, prefix = [3, 2, 2], [5, 0, 7]
+    lengths = [p + n for p, n in zip(prefix, extend)]
+    batch = SimpleNamespace(
+        extend_seq_lens_cpu=extend,
+        extend_seq_lens=torch.tensor(extend),
+        seq_lens_cpu=torch.tensor(lengths),
+        seq_lens=torch.tensor(lengths),
+    )
+    plan = QwenSparseAttnBackend._extend_attn_inputs_from_batch(batch)
+    positions = torch.cat([torch.arange(p, p + n) for p, n in zip(prefix, extend)])
+    actual = torch.cat(
+        [
+            plan.cp_first_positions[i]
+            + torch.arange(int(plan.cu_seqlens_q[i + 1] - plan.cu_seqlens_q[i])) * 4
+            for i in range(len(extend))
+        ]
+    )
+    torch.testing.assert_close(actual.long(), positions[rank::4])
+    assert plan.cp_num_queries == len(positions[rank::4])
+    assert plan.cp_num_tokens == sum(extend)
+    assert plan.cp_prefix_tokens == sum(prefix)
+    assert plan.cu_seqlens_k.tolist() == [0, 8, 10, 19]

@@ -2385,7 +2385,7 @@ def test_qsa_prefill_packing_preserves_unstored_new_kv(
 ):
     """Reorder/store preserves fresh BF16 values and never consumes CP padding.
 
-    Cache writes must match pool division/clamping, leave prefix slots intact,
+    Cache writes must match the unscaled pool clamping, leave prefix slots intact,
     and use global fresh-token slots rather than rank-major source positions.
     """
     if not torch.cuda.is_available():
@@ -2408,7 +2408,7 @@ def test_qsa_prefill_packing_preserves_unstored_new_kv(
             for i, (p, e) in enumerate(zip(prefix_lens, extend_lens))
         ]
     )
-    for scale in (0.3, 0.7):
+    for _ in range(2):
         storage = torch.randn(6 * width, 2, 512, device=device).to(cache_dtype)
         pool = storage[..., ::2]
         new = torch.randn(sum(extend_lens), 2, 256, device=device).to(torch.bfloat16)
@@ -2418,8 +2418,6 @@ def test_qsa_prefill_packing_preserves_unstored_new_kv(
         for i, (prefix, extend) in enumerate(zip(prefix_lens, extend_lens)):
             slots = table[req[i], :prefix]
             cached = pool.index_select(0, slots).float()
-            if cache_dtype == torch.float8_e4m3fn:
-                cached *= scale
             parts.extend([cached.to(torch.bfloat16), new[start : start + extend]])
             pool[table[req[i], prefix : prefix + extend]] = float("nan")
             start += extend
@@ -2430,7 +2428,7 @@ def test_qsa_prefill_packing_preserves_unstored_new_kv(
         if store:
             to_store = new.clone()
             if cache_dtype == torch.float8_e4m3fn:
-                to_store.div_(scale).clamp_(-448, 448)
+                to_store.clamp_(-448, 448)
             expected_pool[locations] = to_store.to(cache_dtype)
         expected_pools.append(expected_pool)
     rank_rows = (sum(extend_lens) + cp_size - 1) // cp_size
@@ -2455,8 +2453,6 @@ def test_qsa_prefill_packing_preserves_unstored_new_kv(
         total_k=sum(lens),
         max_k=max(lens),
         output_dtype=torch.bfloat16,
-        k_scale=0.3,
-        v_scale=0.7,
         new_kv=tuple(new_kv),
         prefix_lens=torch.tensor(prefix_lens, device=device, dtype=torch.int32),
         extend_starts=torch.tensor([0, 3, 5], device=device, dtype=torch.int32),

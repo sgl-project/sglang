@@ -749,15 +749,17 @@ class MambaComponent(TreeComponent):
         assert not req.kv.mamba_pending_checkpoints, "Previous chunk was not cached"
         if self.cache.disable or req.skip_radix_cache_insert or not positions:
             return
-        if self.int8_ckpt_pool is not None:
+        if self.quantizes_checkpoints:
             raise ValueError("Sharded CP checkpoints require the native state pool")
-        allocator = self.cache.req_to_token_pool.mamba_allocator
+        storage, sub_pool = self._state()
         # Extra CP snapshots are optional. Admit them only from spare slots;
         # preserve the ordinary checkpoints and the tree's existing prefixes.
         # The allocator contract is shared by Python and Rust tree cores.
-        count = min(len(positions), max(0, allocator.available_size() - reserve_slots))
+        count = min(
+            len(positions), max(0, storage.available_units(sub_pool) - reserve_slots)
+        )
         if count:
-            slots = allocator.alloc(count)
+            slots = storage.take_state_slots(sub_pool, count)
             assert slots is not None
             req.kv.mamba_pending_checkpoints = [
                 (position, slots[i : i + 1])

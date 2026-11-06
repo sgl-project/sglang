@@ -50,8 +50,6 @@ from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
     RingKVExchange,
     cp_materialize_global_token_order,
-    cp_shard_hidden_states,
-    cp_shard_position_ids,
     get_cp_strategy,
     is_cp_active,
 )
@@ -151,6 +149,7 @@ def _gather_cp_kv(
     k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
     v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
     return k_full, v_full
+
 
 class QSAExtendAttnInputs(msgspec.Struct, frozen=True):
     """Chunk-prefill launch inputs shared by every QSA layer of a forward.
@@ -903,6 +902,13 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     @staticmethod
     def _extend_attn_inputs_from_batch(forward_batch) -> Optional[QSAExtendAttnInputs]:
+        strategy = get_cp_strategy()
+        if not (
+            strategy is not None
+            and strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+            and is_cp_active(forward_batch)
+        ):
+            return None
         if (
             forward_batch.extend_seq_lens_cpu is None
             or forward_batch.seq_lens_cpu is None
@@ -912,13 +918,6 @@ class QwenSparseAttnBackend(AttentionBackend):
         extend = [int(x) for x in forward_batch.extend_seq_lens_cpu]
         lengths = [int(x) for x in forward_batch.seq_lens_cpu]
         device = forward_batch.seq_lens.device
-        strategy = get_cp_strategy()
-        if not (
-            strategy is not None
-            and strategy.kind == ContextParallelStrategyKind.INTERLEAVE
-            and is_cp_active(forward_batch)
-        ):
-            return None
         size, rank = strategy.cp_size, strategy.cp_rank
         ext = np.asarray(extend, dtype=np.int32)
         seq = np.asarray(lengths, dtype=np.int32)
@@ -1142,7 +1141,6 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_batch_idx=self._graph_token_to_batch[:metadata_rows],
             token_slot_table=self._graph_dummy_token_slot_table[:metadata_rows],
             indexer_metadata=indexer_metadata,
-            extend_attn_inputs=self._extend_attn_inputs_from_batch(forward_batch),
             row_req_pool_indices=self._graph_row_req_pool_indices[:metadata_rows],
             is_cuda_graph=True,
             fa2_valid_counts=self._graph_fa2_valid_counts[:metadata_rows],
@@ -1899,7 +1897,9 @@ class QwenSparseAttnBackend(AttentionBackend):
             k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
             v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
             if save_kv_cache:
-                self.kv_layers.layer(layer.layer_id).store(layer, forward_batch.out_cache_loc, k_full, v_full)
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer, forward_batch.out_cache_loc, k_full, v_full
+                )
         if fuse_cache or plan.cp_prefix_tokens:
             # Only cached prefix rows are read from the pool. Preserve current
             # BF16 KV even when the cache is FP8 or cache writes are disabled.

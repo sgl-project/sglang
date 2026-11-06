@@ -849,7 +849,7 @@ def warmup_gdn_projection_norm(
 
 def warmup_gdn_projection(device, dtype, geometry, projection_stride):
     """Compile projection and gate strides used by full-head prefill."""
-    from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+    from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 
     kh, vh, kd, vd = geometry
     channels = 2 * kh * kd + vh * vd

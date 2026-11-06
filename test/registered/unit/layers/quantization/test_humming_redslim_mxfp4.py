@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 import sys
+
 import pytest
 import torch
+
 pytest.importorskip("humming")
 from sglang.srt.layers.quantization.humming import HummingMoEMethod
 from sglang.test.ci.ci_register import register_cpu_ci
+
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
@@ -28,10 +31,18 @@ def test_mega_preserves_native_mxfp4_bytes_and_global_expert_count(monkeypatch):
     }
     for name, shape in layer.sublayer_configs.items():
         n, k = shape["shape_n"], shape["shape_k"]
-        layer.register_parameter(name + "_weight", torch.nn.Parameter(
-            torch.empty((2, n, k // 2), dtype=torch.uint8), requires_grad=False))
-        layer.register_parameter(name + "_weight_scale", torch.nn.Parameter(
-            torch.empty((2, n, k // 32), dtype=torch.uint8), requires_grad=False))
+        layer.register_parameter(
+            name + "_weight",
+            torch.nn.Parameter(
+                torch.empty((2, n, k // 2), dtype=torch.uint8), requires_grad=False
+            ),
+        )
+        layer.register_parameter(
+            name + "_weight_scale",
+            torch.nn.Parameter(
+                torch.empty((2, n, k // 32), dtype=torch.uint8), requires_grad=False
+            ),
+        )
     layer.num_experts = 4
     layer.hidden_size = 128
     layer.intermediate_size_per_partition = 64

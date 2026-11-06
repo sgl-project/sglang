@@ -25,8 +25,8 @@ import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
-from sglang.srt.utils import create_device_stream, device_stream_context
 from sglang.srt.layers.cp.utils import compute_kv_head_overlap
+from sglang.srt.utils import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 
@@ -755,9 +755,20 @@ def gather_all_layers_to_staging(
     if not tokens:
         return 0
     if len({(b.dtype, b.shape[1:]) for b in buffers}) == 1:
-        gather = _gather_all_layers_triton if _USE_TRITON_STAGING else _gather_all_layers_torch
-        return gather(k_buffers, v_buffers, page_indices_np, staging_buffer,
-                      src_head_start, num_heads, page_size)
+        gather = (
+            _gather_all_layers_triton
+            if _USE_TRITON_STAGING
+            else _gather_all_layers_torch
+        )
+        return gather(
+            k_buffers,
+            v_buffers,
+            page_indices_np,
+            staging_buffer,
+            src_head_start,
+            num_heads,
+            page_size,
+        )
     # CUDA's current device is thread-local. Transfer workers must bind the KV
     # owner before StreamContext captures the stream it will restore on exit.
     staging_buffer.device_module.set_device(buffers[0].device.index)
@@ -997,13 +1008,28 @@ def scatter_staging_to_kv(
         or (cp_size > 1 and prefill_attn_tp_size != 1)
     ):
         raise ValueError("Invalid CP staging scatter geometry")
-    if (cp_size == 1 and writer_slot_mask is None
-            and prefill_attn_tp_size <= total_kv_heads
-            and len({(b.dtype, b.shape[1:]) for b in buffers}) == 1):
-        scatter = _scatter_staging_to_kv_triton if _USE_TRITON_STAGING else _scatter_staging_to_kv_torch
-        return scatter(staging_buffer_view, k_buffers, v_buffers, page_idx_tensor,
-                       page_size, prefill_attn_tp_size, decode_attn_tp_size,
-                       dst_tp_rank, total_kv_heads)
+    if (
+        cp_size == 1
+        and writer_slot_mask is None
+        and prefill_attn_tp_size <= total_kv_heads
+        and len({(b.dtype, b.shape[1:]) for b in buffers}) == 1
+    ):
+        scatter = (
+            _scatter_staging_to_kv_triton
+            if _USE_TRITON_STAGING
+            else _scatter_staging_to_kv_torch
+        )
+        return scatter(
+            staging_buffer_view,
+            k_buffers,
+            v_buffers,
+            page_idx_tensor,
+            page_size,
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            dst_tp_rank,
+            total_kv_heads,
+        )
     local_page = page_size // cp_size
     tokens = page_idx_tensor.numel() * local_page
     writers = (

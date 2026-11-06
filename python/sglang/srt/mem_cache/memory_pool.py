@@ -94,7 +94,6 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
-    is_pin_memory_available,
     is_xpu,
     next_power_of_2,
 )

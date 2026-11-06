@@ -182,6 +182,10 @@ class FlashAttentionBackend(AttentionBackend):
                 raise ValueError(
                     "Sharded CP uses FA3 on Hopper; select trtllm_mha on Blackwell"
                 )
+            self.fa_impl_ver = fa_impl_ver
+            self._init_flash_attention_functions(
+                torch.cuda.get_device_capability(model_runner.device)
+            )
             self._init_cp_attention(model_runner)
             return
 
@@ -1498,7 +1502,7 @@ class FlashAttentionBackend(AttentionBackend):
     def _forward_cp_shard(
         self, *, q, kv, segments, scale, k_descale=None, v_descale=None
     ):
-        partial, partial_lse, *_ = flash_attn_with_kvcache(
+        partial, partial_lse, *_ = self.flash_attn_with_kvcache(
             q=q,
             k_cache=kv[0].unsqueeze(0),
             v_cache=kv[1].unsqueeze(0),

@@ -160,8 +160,8 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.dllm.config import DllmConfig
-    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
+    from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_retirer import (

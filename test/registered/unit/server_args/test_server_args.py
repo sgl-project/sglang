@@ -5977,7 +5977,6 @@ class TestRingCPEPD(CustomTestCase):
             ("speculative_algorithm", "EAGLE"),
             ("enable_lora", True),
             ("enable_hierarchical_cache", True),
-            ("enable_pdmux", True),
         )
         for name, value in invalid:
             with self.subTest(name=name):

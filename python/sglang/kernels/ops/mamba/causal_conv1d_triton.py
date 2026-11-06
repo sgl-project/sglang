@@ -508,7 +508,9 @@ def causal_conv1d_fn(
             else torch.empty_like(x)
         )
     elif out.shape != output_shape or out.dtype != x.dtype or out.device != x.device:
-        raise ValueError("Convolution output must match the output shape, dtype and device")
+        raise ValueError(
+            "Convolution output must match the output shape, dtype and device"
+        )
     if block_table is not None:
         if token_block_range is not None:
             raise ValueError("Token block ranges cannot be combined with a block table")

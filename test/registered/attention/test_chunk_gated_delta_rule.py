@@ -26,7 +26,7 @@ from sglang.srt.layers.cp.utils import (
     _heads_to_context,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device, is_hip
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -914,7 +914,9 @@ class TestFlashQLACP(CustomTestCase):
     ):
         import torch.nn.functional as F
 
-        from sglang.kernels.ops.attention.fla.fused_gdn_gating import fused_gdn_gating
+        from sglang.kernels.ops.attention.linear.fused_gdn_gating import (
+            fused_gdn_gating,
+        )
         from sglang.kernels.ops.mamba.causal_conv1d_triton import (
             causal_conv1d_fn,
         )

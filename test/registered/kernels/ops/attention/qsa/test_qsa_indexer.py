@@ -252,10 +252,8 @@ def test_fused_q_prep_without_cache_store(dtype, rows):
     pool = FakePool(128, 32, device, compressed_dtype=dtype)
     hidden = torch.randn(rows, HIDDEN, dtype=torch.bfloat16, device=device)
     positions = torch.arange(rows, device=device).expand(3, -1).contiguous()
-    q, k, stored = indexer.project_qk(
-        hidden, positions, pool=pool, rope_max_position=64
-    )
-    q_ref, k_ref, _ = indexer.project_qk(hidden, positions, rope_max_position=64)
+    q, k, stored = indexer.project_qk(hidden, positions, pool=pool)
+    q_ref, k_ref, _ = indexer.project_qk(hidden, positions)
     assert not stored
     torch.testing.assert_close(k, k_ref)
     assert torch.count_nonzero(pool.key_state) == 0
@@ -274,7 +272,7 @@ def _cp_mqa_ring_case(rank, world, dtype, prefixes, extend, exchange):
     """Real CP entrypoint oracle; isolate projection with precomputed Q and K."""
     from sglang.srt.layers.attention.qsa.metadata import (
         build_pending_ring_slots,
-        build_qsa_prefill_mqa_plan,
+        build_qsa_row_ranges,
     )
 
     device = torch.device("cuda", rank)
@@ -329,21 +327,22 @@ def _cp_mqa_ring_case(rank, world, dtype, prefixes, extend, exchange):
         full_query[rank::world].contiguous(),
     )
     lens = torch.tensor(lengths, dtype=torch.int32, device=device)
-    plan = build_qsa_prefill_mqa_plan(
-        sequence_lengths=lens,
-        sequence_lengths_cpu=lengths,
-        token_slot_table=table,
-        query_positions=local_positions,
-        query_sequence_ids=seq_ids[rank::world],
-        compress_ratio=4,
+    compressed_locs = torch.cat(
+        [
+            table[row, : (length // RATIO) * RATIO : RATIO] // RATIO
+            for row, length in enumerate(lengths)
+        ]
+    ).long()
+    row_starts, row_ends, _ = build_qsa_row_ranges(
+        lens, local_positions, seq_ids[rank::world], RATIO
     )
     expected = indexer.select_prefill_tokens(
         q,
-        pool.compressed[plan.compressed_locs],
-        plan.row_starts,
-        plan.row_ends,
+        pool.compressed[compressed_locs],
+        row_starts,
+        row_ends,
         local_positions,
-        plan.row_sequence_lengths,
+        lens.index_select(0, seq_ids[rank::world].long()),
     )
     raw_parts, start = [], 0
     for prefix, length in zip(prefixes, lengths):
@@ -372,19 +371,18 @@ def _cp_mqa_ring_case(rank, world, dtype, prefixes, extend, exchange):
         token_to_kv_pool=pool,
         pending_ring_slots=pending_slots,
         extend_rope_matrix=global_positions[:, None].expand(-1, 3).contiguous(),
-        prefill_mqa_plan=plan,
-        rope_max_position=max(lengths) - 1,
         is_cuda_graph=False,
         write_locs=writes,
         compress_member_rows=members,
         compress_group_positions=ends,
         get_token_to_batch_idx=lambda: seq_ids,
         get_prefill_mqa_inputs=lambda *args, **kwargs: (
-            pool.compressed.index_select(0, plan.compressed_locs),
-            plan.row_starts,
-            plan.row_ends,
-            plan.row_sequence_lengths,
+            pool.compressed.index_select(0, compressed_locs),
+            row_starts,
+            row_ends,
+            lens,
         ),
+        prefill_max_row_keys=lambda *_: max(lengths) // RATIO,
     )
     from unittest.mock import patch
 

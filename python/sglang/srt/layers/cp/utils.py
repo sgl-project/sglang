@@ -939,7 +939,7 @@ class ShardedContextParallelMetadata(BaseContextParallelMetadata):
 
 def is_gdn_cp_enabled(server_args=None):
     if server_args is not None:
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = resolved_view(server_args)
         return (
@@ -961,7 +961,7 @@ def is_gdn_cp_enabled(server_args=None):
 def is_sharded_cp_enabled(server_args=None):
     """Physical KV sharding; QSA keeps replicated KV with independent GDN CP."""
     if server_args is not None:
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         sharing = resolved_view(server_args).enable_cp_tp_group_sharing
     else:

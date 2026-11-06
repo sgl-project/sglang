@@ -36,8 +36,8 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
-from sglang.srt.utils import set_weight_attrs
 from sglang.srt.runtime_context import get_exec
+from sglang.srt.utils import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import CombineInput, DispatchOutput

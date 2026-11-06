@@ -200,7 +200,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         for rank in range(4):
             with (
                 self.subTest(rank=rank),
-                get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+                _cp_topology(attn_cp_rank=rank, attn_cp_size=4),
             ):
                 # Uneven request boundaries must not round each request up
                 # independently: interleave shards their concatenation.
@@ -211,7 +211,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                     512,
                 )
                 self.assertTrue(runner.can_run_graph(batch))
-        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+        with _cp_topology(attn_cp_rank=0, attn_cp_size=4):
             batch.extend_prefix_lens_cpu = [0, 1, 0]
             self.assertTrue(runner.can_run_graph(batch))
 
@@ -847,7 +847,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             seq_lens=[12],
             extend_seq_lens=[12],
         )
-        with get_parallel().override(attn_cp_size=cp_size):
+        with _cp_topology(attn_cp_size=cp_size):
             pad_logical_token_to_physical(metadata)
         fb = SimpleNamespace(attn_cp_metadata=metadata)
         q = torch.arange(8 * 2).view(8, 2)

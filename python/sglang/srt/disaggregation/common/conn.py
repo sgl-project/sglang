@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -883,8 +884,13 @@ class CommonKVManager(BaseKVManager):
         ]
         if writer_index is not None:
             slots = slot_indices or []
-            parts.extend([b"1" if staged else b"0", str(writer_index).encode("ascii"),
-                          struct.pack(f"{len(slots)}I", *slots)])
+            parts.extend(
+                [
+                    b"1" if staged else b"0",
+                    str(writer_index).encode("ascii"),
+                    struct.pack(f"{len(slots)}I", *slots),
+                ]
+            )
         for endpoint, port in targets:
             na = NetworkAddress(endpoint, port)
             self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
@@ -896,11 +902,16 @@ class CommonKVManager(BaseKVManager):
             room, chunk_idx, page_start, num_pages = (
                 int(part.decode("ascii")) for part in msg[1:5]
             )
-            writer_id = msg[6].decode("ascii") if len(msg) > 6 else msg[5].decode("ascii")
+            writer_id = (
+                msg[6].decode("ascii") if len(msg) > 6 else msg[5].decode("ascii")
+            )
             completion = {}
             if len(msg) > 8:
-                completion = dict(staged=msg[7] == b"1", writer_index=int(msg[8]),
-                                  slot_indices=list(struct.unpack(f"{len(msg[9]) // 4}I", msg[9])))
+                completion = dict(
+                    staged=msg[7] == b"1",
+                    writer_index=int(msg[8]),
+                    slot_indices=list(struct.unpack(f"{len(msg[9]) // 4}I", msg[9])),
+                )
         except (IndexError, ValueError, UnicodeDecodeError, struct.error):
             logger.warning("Dropping malformed CHUNK_READY message")
             return True
@@ -910,7 +921,9 @@ class CommonKVManager(BaseKVManager):
         if handler is None:
             logger.warning("CHUNK_READY for room %s without a staging handler", room)
             return True
-        handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id, **completion)
+        handler.handle_chunk_arrived(
+            room, chunk_idx, page_start, num_pages, writer_id, **completion
+        )
         return True
 
     def conclude_transfer(

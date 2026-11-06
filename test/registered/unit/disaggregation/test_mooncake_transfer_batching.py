@@ -421,17 +421,23 @@ class TestMooncakeEarlySend(CustomTestCase):
                     manager = SimpleNamespace(
                         enable_all_cp_ranks_for_transfer=True,
                         ring_cp_sharded=True,
+                        kv_shard_size=1,
+                        prepare_send_state_indices=lambda state: state,
                         is_dummy_cp_rank=False,
                         attn_cp_size=cp_size,
                         attn_cp_rank=rank,
                         add_transfer_request=MagicMock(),
                     )
-                    sender = SimpleNamespace(
+                    sender = object.__new__(MooncakeKVSender)
+                    vars(sender).update(
                         kv_mgr=manager,
                         bootstrap_room=1,
                         aux_index=0,
                         trace_ctx=MagicMock(),
                         curr_idx=0,
+                        conclude_state=None,
+                        _transfer_start_time=None,
+                        _early_send_wait_event=None,
                         num_kv_indices=pages,
                         _record_transfer_indices=MagicMock(),
                     )
@@ -659,6 +665,14 @@ class TestMooncakeStagingDeviceType(unittest.TestCase):
     silent failure mode is a literal: it works on a CUDA host and allocates
     staging on the wrong device for every other accelerator.
     """
+
+    def setUp(self):
+        config = patch(
+            "sglang.srt.disaggregation.mooncake.conn.get_disagg",
+            return_value=SimpleNamespace(disaggregation_require_bulk=False),
+        )
+        config.start()
+        self.addCleanup(config.stop)
 
     @staticmethod
     def _manager():

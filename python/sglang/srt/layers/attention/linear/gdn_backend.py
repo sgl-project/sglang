@@ -8,8 +8,12 @@ import torch.distributed as dist
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     CAUSAL_CONV1D_FWD_BLOCK_M,
-    causal_conv1d_fn,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_fn
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn as causal_conv1d_fn_triton,
+)
+from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_peer_with_halo,
     causal_conv1d_update,
     causal_conv1d_with_halo,
@@ -1443,6 +1447,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 cache_indices=meta.cache_indices,
             )
         return core_attn_out
+
     def _forward_extend_cp(self, layer, batch, raw, a, b):
         """GDN core only: convolution halos, FlashQLA recurrence and radix state."""
         frame = self.cp_metadata
