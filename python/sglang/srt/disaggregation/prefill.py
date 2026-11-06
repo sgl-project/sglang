@@ -110,6 +110,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.managers.utils import GenerationBatchResult
+    from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 logger = logging.getLogger(__name__)
@@ -135,6 +136,24 @@ def should_force_retry(req: Req) -> bool:
 
     digest = hashlib.sha256(str(req.rid).encode()).digest()
     return int.from_bytes(digest[:8], "big") < retry_prob * 2**64
+
+
+def clamp_kv_send_end(
+    req: Req,
+    cache: BasePrefixCache,
+    *,
+    last_chunk: bool = False,
+    end_idx: Optional[int] = None,
+) -> Optional[int]:
+    """Keep non-final transfers within the prefix protected from deduplication."""
+    if last_chunk or not cache.supports_prefix_sharing() or req.skip_radix_cache_insert:
+        return end_idx
+    # A checkpoint can stop short of the computed chunk (e.g. at an SWA
+    # branch). A later checkpoint may deduplicate and free the unprotected
+    # tail. Keep checkpointing for SWA reclamation and send that tail later.
+    if end_idx is None:
+        end_idx = min(req.extend_end, len(req.origin_input_ids))
+    return min(end_idx, req.kv.cache_protected_len)
 
 
 def _uses_write_through_cache(cache: object) -> bool:
@@ -1624,6 +1643,7 @@ class SchedulerDisaggregationPrefillMixin:
         )
 
         if not last_chunk:
+            end_idx = clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx)
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:
