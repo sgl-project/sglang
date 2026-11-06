@@ -183,6 +183,8 @@ def sdk_double(tmp_path, monkeypatch):
     package.__version__, package.__revision__ = "0.1.0", "a" * 40
     monkeypatch.setitem(sys.modules, "infercast", package)
     monkeypatch.setitem(sys.modules, "infercast.sdk", module)
+    monkeypatch.setitem(sys.modules, "simopus", package)
+    monkeypatch.setitem(sys.modules, "simopus.sdk", module)
     return module
 
 

@@ -282,7 +282,7 @@ class ConfigManager:
                 miss_strategy=predictor_config.get("miss_strategy", "zero"),
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
-        elif predictor_name == "infercast":
+        elif predictor_name in {"simopus", "infercast"}:
             from sglang_simulator.time_predictor.infercast import (
                 InferCastTimePredictor,
             )

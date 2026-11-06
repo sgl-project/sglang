@@ -16,6 +16,7 @@ from sglang_simulator.time_predictor.base import (
     PredictorError,
     ScheduleBatch,
 )
+from sglang_simulator.time_predictor.simopus_sdk import load_sdk
 
 PROVIDER_CONTRACT = "infercast-forward-latency"
 _CONTEXT_MODES = {"EXTEND", "MIXED"}
@@ -243,12 +244,11 @@ class InferCastTimePredictor(InferTimePredictor):
         }
 
         try:
-            from infercast.sdk import (
-                DecodeExecutionProfile,
-                ExtendExecutionProfile,
-                ExtendRequestShape,
-            )
-        except ImportError as error:
+            _, sdk = load_sdk()
+            DecodeExecutionProfile = sdk.DecodeExecutionProfile
+            ExtendExecutionProfile = sdk.ExtendExecutionProfile
+            ExtendRequestShape = sdk.ExtendRequestShape
+        except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
                 "InferCast is not installed or lacks the forward-latency contract",
@@ -360,10 +360,11 @@ class InferCastTimePredictor(InferTimePredictor):
 
     def _build_provider(self, systems_root: str) -> tuple[Any, str, str]:
         try:
-            import infercast
-            from infercast.sdk import PerfDatabase, build_umd_static_model
+            package, sdk = load_sdk()
+            PerfDatabase = sdk.PerfDatabase
+            build_umd_static_model = sdk.build_umd_static_model
 
-            actual_revision = getattr(infercast, "__revision__", None)
+            actual_revision = getattr(package, "__revision__", None)
             if not isinstance(actual_revision, str) or not _FULL_COMMIT.fullmatch(
                 actual_revision
             ):
@@ -394,10 +395,10 @@ class InferCastTimePredictor(InferTimePredictor):
             )
             return (
                 provider,
-                infercast.__version__,
+                package.__version__,
                 _sha256(database.slice_ref.stack_path),
             )
-        except ImportError as error:
+        except (ImportError, AttributeError) as error:
             raise _error(
                 "provider_initialization_failed",
                 "InferCast is not installed",

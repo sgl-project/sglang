@@ -72,7 +72,10 @@ def test_existing_predictor_paths_keep_cwd_and_ancestor_resolution(
     assert ConfigManager.resolve_config_relative_path("missing.json") == "missing.json"
 
 
-def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
+@pytest.mark.parametrize("provider_name", ["simopus", "infercast"])
+def test_config_manager_passes_infercast_configuration(
+    tmp_path, monkeypatch, provider_name
+):
     import sglang_simulator.time_predictor.infercast as infercast_module
 
     captured = {}
@@ -90,7 +93,7 @@ def test_config_manager_passes_infercast_configuration(tmp_path, monkeypatch):
         {
             "platform": {"accelerator": {"name": "mi350x"}},
             "predictor": {
-                "name": "infercast",
+                "name": provider_name,
                 "model_id": "model",
                 "systems_root": "systems",
                 "attn_kernel_impl": "eager",

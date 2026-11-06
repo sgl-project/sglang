@@ -133,8 +133,8 @@ def estimate_infercast_budget(
     unknown = set(budget_config) - _CONFIG_FIELDS
     if unknown:
         raise ValueError(f"unknown memory_budget fields: {sorted(unknown)}")
-    if budget_config.get("provider") != "infercast":
-        raise ValueError("memory_budget.provider must be 'infercast'")
+    if budget_config.get("provider") not in {"simopus", "infercast"}:
+        raise ValueError("memory_budget.provider must be 'simopus' or 'infercast'")
     model_id = budget_config.get("model_id")
     if not isinstance(model_id, str) or not model_id or model_id != model_id.strip():
         raise ValueError("memory_budget.model_id must be a nonempty trimmed string")
@@ -187,21 +187,20 @@ def estimate_infercast_budget(
         ) from None
 
     try:
-        import infercast
+        from sglang_simulator.time_predictor.simopus_sdk import load_sdk
 
-        actual_revision = getattr(infercast, "__revision__", None)
+        package, sdk = load_sdk()
+        actual_revision = getattr(package, "__revision__", None)
         if actual_revision != revision:
             raise ValueError(
                 "memory_budget.provider_revision does not match installed InferCast "
                 f"(configured={revision!r}, installed={actual_revision!r})"
             )
-        from infercast.sdk import (
-            MemoryBudgetPolicy,
-            ResourceTopology,
-            build_model_resources,
-            estimate_memory_budget,
-        )
-    except ImportError as error:
+        MemoryBudgetPolicy = sdk.MemoryBudgetPolicy
+        ResourceTopology = sdk.ResourceTopology
+        build_model_resources = sdk.build_model_resources
+        estimate_memory_budget = sdk.estimate_memory_budget
+    except (ImportError, AttributeError) as error:
         raise ValueError(
             "InferCast with the resource-budget SDK is required"
         ) from error
@@ -238,7 +237,7 @@ def estimate_infercast_budget(
             f"(status={budget.status!r}, max_cache_tokens={max_tokens!r})"
         )
     metrics = {
-        "provider": "infercast",
+        "provider": budget_config["provider"],
         "provider_revision": revision,
         "model_id": model_id,
         "resource_digest": resources.digest,

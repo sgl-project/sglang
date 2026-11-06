@@ -162,12 +162,18 @@ def sdk_double(monkeypatch):
     sdk.build_model_resources, sdk.estimate_memory_budget = build, estimate
     monkeypatch.setitem(sys.modules, "infercast", package)
     monkeypatch.setitem(sys.modules, "infercast.sdk", sdk)
+    monkeypatch.setitem(sys.modules, "simopus", package)
+    monkeypatch.setitem(sys.modules, "simopus.sdk", sdk)
     return sdk
 
 
-def test_target_topology_local_config_and_explicit_policy(sdk_double, tmp_path):
+@pytest.mark.parametrize("provider_name", ["simopus", "infercast"])
+def test_target_topology_local_config_and_explicit_policy(
+    sdk_double, tmp_path, provider_name
+):
     model = _model(tmp_path)
     config = _config(model_revision="d" * 40, shared_expert_tp_size=4)
+    config["provider"] = provider_name
     tokens, metrics = estimate_infercast_budget(model, _hw(), _target(), config)
 
     assert tokens == 1024
@@ -186,7 +192,7 @@ def test_target_topology_local_config_and_explicit_policy(sdk_double, tmp_path):
     assert arguments["shared_expert_tp_size"] == 4
     assert sdk_double.calls[1][2]["device_capacity_bytes"] == 288 * (1 << 30)
     assert sdk_double.calls[1][2]["policy"].to_dict() == config["policy"]
-    assert metrics["provider"] == "infercast"
+    assert metrics["provider"] == provider_name
     assert metrics["resource_digest"] == "b" * 64
     assert metrics["max_total_tokens"] == tokens
     assert "tensors" not in metrics["ranks"][0]
