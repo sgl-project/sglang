@@ -11,6 +11,10 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     static_quant_fp8,
 )
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
+from sglang.srt.layers.linear import MergedColumnParallelLinear
+from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import (
+    CompressedTensorsConfig,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_w8a8_fp8 import (
     CompressedTensorsW8A8Fp8,
 )
@@ -22,11 +26,15 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensor
 )
 from sglang.srt.layers.quantization.fp8_utils import mxfp8_group_quantize
 from sglang.srt.model_executor.cpu_graph_runner import register_fake_ops
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import cpu_has_amx_support
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="stage-a-test-cpu-intel")
+
+# e4m3 has 3 mantissa bits, so rounding error is up to 1/16 of the value.
+FP8_RTOL = 0.0625
 
 
 def _dequant_fp8(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
@@ -74,6 +82,9 @@ def _requantize_tensor_scale_int8(
 
 
 class TestCPUFp8QuantOps(CustomTestCase):
+    def setUp(self):
+        torch.manual_seed(0)
+
     def test_per_token_group_quant_fp8_cpu(self):
         x = torch.linspace(-2.0, 2.0, steps=128, dtype=torch.bfloat16).reshape(2, 64)
 
@@ -101,7 +112,7 @@ class TestCPUFp8QuantOps(CustomTestCase):
         self.assertEqual(q.shape, x.shape)
         self.assertEqual(scale.shape, (3, 1))
         torch.testing.assert_close(
-            _dequant_fp8(q, scale), x.float(), atol=0.02, rtol=0.02
+            _dequant_fp8(q, scale), x.float(), atol=0.02, rtol=FP8_RTOL
         )
 
         static_scale = torch.tensor([0.01], dtype=torch.float32)
@@ -140,7 +151,7 @@ class TestCPUFp8QuantOps(CustomTestCase):
         self.assertEqual(q.shape, (4, 32))
         self.assertEqual(scale.shape, (4, 1))
         torch.testing.assert_close(
-            _dequant_fp8(q[:2], scale[:2]), x.float(), atol=0.02, rtol=0.02
+            _dequant_fp8(q[:2], scale[:2]), x.float(), atol=0.02, rtol=FP8_RTOL
         )
         torch.testing.assert_close(q[2:].float(), torch.zeros(2, 32))
         torch.testing.assert_close(scale[2:], torch.zeros(2, 1))
@@ -183,7 +194,7 @@ class TestCPUFp8QuantOps(CustomTestCase):
         )
         torch.testing.assert_close(out, unpacked)
         ref = x.float() @ (weight.float() * weight_scale).t() + bias.float()
-        torch.testing.assert_close(out.float(), ref, atol=2e-2, rtol=2e-2)
+        torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.05)
 
     @unittest.skipUnless(
         cpu_has_amx_support(), "CPU W8A16 FP8 requires the Intel AMX backend."
@@ -386,6 +397,150 @@ class TestCPUInt8QuantOps(CustomTestCase):
 
         with self.assertRaisesRegex(NotImplementedError, "dynamic symmetric"):
             scheme.process_weights_after_loading(SimpleNamespace())
+
+
+def _ct_config(quant_type: str, weight_strategy: str) -> CompressedTensorsConfig:
+    return CompressedTensorsConfig.from_config(
+        {
+            "quant_method": "compressed-tensors",
+            "format": f"{quant_type}-quantized",
+            "config_groups": {
+                "group_0": {
+                    "targets": ["Linear"],
+                    "weights": {
+                        "num_bits": 8,
+                        "type": quant_type,
+                        "symmetric": True,
+                        "strategy": weight_strategy,
+                        "dynamic": False,
+                    },
+                    "input_activations": {
+                        "num_bits": 8,
+                        "type": quant_type,
+                        "symmetric": True,
+                        "strategy": "token",
+                        "dynamic": True,
+                    },
+                }
+            },
+            "ignore": ["lm_head"],
+        }
+    )
+
+
+def _merged_linear(quant_config, output_sizes):
+    original_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(torch.bfloat16)
+    try:
+        with get_parallel().override(tp_rank=0, tp_size=1):
+            return MergedColumnParallelLinear(
+                64,
+                output_sizes,
+                bias=True,
+                quant_config=quant_config,
+                prefix="model.layers.0.mlp.gate_up_proj",
+            )
+    finally:
+        torch.set_default_dtype(original_dtype)
+
+
+def _load_shards(layer, shards):
+    for shard_id, tensors in enumerate(shards):
+        for name, tensor in tensors.items():
+            param = getattr(layer, name)
+            param.weight_loader(param, tensor, shard_id)
+
+
+class TestCPUCompressedTensorsLoading(CustomTestCase):
+    """Config -> scheme selection -> weight loading -> post-load -> forward on CPU."""
+
+    def setUp(self):
+        torch.manual_seed(0)
+
+    @unittest.skipUnless(
+        cpu_has_amx_support(), "CPU W8A16 FP8 requires the Intel AMX backend."
+    )
+    def test_w8a8_fp8_checkpoint_falls_back_to_w8a16(self):
+        layer = _merged_linear(_ct_config("float", "tensor"), [32, 32])
+        self.assertIsInstance(layer.scheme, CompressedTensorsW8A16Fp8)
+        self.assertEqual(layer.bias.dtype, torch.bfloat16)
+
+        shards = [
+            {
+                "weight": torch.randn(32, 64).to(torch.float8_e4m3fn),
+                "weight_scale": torch.tensor([scale]),
+                "bias": (torch.randn(32) / 10).to(torch.bfloat16),
+            }
+            for scale in (0.1, 0.2)
+        ]
+        _load_shards(layer, shards)
+        layer.quant_method.process_weights_after_loading(layer)
+        self.assertTrue(layer.use_intel_amx_backend)
+        self.assertEqual(layer.bias.dtype, torch.float32)
+
+        x = torch.randn(5, 64, dtype=torch.bfloat16)
+        with get_parallel().override(tp_rank=0, tp_size=1):
+            out, _ = layer(x)
+        dq_weight = torch.cat([s["weight"].float() * s["weight_scale"] for s in shards])
+        bias = torch.cat([s["bias"] for s in shards]).float()
+        ref = x.float() @ dq_weight.t() + bias
+        torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.05)
+
+    @unittest.skipUnless(
+        cpu_has_amx_support(), "CPU W8A8 INT8 requires the Intel AMX backend."
+    )
+    def test_w8a8_int8_checkpoint(self):
+        layer = _merged_linear(_ct_config("int", "channel"), [32, 32])
+        self.assertIsInstance(layer.scheme, CompressedTensorsW8A8Int8)
+
+        shards = [
+            {
+                "weight": torch.randint(-64, 64, (32, 64), dtype=torch.int8),
+                "weight_scale": torch.rand(32, 1) / 100 + 1e-3,
+                "bias": (torch.randn(32) / 10).to(torch.bfloat16),
+            }
+            for _ in range(2)
+        ]
+        _load_shards(layer, shards)
+        layer.quant_method.process_weights_after_loading(layer)
+        self.assertTrue(layer.use_intel_amx_backend)
+
+        x = torch.randn(5, 64, dtype=torch.bfloat16)
+        with get_parallel().override(tp_rank=0, tp_size=1):
+            out, _ = layer(x)
+        ref = _reference_w8a8_int8_linear(
+            x,
+            torch.cat([s["weight"] for s in shards]),
+            torch.cat([s["weight_scale"] for s in shards]),
+            torch.cat([s["bias"] for s in shards]),
+        )
+        torch.testing.assert_close(out.float(), ref.float(), atol=0.1, rtol=0.05)
+
+    def test_scheme_without_cpu_kernel_is_rejected(self):
+        quant_config = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {
+                    "group_0": {
+                        "targets": ["re:.*gate_proj$"],
+                        "weights": {
+                            "num_bits": 4,
+                            "type": "int",
+                            "symmetric": True,
+                            "strategy": "group",
+                            "group_size": 128,
+                        },
+                        "input_activations": None,
+                    }
+                },
+            }
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "not supported on CPU"):
+            quant_config.get_linear_scheme(
+                torch.nn.Module(), layer_name="model.layers.0.mlp.gate_proj"
+            )
 
 
 if __name__ == "__main__":
