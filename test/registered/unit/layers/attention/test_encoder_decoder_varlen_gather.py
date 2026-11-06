@@ -35,8 +35,14 @@ class TestFrozenKVPoolBinding(CustomTestCase):
     def test_frozen_and_independent_draft_pool_ownership(self):
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-        dummy_pool = object()
-        target_pool = MagicMock(spec=xpu_backend.SWAKVPool, swa_layer_nums=1)
+        window_space = object()
+        dummy_pool = MagicMock()
+        dummy_pool.layer_router.routes_to.return_value = False
+        target_pool = MagicMock()
+        target_pool.layer_router.routes_to.return_value = True
+        target_pool.id_spaces.return_value = {
+            xpu_backend.IdSpaceKind.SLIDING_WINDOW: window_space
+        }
         runner = SimpleNamespace(
             model_config=SimpleNamespace(
                 context_len=128,
@@ -50,7 +56,10 @@ class TestFrozenKVPoolBinding(CustomTestCase):
                 req_to_token=torch.zeros((1, 128), dtype=torch.int32)
             ),
             token_to_kv_pool=dummy_pool,
-            token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: target_pool),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                get_kvcache=lambda: target_pool, hands_out_virtual_ids=False
+            ),
+            runner_ids=object(),
             kv_cache_dtype=torch.bfloat16,
             kv_cache_dtype_str="bfloat16",
             page_size=64,
@@ -80,15 +89,16 @@ class TestFrozenKVPoolBinding(CustomTestCase):
                 ),
             ),
         ):
-            for algorithm, expected_pool, translates_swa in (
-                (SpeculativeAlgorithm.FROZEN_KV_MTP, target_pool, True),
-                (SpeculativeAlgorithm.EAGLE, dummy_pool, False),
+            for algorithm, expected_pool, translates_swa, expected_space in (
+                (SpeculativeAlgorithm.FROZEN_KV_MTP, target_pool, True, window_space),
+                (SpeculativeAlgorithm.EAGLE, dummy_pool, False, None),
             ):
                 with self.subTest(algorithm=algorithm):
                     runner.spec_algorithm = algorithm
                     backend = XPUAttentionBackend(runner)
                     self.assertIs(backend.token_to_kv_pool, expected_pool)
                     self.assertEqual(backend.use_sliding_window_kv_pool, translates_swa)
+                    self.assertIs(backend._frozen_draft_window_space, expected_space)
 
 
 class TestEncoderDecoderForward(unittest.TestCase):
