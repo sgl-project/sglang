@@ -53,4 +53,5 @@ TOOL_CALL_PARSER_NAMES = [
     "inkling",
     "iquest_q1",
     "response_template",
+    "xing4_0",
 ]

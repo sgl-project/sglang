@@ -80,7 +80,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    batch_invariant_or_deterministic,
+)
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
@@ -336,6 +339,9 @@ class Fp8Config(QuantizationConfig):
             return 95
         if self.use_mxfp8 and _mxfp8_to_block_fp8_required:
             return 94
+        # TODO: torch.xpu.get_device_capability
+        if self.use_mxfp8 and is_xpu():
+            return 20
 
         return 100 if self.use_mxfp8 else 80
 
@@ -1118,6 +1124,10 @@ class Fp8LinearMethod(LinearMethodBase):
                 "weight_scale_inv_swizzled",
                 block_scale_interleave(scale_u8.contiguous()).contiguous(),
             )
+        elif backend.is_xpu_scaled_mm():
+            # torch scaled_mm reads the canonical [N, K // 32] ue8m0 bytes in
+            # weight_scale_inv directly; no backend-specific layout to prepare.
+            return
         elif backend.is_gfx95():
             fp8_hip.process_dense_weights(self, layer, scale_u8)
         elif backend.is_deep_gemm():
@@ -1434,15 +1444,7 @@ class Fp8LinearMethod(LinearMethodBase):
                 input_tensor = x[0] if isinstance(x, tuple) else x
                 num_tokens = input_tensor.numel() // input_tensor.shape[-1]
                 if num_tokens >= self.mxfp8_prefill_autotune_min_tokens:
-                    from sglang.srt.batch_invariant_ops import (
-                        is_batch_invariant_mode_enabled,
-                    )
-                    from sglang.srt.runtime_context import get_exec
-
-                    extra_kwargs["pin_tactic"] = (
-                        is_batch_invariant_mode_enabled()
-                        or get_exec().deterministic.enable_deterministic_inference
-                    )
+                    extra_kwargs["pin_tactic"] = batch_invariant_or_deterministic()
             if backend.is_flashinfer_cutlass() or backend.is_flashinfer_cutedsl():
                 weight_scale = layer.weight_scale_inv_swizzled
             elif backend.is_flashinfer_trtllm():
