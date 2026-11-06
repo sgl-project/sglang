@@ -21,6 +21,9 @@ from sglang.kernels.ops.diffusion import (
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    get_current_replay_token,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -61,6 +64,7 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -68,6 +72,9 @@ from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
+    eager_on_graph,
+)
 
 logger = init_logger(__name__)
 
@@ -765,6 +772,41 @@ class Cosmos3CausalAttention(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+class _Cosmos3PrefixPad:
+    """Read the live left-pad count once per graph replay, across GEN layers."""
+
+    def __init__(self, rows: torch.Tensor):
+        self.rows = rows
+        self._token = self._value = None
+
+    def get(self) -> int:
+        token = get_current_replay_token()
+        if self._value is None or token != self._token:
+            self._value, self._token = int(self.rows.item()), token
+        return self._value
+
+
+@eager_on_graph(
+    output_factory=lambda attn, q, k, v, prefix_pad: q.new_empty(
+        (*q.shape[:-1], v.shape[-1])
+    )
+)
+def _attend_past_bcg_prefix_pad(
+    attn: USPAttention,
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    prefix_pad: _Cosmos3PrefixPad,
+) -> torch.Tensor:
+    # Only the attention is eager. The graph keeps fixed-size left-padded UND
+    # K/V inputs, while this break sees exactly [real UND | GEN] in both the
+    # fused-pack and split QKNorm+RoPE paths.
+    rows = prefix_pad.get()
+    return attn.attn_impl.forward(
+        q, k[:, rows:], v[:, rows:], get_forward_context().attn_metadata
+    )
+
+
 class Cosmos3CrossAttention(nn.Module):
     """Generation pathway: cross-attention where visual Q attends to all K/V."""
 
@@ -825,6 +867,7 @@ class Cosmos3CrossAttention(nn.Module):
         use_fused_qk_norm_rope: bool,
         round_norm_before_rope: bool = False,
         multiview_layout: Any | None = None,
+        bcg_prefix_pad: _Cosmos3PrefixPad | None = None,
     ) -> torch.Tensor:
         """Cross-attention from GEN to cached UND K/V.
 
@@ -892,7 +935,13 @@ class Cosmos3CrossAttention(nn.Module):
                 rope_cache_positions,
                 round_norm_before_rope=round_norm_before_rope,
             )
-            out = self.attn.forward(q, packed_k, packed_v)
+            out = (
+                _attend_past_bcg_prefix_pad(
+                    self.attn, q, packed_k, packed_v, bcg_prefix_pad
+                )
+                if bcg_prefix_pad is not None
+                else self.attn.forward(q, packed_k, packed_v)
+            )
         elif use_fused_qk_norm_rope:
             q, k = _apply_qwen3_qk_norm_rope(
                 q,
@@ -916,7 +965,16 @@ class Cosmos3CrossAttention(nn.Module):
         elif not use_fused_kv_pack:
             # K/V = [UND prefix (replicated on SP ranks) | GEN suffix].
             # USPAttention applies the configured backend and SP collectives.
-            out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+            if bcg_prefix_pad is None:
+                out = self.attn.forward_with_replicated_kv_prefix(q, k_und, v_und, k, v)
+            else:
+                out = _attend_past_bcg_prefix_pad(
+                    self.attn,
+                    q,
+                    torch.cat([k_und, k], dim=1),
+                    torch.cat([v_und, v], dim=1),
+                    bcg_prefix_pad,
+                )
         out = out.reshape(batch_size, seq_len_gen, -1)
         out, _ = self.to_out(out)
         return out
@@ -1067,6 +1125,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
         round_norm_before_rope: bool = False,
         residual: torch.Tensor | None = None,
         multiview_layout: Any | None = None,
+        bcg_prefix_pad: _Cosmos3PrefixPad | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Fused add+rmsnorm: each `(hidden_states, residual) = norm(...)`
         # collapses the residual add and RMSNorm into one kernel. The
@@ -1087,6 +1146,7 @@ class Cosmos3GenDecoderLayer(nn.Module):
             use_fused_qk_norm_rope,
             round_norm_before_rope,
             multiview_layout=multiview_layout,
+            bcg_prefix_pad=bcg_prefix_pad,
         )
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
@@ -1662,6 +1722,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         multiview_layout: Any | None = None,
         precomputed_kv: list[tuple[torch.Tensor, torch.Tensor]] | None = None,
         precomputed_gen_rope_inputs: tuple[torch.Tensor, torch.Tensor] | None = None,
+        bcg_und_prefix_pad: torch.Tensor | None = None,
         **kwargs,
     ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Forward pass for denoising.
@@ -1712,6 +1773,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         """
         if (precomputed_kv is None) != (precomputed_gen_rope_inputs is None):
             raise ValueError("Both precomputed GEN condition inputs are required")
+        if bcg_und_prefix_pad is not None and precomputed_kv is None:
+            raise ValueError("BCG prefix padding requires precomputed UND K/V")
         if precomputed_kv is None and (text_ids is None or text_mask is None):
             raise ValueError("Cosmos3 requires text_ids and text_mask to be passed")
 
@@ -1916,6 +1979,11 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 pack_kv=True,
             )
         )
+        bcg_prefix_pad = (
+            _Cosmos3PrefixPad(bcg_und_prefix_pad)
+            if bcg_und_prefix_pad is not None
+            else None
+        )
         for i, layer in enumerate(self.gen_layers):
             k_und, v_und = cached_kv_for_key[i]
             hidden_gen, residual = layer(
@@ -1928,6 +1996,7 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 round_norm_before_rope,
                 residual=residual,
                 multiview_layout=multiview_layout,
+                bcg_prefix_pad=bcg_prefix_pad,
             )
 
         # Collapse the trailing residual carry. RMSNorm and the linear
