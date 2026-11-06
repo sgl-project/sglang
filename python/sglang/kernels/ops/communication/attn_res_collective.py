@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.ops.attention.attn_res import _jit_fused_tma_module, _tuning
+from sglang.kernels.ops.attention.attn_res import _tuned_fused_tma_module, _tuning
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -47,7 +47,7 @@ def _attn_res_fused_pull_rs_op(
     occupancy: int,
     consumer_regs: int,
 ) -> None:
-    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_pull_rs(
+    _tuned_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_pull_rs(
         _COMM_MAP[world_size],
         input,
         residual,
@@ -80,7 +80,7 @@ def _attn_res_fused_direct_ag_op(
     occupancy: int,
     consumer_regs: int,
 ) -> None:
-    _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
+    _tuned_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
         _COMM_MAP[world_size],
         prefix_sum,
         bank,
