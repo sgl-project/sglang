@@ -27,7 +27,7 @@ from .mamba_ssm import softplus
         triton.Config({"BLOCK_SIZE_H": 32}),
         triton.Config({"BLOCK_SIZE_H": 64}),
     ],
-    key=["chunk_size", "nheads"],
+    key=["chunk_size", "nheads", "PRESERVE_ZERO_DT"],
     prune_configs_by={
         "early_config_prune": prune_oversized_tiles({"BLOCK_SIZE_H": ("nheads",)})
     },
@@ -65,6 +65,7 @@ def _chunk_cumsum_fwd_kernel(
     # Meta-parameters
     DT_SOFTPLUS: tl.constexpr,
     HAS_DT_BIAS: tl.constexpr,
+    PRESERVE_ZERO_DT: tl.constexpr,
     BLOCK_SIZE_CHUNK: tl.constexpr,
     BLOCK_SIZE_H: tl.constexpr = 16,
 ):
@@ -118,6 +119,14 @@ def _chunk_cumsum_fwd_kernel(
     A = tl.load(A_ptrs, mask=offs_h < nheads, other=0.0).to(tl.float32)
     dA = dt * A[:, None]
     dA_cs = tl.cumsum(dA, axis=1)
+    if PRESERVE_ZERO_DT:
+        # A parallel prefix sum can round a zero tail differently from its
+        # last nonzero entry. Large decay magnifies that difference in exp.
+        last = tl.max(tl.where(dt != 0.0, offs_c[None, :], -1), axis=1)
+        last_sum = tl.sum(
+            tl.where(offs_c[None, :] == last[:, None], dA_cs, 0.0), axis=1
+        )
+        dA_cs = tl.where(offs_c[None, :] > last[:, None], last_sum[:, None], dA_cs)
     tl.store(
         dA_cs_ptrs,
         dA_cs,
@@ -635,7 +644,13 @@ def _chunk_state_varlen_kernel(
 
 
 def _chunk_cumsum_fwd(
-    dt, A, chunk_size, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
+    dt,
+    A,
+    chunk_size,
+    dt_bias=None,
+    dt_softplus=False,
+    dt_limit=(0.0, float("inf")),
+    preserve_zero_dt=False,
 ):
     batch, seqlen, nheads = dt.shape
     assert A.shape == (nheads,)
@@ -681,6 +696,7 @@ def _chunk_cumsum_fwd(
             dA_cumsum.stride(3),
             dt_softplus,
             HAS_DT_BIAS=dt_bias is not None,
+            PRESERVE_ZERO_DT=preserve_zero_dt,
             BLOCK_SIZE_CHUNK=triton.next_power_of_2(chunk_size),
         )
     return dA_cumsum, dt_out

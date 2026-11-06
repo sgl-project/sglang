@@ -2,8 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=34, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=480, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=480, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
 
@@ -17,7 +17,7 @@ from einops import rearrange, repeat
 from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.srt.utils import get_device
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.device import is_hip
 from sglang.utils import is_in_ci
 
 if is_hip():
@@ -917,7 +917,7 @@ def test_mamba_chunk_scan_split_boundary_state(
     with_initial_state,
     state_dtype,
 ):
-    """An aligned continuation must use the unsplit scan's exact FP32 state."""
+    """Aligned continuations preserve the unsplit scan's outputs and states."""
     device = get_device()
     if device not in ["cuda", "xpu"]:
         pytest.skip("Test only supports CUDA and XPU devices")

@@ -5,17 +5,21 @@ from itertools import accumulate
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.ops.mamba.triton_ops import mamba_chunk_scan_combined
-from sglang.kernels.ops.mamba.triton_ops.ssd_chunk_state import chunk_state_varlen
+from sglang.kernels.ops.mamba.triton_ops.ssd_chunk_state import (
+    _chunk_cumsum_fwd,
+    chunk_state_varlen,
+)
 from sglang.kernels.ops.mamba.triton_ops.ssd_combined import (
     _mamba_chunk_scan_combined_fwd,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import Mamba2Metadata
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-small")
+register_amd_ci(est_time=360, suite="stage-b-test-1-gpu-small-amd")
 
 
 def _sequence(length, *, heads, width, state_size, dtype):
@@ -225,6 +229,76 @@ def test_batch_invariant_boundary_state_copies(width, state_size, state_dtype, s
     torch.testing.assert_close(states[1], torch.zeros_like(states[1]), atol=0, rtol=0)
     torch.testing.assert_close(states[2], chunks[2], atol=0, rtol=0)
     torch.testing.assert_close(states[3], final[0].to(state_dtype), atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_batch_invariant_padding_with_fp32_bias(dtype):
+    """Low-precision dt padding must cancel a higher-precision bias exactly."""
+    torch.manual_seed(43413)
+    inputs = dict(heads=4, width=32, state_size=16, dtype=dtype)
+    target, neighbor = (_sequence(n, **inputs) for n in (129, 31))
+    target = (target[0], target[1].to(dtype), *target[2:])
+    neighbor = (neighbor[0], neighbor[1].to(dtype), *neighbor[2:])
+    options = dict(
+        A=-torch.exp(torch.rand(4, device="cuda")),
+        D=None,
+        bias=torch.tensor([0.07, 0.13, 0.31, 0.9], device="cuda"),
+        softplus=False,
+        initial=None,
+        state_dtype=torch.float32,
+        target=0,
+        with_z=False,
+    )
+    reference = _scan([target], **options)
+    actual = _scan([target, neighbor], **options)
+    torch.testing.assert_close(actual[0][:, :129], reference[0], atol=0, rtol=0)
+    torch.testing.assert_close(actual[1][0], reference[1][0], atol=0, rtol=0)
+    torch.testing.assert_close(actual[2], reference[2], atol=0, rtol=0)
+
+
+@pytest.mark.parametrize("length", [169, 425, 769])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16, torch.float32])
+@pytest.mark.parametrize("softplus", [False, True])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_batch_invariant_cumsum_zero_tail(length, dtype, softplus, with_bias):
+    """Zero-dt padding preserves the last active sum even for large decay."""
+    torch.manual_seed(43413)
+    chunk_size, heads = 256, 24
+    dt = torch.randn(1, length, heads, device="cuda", dtype=dtype)
+    # Falcon-H1 includes decay coefficients near -2.4e6.
+    A = torch.tensor(
+        [-2391664.0, -0.0008, 2391664.0], device="cuda", dtype=torch.float32
+    ).repeat(8)
+    bias = torch.randn(heads, device="cuda", dtype=dtype) if with_bias else None
+    options = dict(dt_bias=bias, dt_softplus=softplus, preserve_zero_dt=True)
+    cumsum, effective_dt = _chunk_cumsum_fwd(dt, A, chunk_size, **options)
+    sums_cpu, dt_cpu = cumsum.cpu(), effective_dt.cpu()
+    for head in range(heads):
+        for chunk in range(effective_dt.shape[2]):
+            active = dt_cpu[0, head, chunk].nonzero().flatten()
+            if active.numel():
+                last = active[-1].item()
+                expected = sums_cpu[0, head, chunk, last]
+                tail = sums_cpu[0, head, chunk, last + 1 :]
+            else:
+                expected = torch.tensor(0.0)
+                tail = sums_cpu[0, head, chunk]
+            torch.testing.assert_close(tail, expected.expand_as(tail), atol=0, rtol=0)
+
+    padded_length = triton.cdiv(length, chunk_size) * chunk_size
+    padded_dt = dt.new_empty(1, padded_length, heads)
+    if softplus:
+        padded_dt.fill_(-float("inf"))
+    elif bias is None:
+        padded_dt.zero_()
+    else:
+        padded_dt.copy_(-bias)
+    padded_dt[:, :length].copy_(dt)
+    padded_cumsum, padded_effective_dt = _chunk_cumsum_fwd(
+        padded_dt, A, chunk_size, **options
+    )
+    torch.testing.assert_close(effective_dt, padded_effective_dt, atol=0, rtol=0)
+    torch.testing.assert_close(cumsum, padded_cumsum, atol=0, rtol=0)
 
 
 if __name__ == "__main__":

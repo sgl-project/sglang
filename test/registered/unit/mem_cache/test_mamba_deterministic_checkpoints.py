@@ -6,16 +6,19 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.configs import Lfm2Config, Mamba2Config, MambaConfig
+from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.mamba import MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestDeterministicCheckpoints(unittest.TestCase):
+class TestDeterministicCheckpoints(CustomTestCase):
     def test_no_buffer_only_donates_aligned_prefill_states(self):
         for config, deterministic, finished, length, expected in (
             (Mamba2Config(), True, False, 255, 0),
@@ -33,16 +36,18 @@ class TestDeterministicCheckpoints(unittest.TestCase):
                 finished=finished,
                 length=length,
             ):
-                pool = SimpleNamespace(
-                    mamba_ckpt_pool=None,
-                    mamba_pool=Mock(replayssm_write_pos=None),
-                    translate_mamba_indices=lambda indices: indices,
+                storage = SimpleNamespace(
+                    tree_sub_pool=lambda name: "mamba",
+                    quantizes_checkpoints=lambda sub_pool: False,
+                    settle_replay=Mock(return_value=0),
+                    copy_state=Mock(),
                 )
                 component = MambaComponent.__new__(MambaComponent)
+                component.host_only_checkpoint = False
                 component.cache = SimpleNamespace(
-                    enable_mamba_extra_buffer=False, req_to_token_pool=pool
+                    enable_mamba_extra_buffer=False, kv_storage=lambda: storage
                 )
-                component._alloc_mamba_slot = Mock(return_value=torch.tensor([7]))
+                component._try_alloc_mamba_slot = Mock(return_value=torch.tensor([7]))
                 req = SimpleNamespace(kv=ReqKvInfo(mamba_pool_idx=torch.tensor(3)))
                 params = InsertParams()
                 execution = SimpleNamespace(
@@ -66,13 +71,15 @@ class TestDeterministicCheckpoints(unittest.TestCase):
                 self.assertEqual(actual, expected)
                 if expected == 0:
                     self.assertIsNone(params.mamba_value)
-                    component._alloc_mamba_slot.assert_not_called()
-                    pool.mamba_pool.copy_from.assert_not_called()
+                    component._try_alloc_mamba_slot.assert_not_called()
+                    storage.copy_state.assert_not_called()
                 elif finished:
                     torch.testing.assert_close(params.mamba_value, torch.tensor([3]))
                 else:
                     torch.testing.assert_close(params.mamba_value, torch.tensor([7]))
-                    pool.mamba_pool.copy_from.assert_called_once()
+                    storage.copy_state.assert_called_once_with(
+                        "mamba", torch.tensor([3]), torch.tensor([7])
+                    )
 
 
 if __name__ == "__main__":

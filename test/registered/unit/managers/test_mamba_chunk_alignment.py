@@ -4,18 +4,15 @@ from unittest.mock import patch
 
 from transformers import LlamaConfig
 
-from sglang.srt.configs import (
-    FalconH1Config,
-    FalconMambaConfig,
-    InklingModelConfig,
-    Lfm2Config,
-    Mamba2Config,
-    MambaConfig,
-    NemotronHConfig,
-    ZayaConfig,
-)
+from sglang.srt.configs.falcon_h1 import FalconH1Config
 from sglang.srt.configs.granitemoehybrid import GraniteMoeHybridConfig
 from sglang.srt.configs.hybrid_arch import mamba2_scan_config
+from sglang.srt.configs.inkling import InklingModelConfig
+from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.mamba import FalconMambaConfig, MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
+from sglang.srt.configs.nemotron_h import NemotronHConfig
+from sglang.srt.configs.zaya import ZayaConfig
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

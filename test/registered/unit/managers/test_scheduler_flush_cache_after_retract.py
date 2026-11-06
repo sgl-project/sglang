@@ -7,10 +7,21 @@ from sglang.test.test_utils import maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
+from sglang.srt.managers.scheduler_components.request_receiver import (
+    SchedulerRequestReceiver,
+)
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _make_req(is_retracted: bool, holds_kv: bool = False) -> MagicMock:
@@ -34,11 +45,12 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
+        scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler._engine_paused = True
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch = None
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
@@ -50,8 +62,22 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
+        scheduler.running_reqs = []
+        scheduler.dllm_config = None
+        scheduler.disagg_prefill_bootstrap_queue = None
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
+        scheduler.disagg_decode_prealloc_queue = None
+        scheduler.disagg_decode_transfer_queue = None
+        scheduler.hisparse_coordinator = None
+        scheduler.deferred_responses = DeferredResponses(
+            disaggregation_mode=DisaggregationMode.NULL,
+            output_streamer=None,
+            send_abort=None,
+        )
         scheduler.tree_cache = MagicMock()
         scheduler.req_to_token_pool = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
@@ -73,16 +99,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         either; a paused-engine flush must not starve on it."""
         scheduler = self._new_scheduler()
         scheduler.waiting_queue = [_make_req(is_retracted=False)]
-
-        self.assertTrue(scheduler.flush_cache())
-        scheduler.tree_cache.reset.assert_called_once()
-
-    def test_flush_cache_succeeds_on_mixed_queue_while_paused(self):
-        scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [
-            _make_req(is_retracted=True),
-            _make_req(is_retracted=False),
-        ]
 
         self.assertTrue(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_called_once()

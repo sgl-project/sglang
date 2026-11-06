@@ -128,7 +128,13 @@ def _mamba_chunk_scan_combined_fwd(
     # 1. Compute chunked cumsum of A * dt
     # - here dt may go through a softplus activation
     dA_cumsum, dt = _chunk_cumsum_fwd(
-        dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
+        dt,
+        A,
+        chunk_size,
+        dt_bias=dt_bias,
+        dt_softplus=dt_softplus,
+        dt_limit=dt_limit,
+        preserve_zero_dt=use_scan_boundary_states,
     )
 
     # 2. Compute the state for each intra-chunk
@@ -289,6 +295,9 @@ def mamba_chunk_scan_combined(
         assert return_varlen_states and not return_final_states
         assert not return_intermediate_states
         assert cu_seqlens is not None and out is not None
+        if not dt_softplus and dt_bias is not None:
+            # Padding must cancel dt_bias in its precision.
+            dt = dt.to(torch.promote_types(dt.dtype, dt_bias.dtype))
     if batch_invariant and cu_seqlens.numel() > 2:
         return _mamba_chunk_scan_combined_batch_invariant(
             x,

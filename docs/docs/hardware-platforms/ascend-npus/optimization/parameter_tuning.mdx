@@ -68,6 +68,11 @@ The following system-level tuning steps reduce OS interference and improve CPU s
       <td>`expandable_segments:True`</td>
     </tr>
     <tr>
+      <td>`PYTORCH_NPU_ALLOC_CONF=expandable_segments:True,pin_memory_expandable_segments:True`</td>
+      <td>Additionally extends the expandable allocator to pinned (page-locked) host memory, reducing fragmentation and mitigating intermittent pinned host memory allocation failures. Consider appending `pin_memory_expandable_segments:True` when the workload allocates large pinned host buffers — e.g., large hierarchical cache (HiCache) host pools or KV cache offload — and host memory allocation failures are observed. This option changes memory usage and may introduce performance fluctuations; validate on your own workload before adopting.</td>
+      <td>`expandable_segments:True,pin_memory_expandable_segments:True`</td>
+    </tr>
+    <tr>
       <td>`STREAMS_PER_DEVICE=32`</td>
       <td>Sets the maximum number of parallel streams per NPU device. More streams allow better overlap between compute and communication operations. The default of `32` is sufficient for most deployments; increase only if profiling reveals stream contention in complex pipeline parallelism setups.</td>
       <td>`32`</td>

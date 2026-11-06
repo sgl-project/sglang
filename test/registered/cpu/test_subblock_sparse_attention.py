@@ -55,7 +55,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(
     est_time=9,
     suite="stage-a-test-cpu-intel",
-    disabled="Xeon import initializes CUDA-only vsa (sgl-project/sglang#43334); until 2026-10-24",
 )
 
 
@@ -296,6 +295,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         return SimpleNamespace(
             attention_backend="subblock_sparse_attn",
             attention_backend_config={"compute_mode": compute_mode},
+            performance_mode="speed",
             ring_degree=1,
             resolve_component_attention_backend=lambda *_names: (
                 AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -479,6 +479,7 @@ class TestSubBlockSparseAttentionModalities(CustomTestCase):
         config = MiniMaxH3PipelineConfig()
         server_args = SimpleNamespace(
             attention_backend="fa",
+            performance_mode="speed",
             ring_degree=2,
             resolve_component_attention_backend=lambda *_names: (
                 AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,

@@ -21,7 +21,7 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(
@@ -60,6 +60,17 @@ def _token_indices_for_pages(
 
 
 def _pinned_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     from sglang.srt.mem_cache.pool_host.common import (
         ALLOC_MEMORY_FUNCS,
         alloc_with_pin_memory,
@@ -81,6 +92,17 @@ def _pinned_host_pool(host_pool_cls, **kwargs):
 
 
 def _registered_host_pool(host_pool_cls, **kwargs):
+    if "device_pool" in kwargs:
+        pool = kwargs.pop("device_pool")
+        kwargs.update(
+            buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=pool.size
+            if pool.host_capacity_tokens is None
+            else pool.host_capacity_tokens,
+            start_layer=pool.start_layer,
+            end_layer=pool.end_layer,
+            target_layer_num=pool.layer_num,
+        )
     return host_pool_cls(
         host_to_device_ratio=2.0,
         host_size=0,
@@ -125,7 +147,15 @@ def _run_mha(element_dim: int, page_count: int) -> None:
         enable_memory_saver=False,
     )
     host_pool = _pinned_host_pool(
-        MHATokenToKVPoolHost, device_pool=device_pool, layout="page_first"
+        MHATokenToKVPoolHost,
+        buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+        device_capacity_tokens=device_pool.size
+        if device_pool.host_capacity_tokens is None
+        else device_pool.host_capacity_tokens,
+        start_layer=device_pool.start_layer,
+        end_layer=device_pool.end_layer,
+        write_back_staging=device_pool.hicache_write_back_staging,
+        layout="page_first",
     )
     assert can_use_write_back_jit_kernel(
         element_size=element_dim * host_pool.dtype.itemsize,
@@ -279,7 +309,8 @@ def test_page_first_staged_write_back_mla(element_dim: int, page_count: int) -> 
     "groups,layers,page_size,heads_per_group,dim",
     [(1, 1, 1, 1, 16), (3, 5, 3, 2, 24), (8, 3, 64, 1, 128)],
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_staged_write_back(
@@ -387,7 +418,8 @@ def test_page_unified_write_back_invalid_input(invalid, match):
 @pytest.mark.parametrize(
     "layers,page_size,dim", [(1, 1, 16), (5, 3, 512), (3, 64, 576)]
 )
-@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16, torch.bfloat16])
+# A byte copy: only the element size reaches the kernel, so bf16 repeats fp16.
+@pytest.mark.parametrize("dtype", [torch.uint8, torch.float16])
 @pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
 @pytest.mark.parametrize("page_count", [0, 1, 2, 5])
 def test_page_unified_mla_staged_write_back(
@@ -589,7 +621,13 @@ def test_registered_mmap_page_first_kernel_operands_and_graph(
         )
         host_pool = _registered_host_pool(
             MHATokenToKVPoolHost,
-            device_pool=device_pool,
+            buffer_info=device_pool.get_device_pool_infos()[0].buffer_info,
+            device_capacity_tokens=device_pool.size
+            if device_pool.host_capacity_tokens is None
+            else device_pool.host_capacity_tokens,
+            start_layer=device_pool.start_layer,
+            end_layer=device_pool.end_layer,
+            write_back_staging=device_pool.hicache_write_back_staging,
             layout="page_first",
         )
         host_refs = [host_pool.k_data_refs[0], host_pool.v_data_refs[0]]

@@ -1,15 +1,18 @@
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 import sglang.srt
-from sglang.srt.configs import Lfm2Config, Mamba2Config, MambaConfig
+from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.mamba import MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=23, suite="base-a-test-cpu")
+register_cpu_ci(est_time=34, suite="base-a-test-cpu")
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
@@ -22,9 +25,12 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
             (MambaConfig(), True, True),
             (Lfm2Config(), True, True),
         ):
-            for lazy in (False, True):
+            for lazy, reuse in product((False, True), repeat=2):
                 with self.subTest(
-                    model=type(config).__name__, deterministic=deterministic, lazy=lazy
+                    model=type(config).__name__,
+                    deterministic=deterministic,
+                    lazy=lazy,
+                    reuse=reuse,
                 ):
                     batch = SimpleNamespace(
                         model_config=SimpleNamespace(hf_config=config),
@@ -42,6 +48,7 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                             enable_mamba_extra_buffer_lazy=lazy,
                         ),
                     )
+                    cached_indices = MagicMock()
                     with (
                         patch(
                             "sglang.srt.speculative.spec_utils.get_exec",
@@ -50,9 +57,17 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
                         patch(
                             "sglang.srt.speculative.spec_utils.set_mamba_track_indices_from_reqs"
                         ) as gather,
+                        patch(
+                            "sglang.srt.speculative.spec_utils._VERIFY_TRACK_INDICES",
+                            cached_indices if reuse else None,
+                        ),
                     ):
                         prepare_mamba_track_for_verify(batch)
-                    self.assertEqual(gather.called, expected)
+                    self.assertEqual(gather.called, expected and (lazy or not reuse))
+                    self.assertEqual(
+                        cached_indices.set_from_reqs.called,
+                        expected and reuse and not lazy,
+                    )
                     if not expected:
                         self.assertIsNone(batch.mamba_track_indices)
                         self.assertEqual(batch.mamba_track_buffer_indices, [])
@@ -107,7 +122,10 @@ class TestNgramMambaVerifyUpdate(CustomTestCase):
         target_worker.model_runner.attn_backend.update_mamba_state_after_mtp_verify = (
             MagicMock()
         )
-        mamba_pool = target_worker.model_runner.req_to_token_pool.mamba_pool
+        mamba_pool = MagicMock()
+        # The runner's KV pool router binds the state pool.
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
         mamba_pool.replayssm_spec_fold = False
         mamba_pool.replayssm_cache_base = None
         return target_worker
@@ -250,22 +268,22 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
         return spec_state
 
     def test_fold_helpers_read_pp_request_rows(self):
-        from sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold import (
+        from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold import (
             commit_gdn_replayssm_fold_after_verify,
         )
-        from sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode import (
+        from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
         )
 
         cases = (
             (
                 commit_gdn_replayssm_fold_after_verify,
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_fold",
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_fold",
                 "commit_gdn_replayssm_fold_all_layers",
             ),
             (
                 commit_kda_replayssm_after_verify,
-                "sglang.kernels.ops.attention.fla.kda_replayssm_spec_decode",
+                "sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode",
                 "commit_kda_replayssm_spec_all_layers",
             ),
         )
@@ -295,13 +313,16 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
 
         target_worker = MagicMock()
         req_pool = target_worker.model_runner.req_to_token_pool
-        req_pool.mamba_pool.replayssm_spec_fold = False
-        req_pool.mamba_pool.replayssm_is_kda = False
-        req_pool.mamba_pool.replayssm_cache_base = torch.empty(1)
+        mamba_pool = MagicMock()
+        router = target_worker.model_runner.token_to_kv_pool.layer_router
+        router.part_view.return_value = mamba_pool
+        mamba_pool.replayssm_spec_fold = False
+        mamba_pool.replayssm_is_kda = False
+        mamba_pool.replayssm_cache_base = torch.empty(1)
         req_pool.get_mamba_indices.return_value = torch.tensor(
             [5, 7], dtype=torch.int32
         )
-        req_pool.get_speculative_mamba2_params_all_layers.return_value = (
+        mamba_pool.get_speculative_mamba2_params_all_layers.return_value = (
             self._spec_state()
         )
         batch = MagicMock()
@@ -322,11 +343,11 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 return_value=True,
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_spec"
             ),
             patch(
-                "sglang.kernels.ops.attention.fla.gdn_replayssm_spec_decode."
+                "sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode."
                 "commit_gdn_replayssm_circular"
             ),
             patch(
