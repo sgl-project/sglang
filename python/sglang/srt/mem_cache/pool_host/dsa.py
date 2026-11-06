@@ -2,10 +2,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
 import torch
 
@@ -15,7 +11,11 @@ from sglang.kernels.ops.kvcache.hicache import (
 from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_all_layer_mla_staged_lf_pf as jit_transfer_hicache_all_layer_mla_staged_lf_pf,
 )
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import IndexKeyBufferInfo
+from sglang.srt.mem_cache.pool_host._kvcacheio import (
+    MLA_KVCACHEIO_OPS,
+    require_kvcacheio_ops,
+)
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
     HostKVCache,
@@ -23,9 +23,11 @@ from sglang.srt.mem_cache.pool_host.base import (
 )
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
+    _cuda_host_unregister,
     get_allocator_from_storage,
     make_kernel_ptr_table,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -43,61 +45,103 @@ if _is_cuda or _is_hip:
         transfer_kv_per_layer_mla,
         transfer_kv_per_layer_mla_pf_lf,
     )
+elif _is_xpu:
+    from sglang.srt.mem_cache.pool_host._kvcacheio import (
+        transfer_kv_all_layer_direct_lf_pf,
+        transfer_kv_all_layer_mla,
+        transfer_kv_all_layer_mla_lf_pf,
+        transfer_kv_direct,
+        transfer_kv_per_layer_direct_pf_lf,
+        transfer_kv_per_layer_mla,
+        transfer_kv_per_layer_mla_pf_lf,
+    )
 
 logger = logging.getLogger(__name__)
 
 
 class DSAIndexerPoolHost(HostKVCache):
-    """Host-side DSA index buffers only. Slot layout matches the anchor MLA host pool."""
-
-    device_pool: DSATokenToKVPool
+    """Host index pages with precomputed device-layer to compact-host-layer binding."""
 
     def __init__(
         self,
-        device_pool: DSATokenToKVPool,
-        anchor_host: MLATokenToKVPoolHost,
+        buffer_info: IndexKeyBufferInfo,
+        *,
+        layer_mapping: dict[int, int],
+        target_device_layer_num: int,
+        num_host_pages: int,
+        transfer_page_size: int,
         layout: str,
+        buffer_device: str,
+        dtype: torch.dtype,
+        layer_sharded: bool = False,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
         is_dummy: bool = False,
     ):
+        buffers = buffer_info.buffers
+        if buffers:
+            buffer_info.validate()
+        if len(layer_mapping) != len(buffers) or set(layer_mapping.values()) != set(
+            range(len(buffers))
+        ):
+            raise ValueError(
+                f"index layer_mapping={layer_mapping} must cover {len(buffers)} buffers"
+            )
+        if (
+            target_device_layer_num < 1
+            or num_host_pages < 1
+            or any(layer < 0 for layer in layer_mapping)
+        ):
+            raise ValueError(
+                f"invalid index host geometry: target_device_layer_num={target_device_layer_num}, num_host_pages={num_host_pages}, layer_mapping={layer_mapping}"
+            )
+        if _is_xpu and not is_dummy:
+            require_kvcacheio_ops(
+                pool=type(self).__name__,
+                layout=layout,
+                ops=self._kvcacheio_ops,
+            )
         self._is_dummy = is_dummy
-        self.device_pool = device_pool
-        self.page_size = anchor_host.page_size
-        self.layout = layout
+        self._destroyed = False
+        self.device_pool = None
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
-        self.dtype = device_pool.store_dtype
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-        self.target_layer_num = self._effective_host_layer_num()
-        self.mtp_draft_device_pools = anchor_host.mtp_draft_device_pools
-        self.layer_num = self.target_layer_num + len(self.mtp_draft_device_pools)
-
-        self.index_head_dim = device_pool.index_head_dim
-        self.indexer_quant_block_size = device_pool.quant_block_size
-        self.indexer_dtype = DSATokenToKVPool.index_k_with_scale_buffer_dtype
-        self.indexer_size_per_token = (
-            self.index_head_dim
-            + self.index_head_dim // self.indexer_quant_block_size * 4
-        )
-        self.size = anchor_host.size
-        self.page_num = anchor_host.page_num
-
+        self._layer_sharded = layer_sharded
+        self._buffer_device = torch.device(buffer_device)
+        self.page_size = transfer_page_size
+        self.layout = layout
+        self.dtype = dtype
+        self.indexer_dtype = torch.uint8
+        self.layer_num = len(buffers)
+        self.start_layer = 0
+        self.end_layer = target_device_layer_num
+        self._device_to_host_layer = dict(layer_mapping)
+        self._live_target_layers = [
+            layer for layer in layer_mapping if layer < target_device_layer_num
+        ]
+        self._draft_device_layer_ids = [
+            layer for layer in layer_mapping if layer >= target_device_layer_num
+        ]
+        self.target_layer_num = len(self._live_target_layers)
+        self.packed_device_index_buffers = list(buffers)
+        self.page_num = num_host_pages
+        self.size = num_host_pages * self.page_size
         self.indexer_page_stride_size = (
-            self.indexer_size_per_token * self.page_size * self.indexer_dtype.itemsize
-        )
+            buffer_info.kernel_page_bytes // buffer_info.page_size
+        ) * transfer_page_size
+        self._initialize_host_buffers()
+
+    def _initialize_host_buffers(self):
+        if self.indexer_page_stride_size % self.page_size:
+            raise ValueError("DSA index page bytes must split into whole token bytes")
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
-        self.size_per_token = (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
-        )
-
+        self.size_per_token = self.indexer_layout_dim // self.page_size
         self.can_use_jit = False
         self.can_use_write_back_jit = False
-        if is_dummy:
+        if self._is_dummy:
             self.index_k_with_scale_buffer = None
             self.index_k_device_ptrs = None
             logger.info(
@@ -109,8 +153,7 @@ class DSAIndexerPoolHost(HostKVCache):
             self.clear()
             return
 
-        buf_elem_size = self.page_num * self.layer_num * self.indexer_page_stride_size
-        requested_bytes = buf_elem_size * self.indexer_dtype.itemsize
+        requested_bytes = self.size * self.size_per_token
         available_bytes = host_memory_budget_bytes(requested_bytes)
         if requested_bytes > available_bytes:
             raise ValueError(
@@ -125,7 +168,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 "packed MTP layers: "
                 "target_layers=%d, draft_layers=%d, total_layers=%d.",
                 requested_bytes / 1e9,
-                layout,
+                self.layout,
                 self.target_layer_num,
                 draft_layer_num,
                 self.layer_num,
@@ -134,31 +177,49 @@ class DSAIndexerPoolHost(HostKVCache):
             logger.info(
                 "Allocating %.2f GB host memory for DSA indexer (layout=%s).",
                 requested_bytes / 1e9,
-                layout,
+                self.layout,
             )
         self.init_kv_buffer()
         self._init_write_back_staging_buffers()
         self.lock = threading.RLock()
         self.clear()
 
+    def destroy(self):
+        if self._destroyed:
+            return
+        if not self._is_dummy and self.pin_memory and (_is_cuda or _is_hip):
+            _cuda_host_unregister(self.index_k_with_scale_buffer)
+        self.index_k_with_scale_buffer = None
+        self.index_k_data_refs = []
+        super().destroy()
+
+    def _is_device_layer_sharded(self, device_pool=None) -> bool:
+        return self._layer_sharded
+
     def get_size_per_token(self):
-        return (
-            self.indexer_size_per_token * self.layer_num * self.indexer_dtype.itemsize
-        )
+        return self.size_per_token
 
     def get_ksize_per_token(self):
         return self.get_size_per_token()
 
+    def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
+        return layer_id in self._device_to_host_layer
+
+    def _host_layer_index(self, layer_id: int, device_pool=None) -> int:
+        return self._device_to_host_layer[layer_id]
+
+    def _owned_device_layer_ids(self, device_pool) -> list[int]:
+        return list(self._live_target_layers)
+
+    def _draft_host_layer(self, layer_id: int) -> int:
+        return self._device_to_host_layer[layer_id]
+
     def init_kv_buffer(self):
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
-        device_pools = (self.device_pool, *self.mtp_draft_device_pools)
-        self.packed_device_index_buffers = [
-            buffer for pool in device_pools for buffer in pool.index_k_with_scale_buffer
-        ]
+        alloc_func = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
         self.index_k_device_ptrs = torch.tensor(
             [x.data_ptr() for x in self.packed_device_index_buffers],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._buffer_device,
         )
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer = alloc_func(
@@ -173,7 +234,7 @@ class DSAIndexerPoolHost(HostKVCache):
             ]
             self.index_k_data_ptrs = make_kernel_ptr_table(
                 self.index_k_data_refs,
-                self.device_pool.device,
+                self._buffer_device,
                 host_memory_registered=self.pin_memory,
             )
         elif self.layout in ["page_first", "page_first_direct"]:
@@ -195,7 +256,10 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def _init_write_back_staging_buffers(self):
         self.staging_buffer = None
-        if self.layout != "page_first" or (_is_npu or _is_xpu or _is_mps):
+        if (
+            self.layout != "page_first"
+            or not current_platform.capabilities.hicache_device_kernels
+        ):
             return
 
         self.can_use_write_back_jit = _is_cuda and can_use_write_back_jit_kernel(
@@ -212,7 +276,7 @@ class DSAIndexerPoolHost(HostKVCache):
                 self.indexer_page_stride_size,
             ),
             dtype=self.indexer_dtype,
-            device=self.device_pool.device,
+            device=self._buffer_device,
         )
 
     def get_hybrid_pool_buffer(self):
@@ -233,6 +297,11 @@ class DSAIndexerPoolHost(HostKVCache):
         )
         return host_page_indices, device_page_indices
 
+    if _is_xpu:
+        # {io_backend: {layout: kvcacheio ops}} the transfer methods below call,
+        # checked at construction; keep in step with their branches.
+        _kvcacheio_ops = MLA_KVCACHEIO_OPS
+
     def load_to_device_per_layer(
         self,
         device_pool,
@@ -249,8 +318,11 @@ class DSAIndexerPoolHost(HostKVCache):
             "load on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        host_layer_id = (
+            self._draft_host_layer(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -260,7 +332,7 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
                     src=self.index_k_with_scale_buffer[host_layer_id],
-                    dst=device_pool.index_k_with_scale_buffer[device_layer_id],
+                    dst=self.packed_device_index_buffers[host_layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     item_size=self.indexer_page_stride_size,
@@ -268,7 +340,7 @@ class DSAIndexerPoolHost(HostKVCache):
             elif self.layout == "page_first":
                 transfer_kv_per_layer_mla_pf_lf(
                     src=self.index_k_with_scale_buffer,
-                    dst=device_pool.index_k_with_scale_buffer[device_layer_id],
+                    dst=self.packed_device_index_buffers[host_layer_id],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
@@ -281,7 +353,7 @@ class DSAIndexerPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.index_k_with_scale_buffer[host_layer_id]],
-                    dst_layers=[device_pool.index_k_with_scale_buffer[device_layer_id]],
+                    dst_layers=[self.packed_device_index_buffers[host_layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     page_size=1,
@@ -289,7 +361,7 @@ class DSAIndexerPoolHost(HostKVCache):
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.index_k_with_scale_buffer],
-                    dst_ptrs=[device_pool.index_k_with_scale_buffer[device_layer_id]],
+                    dst_ptrs=[self.packed_device_index_buffers[host_layer_id]],
                     src_indices=host_page_indices,
                     dst_indices=device_page_indices,
                     layer_id=host_layer_id,
@@ -314,8 +386,11 @@ class DSAIndexerPoolHost(HostKVCache):
             "backup on a dummy (non-src DSA) host pool"
         )
         # MTP draft layers do not participate in CP layer sharding.
-        host_layer_id = layer_id if is_draft else self._host_layer_index(layer_id)
-        device_layer_id = 0 if is_draft else layer_id
+        host_layer_id = (
+            self._draft_host_layer(layer_id)
+            if is_draft
+            else self._host_layer_index(layer_id)
+        )
 
         host_page_indices, device_page_indices = self._get_indexer_page_indices(
             host_indices, device_indices
@@ -324,7 +399,7 @@ class DSAIndexerPoolHost(HostKVCache):
         if use_kernel:
             if self.layout == "layer_first":
                 transfer_kv_per_layer_mla(
-                    src=device_pool.index_k_with_scale_buffer[device_layer_id],
+                    src=self.packed_device_index_buffers[host_layer_id],
                     dst=self.index_k_with_scale_buffer[host_layer_id],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
@@ -340,7 +415,7 @@ class DSAIndexerPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=[device_pool.index_k_with_scale_buffer[device_layer_id]],
+                    src_layers=[self.packed_device_index_buffers[host_layer_id]],
                     dst_layers=[self.index_k_with_scale_buffer[host_layer_id]],
                     src_indices=device_page_indices,
                     dst_indices=host_page_indices,
@@ -365,14 +440,12 @@ class DSAIndexerPoolHost(HostKVCache):
                 self._backup_from_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
                 )
-            for draft_layer_id, draft_device_pool in enumerate(
-                self.mtp_draft_device_pools
-            ):
+            for draft_layer_id in self._draft_device_layer_ids:
                 self._backup_from_device_per_layer(
-                    draft_device_pool,
+                    None,
                     host_indices,
                     device_indices,
-                    self.device_pool.layer_num + draft_layer_id,
+                    draft_layer_id,
                     io_backend,
                     is_draft=True,
                 )

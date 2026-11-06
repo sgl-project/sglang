@@ -15,7 +15,7 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.device import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
@@ -37,10 +37,7 @@ def _mock_global_server_args(backend="pytorch"):
     class _DummyTPGroup:
         device_group = None
 
-    # `Sampler.__init__` asks the context for the group; state one for the rest
-    # of the process, since this process has no distributed init. Not the scoped
-    # `override()`: its context manager would be collected here and take the
-    # value back down with it.
+    # Provide a TP group for sampler initialization without distributed setup.
     get_parallel().override_permanently(tp_group=_DummyTPGroup())
     from sglang.srt.runtime_context import get_flags
 

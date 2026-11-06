@@ -467,7 +467,3 @@ class MMMUMultiModelTestBase(CustomTestCase):
                 print(f"Error reading {tag.lower()} file: {e}")
 
         return "\n".join(output_lines)
-
-
-# Backward compatibility alias
-MMMUVLMTestBase = MMMUMultiModelTestBase

@@ -1,7 +1,4 @@
-"""Config-time override declarations for gpt_oss.
-
-Architectures: GptOssForCausalLM.
-"""
+"""Config-time override declarations for gpt_oss."""
 
 import logging
 from typing import Any, Dict
@@ -14,12 +11,8 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    get_nvidia_driver_version,
-    is_cpu,
-    is_mps,
-    is_triton_kernels_available,
-)
+from sglang.srt.utils.device import get_nvidia_driver_version, is_cpu, is_mps
+from sglang.srt.utils.triton_utils import is_triton_kernels_available
 
 logger = logging.getLogger(__name__)
 
@@ -46,9 +39,7 @@ def _gpt_oss_overrides(server_args: Any, hf_config: Any) -> dict:
             # rather than landing on torch_native (no sliding window, no sinks).
             overrides["attention_backend"] = "triton"
     if get_platform().is_xpu:
-        # Check for bf16 dtype on Intel XPU. Reads the pristine dtype request,
-        # which equals the legacy mid-branch read: dtype had no earlier writer
-        # for this arch.
+        # Intel XPU requires bfloat16.
         if cfg.dtype == "auto":
             logger.warning(
                 "GptOssForCausalLM on Intel XPU currently supports bfloat16 dtype only"

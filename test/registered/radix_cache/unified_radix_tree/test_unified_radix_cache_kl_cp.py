@@ -11,7 +11,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=346, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=224, stage="extra-b", runner_config="4-gpu-h100")
 
 QWEN3_32B_MODEL = "Qwen/Qwen3-32B"
 
@@ -65,7 +65,6 @@ class TestUnifiedQwen3HiCacheCP(UnifiedRadixTreeTestMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)

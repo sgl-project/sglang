@@ -10,12 +10,14 @@
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import unittest
 from array import array
 from types import SimpleNamespace
 
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 from sglang.test.test_utils import CustomTestCase
@@ -39,6 +41,7 @@ def _recv(rid, input_ids, max_new_tokens=8):
         top_logprobs_num=0,
         token_ids_logprob=None,
         return_sampling_mask=False,
+        sampling_logprobs_mode="selected",
         require_reasoning=False,
         return_hidden_states=False,
         return_routed_experts=False,
@@ -78,9 +81,35 @@ class TestSessionTokenShare(CustomTestCase):
         if baked is None:
             baked = len(output)
         req.output_ids.extend(output[:baked])
-        req._refresh_fill_ids()
+        req.refresh_fill_ids()
         req.output_ids.extend(output[baked:])
         self.session.finish_req(req)
+
+    def test_full_media_namespace_survives_text_only_turns(self):
+        first = self._create("first", [1, 2, 3])
+        first.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, identity=b"A" * 32)
+                ]
+            )
+        )
+        first_salt = first.cache_salt
+        self._decode_and_finish(first, [4])
+        second = self._create("second", [5])
+        self.assertEqual(second.cache_salt, first_salt)
+        second.extend_image_inputs(
+            MultimodalInputs(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, identity=b"B" * 32)
+                ]
+            )
+        )
+        self.assertNotEqual(second.cache_salt, first_salt)
+        self.assertEqual(first.cache_salt, first_salt)
+        self._decode_and_finish(second, [6])
+        third = self._create("third", [7])
+        self.assertEqual(third.cache_salt, second.cache_salt)
 
     def test_normal_multi_turn_share_and_carry(self):
         in1, out1 = list(range(100, 110)), [1, 2, 3]
@@ -104,6 +133,21 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(list(r3.origin_input_ids), in1 + out1 + in2 + out2 + [9])
         self.assertEqual(list(r3.full_untruncated_fill_ids), list(r3.origin_input_ids))
 
+    def test_multimodal_counts_follow_committed_history(self):
+        """An aborted turn's count edits must not leak into the next turn."""
+        r1 = self._create("r1", [1])
+        r1.mm_image_tokens, r1.mm_audio_tokens, r1.mm_video_tokens = (2, 3, 4)
+        r1.mm_token_counts_ready = True
+        self._decode_and_finish(r1, [])
+
+        r2 = self._create("r2", [2])
+        self.assertEqual(r2.get_mm_token_counts(), (2, 3, 4))
+        r2.mm_image_tokens = 5
+        self.session.abort_req()
+
+        r3 = self._create("r3", [3])
+        self.assertEqual(r3.get_mm_token_counts(), (2, 3, 4))
+
     def test_mid_turn_abort_then_continue(self):
         in1, out1 = list(range(200, 210)), [1, 2, 3]
         r1 = self._create("r1", in1)
@@ -114,7 +158,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50, 51])
         self.assertEqual(list(r2.origin_input_ids), in1 + out1 + [50, 51])
         r2.output_ids.extend([6, 7])
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.session.abort_req()
         self.assertEqual(self.session.committed_origin_len, len(in1))
 
@@ -149,7 +193,7 @@ class TestSessionTokenShare(CustomTestCase):
         # array, then output trimmed to finished_len (like _trim_overshoot)
         # before finish.
         r1.output_ids.extend([1, 2, 3, 4, 5, 6])
-        r1._refresh_fill_ids()
+        r1.refresh_fill_ids()
         del r1.output_ids[4:]
         self.session.finish_req(r1)
         self.assertEqual(
@@ -161,7 +205,7 @@ class TestSessionTokenShare(CustomTestCase):
         r2 = self._create("r2", [50])
         self.assertEqual(list(r2.origin_input_ids), in1 + [1, 2, 3, 4] + [50])
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
-        r2._refresh_fill_ids()
+        r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
 
 

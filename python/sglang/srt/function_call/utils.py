@@ -3,7 +3,7 @@ import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
 from json.decoder import WHITESPACE
-from typing import Any, Dict, List, Literal, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
@@ -108,6 +108,27 @@ def _normalize_type_list(raw_items: List[Any]) -> List[Any]:
         if normalized_item not in normalized_items:
             normalized_items.append(normalized_item)
     return normalized_items
+
+
+# Identifier keywords name a schema and never constrain an instance. The draft
+# 2020-12 metaschema does constrain their form: ``$id`` may not carry a
+# non-empty fragment, which the draft-07 plain-name style (``"$id": "#foo"``)
+# does. Dropping them before ``check_schema`` accepts such schemas without
+# changing which instances validate.
+_SCHEMA_IDENTIFIER_KEYWORDS = ("$id", "$anchor", "$dynamicAnchor")
+
+
+def without_schema_identifiers(schema: Any) -> Any:
+    """Return a copy of a JSON Schema without identifier keywords, for metaschema checks."""
+    if isinstance(schema, dict):
+        return {
+            key: without_schema_identifiers(value)
+            for key, value in schema.items()
+            if key not in _SCHEMA_IDENTIFIER_KEYWORDS
+        }
+    if isinstance(schema, list):
+        return [without_schema_identifiers(item) for item in schema]
+    return schema
 
 
 def normalize_json_schema_types(schema: Any) -> None:
@@ -476,3 +497,40 @@ def get_json_schema_constraint(
         return json_schema
 
     return None
+
+
+def strip_structural_tag_excludes(structural_tag: Any, tokens: Iterable[str]) -> None:
+    """Remove ``tokens`` from every free-text ``excludes`` list in a structural
+    tag, in place.
+
+    xgrammar's builtin tags forbid the model's think tokens in free text. When
+    SGLang's reasoning parser owns the reasoning section that exclusion only
+    fights the model (e.g. an empty ``</think>`` emitted before prose).
+    """
+    tokens = set(tokens)
+    if not tokens:
+        return
+
+    def visit(node: Any) -> None:
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+            return
+        if isinstance(node, dict):
+            excludes = node.get("excludes")
+            if isinstance(excludes, list):
+                node["excludes"] = [s for s in excludes if s not in tokens]
+            for key in ("format", "content", "tags", "elements"):
+                if key in node:
+                    visit(node[key])
+            return
+        if not hasattr(node, "__dict__"):
+            return
+        excludes = getattr(node, "excludes", None)
+        if isinstance(excludes, list):
+            node.excludes = [s for s in excludes if s not in tokens]
+        for key in ("format", "content", "tags", "elements"):
+            if hasattr(node, key):
+                visit(getattr(node, key))
+
+    visit(structural_tag)

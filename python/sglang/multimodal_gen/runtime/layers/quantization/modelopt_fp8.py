@@ -120,9 +120,6 @@ class ModelOptFp8Config(QuantizationConfig):
             return ModelOptFp8LinearMethod(self)
         return None
 
-    def get_scaled_act_names(self) -> list[str]:
-        return []
-
 
 class ModelOptFp8LinearMethod(LinearMethodBase):
     """Linear method for ModelOpt static per-tensor FP8 quantization.

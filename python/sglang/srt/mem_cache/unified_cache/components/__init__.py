@@ -1,11 +1,14 @@
+from sglang.srt.mem_cache.unified_cache.component_type import (
+    BASE_COMPONENT_TYPE,
+    ComponentType,
+)
 from sglang.srt.mem_cache.unified_cache.components.base import (
     _NUM_COMPONENT_TYPES,
-    BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentData,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
+    InternalStateBackup,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -23,6 +26,7 @@ __all__ = [
     "ComponentData",
     "ComponentType",
     "ExternalLinkerLoadPhase",
+    "InternalStateBackup",
     "LinkerTransferPhase",
     "EvictLayer",
     "FullComponent",

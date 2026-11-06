@@ -54,7 +54,7 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             num_questions=self.num_gsm8k_questions,
             max_new_tokens=2048,
             parallel=self.max_running_requests,
-            host=f"http://{url.hostname}",
+            host=url.hostname,
             port=int(url.port),
         )
         metrics = run_few_shot_gsm8k(args)
@@ -101,7 +101,6 @@ class TestUnifiedQwen3HiCachePP(UnifiedRadixTreeTestMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
             },
         )
         cls.input_ids = get_input_ids(cls.model, num_samples=18)
@@ -154,7 +153,6 @@ class TestUnifiedQwen3HiCachePPL3(AccuracyTwoPassMixin, CustomTestCase):
             ],
             env={
                 "SGLANG_ENABLE_RANK_CONSENSUS_CHECKER": "1",
-                "SGLANG_ENABLE_UNIFIED_RADIX_TREE": "1",
                 "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.hicache_dir,
             },
         )

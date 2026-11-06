@@ -40,6 +40,23 @@ class LongCatImageEditSamplingParams(SamplingParams):
     enable_cfg_renorm: bool = False
     enable_prompt_rewrite: bool = False
 
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        if server_args.warmup_resolutions is None:
+            return
+        # Editing derives both the output grid and VL prefix from the input
+        # image. A square placeholder discards an explicit non-square warmup
+        # resolution and captures a graph that the real request cannot replay.
+        import base64
+        import io
+
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (req.width, req.height)).save(buffer, format="PNG")
+        req.image_path = [
+            "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode()
+        ]
+
 
 @dataclass
 class LongCatImageEditTurboSamplingParams(LongCatImageEditSamplingParams):

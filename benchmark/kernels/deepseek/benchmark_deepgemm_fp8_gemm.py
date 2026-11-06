@@ -11,7 +11,7 @@ from sglang.benchmark.deepseek_utils import (
     per_block_cast_to_fp8,
     per_token_cast_to_fp8,
 )
-from sglang.kernels.ops.quantization.fp8_kernel import (
+from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm as w8a8_block_fp8_matmul,
 )
 

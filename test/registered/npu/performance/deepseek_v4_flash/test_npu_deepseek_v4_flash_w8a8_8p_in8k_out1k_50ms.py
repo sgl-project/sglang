@@ -31,7 +31,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
@@ -47,7 +46,6 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     # mtp
-    "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
 }
 
@@ -74,9 +72,8 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     131072,
     "--max-running-requests",
     192,
-    "--dp-size",
+    "--attn-dp-size",
     16,
-    "--enable-dp-attention",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
