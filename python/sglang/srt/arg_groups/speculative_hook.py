@@ -291,11 +291,10 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             algo.handle_server_args(server_args)
 
 
-def _customized_draft_moe_spec(server_args: ServerArgs):
-    """The MoE spec of a customized draft, or None for native drafts and dense ones."""
+def _draft_moe_spec(server_args: ServerArgs):
+    """The MoE spec of the draft, or None when no layer of it is MoE."""
     from sglang.srt.hf_transformers import get_config
     from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
-    from sglang.srt.speculative.dflash_utils import is_customized_draft_config
 
     cfg = resolving_view(server_args)
     if cfg.speculative_draft_model_path is None:
@@ -308,23 +307,19 @@ def _customized_draft_moe_spec(server_args: ServerArgs):
             model_override_args=json.loads(cfg.json_model_override_args),
         )
     except Exception as e:  # unreadable here; the model loader reports it itself
-        logger.debug("Customized-draft check skipped, draft config unreadable: %s", e)
-        return None
-    if not is_customized_draft_config(draft_hf_config):
+        logger.debug("MoE draft check skipped, draft config unreadable: %s", e)
         return None
     return DraftMixFFNSpec.from_config(draft_hf_config).moe
 
 
-def _refuse_customized_moe_draft_parallelism(
-    server_args: ServerArgs, algorithm: str
-) -> None:
+def _refuse_moe_draft_parallelism(server_args: ServerArgs, algorithm: str) -> None:
     """DraftMoE runs FusedMoE on the dense draft path: no DP attention, no a2a dispatch."""
-    if _customized_draft_moe_spec(server_args) is None:
+    if _draft_moe_spec(server_args) is None:
         return
     cfg = resolving_view(server_args)
     if attn_dp_enabled_of(cfg):
         raise ValueError(
-            f"{algorithm} customized drafts with MoE layers do not support "
+            f"{algorithm} drafts with MoE layers do not support "
             "--enable-dp-attention yet: the draft's MoE all-reduce is not "
             "synchronized across DP ranks."
         )
@@ -337,9 +332,9 @@ def _refuse_customized_moe_draft_parallelism(
         )
     if draft_a2a != "none":
         raise ValueError(
-            f"{algorithm} customized drafts with MoE layers run their experts "
-            "without an all-to-all dispatcher; set --speculative-moe-a2a-backend "
-            f"none (got {draft_a2a!r})."
+            f"{algorithm} drafts with MoE layers run their experts without an "
+            "all-to-all dispatcher; set --speculative-moe-a2a-backend none "
+            f"(got {draft_a2a!r})."
         )
 
 
@@ -384,7 +379,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         raise ValueError(
             "DFLASH speculative decoding requires setting --speculative-draft-model-path."
         )
-    _refuse_customized_moe_draft_parallelism(server_args, "DFLASH")
+    _refuse_moe_draft_parallelism(server_args, "DFLASH")
 
     # DFLASH does not use EAGLE-style `num_steps`/`topk`, but those fields still
     # affect generic scheduler/KV-cache accounting (buffer sizing, KV freeing,
@@ -814,7 +809,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark dense speculative decoding requires setting "
                 "--speculative-draft-model-path."
             )
-    _refuse_customized_moe_draft_parallelism(server_args, "DSPARK")
+    _refuse_moe_draft_parallelism(server_args, "DSPARK")
 
     if cfg.speculative_num_steps is None:
         declare_resolution(

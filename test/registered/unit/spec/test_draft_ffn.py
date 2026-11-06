@@ -1,4 +1,4 @@
-"""The draft FFN: its spec from the config, and the MoE layers a customized draft builds and loads."""
+"""The draft FFN: its spec from the config, and the MoE layers a draft builds and loads from it."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,18 +16,11 @@ from sglang.srt.layers.draft.ffn_spec import (
     DraftMoeFFNSpec,
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.models.dflash import (
-    CustomizedDFlashDraftModel,
-    DFlashDraftModel,
-    DFlashMLP,
-)
-from sglang.srt.models.dspark import CustomizedDSparkDraftModel, DSparkDraftModel
+from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLP
+from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.speculative.dflash_utils import (
-    is_customized_draft_config,
-    parse_dflash_draft_config,
-)
+from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
@@ -275,7 +268,6 @@ class TestFFNSpec(CustomTestCase):
             (_qwen_moe(scoring_func="relu"), "scoring_func='relu' is not implemented"),
             (_qwen_moe(hidden_act="gelu"), "hidden_act='gelu' is not implemented"),
             (_qwen_moe(topk_method="foo"), "topk_method='foo' is not implemented"),
-            (_without(_dense(), "intermediate_size"), "intermediate_size is required"),
             (
                 _without(_qwen_moe(), "num_experts_per_tok"),
                 "num_experts_per_tok is required",
@@ -297,14 +289,16 @@ class TestFFNSpec(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, message):
                     DraftMixFFNSpec.from_config(cfg)
 
-    def test_native_drafts_never_parse_the_ffn_spec(self):
-        # A native draft keeps its minimal config; only Customized* names read the FFN.
+    def test_minimal_dense_config_parses_as_dense(self):
+        # A dense draft keeps its minimal config: nothing to size, nothing to refuse.
         minimal = SimpleNamespace(**_without(_dense(), "intermediate_size"))
+        spec = DraftMixFFNSpec.from_config(minimal)
+        self.assertEqual(
+            (spec.has_moe, spec.dense, spec.kind(2)), (False, None, "dense")
+        )
         parse_dflash_draft_config(draft_hf_config=minimal)
-        self.assertFalse(is_customized_draft_config(minimal))
-        minimal.architectures = ["CustomizedDSparkDraftModel"]
-        self.assertTrue(is_customized_draft_config(minimal))
-        with self.assertRaisesRegex(ValueError, "intermediate_size is required"):
+        minimal.num_experts = 8  # now an MoE draft, and its fields are checked
+        with self.assertRaisesRegex(ValueError, "num_experts_per_tok is required"):
             DraftMixFFNSpec.from_config(minimal)
 
 
@@ -394,7 +388,7 @@ def _reference_experts(gate_up, down):
     return experts
 
 
-class TestCustomizedDraftLoading(CustomTestCase):
+class TestDraftMoeLoading(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
@@ -403,34 +397,27 @@ class TestCustomizedDraftLoading(CustomTestCase):
         self.addCleanup(cpu_rope.stop)
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
-    def test_only_customized_drafts_build_moe_layers(self):
-        config = Qwen3Config(**_moe_fields())
-        for layer in CustomizedDFlashDraftModel(config).layers:
+    def test_expert_fields_build_moe_layers(self):
+        for layer in DFlashDraftModel(Qwen3Config(**_moe_fields())).layers:
             self.assertIsInstance(layer.mlp, DraftMoE)
             self.assertIsNotNone(layer.mlp.shared_expert)
             self.assertIsNotNone(layer.mlp.shared_expert_gate)
             self.assertIsNotNone(layer.mlp.gate.expert_bias)
-        for layer in DFlashDraftModel(config).layers:  # native: dense as before
+        for layer in DFlashDraftModel(Qwen3Config(**BASE)).layers:  # no experts
             self.assertIsInstance(layer.mlp, DFlashMLP)
-        for layer in CustomizedDFlashDraftModel(Qwen3Config(**BASE)).layers:
-            self.assertIsInstance(layer.mlp, DFlashMLP)  # customized, dense config
 
-    def test_customized_dspark_builds_moe_layers(self):
-        dflash = dict(_moe_fields()["dflash_config"], mask_token_id=3)
-        config = Qwen3Config(
-            **_moe_fields(
-                dflash_config=dflash, markov_rank=4, markov_head_type="vanilla"
-            )
-        )
-        self.assertIsInstance(
-            CustomizedDSparkDraftModel(config).layers[0].mlp, DraftMoE
-        )
-        self.assertIsInstance(DSparkDraftModel(config).layers[0].mlp, DFlashMLP)
+    def test_dspark_builds_moe_layers(self):
+        dspark = dict(markov_rank=4, markov_head_type="vanilla")
+        dflash = dict(BASE["dflash_config"], mask_token_id=3)
+        moe = Qwen3Config(**_moe_fields(dflash_config=dflash, **dspark))
+        self.assertIsInstance(DSparkDraftModel(moe).layers[0].mlp, DraftMoE)
+        dense = Qwen3Config(**dict(BASE, dflash_config=dflash, **dspark))
+        self.assertIsInstance(DSparkDraftModel(dense).layers[0].mlp, DFlashMLP)
 
     def test_stacked_per_expert_and_prefixed_exports_load_the_same(self):
         for per_expert, prefix in ((False, ""), (True, ""), (False, "model.")):
             with self.subTest(per_expert=per_expert, prefix=prefix):
-                model = CustomizedDFlashDraftModel(Qwen3Config(**_moe_fields()))
+                model = DFlashDraftModel(Qwen3Config(**_moe_fields()))
                 weights, experts = _checkpoint(per_expert=per_expert, prefix=prefix)
                 model.load_weights(list(weights.items()))
                 for layer_id, layer in enumerate(model.layers):
@@ -478,23 +465,23 @@ class TestCustomizedDraftLoading(CustomTestCase):
         }
         for name, partial in cases.items():
             with self.subTest(name=name):
-                model = CustomizedDFlashDraftModel(Qwen3Config(**_moe_fields()))
+                model = DFlashDraftModel(Qwen3Config(**_moe_fields()))
                 with self.assertRaisesRegex(ValueError, "missing"):
                     model.load_weights(list(partial.items()))
         with self.subTest(name="bias without the flag"):
             config = Qwen3Config(**_moe_fields(dflash_config=BASE["dflash_config"]))
             with self.assertRaisesRegex(ValueError, "does not enable"):
-                CustomizedDFlashDraftModel(config).load_weights(list(weights.items()))
+                DFlashDraftModel(config).load_weights(list(weights.items()))
         with self.subTest(name="wrong shape"):
             bad = dict(weights)
             bad["layers.0.mlp.gate.weight"] = torch.zeros(E, H + 1)
             with self.assertRaisesRegex(ValueError, "expected"):
-                CustomizedDFlashDraftModel(Qwen3Config(**_moe_fields())).load_weights(
+                DFlashDraftModel(Qwen3Config(**_moe_fields())).load_weights(
                     list(bad.items())
                 )
-        with self.subTest(name="MoE tensor on a native dense draft"):
+        with self.subTest(name="MoE tensor on a dense draft"):
             with self.assertRaisesRegex(ValueError, "layer is dense"):
-                DFlashDraftModel(Qwen3Config(**_moe_fields())).load_weights(
+                DFlashDraftModel(Qwen3Config(**BASE)).load_weights(
                     list(weights.items())
                 )
 

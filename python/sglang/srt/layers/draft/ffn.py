@@ -419,8 +419,8 @@ def load_draft_ffn_weight(layers, name: str, tensor: torch.Tensor) -> bool:
         return True
     if DraftMoE.owns(rest):
         raise ValueError(
-            f"Draft FFN: {name} is an MoE tensor but the layer is dense; "
-            "use a Customized* architecture."
+            f"Draft FFN: {name} is an MoE tensor but the layer is dense: "
+            "the draft config names no experts."
         )
     return False
 

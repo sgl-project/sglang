@@ -226,7 +226,7 @@ class DraftMoeFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class DraftMixFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
-    """One FFN kind per layer; dense / moe exist only when some layer uses them."""
+    """One FFN kind per layer; dense / moe only when a layer uses them and the config sizes them."""
 
     layer_kinds: Optional[Tuple[str, ...]]  # None: every layer is the same kind
     dense: Optional[DraftDenseFFNSpec]
@@ -234,7 +234,10 @@ class DraftMixFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
 
     @classmethod
     def from_config(cls, draft_hf_config: Any) -> DraftMixFFNSpec:
-        """Dense unless an expert count is set; ffn_layer_types may mark layers either way."""
+        """Dense unless an expert count is set; ffn_layer_types may mark layers either way.
+
+        The dense sub-spec is optional: hosts such as DFlash build dense layers themselves.
+        """
         text = text_config(draft_hf_config)
         num_layers = optional_positive_int(
             cfg_get(text, "num_hidden_layers", None), "num_hidden_layers"
@@ -244,7 +247,7 @@ class DraftMixFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
         layer_kinds = cls._layer_kinds(text, num_layers, default_kind)
         kinds_in_use = set(layer_kinds) if layer_kinds is not None else {default_kind}
         dense = moe = None
-        if FFN_KIND_DENSE in kinds_in_use:
+        if FFN_KIND_DENSE in kinds_in_use and cfg_get(text, "intermediate_size", None):
             dense = DraftDenseFFNSpec.from_config(draft_hf_config)
         if FFN_KIND_MOE in kinds_in_use:
             moe = DraftMoeFFNSpec.from_config(draft_hf_config)
