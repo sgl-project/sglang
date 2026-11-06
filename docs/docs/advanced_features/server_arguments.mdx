@@ -2962,6 +2962,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--layernorm-sp-min-tokens`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--enable-layernorm-sp</code>, run a pass sequence-parallel only above this token count; smaller passes take the replicated path. 0 runs every extend sequence-parallel. Must be a captured prefill CUDA graph bucket, or at or above the largest one.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-megamoe-for-layernorm-sp`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use MegaMoE for Muse Spark LayerNorm SP prefill, including BF16 excluded layers. Requires <code>--enable-layernorm-sp</code> and DeepGEMM with post-expert normalization (release/v0.2.3). Prefill and decode share TRT-LLM expert weights; decode uses FlashInfer TRT-LLM and all-reduce. FlashInfer A2A is optional. Mixed chunking is unsupported.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>

@@ -25,6 +25,10 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--enable-megamoe-for-layernorm-sp requires --enable-layernorm-sp."
             )
+        if cfg.layernorm_sp_min_tokens:
+            raise ValueError(
+                "--layernorm-sp-min-tokens requires --enable-layernorm-sp."
+            )
         return
     architectures = model_config_of(server_args).hf_config.architectures
     validate_layernorm_sp(
@@ -84,6 +88,11 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
                         "a larger eager prefill could replace captured SP workspaces."
                     )
                 prefill_backend = Backend.BREAKABLE
+            validate_layernorm_sp_min_tokens(
+                min_tokens=cfg.layernorm_sp_min_tokens,
+                prefill_backend=prefill_backend,
+                prefill_bs=cfg.cuda_graph_config.prefill.bs,
+            )
             declare_resolution(
                 server_args,
                 "handle_layernorm_sp",
@@ -104,6 +113,37 @@ def handle_layernorm_sp(server_args: ServerArgs) -> None:
                 "SGLANG_MOE_NVFP4_DISPATCH=0 so FlashInfer A2A transports "
                 "BF16 activations and sizes its workspace for the BF16 payload."
             )
+    validate_layernorm_sp_min_tokens(
+        min_tokens=cfg.layernorm_sp_min_tokens,
+        prefill_backend=cfg.cuda_graph_config.prefill.backend,
+        prefill_bs=cfg.cuda_graph_config.prefill.bs,
+    )
+
+
+def validate_layernorm_sp_min_tokens(
+    *, min_tokens: int, prefill_backend, prefill_bs
+) -> None:
+    """--layernorm-sp-min-tokens against the prefill CUDA graphs it will run under.
+
+    A captured prefill graph took the SP or the replicated path for its bucket
+    size, and replays a pass of fewer tokens padded up to that bucket, while the
+    exit gather outside the graph decides on the real count. With the threshold
+    a captured bucket, or at or above the largest one, a pass and its bucket
+    fall on the same side of it.
+    """
+    from sglang.srt.model_executor.cuda_graph_config import Backend
+
+    if min_tokens < 0:
+        raise ValueError(f"--layernorm-sp-min-tokens must be >= 0; got {min_tokens}.")
+    if min_tokens == 0 or prefill_backend == Backend.DISABLED:
+        return
+    buckets = sorted(int(b) for b in prefill_bs or ())
+    if buckets and min_tokens < buckets[-1] and min_tokens not in buckets:
+        raise ValueError(
+            f"--layernorm-sp-min-tokens {min_tokens} must be one of the captured "
+            f"prefill CUDA graph buckets {buckets}, or at or above the largest: a "
+            "replayed graph would otherwise take a path its exit gather does not."
+        )
 
 
 def validate_layernorm_sp(

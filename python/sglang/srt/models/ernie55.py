@@ -151,7 +151,7 @@ def logits_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
         forward_batch.forward_mode != ForwardMode.EXTEND
         or forward_batch._original_forward_mode == ForwardMode.IDLE
         or forward_batch.is_prefill_only
-        or runs_sp(forward_batch.forward_mode)
+        or runs_sp(forward_batch.forward_mode, forward_batch.input_ids.shape[0])
         or _heads_are_split()
         or (forward_batch.attn_cp_metadata is not None and is_cp_active(forward_batch))
         or torch.cuda.is_current_stream_capturing()

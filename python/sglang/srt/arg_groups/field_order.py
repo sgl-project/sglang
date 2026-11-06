@@ -563,5 +563,6 @@ POSITIONAL_FIELD_ORDER = (
     "paged_experts_enable_disk",
     "disable_normalize_embedding",
     "log_schedule_decisions",
+    "layernorm_sp_min_tokens",
 )
 # fmt: on
