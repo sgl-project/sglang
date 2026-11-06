@@ -265,7 +265,7 @@ def test_streaming_multiple_complete_blocks_in_one_delta():
     assert json.loads(result.calls[1].parameters)["nums"] == [1, 2]
 
 
-def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
+def test_unescaped_ampersand_in_parameter_is_preserved():
     detector = MiniCPM5Detector()
     tools = make_tools_weather()
     text = '<function name="get_weather"><param name="city">A & B</param></function>'
@@ -273,6 +273,171 @@ def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     result = detector.detect_and_parse(text, tools)
     assert len(result.calls) == 1
     assert json.loads(result.calls[0].parameters)["city"] == "A & B"
+
+
+@pytest.mark.parametrize(
+    "body,expected",
+    [
+        pytest.param(
+            '<param name="city">Beijing<param name="date">2024-06-27</param>',
+            {"city": "Beijing", "date": "2024-06-27"},
+            id="missing-close-before-next-param",
+        ),
+        pytest.param(
+            '<param name="city">Shanghai',
+            {"city": "Shanghai"},
+            id="missing-close-before-function-end",
+        ),
+        pytest.param(
+            '<arguments><param name="city">Shanghai</arguments>',
+            {"city": "Shanghai"},
+            id="missing-close-in-arguments-wrapper",
+        ),
+        pytest.param(
+            '<param name="city"><![CDATA[A & B</param>'
+            '<param name="date">2024-06-27</param>',
+            {"city": "A & B", "date": "2024-06-27"},
+            id="unterminated-cdata",
+        ),
+    ],
+)
+def test_malformed_parameter_boundaries_recover_with_complete_function(body, expected):
+    """Recover both the current value and any following parameter."""
+    tools = make_tools_weather()
+    text = f'<function name="get_weather">{body}</function>'
+
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == expected
+
+    for split in range(1, len(text)):
+        detector = MiniCPM5Detector()
+        first = detector.parse_streaming_increment(text[:split], tools)
+        assert first.calls == [], split
+        second = detector.parse_streaming_increment(text[split:], tools)
+        assert len(second.calls) == 1, split
+        assert json.loads(second.calls[0].parameters) == expected, split
+
+
+def test_valid_xml_preserves_arguments_wrapper_and_value_conversion():
+    tools = make_tools_weather()
+    tools[0].function.parameters["properties"]["date"] = {}
+    text = (
+        '<function name="get_weather"><arguments>'
+        '<param name="city">A &amp; B</param><param name="date">12</param>'
+        "</arguments></function>"
+    )
+
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city": "A & B", "date": 12}
+
+
+@pytest.mark.parametrize(
+    "city_value, expected_city",
+    [
+        pytest.param(
+            "north <![CDATA[Bei]]><![CDATA[jing </param>]]> end",
+            "north Beijing </param> end",
+            id="cdata-with-embedded-close-and-adjacent-text",
+        ),
+        pytest.param(
+            "literal <param prefix", "literal <param prefix", id="literal-param-prefix"
+        ),
+        pytest.param(
+            "echo '</arguments>' '</param >' '<![CDATA[' && ls",
+            "echo '</arguments>' '</param >' '<![CDATA[' && ls",
+            id="literal-markup-in-command",
+        ),
+    ],
+)
+def test_malformed_xml_preserves_parameter_text(city_value, expected_city):
+    """Preserve literal markup and adjacent CDATA content in argument values."""
+    # The second parameter's bare ampersand makes the whole block use fallback.
+    text = (
+        '<function name="get_weather"><arguments>'
+        f'<param name="city">{city_value}</param>'
+        '<param name="date">A & B</param></arguments></function>'
+    )
+    expected = {"city": expected_city, "date": "A & B"}
+    tools = make_tools_weather()
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == expected
+    for split in range(1, len(text)):
+        detector = MiniCPM5Detector()
+        first = detector.parse_streaming_increment(text[:split], tools)
+        assert first.calls == [], split
+        second = detector.parse_streaming_increment(text[split:], tools)
+        assert len(second.calls) == 1, split
+        assert json.loads(second.calls[0].parameters) == expected, split
+
+
+def test_malformed_xml_preserves_quoted_parameter_name():
+    """A greater-than sign inside a quoted parameter name stays in the name."""
+    tools = make_tools_weather()
+    params = tools[0].function.parameters
+    params["properties"]["city>district"] = params["properties"].pop("city")
+    params["required"] = ["city>district"]
+    text = (
+        '<function name="get_weather">'
+        '<param name="city>district">A & B</param></function>'
+    )
+
+    result = MiniCPM5Detector().detect_and_parse(text, tools)
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city>district": "A & B"}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        pytest.param(
+            '<param/><param name="city">A & B</param>',
+            id="self-closing-without-name",
+        ),
+        pytest.param(
+            """<param note='name="city"'>A & B</param>""",
+            id="name-inside-another-attribute",
+        ),
+        pytest.param('<param name ="city">A & B</param>', id="space-before-equals"),
+        pytest.param(
+            '<param name="city" name="date">A & B</param>',
+            id="duplicate-name-attribute",
+        ),
+        pytest.param(
+            '<param name="city">A & B</param><param name="unknown">x</param>',
+            id="unknown-parameter",
+        ),
+        pytest.param(
+            '<param name="city">A & B</param><param name="city">C</param>',
+            id="duplicate-parameter",
+        ),
+    ],
+)
+def test_malformed_xml_preserves_parameter_name_validation(body):
+    """A bare ampersand triggers recovery without accepting invalid names."""
+    text = f'<function name="get_weather">{body}</function>'
+    result = MiniCPM5Detector().detect_and_parse(text, make_tools_weather())
+    assert result.calls == []
+    assert result.normal_text == text
+
+
+@pytest.mark.parametrize(
+    "ignored_tag",
+    [
+        '<param note="x" name="date">extra</param>',
+        '<param-like name="date">extra</param-like>',
+    ],
+)
+def test_malformed_xml_preserves_skipped_tag_behavior(ignored_tag):
+    text = (
+        f'<function name="get_weather">{ignored_tag}'
+        '<param name="city">A & B</param></function>'
+    )
+    result = MiniCPM5Detector().detect_and_parse(text, make_tools_weather())
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city": "A & B"}
 
 
 if __name__ == "__main__":

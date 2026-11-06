@@ -26,10 +26,55 @@ except Exception:  # pragma: no cover - environment may not have lxml
     _HAS_LXML = False
 
 _FUNC_NAME_V1_REGEX = re.compile(r"<function\s+name=[\'\"]([^\'\"]+)[\'\"][^>]*>")
-_PARAM_WITH_NAME_REGEX = re.compile(
-    r"<param\s+name=[\'\"]([^\'\"]+)[\'\"]>([\s\S]*?)</param>", re.DOTALL
+# A quoted name can contain >, while < starts another tag.
+_PARAM_OPEN_PATTERN = r"""<param(?=\s|/?>)((?:[^<>"']|"[^<"]*"|'[^<']*')*)>"""
+_PARAM_OPEN_REGEX = re.compile(_PARAM_OPEN_PATTERN)
+_PARAM_NAME_REGEX = re.compile(r"\s+name=(['\"])([^'\"]+)\1", re.DOTALL)
+_PARAM_NAME_ATTRIBUTE_REGEX = re.compile(r"\bname=")
+_PARAM_VALUE_MARKER_REGEX = re.compile(
+    rf"<!\[CDATA\[|</param>|{_PARAM_OPEN_PATTERN}|</function>"
 )
-_PARAM_MISSING_NAME_REGEX = re.compile(r"<param(?![^>]*\bname=)[^>]*>", re.DOTALL)
+_ARGUMENTS_OPEN_REGEX = re.compile(r"\s*<arguments\s*>")
+_ARGUMENTS_CLOSE_REGEX = re.compile(r"</arguments\s*>\s*$")
+
+
+def _iter_fallback_params(block: str, body_start: int):
+    """Recover malformed parameter markup while preserving literal CDATA content."""
+    pos = body_start
+    has_arguments_wrapper = _ARGUMENTS_OPEN_REGEX.match(block, body_start) is not None
+    last_cdata_end = block.rfind("]]>")
+    while match := _PARAM_OPEN_REGEX.search(block, pos):
+        # Fallback accepts name-only tags; the XML parser handles other attributes.
+        name = _PARAM_NAME_REGEX.fullmatch(match.group(1))
+        key = name.group(2).strip() if name else None
+        start = match.end()
+        parts = []
+        while marker := _PARAM_VALUE_MARKER_REGEX.search(block, start):
+            marker_text = marker.group()
+            parts.append(block[start : marker.start()])
+            if marker_text == "<![CDATA[":
+                start = marker.end()
+                # Avoid rescanning the suffix for each unclosed CDATA opener.
+                if start <= last_cdata_end:
+                    cdata_end = block.find("]]>", start)
+                    parts.append(block[start:cdata_end])
+                    start = cdata_end + len("]]>")
+                elif len(parts) > 1 or parts[0].strip():
+                    parts.append(marker_text)
+                continue
+            if marker_text == "</function>" and has_arguments_wrapper:
+                # A missing final parameter close may leave the wrapper close
+                # on its value. With an explicit </param>, keep the value intact.
+                parts[-1] = _ARGUMENTS_CLOSE_REGEX.sub("", parts[-1])
+            pos = marker.start() if marker_text.startswith("<param") else marker.end()
+            break
+        else:
+            parts.append(block[start:])
+            pos = len(block)
+
+        # Unsupported layouts with name= are skipped; missing names are invalid.
+        if name or not _PARAM_NAME_ATTRIBUTE_REGEX.search(match.group(1)):
+            yield key, "".join(parts)
 
 
 def get_argument_type(
@@ -177,15 +222,17 @@ class MiniCPM5Detector(BaseFormatDetector):
                         m_fn = _FUNC_NAME_V1_REGEX.search(block)
                         if m_fn:
                             func_name = (m_fn.group(1) or "").strip()
-                        has_invalid_param = (
-                            _PARAM_MISSING_NAME_REGEX.search(block) is not None
-                        )
+                        has_invalid_param = False
                         seen_keys = set()
                         allowed_props = set()
                         if func_name in tool_names:
                             allowed_props = name_to_allowed_props.get(func_name, set())
-                        for pm in _PARAM_WITH_NAME_REGEX.finditer(block):
-                            key = pm.group(1).strip()
+                        for key, val_text in _iter_fallback_params(
+                            block=block, body_start=m_fn.end() if m_fn else 0
+                        ):
+                            if not key:
+                                has_invalid_param = True
+                                break
                             if allowed_props and key not in allowed_props:
                                 has_invalid_param = True
                                 break
@@ -193,11 +240,6 @@ class MiniCPM5Detector(BaseFormatDetector):
                                 has_invalid_param = True
                                 break
                             seen_keys.add(key)
-                            val_text = pm.group(2) or ""
-                            if val_text.startswith("<![CDATA[") and val_text.endswith(
-                                "]]>"
-                            ):
-                                val_text = val_text[len("<![CDATA[") : -len("]]>")]
                             val_text = val_text.strip()
                             arg_type = get_argument_type(
                                 func_name or "", key, name_to_tool
