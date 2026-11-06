@@ -35,6 +35,9 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training import (
     rollout_api,
     weights_api,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
+    rollout_output_store,
+)
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     prepare_request,
     save_outputs,
@@ -140,6 +143,7 @@ async def lifespan(app: FastAPI):
     server_args = app.state.server_args
     build_route_request_models(app)
     async_scheduler_client.initialize(server_args)
+    rollout_output_store.initialize(server_args)
     warmup_done = asyncio.Event()
     app.state.server_warmup_done = warmup_done
 
@@ -194,6 +198,7 @@ async def lifespan(app: FastAPI):
             with suppress(asyncio.CancelledError):
                 await progress_task
         async_scheduler_client.close()
+        rollout_output_store.close()
 
 
 # Health router

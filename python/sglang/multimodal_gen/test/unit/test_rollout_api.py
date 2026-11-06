@@ -11,9 +11,16 @@ import json
 import time
 import types
 import unittest
+from unittest.mock import patch
 
+import msgspec
 import torch
 
+from radix_transfer_plugins import StorageBackend
+from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
+    RolloutOutputStore,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
     MARKS,
     RequestStamps,
@@ -489,6 +496,224 @@ class TestStagesHeader(unittest.TestCase):
     def test_no_metrics_or_no_stages_yields_no_header(self):
         self.assertEqual(stages_header(None), "")
         self.assertEqual(stages_header(types.SimpleNamespace(stages={})), "")
+
+
+class _MemoryBackend(StorageBackend):
+    name = "memory"
+    config_type = msgspec.Struct
+
+    def __init__(self):
+        self.objects = {}
+
+    def put_many(self, objects):
+        keys = []
+        for parts in objects:
+            key = f"mem/{len(self.objects)}"
+            self.objects[key] = {name: bytes(data) for name, data in parts.items()}
+            keys.append(key)
+        return keys
+
+    def get_many(self, keys, *, parts):
+        return [
+            {name: memoryview(bytearray(self.objects[key][name])) for name, _ in named}
+            for key, named in zip(keys, parts)
+        ]
+
+    def register(self, memory):
+        pass
+
+    def unregister(self, memory):
+        pass
+
+    def get_ranges(self, reads, *, into):
+        raise NotImplementedError
+
+    def delete_many(self, keys, *, parts):
+        for key in keys:
+            del self.objects[key]
+
+    def close(self):
+        pass
+
+
+def _store_batch(B=2, K=3, T=2, D=4, L=5):
+    batch = OutputBatch(
+        output=torch.randn(B, 1, 8, 8),
+        rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_log_probs=torch.randn(B, T),
+            rollout_debug_tensors=RolloutDebugTensors(
+                rollout_model_outputs=torch.randn(B, T, D),
+            ),
+            denoising_env=RolloutDenoisingEnv(
+                pos_cond_kwargs={
+                    "encoder_hidden_states": [torch.randn(B, L, D)],
+                    "pooled": torch.randn(L, D),
+                    "img_shapes": [[1, 2, 3], [4, 5, 6]],
+                    "txt_seq_lens": [7, 8],
+                },
+                guidance=torch.tensor([1.0, 2.0]),
+            ),
+            dit_trajectory=RolloutDitTrajectory(
+                latents=torch.randn(B, K, D),
+                timesteps=torch.linspace(1.0, 0.0, T),
+                sigmas=torch.linspace(1.0, 0.0, T + 1),
+                latent_step_indices=torch.tensor([0, 1, 2]),
+            ),
+        ),
+    )
+    batch.metrics = types.SimpleNamespace(total_duration_s=1.0)
+    return batch
+
+
+def _assert_same_tensors(test, inline, via_store, stored, row):
+    """Every marker in ``via_store`` resolves to the tensor ``inline`` carries there."""
+    if isinstance(via_store, dict) and "__store__" in via_store:
+        tensor = stored[via_store["__store__"]]
+        if "row" in via_store:
+            test.assertEqual(via_store["row"], row)
+            tensor = tensor[row]
+        test.assertTrue(torch.equal(_maybe_deserialize(inline), tensor))
+    elif isinstance(via_store, dict):
+        test.assertEqual(set(inline), set(via_store))
+        for key in via_store:
+            _assert_same_tensors(test, inline[key], via_store[key], stored, row)
+    elif isinstance(via_store, list):
+        test.assertEqual(len(inline), len(via_store))
+        for a, b in zip(inline, via_store):
+            _assert_same_tensors(test, a, b, stored, row)
+    else:
+        test.assertEqual(inline, via_store)
+
+
+class TestBuildResponseViaStore(unittest.TestCase):
+    def test_large_tensors_are_stored_once_with_the_batch_axis(self):
+        batch = _store_batch()
+        rtd = batch.rollout_trajectory_data
+        stored = {}
+        resps = _build_response("r", "p", 0, True, batch, stored=stored)
+        self.assertEqual(
+            set(stored),
+            {
+                "dit_trajectory.latents",
+                "rollout_debug_tensors.rollout_model_outputs",
+                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0",
+                "denoising_env.pos_cond_kwargs.pooled",
+            },
+        )
+        self.assertIs(stored["dit_trajectory.latents"], rtd.dit_trajectory.latents)
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                resp.dit_trajectory["latents"],
+                {"__store__": "dit_trajectory.latents", "row": row},
+            )
+            cond = resp.denoising_env["pos_cond_kwargs"]
+            self.assertEqual(
+                cond["encoder_hidden_states"],
+                [
+                    {
+                        "__store__": "denoising_env.pos_cond_kwargs.encoder_hidden_states.0",
+                        "row": row,
+                    }
+                ],
+            )
+            self.assertEqual(
+                cond["pooled"], {"__store__": "denoising_env.pos_cond_kwargs.pooled"}
+            )
+            self.assertEqual(cond["img_shapes"], [[[1, 2, 3], [4, 5, 6]][row]])
+            self.assertEqual(cond["txt_seq_lens"], [7, 8])
+            self.assertIsNone(resp.rollout_debug_tensors["rollout_variance_noises"])
+            self.assertIsNone(resp.output_store_ref)
+
+    def test_small_tensors_stay_inline(self):
+        batch = _store_batch(T=2)
+        resps = _build_response("r", "p", 0, True, batch, stored={})
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                bytes_to_tensor(resp.rollout_log_probs["data"]).shape, (2,)
+            )
+            self.assertEqual(
+                bytes_to_tensor(resp.denoising_env["guidance"]["data"]).item(),
+                row + 1.0,
+            )
+            self.assertEqual(
+                bytes_to_tensor(resp.dit_trajectory["timesteps"]["data"]).shape, (2,)
+            )
+            self.assertEqual(
+                bytes_to_tensor(
+                    resp.dit_trajectory["latent_step_indices"]["data"]
+                ).tolist(),
+                [0, 1, 2],
+            )
+            self.assertIsNotNone(resp.generated_output)
+
+    def test_markers_resolve_to_the_inline_tensors(self):
+        batch = _store_batch()
+        stored = {}
+        inline = _build_response("r", "p", 0, True, batch)
+        via_store = _build_response("r", "p", 0, True, batch, stored=stored)
+        for row, (a, b) in enumerate(zip(inline, via_store)):
+            for field in ("rollout_debug_tensors", "denoising_env", "dit_trajectory"):
+                _assert_same_tensors(
+                    self, getattr(a, field), getattr(b, field), stored, row
+                )
+
+    def test_eval_response_stores_nothing(self):
+        batch = OutputBatch(
+            output=torch.randn(2, 1, 8, 8), rollout_trajectory_data=None
+        )
+        batch.metrics = None
+        stored = {}
+        _build_response("r", "p", 0, False, batch, stored=stored)
+        self.assertEqual(stored, {})
+
+
+class TestRolloutOutputStore(unittest.TestCase):
+    def _store(self):
+        backend = _MemoryBackend()
+        store = RolloutOutputStore()
+        args = types.SimpleNamespace(
+            output_store_backend="memory", output_store_backend_extra_config=None
+        )
+        with patch("radix_transfer_plugins.create_backend", return_value=backend):
+            store.initialize(args)
+        return store, backend
+
+    def test_disabled_without_a_backend(self):
+        store = RolloutOutputStore()
+        store.initialize(types.SimpleNamespace(output_store_backend="none"))
+        self.assertFalse(store.enabled)
+
+    def test_put_and_delete(self):
+        store, backend = self._store()
+        self.assertTrue(store.enabled)
+        ref = store.put({"x": torch.ones(2, dtype=torch.bfloat16)})
+        self.assertEqual(
+            [(f.name, f.dtype, f.shape) for f in ref.fields], [("x", "bfloat16", (2,))]
+        )
+        self.assertIn(ref.key, backend.objects)
+        store.delete(ref)
+        self.assertEqual(backend.objects, {})
+        store.delete(ref)
+        store.close()
+        self.assertFalse(store.enabled)
+
+    def test_unsent_response_deletes_its_object(self):
+        store, backend = self._store()
+        ref = store.put({"x": torch.ones(2)})
+        with patch.object(rollout_api, "rollout_output_store", store):
+            parts = rollout_api._stream_parts([b"a", b"b"], ref)
+            next(parts)
+            parts.close()
+        self.assertEqual(backend.objects, {})
+
+    def test_sent_response_keeps_its_object(self):
+        store, backend = self._store()
+        ref = store.put({"x": torch.ones(2)})
+        with patch.object(rollout_api, "rollout_output_store", store):
+            self.assertEqual(
+                list(rollout_api._stream_parts([b"a", b"b"], ref)), [b"a", b"b"]
+            )
+        self.assertIn(ref.key, backend.objects)
 
 
 if __name__ == "__main__":
