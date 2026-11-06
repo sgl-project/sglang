@@ -18,9 +18,12 @@ from typing import Iterable, Optional
 import torch
 from torch import nn
 
+from sglang.srt.configs.gigachat35 import GigaChat35Config
+from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -32,13 +35,12 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     NextNEnabledConfig,
 )
 from sglang.srt.models.gigachat35 import (
-    GigaChat35Config,
     GigaChat35DecoderLayer,
     _remap_gigachat_weight_names,
     build_norm,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BumpAllocator, add_prefix
+from sglang.srt.utils import BumpAllocator
 
 
 class GigaChat35ModelNextN(nn.Module):
@@ -64,14 +66,15 @@ class GigaChat35ModelNextN(nn.Module):
 
         self.alt_stream = torch.cuda.Stream() if torch.cuda.is_available() else None
 
-        self.decoder = GigaChat35DecoderLayer(
-            config=config,
-            layer_id=0,
-            quant_config=quant_config,
-            prefix=add_prefix("decoder", prefix),
-            alt_stream=self.alt_stream,
-            is_nextn=True,
-        )
+        with layer_stack():
+            self.decoder = GigaChat35DecoderLayer(
+                config=config,
+                layer_id=0,
+                quant_config=quant_config,
+                prefix=add_prefix("decoder", prefix),
+                alt_stream=self.alt_stream,
+                is_nextn=True,
+            )
 
         self.shared_head = nn.Module()
         self.shared_head.norm = build_norm(config, config.hidden_size)
@@ -141,7 +144,6 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.config = config
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
-        self.tp_size = get_parallel().tp_size
         self.num_fused_shared_experts = 0
         self.draft_model_idx = draft_model_idx or 0
 

@@ -28,18 +28,16 @@ _parallel_override = get_parallel().override(attn_tp_size=1)
 _parallel_override.__enter__()
 
 from sglang.srt.configs.model_config import AttentionArch
-from sglang.srt.layers.attention.dsa.dsa_indexer import (
-    BaseIndexerMetadata,
-    Indexer,
-    rotate_activation,
-)
+from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer, rotate_activation
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa_backend import (
     DeepseekSparseAttnBackend,
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
@@ -220,7 +218,7 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
                 "dsa_prefill_backend": "intel_xpu",
                 "dsa_decode_backend": "intel_xpu",
-                "dsa_topk_backend": "torch",  # XPU uses torch.topk fallback
+                "dsa_topk_backend": "sgl-kernel",
                 "dsa_paged_mqa_logits_backend": "auto",
                 "disaggregation_mode": "null",
                 "enable_two_batch_overlap": False,
@@ -236,10 +234,8 @@ class TestDSAIndexerXPU(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         server_args = ServerArgs(model_path="dummy")
-        server_args.enable_dp_attention = False
         server_args.dsa_prefill_backend = "intel_xpu"
         server_args.dsa_decode_backend = "intel_xpu"
-        server_args.dsa_topk_backend = "torch"
         # Disable CUDA-only JIT topk-v2 (TileLang requires CUDA_HOME)
         envs.SGLANG_OPT_USE_TOPK_V2.set(False)
         set_global_server_args_for_scheduler(server_args)
@@ -390,7 +386,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — extend mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_extend_mode(self, mock_act_quant):
         """Indexer forward in EXTEND mode calls sgl_kernel.fp8_mqa_logits on XPU."""
 
@@ -446,7 +442,7 @@ class TestDSAIndexerXPU(CustomTestCase):
     # Test: indexer forward — decode mode
     # ------------------------------------------------------------------
 
-    @patch("sglang.kernels.ops.attention.dsa.triton_kernel.act_quant")
+    @patch("sglang.kernels.ops.quantization.act_quant_triton.act_quant")
     def test_forward_decode_mode(self, mock_act_quant):
         """Indexer forward in DECODE mode calls sgl_kernel.fp8_paged_mqa_logits on XPU."""
 

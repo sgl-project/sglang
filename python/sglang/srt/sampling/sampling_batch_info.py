@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
+from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -12,11 +14,17 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -98,6 +106,14 @@ class SamplingBatchInfo:
     return_sampling_support_logprobs: Optional[List[bool]] = None
     sampling_mask_batch_indices: Optional[torch.Tensor] = None
     sampling_support_logprobs_capture_indices: Optional[torch.Tensor] = None
+    # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
+    sampling_mask_top_ks: Optional[List[int]] = None
+
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
 
     # Device
     device: str = "cuda"
@@ -108,6 +124,11 @@ class SamplingBatchInfo:
     # Host-side eligibility for torch_npu.npu_top_k_top_p. Keeping this off the
     # device avoids a scalar synchronization in the per-token sampling path.
     npu_top_k_top_p_eligible: bool = False
+
+    # Host-side upper bound on every row's top_k, or None when some row samples
+    # from the whole vocabulary. Any value >= the true max stays exact, so
+    # filter_batch keeps it unchanged.
+    max_top_k: Optional[int] = None
 
     @classmethod
     def from_schedule_batch(cls, batch: ScheduleBatch, vocab_size: int):
@@ -182,10 +203,15 @@ class SamplingBatchInfo:
                 )
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
+            )
+            for r in reqs
+        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
@@ -194,6 +220,29 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        features = get_exec().features
+        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
+            watermark_config = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+            watermark_keys = watermark_config.keys
+            watermark_context_windows = watermark_config.context_windows
+            watermark_enabled = watermark_config.enabled
+            watermark_candidates_host = watermark_config.candidates_host
+            has_watermark_candidates = watermark_config.has_candidates
+        else:
+            watermark_keys = None
+            watermark_context_windows = None
+            watermark_enabled = None
+            watermark_candidates_host = None
+            has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -201,6 +250,9 @@ class SamplingBatchInfo:
                 device,
             )
         )
+        sampling_mask_top_ks = [
+            r.sampling_params.top_k if r.return_sampling_mask else 1 for r in reqs
+        ]
 
         if has_custom_logit_processor:
             # Merge the same type of custom logit processors together
@@ -258,6 +310,11 @@ class SamplingBatchInfo:
             npu_top_k_top_p_eligible=all(
                 1 <= r.sampling_params.top_k <= 1024 for r in reqs
             ),
+            max_top_k=(
+                max(r.sampling_params.top_k for r in reqs)
+                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
+                else None
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -268,9 +325,15 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark_keys=watermark_keys,
+            watermark_context_windows=watermark_context_windows,
+            watermark_enabled=watermark_enabled,
+            watermark_candidates_host=watermark_candidates_host,
+            has_watermark_candidates=has_watermark_candidates,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
+            sampling_mask_top_ks=sampling_mask_top_ks,
         )
         ret.adjusted_from_schedule_batch(batch, vocab_size)
         return ret
@@ -424,10 +487,19 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        if self.watermark_candidates_host is not None:
+            self.watermark_candidates_host = [
+                self.watermark_candidates_host[index] for index in keep_indices
+            ]
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -435,6 +507,10 @@ class SamplingBatchInfo:
             self.return_sampling_masks = [
                 self.return_sampling_masks[i] for i in keep_indices
             ]
+            if self.sampling_mask_top_ks is not None:
+                self.sampling_mask_top_ks = [
+                    self.sampling_mask_top_ks[i] for i in keep_indices
+                ]
             if self.return_sampling_support_logprobs is not None:
                 self.return_sampling_support_logprobs = [
                     self.return_sampling_support_logprobs[i] for i in keep_indices
@@ -537,6 +613,9 @@ class SamplingBatchInfo:
                     self.device,
                 )
             )
+            self.sampling_mask_top_ks = (
+                self.sampling_mask_top_ks or [1] * self_len
+            ) + (other.sampling_mask_top_ks or [1] * other_len)
 
         # Note: because the __len()__ operator is defined on the temperatures tensor,
         # please make sure any merge operation with len(self) or len(other) is done before
@@ -547,11 +626,21 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
+
+        if (
+            self.watermark_candidates_host is not None
+            and other.watermark_candidates_host is not None
+        ):
+            self.watermark_candidates_host.extend(other.watermark_candidates_host)
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
@@ -559,6 +648,11 @@ class SamplingBatchInfo:
         self.need_top_k_sampling |= other.need_top_k_sampling
         self.need_min_p_sampling |= other.need_min_p_sampling
         self.npu_top_k_top_p_eligible &= other.npu_top_k_top_p_eligible
+        self.max_top_k = (
+            None
+            if self.max_top_k is None or other.max_top_k is None
+            else max(self.max_top_k, other.max_top_k)
+        )
 
         self.adjusted_merge_batch(other)
 
@@ -597,7 +691,29 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
+            new.penalizer_orchestrator = None
+            return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+@cache
+def _fast_copy_enabled() -> bool:
+    # Preserve the original EAGLE runtime policy without the resource-pool dependency.
+    return (
+        current_platform.is_cuda()
+        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
+        and (get_spec().speculative_eagle_topk or 1) == 1
+        and not get_schedule().disable_overlap_schedule
+        and get_parallel().moe_ep_size == 1
+    )
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
 
 
 def merge_bias_tensor(

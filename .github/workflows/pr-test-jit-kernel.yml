@@ -28,6 +28,11 @@ on:
         required: false
         type: boolean
         default: false
+      continue_on_error:
+        description: 'Run every file in the suite even after one fails (full/scheduled runs)'
+        required: false
+        type: string
+        default: 'false'
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows (verified by CI test).
 # The github context (including github.event_name) IS inherited from the caller.
@@ -54,22 +59,25 @@ jobs:
         include:
           - suite: unit-test-1-gpu-large
             runner_config: 1-gpu-large
-            shard: " (0)"
-            suite_args: --auto-partition-id 0 --auto-partition-size 2 --fork-worker-batch-size 20
-          - suite: unit-test-1-gpu-large
-            runner_config: 1-gpu-large
-            shard: " (1)"
-            suite_args: --auto-partition-id 1 --auto-partition-size 2 --fork-worker-batch-size 20
+            suite_args: --fork-worker-batch-size 20
           - suite: unit-test-1-gpu-small
             runner_config: 1-gpu-small
+            shard: " (0)"
+            suite_args: --auto-partition-id 0 --auto-partition-size 3 --fork-worker-batch-size 20
+          - suite: unit-test-1-gpu-small
+            runner_config: 1-gpu-small
+            shard: " (1)"
+            suite_args: --auto-partition-id 1 --auto-partition-size 3 --fork-worker-batch-size 20
+          - suite: unit-test-1-gpu-small
+            runner_config: 1-gpu-small
+            shard: " (2)"
+            suite_args: --auto-partition-id 2 --auto-partition-size 3 --fork-worker-batch-size 20
           - suite: unit-test-4-gpu-b200
             runner_config: 4-gpu-b200
-          - suite: unit-test-8-gpu-h200
-            runner_config: 8-gpu-h200
-            # Alone among these, it has never run the health check.
-            skip_health_check: true
           - suite: benchmark-test-1-gpu-large
             runner_config: 1-gpu-large
+          - suite: benchmark-test-1-gpu-small
+            runner_config: 1-gpu-small
     runs-on: ${{ fromJson(inputs.runs_on_map)[matrix.runner_config] }}
     timeout-minutes: 240
     steps:
@@ -78,7 +86,6 @@ jobs:
           ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-pr-test-health
-        if: ${{ !matrix.skip_health_check }}
 
       - uses: ./.github/actions/check-maintenance
 
@@ -94,7 +101,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda13.0
+          pattern: wheel-python3.11-cuda13.0
 
       - uses: ./.github/actions/download-rust-ext
         with:
@@ -107,6 +114,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 60
+        env:
+          CONTINUE_ON_ERROR_FLAG: ${{ inputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
         run: |
           cd test/
-          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }}
+          python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }} $CONTINUE_ON_ERROR_FLAG

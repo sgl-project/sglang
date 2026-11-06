@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, List, Optional
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_parallel, get_schedule
 
 if TYPE_CHECKING:
@@ -34,7 +34,7 @@ class SchedulerRecvSkipper:
         return ForwardMode.DECODE
 
     def __init__(self):
-        self._use_synced_mode = get_parallel().enable_dp_attention
+        self._use_synced_mode = get_parallel().attn_dp_enabled
         self._counter = 0
         self._threshold = get_schedule().scheduler_recv_interval
         # All can be tuned if needed

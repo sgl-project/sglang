@@ -24,34 +24,9 @@ def _module():
     )
 
 
-def can_use_fused_gelu_tanh_cat(attn: torch.Tensor, mlp: torch.Tensor) -> bool:
-    return (
-        not torch.is_grad_enabled()
-        and not torch.compiler.is_compiling()
-        and torch.version.hip is None
-        and attn.is_cuda
-        and attn.dtype == mlp.dtype == torch.bfloat16
-        and attn.device == mlp.device
-        and attn.ndim >= 2
-        and attn.shape[:-1] == mlp.shape[:-1]
-        and attn.shape[-1] > 0
-        and mlp.shape[-1] > 0
-        and attn.shape[-1] % 8 == mlp.shape[-1] % 8 == 0
-        and attn.is_contiguous()
-        and mlp.is_contiguous()
-        and attn.numel() > 0
-        and (attn.numel() + mlp.numel()) // 8 <= 2**31 - 1
-        and attn.data_ptr() % 16 == mlp.data_ptr() % 16 == 0
-    )
-
-
 @register_custom_op(mutates_args=["output"])
 def _gelu_tanh_cat(attn: torch.Tensor, mlp: torch.Tensor, output: torch.Tensor) -> None:
-    _module().gelu_tanh_cat(
-        attn.view(-1, attn.shape[-1]),
-        mlp.view(-1, mlp.shape[-1]),
-        output.view(-1, output.shape[-1]),
-    )
+    _module().gelu_tanh_cat(attn, mlp, output)
 
 
 def fused_gelu_tanh_cat(attn: torch.Tensor, mlp: torch.Tensor) -> torch.Tensor:

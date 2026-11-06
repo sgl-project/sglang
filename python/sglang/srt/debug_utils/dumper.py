@@ -1605,7 +1605,7 @@ def _init_custom_process_group(
     one and any other custom groups (e.g. RLHF weight-update groups). Used by
     the grafter to bridge baseline and target systems.
 
-    Adapted from sglang.srt.utils.common.init_custom_process_group; inlined
+    Adapted from sglang.srt.utils.process_group.init_custom_process_group; inlined
     here to keep dumper.py free of cross-file imports.
     """
     from torch.distributed.distributed_c10d import (
@@ -1744,7 +1744,7 @@ class _SGLangPlugin(_FrameworkPlugin):
 
         try:
             parallel = get_parallel()
-            info["enable_dp_attention"] = self._dp_attn.is_dp_attention_enabled()
+            info["attn_dp_enabled"] = self._dp_attn.is_dp_attention_enabled()
             info["attn_tp_rank"] = parallel.attn_tp_rank
             info["attn_tp_size"] = parallel.attn_tp_size
             info["attn_dp_rank"] = parallel.attn_dp_rank

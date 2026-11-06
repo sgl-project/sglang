@@ -13,6 +13,7 @@
 # ==============================================================================
 """A stage's model-facing input and output boundary."""
 
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
@@ -30,13 +31,20 @@ from sglang.srt.layers.layer_boundary.contracts import (
     StageKind,
     StagePath,
 )
-from sglang.srt.layers.layer_boundary.ops import attn_tp_gather_input
+from sglang.srt.layers.layer_boundary.layout import SumGroup
+from sglang.srt.layers.layer_boundary.ops import sum_output
+from sglang.srt.layers.layer_boundary.residual import bind_update
 from sglang.srt.layers.layer_boundary.residual.access import buffer, from_pp
 from sglang.srt.layers.layer_boundary.residual.add_norm import (
     PLAIN_ADD,
 )
 from sglang.srt.layers.layer_boundary.residual.batch import stream_of
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum, ResidualStream
+from sglang.srt.layers.layer_boundary.row_transport import (
+    ComputeTransport,
+    TransportExit,
+    validate_invocation,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_forward
 
@@ -93,6 +101,7 @@ class StageBoundary:
         (``call``: what the stage's read takes, e.g. the attention's
         ``quant_format``)."""
         entry = self.entry(forward_batch, steps)
+        context = call.get("read_context")
         if (
             stream.pending is None
             and stream.residual is None
@@ -120,6 +129,25 @@ class StageBoundary:
                 hidden_states, forward_batch, self.plan.qkv_latent_func
             )
         stream.write(residual)
+        transport = self.declaration.row_transport
+        if transport is not None:
+            if stream.transport is not None:
+                raise RuntimeError("cannot replace an unconsumed compute transport")
+            variant = self.plan.variant_for(forward_batch)
+            ordinary = transport.rows[variant]
+            overlapped = (
+                transport.overlapped_rows.get(variant)
+                if transport.overlapped_rows is not None
+                else None
+            )
+            invocation = transport.bind(
+                hidden_states, forward_batch, context, ordinary, overlapped
+            )
+            if not isinstance(invocation, ComputeTransport):
+                raise TypeError("row transport must bind a ComputeTransport invocation")
+            validate_invocation(invocation, ordinary, overlapped)
+            stream.transport = (self, invocation)
+            hidden_states = invocation.input
         return hidden_states, stream
 
     @property
@@ -167,36 +195,74 @@ class StageBoundary:
         )
         return hidden_states
 
-    def finish(self, hidden_states, forward_batch):
-        """Hand this attention's actual contribution to the following stage."""
-        if self.kind is not StageKind.ATTENTION or not self.plan.finishes_directly:
-            raise RuntimeError(
-                "use the stage exit scope for an FFN or single-stage mixer"
+    def finish(self, hidden_states, forward_batch, *, update_context=None):
+        """Hand this stage's output to the following stage: an attention's
+        actual contribution, or an FFN's or a mixer's output with its sum
+        completed or carried on. An FFN whose boundary has fusions (which may
+        take a MoE finalize handoff) finishes through exit() instead."""
+        if self.declaration.row_transport is not None:
+            with self.exit(forward_batch, update_context=update_context) as output:
+                return output.finish(hidden_states)
+        if self.kind is StageKind.ATTENTION and self.plan.finishes_directly:
+            produced = self.plan.path_for(forward_batch).output
+            completion = (
+                partial(produced.sum_impl.run, forward_batch=forward_batch)
+                if produced.sum_impl is not None
+                else None
             )
-        produced = self.plan.produced(forward_batch)
-        return stream_of(forward_batch).record(
-            hidden_states,
-            produced.update,
-            declared_sum=produced.group if produced.always_partial else None,
+            if produced.always_partial:
+                owed = DeclaredSum(produced.group, completion)
+            else:
+                owed = None
+                if completion is not None:
+                    hidden_states = completion(hidden_states)
+            return stream_of(forward_batch).record(
+                hidden_states,
+                bind_update(produced.update, forward_batch, update_context),
+                declared_sum=owed,
+            )
+        if self.kind is StageKind.FFN and self.plan.fusions is not None:
+            raise RuntimeError(
+                "an FFN whose boundary has fusions finishes through exit()"
+            )
+        return self.exit(forward_batch, update_context=update_context).finish(
+            hidden_states
         )
 
-    def exit(self, forward_batch):
-        """Select and scope one FFN or single-stage mixer's output decision.
+    def transport_context(self, forward_batch):
+        """Borrow this prepared compute's operand transport until finish()."""
+        stream = stream_of(forward_batch)
+        if stream.transport is None or stream.transport[0] is not self:
+            raise RuntimeError("no prepared compute transport for this stage")
+        return stream.transport[1]
+
+    def exit(self, forward_batch, *, update_context=None):
+        """Select and scope one FFN or single-stage mixer's output decision,
+        for an FFN whose MoE may hand off its finalize (see finish()).
 
         Args:
             forward_batch: Active batch whose stream receives the compute result.
 
         Returns:
-            A context manager publishing reduction/finalize flags during compute.
+            A context manager publishing the producer's finalize choice during
+            compute.
             Call its finish(output) exactly once after successful compute, including
             when compute is skipped for an empty input. It completes or carries work
             using the same decision rather than selecting a second path.
         """
+        if self.declaration.row_transport is not None:
+            return TransportExit(self, forward_batch, update_context=update_context)
         result = (
-            self.plan.output.ffn_exit(forward_batch, stream=stream_of(forward_batch))
+            self.plan.output.ffn_exit(
+                forward_batch,
+                stream=stream_of(forward_batch),
+                update_context=update_context,
+            )
             if self.kind is StageKind.FFN
             else self.plan.output.mixer_exit(
-                forward_batch, stream=stream_of(forward_batch)
+                forward_batch,
+                stream=stream_of(forward_batch),
+                update_context=update_context,
             )
         )
         return result
@@ -211,25 +277,24 @@ class StageBoundary:
                 model paths that explicitly support it.
 
         Returns:
-            Tensor or owed handle for prepare. A producer-written residual and a
-            declared partial sum are reconstructed from the incoming contract.
+            The received output, complete: the sender completes every sum
+            before transport (see residual_batch.to_pp), so where this stage's
+            entry declares a sum its producer leaves, it takes the path for a
+            sum already completed. A producer-written residual is
+            reconstructed from the producer's declaration.
         """
+        previous = self.declaration.previous
         hidden_states, residual = from_pp(
             tensors,
-            residual_in_hidden=(
-                self.declaration.previous is not None
-                and self.declaration.previous.update.applied_at_exit
-            ),
+            # The producer's declaration says whether the stream arrives written.
+            residual_in_hidden=previous is not None
+            and (previous.update.applied_at_exit or previous.writes_at_handoff),
             allow_missing_residual=allow_missing_residual,
         )
-        declared_sum = self.entry(forward_batch).declared_sum
         hidden_states, forward_batch.residual_stream = ResidualStream.from_handoff(
-            hidden_states, residual, PLAIN_ADD, declared_sum=declared_sum
+            hidden_states, residual, PLAIN_ADD
         )
         return hidden_states
-
-    def snapshot(self, hidden_states, forward_batch):
-        return stream_of(forward_batch).snapshot(hidden_states)
 
     def capture_output(self, hidden_states, forward_batch, *, skip_empty=False):
         """Capture an output while preserving the caller's reduction timing.
@@ -253,13 +318,40 @@ class StageBoundary:
             hidden_states = stream.complete(hidden_states)
         return hidden_states, stream.snapshot(hidden_states)
 
-    def finish_complete_output(self, hidden_states, forward_batch):
-        """Move an FFN output that compute already completed outside exit()
-        (the operation-scheduled TBO path) onto the rows the layer hands on;
-        it chooses no reduction step."""
-        return self.plan.output.finish_complete_output(
-            hidden_states, stream_of(forward_batch), forward_batch
+    def complete_now(
+        self,
+        hidden_states,
+        forward_batch,
+        *,
+        already_reduced=False,
+        update_context=None,
+    ):
+        """Complete an FFN output outside exit(), including its residual update.
+
+        already_reduced is for a producer kernel that fused the output sum.
+        Row movement and residual write-back still belong to this boundary.
+        """
+        return self.plan.output.complete_now(
+            hidden_states,
+            stream_of(forward_batch),
+            forward_batch,
+            already_reduced=already_reduced,
+            update_context=update_context,
         )
+
+    def sum_part(self, hidden_states, forward_batch, group: SumGroup):
+        """Complete the sum over ``group`` that one part of this FFN's output
+        owes.
+
+        For an FFN that builds the next stream itself (``writes_stream``) from
+        several complete parts, normalizing each before combining them; the
+        stream it hands to its exit is then complete.
+        """
+        if not self.declaration.update.writes_stream:
+            raise RuntimeError(
+                "only an FFN that writes the next stream itself sums its parts"
+            )
+        return sum_output(hidden_states, group, forward_batch, may_quantize=False)
 
     def branch_input(self, source, hidden_states, forward_batch):
         hidden_states, stream = branch.branch_input(
@@ -288,6 +380,13 @@ class StageBoundary:
         return hidden_states
 
     def _prepare_input(self, hidden_states, stream, forward_batch, **call):
+        hidden_states, steps = self._select(hidden_states, forward_batch)
+        return self._prepare(hidden_states, stream, forward_batch, steps, **call)
+
+    def _select(self, hidden_states, forward_batch):
+        """This call's path, looked up once the flags that select it are set:
+        the stack's first stage starts a sequence-parallel batch. Publishes
+        the rows LoRA reads for the stage's input."""
         plan = self.plan
         if self.kind is StageKind.ATTENTION:
             publish_attn_lora_rows(plan._publish_lora_layout)
@@ -300,11 +399,10 @@ class StageBoundary:
                 )
                 if get_forward().sp_active:
                     hidden_states = layernorm_sp.sp_entry_scatter(hidden_states)
-        else:
-            publish_ffn_lora_rows(
-                plan._publish_lora_layout, self.entry(forward_batch).input_rows
-            )
-        return self._prepare(hidden_states, stream, forward_batch, **call)
+        steps = plan.path_for(forward_batch)
+        if self.kind is StageKind.FFN:
+            publish_ffn_lora_rows(plan._publish_lora_layout, steps.entry.input_rows)
+        return hidden_states, steps
 
     def _prepare_attention(
         self,
@@ -315,6 +413,7 @@ class StageBoundary:
         post_residual_addition: Optional[torch.Tensor] = None,
         quant_format: str = "",
         capture: Optional[Callable] = None,
+        read_context=None,
     ):
         # Aux consumers need a materialized output before the input norm.
         # Complete communication here, preserving the existing add+norm kernel
@@ -333,14 +432,17 @@ class StageBoundary:
                     capture(value)
                 else:
                     capture(value + previous, owned=True)
-        hidden_states, stream = self._prepare_input(
+        hidden_states, steps = self._select(hidden_states, forward_batch)
+        hidden_states, stream = self._prepare(
             hidden_states,
             stream,
             forward_batch,
+            steps,
             quant_format=quant_format,
             post_residual_addition=post_residual_addition,
+            read_context=read_context,
         )
-        entry = self.entry(forward_batch)
+        entry = steps.entry
         if capture is not None and not capture_before_read:
             value = stream.residual
             move = entry.capture_move
@@ -367,11 +469,10 @@ class StageBoundary:
                     forward_batch=forward_batch,
                 )
             )
-            # Input gathers allocate fresh DP buffers (see attn_tp_gather_input).
             # Without a gather this is the mutable residual, so retention copies.
             capture_gathered.capture(
                 gathered_last_layer_output,
-                owned=move is attn_tp_gather_input
+                owned=entry.input_retainable
                 or (
                     move is None
                     and entry.capture_preserves_residual is not None
@@ -379,3 +480,26 @@ class StageBoundary:
                 ),
             )
         return hidden_states, stream
+
+
+def check_stage_producers(model: torch.nn.Module) -> None:
+    """Reject a model whose stage producers complete their own output sums.
+
+    In a layer built from stage boundaries, the boundary completes every sum a
+    stage output owes. A submodule there constructed with
+    ``reduce_results=True`` (a row-parallel projection, a MoE block) would
+    have its output summed twice. Called once, after the model is built.
+    """
+    offenders = [
+        f"{name}.{child_name}"
+        for name, layer in model.named_modules()
+        if any(isinstance(v, StageBoundary) for v in vars(layer).values())
+        for child_name, child in layer.named_modules()
+        if child_name and getattr(child, "reduce_results", False) is True
+    ]
+    if offenders:
+        raise ValueError(
+            "stage boundaries complete their producers' output sums, but these "
+            f"submodules sum their own output: {', '.join(offenders[:8])}"
+            + (f" (and {len(offenders) - 8} more)" if len(offenders) > 8 else "")
+        )

@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar, Optional, Protocol
 
+import msgspec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
@@ -43,11 +45,43 @@ class DsaGraphVariants:
         return DSA_DENSE if max_kv_len <= self.index_topk else DSA_SPARSE
 
 
+class SeqLenBucketGraphVariants(msgspec.Struct, frozen=True):
+    """Graphs keyed by the batch's longest request: the first bucket whose limit
+    covers it, else the fallback, which must serve any length."""
+
+    # (label, max_seq_len it serves), ascending.
+    graph_limits: tuple[tuple[str, int], ...]
+    fallback_label: str
+
+    @property
+    def capture_labels(self) -> tuple[str, ...]:
+        return tuple(label for label, _ in self.graph_limits) + (self.fallback_label,)
+
+    def select(self, forward_batch: ForwardBatch) -> str:
+        # Only the host mirror is read: a device max would sync every replay.
+        lengths = forward_batch.seq_lens_cpu
+        if lengths is not None and lengths.device.type == "cpu" and lengths.numel() > 0:
+            max_seq_len = int(lengths.max())
+            for label, limit in self.graph_limits:
+                if max_seq_len <= limit:
+                    return label
+        return self.fallback_label
+
+
 def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariants]:
-    from sglang.srt.configs.model_config import get_dsa_index_topk, is_deepseek_dsa
+    from sglang.srt.configs.model_config import (
+        get_dsa_index_kpool,
+        get_dsa_index_topk,
+        is_deepseek_dsa,
+    )
     from sglang.srt.utils import is_hip
 
     if is_hip() and is_deepseek_dsa(hf_config):
+        # KPool has no dense-skip path: both variants run the full indexer.
+        # Capture it once, keeping the regular DSA dense/sparse split intact.
+        if get_dsa_index_kpool(hf_config) > 1:
+            return None
+
         index_topk = get_dsa_index_topk(hf_config)
         logger.info(
             "[dense-decode] DSA dual-graph enabled: capturing "
@@ -60,6 +94,10 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
+DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
+# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants (requests
+# up to the candidate span); longer ones keep the in-graph metadata upgrade.
+DSV41_EARLY_VERIFY_VARIANTS = frozenset({DSV41_CANDIDATE_UNFILTERED})
 
 
 @dataclass(frozen=True)
@@ -84,6 +122,11 @@ class Dsv41CandidateGraphVariants:
                 "candidate_max_seq_len_upper_bound",
                 None,
             )
+        return self.select_for_max_seq_len(max_seq_len)
+
+    def select_for_max_seq_len(self, max_seq_len: Optional[int]) -> str:
+        """The variant for a batch whose longest request (before this step's verify
+        tokens) is ``max_seq_len``; None, when unknown, takes the fallback."""
         if max_seq_len is not None:
             max_seq_len += self.verify_extra_tokens
             for variant, limit in self.graph_limits:
@@ -97,8 +140,8 @@ def create_dsv41_candidate_graph_variants(
 ) -> Optional[Dsv41CandidateGraphVariants]:
     import torch
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
-    from sglang.srt.utils import is_hip
+    from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config
     dspark_target_verify = (
@@ -110,8 +153,11 @@ def create_dsv41_candidate_graph_variants(
     if not (
         (capture_forward_mode == ForwardMode.DECODE or dspark_target_verify)
         and model_runner.device == "cuda"
-        and not is_hip()
-        and torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        and (
+            is_gfx95_supported()
+            if is_hip()
+            else torch.cuda.get_device_capability(model_runner.gpu_id)[0] >= 10
+        )
         and getattr(text_config, "model_type", None) == "deepseek_v41"
         and getattr(text_config, "candidate_source_layer_id", -1) >= 0
     ):
@@ -127,7 +173,7 @@ def create_dsv41_candidate_graph_variants(
         variants.append(("candidate_all", topk * min(ratios)))
         if ratios == {1, 2}:
             variants.append(("candidate_c2_all", topk * 2))
-    variants.append(("candidate_unfiltered", span))
+    variants.append((DSV41_CANDIDATE_UNFILTERED, span))
     graph_limits = []
     for variant, limit in variants:
         graph_limits.append((variant, min(limit, span)))

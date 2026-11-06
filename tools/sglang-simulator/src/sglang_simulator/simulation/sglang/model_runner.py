@@ -106,8 +106,6 @@ class C_ModelRunnerHook(BaseHook):
                 self.decode_attention_backend_str = resolved.decode
 
             self.attn_backend = None
-            self.decode_attn_backend = None
-            self.decode_attn_backend_group = None
 
         def wrapped_init_cuda_graphs(self, capture_decode_cuda_graph=True):
             self.graph_mem_usage = 0
