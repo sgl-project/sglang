@@ -38,6 +38,7 @@ from sglang.srt.distributed import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -62,10 +63,20 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import get_moe_a2a_backend, reduce_moe_output
+from sglang.srt.layers.moe import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    reduce_moe_output,
+)
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
-from sglang.srt.layers.moe.topk import StandardTopKOutput, TopK, TopKOutputChecker
+from sglang.srt.layers.moe.topk import (
+    StandardTopKOutput,
+    TopK,
+    TopKOutputChecker,
+    capture_routed_experts_if_allowed,
+    is_expert_remapping_enabled,
+)
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
@@ -77,6 +88,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -91,6 +104,9 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
+from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.context_manager import (
+    is_in_tc_piecewise_cuda_graph,
+)
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import (
     can_run_silu_fp4_quant_fusion,
@@ -102,17 +118,14 @@ from sglang.srt.runtime_context import (
     get_stream,
 )
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
     is_npu,
-    make_pp_layers,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 
@@ -227,6 +240,48 @@ class Qwen2MoeMLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+
+def _smallm_router_topk_output(block, hidden_states):
+    """gfx950 one-launch router output with the fused shared expert, or None (unfused path)."""
+    from sglang.kernels.ops.moe.smallm_router_gfx950 import (
+        smallm_router,
+        smallm_router_supported,
+    )
+
+    gw, sw = block.gate.weight, block.shared_expert_gate.weight
+    ok = getattr(block, "_smallm_router_ok", None)
+    if ok is None:
+        cfg, backend = block.topk.topk_config, get_moe_runner_backend()
+        ok = block._smallm_router_ok = (
+            block.num_fused_shared_experts == 1
+            and get_parallel().moe_ep_size == 1
+            and (backend.is_auto() or backend.is_aiter())
+            and cfg.top_k == 10
+            and cfg.renormalize
+            and type(gw.data) is torch.Tensor
+            and gw.dtype == sw.dtype == torch.bfloat16
+            and gw.shape == (512, 4096)
+            and sw.shape == (1, 4096)
+            and gw.is_contiguous()
+            and sw.is_contiguous()
+            and not envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
+            and not envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+            and not is_expert_remapping_enabled()
+        )
+    if (
+        not ok
+        or not smallm_router_supported(hidden_states)
+        or is_in_tc_piecewise_cuda_graph()
+    ):
+        return None
+    out = smallm_router(hidden_states, gw, sw, block._shared_expert_scale())
+    if out is None:
+        return None
+    routed = out[1][:, :10]
+    capture_routed_experts_if_allowed(block.topk.topk_config, block.layer_id, routed)
+    get_global_expert_distribution_recorder().on_select_experts(topk_ids=routed)
+    return StandardTopKOutput(out[0], out[1], None)
 
 
 class Qwen2MoeSparseMoeBlock(nn.Module):
@@ -675,9 +730,8 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         defer_finalize: bool = False,
     ):
         if _use_aiter and self.enable_shared_expert_fusion and not defer_finalize:
-            from sglang.kernels.ops.moe.smallm_router_gfx950 import qwen_moe_topk_output
-
-            if (topk_output := qwen_moe_topk_output(self, hidden_states)) is not None:
+            topk_output = _smallm_router_topk_output(self, hidden_states)
+            if topk_output is not None:
                 return self.experts(hidden_states, topk_output)
         # router_logits: (num_tokens, n_experts)
         router_logits, _ = self.gate(hidden_states)

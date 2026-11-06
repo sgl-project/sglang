@@ -224,13 +224,6 @@ register_kernel(
 register_kernel(
     KernelSpec(
         op="gemm.dsv3_fused_a_gemm",
-        backend=KernelBackend.AOT,
-        target="sgl_kernel:dsv3_fused_a_gemm",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.dsv3_fused_a_gemm",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.gemm.dsv3_fused_a_gemm:dsv3_fused_a_gemm",
         capabilities=CUDA_ONLY,
@@ -539,14 +532,6 @@ register_kernel(
         op="gemm.w8a8_block_int8_matmul",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.int8_kernel:w8a8_block_int8_matmul",
-    )
-)
-register_kernel(
-    KernelSpec(
-        op="gemm.muse_spark_router_gemm",
-        backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.gemm.muse_spark_router_gemm:router_gemm",
-        capabilities=CUDA_ONLY,
     )
 )
 register_kernel(

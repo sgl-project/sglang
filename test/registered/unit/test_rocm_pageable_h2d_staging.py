@@ -2,11 +2,13 @@
 
 The default raised here is what keeps the loader out of the MMU-notifier eviction
 loop, so what is worth pinning is that it is a default and not an override: an
-operator who has tuned the threshold must keep their value.
+operator who has tuned the threshold must keep their value. The same hook defaults
+aiter's AITER_FORCE_A8W4 on gfx1250, again without overriding an operator's value.
 """
 
 import os
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.platform_hook import handle_amd_specifics
@@ -54,6 +56,48 @@ class TestRocmPageableH2DStaging(CustomTestCase):
         os.environ[VAR] = "12345"
         self._run(is_hip=True)
         self.assertEqual(os.environ[VAR], "12345")
+
+
+class TestGfx1250AiterA8W4Default(CustomTestCase):
+    VAR = "AITER_FORCE_A8W4"
+
+    def setUp(self):
+        saved = {v: os.environ.pop(v, None) for v in (self.VAR, VAR)}
+        self.addCleanup(self._restore, saved)
+
+    @staticmethod
+    def _restore(saved):
+        for var, value in saved.items():
+            os.environ.pop(var, None)
+            if value is not None:
+                os.environ[var] = value
+
+    def _run(self, gcn_arch: str):
+        arch = SimpleNamespace(hip=SimpleNamespace(gcn_arch=gcn_arch))
+        with (
+            patch(
+                "sglang.srt.arg_groups.platform_hook.get_platform",
+                return_value=_Platform(True),
+            ),
+            patch("sglang.srt.arg_groups.platform_hook.declare_resolution"),
+            patch(
+                "sglang.srt.arg_groups.platform_hook.current_arch", return_value=arch
+            ),
+        ):
+            handle_amd_specifics(object())
+
+    def test_set_on_gfx1250(self):
+        self._run("gfx1250")
+        self.assertEqual(os.environ.get(self.VAR), "1")
+
+    def test_absent_on_gfx950(self):
+        self._run("gfx950")
+        self.assertIsNone(os.environ.get(self.VAR))
+
+    def test_an_operators_value_survives(self):
+        os.environ[self.VAR] = "0"
+        self._run("gfx1250")
+        self.assertEqual(os.environ[self.VAR], "0")
 
 
 if __name__ == "__main__":

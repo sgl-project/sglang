@@ -1171,7 +1171,9 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.future_map = SimpleNamespace()
+        scheduler.future_map = SimpleNamespace(
+            takes_deferred_relay=lambda batch: False, flush_deferred_relay=lambda: None
+        )
         scheduler.cur_batch_for_debug = None
         scheduler.last_batch = None
         scheduler.running_batch = None
@@ -1245,8 +1247,11 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
-            kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+            kv=SimpleNamespace(
+                holds_kv=True, holds_mamba=False, retraction_backup=None
+            ),
             finished=lambda: True,
+            finished_reason=None,
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
