@@ -599,27 +599,14 @@ def test_qsa_indexer_ignores_dp_attention_token_padding():
 
 def test_sharded_qsa_store_uses_pool_mapping():
     calls = []
-
-    class Pool:
-        qsa_raw_kv_sharding = object()
-
-        def set_kv_buffer(self, *args):
-            calls.append(args)
-
-    class RoutedLayer:
-        def store(self, *args):
-            raise AssertionError("sharded writes must use the QSA pool mapping")
-
     backend = QwenSparseAttnBackend.__new__(QwenSparseAttnBackend)
-    pool = Pool()
-    pool.layer_router = SimpleNamespace(layer=lambda _layer_id: RoutedLayer())
-    backend.token_to_kv_pool = pool
-    layer = SimpleNamespace(layer_id=7)
-    loc, k, v = object(), object(), object()
-
-    backend._store_kv_cache(layer, loc, k, v)
-
-    assert calls == [(layer, loc, k, v)]
+    backend.token_to_kv_pool = SimpleNamespace(
+        qsa_raw_kv_sharding=object(),
+        set_kv_buffer=lambda *args: calls.append(args),
+    )
+    args = (SimpleNamespace(layer_id=7), object(), object(), object())
+    backend._store_kv_cache(*args)
+    assert calls == [args]
 
 
 def test_sharded_qsa_pool_is_not_fused_eligible():
@@ -637,45 +624,23 @@ def test_distributed_decode_scores_local_candidates(monkeypatch):
     if not torch.cuda.is_available():
         pytest.skip("CUDA is required")
 
-    import sglang.kernels.ops.attention.fast_topk as fast_topk_module
-
-    captured = {}
-
-    def fake_decode(*args, min_scored_len=0, **kwargs):
-        captured["min_scored_len"] = min_scored_len
-        return torch.zeros((1, 512), dtype=torch.float32, device="cuda")
+    def fake_decode(*_, min_scored_len=0, **__):
+        assert min_scored_len == 0
+        raise StopIteration
 
     monkeypatch.setattr(qsa_indexer_module, "qsa_mqa_decode", fake_decode)
-    monkeypatch.setattr(
-        fast_topk_module,
-        "fast_topk",
-        lambda logits, lengths, **kwargs: torch.arange(
-            512, dtype=torch.int32, device=logits.device
-        ).unsqueeze(0),
-    )
-    monkeypatch.setattr(
-        QSAIndexer,
-        "_maybe_merge_distributed_topk",
-        lambda self, logits, local_indices, *args, **kwargs: local_indices,
-    )
-    indexer = QSAIndexer.__new__(QSAIndexer)
-    indexer.block_topk = 512
-    indexer.compress_ratio = 4
-    indexer.token_topk = 2048
-    indexer.distributed_topk_group = object()
-
-    indexer.select_decode_tokens(
-        q=torch.zeros((1, 1, 128), dtype=torch.bfloat16, device="cuda"),
-        compressed_cache=torch.empty(0, device="cuda"),
-        compressed_page_table=torch.empty(0, device="cuda"),
-        compressed_lengths=torch.tensor([256], dtype=torch.int32, device="cuda"),
-        max_model_len=512,
-        query_positions=torch.tensor([0], dtype=torch.int32, device="cuda"),
-        sequence_lengths=torch.tensor([1024], dtype=torch.int32, device="cuda"),
-        defer_expansion=True,
-    )
-
-    assert captured["min_scored_len"] == 0
+    indexer = SimpleNamespace(block_topk=512, distributed_topk_group=object())
+    with pytest.raises(StopIteration):
+        QSAIndexer.select_decode_tokens(
+            indexer,
+            torch.empty(1, 1, 1, device="cuda"),
+            None,
+            None,
+            torch.ones(1, dtype=torch.int32, device="cuda"),
+            1,
+            None,
+            None,
+        )
 
 
 def test_qsa_cuda_extend_ignores_dp_attention_padding(monkeypatch):
