@@ -160,6 +160,8 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -214,6 +216,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -231,10 +234,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    is_non_idle_and_non_empty,
     is_sm90_supported,
-    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op

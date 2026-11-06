@@ -108,6 +108,8 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -147,7 +149,6 @@ from sglang.srt.runtime_context import (
 # Utils
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -156,8 +157,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_pp_layers,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 

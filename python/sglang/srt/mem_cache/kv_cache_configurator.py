@@ -120,7 +120,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     cpu_has_amx_support,
     get_available_gpu_memory,
     get_device_memory_capacity,

@@ -1337,7 +1337,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def _normalize_mm_content_hashes(obj: GenerateReqInput) -> None:
         """Merge Native/OpenAI content identities and validate their alignment."""
         from sglang.srt.multimodal.cache import parse_content_hash
-        from sglang.srt.utils import ImageData
+        from sglang.srt.multimodal.media_io import ImageData
 
         images = obj.image_data or []
         explicit = obj.mm_content_hashes

@@ -80,6 +80,9 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
+from sglang.srt.layers.quantization.mxfp8_block_convert import (
+    mxfp8_block_convert_required,
+)
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     batch_invariant_or_deterministic,
@@ -96,6 +99,7 @@ from sglang.srt.layers.quantization.utils import (
     requantize_with_max_scale,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
@@ -115,9 +119,7 @@ from sglang.srt.utils import (
     is_npu,
     is_xpu,
     log_info_on_rank0,
-    mxfp8_block_convert_required,
     print_warning_once,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 

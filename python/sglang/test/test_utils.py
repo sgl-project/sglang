@@ -49,8 +49,8 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
-from sglang.srt.utils.common import filter_noisy_warnings
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+from sglang.srt.utils.log_utils import filter_noisy_warnings
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url

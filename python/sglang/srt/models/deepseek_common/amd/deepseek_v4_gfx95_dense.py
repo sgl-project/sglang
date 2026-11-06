@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import resolve_block_fp8_mxfp8_backend
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 logger = logging.getLogger(__name__)
 
