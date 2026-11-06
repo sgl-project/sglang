@@ -27,7 +27,7 @@ def check_wheel_cuda_version(path_name, target_cuda_version):
         return match.group(1) == target_cuda_version
 
     # An untagged wheel is the default-CUDA build, e.g.
-    # sglang_kernel-0.4.0-cp310-abi3-manylinux2014_x86_64.whl (PyPI rejects
+    # sglang_kernel-0.4.0-cp311-abi3-manylinux2014_x86_64.whl (PyPI rejects
     # local versions, so that upload strips the tag).
     return target_cuda_version == DEFAULT_CUDA_VERSION
 

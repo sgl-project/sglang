@@ -9,10 +9,11 @@ from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils import logging
 
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import VaeFastPathGate
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
 from .base_module import RotaryEmbeddingND, TransformerBlock, _scaled_residual_add
-from .vit_utils import _env_flag, create_token_ids, prepare_rotary_pos_emb
+from .vit_utils import create_token_ids, prepare_rotary_pos_emb
 
 logger = logging.get_logger(__name__)
 
@@ -31,8 +32,6 @@ def _cuda_autocast_disabled(tensor: torch.Tensor):
 
 
 def _fused_blocks_available(blocks, hidden_states) -> bool:
-    if not _env_flag("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1"):
-        return False
     # The fused Triton norms decode to all-NaN on ROCm (MI300), where
     # tensor.is_cuda is also true; keep ROCm on the unfused fp32-norm path.
     if not current_platform.is_cuda():
@@ -169,6 +168,10 @@ class ViTBase(ModelMixin, ConfigMixin):
     """Base class for ViT Encoder and Decoder with common functionality."""
 
     _no_split_modules = ["TransformerBlock"]
+    # Set by minimax_h3_vae_cuda_opt at load and enabled per request by the
+    # decode stage from the quality tier; the fused residual add + RMSNorm is not
+    # bit-exact, so None (or "exact") keeps the unfused blocks.
+    _sgl_gate: VaeFastPathGate | None = None
 
     def _init_weights(self):
         def basic_init(m):
@@ -230,7 +233,11 @@ class ViTBase(ModelMixin, ConfigMixin):
         return hidden_states, img_ids
 
     def forward_transformer_blocks(self, hidden_states, rotary_pos_emb):
-        if _fused_blocks_available(self.transformer_blocks, hidden_states):
+        if (
+            self._sgl_gate is not None
+            and self._sgl_gate.enabled
+            and _fused_blocks_available(self.transformer_blocks, hidden_states)
+        ):
             return _run_fused_transformer_blocks(
                 self.transformer_blocks, hidden_states, rotary_pos_emb
             )

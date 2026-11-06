@@ -1,8 +1,8 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
-import asyncio
 import base64
 import contextlib
+import io
 import os
 import time
 from typing import List, Optional
@@ -19,6 +19,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse
 from PIL import Image
+from pydantic import Json
 
 from sglang.multimodal_gen.configs.sample.glmimage import GlmImageSamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -41,6 +42,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     build_sampling_params,
     choose_output_image_ext,
     merge_image_input_list,
+    output_variant_index,
     process_generation_batch,
     request_extra_value,
     request_field_value,
@@ -48,6 +50,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     resolve_sampling_params_cls,
     sanitize_upload_filename,
     save_image_to_path,
+    select_output_variant,
     temp_dir_if_disabled,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -72,19 +75,8 @@ def _resolve_image_output_format(
     return sampling_params_cls.default_image_output_format()
 
 
-def _read_b64_for_paths(paths: list[str]) -> list[str]:
-    """Read and base64-encode each file. Must be called before cloud upload deletes them."""
-    result = []
-    for path in paths:
-        with open(path, "rb") as f:
-            result.append(base64.b64encode(f.read()).decode("utf-8"))
-    return result
-
-
-async def _upload_and_cleanup_images(paths: list[str]) -> list[str | None]:
-    return await asyncio.gather(
-        *(cloud_storage.upload_and_cleanup(path) for path in paths)
-    )
+def _b64_encode_images(images: list[bytes]) -> list[str]:
+    return [base64.b64encode(image).decode("utf-8") for image in images]
 
 
 def _fallback_image_urls(
@@ -99,39 +91,20 @@ def _fallback_image_urls(
     ]
 
 
-def _select_image_variant_path(item: dict, variant: str | None) -> str | None:
-    file_paths = item.get("file_paths")
-    if file_paths:
-        variant_idx = _image_variant_index(variant)
-        if variant_idx is None:
-            return None
-        if variant_idx < 0 or variant_idx >= len(file_paths):
-            return None
-        return file_paths[variant_idx]
-
-    if variant not in (None, "0", 0):
-        return None
-    return item.get("file_path")
+_SUPPORTED_RESPONSE_FORMATS = ("url", "b64_json")
 
 
-def _image_variant_index(variant: str | None) -> int | None:
-    try:
-        return 0 if variant is None else int(variant)
-    except (TypeError, ValueError):
-        return None
-
-
-def _select_image_variant_cloud_url(item: dict, variant: str | None) -> str | None:
-    variant_idx = _image_variant_index(variant)
-    if variant_idx is None:
-        return None
-
-    urls = item.get("urls")
-    if urls and 0 <= variant_idx < len(urls):
-        return urls[variant_idx]
-    if variant_idx == 0:
-        return item.get("url")
-    return None
+def _raise_if_url_response_undeliverable(resp_format: str, is_persistent: bool) -> None:
+    """Reject unusable response formats before generating."""
+    if resp_format not in _SUPPORTED_RESPONSE_FORMATS:
+        raise HTTPException(
+            status_code=400, detail=f"response_format={resp_format} is not supported"
+        )
+    if resp_format == "url" and not is_persistent and not cloud_storage.is_enabled():
+        raise HTTPException(
+            status_code=400,
+            detail="response_format='url' requires cloud storage to be configured.",
+        )
 
 
 def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
@@ -139,7 +112,7 @@ def _raise_if_image_variant_not_found(item: dict, variant: str | None) -> None:
     if not file_paths:
         return
 
-    variant_idx = _image_variant_index(variant)
+    variant_idx = output_variant_index(variant)
     if variant_idx is None or variant_idx < 0 or variant_idx >= len(file_paths):
         raise HTTPException(
             status_code=404,
@@ -155,17 +128,15 @@ def _build_image_response_kwargs(
     result: OutputBatch,
     *,
     b64_list: list[str] | None = None,
-    cloud_url: str | None = None,
     cloud_urls: list[str | None] | None = None,
-    fallback_url: str | None = None,
     fallback_urls: list[str] | None = None,
     is_persistent: bool = True,
     resize: str | None = None,
 ) -> dict:
     """Build ImageResponse data list.
 
-    For b64_json: uses pre-read b64_list (call _read_b64_for_paths first).
-    For url: uses cloud_url or fallback_url.
+    For b64_json: uses b64_list, the base64 of the returned image bytes.
+    For url: uses cloud_urls or fallback_urls.
     file_path is omitted when is_persistent=False to avoid exposing stale temp paths.
     """
     ret = None
@@ -183,11 +154,6 @@ def _build_image_response_kwargs(
         ]
         ret = {"data": data}
     elif resp_format == "url":
-        if cloud_urls is None and cloud_url is not None:
-            cloud_urls = [cloud_url]
-        if fallback_urls is None and fallback_url is not None:
-            fallback_urls = [fallback_url]
-
         data = []
         for idx, path in enumerate(save_file_path_list):
             url = None
@@ -207,6 +173,10 @@ def _build_image_response_kwargs(
             )
 
         if len(data) != len(save_file_path_list):
+            if cloud_storage.is_enabled():
+                raise HTTPException(
+                    status_code=502, detail="Cloud storage upload failed."
+                )
             raise HTTPException(
                 status_code=400,
                 detail="response_format='url' requires cloud storage to be configured.",
@@ -225,15 +195,15 @@ def _build_image_response_kwargs(
 
 
 def _get_response_resize(
-    sampling_params: SamplingParams, output_path: str | None = None
+    sampling_params: SamplingParams, output_image_bytes: bytes | None = None
 ) -> str | None:
     """Return a generated GLM-Image output's actual size as WIDTHxHEIGHT."""
     if not isinstance(sampling_params, GlmImageSamplingParams):
         return None
 
-    if output_path is not None:
+    if output_image_bytes is not None:
         try:
-            with Image.open(output_path) as output_image:
+            with Image.open(io.BytesIO(output_image_bytes)) as output_image:
                 width, height = output_image.size
             return f"{width}x{height}"
         except (OSError, ValueError):
@@ -268,11 +238,24 @@ async def generations(
     output_format = _resolve_image_output_format(
         request.output_format, sampling_params_cls
     )
+    response_format = request.response_format
+    if "response_format" not in request.model_fields_set:
+        response_format = (
+            sampling_params_cls.default_image_response_format() or response_format
+        )
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     ext = choose_output_image_ext(output_format, request.background)
     prompt = await maybe_enhance_prompt(
         raw_request, request.prompt, enabled=request.enhance_prompt, task="image"
     )
 
+    # responses carry the encoded bytes; files are written only to persist or upload them
+    write_output_files = (
+        server_args.output_path is not None or cloud_storage.is_enabled()
+    )
     with temp_dir_if_disabled(server_args.output_path) as output_dir:
         sampling = _build_request_sampling_params(
             request_id,
@@ -285,6 +268,8 @@ async def generations(
             num_outputs_per_prompt=max(1, min(int(request.n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             num_frames=1,
             seed=request.seed,
             generator_device=request.generator_device,
@@ -332,23 +317,16 @@ async def generations(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
-        response_format = request.response_format
-        if "response_format" not in request.model_fields_set:
-            response_format = (
-                sampling_params_cls.default_image_response_format() or response_format
-            )
-        resp_format = (response_format or "b64_json").lower()
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )
 
         is_persistent = server_args.output_path is not None
-        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
         cloud_url = cloud_urls[0] if cloud_urls else None
         fallback_urls = _fallback_image_urls(
             request_id, len(save_file_path_list), is_persistent
@@ -417,6 +395,8 @@ async def edits(
     output_quality: Optional[str] = Form("default"),
     output_compression: Optional[int] = Form(None),
     enable_teacache: Optional[bool] = Form(False),
+    enable_cache_dit: Optional[bool] = Form(None),
+    cache_dit_params: Optional[Json[dict]] = Form(None),
     enable_upscaling: Optional[bool] = Form(False),
     upscaling_model_path: Optional[str] = Form(None),
     upscaling_scale: Optional[int] = Form(4),
@@ -426,10 +406,19 @@ async def edits(
     profile_all_stages: Optional[bool] = Form(False),
     num_frames: int = Form(1),
 ):
+    if mask is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="Field 'mask' is not supported: no pipeline runs masked inpainting",
+        )
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_params_cls = resolve_sampling_params_cls(server_args)
     output_format = _resolve_image_output_format(output_format, sampling_params_cls)
+    resp_format = (response_format or "b64_json").lower()
+    _raise_if_url_response_undeliverable(
+        resp_format, server_args.output_path is not None
+    )
     # Resolve images from either `image` or `image[]` (OpenAI SDK sends `image[]` when list is provided)
     images = image or image_array
     urls = url or url_array
@@ -466,6 +455,10 @@ async def edits(
             )
 
         ext = choose_output_image_ext(output_format, background)
+        # responses carry the encoded bytes; files are written only to persist or upload them
+        write_output_files = (
+            server_args.output_path is not None or cloud_storage.is_enabled()
+        )
         prompt = await maybe_enhance_prompt(
             raw_request,
             prompt,
@@ -482,6 +475,8 @@ async def edits(
             num_outputs_per_prompt=max(1, min(int(n or 1), 10)),
             output_file_name=f"{request_id}.{ext}",
             output_path=output_dir,
+            save_output=write_output_files,
+            return_image_bytes=True,
             image_path=input_paths,
             seed=seed,
             generator_device=generator_device,
@@ -490,6 +485,8 @@ async def edits(
             true_cfg_scale=true_cfg_scale,
             num_inference_steps=num_inference_steps,
             enable_teacache=enable_teacache,
+            enable_cache_dit=enable_cache_dit,
+            cache_dit_params=cache_dit_params,
             num_frames=num_frames,
             quality=_runtime_sampling_quality(quality),
             output_compression=output_compression,
@@ -512,19 +509,17 @@ async def edits(
             async_scheduler_client, batch
         )
         save_file_path = save_file_path_list[0]
-        response_resize = _get_response_resize(sampling, save_file_path)
-        resp_format = (response_format or "b64_json").lower()
+        response_resize = _get_response_resize(sampling, result.output_image_bytes[0])
 
-        # read b64 before cloud upload may delete the local file
         b64_list = (
-            _read_b64_for_paths(save_file_path_list)
+            _b64_encode_images(result.output_image_bytes)
             if resp_format == "b64_json"
             else None
         )
 
         is_persistent = server_args.output_path is not None
         is_input_persistent = server_args.input_save_path is not None
-        cloud_urls = await _upload_and_cleanup_images(save_file_path_list)
+        cloud_urls = await cloud_storage.upload_all_and_cleanup(save_file_path_list)
         cloud_url = cloud_urls[0] if cloud_urls else None
         fallback_urls = _fallback_image_urls(
             request_id, len(save_file_path_list), is_persistent
@@ -576,9 +571,9 @@ async def download_image_content(
         raise HTTPException(status_code=404, detail="Image not found")
 
     _raise_if_image_variant_not_found(item, variant)
-    file_path = _select_image_variant_path(item, variant)
+    file_path = select_output_variant(item, variant, "file_paths", "file_path")
     if not file_path:
-        cloud_url = _select_image_variant_cloud_url(item, variant)
+        cloud_url = select_output_variant(item, variant, "urls", "url")
     else:
         cloud_url = None
     if not file_path and cloud_url:
