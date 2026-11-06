@@ -36,6 +36,10 @@
 #   HF_TOKEN         for gated models; passed through to the test container
 # Optional:
 #   SLURM_EXCLUDE    comma-separated nodes to keep the scheduler off
+#   SLURM_WHOLE_NODE_ONLY
+#                    comma-separated nodes kept for 8-GPU jobs; jobs asking for
+#                    fewer GPUs stay off them, so packed small jobs can never
+#                    leave every node partly busy
 #   TIME_LIMIT       default 01:30:00
 #   CI_SHARED_DIR    shared-storage dir for job logs, default $HOME/.amd_ci_spur
 #   SUBMIT_ATTEMPTS  default 3
@@ -140,12 +144,14 @@ for attempt in $(seq 1 "$SUBMIT_ATTEMPTS"); do
                  -N1 -t "$TIME_LIMIT" -J "$JOB_NAME" --output "$LOG")
     # A whole node stays --exclusive: the job then clears every stale GPU
     # container on it. Smaller jobs get only their GPUs (ROCR_VISIBLE_DEVICES).
+    EXCLUDE="${SLURM_EXCLUDE:-}"
     if (( GPUS == 8 )); then
         SBATCH_ARGS+=(--exclusive)
     else
         SBATCH_ARGS+=(--gres="gpu:$GPUS")
+        [[ -n "${SLURM_WHOLE_NODE_ONLY:-}" ]] && EXCLUDE="${EXCLUDE:+$EXCLUDE,}$SLURM_WHOLE_NODE_ONLY"
     fi
-    [[ -n "${SLURM_EXCLUDE:-}" ]] && SBATCH_ARGS+=(--exclude="$SLURM_EXCLUDE")
+    [[ -n "$EXCLUDE" ]] && SBATCH_ARGS+=(--exclude="$EXCLUDE")
     JOB_ID="$(sbatch --parsable "${SBATCH_ARGS[@]}" "$SCRIPT_DIR/amd_ci_job_mi35x.sh")"
     JOB_ID="${JOB_ID%%;*}"
     echo "Submitted job $JOB_ID (attempt $attempt/$SUBMIT_ATTEMPTS): suite=$SUITE rocm=$ROCM_VERSION gpus=$GPUS"
