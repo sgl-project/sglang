@@ -2447,6 +2447,17 @@ class Envs:
     # bank write run on the local shard, then only the normalized attention
     # input is all-gathered. Works with NCCL or SGLANG_K3_SP_COLLECTIVE.
     SGLANG_K3_SP_ATTN_RES = EnvBool(False)
+    # K3.1 prefill sequence-parallel tail for plain-TP attention without an EP
+    # all-to-all. From the first MoE layer on, each TP rank keeps only its 1/tp
+    # of the rows of the residual stream; the o_proj and MoE sums become
+    # reduce-scatters, and the full rows are all-gathered only for the
+    # attention, the MoE front and the output. Applies to eager EXTEND batches
+    # of at least _MIN_TOKENS rows; set to 0 to keep the replicated layout.
+    # See KimiK3LinearModel._prefill_sp_begin.
+    SGLANG_K31_PREFILL_SP_TAIL = EnvBool(True)
+    # Smaller eager passes are launch-bound, and the extra collectives can make
+    # them slower.
+    SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS = EnvInt(10240)
     # Merge the router gate and routed_expert_down_proj weights so the K3 MoE
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.

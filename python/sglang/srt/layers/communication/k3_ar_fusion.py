@@ -139,6 +139,11 @@ def _max_buffer_rows() -> int:
     return int(schedule.max_prefill_tokens or 0)
 
 
+def symm_buffer_max_rows() -> int:
+    """Rows every :func:`symm_buffer` holds (the largest prefill batch)."""
+    return _max_buffer_rows()
+
+
 def _create_buffer(
     name: str, width: int, dtype: torch.dtype, group_name: str
 ) -> _Buffer:
