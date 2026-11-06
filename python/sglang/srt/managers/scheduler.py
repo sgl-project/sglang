@@ -58,7 +58,7 @@ from sglang.srt.runtime_context import (
     spawn_world_rank,
 )
 
-from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
+from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
@@ -79,6 +79,8 @@ try:
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+import traceback
+
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
@@ -130,7 +132,7 @@ from sglang.srt.hf_transformers import (
 )
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
-from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
@@ -186,6 +188,7 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ReleaseUocrDocReqInput,
@@ -242,7 +245,6 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
     retract_all,
-    unresumable_abort_message,
 )
 from sglang.srt.managers.schedule_policy import (
     AddReqResult,
@@ -332,7 +334,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
@@ -399,17 +401,16 @@ from sglang.srt.utils import (
     is_mps,
     kill_itself_when_parent_died,
     rank_consensus_checker,
-    require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_confidential_compute, is_npu
+from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -1943,6 +1944,10 @@ class Scheduler(
                     self.weight_updater.end_weight_update,
                 ),
                 (
+                    PluginWeightUpdateReqInput,
+                    self.weight_updater.plugin_weight_update,
+                ),
+                (
                     UpdateWeightsFromDistributedReqInput,
                     self.weight_updater.update_weights_from_distributed,
                 ),
@@ -2632,6 +2637,8 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_shutting_down=lambda: self.gracefully_exit,
+            on_peer_shutdown=self.handle_peer_shutdown,
         )
 
     def init_pool_stats_observer(self) -> None:
@@ -3514,15 +3521,26 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
-            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
-        ):
-            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
-            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+        self._bind_pp_arrival_prefetch(req, recv_req)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
+        """PP0 decides the request's L3 ticket on arrival; every stage takes the
+        prefix match behind that decision at the same step."""
+        controller = self.tree_cache.cache_controller
+        if controller is None or controller.pp_prefetch_command_group is None:
+            return
+        if get_parallel().pp_rank == 0:
+            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+            return
+        # PP0's ticket match refreshes the LRU and may split a node. A request the
+        # grammar queue holds back is enqueued (and matched) steps later, so take
+        # the same match here or the stages' trees drift apart in between.
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
 
     def handle_batch_generate_request(
         self,
@@ -3567,8 +3585,10 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
+                match_end = storage_prefetch_end(
+                    tree_cache,
+                    req,
+                    req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
@@ -4073,8 +4093,9 @@ class Scheduler(
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
     ) -> None:
-        # The HiCache drain is TP-wide consensus; run it before rank-local
-        # decisions (_should_defer_prefill) or ranks enter different collectives.
+        # The HiCache drain is consensus over one DP rank's attention TP and CP
+        # ranks, not TP-wide; run it before rank-local decisions
+        # (_should_defer_prefill) or ranks enter different collectives.
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
@@ -4389,6 +4410,7 @@ class Scheduler(
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
             request_retirer=self.request_retirer,
+            kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
         if self.chunked_req is not None:
@@ -5023,11 +5045,14 @@ class Scheduler(
                         if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
+                            # it, and writers of reused pages follow this stream. Only
+                            # the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
+                            allocator.set_latest_forward_done_event(
+                                forward_done, self.forward_stream
+                            )
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).
                             allocator.set_inflight_forward(
@@ -6002,12 +6027,15 @@ class Scheduler(
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
-        return {
+        inflight_reqs = {
             req
             for batch in self._collect_inflight_batches()
             if batch is not None
             for req in batch.reqs
         }
+        # Prefilled and in no batch until their host copy lands.
+        inflight_reqs.update(self.request_lists().get(ListKind.HISPARSE_STAGING, ()))
+        return inflight_reqs
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
@@ -6135,29 +6163,25 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
-        unresumable = []
+        reqs_to_abort = []
         if retract_reqs:
             # Decode-side retract rebootstraps or aborts, so a host backup would
             # be discarded; non-decode modes never offload.
-            unresumable = retract_all(
+            reqs_to_abort = retract_all(
                 reqs=retract_reqs,
                 tree_cache=self.tree_cache,
                 request_retirer=self.request_retirer,
                 offload_kv=False,
             )
-        self.running_batch.reqs = []
+        # Empties the batch through filter_batch so a beam tail goes with the reqs.
+        self.running_batch.filter_batch(keep_indices=[])
         # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
-            if req in unresumable:
-                self.request_retirer.abort_retracted(
-                    req,
-                    reason=FINISH_ABORT(
-                        unresumable_abort_message(),
-                        status_code=HTTPStatus.SERVICE_UNAVAILABLE,
-                    ),
-                )
+            if req in reqs_to_abort:
+                # retract_all recorded the reason and freed any member rows.
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
             elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
@@ -6433,6 +6457,12 @@ class Scheduler(
         self.gracefully_exit = True
         return None
 
+    def handle_peer_shutdown(self) -> None:
+        # Another attention-DP rank honored a ShutdownReq in this step's MLP-sync
+        # gather; leave at the same step boundary as it, before the next gather.
+        logger.info("Scheduler exiting with its DP peers: a peer honored ShutdownReq")
+        self.gracefully_exit = True
+
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
@@ -6629,8 +6659,7 @@ def run_scheduler_process(
         scheduler.run_event_loop()
 
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
