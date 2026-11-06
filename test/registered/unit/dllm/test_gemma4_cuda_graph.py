@@ -10,7 +10,7 @@ from sglang.srt.dllm.algorithm.gemma4_renoise import Gemma4Renoise
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -158,9 +158,10 @@ class TestGemma4GraphInputEmbeddings(unittest.TestCase):
         runner.ragged_verify_mode = False
         runner.deepep_adapter = Mock()
         runner.bs = 4
+        runner.raw_bs = 4
         runner.raw_num_token = 12
+        runner.require_mlp_tp_gather = False
         runner.captured_req_width = 4
-        runner.enable_pdmux = False
         runner.attention_graph_variants = None
         runner._capture_graph_size = Mock(return_value=4)
         runner._resolve_lora_variant = Mock(return_value=None)

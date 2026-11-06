@@ -28,6 +28,7 @@ from sglang.srt.distributed import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -43,7 +44,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
     is_xpu,
-    set_weight_attrs,
 )
 from sglang.utils import resolve_obj_by_qualname
 

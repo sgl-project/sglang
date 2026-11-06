@@ -12,6 +12,7 @@ from typing import Optional, TypeGuard
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_load_back_jit_kernel,
     can_use_page_unified_write_back_jit_kernel,
 )
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
@@ -48,11 +49,12 @@ def prepare_page_unified_write_back_staging(
         and can_use_page_unified_write_back_jit_kernel(
             group_bytes=geometry.group_bytes, is_mla=geometry.is_mla
         )
+        and can_use_page_unified_load_back_jit_kernel(group_bytes=geometry.group_bytes)
     ):
         row_kind = "latent" if geometry.is_mla else "head-group"
         raise ValueError(
-            "the 'page_unified' host layout requires the staged "
-            "write-back JIT kernel, which could not be built for a "
+            "the 'page_unified' host layout requires the staged write-back "
+            "and load-back JIT kernels, which could not be built for a "
             f"{geometry.group_bytes}-byte {row_kind} row."
         )
     shape = geometry.page_dims(min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK))
@@ -505,6 +507,19 @@ class HostKVCache(abc.ABC):
         engine holds a layout lease.
         """
         return host_indices, device_indices
+
+    def peer_write_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Slots a transfer peer writes for these allocated slots.
+
+        Normal host pools expose physical indices directly. Shared compacting
+        pools override this and `set_peer_write_gate`.
+        """
+        return indices
+
+    def set_peer_write_gate(self, gate) -> None:
+        """Install a predicate that is False while a transfer peer may write
+        slots given by `peer_write_indices`; normal host pools never move
+        slots, so they ignore it."""
 
     def backup_from_device_all_layer_physical(
         self, device_pool, host_indices, device_indices, io_backend

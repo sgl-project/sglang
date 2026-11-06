@@ -31,7 +31,7 @@ The following server arguments are relevant for multi-LoRA serving:
 
 * `max_lora_chunk_size`: Maximum chunk size for the ChunkedSGMV LoRA backend. Only used when --lora-backend is 'csgmv'. Choosing a larger value might improve performance. Please tune this value based on your hardware and workload as needed. Defaults to 16.
 
-* `lora_drain_wait_threshold`: When any LoRA adapter request waits longer than this threshold (in seconds), the scheduler will selectively drain one running adapter to make room. This mitigates extreme tail latency under high or skewed workloads by preventing a small set of adapters from monopolizing batch slots. Set to 0 to disable draining (default).
+* `lora_drain_wait_threshold`: Once an adapter's oldest waiting request exceeds this threshold (seconds), the scheduler can drain an unpinned running adapter to make room. Multiple adapters can be drained when several waiting adapters need slots. Each drain limits new requests to a fixed running request's remaining output budget. Pinned adapters are never drained. This is best effort: the threshold starts draining without reserving a freed slot or guaranteeing a maximum waiting time. Set to 0 to disable draining (default).
 
 * `tp_size`: LoRA serving along with Tensor Parallelism is supported by SGLang. `tp_size` controls the number of GPUs for tensor parallelism. More details on the tensor sharding strategy can be found in [S-Lora](https://arxiv.org/pdf/2311.03285) paper.
 

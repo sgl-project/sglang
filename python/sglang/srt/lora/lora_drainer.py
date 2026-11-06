@@ -14,178 +14,153 @@
 
 import logging
 import time
-from collections import defaultdict
-from dataclasses import dataclass
 from typing import Dict, List, Optional
+
+import msgspec
 
 from sglang.srt.managers.schedule_batch import Req
 
 logger = logging.getLogger(__name__)
 
-DRAIN_SCHEDULE_TOLERANCE = 1.2
+
+class Drain(msgspec.Struct, frozen=True):
+    """
+    The drained adapter leaves the batch around when `anchor_req` finishes,
+    freeing its slot for `starving_adapter` (None is the base model).
+    """
+
+    starving_adapter: Optional[str]
+    anchor_req: Req
 
 
-@dataclass
-class AdapterStats:
-    num_waiting_reqs: int = 0
-    max_wait_time_secs: float = 0.0
-    max_remaining_tokens: int = 0
-    is_draining_for: Optional[str] = None
-
-    def _reset_stats(self):
-        self.num_waiting_reqs = 0
-        self.max_wait_time_secs = 0.0
-        self.max_remaining_tokens = 0
-
-    def is_starving(self, drain_wait_threshold: float):
-        return (
-            self.max_wait_time_secs > drain_wait_threshold and self.num_waiting_reqs > 0
-        )
+def _max_rem_tokens(req: Req) -> int:
+    return req.sampling_params.max_new_tokens - len(req.output_ids)
 
 
 class LoRADrainer:
     """
-    Drainer for LoRA requests that manages draining. It tracks:
-    - Number of waiting requests per adapter
-    - Maximum wait time for requests needing each adapter
-    - Maximum number of tokens needed for running requests for each adapter
+    Frees a batch slot for LoRA adapters whose requests have waited too long.
+
+    An adapter is starving once its oldest waiting request has waited longer than
+    `max_wait_time_secs`. For each starving adapter, the drainer drains an adapter in
+    the batch: the drained adapter stops taking requests that would outlast its
+    running ones, so it leaves the batch when they finish and the starving adapter
+    takes its slot. The adapter that has waited longest goes first, and it gets the
+    adapter that will leave the batch soonest.
     """
 
     def __init__(self, max_loras_per_batch: int, max_wait_time_secs: float = 0.0):
         self.max_loras_per_batch = max_loras_per_batch
         self.max_wait_time_secs = max_wait_time_secs
-        self.adapter_to_stats: Dict[Optional[str], AdapterStats] = defaultdict(
-            AdapterStats
-        )
+        self.drained_adapter_to_drain: Dict[Optional[str], Drain] = {}
 
     def update_draining_state(
         self,
         waiting_queue: List[Req],
         running_reqs: List[Req],
+        *,
+        pinned_loras: Optional[set[str]] = None,
     ) -> None:
-        """
-        Update LoRA drainer state based on current waiting queue and running requests.
+        """Ends drains that are no longer needed; starts drains for starving adapters."""
+        pinned_loras = pinned_loras or set()
+        running_reqs = [req for req in running_reqs if not req.finished()]
+        running_adapters = {req.lora_id for req in running_reqs}
+        waiting_adapters = {req.lora_id for req in waiting_queue}
 
-        This method updates adapter statistics, identifies starving adapters that need
-        to be scheduled, and marks adapters for draining to make room for starving ones.
-        """
-        self._update_adapter_stats(waiting_queue, running_reqs)
-        self._update_draining_loras(running_reqs)
-        self._update_fully_drained_loras(running_reqs)
+        # A drain is over once the drained adapter has left the batch,
+        # or once the starving adapter got a slot or has nothing waiting.
+        for adapter, drain in list(self.drained_adapter_to_drain.items()):
+            if (
+                adapter not in running_adapters
+                or drain.starving_adapter in running_adapters
+                or drain.starving_adapter not in waiting_adapters
+            ):
+                logger.debug(f"LoRA adapter {adapter} stopped draining")
+                del self.drained_adapter_to_drain[adapter]
 
-    def _update_adapter_stats(
-        self,
-        waiting_queue: List[Req],
-        running_reqs: List[Req],
-    ) -> None:
-        for stats in self.adapter_to_stats.values():
-            stats._reset_stats()
-
-        for req in waiting_queue:
-            stats = self.adapter_to_stats[req.lora_id]
-
-            stats.num_waiting_reqs += 1
-            stats.max_wait_time_secs = max(
-                stats.max_wait_time_secs,
-                time.monotonic() - req.time_stats.wait_queue_entry_time,
-            )
-
-        for req in running_reqs:
-            stats = self.adapter_to_stats[req.lora_id]
-
-            stats.max_remaining_tokens = max(
-                stats.max_remaining_tokens,
-                req.sampling_params.max_new_tokens - len(req.output_ids),
-            )
-
-    def _update_draining_loras(self, running_reqs: List[Req]) -> None:
-        """
-        Select LoRA adapters to drain based on starvation detection.
-
-        This method identifies adapters in the waiting queue that are "starving"
-        (waiting too long) and marks currently running adapters as "draining"
-        to make room for the starving adapters. Draining adapters will not
-        accept new requests, allowing them to complete and free up slots.
-        """
-        running_adapter_ids = {req.lora_id for req in running_reqs}
-        if len(running_adapter_ids) < self.max_loras_per_batch:
-            return None
-
-        starving_adapters = set()
-        draining_for_adapters = set()
-        for adapter_id, stats in self.adapter_to_stats.items():
-            if stats.is_starving(self.max_wait_time_secs):
-                starving_adapters.add(adapter_id)
-
-            draining_for_adapter = stats.is_draining_for
-            if draining_for_adapter is not None:
-                draining_for_adapters.add(draining_for_adapter)
-
-        new_starving_adapters = starving_adapters - draining_for_adapters
-        if not new_starving_adapters:
-            return None
-
-        sorted_new_starving_adapters = sorted(
-            new_starving_adapters,
-            key=lambda adapter: self.adapter_to_stats[adapter].max_wait_time_secs,
-            reverse=True,
-        )
-
-        eligible_to_drain_adapters = {
-            adapter
-            for adapter in running_adapter_ids
-            if self.adapter_to_stats[adapter].is_draining_for is None
-        }
-
-        for starving_adapter in sorted_new_starving_adapters:
-            if not eligible_to_drain_adapters:
-                break
-
-            min_eligible_adapter = min(
-                eligible_to_drain_adapters,
-                key=lambda adapter_id: (
-                    self.adapter_to_stats[adapter_id].max_remaining_tokens
-                ),
-            )
-
-            self.adapter_to_stats[
-                min_eligible_adapter
-            ].is_draining_for = starving_adapter
-            logger.debug(
-                f"LoRA adapter {min_eligible_adapter} is draining for {starving_adapter}"
-            )
-
-            eligible_to_drain_adapters.remove(min_eligible_adapter)
-
-    def _update_fully_drained_loras(self, running_reqs: List[Req]) -> None:
-        """
-        Clear draining state for adapters that have fully drained.
-
-        An adapter is considered fully drained when it was marked as draining
-        but no longer has any running requests.
-        """
-        running_adapter_ids = {req.lora_id for req in running_reqs}
-        for adapter_id, stats in self.adapter_to_stats.items():
-            if stats.is_draining_for is None:
-                continue
-
-            if adapter_id not in running_adapter_ids:
-                logger.debug(f"LoRA adapter {adapter_id} finished draining")
-                stats.is_draining_for = None
+        # Pinned adapters reserve slots even when they have no running requests.
+        if len(running_adapters | pinned_loras) >= self.max_loras_per_batch:
+            starving_adapters = self._starving_adapters(waiting_queue)
+            self._start_drains(starving_adapters, running_reqs, pinned_loras)
 
     def can_schedule(self, req: Req) -> bool:
         """
-        Check if a request can be scheduled based on draining state.
+        Whether `req` may join the batch.
 
-        If the adapter for this request is currently draining, only allow
-        scheduling if the request's max_new_tokens is within tolerance of
-        the max remaining tokens for the draining adapter.
+        A drained adapter only takes requests that need at most the tokens its anchor
+        request has left, so that admitting them does not delay the drain.
         """
-        stats = self.adapter_to_stats[req.lora_id]
-        if not stats.is_draining_for:
+        drain = self.drained_adapter_to_drain.get(req.lora_id)
+        if drain is None:
             return True
 
-        return (
-            req.sampling_params.max_new_tokens
-            <= stats.max_remaining_tokens * DRAIN_SCHEDULE_TOLERANCE
+        anchor_req = drain.anchor_req
+        # A retracted or preempted anchor no longer makes progress.
+        if anchor_req.finished() or anchor_req.is_retracted:
+            return False
+
+        return req.sampling_params.max_new_tokens <= _max_rem_tokens(anchor_req)
+
+    def _starving_adapters(self, waiting_queue: List[Req]) -> List[Optional[str]]:
+        """Adapters whose oldest request has waited too long, longest wait first."""
+        now = time.monotonic()
+        adapter_to_longest_wait: Dict[Optional[str], float] = {}
+        for req in waiting_queue:
+            wait = now - req.time_stats.wait_queue_entry_time
+            adapter_to_longest_wait[req.lora_id] = max(
+                wait, adapter_to_longest_wait.get(req.lora_id, 0.0)
+            )
+
+        starving = [
+            adapter
+            for adapter, wait in adapter_to_longest_wait.items()
+            if wait > self.max_wait_time_secs
+        ]
+        return sorted(
+            starving, key=lambda adapter: adapter_to_longest_wait[adapter], reverse=True
         )
+
+    def _start_drains(
+        self,
+        starving_adapters: List[Optional[str]],
+        running_reqs: List[Req],
+        pinned_loras: set[str],
+    ) -> None:
+        # Each adapter in the batch leaves it once its request with the most tokens
+        # left finishes.
+        adapter_to_longest_req: Dict[Optional[str], Req] = {}
+        for req in running_reqs:
+            longest = adapter_to_longest_req.get(req.lora_id)
+            if longest is None or _max_rem_tokens(req) > _max_rem_tokens(longest):
+                adapter_to_longest_req[req.lora_id] = req
+
+        running_adapters = adapter_to_longest_req.keys()
+        already_drained_for = {
+            drain.starving_adapter for drain in self.drained_adapter_to_drain.values()
+        }
+        for starving_adapter in starving_adapters:
+            if (
+                starving_adapter in running_adapters
+                or starving_adapter in pinned_loras
+                or starving_adapter in already_drained_for
+            ):
+                continue
+
+            candidates = [
+                adapter
+                for adapter in running_adapters
+                if adapter not in self.drained_adapter_to_drain
+                and adapter not in pinned_loras
+            ]
+            if not candidates:
+                return
+
+            drained = min(
+                candidates,
+                key=lambda adapter: _max_rem_tokens(adapter_to_longest_req[adapter]),
+            )
+            self.drained_adapter_to_drain[drained] = Drain(
+                starving_adapter=starving_adapter,
+                anchor_req=adapter_to_longest_req[drained],
+            )
+            logger.debug(f"LoRA adapter {drained} is draining for {starving_adapter}")
