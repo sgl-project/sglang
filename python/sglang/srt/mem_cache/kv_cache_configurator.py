@@ -1899,6 +1899,7 @@ class KVCacheConfigurator:
                 kv_cache_dim=target_pool.kv_cache_dim,
                 index_head_dim=index_head_dim,
                 index_kpool=1,
+                use_fp4_indexer=target_pool.use_fp4_indexer,
             )
         if self.use_mla_backend:
             return PageInterleaveMLATokenToKVPool(
