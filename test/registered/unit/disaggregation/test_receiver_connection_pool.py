@@ -5,14 +5,12 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-import importlib.util
 import struct
-import sys
 import threading
 import unittest
 from collections import defaultdict
 from itertools import product
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import msgspec
@@ -38,6 +36,7 @@ from sglang.srt.disaggregation.nixl.conn import (
 from sglang.srt.disaggregation.nixl.conn import (
     NixlKVManager,
 )
+from sglang.test.mori_stub import mori_stub
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -144,27 +143,8 @@ class TestReceiverControlMessages(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        if "mori" not in sys.modules and importlib.util.find_spec("mori") is None:
-            package = ModuleType("mori")
-            cpp = ModuleType("mori.cpp")
-            cpp.TransferStatus = type("TransferStatus", (), {})
-            io = ModuleType("mori.io")
-            for name in (
-                "BackendType",
-                "EngineDesc",
-                "IOEngine",
-                "IOEngineConfig",
-                "MemoryDesc",
-                "MemoryLocationType",
-                "PollCqMode",
-                "RdmaBackendConfig",
-            ):
-                setattr(io, name, type(name, (), {}))
-            io.StatusCode = SimpleNamespace(SUCCESS=0, IN_PROGRESS=1)
-            package.cpp, package.io = cpp, io
-            stub = patch.dict(
-                sys.modules, {"mori": package, "mori.cpp": cpp, "mori.io": io}
-            )
+        stub = mori_stub()
+        if stub is not None:
             stub.start()
             cls.addClassCleanup(stub.stop)
         from sglang.srt.disaggregation.mori.conn import MoriKVManager
@@ -413,12 +393,16 @@ class TestReceiverControlMessages(CustomTestCase):
         receiver.kv_mgr.failure_lock = threading.Lock()
         receiver.kv_mgr.failure_records = {}
         receiver._connect_to_bootstrap_server = Mock(side_effect=zmq.ZMQError())
-        receiver.invalidate_cached_bootstrap_infos = Mock()
+        receiver.kv_mgr.connection_lock = threading.Lock()
+        receiver.kv_mgr.connection_pool = {
+            "prefill:8998_0_0_0": receiver.bootstrap_infos
+        }
+        receiver._connection_pool_entries = dict(receiver.kv_mgr.connection_pool)
 
         receiver.send_metadata(np.array([2], dtype=np.int32), aux_index=9)
 
         self.assertEqual(receiver.conclude_state, KVPoll.Failed)
-        receiver.invalidate_cached_bootstrap_infos.assert_called_once()
+        self.assertEqual(receiver.kv_mgr.connection_pool, {})
 
 
 class TestCommonReceiverLifecycle(CustomTestCase):
@@ -513,6 +497,7 @@ class TestCommonReceiverLifecycle(CustomTestCase):
         receiver, _ = self._make_receiver()
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = SimpleNamespace(_scatter_stream=None)
+        handler._defer_scatter = False
         decode_req = SimpleNamespace(_chunk_events=[])
         handler.release_room(17, decode_req, receiver)
         self.assertEqual(receiver.chunk_staging_infos, [])
