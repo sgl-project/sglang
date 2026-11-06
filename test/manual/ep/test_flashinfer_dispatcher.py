@@ -3,9 +3,7 @@
 Needs 4 NVLink-connected GPUs of compute capability 10.0 or 10.3, the only ones
 FlashInfer builds its Lamport transport for; elsewhere test_dispatch_basic and
 test_dispatch_above_lamport_limit fail their preconditions. The other tests do
-not check which transport they take. Run:
-
-    torchrun --nproc_per_node=4 test/manual/ep/test_flashinfer_dispatcher.py
+not check which transport they take.
 """
 
 import unittest
@@ -113,6 +111,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         unittest.TestCase._callTestMethod(self, method)
 
     def create_dispatcher(self, dispatch_type, quant_config, runner_backend=None):
+        """Helper to create dispatcher instance"""
         get_context().override(
             "test_flashinfer_dispatcher",
             flashinfer_a2a_dispatch_type=dispatch_type,
@@ -441,4 +440,8 @@ class TestFlashinferDispatcher(CustomTestCase):
 
 
 if __name__ == "__main__":
+    """
+    Usage
+    torchrun --nproc_per_node=4 test_flashinfer_dispatcher.py
+    """
     unittest.main()
