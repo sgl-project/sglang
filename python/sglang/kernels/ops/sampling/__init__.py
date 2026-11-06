@@ -119,7 +119,7 @@ def argmax(logits: torch.Tensor) -> torch.Tensor:
     return torch.argmax(logits, dim=-1)
 
 
-__all__ = ["argmax", "cake_softmax", "softmax"]
+__all__ = ["argmax", "cake_softmax", "softcap_argmax", "softmax"]
 
 
 # Migrated from srt/layers/utils/hash.py (RFC #29630, Phase 2.5).
@@ -148,3 +148,20 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="sampling.softcap_argmax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.sampling.softcap_argmax_triton:softcap_argmax",
+        capabilities=frozenset({CapabilityRequirement.XPU}),
+    )
+)
+
+
+def softcap_argmax(logits: torch.Tensor, softcap=None, sanitize=False):
+    """Return first-token argmax without materializing FP32 vocabulary logits."""
+    return get_kernel("sampling.softcap_argmax", KernelBackend.TRITON)(
+        logits, softcap=softcap, sanitize=sanitize
+    )
