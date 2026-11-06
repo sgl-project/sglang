@@ -67,6 +67,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakable_cuda_graph import (
@@ -85,7 +86,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip, is_npu
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 

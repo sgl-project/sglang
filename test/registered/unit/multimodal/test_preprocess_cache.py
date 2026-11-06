@@ -99,7 +99,8 @@ class TestMediaIdentity(unittest.TestCase):
 
     def test_same_url_with_new_contents_misses(self):
         with patch(
-            "sglang.srt.utils.get_image_bytes", side_effect=[b"first", b"second"]
+            "sglang.srt.multimodal.media_io.get_image_bytes",
+            side_effect=[b"first", b"second"],
         ):
             first = snapshot_media("https://example.com/image.png")
             second = snapshot_media("https://example.com/image.png")
