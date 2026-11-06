@@ -12,9 +12,11 @@ Covers:
   - Resubmission succeeds after cleanup
   - Handler failures clean up pending and dispatched requests
   - _handle_batch_output takes non-streaming first_token_time from the scheduler
+  - handle_loop handles a backlog of outputs in one pass, waking each stream once
 """
 
 import asyncio
+import contextlib
 import time
 import unittest
 from array import array
@@ -22,6 +24,8 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import msgspec
+import zmq
+import zmq.asyncio
 from fastapi import HTTPException
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -30,13 +34,16 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode  # noqa: E402
+from sglang.srt.environ import envs  # noqa: E402
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry  # noqa: E402
 from sglang.srt.managers.io_struct import (  # noqa: E402
     AbortReq,
     BatchStrOutput,
     EmbeddingReqInput,
     GenerateReqInput,
+    HealthCheckOutput,
     RequestOutputStats,
+    sock_send,
 )
 from sglang.srt.managers.tokenizer_manager import (  # noqa: E402
     ReqState,
@@ -49,7 +56,9 @@ from sglang.srt.observability.req_time_stats import (  # noqa: E402
     APIServerReqTimeStats,
     SchedulerReqTimeStats,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_serving
+from sglang.srt.utils.watchdog import Watchdog  # noqa: E402
+from sglang.utils import TypeBasedDispatcher  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -1704,6 +1713,386 @@ class TestPriorityRange(CustomTestCase):
                         with self.assertRaisesRegex(ValueError, "signed 64-bit"):
                             asyncio.run(tm.generate_request(obj).__anext__())
                         tm._init_req_state.assert_not_called()
+
+
+def _make_row(rid: str, text: str, token_id: int, finished: bool = False):
+    """One request's row of one step, carrying one token."""
+    out = _make_batch_str_output(
+        rid, finished_reason=None if finished else _NOT_FINISHED
+    )
+    out.output_strs = [text]
+    out.output_ids_flat = array("q", [token_id])
+    out.output_ids_offsets = [0, 1]
+    return out
+
+
+def _merge_rows(*rows: BatchStrOutput) -> BatchStrOutput:
+    """Single-row outputs as the rows of one step's output."""
+    fields = {}
+    for f in msgspec.structs.fields(BatchStrOutput):
+        values = [getattr(row, f.name) for row in rows]
+        if f.name == "output_ids_flat":
+            fields[f.name] = array("q", [i for v in values for i in v])
+        elif f.name == "output_ids_offsets":
+            offsets = [0]
+            for v in values:
+                offsets.append(offsets[-1] + v[1])
+            fields[f.name] = offsets
+        elif all(isinstance(v, list) for v in values):
+            fields[f.name] = [x for v in values for x in v]
+        else:
+            fields[f.name] = values[0]
+    return BatchStrOutput(**fields)
+
+
+class _CountingEvent(asyncio.Event):
+    """Counts set() calls: the wakeups requested for one stream."""
+
+    def __init__(self):
+        super().__init__()
+        self.num_sets = 0
+
+    def set(self):
+        self.num_sets += 1
+        super().set()
+
+
+class _DetokenizerLink:
+    """An inproc PUSH/PULL pair in place of the detokenizer's socket."""
+
+    def __init__(self, name: str):
+        self._ctx = zmq.asyncio.Context()
+        address = f"inproc://{name}"
+        self.pull = self._ctx.socket(zmq.PULL)
+        self.pull.bind(address)
+        # Sync sends queue outputs without yielding to the event loop.
+        self._push = self._ctx.socket(zmq.PUSH, socket_class=zmq.Socket)
+        self._push.connect(address)
+
+    def send(self, *objs) -> None:
+        for obj in objs:
+            sock_send(self._push, obj)
+
+    def close(self) -> None:
+        self._ctx.destroy(linger=0)
+
+
+async def _until(predicate, timeout: float = 5.0) -> None:
+    async def poll():
+        while not predicate():
+            await asyncio.sleep(0)
+
+    await asyncio.wait_for(poll(), timeout)
+
+
+class TestHandleLoopDrain(unittest.IsolatedAsyncioTestCase):
+    """handle_loop handles queued outputs in one pass and wakes each stream once."""
+
+    async def asyncSetUp(self):
+        self.tm = _make_tokenizer_manager(self)
+        self.tm.request_logger = Mock()
+        self.tm.request_metrics_exporter_manager = Mock()
+        self.tm.request_metrics_exporter_manager.exporter_enabled.return_value = False
+        self.tm.soft_watchdog = Watchdog.create(
+            debug_name="test", watchdog_timeout=None
+        )
+        self.client_can_send = asyncio.Event()
+        self.tm._result_dispatcher = TypeBasedDispatcher(
+            [
+                (AbortReq, self.tm._handle_abort_req),
+                # Stands in for a slow client's socket turning writable.
+                (HealthCheckOutput, lambda _: self.client_can_send.set()),
+            ]
+        )
+        self.detokenizer = _DetokenizerLink(f"tokenizer-manager-drain-{id(self)}")
+        self.addCleanup(self.detokenizer.close)
+        self.tm.recv_from_detokenizer = self.detokenizer.pull
+
+    @contextlib.asynccontextmanager
+    async def _handle_loop_running(self):
+        task = asyncio.create_task(self.tm.handle_loop())
+        try:
+            yield
+        finally:
+            if task.done():
+                # handle_loop only ends by raising; report that, not a timeout.
+                task.result()
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    def _register_stream(self, rid: str) -> ReqState:
+        state = _make_req_state(rid)
+        state.obj.stream = True
+        state.event = _CountingEvent()
+        self.tm.rid_to_state[rid] = state
+        return state
+
+    def _open_stream(self, rid: str, slow_client: bool = False):
+        """Register a streaming request; return its state, the chunks its
+        client receives as (text, output_ids, finish type), and the client task.
+        A slow client waits for client_can_send after each chunk."""
+        state = self._register_stream(rid)
+        stream = self.tm._wait_one_response(state.obj)
+        chunks = []
+
+        async def client():
+            async for out in stream:
+                finish_reason = out["meta_info"]["finish_reason"]
+                chunks.append(
+                    (
+                        out["text"],
+                        list(out["output_ids"]),
+                        finish_reason["type"] if finish_reason else None,
+                    )
+                )
+                if slow_client:
+                    await self.client_can_send.wait()
+                    self.client_can_send.clear()
+
+        return state, chunks, asyncio.create_task(client())
+
+    async def test_queued_outputs_reach_a_stream_in_one_wakeup(self):
+        """Outputs queued behind each other wake a stream once, and its one
+        chunk carries all of them; with the drain disabled, each output wakes
+        the stream."""
+        for drain, incremental in ((True, False), (True, True), (False, False)):
+            with self.subTest(drain=drain, incremental=incremental):
+                self.tm.incremental_streaming_output = incremental
+                rid = f"backlog-{drain}-{incremental}"
+                state, chunks, client = self._open_stream(rid)
+                self.detokenizer.send(
+                    _make_row(rid, "a", 1),
+                    _make_row(rid, "b", 2),
+                    _make_row(rid, "c", 3, finished=True),
+                )
+                with envs.SGLANG_ENABLE_TOKENIZER_OUTPUT_DRAIN.override(drain):
+                    async with self._handle_loop_running():
+                        await asyncio.wait_for(client, 5)
+
+                self.assertEqual(chunks[-1], ("abc", [1, 2, 3], "length"))
+                if drain:
+                    self.assertEqual(len(chunks), 1)
+                    self.assertEqual(state.event.num_sets, 1)
+                else:
+                    self.assertEqual(state.event.num_sets, 3)
+
+    async def test_custom_worker_keeps_original_batch_output_signature(self):
+        """Custom workers using the original handler signature keep their
+        per-output dispatch, including when draining is enabled by default."""
+        handled = []
+
+        class CustomWorker(TokenizerManager):
+            async def _handle_batch_output(self, recv_obj):
+                handled.append(recv_obj)
+                await super()._handle_batch_output(recv_obj)
+
+        worker = CustomWorker.__new__(CustomWorker)
+        worker.__dict__.update(self.tm.__dict__)
+        self.tm = worker
+        for drain in (False, True):
+            with self.subTest(drain=drain):
+                handled.clear()
+                rid = f"custom-worker-{drain}"
+                state, chunks, client = self._open_stream(rid)
+                self.detokenizer.send(
+                    _make_row(rid, "a", 1),
+                    _make_row(rid, "b", 2, finished=True),
+                )
+                with envs.SGLANG_ENABLE_TOKENIZER_OUTPUT_DRAIN.override(drain):
+                    async with self._handle_loop_running():
+                        await asyncio.wait_for(client, 5)
+
+                self.assertEqual(len(handled), 2)
+                self.assertEqual(state.event.num_sets, 2)
+                self.assertEqual(chunks[-1], ("ab", [1, 2], "length"))
+
+    async def test_drain_does_not_wake_a_stream_that_took_its_outputs(self):
+        """A slow client can take its outputs during a yield inside a drain.
+
+        The drain must not wake that stream again with nothing queued, which
+        made the stream raise IndexError.
+        """
+        with get_serving().override(batch_notify_size=1):
+            slow, chunks, slow_client = self._open_stream("slow", slow_client=True)
+            _, _, other_client = self._open_stream("other")
+            async with self._handle_loop_running():
+                self.detokenizer.send(_make_row("slow", "a", 1))
+                await _until(lambda: len(chunks) == 1)
+                # The client is still sending "a" when "b" sets its event.
+                self.detokenizer.send(_make_row("slow", "b", 2))
+                await _until(slow.event.is_set)
+                # Its socket turns writable inside the drain that brings "c";
+                # "other" is woken after it, so the drain ends once "other" ends.
+                self.detokenizer.send(
+                    HealthCheckOutput(),
+                    _merge_rows(
+                        _make_row("slow", "c", 3),
+                        _make_row("other", "x", 9, finished=True),
+                    ),
+                )
+                await asyncio.wait_for(other_client, 5)
+                self.client_can_send.set()
+                self.detokenizer.send(_make_row("slow", "d", 4, finished=True))
+                await _until(lambda: len(chunks) == 3 or slow_client.done())
+                self.client_can_send.set()
+                await asyncio.wait_for(slow_client, 5)
+
+        self.assertEqual([text for text, _, _ in chunks], ["a", "abc", "abcd"])
+
+    async def test_abort_queued_between_outputs_applies_in_queue_order(self):
+        """A control message in a backlog takes effect at its place in the
+        queue: an abort queued before a request's last output ends it as aborted."""
+        rid = "aborted"
+        _, chunks, client = self._open_stream(rid)
+        self.detokenizer.send(
+            _make_row(rid, "a", 1),
+            _make_abort_req(rid),
+            _make_row(rid, "b", 2, finished=True),
+        )
+        async with self._handle_loop_running():
+            await asyncio.wait_for(client, 5)
+
+        self.assertEqual(chunks, [("a", [1], "abort")])
+
+    async def test_drain_stops_at_either_cap_without_dropping_outputs(self):
+        """A drain stops at SGLANG_TOKENIZER_MAX_RECV_PER_DRAIN outputs or at
+        SGLANG_TOKENIZER_MAX_ROWS_PER_DRAIN rows and leaves the rest queued for
+        the next pass; none is lost at the boundary."""
+        texts = "abcde"
+        for cap in (
+            envs.SGLANG_TOKENIZER_MAX_RECV_PER_DRAIN,
+            envs.SGLANG_TOKENIZER_MAX_ROWS_PER_DRAIN,
+        ):
+            with self.subTest(cap=cap.name):
+                rid = f"capped-{cap.name}"
+                state, chunks, client = self._open_stream(rid)
+                self.detokenizer.send(
+                    *(
+                        _make_row(rid, text, i, finished=i == len(texts) - 1)
+                        for i, text in enumerate(texts)
+                    )
+                )
+                with cap.override(2):
+                    async with self._handle_loop_running():
+                        await asyncio.wait_for(client, 5)
+
+                # Two passes of two one-row outputs, then the last output alone.
+                self.assertEqual(state.event.num_sets, 3)
+                self.assertEqual(chunks[-1], ("abcde", [0, 1, 2, 3, 4], "length"))
+
+    async def test_rid_reused_during_a_drain_wakes_both_streams(self):
+        """A request can finish and its rid be reused while a drain is running;
+        the drain must wake both the finished stream and the new one."""
+        rid = "reused"
+        new_stream = {}
+
+        async def resubmit_once_finished():
+            while rid in self.tm.rid_to_state:
+                await asyncio.sleep(0)
+            _, new_stream["chunks"], client = self._open_stream(rid)
+            await client
+
+        with get_serving().override(batch_notify_size=1):
+            _, old_chunks, old_client = self._open_stream(rid)
+            self.detokenizer.send(
+                _make_row(rid, "a", 1, finished=True),
+                _make_row(rid, "b", 2, finished=True),
+            )
+            async with self._handle_loop_running():
+                await asyncio.wait_for(
+                    asyncio.gather(old_client, resubmit_once_finished()), 5
+                )
+
+        self.assertEqual(old_chunks, [("a", [1], "length")])
+        self.assertEqual(new_stream["chunks"], [("b", [2], "length")])
+
+    async def test_output_without_backlog_wakes_streams_as_rows_are_handled(self):
+        """With nothing queued behind it, an output still wakes its streams
+        every batch_notify_size rows rather than after its last row."""
+        with get_serving().override(batch_notify_size=1):
+            first = self._register_stream("first")
+            second = self._register_stream("second")
+            second_tokens_when_first_woke = []
+
+            async def first_client():
+                async for _ in self.tm._wait_one_response(first.obj):
+                    second_tokens_when_first_woke.append(list(second.output_ids))
+                    return
+
+            client = asyncio.create_task(first_client())
+            self.detokenizer.send(
+                _merge_rows(_make_row("first", "a", 1), _make_row("second", "b", 2))
+            )
+            async with self._handle_loop_running():
+                await asyncio.wait_for(client, 5)
+
+        self.assertEqual(second_tokens_when_first_woke, [[]])
+
+    async def test_drain_yields_every_batch_notify_size_rows_of_the_pass(self):
+        """A drain yields every batch_notify_size rows it handles, counted
+        across outputs, so HTTP intake keeps running while wakeups are deferred
+        even when each queued output is smaller than batch_notify_size."""
+        rid = "long-drain"
+        queued_while_running = []
+        with get_serving().override(batch_notify_size=2):
+            state, chunks, client = self._open_stream(rid)
+
+            async def intake():
+                while not client.done():
+                    queued_while_running.append(len(state.out_list))
+                    await asyncio.sleep(0)
+
+            self.detokenizer.send(
+                _make_row(rid, "a", 1),
+                _make_row(rid, "b", 2),
+                _make_row(rid, "c", 3),
+                _make_row(rid, "d", 4, finished=True),
+            )
+            async with self._handle_loop_running():
+                other = asyncio.create_task(intake())
+                await asyncio.wait_for(client, 5)
+                await other
+
+        self.assertEqual(chunks, [("abcd", [1, 2, 3, 4], "length")])
+        # The pass's second row is in its second output.
+        self.assertIn(2, queued_while_running)
+
+    async def test_drain_accepts_batch_notify_size_below_one(self):
+        """--batch-notify-size is not range-checked, and the per-output path
+        treats values below 1 as 1. A backlog under them must still drain
+        instead of raising out of handle_loop, which takes the server down."""
+        for size in (0, -1):
+            with self.subTest(batch_notify_size=size):
+                rid = f"notify-size-{size}"
+                _, chunks, client = self._open_stream(rid)
+                self.detokenizer.send(
+                    _make_row(rid, "a", 1),
+                    _make_row(rid, "b", 2),
+                    _make_row(rid, "c", 3, finished=True),
+                )
+                with get_serving().override(batch_notify_size=size):
+                    async with self._handle_loop_running():
+                        await asyncio.wait_for(client, 5)
+
+                self.assertEqual(chunks, [("abc", [1, 2, 3], "length")])
+
+    async def test_drain_reads_msgpack_ipc(self):
+        """The drain's non-blocking reads decode msgpack IPC
+        (SGLANG_USE_PICKLE_IPC=0) as the awaited read does."""
+        rid = "msgpack"
+        state, chunks, client = self._open_stream(rid)
+        with patch("sglang.srt.managers.io_struct._USE_PICKLE_IPC", False):
+            self.detokenizer.send(
+                _make_row(rid, "a", 1),
+                _make_row(rid, "b", 2),
+                _make_row(rid, "c", 3, finished=True),
+            )
+            async with self._handle_loop_running():
+                await asyncio.wait_for(client, 5)
+
+        self.assertEqual(chunks, [("abc", [1, 2, 3], "length")])
+        self.assertEqual(state.event.num_sets, 1)
 
 
 if __name__ == "__main__":

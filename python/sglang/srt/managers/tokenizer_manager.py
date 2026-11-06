@@ -50,6 +50,7 @@ from typing import (
 )
 
 import fastapi
+import msgspec
 import numpy as np
 import pybase64
 import torch
@@ -126,6 +127,7 @@ from sglang.srt.managers.io_struct import (
     build_flat_top_logprobs_arrays,
     flat_top_logprobs_layout,
     row_output_ids,
+    sock_recv,
     sock_send,
     unwrap_from_pickle,
 )
@@ -392,6 +394,16 @@ class ReqState:
 
     # For return_prompt_token_ids: stores prompt token IDs captured after tokenization
     prompt_token_ids: Optional[List[int]] = None
+
+
+class _DrainPass(msgspec.Struct):
+    """Streams that one pass over queued outputs appended to; they are woken
+    once, at the end of the pass."""
+
+    batch_notify_size: int
+    # Keyed by id(state): a rid can finish and be reused within one pass.
+    states: dict[int, ReqState] = {}
+    num_rows: int = 0
 
 
 def _slice_streaming_output_meta_info(
@@ -2667,18 +2679,79 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     async def handle_loop(self):
         """The event loop that handles requests"""
+        # A sync shadow of the same socket: its NOBLOCK reads take queued
+        # outputs without a round trip through the event loop.
+        drain_sock = (
+            zmq.Socket.shadow(self.recv_from_detokenizer.underlying)
+            if envs.SGLANG_ENABLE_TOKENIZER_OUTPUT_DRAIN.get()
+            # Custom workers may override the original one-argument handler.
+            and type(self)._handle_batch_output is TokenizerManager._handle_batch_output
+            else None
+        )
+        max_recv_per_drain = envs.SGLANG_TOKENIZER_MAX_RECV_PER_DRAIN.get()
+        max_rows_per_drain = envs.SGLANG_TOKENIZER_MAX_ROWS_PER_DRAIN.get()
         while True:
             with self.soft_watchdog.disable():
                 recv_obj = await async_sock_recv(self.recv_from_detokenizer)
-            if isinstance(
-                recv_obj,
-                (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+            if drain_sock is not None and (
+                drain_sock.getsockopt(zmq.EVENTS) & zmq.POLLIN
             ):
+                await self._drain_recv_objs(
+                    recv_obj,
+                    sock=drain_sock,
+                    max_recv=max_recv_per_drain,
+                    max_rows=max_rows_per_drain,
+                )
+            else:
+                await self._handle_recv_obj(recv_obj)
+
+    async def _handle_recv_obj(
+        self,
+        recv_obj,
+        drain_pass: Optional[_DrainPass] = None,
+    ):
+        if isinstance(
+            recv_obj,
+            (BatchStrOutput, BatchEmbeddingOutput, BatchTokenIDOutput),
+        ):
+            if drain_pass is None:
                 await self._handle_batch_output(recv_obj)
             else:
-                self._result_dispatcher(recv_obj)
-            self.last_receive_tstamp = real_time()
-            self.soft_watchdog.feed()
+                await self._handle_batch_output(recv_obj, drain_pass=drain_pass)
+        else:
+            self._result_dispatcher(recv_obj)
+        self.last_receive_tstamp = real_time()
+        self.soft_watchdog.feed()
+
+    async def _drain_recv_objs(
+        self, recv_obj, sock: zmq.Socket, max_recv: int, max_rows: int
+    ):
+        drain_pass = _DrainPass(
+            # Not range-checked; the per-output path treats values below 1 as 1.
+            batch_notify_size=max(1, get_serving().batch_notify_size)
+        )
+        await self._handle_recv_obj(recv_obj, drain_pass=drain_pass)
+        for _ in range(max_recv - 1):
+            if drain_pass.num_rows >= max_rows:
+                break
+            try:
+                recv_obj = sock_recv(sock, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            await self._handle_recv_obj(recv_obj, drain_pass=drain_pass)
+        await self._notify_deferred(drain_pass)
+
+    async def _notify_deferred(self, drain_pass: _DrainPass):
+        num_notified = 0
+        for state in drain_pass.states.values():
+            # A stream already woken may have taken its outputs during a yield;
+            # waking it again with an empty out_list would crash it.
+            if not state.out_list:
+                continue
+            state.event.set()
+            num_notified += 1
+            if num_notified % drain_pass.batch_notify_size == 0:
+                await asyncio.sleep(0)
 
     async def _handle_batch_output(
         self,
@@ -2687,6 +2760,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             BatchEmbeddingOutput,
             BatchTokenIDOutput,
         ],
+        drain_pass: Optional[_DrainPass] = None,
     ):
         if isinstance(recv_obj, (BatchStrOutput, BatchTokenIDOutput)):
             customized_info = unwrap_from_pickle(recv_obj.customized_info)
@@ -2694,6 +2768,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             customized_info = None
         pending_notify: dict[str, ReqState] = {}
         batch_notify_size = get_serving().batch_notify_size
+        weight_version = self.config_value("weight_version")
         for i, rid in enumerate(recv_obj.rids):
             state = self.rid_to_state.get(rid, None)
             if state is None:
@@ -2726,7 +2801,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "id": rid,
                 "finish_reason": recv_obj.finished_reasons[i],
                 "prompt_tokens": request_stats.prompt_tokens,
-                "weight_version": self.config_value("weight_version"),
+                "weight_version": weight_version,
                 "num_retractions": request_stats.retraction_count,
             }
 
@@ -2992,13 +3067,20 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if out_dict is not None:
                 state.out_list.append(out_dict)
-                pending_notify[rid] = state
-
-                if len(pending_notify) >= batch_notify_size:
-                    for s in pending_notify.values():
-                        s.event.set()
-                    pending_notify = {}
-                    await asyncio.sleep(0)
+                if drain_pass is not None:
+                    drain_pass.states[id(state)] = state
+                    drain_pass.num_rows += 1
+                    # Wakeups wait for the end of the pass; still yield every
+                    # batch_notify_size rows of it so HTTP intake keeps running.
+                    if drain_pass.num_rows % drain_pass.batch_notify_size == 0:
+                        await asyncio.sleep(0)
+                else:
+                    pending_notify[rid] = state
+                    if len(pending_notify) >= batch_notify_size:
+                        for s in pending_notify.values():
+                            s.event.set()
+                        pending_notify = {}
+                        await asyncio.sleep(0)
 
             if self.enable_metrics and state.obj.log_metrics:
                 self.collect_metrics(state, recv_obj, i, request_stats)
