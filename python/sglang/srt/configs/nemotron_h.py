@@ -170,6 +170,21 @@ class NemotronHConfig(PretrainedConfig):
     model_type = "nemotron_h"
     keys_to_ignore_at_inference = ["past_key_values"]
 
+    _LAYER_TYPE_ALIASES = {
+        "linear_attention": "mamba",
+        "full_attention": "attention",
+    }
+
+    @staticmethod
+    def _canonicalize_layer_types(layers_block_type):
+        """Map transformers 5 layer names onto the names this config stores."""
+        if not isinstance(layers_block_type, list):
+            return layers_block_type
+        return [
+            NemotronHConfig._LAYER_TYPE_ALIASES.get(block_type, block_type)
+            for block_type in layers_block_type
+        ]
+
     @staticmethod
     def _validate_layers_block_type(
         layers_block_type, expected_length=None, param_name="layers_block_type"
@@ -323,11 +338,13 @@ class NemotronHConfig(PretrainedConfig):
         mtp_layers_block_type = self._normalize_layer_type_names(mtp_layers_block_type)
 
         # Compatibility parsing: normalize legacy pattern fields into canonical list fields.
-        layers_block_type = self._resolve_layers_block_type(
-            layers_block_type, hybrid_override_pattern, kwargs
+        layers_block_type = self._canonicalize_layer_types(
+            self._resolve_layers_block_type(
+                layers_block_type, hybrid_override_pattern, kwargs
+            )
         )
-        mtp_layers_block_type = self._resolve_mtp_layers_block_type(
-            mtp_layers_block_type, kwargs
+        mtp_layers_block_type = self._canonicalize_layer_types(
+            self._resolve_mtp_layers_block_type(mtp_layers_block_type, kwargs)
         )
 
         # num_hidden_layers is deprecated and ignored as a source of truth.
