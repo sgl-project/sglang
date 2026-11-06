@@ -17,7 +17,6 @@ from PIL import Image
 
 from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_vae_temporal_blend_write,
-    minimax_h3_vae_output_device_supported,
     minimax_h3_vae_temporal_blend_write,
 )
 from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
@@ -52,18 +51,6 @@ _TEMPORAL_BLEND_FUSION = BitExactFusionGate(
 )
 
 
-def _gate_admits(gate: BitExactFusionGate, sig) -> bool:
-    # Per-signature can_attempt_once: an unverified signature still needs the
-    # eager reference and a host sync, so not inside compile or stream capture.
-    if gate.disabled:
-        return False
-    if gate.is_verified(sig):
-        return True
-    if torch.compiler.is_compiling():
-        return False
-    return not (torch.cuda.is_available() and torch.cuda.is_current_stream_capturing())
-
-
 def _output_kernel_candidate(
     value: torch.Tensor, gate: BitExactFusionGate, sig
 ) -> bool:
@@ -71,8 +58,7 @@ def _output_kernel_candidate(
         value.is_cuda
         and value.dtype == torch.float32
         and not torch.is_grad_enabled()
-        and _gate_admits(gate, sig)
-        and minimax_h3_vae_output_device_supported(value.device)
+        and gate.can_attempt(sig)
     )
 
 

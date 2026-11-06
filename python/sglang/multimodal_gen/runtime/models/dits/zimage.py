@@ -1239,7 +1239,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         Pinning every value a capture consumes keeps those addresses alive;
         contents stay correct because a value never changes for its key.
         Growth is bounded by O(cache sites x captured signatures) small
-        tensors, and nothing is pinned outside graph capture.
+        tensors, and nothing is pinned outside BCG warmup and capture.
         """
         if is_in_breakable_cuda_graph() or (
             _is_cuda and torch.cuda.is_current_stream_capturing()

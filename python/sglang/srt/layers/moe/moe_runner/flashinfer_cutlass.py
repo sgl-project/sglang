@@ -34,7 +34,8 @@ from sglang.srt.runtime_context import (
     max_prefill_buffer_tokens,
 )
 from sglang.srt.utils import is_flashinfer_available
-from sglang.srt.utils.common import is_sm120, next_power_of_2
+from sglang.srt.utils.device import is_sm120
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (

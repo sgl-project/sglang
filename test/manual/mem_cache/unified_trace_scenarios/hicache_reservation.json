@@ -1,0 +1,20 @@
+{"name": "hicache_reservation", "chain": "swa", "page_size": 16, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 64},
+  {"op": "extend", "req": 1, "n": 64},
+  {"op": "extend", "req": 2, "n": 64},
+  {"op": "extend", "req": 3, "n": 64},
+  {"op": "extend", "req": 4, "n": 64},
+  {"op": "extend", "req": 5, "n": 64},
+  {"op": "extend", "req": 6, "n": 64},
+  {"op": "extend", "req": 7, "n": 64},
+  {"op": "extend", "req": 8, "n": 64},
+  {"op": "extend", "req": 9, "n": 64},
+  {"op": "free", "req": 1},
+  {"op": "free", "req": 3},
+  {"op": "free", "req": 5},
+  {"op": "reserve", "member": "full", "n": 48},
+  {"op": "ensure", "full": 96, "window": 96},
+  {"op": "extend", "req": 20, "n": 128},
+  {"op": "flush"},
+  {"op": "extend", "req": 21, "n": 128}
+]}

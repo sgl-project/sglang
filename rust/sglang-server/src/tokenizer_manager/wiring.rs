@@ -81,8 +81,23 @@ impl RequestAdmission {
         self.state.swap(ADMISSION_CANCELLED, Ordering::AcqRel) == ADMISSION_ACCEPTED
     }
 
-    pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == ADMISSION_CANCELLED
+    /// Cancel the request only if Intake has not claimed it. `true` means it
+    /// will never start.
+    pub fn cancel_if_pending(&self) -> bool {
+        self.state
+            .compare_exchange(
+                ADMISSION_PENDING,
+                ADMISSION_CANCELLED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+    }
+
+    /// Whether Intake owns the request and no terminal response or
+    /// cancellation has ended it.
+    pub fn is_accepted(&self) -> bool {
+        self.state.load(Ordering::Acquire) == ADMISSION_ACCEPTED
     }
 
     /// Prevent an explicit abort racing with an observed terminal response
@@ -99,7 +114,8 @@ impl RequestAdmission {
 
 /// The source of the abort request. [`Intake::on_abort`] deregisters the
 /// detok entry for every source and tells the scheduler to stop for all but
-/// [`Self::Local`]; the source is otherwise kept for diagnostics.
+/// [`Self::Local`]; the source is otherwise kept for diagnostics. A
+/// [`Self::Request`] for a request the scheduler has keeps the entry instead.
 ///
 /// [`Rid::from_client`] makes every client-supplied rid internally unique, so
 /// an abort already in flight cannot affect a later reuse of the public ID.
@@ -113,12 +129,16 @@ pub enum AbortSource {
     /// From a dropped call that never reaches the scheduler (tokenize,
     /// detokenize): only its Rust-side state is released.
     Local(Rid),
+    /// From `/abort_request`: the scheduler aborts the request and its own
+    /// terminal output, partial generation included, still reaches the
+    /// client, as Python's `TokenizerManager.abort_request` leaves it.
+    Request(Rid),
 }
 
 impl AbortSource {
     pub fn rid(&self) -> &Rid {
         match self {
-            Self::Guard(rid) | Self::Detok(rid) | Self::Local(rid) => rid,
+            Self::Guard(rid) | Self::Detok(rid) | Self::Local(rid) | Self::Request(rid) => rid,
         }
     }
 }

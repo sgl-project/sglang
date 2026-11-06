@@ -39,6 +39,8 @@ class QuantizationConfig(SRTQuantizationConfig):
     checkpoint_uses_comfy_quantization: bool = False
     supports_srt_linear_layers: bool = False
     supports_quantized_embeddings: bool = False
+    supports_fsdp: bool = True
+    supports_quantized_cpu_load: bool = False
 
     def get_scaled_act_names(self) -> list[str]:
         return []

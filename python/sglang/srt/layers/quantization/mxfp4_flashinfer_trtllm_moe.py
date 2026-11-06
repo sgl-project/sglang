@@ -13,17 +13,15 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, RoutingMethodType
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import (
-    is_flashinfer_available,
-    log_info_on_rank0,
-    set_weight_attrs,
-)
-from sglang.srt.utils.common import next_power_of_2, print_warning_once
+from sglang.srt.utils import is_flashinfer_available, log_info_on_rank0
+from sglang.srt.utils.log_utils import print_warning_once
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 _MXFP8_QUANTIZE_BACKEND = "cute-dsl" if get_platform().is_sm100 else "cuda"
 

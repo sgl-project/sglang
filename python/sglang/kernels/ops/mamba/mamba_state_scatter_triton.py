@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
-from sglang.srt.utils.common import get_device_core_count
+from sglang.srt.utils.device import get_device_core_count
 
 
 def _require_entry_contiguous_dst(

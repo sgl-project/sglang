@@ -6,22 +6,29 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
-from sglang.srt.arg_groups.overrides import (
-    _speculative_moe_runner_default,
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
+    dspark_dp_a2a_backends,
     model_config_of,
-    record_foreign_defaults,
     resolved_view,
     resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
+    _speculative_moe_runner_default,
+    declare_resolution,
+    record_foreign_defaults,
     run_post_process_pass,
 )
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        DSparkDraftConfig,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -88,7 +95,7 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.hf_transformers import get_config
 
         cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -394,7 +401,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.hf_transformers import get_config
 
             draft_hf_config = get_config(
                 cfg.speculative_draft_model_path,
@@ -545,8 +552,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
-        if cfg.enable_pdmux:
-            raise ValueError("UNO tree mode does not yet support PDMux.")
         if cfg.enable_two_batch_overlap:
             raise ValueError("UNO tree mode does not yet support two-batch overlap.")
         if (
@@ -674,10 +679,13 @@ def _handle_dspark(server_args: ServerArgs) -> None:
     if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe", "mori"):
+        allowed_a2a_backends = dspark_dp_a2a_backends(
+            model_config_of(server_args).hf_config.architectures[0]
+        )
+        if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE), 'megamoe', or 'mori', got "
+                "DSpark with dp attention supports moe_a2a_backend "
+                f"{', '.join(map(repr, allowed_a2a_backends))} for this model, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
         if not _is_npu and (
@@ -802,6 +810,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "gamma resolution. Error: %s",
             e,
         )
+    if draft_config is not None:
+        _publish_dspark_mla_draft_backend(server_args, draft_config)
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:
@@ -883,6 +893,35 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
+def _keep_mla_draft_off_trtllm_mha(
+    draft_backend: Optional[str], *, is_mla: bool
+) -> Optional[str]:
+    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
+    if is_mla and draft_backend == "trtllm_mha":
+        logger.warning("MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
+        return "flashinfer"
+    return draft_backend
+
+
+def _publish_dspark_mla_draft_backend(
+    server_args: ServerArgs, draft_config: DSparkDraftConfig
+) -> None:
+    cfg = resolving_view(server_args)
+    draft_backend = cfg.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    mla_backend = _keep_mla_draft_off_trtllm_mha(
+        draft_backend, is_mla=draft_config.is_mla
+    )
+    if mla_backend != draft_backend:
+        # Declared at launch so the KV planners see the backend the draft runs.
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_draft_attention_backend=mla_backend,
+        )
+
+
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """Resolve `speculative_draft_attention_backend` to a final, supported value.
 
@@ -943,8 +982,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.hf_transformers import get_config
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            parse_dflash_draft_config,
+        )
 
         draft_hf_config = get_config(
             cfg.speculative_draft_model_path,
@@ -963,7 +1005,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        draft_backend = _keep_mla_draft_off_trtllm_mha(
+            draft_backend,
+            is_mla=parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla,
+        )
+        if draft_backend == "trtllm_mha" and not (all_sliding or all_causal):
             fallback_backend = get_fallback_backend()
             # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
             if not current_platform.is_out_of_tree() and get_platform().is_sm100:
@@ -1013,7 +1059,7 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
-    from sglang.srt.utils.hf_transformers_utils import get_config
+    from sglang.srt.hf_transformers import get_config
 
     target = model_config_of(server_args).hf_config
     if target.architectures[0] != "IQuestQ1ForCausalLM":
@@ -1131,6 +1177,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "Xing4_0ForCausalLM",
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
@@ -1457,5 +1504,8 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
+    elif model_arch == ERNIE5_5_MOE_ARCH:
+        # One ECHO step; the cookbook's low-latency recipes pass 2.
+        return (1, 1, 2)
     else:
         return (3, 1, 4)

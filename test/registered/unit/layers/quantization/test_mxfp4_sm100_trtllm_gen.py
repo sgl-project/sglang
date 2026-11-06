@@ -241,7 +241,7 @@ def _ref_trtllm(x, layer, method, precision, top_k, router_logits):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         trtllm_moe_enable_pdl,
     )
-    from sglang.srt.utils.common import next_power_of_2
+    from sglang.srt.utils.triton_utils import next_power_of_2
 
     x_quant, x_scale = _quant_input(x, precision, method.hidden_size)
     # zeros, not empty: the output is compared bit-exact, so any row the kernel

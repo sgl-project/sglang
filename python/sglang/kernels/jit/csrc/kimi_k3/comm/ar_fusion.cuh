@@ -611,17 +611,17 @@ struct AllReduceFusionKernel {
     const auto& push = comm.get_push_obj();
     SymbolicSize N = {"num_elements"};
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     if (residual.has_value()) {
       TensorMatcher({N})  //
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(input)
           .verify(residual.value());
     } else {
       TensorMatcher({N})  //
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(input);
     }
     const auto num_elems = N.unwrap();
@@ -653,8 +653,8 @@ struct AllReduceFusionKernel {
     using namespace host;
     auto params = make_params(comm, input, std::nullopt);
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
-    TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
+    device.set_options<kDLGPU>();
+    TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(weight);
     CHECK_HOST(params.num_vecs % kNormRowVecs == 0)
         << "numel must be a multiple of " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
     const auto num_rows = params.num_vecs / kNormRowVecs;
@@ -677,17 +677,17 @@ struct AllReduceFusionKernel {
     const auto& pull = comm.get_pull_obj();
     SymbolicSize N = {"num_elements"};
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     if (residual.has_value()) {
       TensorMatcher({N})  //
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(input)
           .verify(residual.value());
     } else {
       TensorMatcher({N})  //
           .with_dtype<bf16_t>()
-          .with_device<kDLCUDA>(device)
+          .with_device<kDLGPU>(device)
           .verify(input);
     }
     const auto num_elems = N.unwrap();
@@ -799,12 +799,12 @@ struct AllReduceFusionKernel {
     auto TK = SymbolicSize{"num_expanded"};
     TK.set_value(static_cast<int64_t>(num_tokens) * kFinTopK);
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
-    TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(gemm2_out);
+    device.set_options<kDLGPU>();
+    TensorMatcher({P, kNormDim}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(gemm2_out);
     // trtllm-gen returns the routing weights at the dtype the routing form
     // carries -- fp32 for unpacked, bf16 for packed -- consumed as given
-    TensorMatcher({T, K}).with_dtype<fp32_t, bf16_t>().with_device<kDLCUDA>(device).verify(expert_weights);
-    TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLCUDA>(device).verify(permuted_idx);
+    TensorMatcher({T, K}).with_dtype<fp32_t, bf16_t>().with_device<kDLGPU>(device).verify(expert_weights);
+    TensorMatcher({TK}).with_dtype<int32_t>().with_device<kDLGPU>(device).verify(permuted_idx);
     CHECK_HOST(K.unwrap() == kFinTopK) << "finalize_push_norm is specialized for top_k = " << kFinTopK;
 
     const int64_t nbytes = int64_t(params.num_vecs) * 16;
@@ -866,8 +866,8 @@ struct AllReduceFusionKernel {
     num_blocks = std::min<int64_t>(num_blocks, ref.get()->get_pull_blocks());
     using namespace host;
     SymbolicDevice device;
-    device.set_options<kDLCUDA>();
-    TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLCUDA>(device).verify(weight);
+    device.set_options<kDLGPU>();
+    TensorMatcher({kNormDim}).with_dtype<bf16_t>().with_device<kDLGPU>(device).verify(weight);
     CHECK_HOST(params.num_vecs % kNormRowVecs == 0)
         << "numel must be a multiple of " << kNormDim << ", got " << int64_t(params.num_vecs) * 8;
     const auto num_rows = params.num_vecs / kNormRowVecs;

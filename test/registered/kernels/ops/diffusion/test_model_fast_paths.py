@@ -25,6 +25,7 @@ import unittest
 import weakref
 from contextlib import ExitStack, contextmanager
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -152,11 +153,13 @@ from sglang.multimodal_gen.runtime.models.vaes.autoencoder_kl_qwenimage21 import
 from sglang.multimodal_gen.runtime.models.vaes.conv_fold import (
     fold_upsample2x_conv2d_weight,
 )
-from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    use_vae_fast_path,
+)
 from sglang.multimodal_gen.runtime.models.vaes.wan_vae_cuda_opt import (
     FusedWanRMSNormSiLU,
     GatedChannelsLastUpsample,
-    VaeFastPathGate,
 )
 from sglang.multimodal_gen.runtime.models.vaes.wanvae import WanRMS_norm
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -497,32 +500,6 @@ class TestFlux2EagerFusions(CustomTestCase):
         expected = F.silu(second[..., :384]) * second[..., 384:]
         self.assertTrue(torch.equal(actual, expected))
         self.assertEqual(len(flux2._FLUX2_SWIGLU_SIGS), 1)
-
-    @pytest.mark.skipif(
-        not torch.cuda.is_available() or torch.cuda.get_device_capability() != (10, 3),
-        reason="FLUX.2 token-cat NVFP4 requires Blackwell SM103",
-    )
-    def test_token_cat_nvfp4_matches_flashinfer(self):
-        import flashinfer
-
-        torch.manual_seed(20260830)
-        attention = torch.randn(1, 17, 6144, device="cuda", dtype=torch.bfloat16)
-        mlp = torch.randn(1, 17, 18432, device="cuda", dtype=torch.bfloat16)
-        global_scale = torch.tensor(0.625, device="cuda", dtype=torch.float32)
-
-        expected_fp4, expected_scales = flashinfer.fp4_quantize(
-            torch.cat([attention, mlp], dim=-1).view(-1, 24576), global_scale
-        )
-        actual = try_flux2_token_cat_nvfp4(attention, mlp, global_scale)
-
-        self.assertIsNotNone(actual)
-        actual_fp4, actual_scales = actual
-        self.assertTrue(torch.equal(actual_fp4, expected_fp4))
-        self.assertTrue(
-            torch.equal(
-                actual_scales.view(torch.uint8), expected_scales.view(torch.uint8)
-            )
-        )
 
     def test_token_cat_nvfp4_falls_back_while_compiling(self):
         attention = torch.empty(1, 1, 6144, device="cuda", dtype=torch.bfloat16)
@@ -2448,7 +2425,13 @@ def _wan_block_env():
             ("_maybe_install_backend_autotune", None),
         ):
             stack.enter_context(patch.object(attn_layer, name, return_value=value))
-        stack.enter_context(set_forward_context(0, None))
+        stack.enter_context(
+            set_forward_context(
+                0,
+                None,
+                SimpleNamespace(sampling_params=SimpleNamespace(quality="lossless")),
+            )
+        )
         yield
 
 

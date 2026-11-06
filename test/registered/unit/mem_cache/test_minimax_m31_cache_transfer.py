@@ -40,6 +40,7 @@ from sglang.srt.mem_cache.pool_host.minimax_m3_nvfp4 import (
     MiniMaxM3Nvfp4IndexKPoolHost,
     MiniMaxM3Nvfp4MainKVPoolHost,
 )
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -149,6 +150,12 @@ class CopyingKVManager:
         return 0
 
 
+def static_storage(pool) -> StaticKVStorage:
+    """The storage a static pool registers with PD peers through."""
+    allocator = SimpleNamespace(storage=None, state=None, get_kvcache=lambda: pool)
+    return StaticKVStorage(None, allocator)
+
+
 @pytest.mark.parametrize("length,prefix", [(257, 0), (257, 128), (256, 256)])
 def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     src, dst = make_pool(), make_pool()
@@ -163,30 +170,32 @@ def test_pd_transfer_sends_the_suffix_with_all_scales(length, prefix):
     destination_pages = minimax_index_transfer_pages(
         destination_slots, page_size=128, prefix_len=prefix
     )
+    src_storage, dst_storage = static_storage(src), static_storage(dst)
     src_args, dst_args = KVArgs(), KVArgs()
-    setup_state_kv_args(src_args, src)
-    setup_state_kv_args(dst_args, dst)
+    setup_state_kv_args(src_args, src_storage)
+    setup_state_kv_args(dst_args, dst_storage)
     assert src_args.state_types == [StateType.MINIMAX_INDEX_K]
 
     def state(args):
         return args.state_data_ptrs[0], args.state_data_lens[0], args.state_item_lens[0]
 
-    def kv_layer_ids(pool):
+    def kv_layer_ids(pool, storage):
         return build_kv_layer_ids(
             token_to_kv_pool=pool,
             draft_token_to_kv_pool=None,
             num_draft_entries=0,
             num_hidden_layers=2,
+            storage=storage,
         )
 
     # Main rows pair by layer id like production; the index state is flat.
     channels = [
         (
-            get_kv_transfer_buf_infos(src),
-            get_kv_transfer_buf_infos(dst),
+            get_kv_transfer_buf_infos(src_storage),
+            get_kv_transfer_buf_infos(dst_storage),
             False,
-            kv_layer_ids(src),
-            kv_layer_ids(dst),
+            kv_layer_ids(src, src_storage),
+            kv_layer_ids(dst, dst_storage),
         ),
         (state(src_args), state(dst_args), True, None, None),
     ]
@@ -232,6 +241,7 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
     sender.should_send_kv_chunk.return_value = True
     sender.get_max_transfer_tokens.return_value = None
     scheduler = SimpleNamespace(
+        tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: True),
         token_to_kv_pool_allocator=SimpleNamespace(
             page_size=128, translate_kv_indices_for_transfer=lambda x: x
         ),
@@ -248,7 +258,8 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
         disagg_prefill_pending_chunk_rids=set(),
     )
     req = SimpleNamespace(
-        kv=SimpleNamespace(req_pool_idx=0),
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=length),
+        skip_radix_cache_insert=False,
         origin_input_ids=list(range(length)),
         rid="prefix-hit",
         start_send_idx=prefix,
@@ -489,8 +500,10 @@ def test_unsupported_stack_fails_before_allocating_host_memory(case):
 def dspark_params(target, draft):
     return CacheInitParams(
         False,
-        None,
-        SimpleNamespace(get_kvcache=lambda: target),
+        # A request table without recurrent-state slots.
+        SimpleNamespace(holds_state_slots=False),
+        # A static allocator: no unified KV storage.
+        SimpleNamespace(get_kvcache=lambda: target, storage=None),
         128,
         sidecar_draft_device_pools=(draft,),
     )

@@ -518,7 +518,12 @@ Set `--disagg-p2p-hostname` to the actual IP on each machine. For multi-machine,
   </tbody>
 </table>
 
-If not specified, parallelism is auto-derived from `--num-gpus`.
+Role-specific flags take precedence over explicitly set generic flags such as
+`--tp-size` and `--sp-degree`. Otherwise, parallelism is auto-derived for each
+role's `--num-gpus` (or its GPU list in the Python pool API). Automatic CFG,
+sequence-parallel and HSDP choices from the parent configuration are not reused
+for a role with a different device count. Explicit incompatible settings still
+raise an error; they are not silently reduced to fit.
 
 ## Other Options
 

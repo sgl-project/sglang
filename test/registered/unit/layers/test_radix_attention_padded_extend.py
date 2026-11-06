@@ -5,7 +5,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import graph_utils as radix_attention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

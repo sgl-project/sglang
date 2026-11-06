@@ -30,11 +30,8 @@ never fire, and the family's 0.1 would be silently replaced by the generic 0.8.
 
 import unittest
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolution_result,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.runtime_context import get_schedule, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci

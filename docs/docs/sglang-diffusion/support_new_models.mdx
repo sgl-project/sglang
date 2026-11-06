@@ -244,6 +244,15 @@ Prefer this order:
    offload, profiling, disaggregation, batching, and future stage-level
    optimizations.
 
+Custom sampling loops must call `self.check_cancelled(batch)` between sampling
+steps, including inner steps of chunked generation. For grouped requests, pass
+the full request list. Every participating replica rank must reach the same
+checkpoints in the same order, outside CUDA graph capture. Progress bars only
+report progress; changing their update frequency must not change cancellation.
+Executors check between stages, including rank-only stages, and unwind component
+residency on cancellation. Do not call collective checks from rank-only helpers
+or background output threads.
+
 ## Implement the Pieces
 
 ### 1. Sampling Params

@@ -12,6 +12,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 # The run shape MiniMax-M3 CP was validated on; only the draft layout varies below.
 SUPPORTED = dict(
     gfx950=True,
+    sm90=False,
     tp_size=4,
     attn_tp_size=4,
     attn_cp_size=1,
@@ -52,6 +53,46 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
                     **{
                         **SUPPORTED,
                         "draft_is_chain": draft_is_chain_layout(algorithm, eagle_topk),
+                    }
+                )
+                self.assertEqual(reason is None, expected, reason)
+
+    def test_sm90_enables_only_validated_topologies(self):
+        """Each rank must serve exactly one index head of the four; any other split,
+        or another attention CP/DP layout, would merge candidates for the wrong query."""
+        enabled = {
+            (4, 4, 1, 1): True,
+            (8, 8, 1, 1): True,  # head pairs replicated across ranks
+            (2, 2, 1, 1): False,  # two index heads per rank
+            (8, 4, 1, 2): False,  # DP attention not validated
+            (8, 4, 2, 1): False,
+        }
+        for (tp, attn_tp, attn_cp, attn_dp), expected in enabled.items():
+            with self.subTest(tp=tp, attn_tp=attn_tp, attn_cp=attn_cp, attn_dp=attn_dp):
+                reason = unsupported_reason(
+                    **{
+                        **SUPPORTED,
+                        "gfx950": False,
+                        "sm90": True,
+                        "tp_size": tp,
+                        "attn_tp_size": attn_tp,
+                        "attn_cp_size": attn_cp,
+                        "attn_dp_size": attn_dp,
+                    }
+                )
+                self.assertEqual(reason is None, expected, reason)
+        for gfx950, sm90, attn_tp, expected in (
+            (True, False, 8, False),  # TP8 is validated on SM90 only
+            (False, False, 4, False),  # other CUDA architectures stay off
+        ):
+            with self.subTest(gfx950=gfx950, sm90=sm90, attn_tp=attn_tp):
+                reason = unsupported_reason(
+                    **{
+                        **SUPPORTED,
+                        "gfx950": gfx950,
+                        "sm90": sm90,
+                        "tp_size": attn_tp,
+                        "attn_tp_size": attn_tp,
                     }
                 )
                 self.assertEqual(reason is None, expected, reason)

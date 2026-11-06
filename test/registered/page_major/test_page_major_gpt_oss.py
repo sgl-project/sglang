@@ -1,7 +1,7 @@
 """Unified memory pool on a hybrid-SWA MoE model, across the backend matrix.
 
 gpt-oss-20b is uniform-row hybrid-SWA, so its MHA and SWA sub-pools are
-per-layer views and the fa3 cell reads them through the translator's read
+per-layer views and the fa3 cell reads them through the `RunnerIds`' read
 tables. flashinfer is absent on purpose: gpt-oss uses attention sinks, which
 it does not support.
 """
@@ -59,7 +59,7 @@ class TestUnifiedGptOssTriton(DefaultServerBase):
 
 
 class TestUnifiedGptOssFa3(TestUnifiedGptOssTriton):
-    """fa3 pinned: the per-layer views read through the translator's read
+    """fa3 pinned: the per-layer views read through the `RunnerIds`' read
     tables (eager direct-bind + captured fused copy)."""
 
     other_args = _UNIFIED_COMMON_ARGS + ["--attention-backend", "fa3"]

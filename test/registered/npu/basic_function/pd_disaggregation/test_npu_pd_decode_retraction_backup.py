@@ -26,7 +26,7 @@ os.environ.setdefault("SGLANG_TEST_PD_DISAGG_BACKEND", "ascend")
 
 import requests
 
-from sglang.bench_serving import get_tokenizer
+from sglang.benchmark.utils import get_tokenizer
 from sglang.test.ascend.test_ascend_utils import (
     LLAMA_3_2_1B_INSTRUCT_WEIGHTS_PATH,
 )

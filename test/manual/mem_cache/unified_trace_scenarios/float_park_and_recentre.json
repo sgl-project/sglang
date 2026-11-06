@@ -1,0 +1,20 @@
+{"name": "float_park_and_recentre", "chain": "tri", "page_size": 16, "lazy": true, "ops": [
+  {"op": "extend", "req": 0, "n": 64},
+  {"op": "extend", "req": 1, "n": 64},
+  {"op": "extend", "req": 2, "n": 64},
+  {"op": "extend", "req": 3, "n": 64},
+  {"op": "extend", "req": 4, "n": 64},
+  {"op": "extend", "req": 5, "n": 64},
+  {"op": "retire", "req": 0, "upto": 64},
+  {"op": "retire", "req": 1, "upto": 64},
+  {"op": "retire", "req": 2, "upto": 64},
+  {"op": "retire", "req": 3, "upto": 64},
+  {"op": "retire", "req": 4, "upto": 64},
+  {"op": "retire", "req": 5, "upto": 64},
+  {"op": "flush"},
+  {"op": "extend", "req": 10, "n": 32},
+  {"op": "decode", "reqs": [10]},
+  {"op": "free", "req": 10},
+  {"op": "flush"},
+  {"op": "extend", "req": 11, "n": 48}
+]}

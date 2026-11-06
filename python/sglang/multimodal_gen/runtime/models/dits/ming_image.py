@@ -8,7 +8,9 @@ from torch.nn import functional as F
 
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
+    can_use_rmsnorm_cast_before_weight,
     fused_packed_silu_mul_bitexact,
+    rmsnorm_cast_before_weight_bitexact,
 )
 from sglang.multimodal_gen.runtime.distributed import get_sp_world_size
 from sglang.multimodal_gen.runtime.distributed.sp_shard_utils import (
@@ -26,6 +28,8 @@ _MING_SWIGLU_FUSION = BitExactFusionGate(
     "Ming-Image packed SiLU-mul", per_signature=True
 )
 
+_MING_RMSNORM_FUSION = BitExactFusionGate("Ming-Image RMSNorm", per_signature=True)
+
 
 def _eager_silu_and_mul(x: torch.Tensor) -> torch.Tensor:
     gate, up = x.chunk(2, dim=-1)
@@ -36,6 +40,41 @@ class MingRMSNorm(RMSNorm):
     def __init__(self, dim, eps=1e-5):
         # unlike Z-Image, Ming's reference accumulates the variance in fp32
         super().__init__(dim, eps=eps, cast_x_before_out_mul=True, force_native=True)
+
+    def forward_native(
+        self, x, residual=None, post_residual_addition=None, quant_linear=None
+    ):
+        native = super().forward_native
+        if (
+            torch.compiler.is_compiling()
+            or residual is not None
+            or x.shape[-1] != self.hidden_size
+            or self.weight.dtype != x.dtype
+            or not self.weight.is_contiguous()
+            or not can_use_rmsnorm_cast_before_weight(
+                device=x.device,
+                dtype=x.dtype,
+                contiguous=x.is_contiguous(),
+                eps=self.variance_epsilon,
+            )
+        ):
+            return native(x, residual, post_residual_addition, quant_linear)
+        return _MING_RMSNORM_FUSION.run(
+            lambda: rmsnorm_cast_before_weight_bitexact(
+                x, self.weight, self.variance_epsilon
+            ),
+            lambda: native(x),
+            sig=(
+                x.device.index,
+                x.dtype,
+                x.shape[-1],
+                x.numel() // x.shape[-1] >= 16,
+                x.numel() >= 2**29,
+                self.variance_epsilon,
+            ),
+            logger=logger,
+            reraise=(ValueError,),
+        )
 
 
 class MingSiluAndMul(nn.Module):

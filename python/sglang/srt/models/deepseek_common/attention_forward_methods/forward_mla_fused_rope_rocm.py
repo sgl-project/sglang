@@ -10,7 +10,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    get_token_to_kv_pool,
+    get_kv_layers,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -130,10 +130,10 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
             )
 
         # save current latent cache.
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mqa.layer_id).store(
             self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
         )
-        key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
+        key_cache_buf = get_kv_layers().read(self.attn_mqa.layer_id).key()
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
         return (
@@ -197,7 +197,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store(
                 self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
             )
 

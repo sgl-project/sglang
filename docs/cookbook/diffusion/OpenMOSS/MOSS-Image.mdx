@@ -70,6 +70,11 @@ attention backends identical. `quality=lossless` can additionally enable shared
 VAE fast paths. Compare each configuration against its matched reference rather
 than treating either quality name as a cross-backend guarantee.
 
+`quality=high` combines each joint DiT block's Q, K, and V projections into one
+GEMM. This can change BF16 rounding and the generated image. `exact` and `lossless`
+retain separate projections; switching quality on a later request restores that
+path without reloading the checkpoint.
+
 ## 4. Deployment features
 
 Component and layerwise offload reuse the standard residency manager. Start with

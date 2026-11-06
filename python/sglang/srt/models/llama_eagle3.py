@@ -14,8 +14,8 @@ limitations under the License.
 """
 
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_spec
-from sglang.srt.utils import add_prefix
 
 # Adapted from
 # https://github.com/SafeAILab/EAGLE/blob/main/eagle/model/cnets.py

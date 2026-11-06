@@ -22,7 +22,7 @@ class TestHcConsumer(unittest.TestCase):
     def test_dspark_tap_hands_materialized_stream_to_next_layer(self):
         from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import deepseek_v4
 
         class Layer(torch.nn.Module):
@@ -108,7 +108,7 @@ class TestAttentionCompletion(unittest.TestCase):
     def test_projection_and_deferred_sum_preserve_full_precision_policy(self):
         from sglang.srt.layers import linear
         from sglang.srt.layers.moe import utils as moe_utils
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import deepseek_v4
         from sglang.srt.runtime_context import get_forward
 

@@ -31,6 +31,14 @@
                 "expected_e2e_ms": 17742.04
             }
         },
+        "b200-cirrascale2": {
+            "flux1_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 1471.19
+            },
+            "qwen_image_2512_modelopt_nvfp4_t2i": {
+                "expected_e2e_ms": 17346.65
+            }
+        },
         "b200-cirrascale3-0123": {
             "flux1_modelopt_nvfp4_t2i": {
                 "expected_e2e_ms": 1470.24

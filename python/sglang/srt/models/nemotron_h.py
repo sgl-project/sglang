@@ -17,6 +17,7 @@
 
 """Inference-only NemotronH model."""
 
+import logging
 from collections.abc import Iterable
 from functools import lru_cache, partial
 
@@ -24,8 +25,7 @@ import torch
 from torch import nn
 
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs import NemotronHConfig
-from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE
+from sglang.srt.configs.nemotron_h import ATTENTION, MAMBA, MLP, MOE, NemotronHConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -60,17 +60,16 @@ from sglang.srt.layers.quantization import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     DEFAULT_VOCAB_PADDING_SIZE,
     ParallelLMHead,
     VocabParallelEmbedding,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
     eager_on_graph,
@@ -91,14 +90,13 @@ from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_exec, get_model, get_parallel, get_schedule
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     get_current_device_stream_fast,
     is_cuda,
     is_sm120,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_cuda = is_cuda()
 
@@ -178,7 +176,7 @@ class _PrefillSharedExpertCall:
         self.done = torch.cuda.Event(external=True)
         self.output = None
 
-    def launch(self, module, hidden_states):
+    def launch(self, module, hidden_states) -> None:
         main_stream = torch.cuda.current_stream()
         with torch.cuda.stream(self.stream):
             if self.graph is None:
@@ -189,10 +187,9 @@ class _PrefillSharedExpertCall:
                 self.output.record_stream(main_stream)
             else:
                 self.graph.replay()
-        return self.output
 
 
-def _capture_prefill_shared_expert(module, hidden_states, call):
+def _capture_prefill_shared_expert(module, hidden_states, call) -> None:
     call.graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(
         call.graph,
@@ -204,14 +201,13 @@ def _capture_prefill_shared_expert(module, hidden_states, call):
         call.done.record()
     # The ready record belongs to the preceding main-stream graph. Do not
     # replay here: that graph has only been captured, not launched yet.
-    return call.output
 
 
-@eager_on_graph(True, capture_stub=_capture_prefill_shared_expert)
-def _launch_prefill_shared_expert(module, hidden_states, call):
+@eager_on_graph(True, on_capture=_capture_prefill_shared_expert)
+def _launch_prefill_shared_expert(module, hidden_states, call) -> None:
     # BCG retains this call, its graph, events and output until graph cleanup.
     # A replay launches on the same explicit stream for every layer.
-    return call.launch(module, hidden_states)
+    call.launch(module, hidden_states)
 
 
 def _latent_proj_fuses_shared_add(projection: nn.Module) -> bool:
@@ -443,9 +439,8 @@ class NemotronHMoE(nn.Module):
         # one explicit stream, preserving overlap with the routed experts.
         call = _PrefillSharedExpertCall(_get_or_create_alt_stream(self.device_module))
         call.ready.record()
-        shared_output = _launch_prefill_shared_expert(
-            self.shared_experts, hidden_states, call
-        )
+        _launch_prefill_shared_expert(self.shared_experts, hidden_states, call)
+        shared_output = call.output
         router_logits = torch.mm(
             hidden_states, self.gate.weight.t(), out_dtype=torch.float32
         )
