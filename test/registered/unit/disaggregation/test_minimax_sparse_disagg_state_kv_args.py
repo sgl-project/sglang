@@ -4,7 +4,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.base.conn import KVArgs
+from sglang.srt.disaggregation.base.conn import KVArgs, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.utils import setup_state_kv_args
 from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -65,6 +65,50 @@ def _make_kv_pool(start_layer: int = 0) -> MiniMaxSparseKVPool:
 
 
 class TestMiniMaxSparseDisaggStateKvArgs(unittest.TestCase):
+    def test_pp_stage_publishes_global_layer_ids(self):
+        # Layers 0-1 dense, 2-5 sparse; the second of two PP stages owns 3..5.
+        def make_pool(start_layer, end_layer):
+            return MiniMaxSparseKVPool(
+                size=8,
+                page_size=4,
+                dtype=torch.float32,
+                head_num=2,
+                head_dim=8,
+                idx_head_dim=16,
+                dense_layer_ids=[0, 1],
+                sparse_layer_ids=[2, 3, 4, 5],
+                disable_value_sparse_layer_ids=[2, 3, 4, 5],
+                device="cpu",
+                start_layer=start_layer,
+                end_layer=end_layer,
+            )
+
+        for (start, end), main_ids, index_ids, dense_ids in (
+            ((0, 6), [2, 3, 4, 5] * 2, [2, 3, 4, 5], [0, 1] * 2),
+            ((1, 3), [2] * 2, [2], [1] * 2),
+            ((3, 6), [3, 4, 5] * 2, [3, 4, 5], None),
+        ):
+            with self.subTest(start=start, end=end):
+                pool = make_pool(start, end)
+                storage = _static_storage(pool)
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, storage)
+                self.assertEqual(
+                    list(storage.regions(storage.owner).layer_ids), main_ids
+                )
+                self.assertEqual(
+                    len(main_ids), len(storage.regions(storage.owner).ptrs)
+                )
+                expected_types = [StateType.MINIMAX_INDEX_K]
+                expected_ids = [index_ids]
+                if dense_ids is not None:
+                    expected_types.append(StateType.MINIMAX_DENSE_KV)
+                    expected_ids.append(dense_ids)
+                self.assertEqual(kv_args.state_types, expected_types)
+                self.assertEqual(kv_args.state_layer_ids, expected_ids)
+                for ptrs, ids in zip(kv_args.state_data_ptrs, expected_ids):
+                    self.assertEqual(len(ptrs), len(ids))
+
     def test_index_kv_pool_raises(self):
         pool = _make_kv_pool()
         self.assertIsNotNone(pool.index_kv_pool)
