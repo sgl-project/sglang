@@ -28,7 +28,7 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import post_experts_all_reduce
+from sglang.srt.layers.moe import get_moe_a2a_backend, post_experts_all_reduce
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -95,6 +95,7 @@ class HYV3MoEFused(nn.Module):
         alt_stream: Optional[torch.cuda.Stream] = None,
     ):
         super().__init__()
+        self.is_mori = get_moe_a2a_backend().is_mori()
         self.layer_id = layer_id
         self.alt_stream = alt_stream
         self.n_routed_experts = config.num_experts
@@ -169,6 +170,17 @@ class HYV3MoEFused(nn.Module):
             return self._forward_dual_stream(hidden_states)
         return self._forward_single_stream(hidden_states)
 
+    def _reduce_outputs(
+        self, routed_output: torch.Tensor, shared_output: Optional[torch.Tensor]
+    ) -> torch.Tensor:
+        if self.is_mori:
+            if shared_output is None:
+                return routed_output
+            return routed_output + post_experts_all_reduce(shared_output)
+        if shared_output is not None:
+            routed_output = routed_output + shared_output
+        return post_experts_all_reduce(routed_output)
+
     def _forward_single_stream(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_dim = hidden_states.shape[-1]
@@ -176,18 +188,14 @@ class HYV3MoEFused(nn.Module):
 
         router_logits, _ = self.gate(hidden_states.to(dtype=torch.float32))
         topk_output = self.topk(hidden_states, router_logits)
+        shared_output = None
         if self.shared_mlp is not None:
             shared_output = self.shared_mlp(hidden_states)
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
-            final_hidden_states = final_hidden_states + shared_output
-        else:
-            final_hidden_states = self.experts(
-                hidden_states=hidden_states, topk_output=topk_output
-            )
+        final_hidden_states = self.experts(
+            hidden_states=hidden_states, topk_output=topk_output
+        )
 
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        final_hidden_states = self._reduce_outputs(final_hidden_states, shared_output)
 
         return final_hidden_states.view(orig_shape)
 
@@ -210,9 +218,8 @@ class HYV3MoEFused(nn.Module):
             )
 
         current_stream.wait_stream(self.alt_stream)
-        final_hidden_states = final_hidden_states + shared_output
 
-        final_hidden_states = post_experts_all_reduce(final_hidden_states)
+        final_hidden_states = self._reduce_outputs(final_hidden_states, shared_output)
 
         return final_hidden_states.view(orig_shape)
 
