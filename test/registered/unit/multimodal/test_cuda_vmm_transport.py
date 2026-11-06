@@ -15,19 +15,16 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.cuda_vmm_transport_utils import (
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport.cuda_vmm import (
     CudaVmmFeatureTransport,
     CudaVmmMemoryPool,
     CudaVmmPackedTensorTransportProxy,
     _imported_pool_cache_clear,
     _PosixFdBroker,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -495,11 +492,11 @@ class TestCudaVmmTransport(CustomTestCase):
     def test_posix_export_fd_closes_when_allocation_setup_fails(self):
         with (
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.tensor_from_pointer",
+                "sglang.srt.multimodal.transport.cuda_vmm.tensor_from_pointer",
                 side_effect=RuntimeError("forced storage failure"),
             ),
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.os.close",
+                "sglang.srt.multimodal.transport.cuda_vmm.os.close",
                 wraps=os.close,
             ) as close_fd,
             self.assertRaisesRegex(RuntimeError, "forced storage failure"),
@@ -514,7 +511,7 @@ class TestCudaVmmTransport(CustomTestCase):
         close_broker = _PosixFdBroker.close
         with (
             patch(
-                "sglang.srt.utils.cuda_vmm_transport_utils.torch.cuda.Stream",
+                "sglang.srt.multimodal.transport.cuda_vmm.torch.cuda.Stream",
                 side_effect=RuntimeError("forced stream failure"),
             ),
             patch.object(

@@ -28,6 +28,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
@@ -53,14 +54,13 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.glm4 import Glm4Model
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_npu
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 logger = logging.getLogger(__name__)
 

@@ -47,6 +47,8 @@ import aiohttp
 import numpy as np
 import orjson
 import requests
+import setproctitle
+import torch
 import uvicorn
 import uvloop
 from fastapi import (
@@ -70,7 +72,7 @@ from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
     AnthropicCountTokensRequest,
     AnthropicMessagesRequest,
@@ -81,8 +83,6 @@ from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
     node_hosts_rust_server,
-    run_detokenizer_process,
-    run_scheduler_process,
 )
 from sglang.srt.entrypoints.ollama.protocol import (
     OllamaChatRequest,
@@ -126,6 +126,7 @@ from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
+from sglang.srt.managers.detokenizer_manager import run_detokenizer_process
 from sglang.srt.managers.io_struct import (
     AbortReq,
     AttachHiCacheStorageReqInput,
@@ -165,13 +166,16 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
-    TokenizerWorker,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     write_data_for_multi_tokenizer,
 )
-from sglang.srt.managers.tokenizer_manager import ServerStatus, TokenizerManager
+from sglang.srt.managers.scheduler import run_scheduler_process
+from sglang.srt.managers.tokenizer_manager import (
+    ServerStatus,
+    TokenizerManager,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.observability.func_timer import enable_func_timer
 from sglang.srt.observability.http_request_metrics import (
     add_http_request_metrics_middleware,
@@ -221,7 +225,7 @@ WAIT_WEIGHTS_READY_TIMEOUT = int(os.getenv("SGLANG_WAIT_WEIGHTS_READY_TIMEOUT", 
 # Store global states
 @dataclasses.dataclass
 class _GlobalState:
-    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter, TokenizerWorker]
+    tokenizer_manager: Union[TokenizerManager, MultiTokenizerRouter]
     template_manager: TemplateManager
     scheduler_info: Dict
 
@@ -269,6 +273,8 @@ async def init_multi_tokenizer() -> ServerArgs:
     )
 
     # Launch multi-tokenizer manager process
+    setproctitle.setproctitle(f"sglang::tokenizer_worker:{os.getpid()}")
+    torch.set_num_threads(1)
     tokenizer_worker_class = get_tokenizer_worker_class(server_args)
     tokenizer_manager = tokenizer_worker_class(server_args, port_args)
     template_manager = TemplateManager()
@@ -305,7 +311,7 @@ async def lifespan(fast_api_app: FastAPI):
     else:
         # Initialize multi-tokenizer support for worker processes
         server_args = await init_multi_tokenizer()
-        worker_id = _global_state.tokenizer_manager.worker_id
+        worker_id = os.getpid()
         warmup_thread_kwargs = _multi_tokenizer_warmup_kwargs(server_args, worker_id)
         thread_label = f"MultiTokenizer-{worker_id}"
 
@@ -1876,8 +1882,10 @@ async def openai_v1_chat_completions(
 )
 async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     """OpenAI-compatible embeddings endpoint."""
-    return await raw_request.app.state.openai_serving_embedding.handle_request(
-        request, raw_request
+    return model_json_response(
+        await raw_request.app.state.openai_serving_embedding.handle_request(
+            request, raw_request
+        )
     )
 
 
@@ -2289,7 +2297,8 @@ def _get_vlm_warmup_image_base64(model_info: dict) -> str:
     architectures = model_info.get("architectures") or []
     if (
         "KimiK3ForConditionalGeneration" in architectures
-        or model_info.get("model_type") == "kimi_k3"
+        or "KimiK31ForConditionalGeneration" in architectures
+        or model_info.get("model_type") in ("kimi_k3", "kimi_k31")
     ):
         logger.info(
             "Using a 448x448 image for Kimi K3 VLM startup warmup to exercise "

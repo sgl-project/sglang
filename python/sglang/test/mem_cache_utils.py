@@ -1,6 +1,6 @@
 """Shared helpers for mem_cache unit tests."""
 
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH
+from sglang.srt.managers.req_types import FINISH_LENGTH
 
 
 def finish_req(cache, req, up_to):

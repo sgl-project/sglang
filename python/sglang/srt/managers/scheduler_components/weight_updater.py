@@ -16,7 +16,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_KV_CACHE,
     GPU_MEMORY_TYPE_WEIGHTS,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -44,8 +44,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
+from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.runtime_context import get_model, get_parallel
-from sglang.srt.utils.weight_checker import overall_checksum
 
 logger = logging.getLogger(__name__)
 

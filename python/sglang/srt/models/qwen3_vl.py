@@ -29,6 +29,7 @@ from transformers.activations import ACT2FN
 
 from sglang.srt.configs.qwen3_vl import Qwen3VLConfig, Qwen3VLVisionConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.vision import (
     BATCH_BUCKETS,
     FLASHINFER_MAX_SEQLEN_BUCKETS,
@@ -63,11 +64,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
@@ -80,6 +77,7 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
@@ -95,7 +93,6 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)

@@ -94,6 +94,11 @@ from sglang.srt.layers.cp.utils import (
 from sglang.srt.layers.dp_attention import get_dp_tp_group
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
+from sglang.srt.layers.offloader import (
+    create_offloader,
+    get_offloader,
+    set_offloader,
+)
 from sglang.srt.layers.sampler import create_sampler
 from sglang.srt.lora.lora_manager import LoRAManager, init_lora_cuda_graph_moe_buffers
 from sglang.srt.lora.lora_registry import LoRARef
@@ -198,7 +203,9 @@ from sglang.srt.model_executor.runner import (
     EagerRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.weight_checker import WeightChecker
 from sglang.srt.models.unlimited_ocr_v2_support.greedy_graph import UocrGreedyGraph
+from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     assert_published,
@@ -220,11 +227,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.sampling.sampling_observer import SamplingObserver
 from sglang.srt.sampling.watermarking.core import WatermarkState
-from sglang.srt.server_args import (  # noqa: F401  (re-export)
-    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
-    ServerArgs,
-    add_chunked_prefix_cache_attention_backend,
-)
+from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.adaptive_spec_params import (
     resolve_candidate_steps_from_config,
 )
@@ -256,14 +259,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.offloader import (
-    create_offloader,
-    get_offloader,
-    set_offloader,
-)
-from sglang.srt.utils.profile_utils import build_step_span_name
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_checker import WeightChecker
 
 _is_npu = is_npu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -502,7 +498,9 @@ class ModelRunner:
         self.init_torch_distributed()
 
         # Init forward stream for overlap schedule
-        self.forward_stream = torch.get_device_module(self.device).Stream()
+        self.forward_stream = torch.get_device_module(self.device).Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
 
         # Read-done mailbox: the scheduler's WAR barrier reads it from the runner
         # its worker names, and treats None as the coarse whole-forward fence.
@@ -1022,9 +1020,21 @@ class ModelRunner:
             self.memory_pool_config = memory_pool_config
 
         self.init_kv_cache_configurator(draft_parallel_layout)
+        expert_slots = None
+        if get_exec().moe.enable_paged_experts and (
+            get_exec().moe.paged_experts_num_resident in (None, "auto")
+        ):
+            # --paged-experts-num-resident auto: the KV cache first, then the expert slots.
+            from sglang.srt.layers.moe.paged_experts.sizing import ExpertSlotSizing
+
+            expert_slots = ExpertSlotSizing.for_model(
+                self.model, self.kv_cache_configurator, self.pre_model_load_memory
+            )
         result = self.kv_cache_configurator.configure(
             pre_model_load_memory=self.pre_model_load_memory
         )
+        if expert_slots is not None:
+            expert_slots.size(result.max_total_num_tokens)
         self.max_total_num_tokens = result.max_total_num_tokens
         self.max_running_requests = result.max_running_requests
         self.req_to_token_pool = result.req_to_token_pool
@@ -1497,6 +1507,13 @@ class ModelRunner:
 
     def maybe_precompile_model_kernels_after_loading(self) -> None:
         maybe_precompile_model_kernels_after_loading(self.model, self.device)
+
+    def _uses_cpu_graph_attention_backend(self) -> bool:
+        return (
+            self.device == "cpu"
+            and self.prefill_attention_backend_str == "intel_amx"
+            and self.decode_attention_backend_str == "intel_amx"
+        )
 
     def maybe_init_dwdp(self):
         if self.is_draft_worker:
