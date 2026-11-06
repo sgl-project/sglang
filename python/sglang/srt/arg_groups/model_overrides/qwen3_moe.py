@@ -9,21 +9,12 @@ from sglang.srt.arg_groups.model_override_base import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config
+from sglang.srt.utils.common import (
+    get_mixed_precision_moe_quant_algos,
+    get_quantization_config,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _mixed_precision_moe_quant_algos(hf_config: Any) -> set:
-    """quant_algo values ModelOpt MIXED_PRECISION assigns to `*.experts` layers."""
-    quantization_config = getattr(hf_config, "quantization_config", None)
-    if not isinstance(quantization_config, dict):
-        return set()
-    return {
-        str(info.get("quant_algo", "")).upper()
-        for name, info in quantization_config.get("quantized_layers", {}).items()
-        if ".experts" in name and isinstance(info, dict)
-    }
 
 
 @_register_for(
@@ -50,7 +41,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             quantization = quant_method
         has_w4a16_moe_layers = (
             quantization == "modelopt_mixed"
-            and "W4A16_NVFP4" in _mixed_precision_moe_quant_algos(hf_config)
+            and "W4A16_NVFP4" in get_mixed_precision_moe_quant_algos(hf_config)
         )
         if has_w4a16_moe_layers:
             # trtllm-gen only has the W4A4 NVFP4 MoE path.
