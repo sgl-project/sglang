@@ -30,6 +30,7 @@ class _Req:
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
         self.token_indices_to_pool = None
+        self.uniboost_commit_hold = False
 
     def init_next_round_input(self, tree_cache=None):
         pass
@@ -73,6 +74,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.min_free_slots_delayer = None
         s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.decode_preemptor = None
         s.processed_tokens_counter = 0
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None

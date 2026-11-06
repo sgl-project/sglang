@@ -107,6 +107,14 @@ class RequestRetirer:
             release_kv_cache(req, self.tree_cache, checkpoint=False)
         return resumable
 
+    def release_for_resume(self, req: Req) -> None:
+        """Release a decoding request that will resume (uniboost decode
+        time-slicing) into the radix tree, so it resumes from its own cached
+        KV; retract instead frees it uncheckpointed to make room now."""
+        if req.kv.holds_kv and self.hisparse_coordinator is not None:
+            self.hisparse_coordinator.retract_req(req)
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
+
     def abort_retracted(self, req: Req, *, reason: FINISH_ABORT) -> None:
         """Abort a retracted request that will not be requeued. Not finished in place:
         a step launched before the retraction may still carry it and report it again."""

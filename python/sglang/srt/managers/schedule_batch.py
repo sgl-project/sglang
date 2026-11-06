@@ -862,6 +862,19 @@ class Req(ReqDllmMixin):
         # Snapshot of the scheduler prefill-token counter taken at waiting_queue entry; used by HRRN aging.
         self.arrival_processed_tokens: int = 0
 
+        # UniBoost arrival A(r) on its token / wall clock, stamped once when
+        # first sorted; reset_for_retract keeps them (seniority survives).
+        self.uniboost_arrival_tokens: Optional[int] = None
+        self.uniboost_arrival_s: Optional[float] = None
+        # UniBoost commit gate: held out of the current admission pass, and
+        # when its first hold began (bounds the cumulative hold).
+        self.uniboost_commit_hold = False
+        self.uniboost_commit_hold_first_s: Optional[float] = None
+        # UniBoost decode time-slicing (decode_preemption.py): releases so far,
+        # and len(output_ids) at the latest admission (the quantum counts from it).
+        self.num_preemptions = 0
+        self.preempt_resume_output_len = 0
+
     def get_mm_token_counts(self) -> Tuple[int, int, int]:
         """Return per-modality prompt counts, scanning media at most once."""
         if not self.mm_token_counts_ready and self.multimodal_inputs is not None:
@@ -3037,6 +3050,22 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             request_retirer=request_retirer,
             offload_kv=offload_kv,
         )
+
+    def preempt_decode(
+        self, indices: Tuple[int, ...], request_retirer: RequestRetirer
+    ) -> List[Req]:
+        """Release the requests at ``indices`` into the radix tree so they
+        resume from their cached KV, and drop them from the batch; returns them
+        in index order."""
+        drop = set(indices)
+        preempted = [self.reqs[i] for i in sorted(drop)]
+        for req in preempted:
+            request_retirer.release_for_resume(req)
+            req.reset_for_retract()
+        self.filter_batch(
+            keep_indices=[i for i in range(len(self.reqs)) if i not in drop]
+        )
+        return preempted
 
     def prepare_encoder_info_decode(self):
         # Reset the encoder cached status

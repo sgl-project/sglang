@@ -137,6 +137,10 @@ from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.decode_preemption import (
+    DecodePreemptor,
+    available_and_evictable_tokens,
+)
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
@@ -715,6 +719,7 @@ class Scheduler(
 
         # Init schedule policy and new token estimation
         self.init_schedule_policy()
+        self.maybe_init_decode_preemptor()
 
         # Init watchdog, memory saver, input blocker and recv skipper
         self.init_watch_dog_memory_saver_input_blocker()
@@ -1504,6 +1509,17 @@ class Scheduler(
             metrics_collector=self.metrics_collector,
         )
 
+    def maybe_init_decode_preemptor(self):
+        """UniBoost decode time-slicing for first-token-starved waiters; None when off."""
+        self.decode_preemptor = DecodePreemptor.maybe_create(
+            wait_s=get_schedule().uniboost_preempt_wait_s,
+            quantum_tokens=get_schedule().uniboost_preempt_quantum_tokens,
+            max_per_req=get_schedule().uniboost_preempt_max_per_req,
+            dp_rank=get_parallel().dp_rank or 0,
+            tree_supports_mamba=self.tree_cache.supports_mamba(),
+            tree_supports_swa=self.tree_cache.supports_swa(),
+        )
+
     def init_schedule_policy(self):
         # Init schedule policy and new token estimation
         self.policy = SchedulePolicy(
@@ -1512,6 +1528,11 @@ class Scheduler(
             self.enable_hierarchical_cache,
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
+            uniboost_gamma=get_schedule().uniboost_gamma,
+            uniboost_bin_size=get_schedule().uniboost_bin_size,
+            uniboost_clock=get_schedule().uniboost_clock,
+            uniboost_adaptive_gamma=get_schedule().uniboost_adaptive_gamma,
+            uniboost_adaptive_max_jump_s=get_schedule().uniboost_adaptive_max_jump_s,
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -4344,8 +4365,13 @@ class Scheduler(
                     if self.disagg_prefill_bootstrap_queue is not None
                     else []
                 ),
+                chunked_req=self.chunked_req,
             )
         )
+        if self.decode_preemptor is not None:
+            self.waiting_queue.replace(
+                self.decode_preemptor.promote_target(self.waiting_queue)
+            )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4435,6 +4461,9 @@ class Scheduler(
             if adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                continue
+            # Set by the uniboost commit gate for this pass only.
+            if req.uniboost_commit_hold:
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4582,6 +4611,8 @@ class Scheduler(
             )
 
         new_batch.prepare_for_extend()
+        if self.decode_preemptor is not None:
+            self.decode_preemptor.on_admitted(can_run_list)
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
@@ -4764,6 +4795,31 @@ class Scheduler(
             and req.next_output_finishes_by_length()
         ]
 
+    def _preempt_for_starving_waiters(self, batch: ScheduleBatch) -> None:
+        # Runs at the OOM-retraction point: the in-flight step's tokens of a
+        # released request are skipped by the result processor (is_retracted).
+        now_s = time.perf_counter()
+        plan = self.decode_preemptor.maybe_plan(
+            now_s=now_s,
+            waiting_queue=self.waiting_queue,
+            running_reqs=batch.reqs,
+            have_tokens=available_and_evictable_tokens(
+                allocator=self.token_to_kv_pool_allocator, tree_cache=self.tree_cache
+            ),
+            new_token_ratio=self.new_token_ratio_tracker.current,
+            page_size=self.logical_page_size,
+        )
+        if plan is None:
+            return
+        if self.decode_offload_manager is not None:
+            # Pending offload copies may still read the device KV being released.
+            self.decode_offload_manager.drain_before_retraction()
+        preempted = batch.preempt_decode(plan.victim_indices, self.request_retirer)
+        self.running_reqs.leave(preempted)
+        self.decode_preemptor.on_preempted(plan, preempted, now_s)
+        for req in preempted:
+            self._add_request_to_queue(req, is_retracted=True)
+
     def update_running_batch(self, batch: ScheduleBatch) -> Optional[ScheduleBatch]:
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
@@ -4845,6 +4901,9 @@ class Scheduler(
                 self._add_request_to_queue(req, is_retracted=True)
         else:
             self.new_token_ratio_tracker.decay_step()
+
+        if self.decode_preemptor is not None and not kv_full_retract_flag:
+            self._preempt_for_starving_waiters(batch)
 
         if batch.batch_size() < initial_bs:
             batch.batch_is_full = False
@@ -5418,6 +5477,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self._on_step_processed(batch)
+        self.policy.record_completed_requests(batch.reqs)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()

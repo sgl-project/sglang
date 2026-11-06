@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -49,6 +50,7 @@ from typing import TYPE_CHECKING, Dict, Iterable, List, Optional, Set, Union
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.managers import uniboost
 from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
@@ -84,6 +86,19 @@ if TYPE_CHECKING:
 CLIP_MAX_NEW_TOKENS = int(
     os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
 )
+
+
+def running_request_token_reserve(req: Req, new_token_ratio: float) -> float:
+    """KV tokens admission holds back for a running request's remaining decode."""
+    # Fixed-length requests cannot benefit from the early-EOS estimate.
+    ratio = 1.0 if req.sampling_params.ignore_eos else new_token_ratio
+    return (
+        min(
+            (req.sampling_params.max_new_tokens - len(req.output_ids)),
+            CLIP_MAX_NEW_TOKENS,
+        )
+        * ratio
+    )
 
 
 @lru_cache(maxsize=1)
@@ -171,6 +186,7 @@ class CacheAwarePolicy(Enum):
     DFS_WEIGHT = "dfs-weight"  # depth-first search weighting
     HRRN = "hrrn"  # highest response ratio next, token-based aging
     SHORTEST_PREFILL_FIRST = "shortest-prefill-first"
+    UNIBOOST = "uniboost"  # gamma-boosted arrival order (UniBoost, ICML 2026)
 
 
 class CacheAgnosticPolicy(Enum):
@@ -192,6 +208,12 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        *,
+        uniboost_gamma: Optional[float] = None,
+        uniboost_bin_size: int = 256,
+        uniboost_clock: str = "tokens",
+        uniboost_adaptive_gamma: bool = False,
+        uniboost_adaptive_max_jump_s: float = 60.0,
     ):
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
@@ -201,6 +223,32 @@ class SchedulePolicy:
         self.priority_sign = 1 if schedule_low_priority_values_first else -1
         self._shortest_prefill_calls = 0
         self._waiting_prefix_refresh_calls = 0
+        self.uniboost_clock = uniboost.UniBoostClock(uniboost_clock)
+        self.uniboost_gamma = (
+            uniboost_gamma
+            if uniboost_gamma is not None
+            else uniboost.DEFAULT_GAMMA[self.uniboost_clock]
+        )
+        self.uniboost_bin_size = uniboost_bin_size
+        is_uniboost = self.policy == CacheAwarePolicy.UNIBOOST
+        wall = self.uniboost_clock is uniboost.UniBoostClock.WALL
+        if is_uniboost and uniboost_adaptive_gamma and not wall:
+            raise ValueError(
+                "--uniboost-adaptive-gamma requires --uniboost-clock wall "
+                "(the response-time tail fit is in wall seconds)"
+            )
+        self.uniboost_rate: Optional[uniboost.TokenClockRate] = (
+            uniboost.TokenClockRate() if is_uniboost and wall else None
+        )
+        self.uniboost_adaptive: Optional[uniboost.AdaptiveGamma] = (
+            uniboost.AdaptiveGamma(
+                gamma0=self.uniboost_gamma,
+                bin_size=uniboost_bin_size,
+                max_jump_s=uniboost_adaptive_max_jump_s,
+            )
+            if is_uniboost and uniboost_adaptive_gamma
+            else None
+        )
 
         # It is used to find the matching prefix for in-batch prefix caching.
         self.waiting_queue_radix_tree = RadixCache.create_simulated()
@@ -211,6 +259,7 @@ class SchedulePolicy:
         running_batch: Optional[ScheduleBatch] = None,
         processed_tokens: int = 0,
         bootstrap_queue: Iterable[Req] = (),
+        chunked_req: Optional[Req] = None,
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
@@ -231,6 +280,8 @@ class SchedulePolicy:
                 SchedulePolicy._sort_by_priority_and_fcfs(
                     waiting_queue, self.priority_sign
                 )
+        elif policy == CacheAwarePolicy.UNIBOOST:
+            self._sort_by_uniboost(waiting_queue, processed_tokens, chunked_req)
         elif isinstance(policy, CacheAwarePolicy):
             temporary_deprioritized = self._compute_prefix_matches(
                 waiting_queue, policy
@@ -309,6 +360,59 @@ class SchedulePolicy:
         for r in reversed(waiting_queue[:WAITING_QUEUE_PREFIX_MATCH_MAX]):
             touch_waiting_prefix(r, self.tree_cache)
 
+    def _sort_by_uniboost(
+        self,
+        waiting_queue: List[Req],
+        processed_tokens: int,
+        chunked_req: Optional[Req],
+    ) -> None:
+        now_s = time.perf_counter()
+        if self.uniboost_rate is not None:
+            self.uniboost_rate.observe(processed_tokens, now_s)
+        uniboost.stamp_arrivals(
+            waiting_queue, processed_tokens=processed_tokens, now_s=now_s
+        )
+        leader_of: Dict[str, str] = {}
+        temporary_deprioritized = self._compute_prefix_matches(
+            waiting_queue, CacheAwarePolicy.UNIBOOST, leader_of=leader_of
+        )
+        uniboost.sort_waiting_queue(
+            waiting_queue,
+            gamma=self.uniboost_gamma,
+            bin_size=self.uniboost_bin_size,
+            clock=self.uniboost_clock,
+            rate_tokens_per_s=(
+                self.uniboost_rate.tokens_per_s
+                if self.uniboost_rate is not None
+                else None
+            ),
+            temporary_deprioritized=temporary_deprioritized,
+            leader_of=leader_of,
+            enable_priority_scheduling=self.enable_priority_scheduling,
+            priority_sign=self.priority_sign,
+        )
+        # Reads the admission order, so it runs after the sort.
+        uniboost.mark_commit_holds(waiting_queue, chunked_req=chunked_req, now_s=now_s)
+
+    def record_completed_requests(self, reqs: List[Req]) -> None:
+        """Feeds finished requests' response times to adaptive uniboost gamma."""
+        if self.uniboost_adaptive is None:
+            return
+        latencies, works = uniboost.completed_response_times(reqs)
+        if not latencies:
+            return
+        gamma = self.uniboost_adaptive.record(
+            latencies_s=latencies,
+            works=works,
+            rate_tokens_per_s=(
+                self.uniboost_rate.tokens_per_s
+                if self.uniboost_rate is not None
+                else None
+            ),
+        )
+        if gamma is not None:
+            self.uniboost_gamma = gamma
+
     def _determine_active_policy(self, waiting_queue: List[Req]) -> Policy:
         if (
             self.policy
@@ -342,6 +446,11 @@ class SchedulePolicy:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
                     )
+                if policy_enum == CacheAwarePolicy.UNIBOOST:
+                    logger.warning(
+                        "schedule_policy=uniboost requires prefix caching; "
+                        "falling back to fcfs"
+                    )
                 # If tree_cache is disabled, using CacheAgnosticPolicy policy
                 return CacheAgnosticPolicy.FCFS
             return policy_enum
@@ -352,10 +461,19 @@ class SchedulePolicy:
                 raise ValueError(f"Unknown schedule_policy: {policy=}")
 
     def _compute_prefix_matches(
-        self, waiting_queue: List[Req], policy: CacheAwarePolicy
+        self,
+        waiting_queue: List[Req],
+        policy: CacheAwarePolicy,
+        leader_of: Optional[Dict[str, str]] = None,
     ) -> Set[int]:
+        """Returns the in-batch prefix-dedup followers. With leader_of, also
+        fills follower rid -> rid of the queued request that first inserted
+        the shared prefix (its leader)."""
         temporary_deprioritized: Set[int] = set()
         self.waiting_queue_radix_tree.reset()
+        # With leader_of, simulated-tree values hold the inserting request's
+        # index in inserted_by, so a match's deepest value names its leader.
+        inserted_by: List[str] = []
 
         for r in waiting_queue:
             prefix_ids = r.origin_input_ids + r.output_ids
@@ -389,7 +507,19 @@ class SchedulePolicy:
                     >= IN_BATCH_PREFIX_CACHING_DEPRIORITIZE_THRESHOLD
                 ):
                     temporary_deprioritized.add(r.rid)
+                    if leader_of is not None:
+                        path = self.waiting_queue_radix_tree.path_device_indices(
+                            match_result.last_device_node
+                        )
+                        leader_of[r.rid] = inserted_by[int(path[-1])]
                 else:
+                    if leader_of is not None:
+                        value = torch.full(
+                            (len(prefix_ids),), len(inserted_by), dtype=torch.int64
+                        )
+                        inserted_by.append(r.rid)
+                    else:
+                        value = torch.empty(len(prefix_ids), dtype=torch.bool)
                     # Insert with a dummy key
                     self.waiting_queue_radix_tree.insert(
                         InsertParams(
@@ -398,7 +528,7 @@ class SchedulePolicy:
                                 extra_key=extra_key,
                                 cache_salt=cache_salt,
                             ),
-                            value=torch.empty(len(prefix_ids), dtype=torch.bool),
+                            value=value,
                         )
                     )
         return temporary_deprioritized
@@ -428,7 +558,8 @@ class SchedulePolicy:
     ) -> Optional[int]:
         """Cap the active prefill chunk to reserve tokens for shorter waiting requests."""
         if (
-            self.policy != CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+            self.policy
+            not in (CacheAwarePolicy.SHORTEST_PREFILL_FIRST, CacheAwarePolicy.UNIBOOST)
             or budget < 2 * page_size
         ):
             return None
@@ -768,15 +899,7 @@ class PrefillAdder:
         )
 
     def _get_running_request_total_token_offset(self, req: Req) -> int:
-        # Fixed-length requests cannot benefit from the early-EOS estimate.
-        ratio = 1.0 if req.sampling_params.ignore_eos else self.new_token_ratio
-        return (
-            min(
-                (req.sampling_params.max_new_tokens - len(req.output_ids)),
-                CLIP_MAX_NEW_TOKENS,
-            )
-            * ratio
-        )
+        return running_request_token_reserve(req, self.new_token_ratio)
 
     @property
     def rem_total_tokens(self):
@@ -1666,9 +1789,9 @@ class PrefillAdder:
                 return AddReqResult.OTHER
             max_new_tokens = 0
         elif chunk_tokens_limit is not None and chunk_fit_tokens > chunk_tokens_limit:
-            if (
-                has_chunked_req
-                and get_schedule().schedule_policy == "shortest-prefill-first"
+            if has_chunked_req and get_schedule().schedule_policy in (
+                "shortest-prefill-first",
+                "uniboost",
             ):
                 # Only one unfinished chunked request can be tracked.
                 return AddReqResult.OTHER

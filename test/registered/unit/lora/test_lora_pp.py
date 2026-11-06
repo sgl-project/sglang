@@ -149,6 +149,7 @@ class TestAllPPLoras(CustomTestCase):
             policy=mock.Mock(
                 calc_priority=lambda waiting, *args, **kwargs: list(waiting)
             ),
+            decode_preemptor=None,
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,

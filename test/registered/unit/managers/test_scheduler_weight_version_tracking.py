@@ -155,6 +155,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             self.addCleanup(patcher.stop)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler._record_step_counters = MagicMock()
+        scheduler.policy = MagicMock()
         scheduler.metrics_reporter = MagicMock()
         scheduler.enable_fpm = False
         scheduler._maybe_clear_mm_inputs = MagicMock()
