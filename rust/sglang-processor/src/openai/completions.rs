@@ -17,7 +17,8 @@ use super::request::{
     lora_path, one, usage_flags, yes,
 };
 use super::wire::{
-    Reply, StreamState, abort_event, finish_fields, logprob_slice, now, unary_reply, without_nulls,
+    Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
+    unary_reply, without_nulls,
 };
 use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 
@@ -171,7 +172,7 @@ pub fn lower_completion(
     } else {
         Vec::new()
     };
-    let mut lowered = generate_body(&request, headers);
+    let mut lowered = generate_body(&request, headers, settings);
     lowered.custom_labels = labels;
     let (include_usage, continuous_usage_stats) =
         usage_flags(request.stream_options.as_ref(), settings);
@@ -193,7 +194,11 @@ pub fn lower_completion(
     Ok((lowered, responder))
 }
 
-fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> GenerateRequest {
+fn generate_body(
+    request: &CompletionRequest,
+    headers: &OpenAiHeaders<'_>,
+    settings: &OpenAiSettings,
+) -> GenerateRequest {
     let sampling = SamplingParams {
         temperature: Some(request.temperature),
         max_new_tokens: Some(request.max_tokens),
@@ -237,7 +242,11 @@ fn generate_body(request: &CompletionRequest, headers: &OpenAiHeaders<'_>) -> Ge
         top_logprobs_num: Some(OneOrList::One(request.logprobs.unwrap_or(0)).into()),
         stream: Some(request.stream),
         return_text_in_logprobs: Some(true),
-        lora_path: lora_path(&request.model, &request.lora_path),
+        lora_path: lora_path(
+            &request.model,
+            &request.lora_path,
+            settings.served_model_name.as_deref(),
+        ),
         bootstrap_host: request.bootstrap_host.clone().map(Into::into),
         bootstrap_port: request.bootstrap_port.clone().map(Into::into),
         bootstrap_room: request.bootstrap_room.clone().map(Into::into),
@@ -408,7 +417,7 @@ impl CompletionResponder {
         if self.logprobs {
             let echo_input = is_first_chunk && self.echo_logprobs;
             let prev = state.logprob_counts.get(&index).copied().unwrap_or(0);
-            let total = meta.output_token_logprobs_length.unwrap_or(0) as usize;
+            let total = logprobs_length(meta, prev, incremental);
             if prev < total || echo_input {
                 let output = meta
                     .output_token_logprobs

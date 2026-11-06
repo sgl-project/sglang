@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 import sys
 
@@ -9,14 +9,18 @@ import ctypes
 import ctypes.util
 import mmap
 import os
+import signal
 import unittest
 import unittest.mock
 
 import torch
 
 from sglang.srt.mem_cache.pool_host.common import ShmHostTensorAllocator
-from sglang.srt.mem_cache.storage.mmap import alloc_shm
-from sglang.srt.mem_cache.storage.mmap.mmap_allocator import _mmap_prefaulted
+from sglang.srt.mem_cache.storage.mmap import alloc_mmap, alloc_shm
+from sglang.srt.mem_cache.storage.mmap.mmap_allocator import (
+    _mmap_prefaulted,
+    _mmap_private_parallel_prefaulted,
+)
 
 
 class TestMmapAllocator(unittest.TestCase):
@@ -61,6 +65,67 @@ class TestMmapAllocator(unittest.TestCase):
                 self._assert_resident(mm, alloc_bytes)
             finally:
                 mm.close()
+
+    def test_private_parallel_prefaulted_is_resident_and_zeroed(self):
+        """Fully resident and zeroed, including a ragged non-THP-aligned tail."""
+        alloc_bytes = 9 * 2 * 1024 * 1024 + 3 * mmap.PAGESIZE
+        for threads in (1, 4, 64):
+            with self.subTest(threads=threads):
+                mm = _mmap_private_parallel_prefaulted(alloc_bytes, threads)
+                try:
+                    self.assertEqual(len(mm), alloc_bytes)
+                    self._assert_resident(mm, alloc_bytes)
+                    self.assertEqual(mm[:].count(0), alloc_bytes)
+                finally:
+                    mm.close()
+
+    def test_private_parallel_mapping_is_not_inherited_by_fork(self):
+        """MADV_DONTFORK: a forked child touching the buffer must SIGSEGV."""
+        alloc_bytes = 4 * mmap.PAGESIZE
+        mm = _mmap_private_parallel_prefaulted(alloc_bytes, 2)
+        addr = ctypes.addressof(ctypes.c_char.from_buffer(mm))
+        try:
+            pid = os.fork()
+            if pid == 0:  # child: the mapping must not exist here
+                ctypes.c_char.from_address(addr).value  # noqa: B018
+                os._exit(0)
+            _, status = os.waitpid(pid, 0)
+            self.assertTrue(os.WIFSIGNALED(status), f"child exited with {status}")
+            self.assertEqual(os.WTERMSIG(status), signal.SIGSEGV)
+        finally:
+            mm.close()
+
+    def test_alloc_mmap_parallel_flag(self):
+        from sglang.srt.environ import envs
+
+        dims = (3, 1024 * 1024)
+        with envs.SGLANG_HICACHE_HOST_PARALLEL_ALLOC_THREADS.override(4):
+            with unittest.mock.patch(
+                "sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_prefaulted",
+                side_effect=AssertionError("shared path must not run"),
+            ):
+                tensor = alloc_mmap(dims, torch.uint8)
+            self.assertEqual(tensor.shape, dims)
+            self.assertTrue(bool(tensor.eq(0).all()))
+            tensor[2, -1] = 7
+            self.assertEqual(int(tensor[2, -1]), 7)
+
+            # A failure on the new path falls back to the shared mapping.
+            with unittest.mock.patch(
+                "sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_private_parallel_prefaulted",
+                side_effect=OSError("boom"),
+            ):
+                tensor = alloc_mmap(dims, torch.uint8)
+            self.assertEqual(tensor.shape, dims)
+
+    def test_alloc_mmap_parallel_flag_off_by_default(self):
+        """Default off: the shared prefaulted mapping is used unchanged."""
+        with unittest.mock.patch(
+            "sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_private_parallel_prefaulted",
+            side_effect=AssertionError("parallel path must not run by default"),
+        ):
+            tensor = alloc_mmap((2, 1024), torch.uint8)
+        self.assertEqual(tensor.shape, (2, 1024))
 
     def test_alloc_shm_hugepage_warning(self):
         from sglang.srt.environ import envs

@@ -255,8 +255,9 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
 
     def _storage_pages_unsupported(self) -> NotImplementedError:
         return NotImplementedError(
-            "MXFP8 KV host pool does not expose flat storage (L3) pages yet: "
-            "a page's UE8M0 scales live outside kv_buffer."
+            "MXFP8 KV host pool does not expose flat storage (L3) pages: a "
+            "page's UE8M0 scales live outside kv_buffer, so it is stored as a "
+            "multi-buffer object (get_page_buffer_meta)."
         )
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
@@ -268,8 +269,27 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
         raise self._storage_pages_unsupported()
 
+    def get_hybrid_pool_buffer(self):
+        return [self.kv_buffer, self.k_scale_host, self.v_scale_host]
+
     def get_page_buffer_meta(self, indices):
-        raise self._storage_pages_unsupported()
+        """A page's K and V storage objects, each its payload followed by the
+        page's scales over all layers: one multi-buffer object under the
+        payload's key."""
+        payload_ptrs, payload_sizes = super().get_page_buffer_meta(indices)
+        pages = self._page_ids(indices).tolist()
+        assert len(payload_ptrs) == 2 * len(pages)
+        k_scale_bytes = self.layer_num * self.k_sf_page_bytes
+        v_scale_bytes = self.layer_num * self.v_sf_page_bytes
+        k_scale_ptr = self.k_scale_host.data_ptr()
+        v_scale_ptr = self.v_scale_host.data_ptr()
+        ptrs, sizes = [], []
+        for i, page in enumerate(pages):
+            ptrs.append([payload_ptrs[2 * i], k_scale_ptr + page * k_scale_bytes])
+            ptrs.append([payload_ptrs[2 * i + 1], v_scale_ptr + page * v_scale_bytes])
+            sizes.append([payload_sizes[2 * i], k_scale_bytes])
+            sizes.append([payload_sizes[2 * i + 1], v_scale_bytes])
+        return ptrs, sizes
 
     def get_split_heads_page_buffer_meta(
         self, indices: torch.Tensor, split_factor: int

@@ -6,7 +6,7 @@ Graph row capacity is fixed while live token counts and prefix state can change.
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
@@ -55,12 +55,7 @@ def _indexer_with_kv(
     output[logical:].fill_(-1)
 
 
-def _capture_stub(indexer, x, q_lora, positions, output, layer_id, kv_local, kv_output):
-    output.fill_(-1)
-    kv_output.zero_()
-
-
-bcg_indexer_with_kv = eager_on_graph(True, capture_stub=_capture_stub)(_indexer_with_kv)
+bcg_indexer_with_kv = eager_on_graph(True)(_indexer_with_kv)
 
 
 class InterleaveCPBCGInput(PrefillCPBCGInput):
@@ -82,15 +77,24 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
+    # GLM-5.3 Flash (KDA hybrid) and the dense-DSA GLM MoE family
+    # (GLM-5.2 / GLM-5.3 and their fine-tunes) share the interleave BCG path.
+    _SUPPORTED_ARCHITECTURES = (
+        "Glm5NextForConditionalGeneration",
+        "GlmMoeDsaForCausalLM",
+    )
+
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
+        architectures = model_config_of(server_args).hf_config.architectures
         return (
             cfg.dp_size == 1
-            and cfg.ep_size == 1
             and resolved_view(server_args).attn_cp_size > 1
-            and "Glm5NextForConditionalGeneration"
-            in model_config_of(server_args).hf_config.architectures
+            and any(
+                arch in architectures
+                for arch in InterleaveCPBCGInput._SUPPORTED_ARCHITECTURES
+            )
         )
 
     def _max_local_tokens(self, extend_seq_lens):

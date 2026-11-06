@@ -72,9 +72,42 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="elementwise.sam_rel_pos_bias",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.elementwise.sam_rel_pos_bias:sam_rel_pos_bias",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="elementwise.window_unpartition_add",
+        backend=KernelBackend.JIT,
+        target=(
+            "sglang.kernels.ops.elementwise.window_unpartition_add:"
+            "window_unpartition_add"
+        ),
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
         op="elementwise.kimi_k3_mla_output_gate",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.elementwise.mla_output_gate:kimi_k3_mla_output_gate",
         capabilities=CUDA_ONLY,
     )
 )
+
+
+# Beam fused op, built per layer: inventoried through its class methods.
+for _bk in ("torch", "triton"):
+    register_kernel(
+        KernelSpec(
+            op="elementwise.beam_attention_gate",
+            backend=KernelBackend(_bk),
+            target="sglang.kernels.ops.elementwise.beam_fused:BeamAttentionGateOp."
+            + ("forward_native" if _bk == "torch" else f"forward_{_bk}"),
+            capabilities=frozenset() if _bk == "torch" else CUDA_ONLY,
+        )
+    )
+del _bk

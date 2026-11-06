@@ -24,16 +24,15 @@ from sglang.multimodal_gen.configs.sample.cosmos3 import (
     COSMOS3_EDGE_SUPPORTED_RESOLUTIONS,
     Cosmos3SamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import (
     _PIPELINE_REGISTRY,
     _discover_and_register_pipelines,
     _get_config_info,
     get_non_diffusers_pipeline_name,
 )
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.entrypoints.action.protocol import (
     action_generation_response,
     action_metadata,
@@ -48,6 +47,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.video_api import (
     _multipart_video_extras,
     _resolve_video_path,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
+    Qwen3VLTextRotaryEmbedding,
+)
 from sglang.multimodal_gen.runtime.loader.component_loaders import scheduler_loader
 from sglang.multimodal_gen.runtime.loader.component_loaders.scheduler_loader import (
     SchedulerLoader,
@@ -60,6 +62,8 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     compute_mrope_position_ids_action,
     compute_mrope_position_ids_sound,
     compute_mrope_position_ids_vision,
+    sequence_shard_padding,
+    shard_sequence,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
@@ -104,6 +108,63 @@ def _cosmos3_server_args(config=None, batching_max_size=1):
         batching_max_size=batching_max_size,
         pipeline_config=config or Cosmos3Config(),
     )
+
+
+class _RopeOnlyTransformer(torch.nn.Module):
+    _maybe_install_step_mixed_precision = (
+        Cosmos3OmniTransformer._maybe_install_step_mixed_precision
+    )
+
+    def __init__(self, device, meta_rope, rope_theta, head_dim):
+        super().__init__()
+        self.rope_theta = rope_theta
+        self.hf_config = {}
+        self.modelopt_fp8_checkpoint = False
+        self.language_model = torch.nn.Module()
+        with torch.device("meta" if meta_rope else "cpu"):
+            self.language_model.rotary_emb = Qwen3VLTextRotaryEmbedding(
+                head_dim=head_dim, rope_theta=rope_theta
+            )
+        self.language_model.embed_tokens = torch.nn.Embedding(
+            num_embeddings=2, embedding_dim=2, device=device
+        )
+        self.time_embedder = torch.nn.Linear(
+            in_features=2, out_features=2, device=device
+        )
+        self.proj_in = torch.nn.Linear(in_features=2, out_features=2, device=device)
+        self.proj_out = torch.nn.Linear(in_features=2, out_features=2, device=device)
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available(), "requires CUDA/ROCm for CPU/GPU RoPE parity"
+)
+class TestCosmos3RopePlacement(CustomTestCase):
+    def test_rope_table_does_not_depend_on_dit_placement(self):
+        """A CPU-offloaded DiT must build the RoPE table a resident one builds."""
+        rope_theta, head_dim = 100_000_000, 128
+        exponents = torch.arange(
+            start=0,
+            end=head_dim,
+            step=2,
+            dtype=torch.float32,
+            device=get_local_torch_device(),
+        )
+        reference = (1.0 / (rope_theta ** (exponents / head_dim))).cpu()
+        for device in ("cpu", "cuda"):
+            for meta_rope in (True, False):
+                with self.subTest(device=device, meta_rope=meta_rope):
+                    model = _RopeOnlyTransformer(
+                        device=device,
+                        meta_rope=meta_rope,
+                        rope_theta=rope_theta,
+                        head_dim=head_dim,
+                    )
+                    Cosmos3OmniTransformer.post_load_weights(model)
+                    rotary_emb = model.language_model.rotary_emb
+                    self.assertEqual(rotary_emb.inv_freq.device.type, device)
+                    self.assertEqual(rotary_emb.inv_freq.dtype, torch.float32)
+                    self.assertTrue(torch.equal(rotary_emb.inv_freq.cpu(), reference))
+                    self.assertNotIn("inv_freq", rotary_emb.state_dict())
 
 
 class TestCosmos3T1FusedQKNormRoPE(unittest.TestCase):
@@ -2242,6 +2303,31 @@ class TestCosmos3DurationTemplateSuppression(unittest.TestCase):
         self.assertIn("seconds long", final)
 
 
+class TestCosmos3SequenceSharding(unittest.TestCase):
+    def test_sequence_sharding_helpers(self):
+        """Every GEN modality (video, control, action, sound) rides one pad-and-
+        shard rule under Ulysses: tokens pad with zeros, RoPE positions pad by
+        repeating the last entry, each rank gets one contiguous chunk, and
+        degree 1 returns the input itself."""
+        self.assertEqual(sequence_shard_padding(10, 1), 0)
+        self.assertEqual(sequence_shard_padding(10, 4), 2)
+        self.assertEqual(sequence_shard_padding(12, 4), 0)
+        tokens = torch.arange(10.0).view(1, 10, 1)
+        self.assertEqual(
+            shard_sequence(tokens, 4, 0, dim=1, pad_last=False).flatten().tolist(),
+            [0.0, 1.0, 2.0],
+        )
+        self.assertEqual(
+            shard_sequence(tokens, 4, 3, dim=1, pad_last=False).flatten().tolist(),
+            [9.0, 0.0, 0.0],
+        )
+        positions = torch.arange(10).view(1, 1, 10).expand(3, 1, 10)
+        last = shard_sequence(positions, 4, 3, dim=2, pad_last=True)
+        self.assertEqual(last.shape, (3, 1, 3))
+        self.assertEqual(last[0, 0].tolist(), [9, 9, 9])
+        self.assertIs(shard_sequence(tokens, 1, 0, dim=1, pad_last=False), tokens)
+
+
 @unittest.skipUnless(
     torch.cuda.is_available() and torch.version.hip is None, "requires CUDA"
 )
@@ -2283,6 +2369,47 @@ class TestCosmos3VideoPreprocess(CustomTestCase):
                 self.assertEqual(actual.shape, (1, 3, 45 if force_cpu else 5, 24, 40))
                 outputs.append(actual[:, :, :5].cpu())
         self.assertTrue(torch.equal(outputs[0], outputs[1]))
+
+    def test_vae_cache_key(self):
+        """Video content and VAE settings distinguish Cosmos3 cache entries."""
+        from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
+
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        class VAE(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = types.SimpleNamespace(
+                    latents_mean=[0, 0, 0], latents_std=[1, 1, 1]
+                )
+                self.calls = 0
+                self.use_tiling = False
+
+            @conditioning.cached_vae_encode
+            def encode(self, pixels):
+                self.calls += 1
+                mean = pixels * (2 if self.use_tiling else 1)
+                return DiagonalGaussianDistribution(
+                    torch.cat([mean, torch.zeros_like(mean)], dim=1)
+                )
+
+        stage = Cosmos3LatentPreparationStage.__new__(Cosmos3LatentPreparationStage)
+        stage.vae = VAE().eval()
+        cache = conditioning.ConditioningCache(1024 * 1024)
+        video = torch.zeros(1, 3, 5, 16, 16, device="cuda")
+        video[:, :, 0] = 1
+        with torch.no_grad(), cache.scope():
+            self.assertTrue(torch.equal(stage._vae_encode(video), video))
+            hit = stage._vae_encode(video.clone())
+            self.assertTrue(torch.equal(hit, video))
+            self.assertEqual(stage.vae.calls, 1)
+            changed = video.clone()
+            changed[:, :, -1] = 0.5
+            self.assertTrue(torch.equal(stage._vae_encode(changed), changed))
+            self.assertEqual(stage.vae.calls, 2)
+            stage.vae.use_tiling = True
+            self.assertTrue(torch.equal(stage._vae_encode(video), video * 2))
+            self.assertEqual(stage.vae.calls, 3)
 
 
 if __name__ == "__main__":
