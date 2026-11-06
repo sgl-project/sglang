@@ -46,11 +46,15 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
+    # Pages pending until their step is processed: counted in `holes` (a take
+    # uses them), yet their bytes stay the band's until they are settled.
+    pending: int = 0
 
     @property
     def transparent(self) -> bool:
-        """An empty float: its neighbours' frontier walks see through it."""
-        return self.grow == "float" and self.live == 0
+        """An empty float: its neighbours' frontier walks see through it. Pages
+        pending until their step is processed keep a float opaque."""
+        return self.grow == "float" and self.live == 0 and self.pending == 0
 
     @property
     def drains(self) -> bool:
@@ -87,7 +91,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] - 1, -1, -1):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.high_byte
         return 0
 
@@ -96,7 +100,7 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
         bands = self.bands
         for i in range(self.positions[name] + 1, len(bands)):
             band = bands[i]
-            if band.live or band.grow != "float":
+            if not band.transparent:
                 return band.low_byte
         return self.total_bytes
 
@@ -122,8 +126,9 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.min_page_index,
         band.lazy_compaction,
         band.moves_blocked(),
-        # Unsettled frees drain like holes once their forward completes.
-        band._free_phys_pages.numel() + band._unsettled_page_count(),
+        # Holes, and pages pending until their step is processed: a take reaches
+        # those after it settles them (`Band.settle_pending`).
+        band._reusable_pages(),
         # `allocated_count() // page_size`: lazy ends count live pages apart
         # from the holes and pending pages inside their span.
         band.live_page_count if band.lazy_compaction else span,
@@ -135,6 +140,7 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
+        band._pending_until_retire_pages,
     )
 
 
@@ -650,14 +656,16 @@ def reclaimed_snapshot(
         )
         live = b.live - reclaimed
         low, high, span = b.low_byte, b.high_byte, b.span
-        holes = b.holes + reclaimed
+        holes, pending = b.holes + reclaimed, b.pending
+        # Recovery settles every pending page first: a float left with no live
+        # page parks, and an unblocked end's urgent flush absorbs them.
         if empty_pool or (not live and (b.grow == "float" or not b.blocked)):
-            span = holes = 0
+            span = holes = pending = 0
             low = high = (
                 b.num_pages if b.grow == "down" else b.min_page
             ) * b.page_bytes
         elif b.grow != "float" and not b.blocked:
-            span, holes = live, 0
+            span, holes, pending = live, 0, 0
             if b.grow == "up":
                 high = (b.min_page + live) * b.page_bytes
             else:
@@ -668,6 +676,7 @@ def reclaimed_snapshot(
                 live=live,
                 span=span,
                 holes=holes,
+                pending=pending,
                 low_byte=low,
                 high_byte=high,
                 free_virtual_pages=(
@@ -823,6 +832,8 @@ def sequential_fit(
     lows = [b.low_byte for b in bands]
     highs = [b.high_byte for b in bands]
     live = [b.live for b in bands]
+    # Opaque: live pages, or pages pending until their step is processed.
+    occupied = [b.live + b.pending for b in bands]
     for name, pages in demands:
         if pages < 0:
             return False
@@ -838,7 +849,7 @@ def sequential_fit(
             (
                 highs[j]
                 for j in range(i - 1, -1, -1)
-                if live[j] or bands[j].grow != "float"
+                if occupied[j] or bands[j].grow != "float"
             ),
             0,
         )
@@ -846,7 +857,7 @@ def sequential_fit(
             (
                 lows[j]
                 for j in range(i + 1, len(bands))
-                if live[j] or bands[j].grow != "float"
+                if occupied[j] or bands[j].grow != "float"
             ),
             snapshot.total_bytes,
         )
@@ -863,7 +874,7 @@ def sequential_fit(
                 if start < lo:
                     return False
                 lows[i] = start * b.page_bytes
-            elif not live[i]:
+            elif not occupied[i]:
                 if extension > hi - lo:
                     return False
                 start = lo + (hi - lo - extension) // 2
@@ -881,4 +892,5 @@ def sequential_fit(
                 else:
                     lows[i] -= extension * b.page_bytes
         live[i] += pages
+        occupied[i] += pages
     return True

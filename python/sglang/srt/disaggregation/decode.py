@@ -433,9 +433,6 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
-    # The allocator's reuse fences after this allocation: prefill's RDMA into the
-    # destination follows no stream, so it is published only once they complete.
-    reuse_fences: Tuple[torch.cuda.Event, ...] = ()
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1766,6 +1763,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Counted as published until extend(): a later allocation in this
                 # loop must not compact (move) pages the publish will read back.
                 self._num_published_destinations += 1
+                # A take of pages a forward may still use (freed while it ran)
+                # queued its wait for that forward on this stream first, so this
+                # event, and the readback the publish gates on it, follow it.
                 allocated = torch.cuda.Event()
                 allocated.record()
                 self._pending_publish.append(
@@ -1776,9 +1776,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_len,
                         fill_len=fill_len,
-                        reuse_fences=tuple(
-                            self.token_to_kv_pool_allocator.reuse_fences()
-                        ),
                     )
                 )
             else:
@@ -1834,8 +1831,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Gate the readback on this allocation only, not on the forward the
             # schedule stream has been fenced behind since.
             self._publish_stream.wait_event(entry.allocated)
-            for fence in entry.reuse_fences:
-                self._publish_stream.wait_event(fence)
             with torch.cuda.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
@@ -3472,6 +3467,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
+                # FIXME: without deferred release, a failed receive's device
+                # destination is released at once, with no proof that the
+                # remote writer stopped; a late write can land in reused pages.
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
@@ -3570,6 +3568,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
+        # FIXME: a device destination released at its deadline has no proof
+        # that the remote writer stopped. Its pages can then be handed out
+        # again while a late write still lands in them.
         if not self._deferred_releases:
             return
         now = time.monotonic()
