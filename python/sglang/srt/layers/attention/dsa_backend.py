@@ -4588,9 +4588,11 @@ class DeepseekSparseAttnBackend(
         if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        row_plan = _plan_live_rows(
-            q_all.shape[0], metadata.cache_seqlens_int32.shape[0], forward_batch
-        )
+        # Plan against the rows the kernel reads: prefill passes the per-token
+        # dsa_cache_seqlens_int32, while cache_seqlens_int32 has one row per
+        # request.
+        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        row_plan = _plan_live_rows(q_all.shape[0], seq_lens.shape[0], forward_batch)
         if row_plan.q_pad_rows:
             if is_prefill:
                 raise AssertionError(
@@ -4678,7 +4680,6 @@ class DeepseekSparseAttnBackend(
         q = q_all.view(batch_size, 1, kernel_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
-        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
         if row_plan.meta_pad_rows:
             # CP graph metadata includes the physical shard's padding; its
             # eager attention bridge can narrow Q to the live local rows.
