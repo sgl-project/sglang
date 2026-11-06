@@ -330,6 +330,7 @@ def _packed_prefill_case(
     return q, k, as_tensor(starts), as_tensor(ends), max(lengths)
 
 
+@pytest.mark.parametrize("score_scale", [None, 3.0])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "lengths, rows_per_block",
@@ -339,9 +340,12 @@ def _packed_prefill_case(
         ([9000], 8),  # one short request: many key splits
     ],
 )
-def test_relative_prefill_scores_equal_absolute(dtype, lengths, rows_per_block):
+def test_relative_prefill_scores_equal_absolute(
+    dtype, lengths, rows_per_block, score_scale
+):
     """Request-relative scoring puts the same fp32 values in each row's own
-    window as the absolute-layout kernel does, bit for bit."""
+    window as the absolute-layout kernel does, bit for bit. The relative
+    kernel applies the scale itself; the absolute path divides afterwards."""
     from sglang.srt.layers.attention.qsa.mqa import (
         HAS_TILELANG,
         tilelang_qsa_mqa_prefill,
@@ -354,13 +358,17 @@ def test_relative_prefill_scores_equal_absolute(dtype, lengths, rows_per_block):
     q, k, starts, ends, width = _packed_prefill_case(
         lengths, rows_per_block, torch.device("cuda"), dtype, seed=11
     )
-    absolute = tilelang_qsa_mqa_prefill(q, k, starts, ends)
-    relative = tilelang_qsa_mqa_prefill_relative(q, k, starts, ends, width)
+    absolute = tilelang_qsa_mqa_prefill(q, k, starts, ends, score_scale)
+    relative = tilelang_qsa_mqa_prefill_relative(q, k, starts, ends, width, score_scale)
     assert relative.shape == (q.shape[0], width)
     for row in range(q.shape[0]):
         s, e = int(starts[row]), int(ends[row])
         assert torch.equal(relative[row, : e - s], absolute[row, s:e]), row
-    # The torch reference agrees on the windows (and masks the rest).
+    if score_scale is not None:
+        return
+    # The torch reference agrees on the windows (and masks the rest). Its
+    # tolerance is sized for the default scale: fp8 scores scaled less are
+    # larger, and so are their absolute rounding differences.
     reference = torch_qsa_mqa_prefill_relative(q, k, starts, ends, width)
     lengths_t = (ends - starts).long().reshape(-1, 1)
     window = torch.arange(width, device=q.device) < lengths_t
