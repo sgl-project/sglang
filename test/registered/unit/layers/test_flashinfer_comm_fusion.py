@@ -7,7 +7,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.layers import flashinfer_comm_fusion as fusion
 from sglang.srt.runtime_context import get_parallel, override_platform
-from sglang.srt.utils.common import is_confidential_compute
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 

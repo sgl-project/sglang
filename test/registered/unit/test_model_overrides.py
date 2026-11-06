@@ -39,7 +39,7 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import _declared_default
-from sglang.srt.utils.common import is_confidential_compute
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
 
 
