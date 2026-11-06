@@ -156,6 +156,8 @@ def reset_scheduler_at_step(scheduler: object, step_index: int) -> None:
 
 
 class ProgressiveDenoisingStageRouter(PipelineStage):
+    supports_denoising_step_profiling = True
+
     def __init__(
         self,
         standard_stage: DenoisingStage,

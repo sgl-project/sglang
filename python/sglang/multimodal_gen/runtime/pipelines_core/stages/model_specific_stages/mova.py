@@ -162,6 +162,8 @@ class MOVATimestepPreparationStage(PipelineStage):
 class MOVADenoisingStage(PipelineStage):
     """Run MOVA dual-tower denoising loop."""
 
+    supports_denoising_step_profiling = True
+
     def __init__(self, video_dit, video_dit_2, audio_dit, dual_tower_bridge, scheduler):
         super().__init__()
         self.video_dit = video_dit

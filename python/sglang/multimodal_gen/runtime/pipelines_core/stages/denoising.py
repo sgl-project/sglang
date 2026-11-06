@@ -304,6 +304,8 @@ class DenoisingStage(PipelineStage):
     the initial noise into the final output.
     """
 
+    supports_denoising_step_profiling = True
+
     @property
     def role_affinity(self):
         return RoleType.DENOISER
