@@ -1397,6 +1397,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             padded_view.num_padding = r - bs
             padded_view.max_seq_len_override = static_forward_batch.max_seq_len_override
             padded_view.input_ids = static_forward_batch.input_ids
+            if self.buffer_registry.has_slot("mamba_track_indices"):
+                padded_view.mamba_track_indices = self.buffer_registry.get_slot(
+                    "mamba_track_indices"
+                ).buffer[:r]
+            if self.buffer_registry.has_slot("mamba_track_mask"):
+                padded_view.mamba_track_mask = self.buffer_registry.get_slot(
+                    "mamba_track_mask"
+                ).buffer[:r]
             attn_backend.init_forward_metadata_out_graph(padded_view)
         elif not self.use_captured_attn_metadata:
             # An idle DP rank retains the padded graph shape for collective
