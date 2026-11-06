@@ -368,6 +368,57 @@ class TestC4StateTransferLayout(unittest.TestCase):
         )
 
 
+class TestNpuPDStateComponents(unittest.TestCase):
+    @patch("sglang.srt.mem_cache.static_kv_storage.is_npu", return_value=True)
+    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=True)
+    def test_empty_pp_buckets_keep_the_full_model_wire_order(self, *_):
+        from sglang.srt.mem_cache.static_kv_storage import _static_state_entries
+
+        ratios = [4, 4, 128, 4]
+
+        def entries(local_ratios):
+            pool = object.__new__(DSV4NPUTokenToKVPool)
+            pool.layer_router = SimpleNamespace(sub_pool=lambda _: None)
+            pool.compression_ratios = ratios
+            pool._unified_kv = False
+            pool.get_state_buf_infos = lambda: ([10], [1024], [128])
+            pool.get_request_state_buf_infos = lambda: (
+                ([20], [1024], [128]) if 128 in local_ratios else ([], [], [])
+            )
+            pool.get_c128_kv_buf_infos = lambda: (
+                ([30], [1024], [128]) if 128 in local_ratios else ([], [], [])
+            )
+            pool.get_c4_state_buf_infos = lambda: (
+                ([40, 50], [1024, 1024], [8, 8]) if 4 in local_ratios else ([], [], [])
+            )
+            return _static_state_entries(
+                pool,
+                draft_token_to_kv_pool=None,
+                total_kv_layers=None,
+                state_pool=None,
+            )
+
+        full = entries(ratios)
+        expected = [entry.state_type for entry in full.wire_entries]
+        for local_ratios in ([4, 4], [128], []):
+            with self.subTest(local_ratios=local_ratios):
+                stage = entries(local_ratios)
+                self.assertEqual(
+                    [entry.state_type for entry in stage.wire_entries], expected
+                )
+                for entry in stage.wire_entries:
+                    if entry.state_type.value in ("c128_state", "dsv4_c128"):
+                        self.assertEqual(
+                            bool(stage.regions[entry.sub_pool].ptrs),
+                            128 in local_ratios,
+                        )
+                    elif entry.state_type.value == "dsv4_c4_state":
+                        self.assertEqual(
+                            bool(stage.regions[entry.sub_pool].ptrs),
+                            4 in local_ratios,
+                        )
+
+
 class TestC4IndexerInitialization(unittest.TestCase):
     @patch(
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",

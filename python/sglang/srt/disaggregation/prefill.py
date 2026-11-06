@@ -1774,9 +1774,8 @@ class SchedulerDisaggregationPrefillMixin:
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
-            state_types = (
-                self.disagg_prefill_bootstrap_queue.kv_manager.kv_args.state_types
-            )
+            state_kv_args = self.disagg_prefill_bootstrap_queue.kv_manager.kv_args
+            state_types = state_kv_args.state_types
             payloads = {
                 StateType.MAMBA: _mamba_payload,
                 StateType.QSA_PENDING: _qsa_pending_payload,
@@ -1811,7 +1810,11 @@ class SchedulerDisaggregationPrefillMixin:
                     )
                 )
             state_indices = [
-                payloads[st]() if st in payloads else None for st in state_types
+                # Empty PP buckets keep their wire slot but own no payload.
+                payloads[st]()
+                if st in payloads and state_kv_args.state_data_ptrs[i]
+                else None
+                for i, st in enumerate(state_types)
             ]
 
         transfer_chunk_tokens = req.disagg_kv_sender.get_max_transfer_tokens()
