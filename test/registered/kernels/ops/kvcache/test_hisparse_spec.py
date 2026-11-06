@@ -14,7 +14,7 @@ from sglang.srt.utils import is_npu, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or is_npu() or is_xpu(),
