@@ -24,9 +24,11 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
     RowParallelLinearWithLoRA,
     _compute_lora_delta,
-    _request_allows_lossless,
 )
-from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+    set_forward_context,
+)
 from sglang.multimodal_gen.test.quality_tier_admission import (
     assert_error_no_worse_than_reference,
 )
@@ -130,16 +132,16 @@ def test_lossless_tier_is_admitted_against_the_fp64_math(stacked, adapter_dtype)
 
 def test_only_a_request_that_allows_it_takes_the_lossless_path():
     # LTX-2's denoising, among others, sets the context without forward_batch
-    assert not _request_allows_lossless()  # no forward context
+    assert not request_allows_lossless()  # no forward context
     with set_forward_context(0, None):
-        assert not _request_allows_lossless()
+        assert not request_allows_lossless()
     with set_forward_context(0, None, SimpleNamespace(runtime_lora_scale=1.0)):
-        assert not _request_allows_lossless()
+        assert not request_allows_lossless()
     with set_forward_context(0, None, _batch("exact")):
-        assert not _request_allows_lossless()
+        assert not request_allows_lossless()
     for quality in ("lossless", "high"):
         with set_forward_context(0, None, _batch(quality)):
-            assert _request_allows_lossless()
+            assert request_allows_lossless()
 
 
 class _RowLinear(nn.Module):
