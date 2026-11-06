@@ -1,4 +1,4 @@
-"""Unit tests for the sglang.srt.utils.hf_transformers subpackage.
+"""Unit tests for the sglang.srt.hf_transformers subpackage.
 
 Tests cover the pure utility functions (compat patches, config helpers,
 context length, GGUF detection, etc.) that don't require actual model files.
@@ -19,9 +19,8 @@ from transformers import PretrainedConfig
 from transformers.image_processing_backends import PilBackend
 from transformers.image_processing_utils import BaseImageProcessor
 
-import sglang.srt.utils.hf_transformers.processor as processor_utils
-from sglang.srt.utils import hf_transformers_patches
-from sglang.srt.utils.hf_transformers.common import (
+import sglang.srt.hf_transformers.processor as processor_utils
+from sglang.srt.hf_transformers.common import (
     _is_deepseek_ocr2_model,
     _is_deepseek_ocr_model,
     _override_v_head_dim_if_zero,
@@ -33,11 +32,12 @@ from sglang.srt.utils.hf_transformers.common import (
     get_rope_config,
     resolve_hf_gguf_reference,
 )
-from sglang.srt.utils.hf_transformers.config import (
+from sglang.srt.hf_transformers.config import (
     _apply_gemma4_attention_overrides,
     get_config,
 )
-from sglang.srt.utils.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.hf_transformers.tokenizer import _fix_special_tokens_pattern
+from sglang.srt.utils import hf_transformers_patches
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -746,22 +746,12 @@ class TestFixSpecialTokensPattern(CustomTestCase):
 
 class TestModuleReExports(CustomTestCase):
     def test_all_public_symbols_importable(self):
-        import sglang.srt.utils.hf_transformers as pkg
+        import sglang.srt.hf_transformers as pkg
 
         for name in pkg.__all__:
             self.assertTrue(
                 hasattr(pkg, name),
                 f"{name} listed in __all__ but not importable from package",
-            )
-
-    def test_shim_module_exports_match(self):
-        import sglang.srt.utils.hf_transformers as pkg
-        import sglang.srt.utils.hf_transformers_utils as shim
-
-        for name in pkg.__all__:
-            self.assertTrue(
-                hasattr(shim, name),
-                f"{name} not available through shim module hf_transformers_utils",
             )
 
 
@@ -835,7 +825,7 @@ class TestAutoConfigRegistration(CustomTestCase):
             CONFIG_MAPPING_NAMES,
         )
 
-        import sglang.srt.configs  # noqa: F401  (populates the registrations)
+        import sglang.srt.configs.all_configs  # noqa: F401  (populates the registrations)
 
         # `_extra_content` is exactly the set of classes SGLang registered, so
         # this covers `_CONFIG_REGISTRY` and the standalone registrations alike.

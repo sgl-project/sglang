@@ -17,19 +17,19 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    CustomTestCase,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 from sglang.test.vlm_utils import (
     IMAGE_MAN_IRONING_URL,
     AudioOpenAITestMixin,
-    CustomTestCase,
     ImageOpenAITestMixin,
     TestOpenAIMLLMServerBase,
     VideoOpenAITestMixin,
-    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=641, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=641, stage="extra-a", runner_config="1-gpu-large")
 
 
 # --- Qwen3-VL grounding regression (deepstack fusion) --------------------------
