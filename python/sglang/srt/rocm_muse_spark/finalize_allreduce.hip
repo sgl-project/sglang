@@ -1,13 +1,15 @@
-// Muse Spark MoE finalize fused with the TP4 all-reduce of its output (gfx950, xGMI peers).
+// Muse Spark MoE finalize fused with the TP4 / TP8 all-reduce of its output (gfx950, xGMI peers).
 //
-// One 256-thread block per token row r of an M-row batch (M a multiple of 4, hidden 4096, top-8):
+// One 256-thread block per token row r of an M-row batch (M a multiple of NR, hidden 4096, top-8):
 //   1. finalize: the per-expert input-scale RMSNorm and route-weighted sum of the row's local-expert slots, with the
 //      thread mapping, reduction order and rounding points of aiter's FlyDSL muse_moe_finalize_vector_flydsl;
-//   2. the row's partial goes to its owner rank r / (M / 4), which sums the four partials in the order of aiter's
+//   2. the row's partial goes to its owner rank r / (M / NR), which sums the NR partials in the order of aiter's
 //      cross_device_reduce_2stage (owner first, then owner+1, ...; FP32, one BF16 rounding) and pushes the sum to
 //      the other ranks; every rank writes the row to `out`.
-// So the result is bitwise the FlyDSL finalize followed by the aiter two-stage all-reduce, except that a -0.0 can
-// come out as +0.0.
+//      One-shot calls (`oneshot`, small batches) instead push the row's partial to every rank, and each rank sums
+//      the NR partials in rank order 0..NR-1 as aiter's cross_device_reduce_1stage does (FP32, one BF16 rounding).
+// So the result is bitwise the FlyDSL finalize followed by the aiter two-stage (one-stage) all-reduce, except that a
+// -0.0 can come out as +0.0.
 //
 // The data is its own flag (Lamport): inbox records start as the BF16 -0.0 pattern (0x8000), senders map -0.0 to
 // +0.0, readers spin with cache-bypassing volatile loads until no lane holds the sentinel. Each row keeps a call
@@ -18,7 +20,8 @@
 #include <hip/hip_runtime.h>
 #include <cstdint>
 
-#define NR 4
+// NR (ranks) is set at build time; the peer table is sized for the largest.
+#define MAX_NR 8
 #define HID 4096
 #define TOPK 8
 #define ROW_BYTES (HID * 2)
@@ -31,7 +34,7 @@ typedef __amdgpu_buffer_rsrc_t rsrc_t;
 #define CPOL_SYS_VOL (17 | (1u << 31))
 
 struct Peers {
-    uint8_t* inbox[NR];
+    uint8_t* inbox[MAX_NR];
 };
 
 struct Args {
@@ -49,9 +52,9 @@ struct Args {
     int32_t rank;
     int32_t rows;
     uint32_t max_rows;
-    uint32_t pad;
+    uint32_t oneshot;
 };
-static_assert(sizeof(Args) == 112, "Args is mirrored by a ctypes struct");
+static_assert(sizeof(Args) == 144, "Args is mirrored by a ctypes struct");
 
 __device__ __forceinline__ rsrc_t make_rsrc(const void* base) {
     return __builtin_amdgcn_make_buffer_rsrc((void*)base, 0, 0x7fffffff, 0x00020000);
@@ -105,13 +108,14 @@ __device__ __forceinline__ uint32_t s2_off(const Args& a, uint32_t slot, int row
     return (3u * NR * a.max_rows + slot * a.max_rows + row) * ROW_BYTES;
 }
 
-extern "C" __global__ void __launch_bounds__(256) muse_finalize_allreduce_tp4(Args a) {
+extern "C" __global__ void __launch_bounds__(256) muse_finalize_allreduce(Args a) {
     const int r = blockIdx.x;
     const int tid = threadIdx.x, lane = tid & 63, wave = tid >> 6;
     const uint32_t call = (uint32_t)a.row_state[2 * r];
     const int prev_owner = a.row_state[2 * r + 1];
     const uint32_t slot = call % 3u, prev = (call + 2u) % 3u;
-    const int owner = r / (a.rows / NR);
+    // a one-shot row is summed by every rank: each counts as its owner (for the inbox reset below)
+    const int owner = a.oneshot ? a.rank : r / (a.rows / NR);
     __shared__ float sums[TOPK * 4];
     __shared__ uint16_t rowbuf[HID];
 
@@ -172,7 +176,30 @@ extern "C" __global__ void __launch_bounds__(256) muse_finalize_allreduce_tp4(Ar
 
     const rsrc_t my = make_rsrc(a.peers.inbox[a.rank]);
     uint4* outrow = a.out + (size_t)r * PACKS_PER_ROW;
-    if (owner != a.rank) {
+    if (a.oneshot) {
+        // ---- push the partial to every other rank, then sum all NR partials in rank order ----
+        const uint32_t base = s1_off(a, slot, a.rank, r);
+#pragma unroll
+        for (int k = 1; k < NR; ++k) {
+            const rsrc_t dst = make_rsrc(a.peers.inbox[(a.rank + k) % NR]);
+#pragma unroll
+            for (int i = 0; i < 2; ++i) bst_x4(dst, base + (tid + i * 256) * 16, mine[i]);
+        }
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            const int p = tid + i * 256;
+            float acc[8];
+#pragma unroll
+            for (int src = 0; src < NR; ++src) {
+                uint4 t = mine[i];
+                if (src != a.rank) {
+                    do { t = bld_x4(my, s1_off(a, slot, src, r) + p * 16); } while (has_sentinel(t));
+                }
+                add_pack(t, acc, src == 0);
+            }
+            outrow[p] = pack_acc(acc);
+        }
+    } else if (owner != a.rank) {
         // ---- push the partial to the owner, then wait for the owner's sum ----
         const rsrc_t dst = make_rsrc(a.peers.inbox[owner]);
         const uint32_t base = s1_off(a, slot, a.rank, r);
@@ -186,7 +213,7 @@ extern "C" __global__ void __launch_bounds__(256) muse_finalize_allreduce_tp4(Ar
             outrow[tid + i * 256] = t;
         }
     } else {
-        // ---- owner: sum the four partials (owner first), push the sum to the other ranks ----
+        // ---- owner: sum the NR partials (owner first), push the sum to the other ranks ----
 #pragma unroll
         for (int i = 0; i < 2; ++i) {
             const int p = tid + i * 256;

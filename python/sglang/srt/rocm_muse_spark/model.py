@@ -1045,8 +1045,8 @@ class MuseSpark1xMoE(nn.Module):
             and _is_rocm()
             and mxfp4_moe.COMPACT_A4_ENABLED
             and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 4
-            and self.num_local_experts == 64
+            and self.tp_size == self.ep_size
+            and (self.tp_size, self.num_local_experts) in ((4, 64), (8, 32))
             and self.top_k == 8
             and self.expert_hidden_size == 4096
             else None
