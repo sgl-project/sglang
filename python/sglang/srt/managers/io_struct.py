@@ -989,6 +989,7 @@ class GenerateReqInput:
             ),
             image_data=self.image_data[i],
             video_data=self.video_data[i],
+            video_config=self.video_config,
             audio_data=self.audio_data[i],
             mm_hashes=self.mm_hashes[i] if self.mm_hashes is not None else None,
             mm_content_hashes=(
