@@ -72,7 +72,7 @@ void bias_gelu_tanh(tvm::ffi::TensorView input, tvm::ffi::TensorView bias, tvm::
   auto num_rows = SymbolicSize{"num_rows"};
   auto hidden_dim = SymbolicSize{"hidden_dim"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({num_rows, hidden_dim}).with_dtype<T>().with_device(device_).verify(input);
   TensorMatcher({hidden_dim}).with_dtype<T>().with_device(device_).verify(bias);

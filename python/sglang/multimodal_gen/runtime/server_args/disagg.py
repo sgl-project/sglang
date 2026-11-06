@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from dataclasses import fields
 from typing import ClassVar
 
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
@@ -41,6 +42,40 @@ class DisaggServerArgsMixin:
         if role_type == RoleType.DECODER:
             return {**_none, "sp_degree": self.decoder_sp}
         return _none
+
+    def for_disagg_role(self, role_type: RoleType, **overrides):
+        """Derive a worker's arguments without inheriting resolved parent topology."""
+        values = vars(self)
+        kwargs = {
+            f.name: values[f.name]
+            for f in fields(self)
+            if f.init and f.name != "pipeline_config"
+        }
+        explicit = self._explicit_arg_names.copy()
+        # re-run automatic choices for this role's device count, not the parent's
+        for name in (
+            "tp_size",
+            "sp_degree",
+            "ulysses_degree",
+            "ring_degree",
+            "kv_gather_degree",
+            "enable_cfg_parallel",
+            "cfg_parallel_degree",
+            "hsdp_shard_dim",
+        ):
+            if name not in explicit:
+                kwargs.pop(name)
+        kwargs["sp_split_auto"] = False
+        # role-specific flags override explicit generic flags; validation stays shared
+        for name, value in self.get_role_parallelism(role_type).items():
+            if value is not None:
+                kwargs[name] = value
+                explicit.add(name)
+        kwargs.update(overrides)
+        kwargs.update(
+            disagg_role=role_type, disagg_mode=True, _explicit_arg_names=explicit
+        )
+        return type(self).from_kwargs(**kwargs)
 
     def derive_pool_result_endpoint(self) -> str:
         host, base_port = parse_tcp_host_port(
@@ -84,13 +119,6 @@ class DisaggServerArgsMixin:
             f"Default: {cls.disagg_timeout}.",
         )
         parser.add_argument(
-            "--disagg-downstream-wait-timeout",
-            type=int,
-            default=cls.disagg_downstream_wait_timeout,
-            help="Timeout in seconds while waiting for a downstream role slot. "
-            f"Default: {cls.disagg_downstream_wait_timeout}.",
-        )
-        parser.add_argument(
             "--disagg-dispatch-policy",
             type=str,
             default=cls.disagg_dispatch_policy,
@@ -98,52 +126,10 @@ class DisaggServerArgsMixin:
             help="Dispatch policy for pool mode disagg routing.",
         )
         parser.add_argument(
-            "--disagg-instance-id",
-            type=int,
-            default=cls.disagg_instance_id,
-            help="Stable per-role instance ID used by DiffusionServer registration.",
-        )
-        parser.add_argument(
-            "--disagg-max-slots-per-instance",
-            type=int,
-            default=cls.disagg_max_slots_per_instance,
-            help="Maximum concurrent transfer/computation slots tracked per instance.",
-        )
-        parser.add_argument(
-            "--disagg-transfer-redundancy",
-            type=float,
-            default=cls.disagg_transfer_redundancy,
-            help="Redundancy factor used when sizing transfer buffers from warmup.",
-        )
-        parser.add_argument(
-            "--disagg-role-device",
-            type=str,
-            default=cls.disagg_role_device,
-            choices=["auto", "cpu", "cuda"],
-            help=(
-                "Per-role device override. 'cpu' is intended for same-machine "
-                "encoder roles."
-            ),
-        )
-        parser.add_argument(
-            "--disagg-transfer-backend",
-            type=str,
-            default=cls.disagg_transfer_backend,
-            choices=["auto", "mock", "mooncake"],
-            help="Transfer backend for multimodal diffusion disaggregation.",
-        )
-        parser.add_argument(
             "--disagg-transfer-pool-size",
             type=int,
             default=cls.disagg_transfer_pool_size,
             help="Size of the P2P transfer buffer pool in bytes.",
-        )
-        parser.add_argument(
-            "--disagg-transfer-pin-memory",
-            type=str,
-            default=cls.disagg_transfer_pin_memory,
-            choices=["auto", "off", "required"],
-            help="CUDA host-register same-host shared-memory transfer buffers.",
         )
         parser.add_argument(
             "--disagg-p2p-hostname",

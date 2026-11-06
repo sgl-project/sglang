@@ -66,7 +66,7 @@ _SHAPES = (
     # A pass and a handler both decide this one: waterfill forces `deepep`
     # and the ascend handler wants `none`. Without this shape nothing in
     # the set reaches a field two writers disagree about.
-    {"enable_waterfill": True, "moe_a2a_backend": "ascend_tp"},
+    {"enable_waterfill": True, "moe_a2a_backend": "none"},
 )
 
 # Which converted fields the shapes above reach; the rest need a device or an
@@ -535,7 +535,7 @@ class TestResolutionDeclarations(CustomTestCase):
         registry entry that ran earlier -- where before, the pass's declaration
         was applied on top of the handler's bare write. One handler was found
         that way (it gated on the raw field while its neighbours read the
-        resolving view, so `--enable-waterfill --moe-a2a-backend ascend_tp`
+        resolving view, so `--enable-waterfill --moe-a2a-backend none`
         silently stopped forcing `deepep`).
 
         This is the invariant rather than that instance: walk the stash in
@@ -544,7 +544,7 @@ class TestResolutionDeclarations(CustomTestCase):
         deferred sources are derived from the live registries and the constant
         override table, so a new pass is covered without being listed.
         """
-        from sglang.srt.arg_groups import overrides
+        from sglang.srt.arg_groups import model_override_base, overrides
 
         deferred = {
             getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
@@ -552,17 +552,19 @@ class TestResolutionDeclarations(CustomTestCase):
         }
         deferred |= {
             getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
-            for fns in overrides._MODEL_OVERRIDE_FNS.values()
+            for fns in model_override_base._MODEL_OVERRIDE_FNS.values()
             for fn in fns
         }
         deferred |= {
             getattr(fn, "__qualname__", getattr(fn, "__name__", ""))
-            for _predicate, fn in overrides._PREDICATE_OVERRIDE_FNS
+            for _predicate, fn in model_override_base._PREDICATE_OVERRIDE_FNS
         }
         # The constant arch -> {field: value} table is a deferred writer too --
         # it has no callable, and its stash source is spelled by the collector
         # (`MODEL_OVERRIDES[<arch>]`).
-        deferred |= {f"MODEL_OVERRIDES[{arch!r}]" for arch in overrides.MODEL_OVERRIDES}
+        deferred |= {
+            f"MODEL_OVERRIDES[{arch!r}]" for arch in model_override_base.MODEL_OVERRIDES
+        }
         self.assertGreater(
             len(deferred), 40, "the deferred-writer set collapsed; nothing to compare"
         )

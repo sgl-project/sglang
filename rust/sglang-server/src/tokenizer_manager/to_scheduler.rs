@@ -10,6 +10,7 @@ use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
+pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
 use crate::tokenizer_manager::to_scheduler_validation::{
     check_total_tokens, validate, validate_input_ids,
 };
@@ -59,6 +60,20 @@ impl Intake {
             mm,
             request_states: HashMap::new(),
             shutdown,
+        }
+    }
+}
+
+/// The scheduler's `AbortReq` for one request.
+fn abort_req(rid: &Rid) -> Option<SchedulerRequest> {
+    match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
+        Ok(header) => Some(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }),
+        Err(e) => {
+            tracing::error!(rid = %rid, error = %e, "abort encode failed");
+            None
         }
     }
 }
@@ -352,16 +367,18 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
             ),
             RequestKind::Control(_)
             | RequestKind::Detokenize { .. }
             | RequestKind::Tokenize { .. } => (
                 false, /* decode_logprob_text */
                 false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
             ),
         };
         self.senders
@@ -371,6 +388,7 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                skip_special_tokens,
             })
             .is_ok()
     }
@@ -458,8 +476,22 @@ impl Intake {
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
     /// abort there yet: it is marked `Aborted` and dropped when it returns.
+    ///
+    /// An `/abort_request` ([`AbortSource::Request`]) for a request the
+    /// scheduler has keeps its sink, so the scheduler's terminal output still
+    /// reaches the client, and queues behind the request on the request ring:
+    /// the reserved lane could overtake it, and the scheduler would then run
+    /// the request it never saw aborted to completion. On a full ring it is
+    /// handled like any other abort and the client's call ends on its own.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
+        if matches!(source, AbortSource::Request(_))
+            && !self.request_states.contains_key(&rid)
+            && let Some(abort) = abort_req(&rid)
+            && self.to_scheduler_tx.try_push(abort)
+        {
+            return;
+        }
         let _ = self
             .senders
             .detok_for(&rid)
@@ -473,16 +505,10 @@ impl Intake {
             return;
         }
 
-        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
-            Ok(header) => {
-                if !self.to_scheduler_tx.push_priority(SchedulerRequest {
-                    header,
-                    buffers: Vec::new(),
-                }) {
-                    tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
-                }
-            }
-            Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
+        if let Some(abort) = abort_req(&rid)
+            && !self.to_scheduler_tx.push_priority(abort)
+        {
+            tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
         }
     }
 
