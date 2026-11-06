@@ -1772,6 +1772,19 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
 @register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """Set shared-expert fusion requirements for the selected A2A backend."""
+    if view.fuseep_mode == 3:
+        if view.moe_a2a_backend != "ascend_fuseep" or view.device != "npu":
+            raise ValueError(
+                "--fuseep-mode 3 requires --device npu --moe-a2a-backend ascend_fuseep"
+            )
+        if view.quantization != "modelslim":
+            raise ValueError("--fuseep-mode 3 requires --quantization modelslim")
+        if not view.disable_shared_experts_fusion:
+            raise ValueError("--fuseep-mode 3 requires --disable-shared-experts-fusion")
+        if view.speculative_algorithm is not None:
+            raise ValueError("--fuseep-mode 3 does not support speculative decoding")
+        if view.enable_eplb:
+            raise ValueError("--fuseep-mode 3 does not support expert load balancing")
     if view.moe_a2a_backend in ("deepep", "megamoe") and view.enable_waterfill:
         if view.disable_shared_experts_fusion:
             logger.warning(
