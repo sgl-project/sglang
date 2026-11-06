@@ -33,7 +33,9 @@ def _with_replicated_projection(binding, target, rows_per_head, key_rows=None):
     descriptor select the K rows of every KV head, without per-head segments,
     temporary weights, or an all-gather while paused.
     """
-    heads = target.shape[0] if key_rows is not None else target.shape[0] // rows_per_head
+    heads = (
+        target.shape[0] if key_rows is not None else target.shape[0] // rows_per_head
+    )
     span = heads * rows_per_head
     start = binding.slices[0][0] // span * span
     coverage = [[start, start + span], [0, binding.shape[1]]]

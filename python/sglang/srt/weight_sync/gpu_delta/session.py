@@ -272,8 +272,12 @@ def with_gpu_delta_controls(scheduler, dispatcher):
     from sglang.utils import TypeBasedDispatcher
 
     parallel = get_parallel()
-    reply_group = parallel.attn_tp_group if parallel.attn_tp_size > 1 else None
-    control = GpuDeltaSchedulerControl(scheduler, reply_group)
+    reply_groups = []
+    if parallel.attn_cp_size > 1:
+        reply_groups.append(parallel.attn_cp_group)
+    if parallel.attn_tp_size > 1:
+        reply_groups.append(parallel.attn_tp_group)
+    control = GpuDeltaSchedulerControl(scheduler, tuple(reply_groups))
     dispatcher += TypeBasedDispatcher(
         [
             (delta_io.GetGpuDeltaInfoReqInput, control.handle),
@@ -292,9 +296,9 @@ def with_gpu_delta_controls(scheduler, dispatcher):
 class GpuDeltaSchedulerControl:
     """Small scheduler adapter; dependencies are lazy for ordinary disk users."""
 
-    def __init__(self, scheduler, reply_group=None):
+    def __init__(self, scheduler, reply_groups=()):
         self.scheduler = scheduler
-        self.reply_group = reply_group
+        self.reply_groups = reply_groups
         self.session: DeltaSession | None = None
 
     def _describe(self, engine_id: str) -> dict:
@@ -309,15 +313,14 @@ class GpuDeltaSchedulerControl:
             raise ValueError(
                 "GPU delta requires the global control broadcast without EP scale joiners"
             )
-        # DCP partitions KV inside an attention-TP group; every weight owner
-        # still replies through that group's leader. Prefill CP and PP require
-        # separate control and consumer admission.
-        if parallel.attn_cp_size != 1 or parallel.pp_size != 1:
-            raise ValueError("GPU delta currently requires attention CP1 and PP1")
+        # PP relays controls only after this handler returns and retains several
+        # in-flight microbatches; it needs a separate pause/drain protocol.
+        if parallel.pp_size != 1:
+            raise ValueError("GPU delta currently requires PP1")
+        if parallel.attn_cp_size > 1 and parallel.enable_cp_decode_attn_tp:
+            raise ValueError("GPU delta does not support CP decode attention TP caches")
         if parallel.attn_tp_size % parallel.attn_dcp_size:
-            raise ValueError(
-                "GPU delta requires DCP groups inside attention TP groups"
-            )
+            raise ValueError("GPU delta requires DCP groups inside attention TP groups")
         if scheduler.enable_lora or str(scheduler.disaggregation_mode.value) != "null":
             raise ValueError(
                 "GPU delta currently requires no LoRA and no disaggregation"
@@ -447,22 +450,22 @@ class GpuDeltaSchedulerControl:
             success, message = False, str(exc)
         receipt["generation_paused"] = self.scheduler._engine_paused
         replies = [(success, message, receipt)]
-        if self.reply_group is not None:
+        for group in self.reply_groups:
             from torch.distributed import gather_object
 
-            group = self.reply_group
-            replies = [None] * group.world_size if group.rank_in_group == 0 else None
-            # Use the scheduler's CPU group, including failed rank replies. Only
-            # its leader owns the tokenizer socket; the tokenizer waits for every
-            # DP route before advancing prepare/apply/resume to the next phase.
+            gathered = [None] * group.world_size if group.rank_in_group == 0 else None
+            # CP leaders gather along TP. Carry every accumulated receipt,
+            # including failures, to the sole CP0/TP0 tokenizer socket per DP
+            # route before advancing prepare/apply/resume to the next phase.
             gather_object(
-                (success, message, receipt),
                 replies,
+                gathered,
                 dst=group.ranks[0],
                 group=group.cpu_group,
             )
-            if replies is None:
+            if gathered is None:
                 return None
+            replies = [reply for participants in gathered for reply in participants]
         return delta_io.GpuDeltaReqOutput(
             rid=request.rid,
             success=all(reply[0] for reply in replies),

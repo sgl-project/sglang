@@ -93,8 +93,25 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             for dcp in (False, True):
                 with self.subTest(tp_rank=tp_rank, tp_size=tp_size, dcp=dcp):
                     self._check_shared_expert_partition(tp_rank, tp_size, dcp)
+        # CP partners repeat attention shards while shared experts retain their
+        # own TP group: TP4/CP2 attention rank1 lives on global ranks1 and3.
+        # Pure CP also repeats a complete attention image on each TP2 rank.
+        for tp_rank, tp_size, attn_rank, attn_size in (
+            (1, 4, 1, 2),
+            (3, 4, 1, 2),
+            (0, 2, 0, 1),
+            (1, 2, 0, 1),
+        ):
+            with self.subTest(
+                tp_rank=tp_rank, tp_size=tp_size, attn_size=attn_size, prefill_cp=True
+            ):
+                self._check_shared_expert_partition(
+                    tp_rank, tp_size, False, attn_rank, attn_size
+                )
 
-    def _check_shared_expert_partition(self, tp_rank, tp_size, dcp):
+    def _check_shared_expert_partition(
+        self, tp_rank, tp_size, dcp, attn_rank=3, attn_size=4
+    ):
         intermediate, hidden = 32, 16
         shard = intermediate // tp_size
         before = {
@@ -147,7 +164,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         # Attention and shared experts may use different TP groups. MLA's
         # projected K/V caches must refresh from the selected local kv_b shard.
         attn = layer.self_attn = torch.nn.Module()
-        attn_group = SimpleNamespace(rank_in_group=3, world_size=4)
+        attn_group = SimpleNamespace(rank_in_group=attn_rank, world_size=attn_size)
         attn.qk_nope_head_dim, attn.v_head_dim = 4, 6
         attn.qk_head_dim = 8
         attn.q_b_proj_qrep = None
@@ -167,9 +184,10 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
             value = torch.randn(shape).bfloat16()
             attention_before[name] = value
             attention_after[name] = torch.randn_like(value)
-            width = shape[axis] // 4
+            width = shape[axis] // attn_size
             module.weight = torch.nn.Parameter(
-                value.narrow(axis, 3 * width, width).clone(), requires_grad=False
+                value.narrow(axis, attn_rank * width, width).clone(),
+                requires_grad=False,
             )
             setattr(module.weight, "input_dim" if axis == 1 else "output_dim", axis)
             setattr(attn, name, module)
@@ -177,7 +195,7 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
                 "dtype": "BF16",
                 "shape": list(shape),
             }
-        key, value = attn.kv_b_proj.weight.unflatten(0, (1, 10)).split([4, 6], dim=1)
+        key, value = attn.kv_b_proj.weight.unflatten(0, (-1, 10)).split([4, 6], dim=1)
         attn.w_kc = key.clone().detach()
         attn.w_vc = value.transpose(1, 2).clone().detach()
         if dcp:
@@ -201,15 +219,19 @@ class TestFlashInferDeltaLayout(unittest.TestCase):
         plan.check_identity()
         for name, value in attention_after.items():
             axis = 1 if name == "o_proj" else 0
-            width = value.shape[axis] // 4
+            width = value.shape[axis] // attn_size
             torch.testing.assert_close(
                 _bytes(getattr(attn, name).weight),
-                _bytes(value.narrow(axis, 3 * width, width)),
+                _bytes(value.narrow(axis, attn_rank * width, width)),
                 rtol=0,
                 atol=0,
             )
-        key, value = attention_after["kv_b_proj"][30:].unflatten(0, (1, 10)).split(
-            [4, 6], dim=1
+        kv_width = attention_after["kv_b_proj"].shape[0] // attn_size
+        key, value = (
+            attention_after["kv_b_proj"]
+            .narrow(0, attn_rank * kv_width, kv_width)
+            .unflatten(0, (-1, 10))
+            .split([4, 6], dim=1)
         )
         torch.testing.assert_close(_bytes(attn.w_kc), _bytes(key), rtol=0, atol=0)
         torch.testing.assert_close(

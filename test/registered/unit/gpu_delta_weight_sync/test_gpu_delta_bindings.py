@@ -202,7 +202,7 @@ def test_cutedsl_bindings_preserve_scale_images_padding_and_aliases():
                     f"{stem}_weight": torch.zeros(
                         (1, full_rows, cols * 8), dtype=torch.uint8
                     ),
-                }
+                },
             )
             layout = fi.FlashInferLayout("nvfp4", "cutedsl", True, "w4a4", True)
             layer._map_global_expert_id_to_local_expert_id = lambda expert: expert
@@ -434,16 +434,12 @@ def test_trtllm_tp_preserves_padded_loader_offsets(
     # by its padded width 128: rank one owns [128:192], not [96:192].
     scale = suffix == "weight_scale"
     divisor = 16 if scale else 2
-    shape = (
-        (192, 128 // divisor) if projection == "gate" else (128, 192 // divisor)
-    )
+    shape = (192, 128 // divisor) if projection == "gate" else (128, 192 // divisor)
     rows = 2 * partition if projection == "gate" else 128
     cols = (128 if projection == "gate" else partition) // divisor
     logical = torch.zeros(rows, cols, dtype=torch.uint8)
     physical = (
-        blocked_scales(shuffled_rows(logical))
-        if scale
-        else shuffled_rows(logical)
+        blocked_scales(shuffled_rows(logical)) if scale else shuffled_rows(logical)
     )
     stem = "w13" if projection == "gate" else "w2"
     layer = SimpleNamespace(
@@ -482,7 +478,7 @@ def test_trtllm_tp_preserves_padded_loader_offsets(
         if projection == "gate":
             logical[:128:2] = mask[128:]
         else:
-            logical[:, :64 // divisor] = mask[:, 128 // divisor:]
+            logical[:, : 64 // divisor] = mask[:, 128 // divisor :]
     expected = shuffled_rows(logical)
     if scale:
         expected = blocked_scales(expected)

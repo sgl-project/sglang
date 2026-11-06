@@ -174,9 +174,7 @@ def case(kind, index):
         # A full canonical mask feeds a rank-local interleaved destination.
         # Column TP must retain the global source row stride, including its
         # nonzero shard offset. Padding outside the target must remain intact.
-        target = (
-            storage[16:-16].view(rows // 4, columns // 4, 4, 4).permute(0, 2, 1, 3)
-        )
+        target = storage[16:-16].view(rows // 4, columns // 4, 4, 4).permute(0, 2, 1, 3)
     else:
         size, padding = kind
         canonical_shape = (1, size)

@@ -203,9 +203,19 @@ def reply(control, obj, state, ranks=(0,)):
     )
 
 
+@pytest.mark.parametrize("ranks_per_route", [2, 4], ids=["tp2", "cp2-tp2"])
 def test_update_waits_for_every_rank_before_apply_and_resume(
-    control, publication, monkeypatch
+    control, publication, monkeypatch, ranks_per_route
 ):
+    routes = (
+        tuple(range(ranks_per_route)),
+        tuple(range(ranks_per_route, 2 * ranks_per_route)),
+    )
+    publication["participants"] = [
+        dict(engine_id="e0", rank_id=f"r{rank}", hostname="host", host_cache_id="cache")
+        for rank in range(2 * ranks_per_route)
+    ]
+
     async def run():
         facade, _, versions = control
         setup_calls = []
@@ -226,29 +236,33 @@ def test_update_waits_for_every_rank_before_apply_and_resume(
         assert type(prepare) is io.PrepareGpuDeltaReqInput
         assert prepare.validate_payload_hash is True
         assert not facade.manager.is_pause
-        reply(facade, prepare, "PREPARED", ranks=(0, 1))
+        reply(facade, prepare, "PREPARED", ranks=routes[0])
         await asyncio.sleep(0)
         assert sent.empty() and not task.done()
-        reply(facade, prepare, "PREPARED", ranks=(2, 3))
+        reply(facade, prepare, "PREPARED", ranks=routes[1])
         apply = await sent.get()
         assert type(apply) is io.ApplyGpuDeltaReqInput
         assert facade.manager.is_pause
-        reply(facade, apply, "APPLIED", ranks=(0, 1))
+        reply(facade, apply, "APPLIED", ranks=routes[0])
         await asyncio.sleep(0)
         assert sent.empty() and facade.manager.is_pause
-        reply(facade, apply, "APPLIED", ranks=(2, 3))
+        reply(facade, apply, "APPLIED", ranks=routes[1])
         resume = await sent.get()
         assert type(resume) is io.ResumeGpuDeltaReqInput
         assert facade.manager.is_pause and versions == []
-        reply(facade, resume, "RESUMED", ranks=(0, 1))
+        reply(facade, resume, "RESUMED", ranks=routes[0])
         await asyncio.sleep(0)
         assert not task.done() and facade.manager.is_pause and versions == []
-        reply(facade, resume, "RESUMED", ranks=(2, 3))
+        reply(facade, resume, "RESUMED", ranks=routes[1])
         result = await task
         assert result["success"] and not facade.manager.is_pause
         assert versions == ["7"] and sent.empty()
-        assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * 4
-        assert [r["state"] for r in result["participants"]] == ["RESUMED"] * 4
+        assert [r["state"] for r in result["applied_participants"]] == ["APPLIED"] * (
+            2 * ranks_per_route
+        )
+        assert [r["state"] for r in result["participants"]] == ["RESUMED"] * (
+            2 * ranks_per_route
+        )
         assert setup_calls == ["loop", "workers"]
 
     asyncio.run(asyncio.wait_for(run(), timeout=2))
