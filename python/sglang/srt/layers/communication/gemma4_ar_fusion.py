@@ -29,11 +29,9 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Smallest extend batch that takes the fused path, per TP size, unless
-# SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS says otherwise. From
-# bench_gemma4_ar_fusion.py on H200 (fused incl. the staging copy vs the stock
-# all-reduce + epilogue, both CUDA-graph captured): at TP4 / TP8 the fused site
-# is 1.5-2.1x faster from 128 tokens up; at TP2 it is 9-13 % faster from 2048
-# tokens and within 3-5 % below, so TP2 keeps the stock path there.
+# SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS says otherwise. At TP4 / TP8 the fused
+# site is 1.5-2.1x faster from 128 tokens up; at TP2 it is 9-13 % faster from
+# 2048 tokens and within 3-5 % below, so TP2 keeps the stock path there.
 DEFAULT_MIN_TOKENS = {2: 2048, 4: 128, 8: 128}
 
 
