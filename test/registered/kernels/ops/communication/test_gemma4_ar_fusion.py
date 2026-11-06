@@ -2,7 +2,7 @@
 against an fp32 reference of the unfused path; every rank must receive the same
 rows.
 
-Run with ``python <this file>``; it relaunches under torchrun on 4 GPUs.
+Run with ``python <this file>``; it relaunches under torchrun on 2, 4 and 8 GPUs.
 """
 
 from __future__ import annotations
@@ -206,4 +206,4 @@ def test_final(hidden: int, rows: int):
 
 
 if __name__ == "__main__":
-    multigpu_pytest_main(__name__, __file__, num_gpus=(4,))
+    multigpu_pytest_main(__name__, __file__, num_gpus=(2, 4, 8))

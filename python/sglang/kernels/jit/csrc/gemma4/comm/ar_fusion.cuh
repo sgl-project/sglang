@@ -17,11 +17,11 @@
 // kFinal (last layer) stops after the residual update and multicasts the bf16
 // rows instead, so the caller's final norm sees every row.
 //
-// Barriers reuse the CustomAllReduceV2 pull plane exactly as
-// kimi_k3/comm/ar_fusion.cuh does: block b of every rank meets block b of every
-// other rank through one `multimem.red` on the semaphore's multicast alias,
-// twice per launch (all partials visible / all outputs landed). Every rank must
-// launch the same grid, and the launch is clamped to the plane's block count.
+// Barriers reuse the CustomAllReduceV2 pull plane: block b of every rank meets
+// block b of every other rank through one `multimem.red` on the semaphore's
+// multicast alias, twice per launch (all partials visible / all outputs
+// landed). Every rank must launch the same grid, and the launch is clamped to
+// the plane's block count.
 //
 // Rounding points match the unfused path (gemma4_fused_ops.py + the per-group
 // quant), see `round_a` in Params. Hidden size and block width are template

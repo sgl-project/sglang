@@ -2335,9 +2335,10 @@ class Envs:
     # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
     # quant of the dense layer stack as one NVLS kernel per site, for extend
     # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
-    # See srt/layers/communication/gemma4_ar_fusion.py.
+    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
+    # srt/layers/communication/gemma4_ar_fusion.py).
     SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
-    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(512)
+    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
     SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
 
     # ===================================================================

@@ -2,7 +2,8 @@
 ``kernels.ops.communication.gemma4_ar_fusion``.
 
 Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend batches of
-``SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS`` .. ``_MAX_TOKENS`` tokens run every
+``SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS`` (default per TP size, see
+``DEFAULT_MIN_TOKENS``) .. ``_MAX_TOKENS`` tokens run every
 TP all-reduce + RMSNorm -> residual add (x layer_scalar) -> RMSNorm -> per-128
 FP8 quant of the dense layer stack as one NVLS kernel each; everything else
 takes the regular path. Needs SM90 with NVLink multicast (CustomAllReduceV2
@@ -26,6 +27,20 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+# Smallest extend batch that takes the fused path, per TP size, unless
+# SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS says otherwise. From
+# bench_gemma4_ar_fusion.py on H200 (fused incl. the staging copy vs the stock
+# all-reduce + epilogue, both CUDA-graph captured): at TP4 / TP8 the fused site
+# is 1.5-2.1x faster from 128 tokens up; at TP2 it is 9-13 % faster from 2048
+# tokens and within 3-5 % below, so TP2 keeps the stock path there.
+DEFAULT_MIN_TOKENS = {2: 2048, 4: 128, 8: 128}
+
+
+def default_min_tokens(world_size: int) -> int:
+    # the entry of the nearest TP size at or below world_size
+    return DEFAULT_MIN_TOKENS[max(n for n in DEFAULT_MIN_TOKENS if n <= world_size)]
+
 
 GROUP = 128
 
@@ -119,9 +134,10 @@ class Gemma4ArFusion:
         self.eps = float(eps)
         self.hidden = hidden_size
         self.max_tokens = int(envs.SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS.get())
-        self.min_tokens = max(
-            int(envs.SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS.get()), self.world_size
+        min_tokens = int(envs.SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS.get()) or (
+            default_min_tokens(self.world_size)
         )
+        self.min_tokens = max(min_tokens, self.world_size)
         T, H = self.max_tokens, hidden_size
         # partial sums in (bf16); the last layer multicasts the bf16 residual into it
         self.partial = _symm_buffer((T, H), torch.bfloat16, state.group_name)
