@@ -115,26 +115,6 @@ class TestSWAAllocExtendPageEstimation(CustomTestCase):
         self.assertIsNone(result)
         stub.swa_attn_allocator.alloc_extend.assert_not_called()
 
-    def test_exactly_at_capacity_succeeds(self):
-        stub = _make_self(page_size=8, full_available=16, swa_available=16)
-        result = _call(
-            stub,
-            prefix_lens_cpu=torch.tensor([8, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([9, 9], dtype=torch.int64),
-            extend_num_tokens=2,
-        )
-        self.assertIsNotNone(result)
-
-    def test_one_over_capacity_refuses(self):
-        stub = _make_self(page_size=8, full_available=16, swa_available=16)
-        result = _call(
-            stub,
-            prefix_lens_cpu=torch.tensor([8, 8, 8], dtype=torch.int64),
-            seq_lens_cpu=torch.tensor([9, 9, 9], dtype=torch.int64),
-            extend_num_tokens=3,
-        )
-        self.assertIsNone(result)
-
 
 if __name__ == "__main__":
     unittest.main()

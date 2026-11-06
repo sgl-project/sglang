@@ -33,6 +33,7 @@ import torch
 
 logger = logging.getLogger(__name__)
 
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,
     DecLockRefParams,
@@ -300,13 +301,17 @@ class RadixCache(BasePrefixCache):
             self.init_metrics_collector()
 
         if self.token_to_kv_pool_allocator:
+            self.logical_page_size = self.token_to_kv_pool_allocator.page_size
             dev = self.token_to_kv_pool_allocator.device
             if isinstance(dev, (str, torch.device)):
                 self.device = torch.device(dev)
             else:
                 self.device = torch.device("cpu")
         else:
+            self.logical_page_size = self.page_size
             self.device = torch.device("cpu")
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
 
         self.eviction_strategy = get_eviction_strategy(
             "lru" if self.disable else self.eviction_policy,
@@ -481,7 +486,7 @@ class RadixCache(BasePrefixCache):
                 priority=priority,
             )
         )
-        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, key_len)
+        req.kv.record_insert(key_len)
         if split_prompt:
             # Split the leaf at the prompt boundary so eviction can drop the
             # output KV without the prompt; a prefix re-insert only changes topology.
@@ -536,7 +541,7 @@ class RadixCache(BasePrefixCache):
         # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
         # checkpoint or release_kv_cache frees the rest.
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.protect_prefix(len(new_indices))
 
         self.unlock(req.lock)
         req.lock = self.lock(new_last_node)

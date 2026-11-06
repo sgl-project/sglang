@@ -4,43 +4,27 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import torch
 import torch.nn as nn
 
-from sglang.multimodal_gen.runtime.layers.quantization.modelopt_quant import (
-    ModelOptFp8LinearMethod,
-)
 from sglang.multimodal_gen.runtime.models.dits.qwen_image import (
     QwenImageTransformerBlock,
 )
+from sglang.multimodal_gen.test.unit.modelopt_fp8_stub import fp8_linear
 from sglang.test.test_utils import CustomTestCase
-
-
-def _fp8_linear(input_scale: float) -> nn.Module:
-    linear = nn.Module()
-    linear.quant_method = object.__new__(ModelOptFp8LinearMethod)
-    linear.register_parameter(
-        "input_scale",
-        nn.Parameter(
-            torch.tensor(input_scale, dtype=torch.float32, device="cuda"),
-            requires_grad=False,
-        ),
-    )
-    return linear
 
 
 def _attention(*, fused: bool, scales: tuple[float, ...]) -> SimpleNamespace:
     if fused:
         return SimpleNamespace(
             use_fused_qkv=True,
-            to_qkv=_fp8_linear(scales[0]),
+            to_qkv=fp8_linear(scales[0]),
             added_kv_proj_dim=None,
         )
     return SimpleNamespace(
         use_fused_qkv=False,
-        to_q=_fp8_linear(scales[0]),
-        to_k=_fp8_linear(scales[1]),
-        to_v=_fp8_linear(scales[2]),
+        to_q=fp8_linear(scales[0]),
+        to_k=fp8_linear(scales[1]),
+        to_v=fp8_linear(scales[2]),
         added_kv_proj_dim=None,
     )
 

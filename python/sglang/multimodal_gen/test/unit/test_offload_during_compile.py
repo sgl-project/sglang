@@ -47,10 +47,12 @@ class TestOffloadDuringCompile(CustomTestCase):
         self.dit = _DiT()
         self.counter = CompileCounter()
         self.dit.compile(backend=self.counter)
-        self.stage = SimpleNamespace(
-            _offloaded_dit_modules_for_compile=[self.dit],
-            _move_resident_components_for_warmup=lambda: [],
+        self.stage = DenoisingStage.__new__(DenoisingStage)
+        self.stage.server_args = SimpleNamespace(
+            dit_layerwise_offload=False, is_dit_layerwise_offload_selected=False
         )
+        self.stage._offloaded_dit_modules_for_compile = [self.dit]
+        self.stage._move_resident_components_for_warmup = lambda: []
 
     def _forward(self, *, is_warmup):
         with DenoisingStage._offload_for_torch_compile_warmup(
