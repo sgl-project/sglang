@@ -29,6 +29,7 @@ from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrVisionConfig,
 )
 
+from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -55,7 +56,6 @@ from sglang.srt.models.glm4v import (
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 

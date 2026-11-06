@@ -20,25 +20,6 @@ _FP8_DTYPES = (
 )
 
 
-def _compute_pdl_support() -> bool:
-    # PDL (programmatic dependent launch) is an SM90+ Triton launch feature.
-    try:
-        major, _ = torch.cuda.get_device_capability()
-        return major >= 9
-    except Exception:
-        return False
-
-
-_PDL_SUPPORTED: bool | None = None
-
-
-def _arch_supports_pdl() -> bool:
-    global _PDL_SUPPORTED
-    if _PDL_SUPPORTED is None:
-        _PDL_SUPPORTED = _compute_pdl_support()
-    return _PDL_SUPPORTED
-
-
 @triton.heuristics(
     {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
 )
