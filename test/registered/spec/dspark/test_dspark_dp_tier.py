@@ -84,7 +84,6 @@ class TestDraftDpSyncMetadata(CustomTestCase):
                 ),
                 verify_window=window,
                 bs=1,
-                device="cpu",
                 embed_module=torch.nn.Embedding(16, 2),
             )
             torch.testing.assert_close(result.raw_hidden, hidden[1:])
@@ -98,6 +97,10 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
         proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+        proposer._dp_meta_host = None
+        proposer._dp_meta_device = None
+        proposer._dp_meta_copied = []
+        proposer._dp_meta_slot = 0
 
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         batch = SimpleNamespace(
