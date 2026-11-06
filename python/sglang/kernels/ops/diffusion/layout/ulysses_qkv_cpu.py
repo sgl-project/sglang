@@ -24,6 +24,4 @@ def pack_qkv_destination_major_cpu(
 
     import sgl_kernel  # noqa: F401
 
-    return torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(
-        q, k, v, world_size, out
-    )
+    return torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(q, k, v, world_size, out)

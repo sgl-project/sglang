@@ -30,11 +30,7 @@ from __future__ import annotations
 from typing import Any
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import (
-    CapabilityRequirement,
-    KernelBackend,
-    KernelSpec,
-)
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
 _CPU = frozenset({CapabilityRequirement.CPU})
