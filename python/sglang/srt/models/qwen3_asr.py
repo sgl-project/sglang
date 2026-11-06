@@ -16,7 +16,10 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen3 import Qwen3ForCausalLM
 from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeAudioEncoder
 from sglang.srt.multimodal.modality import Modality
@@ -164,6 +167,12 @@ class Qwen3ASRForConditionalGeneration(nn.Module):
                 name = name.replace("thinker.model.", "language_model.model.", 1)
 
             is_audio = "audio_tower" in name
+
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             # Audio tower: remap out_proj → proj for VisionAttention
             if is_audio and "out_proj" in name:
