@@ -25,11 +25,11 @@ on its node, so each DP listener drains on its own. TODO(attention DP): rank
 0 broadcasts the ``ShutdownReq`` once its own listener closed, so the other DP
 listeners' last requests may be cut. Rust mode also forces
 ``enable_dp_attention_local_control_broadcast`` on, which keeps the
-``ShutdownReq`` in DP group 0; it must reach every DP group, through the
-control fan-out across DP listeners. Without a local listener-hosting
-scheduler (elastic EP joiners and plain data parallelism, whose schedulers
-the DP controller starts) the main process keeps its previous SIGTERM
-behavior.
+``ShutdownReq`` in DP group 0; the MLP-sync gather of that step carries it to
+the other DP groups (``DPShutdownVote``), so every rank on every node leaves
+the event loop at the same step. Without a local listener-hosting scheduler
+(elastic EP joiners and plain data parallelism, whose schedulers the DP
+controller starts) the main process keeps its previous SIGTERM behavior.
 """
 
 from __future__ import annotations

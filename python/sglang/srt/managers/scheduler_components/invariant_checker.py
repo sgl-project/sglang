@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import (
     TYPE_CHECKING,
     Callable,
@@ -55,6 +56,30 @@ logger = logging.getLogger(__name__)
 BUSY_MEM_CHECK_LOG_RING_SIZE = 1000
 
 
+class CheckPhase(Enum):
+    """Where in the scheduler loop a state check runs."""
+
+    # A step is launched.
+    LAUNCH = "launch"
+    # A step's result is processed.
+    RESULT = "result"
+    # The end of an event-loop iteration; checks run only if it ran a batch.
+    BUSY = "busy"
+    # A fully idle iteration.
+    IDLE = "idle"
+
+
+@dataclass(frozen=True, slots=True)
+class StateCheck:
+    # Identifies the check; the checker itself never reads it.
+    name: str
+    phase: CheckPhase
+    # Evaluated on every run.
+    when: Callable[[], bool]
+    # A LAUNCH or RESULT check takes the step's batch: `fn(batch)`, else `fn()`.
+    fn: Callable[..., None]
+
+
 def _raise_if_any(reqs: Set[Req], message: str) -> None:
     if reqs:
         raise RuntimeError(f"{message}: {sorted(req.rid for req in reqs)}")
@@ -79,11 +104,73 @@ class SchedulerInvariantChecker:
     get_running_batches: Callable = field(default=lambda: ())
     # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
+    # Whether the idle pool checks skip this idle iteration.
+    get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     count_req_pool_leak_warnings: int = 0
     count_memory_leak_warnings: int = 0
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
+    checks: Dict[CheckPhase, List[StateCheck]] = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.checks = {phase: [] for phase in CheckPhase}
+        for check in (
+            StateCheck(
+                name="request_lists",
+                phase=CheckPhase.LAUNCH,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_request_lists,
+            ),
+            StateCheck(
+                name="batch_consistency",
+                phase=CheckPhase.RESULT,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_batch_consistency,
+            ),
+            StateCheck(
+                name="busy_pools",
+                phase=CheckPhase.BUSY,
+                when=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get,
+                fn=self._check_busy_pools,
+            ),
+            StateCheck(
+                name="kv_pages",
+                phase=CheckPhase.BUSY,
+                when=envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get,
+                fn=self._check_kv_page_invariants,
+            ),
+            StateCheck(
+                name="idle_pools",
+                phase=CheckPhase.IDLE,
+                when=lambda: not self.get_skip_idle_pool_checks(),
+                fn=self._check_idle_pools,
+            ),
+            StateCheck(
+                name="tree_cache",
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get,
+                fn=self._check_tree_cache,
+            ),
+        ):
+            self.checks[check.phase].append(check)
+
+    def run(self, phase: CheckPhase, batch: Optional[ScheduleBatch] = None) -> None:
+        """Run the checks at `phase` that are due, in registration order. BUSY
+        and IDLE record the sanity-check stage: IDLE on every run, BUSY when a
+        check is due."""
+        due = [check for check in self.checks[phase] if check.when()]
+        args = () if batch is None else (batch,)
+        if phase is CheckPhase.IDLE or (phase is CheckPhase.BUSY and due):
+            self._run_in_sanity_stage(due)
+        else:
+            for check in due:
+                check.fn(*args)
+
+    @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
+    def _run_in_sanity_stage(self, due: List[StateCheck]) -> None:
+        for check in due:
+            check.fn()
 
     @staticmethod
     def _check_pool_invariant(
@@ -302,8 +389,7 @@ class SchedulerInvariantChecker:
 
         return full_uncached, swa_uncached
 
-    @scheduler_stage_method(SCHEDULER_STAGE_SANITY_CHECK_CACHE)
-    def self_check_during_busy(self):
+    def _check_busy_pools(self):
         if self.get_last_batch() is None:
             return
 
@@ -337,14 +423,13 @@ class SchedulerInvariantChecker:
         assert not full_leak, f"Full Pool Mem Leak Detected! {full_msg}"
         assert not swa_leak, f"SWA Pool Mem Leak Detected! {swa_msg}"
 
-        if envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get():
-            self._check_kv_page_invariants()
-
     def _check_kv_page_invariants(self):
         """committed<=allocated for every req/slot, and no double free:
           A. no owner references a page that is in the free pool (use-after-free).
           B. the free pool has no duplicate pages (two owners freed the same page).
         All heavy work runs on GPU to avoid per-token device->host sync."""
+        if self.get_last_batch() is None:
+            return
         rtt = self.req_to_token_pool.req_to_token
         row_width = rtt.shape[1]
 
@@ -424,6 +509,19 @@ class SchedulerInvariantChecker:
                 f"the free pool, sample pages={torch.unique(stale)[:8].tolist()}.",
             )
 
+    def _check_idle_pools(self):
+        has_leak, messages = self._check_all_pools(
+            self.pool_stats_observer.get_pool_stats(),
+        )
+        if has_leak:
+            self._report_leak("pool", "\n".join(messages))
+        self._check_req_pool()
+        # Byte-conservation diagnostic (static pools return [] -- the token
+        # identity above can't see byte leaks).
+        byte_violations = self.pool_stats_observer.storage.accounting_violations()
+        if byte_violations:
+            self._report_leak("pool-bytes", "\n".join(byte_violations))
+
     def _check_req_pool(self):
         # Account for pre-alloc headroom whenever the pool has it. The decode
         # pool always does; with runtime P<->D role switching a prefill instance
@@ -480,11 +578,9 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
-    def maybe_check_request_lists(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, at the launch of `batch`: each
-        live request is in exactly one list, one that matches its state."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
+    def _check_request_lists(self, batch: ScheduleBatch) -> None:
+        """At the launch of `batch`: each live request is in exactly one list,
+        one that matches its state."""
         lists = self.get_request_lists()
         owners: Dict[Req, ListKind] = {}
         for kind, reqs in lists.items():
@@ -529,11 +625,8 @@ class SchedulerInvariantChecker:
             "Requests in running but in no running batch or step",
         )
 
-    def maybe_check_batch_consistency(self, batch: ScheduleBatch) -> None:
-        """With SGLANG_ENABLE_RUNNING_REQS_CHECK, a step is processed once, with
-        the requests it was launched with."""
-        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            return
+    def _check_batch_consistency(self, batch: ScheduleBatch) -> None:
+        """A step is processed once, with the requests it was launched with."""
         launched = batch.launched_reqs or ()
         if len(batch.reqs) != len(launched) or any(
             req is not launched_req for req, launched_req in zip(batch.reqs, launched)
@@ -549,8 +642,6 @@ class SchedulerInvariantChecker:
             )
 
     def _check_tree_cache(self):
-        if not envs.SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK.get():
-            return
         ps = self.pool_stats_observer.get_pool_stats()
         if self.tree_cache.supports_prefix_sharing() and (
             (ps.is_hybrid_swa and self.tree_cache.supports_swa())

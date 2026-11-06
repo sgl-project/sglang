@@ -164,10 +164,13 @@ class MLPSyncBatchInfo:
     is_health_check: bool = False
     # Causal (query, key) pairs this rank attends this step.
     attention_pairs: int = 0
+    # This rank honored a ShutdownReq and leaves the event loop after this step.
+    is_shutting_down: bool = False
 
     # some gathered elements
     tp0_info_cpu: torch.Tensor = None
     any_health_check: bool = False
+    any_shutting_down: bool = False
     sync_wait_seconds: float = 0.0
     global_num_tokens: list[int] = None
     global_num_tokens_for_logprob: list[int] = None
@@ -190,6 +193,7 @@ class MLPSyncBatchInfo:
                 int(self.can_run_draft_cuda_graph),
                 int(self.is_health_check),
                 self.attention_pairs,
+                int(self.is_shutting_down),
             ],
             device=device,
             dtype=dtype,
@@ -209,6 +213,7 @@ class MLPSyncBatchInfo:
                 1,  # can_run_draft_cuda_graph
                 0,  # is_health_check
                 0,  # attention_pairs
+                0,  # is_shutting_down
             ],
             device=device,
             dtype=dtype,
@@ -221,6 +226,7 @@ class MLPSyncBatchInfo:
         self.global_num_tokens_for_logprob = [self.num_tokens_for_logprob]
         self.global_attention_pairs = [self.attention_pairs]
         self.any_health_check = self.is_health_check
+        self.any_shutting_down = self.is_shutting_down
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
                 self.tp0_info_cpu[:, 5].tolist()
@@ -297,6 +303,7 @@ class MLPSyncBatchInfo:
         self.can_run_draft_cuda_graph = bool(tp0_info_cpu[:, 8].min())
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
+        self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -518,6 +525,35 @@ class DPSyncWaitCarry:
         self.seconds = 0.0
 
 
+class DPShutdownVote:
+    """Carries a rank's ShutdownReq through the MLP-sync gather.
+
+    Every attention-DP rank gathers once per scheduler step, so a rank that
+    honored a ShutdownReq tells all the others in the same step, and every rank
+    leaves the event loop at the same step boundary. Without it, a ShutdownReq
+    that reaches one DP group only (local control broadcast, as the Rust
+    server's rank-0 listener sends it) stops that group, and the other groups'
+    next gather fails against the departed ranks. A paused engine runs no
+    gather, so a rank that honors a ShutdownReq while paused leaves without
+    voting; the other DP groups stop when their node's launcher stops them.
+    """
+
+    __slots__ = ("local", "any")
+
+    def __init__(self, local: bool) -> None:
+        self.local = local
+        self.any = local
+
+
+class DPShutdownVoteSent:
+    """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
+
+    __slots__ = ("value",)
+
+    def __init__(self) -> None:
+        self.value = False
+
+
 def prepare_mlp_sync_batch_raw(
     local_batch: ScheduleBatch,
     model_runner: ModelRunner,
@@ -529,6 +565,7 @@ def prepare_mlp_sync_batch_raw(
     draft_require_mlp_tp_gather: Optional[bool] = None,
     dwdp: bool = False,
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
+    shutdown_vote: Optional[DPShutdownVote] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -644,6 +681,7 @@ def prepare_mlp_sync_batch_raw(
         # Gathered unconditionally like the other columns, so a per-process
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
+        is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
     )
 
     if num_dp_ranks == 1:
@@ -656,6 +694,8 @@ def prepare_mlp_sync_batch_raw(
         )
 
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
+    if shutdown_vote is not None and metadata_ready:
+        shutdown_vote.any = mlp_sync_info.any_shutting_down
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -732,6 +772,29 @@ class SchedulerDPAttnAdapter:
     spec_algorithm: SpeculativeAlgorithm
     get_require_mlp_sync: Callable[[], bool]
     sync_wait_carry: DPSyncWaitCarry = field(default_factory=DPSyncWaitCarry)
+    # Whether this rank honored a ShutdownReq, and what to do when a peer DP
+    # rank did (see DPShutdownVote).
+    get_shutting_down: Callable[[], bool] = lambda: False
+    on_peer_shutdown: Optional[Callable[[], None]] = None
+    # Set once a gather carried this rank's own shutdown vote.
+    shutdown_vote_sent: DPShutdownVoteSent = field(
+        default_factory=DPShutdownVoteSent, init=False
+    )
+
+    def shutdown_vote_pending(self) -> bool:
+        """This rank honored a ShutdownReq that no MLP-sync gather has carried yet.
+
+        A loop that stops scheduling batches on shutdown still runs one batch
+        selection while this holds, so its gather tells the other DP ranks.
+        """
+        num_dp_ranks = get_parallel().num_dp_ranks
+        return (
+            self.get_shutting_down()
+            and not self.shutdown_vote_sent.value
+            and self.get_require_mlp_sync()
+            and num_dp_ranks > 1
+            and not should_skip_scheduler_all_gather(num_dp_ranks)
+        )
 
     def drop_sync_wait_carry(self) -> None:
         """The iteration produced no batch, so its gather waits have no step to land on."""
@@ -747,7 +810,8 @@ class SchedulerDPAttnAdapter:
                 moe_a2a_backend=draft_moe_a2a_backend,
             )
 
-        return prepare_mlp_sync_batch_raw(
+        shutdown_vote = DPShutdownVote(self.get_shutting_down())
+        batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
             get_idle_batch=self.get_idle_batch,
@@ -758,7 +822,17 @@ class SchedulerDPAttnAdapter:
             offload_tags=self.offload_tags,
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
+            shutdown_vote=shutdown_vote,
         )
+        if shutdown_vote.local:
+            self.shutdown_vote_sent.value = True
+        if (
+            shutdown_vote.any
+            and not shutdown_vote.local
+            and self.on_peer_shutdown is not None
+        ):
+            self.on_peer_shutdown()
+        return batch
 
     def maybe_prepare_mlp_sync_batch(
         self,

@@ -502,6 +502,9 @@ class Envs:
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    # Scheduler state checks. BUSY runs the busy pool check (its value also sets
+    # the log verbosity). IDLE runs no check of its own: it picks whether a leak
+    # found by the idle pool checks or the KV page check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
@@ -509,7 +512,8 @@ class Envs:
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
     # Check each schedule that the running requests equal the ones batches hold.
     SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
-    # Physical KV-page checks: committed<=allocated + no page alias.
+    # Physical KV-page checks: committed<=allocated + no page alias. Runs them at
+    # every busy iteration, with or without the BUSY flag.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
@@ -751,6 +755,8 @@ class Envs:
     SGLANG_ENABLE_DISAGG_PREFILL_CONTINUOUS_INPUT_POLLING = EnvBool(False)
     # Opt-in: retire finished prefill KV transfers while a forward result is pending.
     SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_WHILE_WAITING = EnvBool(False)
+    # Opt-in: drain HiCache L3 events while a prefill forward result is pending.
+    SGLANG_DISAGG_PREFILL_POLL_HICACHE_WHILE_WAITING = EnvBool(False)
     # Override NVML Confidential Computing autodetection. None = autodetect.
     SGLANG_FORCE_CONFIDENTIAL_COMPUTE = EnvBool(None)
 
