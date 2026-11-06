@@ -128,13 +128,13 @@ class TestErnie5_5SwaBuffers(CustomTestCase):
         pool._stage_start, pool._stage_end = stage.start, stage.stop
         pool.stage_layer_ids = tuple(stage)
         pool._swa_buffer_index = {
-            layer: index for index, layer in enumerate(pool._swa_layer_ids())
+            layer: index for index, layer in enumerate(pool.swa_layer_ids())
         }
         return pool
 
     def test_swa_buffers_cover_only_the_hca_layers(self):
         pool = self._swa_pool(range(0, 8), mla_layer_ids=(3, 7))
-        self.assertEqual(pool._swa_layer_ids(), [0, 1, 2, 4, 5, 6])
+        self.assertEqual(pool.swa_layer_ids(), [0, 1, 2, 4, 5, 6])
         self.assertEqual(
             [pool._swa_local_layer_id(i) for i in (0, 1, 2, 4, 5, 6)], list(range(6))
         )
@@ -147,8 +147,8 @@ class TestErnie5_5SwaBuffers(CustomTestCase):
         )
 
         pool = self._swa_pool(range(7, 14), mla_layer_ids=(13,))
-        mapping = _dsv4_transfer_layer_mapping(tuple(pool._swa_layer_ids()), 7)
-        self.assertEqual(len(mapping), len(pool._swa_layer_ids()))
+        mapping = _dsv4_transfer_layer_mapping(tuple(pool.swa_layer_ids()), 7)
+        self.assertEqual(len(mapping), len(pool.swa_layer_ids()))
         self.assertEqual(mapping, {0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5})
 
 

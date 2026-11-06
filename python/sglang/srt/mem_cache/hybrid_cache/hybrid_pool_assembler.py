@@ -821,7 +821,7 @@ def build_deepseek_v4_hicache_stack(
 
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         for pool in params.mtp_draft_device_pools:
-            if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool._swa_layer_ids():
+            if isinstance(pool, DeepSeekV4TokenToKVPool) and not pool.swa_layer_ids():
                 # A draft with no SWA layer has no SWA buffer to pack.
                 continue
             draft_swa = _dsv4_pool_infos(pool).get(PoolName.SWA)

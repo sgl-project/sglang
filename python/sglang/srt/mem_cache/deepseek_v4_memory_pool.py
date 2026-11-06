@@ -565,8 +565,11 @@ DSV41_INDEX_PAGE_SIZE = dsv41_index_page_size()
 class DeepSeekV4IndexerPool(KVCache):
     quant_block_size = 128
     index_k_with_scale_buffer_dtype = torch.uint8
-    # GetKAndS reads it; this pool keeps fp8 index keys.
-    use_fp4_indexer = False
+
+    @property
+    def index_key_bytes_per_token(self) -> int:
+        # GetKAndS reads it; index_k_with_scale_buffer keeps fp8 keys.
+        return self.index_head_dim
 
     def __init__(
         self,
@@ -1206,7 +1209,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.indexer_head_dim = indexer_head_dim
 
         # Layers without SWA (a subclass's full-attention ones) get no buffer.
-        swa_layer_num = len(self._swa_layer_ids())
+        swa_layer_num = len(self.swa_layer_ids())
         kv_pool_cls: type = DeepSeekV4SingleKVPool
 
         self.request_window = None
@@ -1512,7 +1515,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         if self.swa_kv_pool is None:
             return None
         info = self.swa_kv_pool.paged_buffer_info()
-        swa_layer_num = len(self._swa_layer_ids())
+        swa_layer_num = len(self.swa_layer_ids())
         if len(info.buffers) != swa_layer_num:
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
@@ -1535,7 +1538,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 DevicePoolInfo(
                     pool_name=PoolName.SWA,
                     indices_from_pool=PoolName.SWA,
-                    layer_ids=tuple(self._swa_layer_ids()),
+                    layer_ids=tuple(self.swa_layer_ids()),
                     buffer_info=swa,
                 )
             )
@@ -2160,7 +2163,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         )
         return indexer_compress_state_pool
 
-    def _swa_layer_ids(self) -> list[int]:
+    def swa_layer_ids(self) -> list[int]:
         """Global ids of this stage's layers that own an SWA buffer, in buffer order."""
         return list(self.stage_layer_ids)
 

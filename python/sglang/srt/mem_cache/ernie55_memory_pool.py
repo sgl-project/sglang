@@ -17,7 +17,7 @@ for the MLA layers.
 
 The HCA layers (``compress_ratio == 128``) keep the compressed-KV layout
 unchanged. An MLA layer is presented to the compressed-KV pool as ratio 0 (no
-compressed state) and excluded from its SWA buffers by ``_swa_layer_ids``; it
+compressed state) and excluded from its SWA buffers by ``swa_layer_ids``; it
 stores its latent KV plus the DSA lightning-indexer key in
 :attr:`Ernie5_5TokenToKVPool.mla_kv_pool`.
 """
@@ -119,11 +119,11 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
         use_fp4_indexer: bool = False,
         **dsv4_kwargs,
     ):
-        # Read by _swa_layer_ids, which the base __init__ calls.
+        # Read by swa_layer_ids, which the base __init__ calls.
         self._mla_layer_ids = frozenset(mla_layer_ids)
         super().__init__(**dsv4_kwargs)
         self._swa_buffer_index = {
-            layer: index for index, layer in enumerate(self._swa_layer_ids())
+            layer: index for index, layer in enumerate(self.swa_layer_ids())
         }
         assert self.full_size is not None, "the compressed-KV pool sets full_size"
         if self.page_size % DSA_PAGE_SIZE:
@@ -154,11 +154,11 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
             ),
         )
 
-    def _swa_layer_ids(self) -> list[int]:
+    def swa_layer_ids(self) -> list[int]:
         # The MLA layers attend over the full context and keep no SWA buffer.
         return [
             layer
-            for layer in super()._swa_layer_ids()
+            for layer in super().swa_layer_ids()
             if layer not in self._mla_layer_ids
         ]
 
@@ -243,7 +243,7 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
 
 class Ernie5_5PoolConfigurator(DSV4PoolConfigurator):
     """ERNIE 5.5 Flash: the MLA layers keep a latent + index key per full token
-    and no SWA buffer (Ernie5_5TokenToKVPool._swa_layer_ids)."""
+    and no SWA buffer (Ernie5_5TokenToKVPool.swa_layer_ids)."""
 
     def __init__(self, kvc: KVCacheConfigurator):
         self._hf_config = kvc.model_config.hf_config

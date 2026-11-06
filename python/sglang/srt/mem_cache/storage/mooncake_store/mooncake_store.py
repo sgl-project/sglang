@@ -1091,10 +1091,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             PoolName.DEEPSEEK_V4_C4_STATE,
             PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
             PoolName.DEEPSEEK_V4_C128_STATE,
-            PoolName.ERNIE5_5_MLA,
-            PoolName.ERNIE5_5_MLA_INDEXER,
         ):
-            # DSA indexer, DeepSeek V4 and ERNIE 5.5 side pools are page-packed
+            # DSA indexer and DeepSeek V4 side pools are page-packed
             # single-object pools.
             suffixes = [f"_{self.mla_suffix}_{pool_name}"]
         elif pool_name == PoolName.SWA:
@@ -1105,6 +1103,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     f"_{self.mha_suffix}_{pool_name}_v",
                 ]
             elif self.is_mla_backend:
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        else:
+            from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+            if isinstance(host_pool, DeepSeekV4PagedHostPool):
+                # A compressed-KV pool's extra_host_regions are page-packed
+                # single-object pools too.
                 suffixes = [f"_{self.mla_suffix}_{pool_name}"]
 
         if not suffixes:
