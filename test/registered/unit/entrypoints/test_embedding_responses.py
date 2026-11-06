@@ -1,12 +1,18 @@
-"""JSON encoding of the OpenAI `/v1/embeddings` route, checked without a server."""
+"""JSON encoding of embedding routes, checked without a server."""
 
 import asyncio
+import itertools
+import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import Response
+from starlette.responses import JSONResponse
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.cohere.encoding import build_embed_response
+from sglang.srt.entrypoints.cohere.protocol import CohereEmbedRequest
 from sglang.srt.entrypoints.openai.protocol import (
     EmbeddingObject,
     EmbeddingRequest,
@@ -48,6 +54,132 @@ class TestEmbeddingResponses(CustomTestCase):
         self.assertEqual(
             response.body, response_model.model_dump_json(by_alias=True).encode()
         )
+
+    def _cohere_response(self, request, response_model):
+        raw_request = SimpleNamespace(
+            app=SimpleNamespace(
+                state=SimpleNamespace(
+                    cohere_serving_embedding=SimpleNamespace(
+                        handle_request=AsyncMock(return_value=response_model)
+                    )
+                )
+            )
+        )
+        return asyncio.run(http_server.cohere_v2_embed(request, raw_request))
+
+    def test_cohere_response_preserves_formats_and_metadata(self):
+        formats = ("float", "base64", "binary", "ubinary")
+        combinations = [None, []] + [
+            list(combination)
+            for size in range(1, len(formats) + 1)
+            for combination in itertools.combinations(formats, size)
+        ]
+        for requested in combinations:
+            with self.subTest(embedding_types=requested):
+                request = CohereEmbedRequest(
+                    texts=["hello", "文档🙂"], embedding_types=requested
+                )
+                response_model = build_embed_response(
+                    request,
+                    [
+                        {
+                            "embedding": [
+                                -1.0,
+                                0.0,
+                                -0.0,
+                                1.0,
+                                3.25,
+                                -4.5,
+                                1e-9,
+                                -1e-9,
+                            ],
+                            "meta_info": {"prompt_tokens": 3},
+                        },
+                        {"embedding": [0.25] * 8, "meta_info": {"prompt_tokens": 5}},
+                    ],
+                    request_id="embd-fixed",
+                )
+                response = self._cohere_response(request, response_model)
+                self.assertIsInstance(response, Response)
+                self.assertEqual(response.status_code, 200)
+                self.assertEqual(response.media_type, "application/json")
+                body = json.loads(response.body)
+                # JSON spelling may differ; compare parsed wire content with
+                # the previous serialization path using the same response.
+                previous = JSONResponse(response_model.model_dump(exclude_none=True))
+                self.assertEqual(body, json.loads(previous.body))
+                self.assertEqual(set(body["embeddings"]), set(requested or ["float"]))
+                self.assertEqual(body["id"], "embd-fixed")
+                self.assertEqual(body["texts"], request.texts)
+                self.assertEqual(body["response_type"], "embeddings_by_type")
+                self.assertEqual(
+                    body["meta"],
+                    {
+                        "api_version": {"version": "2"},
+                        "billed_units": {"input_tokens": 8, "image_tokens": 0},
+                    },
+                )
+
+    def test_cohere_image_response_omits_texts_and_keeps_token_accounting(self):
+        request = CohereEmbedRequest(images=["data:image/png;base64,aA=="])
+        response_model = build_embed_response(
+            request,
+            [{"embedding": [0.25] * 8, "meta_info": {"prompt_tokens": 7}}],
+        )
+        response = self._cohere_response(request, response_model)
+        self.assertEqual(response.status_code, 200)
+        body = json.loads(response.body)
+        self.assertNotIn("texts", body)
+        self.assertEqual(set(body["embeddings"]), {"float"})
+        self.assertEqual(
+            body["meta"]["billed_units"], {"input_tokens": 0, "image_tokens": 7}
+        )
+
+    def test_cohere_nonfinite_values_keep_existing_error_behavior(self):
+        formats = ("float", "base64", "binary", "ubinary")
+        for size in range(1, len(formats) + 1):
+            for requested in itertools.combinations(formats, size):
+                for value in (float("nan"), float("inf"), -float("inf")):
+                    with self.subTest(embedding_types=requested, value=value):
+                        request = CohereEmbedRequest(
+                            texts=["hello"], embedding_types=list(requested)
+                        )
+                        response_model = build_embed_response(
+                            request,
+                            [
+                                {
+                                    "embedding": [value] + [0.25] * 7,
+                                    "meta_info": {"prompt_tokens": 3},
+                                }
+                            ],
+                            request_id="embd-fixed",
+                        )
+                        with patch.object(http_server.logger, "exception"):
+                            response = self._cohere_response(request, response_model)
+                        self.assertEqual(response.media_type, "application/json")
+                        if "float" in requested:
+                            self.assertEqual(response.status_code, 500)
+                            self.assertEqual(
+                                json.loads(response.body),
+                                {
+                                    "error": {
+                                        "message": "Internal server error",
+                                        "type": "InternalServerError",
+                                        "param": None,
+                                        "code": 500,
+                                    }
+                                },
+                            )
+                        else:
+                            # Encoded-only outputs never expose nonfinite JSON
+                            # numbers, so they must remain accepted.
+                            self.assertEqual(response.status_code, 200)
+                            previous = JSONResponse(
+                                response_model.model_dump(exclude_none=True)
+                            )
+                            self.assertEqual(
+                                json.loads(response.body), json.loads(previous.body)
+                            )
 
 
 if __name__ == "__main__":

@@ -80,8 +80,12 @@ class PixtralProcessor(BaseMultimodalProcessor):
             image_data=image_data,
             return_text=True,
         )
+        processor_kwargs = {}
+        add_special_tokens = getattr(request_obj, "embedding_add_special_tokens", None)
+        if add_special_tokens is not None:
+            processor_kwargs["add_special_tokens"] = add_special_tokens
         mm_items, input_ids, _ = await self.process_and_combine_mm_data_async(
-            mm_data, self.mm_tokens
+            mm_data, self.mm_tokens, **processor_kwargs
         )
 
         return MultimodalProcessorOutput(

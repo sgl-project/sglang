@@ -1288,6 +1288,12 @@ class EmbeddingReqInput:
     # "float" (default / None) returns list[float]; "tensor" returns the raw
     # torch.Tensor at the engine's native compute dtype.
     encoding_format: Optional[str] = None
+    # Request-scoped embedding input budget. None preserves legacy/native behavior.
+    # Applied after multimodal processing, before the request reaches the scheduler.
+    embedding_truncate: Optional[Literal["END", "START", "NONE"]] = None
+    embedding_max_tokens: Optional[int] = None
+    # Templates already contain special tokens; raw text keeps tokenizer defaults.
+    embedding_add_special_tokens: Optional[bool] = None
     # Whether to return pooled hidden states (pre-head transformer output)
     return_pooled_hidden_states: bool = False
     # Whether to return prompt token IDs without computing logprobs
@@ -1480,6 +1486,9 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                embedding_truncate=self.embedding_truncate,
+                embedding_max_tokens=self.embedding_max_tokens,
+                embedding_add_special_tokens=self.embedding_add_special_tokens,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
                 return_prompt_token_ids=self.return_prompt_token_ids,
                 encoding_format=self.encoding_format,
@@ -1514,6 +1523,9 @@ class EmbeddingReqInput:
                 positional_embed_overrides=self._get_positional_embed_overrides_item(i),
                 http_worker_ipc=self.http_worker_ipc,
                 priority=self.priority,
+                embedding_truncate=self.embedding_truncate,
+                embedding_max_tokens=self.embedding_max_tokens,
+                embedding_add_special_tokens=self.embedding_add_special_tokens,
                 dimensions=self.dimensions,
                 encoding_format=self.encoding_format,
                 return_pooled_hidden_states=self.return_pooled_hidden_states,
