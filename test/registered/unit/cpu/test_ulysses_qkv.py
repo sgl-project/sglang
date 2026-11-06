@@ -6,6 +6,7 @@ import sgl_kernel  # noqa: F401
 import torch
 
 import sglang.multimodal_gen.runtime.layers.usp as usp
+from sglang.kernels.ops.diffusion import pack_qkv_destination_major_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="stage-a-test-cpu-intel")
@@ -93,9 +94,7 @@ def test_pack_qkv_destination_major_cpu_is_bit_exact(dtype):
 
     actual = torch.empty_like(expected)
 
-    result = torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(
-        q, k, v, world_size, out=actual
-    )
+    result = pack_qkv_destination_major_cpu(q, k, v, world_size, out=actual)
 
     assert torch.equal(result, expected)
 

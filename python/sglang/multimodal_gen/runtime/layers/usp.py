@@ -9,7 +9,11 @@ import torch
 import torch.distributed as dist
 from torch.distributed.tensor.experimental._attention import _cp_options
 
-from sglang.kernels.ops.diffusion import pack_qkv_destination_major, usp_merge_heads
+from sglang.kernels.ops.diffusion import (
+    pack_qkv_destination_major,
+    pack_qkv_destination_major_cpu,
+    usp_merge_heads,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_ring_ctx,
     get_sp_group,
@@ -459,7 +463,7 @@ def _usp_input_all_to_all_packed_qkv(
             q.device,
         )
 
-        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu(q, k, v, world_size, packed)
+        pack_qkv_destination_major_cpu(q, k, v, world_size, out=packed)
     else:
         packed = torch.empty(
             (world_size, s_local, h_local, 3 * head_size),
@@ -601,11 +605,10 @@ def _usp_input_all_to_all_qkv(
     b, s_local, h_global, d = q.shape
     h_local = h_global // world_size
     rows = b * s_local
-    pack_fn = (
-        torch.ops.sgl_kernel.pack_qkv_destination_major_cpu
-        if q.device.type == "cpu"
-        else pack_qkv_destination_major
-    )
+    if q.device.type == "cpu":
+        pack_fn = pack_qkv_destination_major_cpu
+    else:
+        pack_fn = pack_qkv_destination_major
 
     packed = pack_fn(
         q.view(rows, h_global, d),

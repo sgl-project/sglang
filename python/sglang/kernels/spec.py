@@ -158,7 +158,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
     (``min_cuda_arch`` / ``max_cuda_arch`` apply only when ``device == CUDA``).
 
     The device-only cases are so common that they are exposed as class constants
-    (``CapabilityRequirement.CUDA`` / ``.HIP`` / ``.MUSA`` / ``.NPU``);
+    (``CapabilityRequirement.CPU`` / ``.CUDA`` / ``.HIP`` / ``.MUSA`` / ``.NPU``);
     use :meth:`cuda` for an
     arch-bounded CUDA requirement (e.g. ``CapabilityRequirement.cuda(
     min_sm=(10, 0))`` for SM100+).
@@ -170,6 +170,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
 
     # Common device-only shortcuts, assigned after the class body (they are
     # instances of the class itself). ClassVar keeps them out of msgspec fields.
+    CPU: ClassVar[CapabilityRequirement]
     CUDA: ClassVar[CapabilityRequirement]
     HIP: ClassVar[CapabilityRequirement]
     MUSA: ClassVar[CapabilityRequirement]
@@ -197,6 +198,7 @@ class CapabilityRequirement(msgspec.Struct, frozen=True):
         return True
 
 
+CapabilityRequirement.CPU = CapabilityRequirement(device=DeviceType.CPU)
 CapabilityRequirement.CUDA = CapabilityRequirement(device=DeviceType.CUDA)
 CapabilityRequirement.HIP = CapabilityRequirement(device=DeviceType.HIP)
 CapabilityRequirement.MUSA = CapabilityRequirement(device=DeviceType.MUSA)

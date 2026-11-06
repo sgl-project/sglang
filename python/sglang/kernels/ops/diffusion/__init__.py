@@ -30,9 +30,14 @@ from __future__ import annotations
 from typing import Any
 
 from sglang.kernels.registry import register_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 _CUDA = frozenset({CapabilityRequirement.CUDA})
+_CPU = frozenset({CapabilityRequirement.CPU})
 _CUDA_SM90_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0))})
 _CUDA_SM100_PLUS = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))})
 _HIP = frozenset({CapabilityRequirement.HIP})
@@ -574,6 +579,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.pack_qkv_destination_major",
+        KernelBackend.AOT,
+        "layout.ulysses_qkv_cpu:pack_qkv_destination_major_cpu",
+        _CPU,
+    ),
+    (
         "diffusion.copy_head_groups",
         KernelBackend.TRITON,
         "layout.head_group_copy_triton:copy_head_groups",
@@ -840,6 +851,7 @@ _EXPORTS: dict[str, str] = {
     "fused_causal_conv3d_cat_pad_cuda": "sglang.kernels.kda_kernels.causal_conv3d_cat_pad_jit",
     "fused_causal_conv3d_cat_pad": "layout.causal_conv3d_cat_pad_triton",
     "pack_qkv_destination_major": "layout.ulysses_qkv_triton",
+    "pack_qkv_destination_major_cpu": "layout.ulysses_qkv_cpu",
     "copy_head_groups": "layout.head_group_copy_triton",
     "fused_qknorm_rope_out_of_place": "rope.qknorm_rope_jit",
     "vdn_delta_factors": "attention.vdn_delta_factors_jit",
