@@ -53,7 +53,7 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5ForCausalLM,
     Qwen3_5ForConditionalGeneration,
     Qwen3_5GatedDeltaNet,
-    _linear_accepts_fp8_tuple,
+    _linear_accepts_quant_tuple,
 )
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import is_cuda
@@ -72,6 +72,16 @@ _MOBIUS_PACKED_WEIGHT_MAPPING = (
     ("in_proj_ba.", "in_proj_b.", 0),
     ("in_proj_ba.", "in_proj_a.", 1),
 )
+
+
+def _linear_accepts_fp8_group_tuple(linear) -> bool:
+    # These reads declare no quant_format, so the fused all-reduce emits the
+    # per-group (fp8, scale) tuple; Quark per-token FP8 and MXFP4 consumers
+    # also pass _linear_accepts_quant_tuple but cannot read that layout.
+    return (
+        _linear_accepts_quant_tuple(linear)
+        and linear.quant_method.__class__.__name__ == "Fp8LinearMethod"
+    )
 
 
 def _is_intentional_mobius_skip(name: str, tie_word_embeddings: bool) -> bool:
@@ -490,7 +500,9 @@ class InternS2MobiusLinearDecoderLayer(_InternS2MobiusDecoderMixin, nn.Module):
         self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.linear_attn.in_proj_qkvz)
+        accepts_fp8_input = _linear_accepts_fp8_group_tuple(
+            self.linear_attn.in_proj_qkvz
+        )
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
@@ -621,7 +633,7 @@ class InternS2MobiusAttentionDecoderLayer(
         )
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        accepts_fp8_input = _linear_accepts_fp8_tuple(self.qkv_proj)
+        accepts_fp8_input = _linear_accepts_fp8_group_tuple(self.qkv_proj)
         self.attn_boundary, self.ffn_boundary = append_stages(
             (
                 declare_attn(
