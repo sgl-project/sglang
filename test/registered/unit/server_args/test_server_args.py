@@ -58,6 +58,7 @@ from sglang.srt.arg_groups.mamba_hook import (
     handle_mamba_backend,
 )
 from sglang.srt.arg_groups.memory_hook import handle_gpu_memory_settings
+from sglang.srt.arg_groups.model_hook import _restrict_aiter_mxfp4_intermediate
 from sglang.srt.arg_groups.model_path_hook import handle_load_format
 from sglang.srt.arg_groups.moe_hook import (
     handle_a2a_moe,
@@ -5470,6 +5471,32 @@ class TestPagedExpertsNumResident(unittest.TestCase):
         for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 _paged_experts_num_resident(bad)
+
+
+class TestAiterMxfp4IntermediateGuard(CustomTestCase):
+    GLM = "Glm5NextForConditionalGeneration"
+
+    def _resolve(self, value, *, is_hip, model_arch):
+        flag = envs.AITER_MXFP4_INTERMEDIATE
+        with flag.override(value), override_platform(is_hip=is_hip):
+            _restrict_aiter_mxfp4_intermediate(model_arch)
+            return os.environ.get(flag.name)
+
+    def test_kept_only_for_glm53_flash_on_rocm(self):
+        self.assertEqual(self._resolve("1", is_hip=True, model_arch=self.GLM), "1")
+
+    def test_cleared_outside_glm53_flash_on_rocm(self):
+        # AITER reads the raw variable process-wide, so every other launch must
+        # see it off: another architecture, a non-ROCm platform, or none at all.
+        for is_hip, model_arch in (
+            (True, "DeepseekV3ForCausalLM"),
+            (False, self.GLM),
+            (True, None),
+        ):
+            with self.subTest(is_hip=is_hip, model_arch=model_arch):
+                self.assertEqual(
+                    self._resolve("1", is_hip=is_hip, model_arch=model_arch), "0"
+                )
 
 
 if __name__ == "__main__":
