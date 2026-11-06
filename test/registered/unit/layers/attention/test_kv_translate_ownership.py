@@ -37,7 +37,7 @@ from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxHybridAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
