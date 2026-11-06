@@ -82,7 +82,8 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.srt.utils import add_prefix, is_device_stream_capturing
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.utils import is_device_stream_capturing
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()

@@ -7,6 +7,7 @@ import subprocess
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import (
     HipKernel,
     build_gfx950_module,
@@ -55,6 +56,10 @@ def try_smallm_fp8_bs_linear(x, WQ, w_scale):
     ):
         return None
     if _mod is None:
+        hip = current_arch().hip
+        if hip is None or hip.gcn_arch != "gfx950":
+            _mod = False
+            return None
         try:
             _mod = build_gfx950_module(_SRC, "sglang_smallm_fp8_bs_")
         except (OSError, subprocess.CalledProcessError, RuntimeError) as e:

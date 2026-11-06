@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 
 def _inputs_on_cuda(*args, **kwargs) -> bool:
