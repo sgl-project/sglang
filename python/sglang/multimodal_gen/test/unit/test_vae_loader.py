@@ -747,6 +747,27 @@ class TestVAELoader(unittest.TestCase):
         ):
             self.assertEqual(_channels_last_3d_prefix(server_args), "decoder.")
 
+    def test_channels_last_3d_rocm_defaults_follow_arch(self):
+        for arch, expected in (("gfx942", True), ("gfx1100", False)):
+            with (
+                self.subTest(arch=arch),
+                patch.dict("os.environ", {}, clear=True),
+                patch.object(
+                    vae_loader.current_platform, "is_cuda", return_value=False
+                ),
+                patch.object(vae_loader.current_platform, "is_rocm", return_value=True),
+                patch.object(
+                    vae_loader.current_platform,
+                    "get_gcn_arch_name",
+                    return_value=arch,
+                    create=True,
+                ),
+            ):
+                server_args = _FakeServerArgs(WanT2V480PConfig())
+                self.assertEqual(
+                    _should_use_channels_last_3d(server_args, "video_vae"), expected
+                )
+
     def test_channels_last_3d_can_be_disabled_by_env(self):
         with (
             patch.dict(

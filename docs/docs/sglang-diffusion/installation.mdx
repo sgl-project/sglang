@@ -95,6 +95,8 @@ Docker is also recommended for AMD GPUs. Use a ROCm image matched to your GPU an
 
 For **Strix Halo / gfx1151**, use `rocm/sgl-dev:*-gfx1151*` (image sets `SGLANG_USE_AITER=0`) and pass `--attention-backend torch_sdpa --num-gpus 1`. Do not use AITER on wave32 gfx115x. See the Strix Halo section in [AMD GPUs](../hardware-platforms/amd_gpu).
 
+On Radeon (RDNA) GPUs, `torch_sdpa` is the default attention backend and video VAEs keep the default Conv3d memory layout (`channels_last_3d` is only enabled on CDNA). Wan-family VAE decoding on RDNA is much faster with `SGLANG_USE_ROCM_VAE_CONV2D_BF16=1`, which runs the causal 3D convolutions as batched BF16 2D convolutions.
+
 ## Platform-Specific: MUSA (Moore Threads GPUs)
 ## Moore Threads GPUs (MUSA)
 
