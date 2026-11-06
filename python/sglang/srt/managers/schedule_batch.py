@@ -12,13 +12,8 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_track_grid,
 )
-from sglang.srt.utils.common import (
-    async_h2d,
-    ceil_align,
-    flatten_arrays_to_pinned_cpu,
-    is_hip,
-    is_pin_memory_available,
-)
+from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
+from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -3526,9 +3521,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
-            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-            return lambda req: due_this_forward
+        if _is_hip:
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_megamoe():
+                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+                return lambda req: due_this_forward
         return lambda req: (
             req.seqlen - 1 - sliding_window_size
             >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval

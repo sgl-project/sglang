@@ -28,8 +28,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
-from sglang.srt.utils.common import async_d2h as _async_d2h
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.device import async_d2h as _async_d2h
+from sglang.srt.utils.device import is_cuda
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
