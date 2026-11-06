@@ -2042,6 +2042,16 @@ class UnifiedRadixCache(BasePrefixCache):
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:
                 continue
+            # A split fragment keeps the original node's ack, and component
+            # transfers can cover other nodes. Check the whole publish set,
+            # not just ack keys, before assigning any node a new ack owner.
+            publish_set = set(self._backup_publish_node_ids(node_id, comp_xfers))
+            # Write-back eviction has its own round-wide completion barrier.
+            if not write_back and any(
+                not publish_set.isdisjoint(pending.publish_node_ids)
+                for pending in self.ongoing_write_through.values()
+            ):
+                self.writing_check(write_back=True)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers
