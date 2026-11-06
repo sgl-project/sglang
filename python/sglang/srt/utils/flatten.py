@@ -61,9 +61,25 @@ def flatten_hidden(hs):
     if not hs:
         return vals, lens
     for row in hs:
-        flat = _flatten_floats(row)
-        vals.extend(flat)
-        lens.append(len(flat))
+        if isinstance(row, (int, float)):
+            vals.append(float(row))
+            lens.append(1)
+        elif not row:
+            lens.append(0)
+        elif isinstance(row[0], (int, float)):
+            start = len(vals)
+            try:
+                vals.extend(map(float, row))
+                lens.append(len(vals) - start)
+            except TypeError:
+                del vals[start:]
+                flat = _flatten_floats(row)
+                vals.extend(flat)
+                lens.append(len(flat))
+        else:
+            flat = _flatten_floats(row)
+            vals.extend(flat)
+            lens.append(len(flat))
     return vals, lens
 
 
@@ -73,6 +89,13 @@ def _flatten_floats(x):
     chunk."""
     if isinstance(x, (int, float)):
         return [float(x)]
+    if not x:
+        return []
+    if isinstance(x[0], (int, float)):
+        try:
+            return list(map(float, x))
+        except TypeError:
+            pass
     out: List[float] = []
     for e in x:
         out.extend(_flatten_floats(e))
