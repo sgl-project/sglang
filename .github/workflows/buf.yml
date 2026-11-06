@@ -1,0 +1,108 @@
+name: Buf Protobuf
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v[0-9]+.*"
+    paths:
+      - "proto/**"
+      - ".github/workflows/buf.yml"
+  release:
+    types:
+      - published
+  pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+    paths:
+      - "proto/**"
+      - ".github/workflows/buf.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: buf-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+  # Read the merged PR's labels before publishing a push to main.
+  pull-requests: read
+
+jobs:
+  buf:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Buf
+        uses: bufbuild/buf-action@v1
+        with:
+          version: 1.75.0
+          setup_only: true
+
+      - name: Build and lint protobuf schemas
+        run: |
+          buf build proto
+          buf lint proto
+
+      - name: Check for breaking protobuf changes
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'buf skip breaking')
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch --no-tags --depth=1 origin "${BASE_SHA}"
+          base_dir="$(mktemp -d)"
+          trap 'rm -rf "${base_dir}"' EXIT
+          git archive "${BASE_SHA}" proto | tar -x -C "${base_dir}"
+          buf breaking proto --against "${base_dir}/proto"
+
+      # The PR check is not a required status check, so a PR whose breaking
+      # check failed can still merge. Re-check against the previous main commit
+      # so an unapproved breaking change never reaches the registry.
+      - name: Block unapproved breaking changes before publishing
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          labels="$(gh api "repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" --jq '.[].labels[].name')"
+          if grep -qxF 'buf skip breaking' <<<"${labels}"; then
+            echo "::notice::Breaking changes approved via the 'buf skip breaking' label."
+            exit 0
+          fi
+          git fetch --no-tags --depth=1 origin "${BEFORE_SHA}"
+          base_dir="$(mktemp -d)"
+          trap 'rm -rf "${base_dir}"' EXIT
+          git archive "${BEFORE_SHA}" proto | tar -x -C "${base_dir}"
+          buf breaking proto --against "${base_dir}/proto"
+
+      - name: Push module to Buf Schema Registry
+        if: (github.event_name == 'push' || github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')) && github.repository == 'sgl-project/sglang'
+        env:
+          BUF_TOKEN: ${{ secrets.BUF_TOKEN }}
+          BSR_PUBLISH_ENABLED: ${{ vars.BSR_PUBLISH_ENABLED }}
+        run: |
+          # Publishing is opt-in so this workflow can merge before the registry
+          # is set up; once enabled, a missing token fails instead of skipping.
+          if [ "${BSR_PUBLISH_ENABLED}" != "true" ]; then
+            echo "::notice::Skipping BSR push because vars.BSR_PUBLISH_ENABLED is not 'true'."
+            exit 0
+          fi
+          if [ -z "${BUF_TOKEN}" ]; then
+            echo "::error::vars.BSR_PUBLISH_ENABLED is 'true' but secrets.BUF_TOKEN is empty."
+            exit 1
+          fi
+          labels=(--label "${GITHUB_SHA}")
+          if [ -n "${GITHUB_REF_NAME}" ]; then
+            labels+=(--label "${GITHUB_REF_NAME}")
+          fi
+          buf push proto \
+            --create \
+            --create-visibility public \
+            --create-default-label main \
+            --source-control-url "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}" \
+            "${labels[@]}"
