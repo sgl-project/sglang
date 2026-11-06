@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.quantization.dsa_quant_k_cache import fp8_ds_mla_row_width
 from sglang.srt.arg_groups.kv_cache_hook import draft_rows_refusal
 from sglang.srt.arg_groups.model_override_base import resolving_view
@@ -67,6 +68,10 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     select_dsv4_kv_layout,
 )
 from sglang.srt.mem_cache.draft_kv_budget import resolve_dflash_draft_cell_size
+from sglang.srt.mem_cache.dsv41_main_kv_layout import (
+    MainKVLayoutSpec,
+    resolve_dsv41_main_kv_layout_specs,
+)
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
@@ -414,6 +419,12 @@ class KVCacheConfigurator:
     kv_shard_group: Optional[GroupCoordinator] = field(init=False)
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
+    dsv4_kv_layout: Optional[KVLayout] = field(init=False, default=None)
+    dsv4_compressed_kv_layout: Optional[str] = field(init=False, default=None)
+    dsv41_main_kv_layout_specs: Optional[dict[int, MainKVLayoutSpec]] = field(
+        init=False, default=None
+    )
+    _dsv4_layouts_resolved: bool = field(init=False, default=False)
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
@@ -455,6 +466,30 @@ class KVCacheConfigurator:
                 self.model,
                 use_mla_backend=self.use_mla_backend,
             )
+
+    def resolve_dsv4_storage_layouts(
+        self,
+    ) -> tuple[KVLayout, Optional[str], Optional[dict[int, MainKVLayoutSpec]]]:
+        if self._dsv4_layouts_resolved:
+            return (
+                self.dsv4_kv_layout,
+                self.dsv4_compressed_kv_layout,
+                self.dsv41_main_kv_layout_specs,
+            )
+
+        option = getattr(self.server_args, "dsv41_main_kv_layout", "auto")
+        if option in ("flashmla_fp8", "packed_fp4"):
+            kv_layout, compressed_kv_layout = KVLayout.V4, None
+        else:
+            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+
+        specs = resolve_dsv41_main_kv_layout_specs(option, self.page_size)
+
+        self.dsv4_kv_layout = kv_layout
+        self.dsv4_compressed_kv_layout = compressed_kv_layout
+        self.dsv41_main_kv_layout_specs = specs
+        self._dsv4_layouts_resolved = True
+        return kv_layout, compressed_kv_layout, specs
 
     def hybrid_swa_token_capacity(
         self,
@@ -1952,9 +1987,17 @@ class KVCacheConfigurator:
             kv_layout_kwargs = {}
         else:
             pool_cls = DeepSeekV4TokenToKVPool
-            kv_layout, compressed_kv_layout = select_dsv4_kv_layout()
+            # 584-byte V4 pages, or the V4.1 fp8 / fp4 pages of the SM100 FlashMLA
+            # decode kernel (SGLANG_DSV4_KV_LAYOUT / SGLANG_DSV4_COMPRESSED_KV_LAYOUT).
+            (
+                kv_layout,
+                compressed_kv_layout,
+                main_kv_layout_specs,
+            ) = self.resolve_dsv4_storage_layouts()
             kv_layout_kwargs = dict(
-                kv_layout=kv_layout, compressed_kv_layout=compressed_kv_layout
+                kv_layout=kv_layout,
+                compressed_kv_layout=compressed_kv_layout,
+                main_kv_layout_specs=main_kv_layout_specs,
             )
 
         unified_fp8 = unified_fp8_for_dsv4_pool(

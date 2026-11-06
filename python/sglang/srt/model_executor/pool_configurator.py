@@ -41,8 +41,11 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     get_dsv4_indexer_bytes_per_token,
     get_swa_ring_size,
     resolve_compress_state_ring_size,
+    resolve_compressed_kv_layout,
+    select_dsv4_kv_layout,
     uses_draft_swa_ring,
 )
+from sglang.srt.mem_cache.dsv41_main_kv_layout import MainKVLayoutSpec
 from sglang.srt.mem_cache.memory_pool import (
     DSATokenToKVPool,
     get_minimax_sparse_index_dtype,
@@ -1089,6 +1092,32 @@ class SWARequestCapPoolConfigurator(HybridSWAPoolConfigurator):
 DSV4_DEFAULT_SWA_FULL_TOKENS_RATIO = 0.1
 
 
+def get_dsv4_main_kv_physical_bytes_per_slot(
+    *,
+    ratio: int,
+    full_page_size: int,
+    kv_layout,
+    compressed_kv_layout: Optional[str],
+    packed_specs: Optional[dict[int, MainKVLayoutSpec]],
+) -> float:
+    if ratio not in (1, 2):
+        raise ValueError(
+            f"Main KV physical sizing only supports ratio 1/2, got {ratio}"
+        )
+    page_slots = full_page_size // ratio
+    if packed_specs is not None:
+        spec = packed_specs[ratio]
+        if spec.page_slots != page_slots:
+            raise ValueError(
+                f"ratio-{ratio} spec has {spec.page_slots} page slots, "
+                f"expected {page_slots}"
+            )
+        return spec.page_bytes / spec.page_slots
+
+    layout = resolve_compressed_kv_layout(kv_layout, ratio, compressed_kv_layout)
+    return layout.page_bytes(page_slots) / page_slots
+
+
 def _operator_swa_full_tokens_ratio() -> Optional[float]:
     """The operator's --swa-full-tokens-ratio, or None when it was not given."""
     schedule = get_schedule()
@@ -1113,6 +1142,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
 
     # object.__new__ stubs (SWA floor tests) skip __init__
     _dspark_draft_on_bf16 = False
+    _trtllm_uniform_fp8 = False
 
     def __init__(self, kvc: KVCacheConfigurator):
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
@@ -1132,6 +1162,9 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # Resolve the unified-kv gate before any sizing so the two cannot drift.
         self._unified = is_unified_kv_triton()
         self._unified_fp8 = is_unified_kv_fp8()
+        self._trtllm_uniform_fp8 = (
+            not self._unified and get_exec().kernel.dsv4_attn_backend == "trtllm"
+        )
         # DSpark draft still allocates a bf16 ring; target fp8 * (T+1)/T would
         # under-count that ring (640 vs 1024). MTP keeps the old inflation.
         self._dspark_draft_on_bf16 = bool(
@@ -1144,7 +1177,7 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         if self._unified:
             # Unified_kv stores the whole latent: one bf16 row, or fp8 nope + bf16 rope.
             self.kv_bytes = self._unified_row_bytes
-        elif get_exec().kernel.dsv4_attn_backend == "trtllm":
+        elif self._trtllm_uniform_fp8:
             self.kv_bytes = self.attn_head_dim
         else:
             # One FlashMLA-layout latent slot, in bytes.
@@ -1178,6 +1211,18 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         )
         self.sliding_window_size = kvc.sliding_window_size
         self.page_size = kvc.page_size
+        layout_resolver = getattr(type(kvc), "resolve_dsv4_storage_layouts", None)
+        if layout_resolver is None:
+            self._dsv4_kv_layout, self._dsv4_compressed_kv_layout = (
+                select_dsv4_kv_layout()
+            )
+            self._dsv41_main_kv_layout_specs = None
+        else:
+            (
+                self._dsv4_kv_layout,
+                self._dsv4_compressed_kv_layout,
+                self._dsv41_main_kv_layout_specs,
+            ) = layout_resolver(kvc)
         self.is_speculative = get_spec().speculative_algorithm is not None
         self.online_c128_mtp_max_draft_tokens = max_speculative_num_draft_tokens() or 0
         self.attn_dp_size = kvc.attn_dp_size
@@ -1282,9 +1327,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             # Keep the separate metadata/scratch reserve, but bound the budget
             # below by the exact packed pages, tags and capture workspace.
-            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-                select_dsv4_kv_layout,
-            )
             from sglang.srt.mem_cache.dsv41_request_window import (
                 RequestWindowSpec,
                 request_window_workspace_rows,
@@ -1433,16 +1475,19 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
         # through DeepSeekV4SingleKVPool.create_buffer, so they carry no page pad.
         if self._unified or _is_npu or get_exec().kernel.dsv4_attn_backend == "trtllm":
             return self.kv_bytes
-        from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-            resolve_compressed_kv_layout,
-            select_dsv4_kv_layout,
-        )
-
-        layout, compressed_option = select_dsv4_kv_layout()
+        if compress_ratio in (1, 2) and self._dsv41_main_kv_layout_specs is not None:
+            return get_dsv4_main_kv_physical_bytes_per_slot(
+                ratio=compress_ratio,
+                full_page_size=self.page_size,
+                kv_layout=self._dsv4_kv_layout,
+                compressed_kv_layout=self._dsv4_compressed_kv_layout,
+                packed_specs=self._dsv41_main_kv_layout_specs,
+            )
+        layout = self._dsv4_kv_layout
         page_size = self.page_size
         if compress_ratio:
             layout = resolve_compressed_kv_layout(
-                layout, compress_ratio, compressed_option
+                layout, compress_ratio, self._dsv4_compressed_kv_layout
             )
             page_size = self.page_size // compress_ratio
         return layout.page_bytes(page_size) / page_size
