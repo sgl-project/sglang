@@ -50,3 +50,10 @@ graph capture; launch errors propagate rather than switching kernels in a graph.
 The slot replaces `MlaValue` in DCP1 and native-MLA paths; fused DCP8 keeps
 `DcpValue`. Measure the slot separately with the same profile and workload so its
 effect is not mixed into the native-MLA versus fused-attention comparison.
+
+FlashInfer [#8917](https://github.com/flashinfer-ai/flashinfer/pull/8917)
+(`f454a17f3f2bae878caf2d49637b1d2b6f407fcd`) adds automatic 8-row / 16-row
+program selection during preparation. Keep that selection in FlashInfer. Its
+reported PDL-enabled warm-L2 standalone timings regress for some B >= 25 rows,
+while the same rows improve behind a PDL predecessor. Qualify the actual
+predecessor and complete call before drawing a serving-performance conclusion.
