@@ -257,7 +257,7 @@ def should_include_usage(
         include_usage = (
             stream_response_default_include_usage
             if stream_options.include_usage is None
-            else stream_options.include_usage
+            else bool(stream_options.include_usage)
         )
         continuous_usage_stats = bool(stream_options.continuous_usage_stats)
     else:

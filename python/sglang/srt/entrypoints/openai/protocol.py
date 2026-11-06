@@ -228,10 +228,25 @@ class UsageInfo(BaseModel):
     # The OpenAI location of reasoning_tokens; set only when there are some.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        data = handler(self)
+        # Absent unless a surface fills it (K3 does, per its stream spec), so
+        # every other model's usage object keeps its historical shape.
+        if data.get("completion_tokens_details") is None:
+            data.pop("completion_tokens_details", None)
+        return data
+
 
 class StreamOptions(BaseModel):
+    # None means "unset": fall back to the server default. An explicit false
+    # must be able to suppress the summary frame even when the server default
+    # turns it on, which a False default cannot express.
     include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
+    # K3 API extension: attach choices[].internal_content[].token_ids to
+    # every increment frame — the raw token ids behind that increment.
+    include_internal_content: Optional[bool] = False
 
 
 class JsonSchemaResponseFormat(BaseModel):
@@ -736,6 +751,18 @@ class FunctionResponse(BaseModel):
     name: Optional[str] = None
     arguments: Optional[str | Dict[str, Any]] = None
 
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # K3 streaming format: continuation chunks must not carry a name key, not
+        # even null; the arguments key must always be present.
+        # Non-streaming responses always set name, so they are unaffected.
+        data = handler(self)
+        if data.get("name") is None:
+            data.pop("name", None)
+        if data.get("arguments") is None:
+            data["arguments"] = ""
+        return data
+
 
 class ToolCall(BaseModel):
     """Tool call response."""
@@ -744,6 +771,19 @@ class ToolCall(BaseModel):
     index: Optional[int] = None
     type: Literal["function"] = "function"
     function: FunctionResponse
+
+    @model_serializer(mode="wrap")
+    def _serialize(self, handler):
+        # Streaming continuation chunks (id is None) may only carry index +
+        # function.arguments; id/type must not appear, not even null.
+        # First chunks and non-streaming responses (id set) keep every field.
+        data = handler(self)
+        if data.get("id") is None:
+            data.pop("id", None)
+            data.pop("type", None)
+        if data.get("index") is None:
+            data.pop("index", None)
+        return data
 
 
 _GenericMessageRole = Literal[
@@ -1085,6 +1125,15 @@ class ChatCompletionRequest(PDRoutingFields):
         "repetition_penalty": 1.0,
     }
 
+    # Streaming created timestamp: set once per request by the serving layer
+    # and reused for every frame (the K3 streaming format requires it constant;
+    # computing it per frame drifts across second boundaries on long streams).
+    _stream_created_ts: Optional[int] = None
+    # Wire-level response id, derived once from the first engine event. With
+    # n>1 the engine assigns a separate rid per sampled choice, so deriving it
+    # per frame would break the constant-id contract.
+    _stream_wire_id: Optional[str] = None
+
     @model_validator(mode="before")
     @classmethod
     def _handle_deprecated_dp_rank(cls, values):
@@ -1404,9 +1453,16 @@ class DeltaMessage(BaseModel):
     tool_calls: Optional[List[ToolCall]] = Field(default=None, examples=[None])
     hidden_states: Optional[object] = None
 
+    # The K3 streaming format drops every null field: reasoning_content must
+    # not be null and the end frame must be {}. Other models keep the null
+    # keys, which OpenAI SDK clients read as attributes.
+    _omit_nulls: bool = PrivateAttr(default=False)
+
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self._omit_nulls:
+            return {k: v for k, v in data.items() if v is not None}
         if self.hidden_states is None:
             data.pop("hidden_states", None)
         return data
@@ -1418,14 +1474,30 @@ class ChatCompletionResponseStreamChoice(BaseModel):
     logprobs: Optional[Union[LogProbs, ChoiceLogprobs]] = None
     finish_reason: Optional[
         Literal[
-            "stop", "length", "tool_calls", "content_filter", "function_call", "abort"
+            "stop",
+            "length",
+            "tool_calls",
+            "content_filter",
+            "function_call",
+            "abort",
+            # K3 API extensions; "abort" is mapped onto
+            # server_interrupted on the K3 wire.
+            "unexpected_state",
+            "malformed_byte_sequence",
+            "engine_overloaded",
+            "server_interrupted",
+            "repeat",
+            "unknown",
         ]
     ] = None
     matched_stop: Union[None, int, str] = None
+    internal_content: Optional[List[Dict[str, Any]]] = None
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
         data = handler(self)
+        if self.internal_content is None:
+            data.pop("internal_content", None)
         if self.delta.tool_calls is None:
             data["delta"].pop("tool_calls", None)
         return data
