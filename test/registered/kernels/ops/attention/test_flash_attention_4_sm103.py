@@ -1,7 +1,8 @@
 """SM103 FA4 tests for the softmax row max from tcgen05.ld.red.
 
-The output and LSE must match the FMNMX path (SGLANG_FA4_TMEM_LOAD_RED_MAX=0)
-bit for bit and stay within FA4's usual tolerance of the reference.
+The output and LSE must match the FMNMX path (the forward kernel built with
+tmem_load_red_max=False) bit for bit and stay within FA4's usual tolerance of
+the reference.
 """
 
 import math
@@ -11,6 +12,7 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+from sglang.kernels.ops.attention.flash_attn.cute import interface as fa4_interface
 from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100 import (
     FlashAttentionForwardSm100,
 )
@@ -33,7 +35,14 @@ if not (
         allow_module_level=True,
     )
 
-RED_MAX_ENV = "SGLANG_FA4_TMEM_LOAD_RED_MAX"
+
+class _FmnmxForwardSm100(FlashAttentionForwardSm100):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **{**kwargs, "tmem_load_red_max": False})
+
+
+# The FMNMX kernels share the compile keys of the default ones.
+_FMNMX_COMPILE_CACHE = {}
 
 
 def _bits(t: torch.Tensor) -> torch.Tensor:
@@ -42,9 +51,13 @@ def _bits(t: torch.Tensor) -> torch.Tensor:
 
 
 def _run_fa4(monkeypatch, red_max: bool, **kwargs):
-    # The flag is in the compile key, so both variants coexist.
-    monkeypatch.setenv(RED_MAX_ENV, "1" if red_max else "0")
-    return flash_attn_varlen_func(**kwargs, return_softmax_lse=True, ver=4)
+    with monkeypatch.context() as m:
+        if not red_max:
+            m.setattr(fa4_interface, "FlashAttentionForwardSm100", _FmnmxForwardSm100)
+            m.setattr(
+                fa4_interface._flash_attn_fwd, "compile_cache", _FMNMX_COMPILE_CACHE
+            )
+        return flash_attn_varlen_func(**kwargs, return_softmax_lse=True, ver=4)
 
 
 def _check_red_max(

@@ -20,6 +20,7 @@ import msgspec
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4.attn_metadata_kernels import (
     BuildCausalSwaPageIndices,
     BuildPageTablePositions,
@@ -91,7 +92,6 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import (
     DecodeInputs,
     PrefillInputs,
     RowShard,
-    is_sm100_or_newer,
     make_candidate_indexer,
     make_full_topk_indexer,
 )
@@ -3721,7 +3721,9 @@ class DeepseekV4AttnBackend(
                 slots,
                 pos,
                 fuse_index_store=(
-                    x.is_cuda and torch.version.cuda is not None and is_sm100_or_newer()
+                    x.is_cuda
+                    and torch.version.cuda is not None
+                    and current_arch().is_sm_at_least(10)
                 ),
             )
             return
@@ -3751,7 +3753,7 @@ class DeepseekV4AttnBackend(
             pooled,
             slots,
             group_pos,
-            fuse_index_store=is_sm100_or_newer(),
+            fuse_index_store=current_arch().is_sm_at_least(10),
         )
 
     def _low_ratio_compress_fused(

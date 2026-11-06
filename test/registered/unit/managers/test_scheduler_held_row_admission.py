@@ -96,6 +96,7 @@ class TestHeldRowAdmission(CustomTestCase):
         s.enable_lora = False
         s.disaggregation_mode = disaggregation_mode
         s.disagg_prefill_bootstrap_queue = None
+        s.disagg_prefill_transfer_queue = []
         s.enable_hicache_storage = False
         s.enable_lmcache = False
         s.enable_unified_cache_external_linker = False
