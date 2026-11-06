@@ -37,7 +37,7 @@ PYTHON_FRONTEND_SOURCES: Tuple[Path, ...] = (
     _SRT / "managers/detokenizer_manager.py",
     _SRT / "entrypoints/http_server.py",
     *sorted((_SRT / "entrypoints/openai").glob("serving_*.py")),
-    _SRT / "utils/request_logger.py",
+    _SRT / "observability/request_logger.py",
     _SRT / "multimodal/processors/base_processor.py",
     _SRT / "function_call/function_call_parser.py",
 )

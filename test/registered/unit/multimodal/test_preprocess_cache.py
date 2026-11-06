@@ -25,9 +25,10 @@ from sglang.srt.multimodal.cache.identity import resolve_multimodal_item_identit
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cuda_ci(est_time=7, stage="base-b", runner_config="1-gpu-small")
 
 
 class TestMediaIdentity(unittest.TestCase):
@@ -98,7 +99,8 @@ class TestMediaIdentity(unittest.TestCase):
 
     def test_same_url_with_new_contents_misses(self):
         with patch(
-            "sglang.srt.utils.get_image_bytes", side_effect=[b"first", b"second"]
+            "sglang.srt.multimodal.media_io.get_image_bytes",
+            side_effect=[b"first", b"second"],
         ):
             first = snapshot_media("https://example.com/image.png")
             second = snapshot_media("https://example.com/image.png")

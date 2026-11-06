@@ -23,7 +23,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     topk_transform_paged_v2,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 from .types import DecodeInputs, PrefillInputs, RowShard
 
