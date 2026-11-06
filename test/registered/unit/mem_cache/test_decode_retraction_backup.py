@@ -51,7 +51,6 @@ from sglang.srt.speculative.base_spec_worker import (
     HiCacheDraftMode,
     HiCacheDraftPlan,
 )
-from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
@@ -385,13 +384,9 @@ class TestDecodeRetractionBackup(CustomTestCase):
             num_reserved_decode_tokens=0,
             scheduler=SimpleNamespace(
                 server_args=env.server_args,
-                spec_algorithm=SpeculativeAlgorithm.NONE,
                 ps=SimpleNamespace(dp_rank=0, gpu_id=0),
                 model_config=SimpleNamespace(
-                    num_hidden_layers=env.target_pool.layer_num,
-                    hf_config={},
-                    model_path=env.server_args.model_path,
-                    revision=env.server_args.revision,
+                    num_hidden_layers=env.target_pool.layer_num
                 ),
                 running_batch=SimpleNamespace(reqs=[]),
                 waiting_queue=[],
