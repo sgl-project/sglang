@@ -16,6 +16,7 @@ from sglang.srt.distributed.parallel_state import P2PWork
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
@@ -141,10 +142,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
-                        self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                            recv_reqs,
-                            async_send=True,
-                        )
+                        self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     plan = self.get_next_batch_to_run(
                         running_batch=self.running_batch, last_batch=self.last_batch
@@ -350,9 +348,7 @@ class SchedulerPPMixin:
                 if tmbs[next_mb_id] is not None:
                     self.process_disagg_prefill_transfer_queue(next_release_rids)
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_transfer_work = self._pp_send_pyobj_to_next_stage(
                         transferred_rids, async_send=True
                     )
@@ -535,9 +531,7 @@ class SchedulerPPMixin:
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
 
                 if not self.pp_group.is_last_rank:
-                    self.send_req_work = self._pp_send_pyobj_to_next_stage(
-                        recv_reqs, async_send=True
-                    )
+                    self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                     send_retract_work = self._pp_send_pyobj_to_next_stage(
                         retract_rids, async_send=True
                     )
@@ -762,6 +756,11 @@ class SchedulerPPMixin:
             self.pp_outputs,
         )
         return next_pp_outputs, next_batch_result, d2h_event
+
+    def _pp_send_reqs_to_next_stage(self: Scheduler, recv_reqs: List) -> List[P2PWork]:
+        return self._pp_send_pyobj_to_next_stage(
+            strip_mm_features_for_pp_relay(recv_reqs), async_send=True
+        )
 
     def _pp_send_pyobj_to_next_stage(self: Scheduler, data, async_send: bool = False):
         p2p_work = []
