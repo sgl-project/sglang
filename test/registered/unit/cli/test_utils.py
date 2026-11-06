@@ -42,6 +42,46 @@ class TestDiffusionModelDetection(CustomTestCase):
         modelscope_patcher.start()
         self.addCleanup(modelscope_patcher.stop)
 
+    @patch("sglang.cli.utils._is_diffusers_model_dir", return_value=True)
+    def test_explicit_hub_source_overrides_global_switch(self, is_diffusers):
+        hf_download = unittest.mock.Mock(return_value="/cache/hf/model_index.json")
+        ms_download = unittest.mock.Mock(return_value="/cache/ms/model_index.json")
+        ms = SimpleNamespace(model_file_download=ms_download)
+        for global_source in (False, True):
+            for source, selected, other in (
+                ("hf", hf_download, ms_download),
+                ("modelscope", ms_download, hf_download),
+            ):
+                with self.subTest(global_source=global_source, source=source):
+                    hf_download.reset_mock()
+                    ms_download.reset_mock()
+                    with (
+                        patch(
+                            "sglang.cli.utils.envs.SGLANG_USE_MODELSCOPE.get",
+                            return_value=global_source,
+                        ),
+                        patch("huggingface_hub.hf_hub_download", hf_download),
+                        patch.dict("sys.modules", {"modelscope": ms}),
+                        # A relative local directory must not shadow an explicit Hub source.
+                        patch("sglang.cli.utils.os.path.isdir", return_value=True),
+                    ):
+                        self.assertTrue(get_is_diffusion_model(f"{source}://Org/Model"))
+                    selected.assert_called_once_with(
+                        **(
+                            {"repo_id": "Org/Model", "filename": "model_index.json"}
+                            if source == "hf"
+                            else {
+                                "model_id": "Org/Model",
+                                "file_path": "model_index.json",
+                            }
+                        )
+                    )
+                    other.assert_not_called()
+
+    def test_invalid_explicit_hub_reference_fails_before_detection(self):
+        with self.assertRaisesRegex(ValueError, "Expected hf://owner/repo"):
+            get_is_diffusion_model("hf://Org/Model/config.json")
+
     @patch("huggingface_hub.HfApi")
     @patch("huggingface_hub.hf_hub_download")
     def test_gated_diffusion_repo_uses_metadata_fallback(

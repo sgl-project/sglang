@@ -51,7 +51,9 @@ class Model(msgspec.Struct):
     model_path: A[
         str,
         Arg(
-            help="The path of the model weights. This can be a local folder or a Hugging Face repo ID.",
+            help="The path of the model weights. This can be a local folder, a repo ID, "
+            "hf://owner/repo, or modelscope://owner/repo. An explicit source "
+            "does not depend on SGLANG_USE_MODELSCOPE.",
             aliases=["--model"],
         ),
     ]
