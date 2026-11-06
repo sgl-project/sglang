@@ -2850,11 +2850,20 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = block_table[:real_bs]
 
             if layer.attn_type == AttentionType.ENCODER_ONLY:
-                mask = None
-                sparse_mode = 0
+                # Banded sparse mode requires the compressed mask even for
+                # bidirectional attention; next_tokens supplies the right bound.
+                mask = self.mtp_mask if is_swa_layer else None
+                # FIA only honours pre_tokens/next_tokens in the banded sparse
+                # modes, so an encoder-only SWA layer needs sparse_mode=4 too.
+                # next_tokens keeps the window symmetric (non-causal).
+                sparse_mode = 4 if is_swa_layer else 0
+                next_tokens = (
+                    layer.sliding_window_size if is_swa_layer else FULL_ATTENTION_WINDOW
+                )
             else:
                 mask = self.mtp_mask
                 sparse_mode = 4 if is_swa_layer else 3
+                next_tokens = 0 if is_swa_layer else FULL_ATTENTION_WINDOW
 
             if self.is_hybrid_swa or self.use_fias_v2_bsnd:
                 attn_output, _ = torch_npu.npu_fused_infer_attention_score_v2(
@@ -2876,7 +2885,7 @@ class AscendAttnBackend(AttentionBackend):
                         if is_swa_layer
                         else FULL_ATTENTION_WINDOW
                     ),
-                    next_tokens=0 if is_swa_layer else FULL_ATTENTION_WINDOW,
+                    next_tokens=next_tokens,
                     learnable_sink=sinks,
                 )
             else:
@@ -2894,6 +2903,12 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths=actual_seq_lengths,
                     actual_seq_lengths_kv=actual_seq_lengths_kv,
                     sparse_mode=sparse_mode,
+                    pre_tokens=(
+                        layer.sliding_window_size
+                        if is_swa_layer
+                        else FULL_ATTENTION_WINDOW
+                    ),
+                    next_tokens=next_tokens,
                 )
             attn_output = attn_output.view(-1, layer.tp_q_head_num * layer.v_head_dim)
             if (
