@@ -83,6 +83,7 @@
 --speculative-use-rejection-sampling
 --startup-weight-load-mode
 --swa-prefix-tails
+--token-space-preprocess-cache-trust-url
 --trust-mm-content-hashes
 --trust-request-chat-template
 --uno-lora-path

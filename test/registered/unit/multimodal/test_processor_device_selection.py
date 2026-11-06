@@ -276,7 +276,7 @@ class TestTokenSpaceDevices(CustomTestCase):
                     "sglang.srt.multimodal.multimodal_processor_mixin.load_video"
                 ) as load_video,
                 self.assertRaises(_Stop),
-                patch.object(processor, "_list_media_items", side_effect=_Stop),
+                patch.object(processor, "_process_items", side_effect=_Stop),
             ):
                 asyncio.run(
                     processor.process(

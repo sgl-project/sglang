@@ -122,6 +122,12 @@ class Mm(msgspec.Struct):
         "skip reading media on a hot metadata-cache hit; only enable it when "
         "the caller guarantees that hashes identify immutable media bytes.",
     ] = False
+    token_space_preprocess_cache_trust_url: A[
+        bool,
+        "Key the token-space preprocess cache by each media's URL, path or inline "
+        "data instead of its content, so a hit skips the download. The token-space "
+        "cache stays off without it; only enable it when URLs name immutable media.",
+    ] = False
     limit_mm_data_per_request: A[
         Optional[Union[str, Dict[str, int]]],
         Arg(
