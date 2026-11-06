@@ -23,10 +23,10 @@ import numpy as np
 import torch
 from torch import nn
 
+from sglang.kernels.ops.communication.engram_gather_peer import engram_gather_peer
 from sglang.kernels.ops.embeddings.engram_gate import fused_engram_gate
 from sglang.kernels.ops.embeddings.engram_gather import (
     engram_gather,
-    engram_gather_peer,
     engram_rows_to_token_major,
     unpack_mxfp4_rows,
 )
@@ -54,6 +54,7 @@ from sglang.srt.distributed.device_communicators.cuda_wrapper import (
 )
 from sglang.srt.distributed.parallel_state import inplace_all_reduce
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers.tokenizer import get_tokenizer
 from sglang.srt.layers.dp_attention import (
     attn_cp_all_gather_into_tensor,
     dp_gather_replicate,
@@ -85,7 +86,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.utils import add_prefix, is_cuda, is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
@@ -385,18 +385,28 @@ class EngramHasher(nn.Module):
         device = input_ids.device
         # Tokens at or past num_real are graph padding. History comes from
         # self.history via req_slots unless the scheduler supplied this extend's rows.
-        num_real, block, row, starts = num_tokens, 1, None, None
+        num_real, block, row, starts, extend_bs = num_tokens, 1, None, None, 0
         history, hist_via_slots = self.history, True
         if mode.is_decode():
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
         elif mode.is_target_verify():
-            block = int(forward_batch.spec_info.draft_token_num)
-            assert num_tokens == bs * block, (
-                "engram target-verify expects one equal block per request, got "
-                f"{num_tokens} tokens for {bs} requests of {block}"
-            )
-            kmode = MODE_VERIFY
+            layout = forward_batch.ragged_verify_layout
+            if layout is None:
+                block = int(forward_batch.spec_info.draft_token_num)
+                assert num_tokens == bs * block, (
+                    "engram target-verify expects one equal block per request, got "
+                    f"{num_tokens} tokens for {bs} requests of {block}"
+                )
+                kmode = MODE_VERIFY
+            else:
+                # Packed (compact) verify: a token belongs to the last run starting
+                # at or before it, so graph padding hashes with the row the layout
+                # gives it (the tail with the last row) and is discarded; verify
+                # commits no history.
+                starts, extend_bs = layout.qo_indptr_device[:-1], layout.bs
+                assert layout.bs == bs, f"{layout.bs} layout rows for {bs} requests"
+                kmode = MODE_EXTEND
             commit_rows = commit_last = None
         else:
             assert mode.is_extend(), (
@@ -451,6 +461,7 @@ class EngramHasher(nn.Module):
                 block=block,
                 row=row,
                 starts=starts,
+                extend_bs=extend_bs,
                 image_token_id=self.image_token_id,
                 mm_pad_shift=MM_PAD_SHIFT_VALUE,
             )
@@ -508,6 +519,9 @@ class EngramHasher(nn.Module):
                 row = t // block
                 offset = t - row * block
             else:
+                if row is None:
+                    row = torch.searchsorted(starts, t.to(starts.dtype), right=True)
+                    row = (row - 1).clamp_min(0)
                 offset = t - starts[row]
             # Predecessor at shift s of token t: an earlier token of the same run
             # when s <= offset, else history[row, -(s - offset)].
