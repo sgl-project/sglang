@@ -34,7 +34,6 @@ from sglang.srt.utils import (
     ceil_div,
     get_available_gpu_memory,
     is_musa,
-    is_sail,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,8 +42,6 @@ _is_musa = is_musa()
 
 if ENABLE_JIT_DEEPGEMM:
     import deep_gemm
-
-_is_sail = is_sail()
 
 
 _BUILTIN_M_LIST = list(range(1, 1024 * 16 + 1))
@@ -241,6 +238,22 @@ def _maybe_compile_deep_gemm_one_type_all(
             )
 
 
+def _contiguous_m_alignment() -> int:
+    """M alignment of the contiguous grouped layouts.
+
+    Builds that only expose the M-side query (the SAIL vendor build has no
+    ``get_mk_alignment_for_contiguous_layout``) answer with it; every other
+    build answers with the joint M/K query.
+    """
+    if hasattr(deep_gemm, "get_mk_alignment_for_contiguous_layout"):
+        m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
+    else:
+        m_alignment = deep_gemm.get_m_alignment_for_contiguous_layout()
+    if isinstance(m_alignment, tuple):
+        m_alignment = m_alignment[0]
+    return m_alignment
+
+
 # NOTE(alcanderian): get_num_sms should be change when 2-batch-overlap is introduced
 def _compile_deep_gemm_one_type_all(
     kernel_type: DeepGemmKernelType,
@@ -257,24 +270,9 @@ def _compile_deep_gemm_one_type_all(
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG_CHANNEL,
             DeepGemmKernelType.GROUPED_GEMM_NT_I8I8BF16_CONTIG,
+            DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG,
         ]:
-            # TODO: SAIL DeepGEMM has no get_mk_alignment_for_contiguous_layout,
-            # fall back to get_m_alignment_for_contiguous_layout instead.
-            if not _is_sail:
-                m_alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
-            else:
-                m_alignment = deep_gemm.get_m_alignment_for_contiguous_layout()
-            if isinstance(m_alignment, tuple):
-                m_alignment = m_alignment[0]
-            m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
-        elif kernel_type == DeepGemmKernelType.GROUPED_GEMM_NT_BF16_CONTIG:
-            m_alignment = (
-                deep_gemm.get_m_alignment_for_contiguous_layout()
-                if _is_sail
-                else deep_gemm.get_mk_alignment_for_contiguous_layout()
-            )
-            if isinstance(m_alignment, tuple):
-                m_alignment = m_alignment[0]
+            m_alignment = _contiguous_m_alignment()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         if not m_list:
