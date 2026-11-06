@@ -2024,11 +2024,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     meta_info[key] = [
                         item for m in meta_info_list for item in m.get(key, [])
                     ]
-            # Scalar metrics remain cumulative even when token payloads are deltas.
-            for chunk_meta in reversed(meta_info_list):
-                if (metrics := chunk_meta.get("dllm_metrics")) is not None:
-                    meta_info["dllm_metrics"] = metrics
-                    break
             out["meta_info"] = meta_info
         return out
 

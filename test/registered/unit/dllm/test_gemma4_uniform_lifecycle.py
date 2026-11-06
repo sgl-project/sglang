@@ -203,6 +203,27 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         self.assertEqual(req.dllm_generation_forward_count, 0)
         self.assertEqual(req.dllm_computed_end, 8)
 
+    def test_invalid_forward_metadata_leaves_all_request_counts_unchanged(self):
+        for metadata in (None, (("prompt", 8),), (("prompt", 8),) * 3):
+            with self.subTest(metadata=metadata):
+                scheduler = _Scheduler(fdfo=True)
+                reqs = [_Req(prefill=True), _Req(prefill=True)]
+                batch = _Batch(reqs)
+                batch.dllm_forward_metadata = metadata
+                with self.assertRaisesRegex(ValueError, "one snapshot per request"):
+                    scheduler.process_batch_result_dllm(batch, _result(None))
+                for req in reqs:
+                    self.assertEqual(req.dllm_forward_count, 0)
+                    self.assertEqual(req.dllm_prompt_forward_count, 0)
+                    self.assertEqual(req.dllm_generation_forward_count, 0)
+                    self.assertEqual(req.dllm_recompute_forward_count, 0)
+                    self.assertEqual(req.dllm_computed_end, 0)
+
+    def test_empty_forward_metadata_is_valid_for_empty_batch(self):
+        scheduler = _Scheduler(fdfo=True)
+        scheduler.process_batch_result_dllm(_Batch([]), _result(None))
+        scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+
     def test_context_forward_classification_and_zero_work(self):
         scheduler = _Scheduler(fdfo=True)
         req = _Req(prefill=True)

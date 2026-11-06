@@ -1798,7 +1798,7 @@ class TestForwardMetricsStreaming(unittest.TestCase):
                         state.out_list[-1]["meta_info"]["completion_tokens"], 8
                     )
 
-    def test_coalesce_uses_last_present_snapshot(self):
+    def test_coalesce_uses_last_snapshot_with_earlier_metrics_absent(self):
         tm = _make_tokenizer_manager(self)
         metrics = make_dllm_metrics(
             6,
@@ -1809,12 +1809,34 @@ class TestForwardMetricsStreaming(unittest.TestCase):
         )
         chunks = [
             {"text": "", "meta_info": {}},
-            {"text": "hello", "meta_info": {"dllm_metrics": metrics}},
-            {"text": "!", "meta_info": {}},
+            {"text": "hello", "meta_info": {}},
+            {"text": "!", "meta_info": {"dllm_metrics": metrics}},
         ]
         merged = tm._coalesce_streaming_chunks(chunks, "missing-key")
         self.assertEqual(merged["text"], "hello!")
         self.assertEqual(merged["meta_info"]["dllm_metrics"], metrics)
+
+    def test_coalesce_abort_echo_does_not_inherit_earlier_metrics(self):
+        tm = _make_tokenizer_manager(self)
+        tm.incremental_streaming_output = True
+        state = _make_req_state("metrics-abort")
+        state.obj.stream = True
+        state.obj.return_sampling_mask = False
+        tm.rid_to_state[state.obj.rid] = state
+        asyncio.run(
+            tm._handle_batch_output(
+                _dllm_output(BatchStrOutput, state.obj.rid, 5, 2, [10, 11], False)
+            )
+        )
+        self.assertIn("dllm_metrics", state.out_list[-1]["meta_info"])
+
+        tm._handle_abort_req(_make_abort_req(state.obj.rid))
+        self.assertEqual(len(state.out_list), 2)
+        self.assertNotIn("dllm_metrics", state.out_list[-1]["meta_info"])
+        merged = tm._coalesce_streaming_chunks(state.out_list, state.obj.rid)
+        self.assertEqual(merged["meta_info"]["finish_reason"]["type"], "abort")
+        self.assertEqual(merged["meta_info"]["completion_tokens"], 2)
+        self.assertNotIn("dllm_metrics", merged["meta_info"])
 
     def test_ar_metadata_absent_and_zero_work_defined(self):
         tm = _make_tokenizer_manager(self)

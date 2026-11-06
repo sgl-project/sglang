@@ -425,7 +425,7 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertEqual(state["step"], 0)
         torch.testing.assert_close(state["current"], final)
 
-    def test_encoder_returns_five_tuple_and_skips_denoising(self):
+    def test_encoder_returns_forward_metrics_and_skips_denoising(self):
         marker = object()
         runner = SimpleNamespace(
             calls=0,

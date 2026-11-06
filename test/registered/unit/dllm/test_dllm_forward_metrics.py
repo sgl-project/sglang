@@ -67,7 +67,9 @@ class TestActualForwardCount(unittest.TestCase):
         batch = _batch(["fast", "slow"])
         counts = {"fast": 0, "slow": 0}
         states = None
-        while batch.rids:
+        for _ in range(8):
+            if not batch.rids:
+                break
             result = algorithm.run(runner, batch, states)
             self.assertEqual(len(result), 6, "FDFO must report unresolved work")
             self.assertEqual(result.forward_count, 1)
@@ -81,6 +83,7 @@ class TestActualForwardCount(unittest.TestCase):
             rows = batch.input_ids.view(-1, 4)[keep].flatten().tolist()
             states = [result.dllm_algo_state[i] for i in keep]
             batch = _batch([batch.rids[i] for i in keep], rows)
+        self.assertFalse(batch.rids, "FDFO did not finish within eight rounds")
         self.assertEqual(counts, {"fast": 2, "slow": 5})
         self.assertEqual(
             counts,

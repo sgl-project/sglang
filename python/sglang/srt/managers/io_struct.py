@@ -1768,11 +1768,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
-    # Cumulative forwards per request, present only for dLLM services.
-    dllm_forward_counts: Optional[List[int]] = None
-    dllm_prompt_forward_counts: Optional[List[int]] = None
-    dllm_generation_forward_counts: Optional[List[int]] = None
-    dllm_recompute_forward_counts: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None
@@ -1789,6 +1784,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Cumulative forwards per request, present only for dLLM services.
+    dllm_forward_counts: Optional[List[int]] = None
+    dllm_prompt_forward_counts: Optional[List[int]] = None
+    dllm_generation_forward_counts: Optional[List[int]] = None
+    dllm_recompute_forward_counts: Optional[List[int]] = None
 
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
@@ -1861,10 +1862,6 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     # Verify count: number of verification forward passes
     spec_verify_ct: Optional[List[int]] = None
-    dllm_forward_counts: Optional[List[int]] = None
-    dllm_prompt_forward_counts: Optional[List[int]] = None
-    dllm_generation_forward_counts: Optional[List[int]] = None
-    dllm_recompute_forward_counts: Optional[List[int]] = None
     # Accepted drafts
     spec_num_correct_drafts: Optional[List[int]] = None
     spec_num_block_accept_tokens: Optional[List[int]] = None
@@ -1878,6 +1875,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # See BatchTokenIDOutput.dllm_forward_counts.
+    dllm_forward_counts: Optional[List[int]] = None
+    dllm_prompt_forward_counts: Optional[List[int]] = None
+    dllm_generation_forward_counts: Optional[List[int]] = None
+    dllm_recompute_forward_counts: Optional[List[int]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:

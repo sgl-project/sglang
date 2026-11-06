@@ -92,10 +92,14 @@ class SchedulerDllmMixin:
         if result.copy_done is not None:
             result.copy_done.synchronize()
 
+        metadata = batch.dllm_forward_metadata
+        if metadata is None or len(metadata) != len(batch.reqs):
+            raise ValueError(
+                "dLLM forward metadata must contain one snapshot per request"
+            )
+
         # Count work even when a round emits no tokens (prefill or denoising).
-        for req, (phase, computed_end) in zip(
-            batch.reqs, batch.dllm_forward_metadata, strict=True
-        ):
+        for req, (phase, computed_end) in zip(batch.reqs, metadata, strict=True):
             req.dllm_forward_count += result.dllm_forward_count
             field = f"dllm_{phase}_forward_count"
             setattr(req, field, getattr(req, field) + result.dllm_forward_count)
