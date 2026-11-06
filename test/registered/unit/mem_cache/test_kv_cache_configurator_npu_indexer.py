@@ -5,12 +5,15 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
     _quantize_npu_indexer_activation,
 )
 from sglang.srt.mem_cache import kv_cache_configurator as kcc
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    QUANT_MODE_TOKEN_INT8,
+    resolve_indexer_quant_mode,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -83,9 +86,9 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
 
 
 class TestNPUIndexerInt8Cache(CustomTestCase):
-    """SGLANG_NPU_INDEXER_INT8 may replace only the BF16 indexer cache."""
+    """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
 
-    def _build_pool(self, dtype, kv_cache_dim=None):
+    def _build_pool(self, dtype, kv_cache_dim=None, indexer_quant_mode=None):
         with (
             get_context().override_server_args(enable_hierarchical_cache=False),
             patch.object(
@@ -105,32 +108,43 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 enable_memory_saver=False,
                 index_head_dim=128,
                 kv_cache_dim=kv_cache_dim,
+                indexer_quant_mode=indexer_quant_mode,
             )
 
-    def test_flag_swaps_only_the_bf16_indexer_cache(self):
+    def test_int8_mode_swaps_only_the_bf16_indexer_cache(self):
         fp8_kv_cache_dim = 512 + 512 // 128 * 4 + 64 * 2
         cases = [
-            # flag, kv dtype, kv_cache_dim, index K dtype, index K scale dtype
-            (False, torch.bfloat16, None, torch.bfloat16, None),
-            (True, torch.bfloat16, None, torch.int8, torch.float16),
-            # The FP8 KV cache already has an FP8 indexer; the flag must keep it.
+            # quant mode, kv dtype, kv_cache_dim, index K dtype, scale dtype
+            (None, torch.bfloat16, None, torch.bfloat16, None),
+            (QUANT_MODE_TOKEN_INT8, torch.bfloat16, None, torch.int8, torch.float16),
+            # The FP8 KV cache already has an FP8 indexer; resolve rejects
+            # int8 on top of it, and the pool must keep the FP8 indexer even
+            # if the mode is passed in directly.
             (
-                True,
+                QUANT_MODE_TOKEN_INT8,
                 torch.float8_e4m3fn,
                 fp8_kv_cache_dim,
                 torch.float8_e4m3fn,
                 torch.float32,
             ),
         ]
-        for flag, dtype, kv_cache_dim, key_dtype, scale_dtype in cases:
-            with (
-                self.subTest(flag=flag, dtype=dtype),
-                envs.SGLANG_NPU_INDEXER_INT8.override(flag),
-            ):
-                pool = self._build_pool(dtype, kv_cache_dim)
+        for quant_mode, dtype, kv_cache_dim, key_dtype, scale_dtype in cases:
+            with self.subTest(quant_mode=quant_mode, dtype=dtype):
+                pool = self._build_pool(dtype, kv_cache_dim, quant_mode)
                 scale = pool.index_k_scale_buffer
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
+
+    def test_resolve_indexer_quant_mode(self):
+        self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))
+        self.assertIsNone(resolve_indexer_quant_mode(None, torch.float8_e4m3fn))
+        self.assertEqual(
+            resolve_indexer_quant_mode("int8", torch.bfloat16), QUANT_MODE_TOKEN_INT8
+        )
+        with self.assertRaises(ValueError):
+            resolve_indexer_quant_mode("int8", torch.float8_e4m3fn)
+        with self.assertRaises(ValueError):
+            resolve_indexer_quant_mode("fp8_e4m3", torch.bfloat16)
 
     def test_empty_input_scale_matches_int8_cache(self):
         """A batch with no tokens still writes its (empty) scale to the pool,

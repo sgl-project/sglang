@@ -19,6 +19,16 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.bfloat16: "bf16",
 }
 
+# Quantization recipes of the NPU DSA quantized indexer cache. Unlike the
+# quant_lightning_indexer (v2) FP8/MXFP8/FP4 quant modes, the INT8 recipe
+# runs the v1 npu_quant_lightning_indexer op, where the quantization is
+# implied by the INT8 key dtype (its quant_mode args stay 0).
+QUANT_MODE_TOKEN_INT8 = 0
+
+_INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
+    "int8": QUANT_MODE_TOKEN_INT8,
+}
+
 
 def allow_target_draft_different_cache_dtype(
     *, is_dflash: bool, speculative_draft_attention_backend: Optional[str]
@@ -108,3 +118,37 @@ def configure_kv_cache_dtype(
         resolved_kv_cache_dtype = "auto"
 
     return resolved_kv_cache_dtype, kv_cache_dtype
+
+
+def resolve_indexer_quant_mode(
+    indexer_kv_cache_dtype: Optional[str],
+    main_kv_cache_dtype: torch.dtype,
+) -> Optional[int]:
+    """Map --indexer-kv-cache-dtype to a quantized-indexer recipe for the
+    NPU DSA indexer cache.
+
+    None leaves the quantized indexer at its default: an FP8 main KV cache
+    keeps the existing FP8 indexer (the DSA FP8 packed store), any other
+    main dtype leaves the quantized indexer disabled (the DSA indexer then
+    runs the legacy bf16 npu_lightning_indexer path). The INT8 recipe only
+    exists on top of a non-FP8 main KV cache; the FP8 main cache already
+    stores the indexer cache quantized.
+    """
+    if indexer_kv_cache_dtype is None:
+        return None
+    quant_mode = _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE.get(indexer_kv_cache_dtype)
+    if quant_mode is None:
+        raise ValueError(
+            f"Unsupported indexer_kv_cache_dtype: {indexer_kv_cache_dtype}."
+        )
+    if main_kv_cache_dtype in (
+        torch.float8_e4m3fn,
+        torch.float8_e4m3fnuz,
+    ):
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
+            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16); the FP8 "
+            f"DSA packed main cache already stores the indexer cache "
+            f"quantized, got main KV cache dtype {main_kv_cache_dtype}."
+        )
+    return quant_mode

@@ -6,6 +6,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -648,6 +649,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        indexer_quant_mode: Optional[int] = None,
     ):
         # MLAPO historically owned NZ writes. Keep the allocation unchanged and
         # write into the NZ-addressed view below so ordinary MLA (including
@@ -709,8 +711,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
+        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache;
+        # hierarchical cache and the FP8 DSA packed store keep the default
+        # indexer cache instead.
         self.indexer_kv_store_int8 = (
-            envs.SGLANG_NPU_INDEXER_INT8.get()
+            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
             and not get_memory().enable_hierarchical_cache
             and not self.dsa_kv_cache_store_fp8
             and index_head_dim is not None
