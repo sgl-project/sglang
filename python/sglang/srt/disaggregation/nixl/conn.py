@@ -1659,6 +1659,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                             device_bound = True
                         kv_chunk.wait_event.synchronize()
                     kv_chunk.wait_event = None
+                # The scheduler hands over pinned host page indices behind a
+                # non-blocking copy (supports_host_tensor_indices); wait for the
+                # copy here instead of on the schedule stream.
+                if kv_chunk.indices_event is not None:
+                    kv_chunk.indices_event.synchronize()
+                    kv_chunk.indices_event = None
+                if isinstance(kv_chunk.prefill_kv_indices, torch.Tensor):
+                    kv_chunk.prefill_kv_indices = kv_chunk.prefill_kv_indices.numpy()
 
                 if self.check_status(room) == KVPoll.Failed:
                     self._staging_outstanding.pop(room, None)
@@ -3340,6 +3348,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                 state_indices=state_indices,
                 num_kv_tokens=num_kv_tokens,
                 wait_event=wait_event,
+                indices_event=indices_event,
             )
         )
         return None
@@ -3574,7 +3583,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
 
 class NixlKVSender(CommonKVSender):
-    pass
+    # Like Mooncake: the scheduler copies the page indices to pinned host memory
+    # without blocking and the transfer worker waits on the copy's event, so the
+    # scheduler thread no longer waits behind the in-flight forward on every send.
+    supports_host_tensor_indices = True
 
 
 class NixlKVReceiver(CommonKVReceiver):

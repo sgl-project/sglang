@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import numpy as np
 import requests
+import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -784,6 +785,42 @@ class TestNixlTransferWorker(CustomTestCase):
 
         self.assertEqual(order, [])
         mgr.send_kvcache.assert_not_called()
+
+    def test_host_page_indices_are_read_after_their_copy_lands(self):
+        """Pinned host page indices are read only once their copy's event lands.
+
+        The scheduler queues the indices as a host tensor behind a non-blocking
+        device-to-host copy and records an event after it. A worker that skips
+        the event reads whatever the pinned buffer held before the copy, and one
+        that passes the tensor on as-is hands torch indices to code written for
+        numpy arrays; either way the transfer still reports success.
+        """
+        room = 27
+        mgr = self._make_manager(room)
+        order = []
+        host_indices = torch.full((1,), -1, dtype=torch.int32)
+        read_indices = []
+
+        def record_read(_peer_name, indices, *args, **kwargs):
+            order.append("read")
+            read_indices.append(indices)
+            return "kv_handle"
+
+        def copy_lands():
+            order.append("copy")
+            host_indices.fill_(7)
+
+        mgr.send_kvcache = MagicMock(side_effect=record_read)
+        chunk = self._make_chunk(room, [1], is_last_chunk=False)
+        chunk.prefill_kv_indices = host_indices
+        chunk.indices_event = SimpleNamespace(synchronize=copy_lands)
+
+        self._run_worker_once(mgr, chunk)
+
+        self.assertEqual(order, ["copy", "read"])
+        (indices,) = read_indices
+        self.assertIsInstance(indices, np.ndarray)
+        self.assertEqual(indices.tolist(), [7])
 
 
 class TestNixlDecodeListener(CustomTestCase):
