@@ -29,6 +29,7 @@ from sglang.srt.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
 )
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -49,7 +50,6 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
 from sglang.srt.utils import add_prefix, is_cuda, make_layers
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 _is_cuda = is_cuda()
 

@@ -95,7 +95,7 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers import get_config
+        from sglang.srt.hf_transformers import get_config
 
         cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -401,7 +401,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers import get_config
+            from sglang.srt.hf_transformers import get_config
 
             draft_hf_config = get_config(
                 cfg.speculative_draft_model_path,
@@ -982,11 +982,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
+        from sglang.srt.hf_transformers import get_config
         from sglang.srt.speculative.dflash_utils import (
             get_dflash_layer_types,
             parse_dflash_draft_config,
         )
-        from sglang.srt.utils.hf_transformers import get_config
 
         draft_hf_config = get_config(
             cfg.speculative_draft_model_path,
@@ -1059,7 +1059,7 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
 
 def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
     from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
-    from sglang.srt.utils.hf_transformers import get_config
+    from sglang.srt.hf_transformers import get_config
 
     target = model_config_of(server_args).hf_config
     if target.architectures[0] != "IQuestQ1ForCausalLM":

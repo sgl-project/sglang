@@ -21,6 +21,7 @@ from sglang.srt.platforms.device_mixin import (
     PlatformEnum,
 )
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
@@ -95,6 +96,7 @@ _PLATFORM_IDENTITY = [
     (PlatformEnum.XPU, "xpu", "xpu", "is_xpu"),
     (PlatformEnum.MUSA, "musa", "musa", "is_musa"),
     (PlatformEnum.NPU, "npu", "npu", "is_npu"),
+    (PlatformEnum.MLU, "mlu", "mlu", "is_mlu"),
     (PlatformEnum.TPU, "tpu", "tpu", "is_tpu"),
     (PlatformEnum.MPS, "mps", "mps", "is_mps"),
 ]
@@ -104,6 +106,7 @@ _CUDA_ALIKE = [
     (PlatformEnum.CUDA, "cuda", "cuda", True),
     (PlatformEnum.ROCM, "rocm", "hip", True),
     (PlatformEnum.MUSA, "musa", "musa", True),
+    (PlatformEnum.MLU, "mlu", "mlu", False),
     (PlatformEnum.CPU, "cpu", "cpu", False),
     (PlatformEnum.NPU, "npu", "npu", False),
 ]
@@ -530,6 +533,7 @@ class TestMpsDeviceMixin(CustomTestCase):
 
         with (
             patch.object(common, "is_mps", return_value=True),
+            patch.object(common, "is_mlu", return_value=False),
             patch.object(common, "is_cuda", return_value=False),
             patch.object(common, "is_hip", return_value=False),
             patch.object(common, "is_cpu", return_value=False),
@@ -609,6 +613,21 @@ class TestMusaAvailableMemory(CustomTestCase):
                             clear_cache.assert_called_once_with(musa)
                         else:
                             clear_cache.assert_not_called()
+
+
+class TestMluSRTPlatform(CustomTestCase):
+    """Tests for MLU platform defaults that do not require MLU hardware."""
+
+    def test_mlu_platform_backend_defaults(self):
+        base = MluSRTPlatform()
+        self.assertEqual(base.get_dispatch_key_name(), "mlu")
+        self.assertEqual(base.get_torch_distributed_backend_str(), "cncl")
+
+    def test_mlu_pin_memory_available_for_mlu_targets(self):
+        base = MluSRTPlatform()
+        self.assertTrue(base.is_pin_memory_available())
+        self.assertTrue(base.is_pin_memory_available(device="mlu"))
+        self.assertFalse(base.is_pin_memory_available(device="cpu"))
 
 
 class TestPinMemoryAvailability(CustomTestCase):
