@@ -32,6 +32,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.layers.offloader import get_offloader
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -46,7 +47,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -1509,7 +1509,9 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+        situ_and_mul_masked_post_quant,
+    )
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2
@@ -1685,10 +1687,14 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # Quantize with the power-of-two (UE8M0) scale the GEMM reads, not amax / 448.
+    bits = (amax / 448.0).to(tl.int32, bitcast=True)
+    exp = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    q = (y / scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(

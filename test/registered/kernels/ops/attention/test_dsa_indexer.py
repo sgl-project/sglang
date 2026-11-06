@@ -255,6 +255,7 @@ class MockModelRunner:
             index_head_dim=self.config["index_head_dim"],
             enable_memory_saver=False,
             kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
+            use_fp4_indexer=self.config.get("use_fp4_indexer", False),
         )
 
         # Required by backend with DSA-specific attributes
