@@ -5,8 +5,13 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from sglang.kernels.ops.diffusion import can_use_fp8_rowwise, fp8_rowwise
+from sglang.kernels.ops.diffusion import (
+    can_use_fp8_rowwise,
+    fp8_rowwise,
+    fused_packed_swiglu_fp8_rowwise,
+)
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -99,6 +104,136 @@ def test_fp32_rounding_boundaries():
     rq, rs = reference(x)
     assert torch.equal(s, rs)
     assert torch.equal(q.view(torch.uint8), rq.view(torch.uint8))
+
+
+class TestPackedSwiGLUFp8(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        if not torch.cuda.is_available() or not can_use_fp8_rowwise(
+            torch.empty((1, 1), device="cuda", dtype=torch.bfloat16)
+        ):
+            pytest.skip("NVIDIA SM89+ required")
+
+    def assert_matches_reference(self, packed, alignment=16):
+        gate, up = packed.chunk(2, dim=-1)
+        values = (F.silu(gate) * up).reshape(-1, gate.shape[-1])
+        rq, rs = reference(values, alignment)
+        q, scales = fused_packed_swiglu_fp8_rowwise(packed, alignment)
+        self.assertTrue(torch.equal(scales, rs))
+        self.assertTrue(torch.equal(q.view(torch.uint8), rq.view(torch.uint8)))
+        if gate.shape[-1] == 9216 and values.shape[0]:
+            from sglang.kernels.ops.diffusion.quantization.swiglu_fp8_rowwise_triton import (
+                _swiglu_fp8_rowwise_tiled_kernel,
+            )
+
+            tq, ts = torch.empty_like(q), torch.empty_like(scales)
+            _swiglu_fp8_rowwise_tiled_kernel[(q.shape[0],)](
+                packed,
+                tq,
+                ts,
+                values.shape[0],
+                9216,
+                packed.stride(1),
+                1024,
+                num_warps=16,
+                enable_fp_fusion=False,
+            )
+            self.assertTrue(torch.equal(ts, rs))
+            self.assertTrue(torch.equal(tq.view(torch.uint8), rq.view(torch.uint8)))
+        return q, scales
+
+    def test_strided_rounding_and_padding(self):
+        """Guard row-strided projection slices, BF16 rounds and zero padding."""
+        torch.manual_seed(42)
+        for batch, rows, hidden in [
+            (1, 0, 33),
+            (2, 17, 257),
+            (1, 32, 9216),
+            (1, 340, 9216),
+            (2, 170, 9216),
+            (1, 3173, 9216),
+        ]:
+            with self.subTest(batch=batch, rows=rows, hidden=hidden):
+                storage = torch.randn(
+                    (batch, rows, 3 * hidden), device="cuda", dtype=torch.bfloat16
+                )
+                packed = storage[..., hidden:]
+                if rows:
+                    packed[:, 0].zero_()
+                if rows > 1:
+                    packed[:, 1] *= 1e-13
+                self.assert_matches_reference(packed)
+
+    def test_bf16_gate_values(self):
+        """Keep SiLU/multiply rounding across every finite BF16 gate encoding."""
+        bits = torch.arange(65536, device="cuda", dtype=torch.int32)
+        gate = bits.to(torch.int16).view(torch.bfloat16)
+        finite_gate = torch.where(torch.isfinite(gate), gate, 0)
+        gate = torch.zeros(8 * 9216, device="cuda", dtype=torch.bfloat16)
+        gate[:65536] = finite_gate
+        gate = gate.reshape(1, 8, 9216)
+        up = (
+            torch.tensor([0.125, -0.25, 0.5, -1.0], device="cuda", dtype=torch.bfloat16)
+            .repeat(18432)
+            .reshape_as(gate)
+        )
+        self.assert_matches_reference(torch.cat((gate, up), dim=-1), 1)
+
+    def test_subnormal_gate_rounding(self):
+        """Large up values expose lost BF16 subnormals before quantization."""
+        gate = torch.tensor(
+            [1e-38, 1e-39, 1e-40, 1e-41, 1e-42], device="cuda", dtype=torch.bfloat16
+        )
+        gate = gate[:, None].expand(5, 9216).clone()[None]
+        self.assert_matches_reference(
+            torch.cat((gate, torch.full_like(gate, 1e30)), -1)
+        )
+
+    def test_graph_replay_and_gemm(self):
+        """Fresh graph inputs preserve quantized operands and downstream GEMM."""
+        packed = torch.randn((1, 17, 27648), device="cuda", dtype=torch.bfloat16)[
+            ..., 9216:
+        ]
+        w, ws = reference(torch.randn((32, 9216), device="cuda", dtype=torch.bfloat16))
+
+        def chain():
+            q, scales = fused_packed_swiglu_fp8_rowwise(packed)
+            return (
+                q,
+                scales,
+                torch._scaled_mm(
+                    q,
+                    w.T,
+                    scales[:, None],
+                    ws[None, :],
+                    out_dtype=torch.bfloat16,
+                    use_fast_accum=True,
+                ),
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            for _ in range(3):
+                chain()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            q, scales, out = chain()
+        packed.normal_()
+        graph.replay()
+        rq, rs = self.assert_matches_reference(packed)
+        self.assertTrue(torch.equal(q.view(torch.uint8), rq.view(torch.uint8)))
+        self.assertTrue(torch.equal(scales, rs))
+        expected = torch._scaled_mm(
+            rq,
+            w.T,
+            rs[:, None],
+            ws[None, :],
+            out_dtype=torch.bfloat16,
+            use_fast_accum=True,
+        )
+        self.assertTrue(torch.equal(out, expected))
 
 
 if __name__ == "__main__":

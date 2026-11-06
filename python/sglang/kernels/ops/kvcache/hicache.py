@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -130,7 +131,7 @@ def use_hicache_tma_kernel(
     """
     if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
         return False
-    if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
+    if element_size % 16 != 0 or not current_arch().is_sm_at_least(9):
         return False
     if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
         return False
@@ -688,6 +689,29 @@ def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> M
         cuda_files=["kvcacheio/staged_write_back.cuh"],
         cuda_wrappers=[("launch", f"&HiCachePageUnifiedWriteBackKernel<{args}>::run")],
     )
+
+
+def can_use_page_unified_write_back_jit_kernel(
+    *,
+    group_bytes: int,
+    is_mla: bool = False,
+) -> bool:
+    """Probe the module the page-unified write-back actually launches.
+
+    Its own build, not the page_first staged one: same header, a different
+    template instantiation under a different `cache_once` key, so a page_first
+    probe says nothing about whether this one compiles.
+    """
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified write-back")
+        return False
+    try:
+        _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT write-back kernel: {e}")
+        return False
 
 
 @debug_kernel_api

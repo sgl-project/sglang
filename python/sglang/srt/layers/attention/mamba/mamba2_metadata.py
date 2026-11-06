@@ -47,6 +47,9 @@ class ForwardMetadata:
     # state. Fires on EXACTLY the rows the radix track snapshots, i.e. the same
     # condition the track uses: seq_lens_cpu % mamba_track_interval == 0.
     replayssm_force_flush: Optional[torch.Tensor] = None
+    # KDA host-only ReplaySSM: ring rows are live requests (req_pool_idx),
+    # not mamba slots. None keeps the ring indexed by mamba_cache_indices.
+    replayssm_ring_indices: Optional[torch.Tensor] = None
     # For topk > 1 eagle
     retrieve_next_token: Optional[torch.Tensor] = None
     retrieve_next_sibling: Optional[torch.Tensor] = None
@@ -231,7 +234,10 @@ class Mamba2Metadata(ForwardMetadata):
         forward_batch: ForwardBatch,
     ) -> "Mamba2Metadata":
         """This path cannot run with CUDA graph, as it contains extend requests."""
-        if forward_batch.extend_num_tokens is None:
+        if (
+            forward_batch.extend_num_tokens is None
+            or forward_batch.logical_forward_mode.is_decode()
+        ):
             draft_token_num = (
                 forward_batch.spec_info.draft_token_num
                 if forward_batch.spec_info is not None

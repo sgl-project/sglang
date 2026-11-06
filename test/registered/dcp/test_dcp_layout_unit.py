@@ -66,7 +66,7 @@ class TestFilterDcpLocalChunkKvIndices(CustomTestCase):
 
     def _owner_rule(self, kv, dcp_size, dcp_rank):
         # Selection only: the filters leave ids WIDENED and the collapse now
-        # happens once, in KVIndexTranslator.translate_dcp_read_ids.
+        # happens once, in RunnerIds.translate_dcp_read_ids.
         return kv[kv % dcp_size == dcp_rank]
 
     def _run(self, starts, lens, dcp_size, dcp_rank, seed=0):
@@ -198,9 +198,11 @@ class TestGetDcpLens(CustomTestCase):
             max_extend_len=1,
             qo_indptr=torch.tensor([0, 1], dtype=torch.int64),
         )
+        layer_kv = SimpleNamespace(
+            key=lambda: torch.empty(0), value=lambda: torch.empty(0)
+        )
         backend.token_to_kv_pool = SimpleNamespace(
-            get_key_buffer=lambda _layer_id: torch.empty(0),
-            get_value_buffer=lambda _layer_id: torch.empty(0),
+            layer_router=SimpleNamespace(read=lambda _layer_id: layer_kv)
         )
 
         kernel_q_shapes = []
@@ -252,8 +254,11 @@ class TestGetDcpLens(CustomTestCase):
         writes = []
         backend = TritonAttnBackend.__new__(TritonAttnBackend)
         backend.dcp_size, backend.dcp_rank = 2, 1
+        layer_kv = SimpleNamespace(
+            store=lambda *args, **kwargs: writes.append((args, kwargs))
+        )
         backend.token_to_kv_pool = SimpleNamespace(
-            set_kv_buffer=lambda *args, **kwargs: writes.append((args, kwargs))
+            layer_router=SimpleNamespace(layer=lambda _layer_id: layer_kv)
         )
         out_cache_loc = torch.tensor([8, 9, 10, 11, 12])
         forward_batch = SimpleNamespace(
@@ -264,7 +269,9 @@ class TestGetDcpLens(CustomTestCase):
         )
         k = torch.zeros(5, 1, 2)
 
-        backend._set_kv_buffer(forward_batch, SimpleNamespace(), None, k, k.clone())
+        backend._set_kv_buffer(
+            forward_batch, SimpleNamespace(layer_id=0), None, k, k.clone()
+        )
 
         ((args, kwargs),) = writes
         loc_info = args[1]

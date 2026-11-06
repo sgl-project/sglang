@@ -7,6 +7,7 @@ import torch
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.layers.dp_attention import DpPaddingMode, set_dp_buffer_len_from_batch
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.common import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -26,11 +27,20 @@ def late_layer_dp_counts(
         # Local-only counts (MegaMoE with a DP LM head): no peer geometry to share.
         counts = [local_late_rows]
     elif in_graph:
-        # Prefill graphs pad every DP rank to one shape, so the tail block is
-        # rank-uniform and the capture bakes it in; replays never run this code.
+        # The capture bakes the tail block and replays never run this code. Every
+        # rank shares one bucket whenever the graph holds a DP gather.
         counts = [local_late_rows] * len(early)
+    elif forward_batch.global_late_layer_num_tokens_cpu is not None:
+        # Exchanged in ForwardBatch.prepare_mlp_sync_batch, which a peer replaying
+        # the prefill graph reaches too; a gather here would wait for it forever.
+        counts = forward_batch.global_late_layer_num_tokens_cpu
+        assert counts[get_parallel().attn_dp_rank] == local_late_rows, (
+            counts,
+            local_late_rows,
+        )
     else:
-        # Tail row counts are host-known; the CPU group avoids a device sync.
+        # Without the exchange (no extend in the batch) every rank takes this
+        # path; the CPU group avoids a device sync.
         counts = torch.empty(len(early), dtype=torch.int64)
         all_gather_single(
             counts,
@@ -61,11 +71,10 @@ def enter_late_layer_dp(forward_batch: ForwardBatch, counts: List[int]) -> tuple
     # Device ops only: this runs inside prefill graph capture, where a host copy
     # would be recorded against pageable memory.
     gpu = fb.global_num_tokens_gpu
-    fb.global_num_tokens_gpu = (
-        torch.full_like(gpu, counts[0])
-        if len(set(counts)) == 1
-        else gpu.new_tensor(counts)
-    )
+    if len(set(counts)) == 1:
+        fb.global_num_tokens_gpu = torch.full_like(gpu, counts[0])
+    else:
+        fb.global_num_tokens_gpu = async_h2d(counts, dtype=gpu.dtype, device=gpu.device)
     fb.global_num_tokens_padded_cpu = counts
     # The MoE gatherv reads its sizes from the logprob counts when present.
     fb.global_num_tokens_for_logprob_cpu = counts
