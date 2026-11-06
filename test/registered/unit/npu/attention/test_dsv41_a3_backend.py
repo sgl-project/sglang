@@ -6,13 +6,13 @@ the numerical correctness of the external kernels.
 """
 
 import ast
+import builtins
 import functools
-import importlib.metadata
 import os
 import unittest
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import Mock, call, patch
+from unittest.mock import Mock, patch
 
 import torch
 import torch.nn.functional as F
@@ -529,148 +529,92 @@ class TestA3OpLoading(unittest.TestCase):
     def setUp(self):
         self.ns = _definitions(
             BACKEND,
-            {"_dsv41_a3_op_module", "_dsv41_a3_compressor_kernel"},
-            {"functools": functools},
+            {"_dsv41_a3_ops", "_dsv41_a3_compressor_kernel"},
+            {"functools": functools, "SimpleNamespace": SimpleNamespace},
         )
-        self.load_module = self.ns["_dsv41_a3_op_module"]
+        self.attention = ModuleType("sgl_kernel_npu.operators.attention")
+        self.attention.sparse_flash_mla = Mock()
+        self.attention.sparse_flash_mla_metadata = Mock()
+        self.attention.compressor_v2 = Mock()
+        self.indexer = ModuleType("sgl_kernel_npu.operators.indexer")
+        self.indexer.lightning_indexer_v2 = Mock()
+        self.indexer.sparse_lightning_indexer = Mock()
+        self.modules = {
+            self.attention.__name__: self.attention,
+            self.indexer.__name__: self.indexer,
+        }
 
-    @staticmethod
-    def _provider(name, package="cann_ops_transformer_testvendor"):
-        return importlib.metadata.EntryPoint(
-            name=name,
-            value=f"{package}.ops.attention.{name}:{name}",
-            group="cann_ops_transformer.ops",
+    def test_loads_public_kernel_apis_and_matching_metadata(self):
+        with patch.dict("sys.modules", self.modules):
+            ops = self.ns["_dsv41_a3_ops"]()
+        self.assertIs(ops.attention, self.attention.sparse_flash_mla)
+        self.assertIs(ops.metadata, self.attention.sparse_flash_mla_metadata)
+        self.assertIs(ops.indexer, self.indexer.lightning_indexer_v2)
+        self.assertIs(ops.candidate, ops.indexer)
+        self.assertIs(ops.sparse_indexer, self.indexer.sparse_lightning_indexer)
+
+    def test_public_indexer_preserves_two_and_four_output_modes(self):
+        ordinary = (object(), object())
+        candidates = (*ordinary, object(), object())
+        self.indexer.lightning_indexer_v2.side_effect = lambda *args, **kwargs: (
+            candidates if kwargs.get("candidate_topk_blocks") is not None else ordinary
         )
-
-    def test_loads_base_registration_before_arbitrary_vendor_module(self):
-        name = "sparse_lightning_indexer"
-        provider = self._provider(name)
-        module = ModuleType(provider.module)
-        with (
-            patch.object(importlib, "import_module", return_value=module) as imported,
-            patch.object(
-                importlib.metadata, "entry_points", return_value=[provider]
-            ) as entries,
-        ):
-            self.assertIs(self.load_module(name), module)
-        entries.assert_called_once_with(group="cann_ops_transformer.ops", name=name)
-        self.assertEqual(
-            imported.call_args_list,
-            [call("cann_ops_transformer.ops"), call(provider.module)],
-        )
-
-    def test_full_package_without_vendor_falls_back_to_base_module(self):
-        name = "lightning_indexer_v2"
-        module = ModuleType(f"cann_ops_transformer.ops.attention.{name}")
-        with (
-            patch.object(importlib, "import_module", return_value=module) as imported,
-            patch.object(importlib.metadata, "entry_points", return_value=[]),
-        ):
-            self.assertIs(self.load_module(name), module)
-        self.assertEqual(
-            imported.call_args_list,
-            [call("cann_ops_transformer.ops"), call(module.__name__)],
+        with patch.dict("sys.modules", self.modules):
+            ops = self.ns["_dsv41_a3_ops"]()
+        args = (object(), object(), object(), 512)
+        self.assertIs(ops.indexer(*args), ordinary)
+        self.assertIs(
+            ops.candidate(*args, candidate_topk_blocks=2048, candidate_block_size=8),
+            candidates,
         )
 
-    def test_module_discovery_and_import_are_cached(self):
-        name = "sparse_flash_mla"
-        provider = self._provider(name)
-        module = ModuleType(provider.module)
-        with (
-            patch.object(importlib, "import_module", return_value=module) as imported,
-            patch.object(
-                importlib.metadata, "entry_points", return_value=[provider]
-            ) as entries,
-        ):
-            self.assertIs(self.load_module(name), module)
-            self.assertIs(self.load_module(name), module)
-        self.assertEqual(imported.call_count, 2)
-        entries.assert_called_once()
+    def test_public_api_resolution_is_cached(self):
+        with patch.dict("sys.modules", self.modules):
+            ops = self.ns["_dsv41_a3_ops"]()
+            self.assertIs(self.ns["_dsv41_a3_ops"](), ops)
+            self.assertIs(
+                self.ns["_dsv41_a3_compressor_kernel"](),
+                self.attention.compressor_v2,
+            )
+            self.attention.compressor_v2 = Mock()
+            self.assertIsNot(
+                self.ns["_dsv41_a3_compressor_kernel"](),
+                self.attention.compressor_v2,
+            )
 
-    def test_broken_vendor_import_is_not_hidden_by_base_fallback(self):
-        name = "sparse_lightning_indexer"
-        provider = self._provider(name)
-        failure = ImportError("vendor binding dependency missing")
+    def test_missing_public_api_does_not_fall_back_to_standalone_vendor(self):
+        del self.indexer.sparse_lightning_indexer
+        with patch.dict("sys.modules", self.modules):
+            with self.assertRaises(ImportError):
+                self.ns["_dsv41_a3_ops"]()
 
-        def import_module(module_name):
-            if module_name == provider.module:
-                raise failure
-            return ModuleType(module_name)
+    def test_npu_init_keeps_standalone_bindings_only_on_a5(self):
+        utils = ROOT / "python/sglang/srt/hardware_backend/npu/utils.py"
+        for arch35 in (False, True):
+            with self.subTest(arch35=arch35):
+                imports = []
+                npu = SimpleNamespace(npu=SimpleNamespace(set_compile_mode=Mock()))
 
-        with (
-            patch.object(
-                importlib, "import_module", side_effect=import_module
-            ) as imported,
-            patch.object(importlib.metadata, "entry_points", return_value=[provider]),
-        ):
-            with self.assertRaises(ImportError) as raised:
-                self.load_module(name)
-        self.assertIs(raised.exception, failure)
-        self.assertEqual(
-            imported.call_args_list,
-            [call("cann_ops_transformer.ops"), call(provider.module)],
-        )
+                def import_module(name, *args, **kwargs):
+                    imports.append(name)
+                    return npu if name == "torch_npu" else ModuleType(name)
 
-    def test_multiple_vendor_providers_fail_instead_of_selecting_arbitrarily(self):
-        name = "lightning_indexer_v2"
-        providers = [
-            self._provider(name, package) for package in ("vendor_a", "vendor_b")
-        ]
-        with (
-            patch.object(importlib, "import_module") as imported,
-            patch.object(importlib.metadata, "entry_points", return_value=providers),
-        ):
-            with self.assertRaisesRegex(RuntimeError, name):
-                self.load_module(name)
-        imported.assert_called_once_with("cann_ops_transformer.ops")
-
-    def test_missing_candidate_overload_is_reported_during_initialization(self):
-        ops = SimpleNamespace(
-            sparse_flash_mla=Mock(),
-            sparse_flash_mla_metadata=Mock(),
-            lightning_indexer=SimpleNamespace(default=Mock()),
-            sparse_lightning_indexer=Mock(),
-        )
-        loader = Mock()
-        namespace = _definitions(
-            BACKEND,
-            {"_dsv41_a3_ops"},
-            {
-                "functools": functools,
-                "SimpleNamespace": SimpleNamespace,
-                "torch": SimpleNamespace(ops=SimpleNamespace(cann_ops_transformer=ops)),
-                "_dsv41_a3_op_module": loader,
-            },
-        )
-        with self.assertRaisesRegex(RuntimeError, "candidate"):
-            namespace["_dsv41_a3_ops"]()
-        self.assertEqual(
-            loader.call_args_list,
-            [
-                call("lightning_indexer_v2"),
-                call("sparse_flash_mla"),
-                call("sparse_lightning_indexer"),
-            ],
-        )
-
-    def test_compressor_uses_selected_vendor_builder_and_caches_loaded_kernel(self):
-        package = ModuleType(
-            "cann_ops_transformer_othercmp.ops.attention.compressor_v2"
-        )
-        kernel = Mock()
-        builder = SimpleNamespace(
-            load=Mock(return_value=SimpleNamespace(compressor=kernel))
-        )
-        module = ModuleType(f"{package.__name__}.compressor")
-        module.compressor_op_builder = builder
-        loader = Mock(return_value=package)
-        self.ns["_dsv41_a3_op_module"] = loader
-        with patch.object(importlib, "import_module", return_value=module) as imported:
-            self.assertIs(self.ns["_dsv41_a3_compressor_kernel"](), kernel)
-            self.assertIs(self.ns["_dsv41_a3_compressor_kernel"](), kernel)
-        loader.assert_called_once_with("compressor_v2")
-        imported.assert_called_once_with(module.__name__)
-        builder.load.assert_called_once()
+                namespace = _definitions(
+                    utils,
+                    {"init_npu_backend"},
+                    {
+                        "_call_once": lambda fn: fn,
+                        "_is_npu": True,
+                        "is_npu_arch35": lambda: arch35,
+                        "logger": Mock(),
+                        "sys": SimpleNamespace(modules={"sglang.multimodal_gen": None}),
+                    },
+                )
+                with patch.object(builtins, "__import__", side_effect=import_module):
+                    namespace["init_npu_backend"]()
+                self.assertIn("sgl_kernel_npu", imports)
+                self.assertIn("custom_ops", imports)
+                self.assertEqual("cann_ops_transformer" in imports, arch35)
 
 
 class TestA3CompressorContract(unittest.TestCase):
@@ -714,8 +658,31 @@ class TestA3CompressorContract(unittest.TestCase):
         inputs = self._inputs()
         calls = []
 
-        def compressor(x, wkv, wgate, state, ratio, block_table, cu, used, start):
-            calls.append((x, wkv, wgate, state, ratio, block_table, cu, used, start))
+        def compressor(
+            x,
+            wkv,
+            wgate,
+            state,
+            ratio,
+            *,
+            state_block_table,
+            cu_seqlens,
+            seqused,
+            start_pos,
+        ):
+            calls.append(
+                (
+                    x,
+                    wkv,
+                    wgate,
+                    state,
+                    ratio,
+                    state_block_table,
+                    cu_seqlens,
+                    seqused,
+                    start_pos,
+                )
+            )
             state.add_(1)
             return x.new_zeros((4, wkv.shape[0]))
 

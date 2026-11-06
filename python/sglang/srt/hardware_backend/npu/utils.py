@@ -247,16 +247,17 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
-    try:
-        # Registers the ds41 (DeepSeek-V4.1) Python operators under
-        # cann_ops_transformer.ops.ds41. Absent for DSV4-only deployments.
-        import cann_ops_transformer  # noqa: F401
-    except ImportError as e:
-        logger.warning(
-            "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
-            "will not be registered: %s",
-            e,
-        )
+    if is_npu_arch35():
+        try:
+            # A5 still uses ds41. A3 uses the sgl-kernel-npu bundled bindings;
+            # importing the standalone package can register conflicting ops.
+            import cann_ops_transformer  # noqa: F401
+        except ImportError as e:
+            logger.warning(
+                "cann_ops_transformer unavailable; DeepSeek-V4.1 NPU operators "
+                "will not be registered: %s",
+                e,
+            )
 
     import torch_npu
 

@@ -111,66 +111,33 @@ def _ds41_ops():
 
 
 @functools.cache
-def _dsv41_a3_op_module(name):
-    """Resolve an ops-transformer vendor wheel or the full package's binding."""
-    from importlib import import_module
-    from importlib.metadata import entry_points
-
-    # Vendor bindings (notably CompressorV2) require the base ops namespace
-    # during import. Let its entrypoint loader select providers before any
-    # physical imports can register older bindings from the base package.
-    import_module("cann_ops_transformer.ops")
-    providers = list(entry_points(group="cann_ops_transformer.ops", name=name))
-    if len(providers) > 1:
-        raise RuntimeError(
-            f"Multiple ops-transformer providers for {name}: "
-            f"{[provider.value for provider in providers]}; keep one provider."
-        )
-    module_name = (
-        providers[0].module
-        if providers
-        else f"cann_ops_transformer.ops.attention.{name}"
-    )
-    # Some entrypoints export a module rather than an attribute named after
-    # the operator directory, so EntryPoint.load() is not interchangeable.
-    return import_module(module_name)
-
-
-@functools.cache
 def _dsv41_a3_ops():
-    """BF16 A3 operators, with matching SMLA metadata and LI V3 candidates."""
-    for name in (
-        "lightning_indexer_v2",
-        "sparse_flash_mla",
-        "sparse_lightning_indexer",
-    ):
-        _dsv41_a3_op_module(name)
+    """Use the paired BF16 A3 operators bundled by sgl-kernel-npu."""
+    from sgl_kernel_npu.operators.attention import (
+        sparse_flash_mla,
+        sparse_flash_mla_metadata,
+    )
+    from sgl_kernel_npu.operators.indexer import (
+        lightning_indexer_v2,
+        sparse_lightning_indexer,
+    )
 
-    ops = torch.ops.cann_ops_transformer
-    try:
-        return SimpleNamespace(
-            attention=ops.sparse_flash_mla,
-            metadata=ops.sparse_flash_mla_metadata,
-            indexer=ops.lightning_indexer.default,
-            candidate=ops.lightning_indexer.candidate,
-            sparse_indexer=ops.sparse_lightning_indexer,
-        )
-    except AttributeError as exc:
-        raise RuntimeError(
-            "DSV4.1 A3 requires SMLA/metadata, SparseLightningIndexer and "
-            "lightning_indexer.candidate. Check ops-transformer import warnings "
-            "and use a compatible base package with vendor entrypoint support; "
-            "an already registered older Indexer cannot be replaced safely."
-        ) from exc
+    return SimpleNamespace(
+        attention=sparse_flash_mla,
+        metadata=sparse_flash_mla_metadata,
+        indexer=lightning_indexer_v2,
+        # The public API selects the four-output overload when candidate
+        # arguments are supplied; ordinary top-k still returns two outputs.
+        candidate=lightning_indexer_v2,
+        sparse_indexer=sparse_lightning_indexer,
+    )
 
 
 @functools.cache
 def _dsv41_a3_compressor_kernel():
-    from importlib import import_module
+    from sgl_kernel_npu.operators.attention import compressor_v2
 
-    package = _dsv41_a3_op_module("compressor_v2")
-    module = import_module(f"{package.__name__}.compressor")
-    return module.compressor_op_builder.load().compressor
+    return compressor_v2
 
 
 @torch.library.custom_op("sglang::dsv41_a3_compressor", mutates_args=("state_cache",))
@@ -185,19 +152,18 @@ def _dsv41_a3_compressor(
     start_pos: torch.Tensor,
     cmp_ratio: int,
 ) -> torch.Tensor:
-    # The upstream Python wrapper declares no mutations although CompressorV2
-    # updates its cycle bank. Expose the actual contract to graph tracing; the
-    # C++ binding and ACLNN kernel themselves are reused without modification.
+    # Keep the cycle-bank mutation visible to graph tracing while using the
+    # public sgl-kernel-npu entry point (including its input validation).
     return _dsv41_a3_compressor_kernel()(
         x,
         wkv,
         wgate,
         state_cache,
         cmp_ratio,
-        state_block_table,
-        cu_seqlens,
-        seqused,
-        start_pos,
+        state_block_table=state_block_table,
+        cu_seqlens=cu_seqlens,
+        seqused=seqused,
+        start_pos=start_pos,
     )
 
 
@@ -2916,7 +2882,7 @@ class DeepseekV4AscendAttnBackend(
             )
         if self._dsv4_has_low_ratio and not is_npu_arch35():
             _dsv41_a3_ops()
-            # Load CompressorV2 before capture, not from inside a graph.
+            # Resolve the public API here; graph warmup loads the lazy binding.
             _dsv41_a3_compressor_kernel()
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
