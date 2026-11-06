@@ -346,6 +346,11 @@ def _prepare_ple_batch(
         .long()
     )
 
+    pool = get_req_to_token_pool()
+    state_indices = (
+        get_attn_backend().runner_ids.state_ids(pool.state_sub_pool).ids(state_indices)
+    )
+
     # CUDA graph padding uses request slot 0, which may belong to a real request.
     # Map padded sequences to the state pools' reserved dummy slot instead.
     out_cache_loc = forward_batch.out_cache_loc
@@ -481,9 +486,17 @@ def _ple_track_targets(
     Masked-off rows route to reserved slot 0, so the shape stays graph-capturable.
     None when tracking is inactive or its metadata is absent.
     """
-    track_indices = forward_batch.mamba_track_indices
+    if (
+        forward_batch.mamba_track_indices is None
+        or forward_batch.mamba_track_mask is None
+    ):
+        return None
+    # Metadata owns physical tracking destinations in eager and graph execution.
+    # The batch field is already translated in eager mode but stays virtual on
+    # decode graph replay; consuming it here would mix the two address domains.
+    track_indices = get_attn_backend().linear_attn_backend.state_tracking_indices
     track_mask = forward_batch.mamba_track_mask
-    if track_indices is None or track_mask is None:
+    if track_indices is None:
         return None
 
     rows = batch.lengths.shape[0]
@@ -2414,7 +2427,12 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     )
                 )
 
+        # Print warning once per load_weights() call
+        ple_warned_downcast = False
+
         def load_qwen4_exp_ple_shard(name: str, loaded_weight: torch.Tensor) -> bool:
+            nonlocal ple_warned_downcast
+
             if ".ngram_embedding.shard_" not in name:
                 return False
             import re
@@ -2461,8 +2479,8 @@ class Qwen4ExpForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 emb.weight.dtype == torch.float8_e4m3fn
                 and loaded_weight.dtype != torch.float8_e4m3fn
             ):
-                if not getattr(load_qwen4_exp_ple_shard, "_warned_downcast", False):
-                    load_qwen4_exp_ple_shard._warned_downcast = True
+                if not ple_warned_downcast:
+                    ple_warned_downcast = True
                     logger.warning(
                         "PLE checkpoint shards are %s but the embedding storage "
                         "is fp8 (ple_embedding_dtype / fp8 quant config); "

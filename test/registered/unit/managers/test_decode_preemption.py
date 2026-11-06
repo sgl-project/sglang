@@ -218,7 +218,7 @@ class TestPreemptDecodeRelease(CustomTestCase):
         batch.filter_batch = Mock()
 
         with patch.object(request_retirer, "release_kv_cache") as rel:
-            preempted = batch.preempt_decode((1,), release=retirer.release_for_resume)
+            preempted = batch.preempt_decode((1,), retirer)
         rel.assert_called_once_with(victim, tree_cache, checkpoint=True)
         self.assertEqual(preempted, [victim])
         batch.filter_batch.assert_called_once_with(keep_indices=[0])
@@ -252,13 +252,11 @@ class TestSchedulerPreemptGlue(CustomTestCase):
         )
         batch = SimpleNamespace(
             reqs=[victim],
-            preempt_decode=Mock(side_effect=lambda idx, release: [victim]),
+            preempt_decode=Mock(side_effect=lambda idx, retirer: [victim]),
         )
         with patch("time.perf_counter", return_value=100.0):
             sched._preempt_for_starving_waiters(batch)
-        batch.preempt_decode.assert_called_once_with(
-            (0,), release=sched.request_retirer.release_for_resume
-        )
+        batch.preempt_decode.assert_called_once_with((0,), sched.request_retirer)
         sched.running_reqs.leave.assert_called_once_with([victim])
         self.assertEqual(requeued, [(victim, True)])
 

@@ -7,15 +7,14 @@ materialization points while operating directly on the three projection views.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
 
-_DISABLE_LFM_FUSED_CONV = os.getenv("SGLANG_DISABLE_LFM_FUSED_CONV", "0") == "1"
+_DISABLE_LFM_FUSED_CONV = envs.SGLANG_DISABLE_LFM_FUSED_CONV.get()
 
 
 @triton.jit
