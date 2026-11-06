@@ -137,6 +137,7 @@ class PoolName(str, Enum):
     DRAFT = "draft"
     DRAFT_INDEXER = "draft_indexer"
     DRAFT_SWA = "draft_swa"
+    DRAFT_MAMBA = "draft_mamba"
 
     def __str__(self) -> str:
         return self.value

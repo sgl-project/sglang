@@ -216,6 +216,7 @@ fn pool_name_str(name: PoolName) -> &'static str {
         PoolName::Draft => "draft",
         PoolName::DraftIndexer => "draft_indexer",
         PoolName::DraftSwa => "draft_swa",
+        PoolName::DraftMamba => "draft_mamba",
     }
 }
 
@@ -245,6 +246,7 @@ fn parse_pool_name(name: &str) -> PyResult<PoolName> {
         "draft" => Ok(PoolName::Draft),
         "draft_indexer" => Ok(PoolName::DraftIndexer),
         "draft_swa" => Ok(PoolName::DraftSwa),
+        "draft_mamba" => Ok(PoolName::DraftMamba),
         other => Err(PyValueError::new_err(format!("unknown pool name: {other}"))),
     }
 }
