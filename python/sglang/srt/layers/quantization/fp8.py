@@ -3305,10 +3305,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         configured_backend = get_moe_runner_backend()
         moe_runner_backend = self._resolve_moe_runner_backend()
 
-        if moe_runner_backend.is_deep_gemm():
-            if _is_sail:
-                import sglang.srt.hardware_backend.sail.moe.deepgemm_moe  # noqa: F401 – triggers @register_fused_func
-
         if (
             configured_backend.is_flashinfer_cutlass()
             or configured_backend.is_flashinfer_cutedsl()
