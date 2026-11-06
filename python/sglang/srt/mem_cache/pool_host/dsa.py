@@ -74,6 +74,8 @@ class DSAIndexerPoolHost(HostKVCache):
         buffer_device: str,
         dtype: torch.dtype,
         layer_sharded: bool = False,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
@@ -111,8 +113,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self._layer_sharded = layer_sharded
         self._buffer_device = torch.device(buffer_device)
         self.page_size = transfer_page_size
-        self.dcp_size = anchor_host.dcp_size
-        self.dcp_rank = anchor_host.dcp_rank
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
         self.layout = layout
         self.dtype = dtype
         self.indexer_dtype = torch.uint8

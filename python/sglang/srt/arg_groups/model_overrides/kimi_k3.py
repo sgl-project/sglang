@@ -184,14 +184,10 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
-        if (
-            cfg.speculative_algorithm is not None
-            or cfg.disaggregation_mode != "null"
-            or cfg.enable_hierarchical_cache
-        ):
+        if cfg.speculative_algorithm is not None or cfg.disaggregation_mode != "null":
             raise ValueError(
-                "Kimi-K3.1 DCP does not support speculative decoding, PD "
-                "disaggregation or HiCache yet."
+                "Kimi-K3.1 DCP does not support speculative decoding or PD "
+                "disaggregation yet."
             )
         if (
             cfg.dsa_topk_backend != "sgl-kernel"
