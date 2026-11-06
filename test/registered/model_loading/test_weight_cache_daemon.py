@@ -32,9 +32,9 @@ DEFAULT_MODEL = "Qwen/Qwen3-0.6B"
 # file per suite, TestWeightCacheDaemonTP2 self-skips when fewer than 2 GPUs are
 # visible (i.e. on the 1-gpu runner). Each class also has a vmm_fd variant, which
 # brings up one more fixture. The vmm_fd two-client class uses one GPU but runs
-# on the 2-GPU runner only, to keep its extra server launches out of base-b.
+# on the 2-GPU runner only, to keep the 1-GPU suite short.
 register_cuda_ci(est_time=970, stage="extra-a", runner_config="2-gpu-large")
-register_cuda_ci(est_time=142, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=142, stage="extra-a", runner_config="1-gpu-small")
 
 # Capture the client server's logs so test_loaded_via_ipc can assert the IPC
 # load path actually ran (and did not silently fall back to disk).
