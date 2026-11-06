@@ -315,6 +315,14 @@ jobs:
       matrix:
         test_config:
           # TEMP: overlap-schedule validation — only these cases run.
+          # deepseek_v4_flash overlap two-pass: pass 1 (ASCEND_USE_FIA unset)
+          - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset.py
+            test_type: 'perf'
+            prefill_decode_deployment: 'separation'
           # deepseek_v4_flash overlap (no spec) performance tests
           - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms_overlap
             prefill_size: 1
@@ -324,6 +332,13 @@ jobs:
             test_type: 'perf'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash overlap (no spec) accuracy tests
+          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap_fia_unset
+            prefill_size: 1
+            decode_size: 1
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap_fia_unset.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
           - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap
             prefill_size: 1
             decode_size: 1
@@ -332,6 +347,13 @@ jobs:
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_pro overlap (no spec) accuracy tests
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap_fia_unset
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap_fia_unset.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
           - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap
             prefill_size: 2
             decode_size: 2
@@ -386,6 +408,10 @@ jobs:
             test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
             test_type: 'accuracy'
           # deepseek_v4_pro overlap (no spec) performance tests
+          - name: deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset
+            node_size: 2
+            test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap_fia_unset.py
+            test_type: 'perf'
           - name: deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap
             node_size: 2
             test_case: test/registered/npu/performance/deepseek_v4_pro/test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap.py

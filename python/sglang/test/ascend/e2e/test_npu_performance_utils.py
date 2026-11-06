@@ -962,6 +962,8 @@ def assert_metrics(self, metrics):
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
 
+    self.last_metrics = metrics
+
     tc_name = self.__class__.__name__
     # The perf knobs below are declared on the perf test bases; callers from
     # other bases (e.g. accuracy cases) may not define them, so read them

@@ -9,9 +9,12 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression, record_pass1
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
+
+CASE_ID = "test_npu_deepseek_v4_flash_w8a8_8p_gpqa_overlap"
 
 register_npu_ci(est_time=3600, suite="base-c-test-acc-16-npu-a3")
 
@@ -31,6 +34,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
+    "ASCEND_USE_FIA": "0",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -62,6 +66,11 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     # war barrier
     "SGLANG_ENABLE_WAR_BARRIER": "1",
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+}
+
+# Pass 1: ASCEND_USE_FIA left unset (image default).
+DEEPSEEK_V4_FLASH_W8A8_PASS1_ENVS = {
+    k: v for k, v in DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS.items() if k != "ASCEND_USE_FIA"
 }
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
@@ -134,13 +143,12 @@ DEEPSEEK_V4_FLASH_W8A8_GENERATION_CONFIG_HIGH = {
 }
 
 
-class TestNPUDeepSeekV4FlashW8A88PGPQAOverlap(TestNpuAccuracyTestCaseBase):
-    """Test NPU accuracy for DeepSeek-V4-Flash W8A8 8p GPQA without spec decoding."""
+class W8A88PGPQAOverlapBase(TestNpuAccuracyTestCaseBase):
+    """Shared config for the two-pass (FIA unset vs FIA=0) GPQA comparison."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS
-    envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
     accuracy = 0.93 if _is_pr_pipeline else 0.874
     datasets = ["gsm8k"] if _is_pr_pipeline else ["gpqa_diamond"]
     few_shot_num = 0
@@ -176,9 +184,27 @@ class TestNPUDeepSeekV4FlashW8A88PGPQAOverlap(TestNpuAccuracyTestCaseBase):
         cls.process = subprocess.Popen(command, env=env)
         wait_for_server(cls.base_url, timeout=cls.server_timeout, process=cls.process)
 
-    def test_npu_deepseek_v4_flash_w8a8_8p_gpqa_overlap(self):
-        """Run NPU accuracy test for DeepSeek-V4-Flash W8A8 8p GPQA without spec decoding."""
+
+class TestNPUDeepSeekV4FlashW8A88PGPQAOverlapPass1(W8A88PGPQAOverlapBase):
+    """Pass 1: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA unset."""
+
+    envs = DEEPSEEK_V4_FLASH_W8A8_PASS1_ENVS
+
+    def test_npu_deepseek_v4_flash_w8a8_8p_gpqa_overlap_pass1(self):
+        """Run pass-1 GPQA and record the baseline metrics."""
         self.run_accuracy()
+        record_pass1(CASE_ID, self.last_metrics)
+
+
+class TestNPUDeepSeekV4FlashW8A88PGPQAOverlapPass2(W8A88PGPQAOverlapBase):
+    """Pass 2: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA=0."""
+
+    envs = DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS
+
+    def test_npu_deepseek_v4_flash_w8a8_8p_gpqa_overlap_pass2(self):
+        """Run pass-2 GPQA and assert no regression vs pass 1."""
+        self.run_accuracy()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":

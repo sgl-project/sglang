@@ -9,7 +9,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression
 from sglang.test.ci.ci_register import register_npu_ci
+
+CASE_ID = "test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap"
 
 register_npu_ci(
     est_time=4800,
@@ -24,6 +27,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_COMMON_ENVS = {
     "MF_HYBM_USE_VMM_SEGMENT": "1",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
+    "ASCEND_USE_FIA": "0",
     "SGLANG_SET_CPU_AFFINITY": "1",
     # skip gpu branch
     "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
@@ -210,6 +214,7 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHighOverlap(TestNpuAccuracyMultiNodePdSep
     def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high_overlap(self):
         """Run NPU accuracy test for DSV4-Pro W4A8 PD-Sep GPQA High mode without spec decoding."""
         self.run_accuracy()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
     def test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_l2_host_hit_rate_overlap(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""

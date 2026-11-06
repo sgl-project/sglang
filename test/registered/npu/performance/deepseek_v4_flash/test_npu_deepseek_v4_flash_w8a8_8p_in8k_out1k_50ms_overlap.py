@@ -8,9 +8,12 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression, record_pass1
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
 from sglang.utils import wait_for_server
+
+CASE_ID = "test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms_overlap"
 
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3", nightly=True)
 register_npu_ci(est_time=1800, suite="nightly-perf-16-npu-a3-cann910", nightly=True)
@@ -20,6 +23,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
+    "ASCEND_USE_FIA": "0",
     "INF_NAN_MODE_FORCE_DISABLE": "1",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "HCCL_SOCKET_IFNAME": "lo",
@@ -50,6 +54,11 @@ DEEPSEEK_V4_FLASH_W8A8_8P_ENVS = {
     "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
     # mtp
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
+}
+
+# Pass 1: ASCEND_USE_FIA left unset (image default).
+DEEPSEEK_V4_FLASH_W8A8_8P_PASS1_ENVS = {
+    k: v for k, v in DEEPSEEK_V4_FLASH_W8A8_8P_ENVS.items() if k != "ASCEND_USE_FIA"
 }
 
 # Server launch arguments for DSV4-Flash W8A8 single-node 8p PD-mix.
@@ -112,14 +121,13 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
 ]
 
 
-class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50msOverlap(TestNpuPerformanceTestCaseBase):
-    """Test NPU performance for DeepSeek-V4-Flash W8A8 8p in8k out1k without spec decoding."""
+class W8A88PIn8kOut1k50msOverlapBase(TestNpuPerformanceTestCaseBase):
+    """Shared config for the two-pass (FIA unset vs FIA=0) throughput comparison."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
     dataset_type = AISBENCHMARK_DATASET_DEFAULT
     model = DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH
     other_args = DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS
-    envs = DEEPSEEK_V4_FLASH_W8A8_8P_ENVS
     dataset_name = "random"
     input_len = 8000
     output_len = 1000
@@ -128,9 +136,9 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50msOverlap(TestNpuPerformanceTestCas
     random_range_ratio = 1
     warmup_requests = 32
     request_rate = float("inf")
-    tpot = 50
+    # tpot = 50
     max_attempts = 3
-    output_token_throughput = 3100
+    # output_token_throughput = 3100
     # accept_rate = 0.5  # spec decoding disabled in this overlap-schedule variant
 
     @classmethod
@@ -158,9 +166,27 @@ class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50msOverlap(TestNpuPerformanceTestCas
         cls.process = subprocess.Popen(command, env=env)
         wait_for_server(cls.base_url, timeout=cls.timeout, process=cls.process)
 
-    def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms_overlap(self):
-        """Run NPU performance test for DeepSeek-V4-Flash W8A8 8p in8k out1k without spec decoding."""
+
+class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50msOverlapPass1(W8A88PIn8kOut1k50msOverlapBase):
+    """Pass 1: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA unset."""
+
+    envs = DEEPSEEK_V4_FLASH_W8A8_8P_PASS1_ENVS
+
+    def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms_overlap_pass1(self):
+        """Run pass-1 throughput and record the baseline metrics."""
         self.run_throughput()
+        record_pass1(CASE_ID, self.last_metrics)
+
+
+class TestNPUDeepSeekV4FlashW8A88PIn8kOut1k50msOverlapPass2(W8A88PIn8kOut1k50msOverlapBase):
+    """Pass 2: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA=0."""
+
+    envs = DEEPSEEK_V4_FLASH_W8A8_8P_ENVS
+
+    def test_npu_deepseek_v4_flash_w8a8_8p_in8k_out1k_50ms_overlap_pass2(self):
+        """Run pass-2 throughput and assert no regression vs pass 1."""
+        self.run_throughput()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":

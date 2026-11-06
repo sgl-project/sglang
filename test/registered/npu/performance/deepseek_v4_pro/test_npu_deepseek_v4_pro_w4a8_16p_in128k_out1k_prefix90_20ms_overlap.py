@@ -6,7 +6,10 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression
 from sglang.test.ci.ci_register import register_npu_ci
+
+CASE_ID = "test_npu_deepseek_v4_pro_w4a8_16p_in128k_out1k_prefix90_20ms_overlap"
 
 register_npu_ci(
     est_time=2000,
@@ -26,6 +29,7 @@ DEEPSEEK_V4_PRO_W4A8_16P_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
+    "ASCEND_USE_FIA": "0",
     "SGLANG_SET_CPU_AFFINITY": "1",
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_DSV4_FP4_EXPERTS": "False",
@@ -148,12 +152,13 @@ class TestNPUDeepSeekV4ProW4A816PIn128kOut1kPrefix90RadixCacheOverlap(
     output_len = 1024
     request_rate = float("inf")
     seed = 42
-    tpot = 20
-    output_token_throughput = 128
+    # tpot = 20
+    # output_token_throughput = 128
 
     def test_npu_deepseek_v4_pro_w4a8_mix_16p_in128k_out1k_prefix_90_20ms_overlap(self):
         """Run NPU performance test for DeepSeek-V4-Pro W4A8 16p mix 16p in128k out1k without spec decoding."""
         self.run_throughput()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
 
 if __name__ == "__main__":
