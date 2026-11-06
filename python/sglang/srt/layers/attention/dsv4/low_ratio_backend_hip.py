@@ -287,6 +287,51 @@ def _fill_identity_request(
         raw_rows[:, :lc] = torch.where(reach, j[None, :], -1).to(torch.int32)
 
 
+def _fill_identity_rows_batched(
+    *,
+    meta: torch.Tensor,
+    lc_per_req: List[int],
+    extend_lens: List[int],
+    k_slots: torch.Tensor,
+    lens: torch.Tensor,
+    page_rows: torch.Tensor,
+    raw_rows: Optional[torch.Tensor],
+) -> bool:
+    """A whole run of identity requests in a launch count that does not grow with the request
+    count. Writes exactly what the same requests' _fill_identity_request calls write: column j
+    of a row of request b holds compressed position j while j < min(lens_row, lc_b) and -1
+    otherwise, and the columns past max(lc) keep the -1 the caller pre-filled. False when the
+    requests are not the plain int32 run this path needs, so the caller keeps the loop."""
+    num_reqs, num_rows = len(lc_per_req), page_rows.shape[0]
+    # a lone request is one _fill_identity_request already: batching it only adds launches
+    if num_reqs < 2 or num_rows == 0 or sum(extend_lens) != num_rows:
+        return False
+    if page_rows.dtype != torch.int32 or (
+        raw_rows is not None and raw_rows.dtype != torch.int32
+    ):
+        return False
+    # only the columns a request of this run can reach need writing
+    width = max(lc_per_req)
+    if width == 0 or width > page_rows.shape[1]:
+        return False
+    device = page_rows.device
+    counts, offsets, row_counts = meta[0], meta[1], meta[2]
+    col = torch.arange(width, device=device)
+    # [num_reqs, width] gather index into k_slots, parked at 0 past a request's own slots
+    gather = torch.where(
+        col[None, :] < counts[:, None], offsets[:, None] + col[None, :], 0
+    )
+    slots_by_req = k_slots[gather].to(torch.int32)
+    row_req = torch.repeat_interleave(
+        torch.arange(num_reqs, device=device), row_counts, output_size=num_rows
+    )
+    reach = col[None, :] < torch.minimum(lens.to(torch.int64), counts[row_req])[:, None]
+    page_rows[:, :width] = torch.where(reach, slots_by_req[row_req], -1)
+    if raw_rows is not None:
+        raw_rows[:, :width] = torch.where(reach, col[None, :].to(torch.int32), -1)
+    return True
+
+
 def _decode_batch_max_seq_len(forward_batch) -> Optional[int]:
     """The host-side longest context of a decode batch, None when unknown."""
     seq_lens_cpu = forward_batch.seq_lens_cpu
@@ -540,9 +585,27 @@ def low_ratio_index_topk_hip_extend(
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int64),
             device=pos.device,
         )
+        # one host-to-device copy carries every per-request vector the batched fill reads
+        identity_meta = torch.tensor(
+            [lc_per_req, starts, extend_lens_cpu], dtype=torch.int64, device=pos.device
+        )
 
     def fill_identity_requests(req_lo, req_hi, tok_lo):
         """Identity requests req_lo..req_hi: rows written without scores, None published per request."""
+        group_lens = extend_lens_cpu[req_lo:req_hi]
+        group = slice(tok_lo, tok_lo + sum(group_lens))
+        if _fill_identity_rows_batched(
+            meta=identity_meta[:, req_lo:req_hi],
+            lc_per_req=lc_per_req[req_lo:req_hi],
+            extend_lens=group_lens,
+            k_slots=k_slots,
+            lens=compress_lens[group],
+            page_rows=page_indices[group],
+            raw_rows=None if raw_indices is None else raw_indices[group],
+        ):
+            if publish is not None:
+                publish.extend([None] * (req_hi - req_lo))
+            return
         tok = tok_lo
         for b in range(req_lo, req_hi):
             t_len, lc = extend_lens_cpu[b], lc_per_req[b]
