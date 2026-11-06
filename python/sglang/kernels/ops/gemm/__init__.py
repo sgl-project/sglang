@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 _SM90 = frozenset({CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))})
 _SM120 = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 0))})
 _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
+_SM107 = frozenset({CapabilityRequirement.cuda(min_sm=(10, 7), max_sm=(10, 7))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
@@ -397,6 +398,14 @@ register_kernel(
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.dsv4_wo_a:wo_a_bf16_small_batch_mxfp8",
         capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.sm107_bmm_mxfp8",
+        backend=KernelBackend.CUTE_DSL,
+        target="sglang.kernels.ops.gemm.sm107_bmm_mxfp8:bmm_mxfp8",
+        capabilities=_SM107,
     )
 )
 register_kernel(

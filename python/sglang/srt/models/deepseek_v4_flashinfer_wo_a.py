@@ -1,13 +1,13 @@
 """DeepSeek-V4.1 MegaAttention ``wo_a`` (``bhr,hdr->bhd``) on FlashInfer's SM107 batched MXFP8 GEMM.
 
 FlashMLA's prefill writes its output scales in the 128x4-swizzled scale layout (``out_sf_swizzled_128x4``)
-and ``flashinfer.bmm_mxfp8(backend="cute-dsl")`` runs the head groups in one launch, writing the FP8
-result and its 128x4 scales straight into ``wo_b``'s input. The output bytes equal DeepGEMM's
+and FlashInfer's SM107 batched MXFP8 GEMM (``sglang.kernels.ops.gemm.sm107_bmm_mxfp8``, vendored from
+flashinfer-ai/flashinfer#9003) runs the head groups in one launch, writing the FP8 result and its 128x4
+scales straight into ``wo_b``'s input. The output bytes equal DeepGEMM's
 ``fp8_einsum`` with a 128x4-swizzled output pair.
 """
 
 import functools
-import inspect
 from typing import Tuple, Union
 
 import torch
@@ -19,19 +19,18 @@ from sglang.srt.utils import get_device_sm
 
 @functools.cache
 def _available() -> bool:
+    if get_device_sm() != 107:
+        return False
     try:
-        import flashinfer
-
         from sglang.kernels.ops.attention.flash_mla_interface import (
             MEGA_PREFILL_SWIZZLED_SF,
         )
+        from sglang.kernels.ops.gemm.sm107_bmm_mxfp8 import (  # noqa: F401
+            dense_blockscaled_gemm_sm107,
+        )
     except ImportError:
         return False
-    return (
-        MEGA_PREFILL_SWIZZLED_SF
-        and "out_scale" in inspect.signature(flashinfer.bmm_mxfp8).parameters
-        and get_device_sm() == 107
-    )
+    return MEGA_PREFILL_SWIZZLED_SF
 
 
 def flashinfer_wo_a_enabled(rows: int, device: torch.device) -> bool:
@@ -74,7 +73,7 @@ def flashinfer_wo_a_einsum(
     out: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
 ) -> None:
     """``out`` is a bf16 [rows, groups, d] tensor or an (fp8 [rows, groups * d], FlashInfer 128x4 scale) pair."""
-    import flashinfer
+    from sglang.kernels.ops.gemm.sm107_bmm_mxfp8 import bmm_mxfp8
 
     rows, groups, _ = o_fp8.shape
     d = weight.shape[1]
@@ -83,23 +82,13 @@ def flashinfer_wo_a_einsum(
     a_scale = torch.as_strided(o_s, (o_s.numel(),), (1,)).view(torch.uint8)
     if isinstance(out, tuple):
         y, y_sf = out
-        flashinfer.bmm_mxfp8(
+        bmm_mxfp8(
             a,
             b,
             a_scale,
             weight_scale_flashinfer,
-            torch.float8_e4m3fn,
-            out=y.view(rows, groups, d).transpose(0, 1),
-            backend="cute-dsl",
-            out_scale=y_sf.view(torch.uint8).view(-1),
+            y.view(rows, groups, d).transpose(0, 1),
+            y_sf.view(torch.uint8).view(-1),
         )
     else:
-        flashinfer.bmm_mxfp8(
-            a,
-            b,
-            a_scale,
-            weight_scale_flashinfer,
-            out.dtype,
-            out=out.transpose(0, 1),
-            backend="cute-dsl",
-        )
+        bmm_mxfp8(a, b, a_scale, weight_scale_flashinfer, out.transpose(0, 1))

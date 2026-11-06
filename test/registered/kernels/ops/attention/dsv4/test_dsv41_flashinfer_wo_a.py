@@ -20,7 +20,7 @@ GROUPS, RANK = 8, 1024
 
 @unittest.skipUnless(
     torch.cuda.is_available() and fi_wo_a._available(),
-    "needs CC 10.7, FlashMLA's out_sf_swizzled_128x4 and flashinfer.bmm_mxfp8(out_scale=...)",
+    "needs CC 10.7 and FlashMLA's out_sf_swizzled_128x4",
 )
 class TestFlashInferWoA(CustomTestCase):
     def _attention(self, rows, swizzled):
@@ -60,7 +60,7 @@ class TestFlashInferWoA(CustomTestCase):
         )
         wq, ws = quantize_wo_a(weight)
         ws_fi = fi_wo_a.wo_a_scale_to_flashinfer(wq, ws)
-        for rows in (128, 512, 4096):
+        for rows in (128, 384, 4096):
             data, scale = self._attention(rows, False)
             data_fi, scale_fi = self._attention(rows, True)
             self.assertFalse(fi_wo_a.scales_swizzled_128x4(scale))

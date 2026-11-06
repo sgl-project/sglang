@@ -1567,8 +1567,7 @@ class Envs:
     # selected set on every run.
     SGLANG_TOPK_V2_MODE = EnvInt(1)
     # DeepSeek-V4.1 MegaAttention prefill on CC 10.7: FlashMLA writes 128x4-swizzled scales and
-    # wo_a runs on FlashInfer's batched MXFP8 GEMM (needs FlashMLA's out_sf_swizzled_128x4 and
-    # flashinfer.bmm_mxfp8(out_scale=...)).
+    # wo_a runs on FlashInfer's SM107 batched MXFP8 GEMM (needs FlashMLA's out_sf_swizzled_128x4).
     SGLANG_OPT_DSV41_FLASHINFER_WO_A = EnvBool(False)
 
     # ===================================================================
