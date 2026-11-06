@@ -240,6 +240,11 @@ def is_musa() -> bool:
 
 
 @lru_cache(maxsize=1)
+def is_mlu() -> bool:
+    return hasattr(torch, "mlu") and torch.mlu.is_available()
+
+
+@lru_cache(maxsize=1)
 def is_mps() -> bool:
     return hasattr(torch, "mps") and torch.mps.is_available()
 
@@ -288,11 +293,6 @@ def _check_cuda_device_version(
     )
 
 
-is_ampere_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(12, 3)
-    )
-)
 is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
     partial(
         _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
@@ -458,6 +458,22 @@ def get_available_gpu_memory(
             free_gpu_memory = psutil.virtual_memory().available
         else:
             free_gpu_memory, _ = torch.cuda.mem_get_info(gpu_id)
+
+    elif device == "mlu":
+        num_gpus = torch.mlu.device_count()
+        assert gpu_id < num_gpus
+
+        if torch.mlu.current_device() != gpu_id:
+            logger.warning(
+                "current device is not %s, but %s, which may cause useless "
+                "memory allocation for torch MLU context.",
+                gpu_id,
+                torch.mlu.current_device(),
+            )
+
+        if empty_cache:
+            empty_device_cache(torch.mlu)
+        free_gpu_memory, _ = torch.mlu.mem_get_info(gpu_id)
 
     elif device == "xpu":
         num_gpus = torch.xpu.device_count()
@@ -912,6 +928,12 @@ def get_free_cpu_memory() -> int:
     return free_cpu_memory
 
 
+def get_mlu_memory_capacity():
+    if not is_mlu():
+        raise RuntimeError("MLU device is not available.")
+    return torch.mlu.mem_get_info()[1] // 1024 // 1024  # unit: MB
+
+
 def get_cpu_memory_capacity():
     # Per-rank memory capacity cannot be determined for customized core settings
     if os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", ""):
@@ -1014,6 +1036,8 @@ def get_device_memory_capacity(device: str = None):
         gpu_mem = get_xpu_memory_capacity()
     elif device == "musa":
         gpu_mem = get_mtgpu_memory_capacity()
+    elif device == "mlu":
+        gpu_mem = get_mlu_memory_capacity()
     else:
         # GPU memory is not known yet or no GPU is available.
         gpu_mem = None
@@ -1024,6 +1048,9 @@ def get_device_memory_capacity(device: str = None):
 def get_device_name(device_id: int = 0) -> str:
     if hasattr(torch, "mps") and torch.mps.is_available():
         return torch.backends.mps.get_name()
+
+    if is_mlu():
+        return torch.mlu.get_device_name(device_id)
 
     if (hasattr(torch, "cuda") and torch.cuda.is_available()) or is_musa():
         return torch.cuda.get_device_name(device_id)
@@ -1084,6 +1111,11 @@ def get_device(device_id: Optional[int] = None) -> str:
             )
         return "cpu"
 
+    if is_mlu():
+        if device_id is None:
+            return "mlu"
+        return "mlu:{}".format(device_id)
+
     if hasattr(torch, "cuda") and torch.cuda.is_available():
         if device_id is None:
             return "cuda"
@@ -1126,7 +1158,7 @@ def get_device(device_id: Optional[int] = None) -> str:
         return current_platform.get_device(device_id)
     except Exception:
         raise RuntimeError(
-            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS) or platform plugin is available."
+            "No accelerator (CUDA, XPU, HPU, NPU, MUSA, MPS, MLU) or platform plugin is available."
         )
 
 
@@ -1135,6 +1167,12 @@ def get_device_count() -> int:
     if hasattr(torch, "mps") and torch.mps.is_available():
         try:
             return torch.mps.device_count()
+        except RuntimeError:
+            return 0
+
+    if is_mlu():
+        try:
+            return torch.mlu.device_count()
         except RuntimeError:
             return 0
 
@@ -1346,29 +1384,6 @@ def get_cuda_driver_bindings():
         from cuda import cuda as cuda_driver
 
     return cuda_driver
-
-
-def get_device_sm_nvidia_smi():
-    try:
-        # Run nvidia-smi command and capture output
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-
-        # Get the first line of output (assuming at least one GPU exists)
-        compute_cap_str = result.stdout.strip().split("\n")[0]
-
-        # Convert string (e.g., "9.0") to tuple of integers (9, 0)
-        major, minor = map(int, compute_cap_str.split("."))
-        return (major, minor)
-
-    except (subprocess.CalledProcessError, FileNotFoundError, ValueError) as e:
-        # Handle cases where nvidia-smi isn't available or output is unexpected
-        logger.error("Error getting compute capability: %s", e)
-        return (0, 0)  # Default/fallback value
 
 
 @contextmanager
@@ -1645,8 +1660,8 @@ def make_layers(
         check_declared_stages,
         layer_stack,
     )
+    from sglang.srt.layers.offloader import get_offloader
     from sglang.srt.layers.utils import PPMissingLayer
-    from sglang.srt.utils.offloader import get_offloader
 
     assert not pp_size or num_hidden_layers >= pp_size
     start_layer, end_layer = (
@@ -1741,6 +1756,8 @@ def set_random_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
     if torch.xpu.is_available():
         torch.xpu.manual_seed_all(seed)
+    if is_mlu():
+        torch.mlu.manual_seed_all(seed)
 
 
 _mm_http_session = threading.local()
@@ -3050,6 +3067,8 @@ def direct_register_custom_op(
             my_lib.impl(op_name, op_func, "XPU")
         elif is_musa():
             my_lib.impl(op_name, op_func, "MUSA")
+        elif is_mlu():
+            my_lib.impl(op_name, op_func, "MLU")
         else:
             my_lib.impl(op_name, op_func, "CUDA")
         if fake_impl is not None:
@@ -3870,10 +3889,10 @@ def retry(
             traceback.print_exc()
 
             if try_index >= max_retry:
-                raise Exception(f"retry() exceed maximum number of retries.")
+                raise Exception("retry() exceed maximum number of retries.")
 
             if not should_retry(e):
-                raise Exception(f"retry() observe errors that should not be retried.")
+                raise Exception("retry() observe errors that should not be retried.")
 
             delay = min(initial_delay * (2**try_index), max_delay) * (
                 0.75 + 0.25 * random.random()
@@ -4340,7 +4359,7 @@ def dim_is_supported(weight):
 def _process_weight_after_loading(module, weight_names, transpose_dims=None) -> None:
     # Pack weight for get better performance on CPU
     devices = {getattr(module, weight_name).device for weight_name in weight_names}
-    assert len(devices) == 1, f"Expects all weights to be on the same device"
+    assert len(devices) == 1, "Expects all weights to be on the same device"
     device = devices.pop()
 
     if transpose_dims:
@@ -4568,9 +4587,9 @@ def get_physical_cpus_by_numa_or_block():
     use_block = n_blocks > n_nodes
     physical_by_group = defaultdict(dict)
 
-    for cpu, core, socket, node, block in cpu_info:
+    for cpu, core, socket_id, node, block in cpu_info:
         group = block if use_block else node
-        key = (core, socket)
+        key = (core, socket_id)
         if key not in physical_by_group[group]:
             # Pick the first CPU seen for that physical core.
             physical_by_group[group][key] = cpu
@@ -4781,6 +4800,7 @@ SUPPORTED_LORA_TARGET_MODULES = [
     "wk",
     "weights_proj",
     "gate_proj",
+    "self_attn.gate_proj",
     "up_proj",
     "down_proj",
     "qkv_proj",
@@ -4893,19 +4913,6 @@ def json_list_type(value):
         raise argparse.ArgumentTypeError(
             f"Invalid JSON list: {value}. Please provide a valid JSON list."
         )
-
-
-def get_extend_input_len_swa_limit(
-    sliding_window_size: int, chunked_prefill_size: int, page_size: int
-) -> int:
-    # 1. a factor of 2x is because each prefill contains chunked_prefill_size tokens,
-    #    and between prefills, we run the tree cache's checkpoint(),
-    #    so we unlock the previously locked nodes.
-    # 2. max is to handle the case that chunked_prefill_size is larger than sliding_window_size.
-    #    in that case, each prefill contains chunked_prefill_size tokens,
-    #    and we can only free out-of-sliding-window kv indices after each prefill.
-    # 3. page_size is because we want to have 1 token extra for generated tokens.
-    return page_size + 2 * max(sliding_window_size, chunked_prefill_size)
 
 
 def get_num_new_pages(
@@ -5116,20 +5123,6 @@ def calc_diff(x, y):
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
-
-
-@contextmanager
-def temp_attr_context(obj, attr, value):
-    if obj is None:
-        yield
-        return
-
-    original_value = getattr(obj, attr)
-    setattr(obj, attr, value)
-    try:
-        yield
-    finally:
-        setattr(obj, attr, original_value)
 
 
 def raise_error_or_warn(obj, strict, counter_name, message, log_interval=1000):

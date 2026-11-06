@@ -2,7 +2,9 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+    situ_and_mul_masked_post_quant,
+)
 from sglang.srt.utils import get_device_sm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase

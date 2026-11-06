@@ -13,7 +13,6 @@ from torch.distributed._composable.fsdp import (
 )
 from torch.distributed.tensor import DTensor
 
-from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
     get_tp_rank,
@@ -35,6 +34,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.weight_only_fp8 import (
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context_or_none,
+    request_allows_lossless,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     write_dense_weight,
@@ -78,16 +78,6 @@ def _compute_lora_delta(
     )
 
 
-def _request_allows_lossless() -> bool:
-    # only a request that allows it: many stages set the forward context
-    # without forward_batch, and an exact request must still get exact bytes
-    context = get_forward_context_or_none()
-    forward_batch = None if context is None else context.forward_batch
-    sampling_params = getattr(forward_batch, "sampling_params", None)
-    quality = getattr(sampling_params, "quality", None)
-    return quality is not None and quality_allows(quality, "lossless")
-
-
 def _can_add_lora_delta_in_gemm(
     out: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor
 ) -> bool:
@@ -95,7 +85,7 @@ def _can_add_lora_delta_in_gemm(
         return False
     if lora_A.dim() == 3 and lora_A.shape[0] != lora_B.shape[0]:
         return False
-    return lora_A.dim() in (2, 3) and out.is_contiguous() and _request_allows_lossless()
+    return lora_A.dim() in (2, 3) and out.is_contiguous() and request_allows_lossless()
 
 
 def _add_lora_delta_in_gemm(
@@ -196,7 +186,7 @@ class BaseLayerWithLoRA(nn.Module):
     ) -> torch.Tensor:
         if self.lora_alpha != self.lora_rank:
             delta = delta * (self.lora_alpha / self.lora_rank)  # type: ignore
-        if _request_allows_lossless():
+        if request_allows_lossless():
             scale = self.strength * runtime_lora_scale
             return delta if scale == 1.0 else delta * scale
         if self.strength != 1.0:
@@ -964,7 +954,7 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         bias_in_gemm = (
             bias is not None
             and not self.base_layer.skip_bias_add
-            and _request_allows_lossless()
+            and request_allows_lossless()
         )
         output_parallel = self.base_layer.quant_method.apply(
             self.base_layer,

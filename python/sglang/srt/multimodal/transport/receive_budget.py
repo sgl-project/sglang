@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.pool_host.base import (
     ranks_per_host,
 )
 from sglang.srt.multimodal.cache.identity import resolve_multimodal_item_identity
-from sglang.srt.utils.cuda_vmm_transport_utils import CudaVmmTensorTransportProxy
+from sglang.srt.multimodal.transport.cuda_vmm import CudaVmmTensorTransportProxy
 
 logger = logging.getLogger(__name__)
 
