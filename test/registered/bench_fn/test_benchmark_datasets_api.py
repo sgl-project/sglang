@@ -549,6 +549,78 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
+    def test_custom_sampler_skips_invalid_records(self):
+        valid_turns = [{"content": "valid prompt"}, {"content": "valid answer"}]
+        invalid_records = [None, True, 123, "text", [], [valid_turns]]
+        for conversation_key in ("conversations", "conversation"):
+            invalid_records.extend(
+                {conversation_key: value}
+                for value in (None, 123, "text", {"a": 1, "b": 2}, [], [{}])
+            )
+            for index in (0, 1):
+                for value in (None, 123, "text", []):
+                    turns = valid_turns.copy()
+                    turns[index] = value
+                    invalid_records.append({conversation_key: turns})
+                for text_key in ("content", "value"):
+                    for value in (None, True, 123, [], {"text": "not plain text"}):
+                        turns = valid_turns.copy()
+                        turns[index] = {text_key: value}
+                        invalid_records.append({conversation_key: turns})
+
+        path = self.tmpdir_path / "mixed_custom.jsonl"
+        valid_record = {"conversations": valid_turns}
+        for record in invalid_records:
+            with self.subTest(record=record):
+                path.write_text(
+                    "\n{invalid json}\n"
+                    + json.dumps(record)
+                    + "\n"
+                    + json.dumps(valid_record)
+                    + "\n",
+                    encoding="utf-8",
+                )
+                rows = get_dataset(
+                    make_args(
+                        dataset_name="custom", dataset_path=str(path), num_prompts=2
+                    ),
+                    tokenizer=self.tokenizer,
+                )
+                self.assertEqual([row.prompt for row in rows], ["valid prompt"])
+                self.assertEqual(rows[0].prompt_len, 2)
+                self.assertEqual(rows[0].output_len, 2)
+
+    def test_custom_sampler_preserves_key_aliases(self):
+        records = [
+            {conversation_key: [{text_key: "valid prompt"}, {text_key: "valid answer"}]}
+            for conversation_key in ("conversations", "conversation")
+            for text_key in ("content", "value")
+        ]
+        path = self.tmpdir_path / "custom_aliases.jsonl"
+        path.write_text(
+            "\n".join(json.dumps(record) for record in records), encoding="utf-8"
+        )
+        rows = sample_custom_requests(
+            dataset_path=str(path),
+            num_requests=4,
+            tokenizer=self.tokenizer,
+            fixed_output_len=4,
+            apply_chat_template=True,
+        )
+        expected_prompt = self.tokenizer.apply_chat_template(
+            [{"role": "user", "content": "valid prompt"}],
+            add_generation_prompt=True,
+            tokenize=False,
+            return_dict=False,
+        )
+        self.assertEqual(len(rows), 4)
+        for row in rows:
+            self.assertEqual(row.prompt, expected_prompt)
+            self.assertEqual(
+                row.prompt_len, len(self.tokenizer.encode(expected_prompt))
+            )
+            self.assertEqual(row.output_len, 4)
+
     def test_openai_sampler(self):
         dataset_path = self._write_openai_jsonl()
         rows = sample_openai_requests(
