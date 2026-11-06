@@ -1563,6 +1563,7 @@ def setup_state_kv_args(
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
     kv_args.state_types = []
+    kv_args.dsa_index_k_token_bytes = None
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1578,6 +1579,16 @@ def setup_state_kv_args(
         if isinstance(owner_view, DeepSeekV4TokenToKVPool)
         else None
     )
+
+    def set_dsa_index_k_token_bytes(kv_args, pool) -> None:
+        # Per-token bytes of an index-K page: the fp8 keys of every token,
+        # then their scales. A PD DCP relayout moves the two parts separately.
+        if pool.index_kpool != 1:
+            return
+        value_bytes = pool.index_head_dim
+        scale_bytes = pool.index_head_dim // pool.quant_block_size * 4
+        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
+
     for entry in storage.wire_entries():
         region = storage.regions(entry.sub_pool, part=entry.part)
         state_type = _wire_state_type(entry.state_type)

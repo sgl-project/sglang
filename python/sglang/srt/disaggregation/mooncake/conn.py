@@ -1506,6 +1506,110 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_device_data_ptrs=dst_device_kv_ptrs,
         )
 
+    def _dsa_index_k_dcp_params(
+        self,
+        dsa_index_k: Tuple[List[int], List[int], int],
+        src_rows: npt.NDArray[np.int64],
+        dst_rows: npt.NDArray[np.int64],
+        pack_buffer,
+        pack_offset_bytes: int,
+    ) -> list:
+        """Transfer params moving index-K rows ``src_rows`` to ``dst_rows``.
+
+        An index-K page holds the fp8 keys of its tokens, then their scales, so
+        a token's row is two pieces: each is addressed in units of its own
+        width, which the page bytes are a multiple of. The source pieces are
+        packed in destination order when the pack buffer has room."""
+        src_ptrs, dst_ptrs, page_bytes = dsa_index_k
+        page_size = self.kv_args.page_size
+        value_bytes, scale_bytes = self.kv_args.dsa_index_k_token_bytes
+        if page_bytes % value_bytes or (page_size * value_bytes) % scale_bytes:
+            raise ValueError(
+                f"DSA index-K page of {page_bytes} bytes does not split into "
+                f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
+            )
+        params = []
+        for width, offset in ((value_bytes, 0), (scale_bytes, page_size * value_bytes)):
+            pages_per_unit = page_bytes // width
+            src_units = (
+                src_rows // page_size * pages_per_unit
+                + (offset // width)
+                + src_rows % page_size
+            )
+            dst_units = (
+                dst_rows // page_size * pages_per_unit
+                + (offset // width)
+                + dst_rows % page_size
+            )
+            layer_srcs = list(src_ptrs)
+            if pack_buffer is not None:
+                from sglang.srt.disaggregation.common.dcp_pack import try_pack_dcp_src
+
+                packed = try_pack_dcp_src(
+                    pack_buffer=pack_buffer,
+                    kv_data_ptrs=layer_srcs,
+                    src_token_indices=src_units,
+                    token_item_lens=[width] * len(layer_srcs),
+                    pack_offset_bytes=pack_offset_bytes,
+                )
+                if packed is not None:
+                    layer_srcs, src_units = packed
+                    pack_offset_bytes += src_rows.size * width * len(src_ptrs)
+            groups = group_concurrent_contiguous(src_units, dst_units)
+            params += [
+                (src_ptr, dst_ptr, width, groups)
+                for src_ptr, dst_ptr in zip(layer_srcs, dst_ptrs)
+            ]
+        return params
+
+    def dsa_index_k_dcp_entries(
+        self, registration_info: KVArgsRegisterInfo
+    ) -> Optional[Tuple[List[int], List[int], int]]:
+        """The DSA index-K a PD DCP relayout moves with the KV: (source,
+        destination buffers, page bytes), or None when the pool has none."""
+        state_types = getattr(self.kv_args, "state_types", [])
+        if StateType.DSA not in state_types:
+            return None
+        if self.kv_args.dsa_index_k_token_bytes is None:
+            raise RuntimeError("PD DCP needs a token-shardable DSA index-K (no kpool)")
+        i = state_types.index(StateType.DSA)
+        src_ptrs, dst_ptrs, _ = self.get_mla_kv_ptrs_with_pp(
+            self.kv_args.state_data_ptrs[i],
+            registration_info.dst_state_data_ptrs[i],
+            StateType.DSA,
+        )
+        src_lens, dst_lens, _ = self.get_mla_kv_ptrs_with_pp(
+            self.kv_args.state_item_lens[i],
+            registration_info.dst_state_item_lens[i],
+            StateType.DSA,
+        )
+        # Layers that reuse the previous top-k keep no index-K on either side.
+        pairs = [
+            (src, dst, src_len)
+            for src, dst, src_len, dst_len in zip(
+                src_ptrs, dst_ptrs, src_lens, dst_lens
+            )
+            if src_len and dst_len
+        ]
+        if not pairs:
+            return None
+        page_bytes = {src_len for _, _, src_len in pairs}
+        dst_page_bytes = {
+            dst_len
+            for src_len, dst_len in zip(src_lens, dst_lens)
+            if src_len and dst_len
+        }
+        if len(page_bytes) != 1 or page_bytes != dst_page_bytes:
+            raise RuntimeError(
+                "PD DCP needs one DSA index-K page geometry on both peers, got "
+                f"src={sorted(page_bytes)}, dst={sorted(dst_page_bytes)}"
+            )
+        return (
+            [src for src, _, _ in pairs],
+            [dst for _, dst, _ in pairs],
+            page_bytes.pop(),
+        )
+
     def send_kvcache_dcp(
         self,
         mooncake_session_id: str,
@@ -1525,7 +1629,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
+        """``dsa_index_k``: (source, destination buffers, page bytes) of a DSA
+        index-K the decode shards by token like its KV (Kimi-K3.1); its rows
+        move with the target KV rows."""
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size
@@ -1598,6 +1706,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 for entry in range(num_target)
             ]
+        if dsa_index_k is not None and plan.target_src_token_indices.size:
+            layers_params += self._dsa_index_k_dcp_params(
+                dsa_index_k,
+                plan.target_src_token_indices,
+                plan.target_dst_token_indices,
+                pack_buffer,
+                # after the target and draft KV rows packed for this transfer
+                pack_offset_bytes=(
+                    plan.target_src_token_indices.size
+                    * sum(dcp_token_item_lens[:num_target])
+                    + plan.draft_src_token_indices.size
+                    * sum(dcp_token_item_lens[num_target:])
+                ),
+            )
         sliced_draft_params = []
         draft_to_pack = []
         if num_draft > 0 and plan.draft_src_token_indices.size:
@@ -2070,6 +2192,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
             if indices is None:
+                continue
+            if (
+                st == StateType.DSA
+                and target_rank_registration_info is not None
+                and target_rank_registration_info.requires_dcp_relayout
+            ):
+                # Moved row by row with the KV (send_kvcache_dcp).
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]
@@ -2815,6 +2944,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
+                                dsa_index_k=self.dsa_index_k_dcp_entries(
+                                    target_rank_registration_info
+                                ),
                             )
                         elif (
                             self.is_mla_backend

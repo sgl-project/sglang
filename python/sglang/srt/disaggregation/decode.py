@@ -89,6 +89,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
@@ -1942,7 +1943,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 decode_req.req.kv.req_pool_idx,
                 total_prefix_len,
                 seq_len,
-                self.token_to_kv_pool.page_size,
+                dsa_index_k_page_tokens(self.token_to_kv_pool.page_size),
             )
 
         def _dsa_tail_payload():
