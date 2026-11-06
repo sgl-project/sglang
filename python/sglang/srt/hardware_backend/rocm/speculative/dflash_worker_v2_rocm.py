@@ -36,7 +36,7 @@ class DFlashWorkerV2ROCm(DFlashWorkerV2):
         self._tail_graph_commit_buf: Optional[torch.Tensor] = None
 
     def _build_prep_graph(self):
-        from sglang.srt.hardware_backend.rocm.speculative.dflash_prep_graph import (
+        from sglang.srt.hardware_backend.gpu.speculative.dflash_prep_graph import (
             DFlashPrepGraph,
         )
 
