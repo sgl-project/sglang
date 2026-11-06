@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -79,13 +80,9 @@ def _jit_route_warp_module(
     )
 
 
-@functools.cache
-def _device_ok(device_index: Optional[int]) -> bool:
+def _device_ok() -> bool:
     # redux.sync needs SM80+; the kernel is CUDA-only.
-    return (
-        torch.version.hip is None
-        and torch.cuda.get_device_capability(device_index)[0] >= 8
-    )
+    return current_arch().is_sm_at_least(8)
 
 
 @functools.cache
@@ -97,11 +94,10 @@ def covered(
     num_fused_shared_experts: int = 0,
     num_expert_group: int = 1,
     topk_group: int = 1,
-    device_index: Optional[int] = None,
 ) -> bool:
     """Whether :func:`moe_route_warp` serves this router config. Static facts
     only; the launcher rejects misaligned or non-row-major logits."""
-    if not _device_ok(device_index) or scoring_func not in _SCORING_FUNCS:
+    if not _device_ok() or scoring_func not in _SCORING_FUNCS:
         return False
     if scores_dtype not in (torch.float32, torch.bfloat16):
         return False
@@ -196,13 +192,11 @@ def moe_route_warp(
 
 
 @functools.cache
-def muse_spark_route_warp_covered(
-    num_experts: int, topk: int, device_index: Optional[int] = None
-) -> bool:
+def muse_spark_route_warp_covered(num_experts: int, topk: int) -> bool:
     """Whether :func:`muse_spark_route_warp` serves this MuseSpark router config
     (fp32 logits and bias, sigmoid scoring: the caller's checks)."""
     return (
-        _device_ok(device_index)
+        _device_ok()
         and num_experts % 32 == 0
         and num_experts <= 512
         and 1 <= topk <= 32
