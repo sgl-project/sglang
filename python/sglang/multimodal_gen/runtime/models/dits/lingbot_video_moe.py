@@ -12,12 +12,11 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+    LINGBOT_VIDEO_RMSNORM,
     can_use_rmsnorm_scale_shift_per_token,
-    lingbot_video_gated_residual_active,
-    mark_lingbot_video_gated_residual_site,
-    mark_lingbot_video_rmsnorm_site,
     rmsnorm_scale_shift_per_token,
-    try_lingbot_video_gated_residual,
+    try_gated_residual,
     try_lingbot_video_rmsnorm,
 )
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -88,7 +87,7 @@ class LingBotVideoRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.variance_epsilon = eps
-        mark_lingbot_video_rmsnorm_site(self)
+        LINGBOT_VIDEO_RMSNORM.mark(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         fused = try_lingbot_video_rmsnorm(
@@ -116,7 +115,9 @@ def _lingbot_gated_residual(
     block's quality-gated site is enabled; otherwise the reference FP32
     multiply form (bit-exact for ``quality="exact"``).
     """
-    fused = try_lingbot_video_gated_residual(block, residual, update, gate)
+    fused = try_gated_residual(
+        LINGBOT_VIDEO_GATED_RESIDUAL, block, residual, update, gate
+    )
     if fused is not None:
         return fused
     return residual + (gate * update).to(residual.dtype)
@@ -136,7 +137,7 @@ def _lingbot_norm_modulate(
     quality-gated site is enabled; otherwise the reference chain. ``scale`` is
     the raw ``scale_msa/mlp``; the kernel applies ``x * (1 + scale)``.
     """
-    if lingbot_video_gated_residual_active(
+    if LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(
         block
     ) and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift):
         try:
@@ -337,7 +338,7 @@ class LingBotVideoBlock(nn.Module):
         self.layer_idx = layer_idx
         h = hidden_size
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
-        mark_lingbot_video_gated_residual_site(self)
+        LINGBOT_VIDEO_GATED_RESIDUAL.mark(self)
         self.norm1 = LingBotVideoRMSNorm(h, norm_eps)
         self.attn = LingBotVideoAttention(
             h,

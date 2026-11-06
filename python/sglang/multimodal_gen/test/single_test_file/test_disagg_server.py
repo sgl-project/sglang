@@ -25,10 +25,10 @@ from __future__ import annotations
 
 import base64
 import os
-import signal
 import subprocess
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import requests
@@ -39,7 +39,7 @@ from sglang.multimodal_gen.test.test_utils import (
     find_free_port,
     wait_for_server_health,
 )
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
 HOST = "127.0.0.1"
 _LOG_DIR = Path(os.environ.get("SGLANG_TEST_LOG_DIR", "/tmp"))
@@ -53,14 +53,7 @@ _STARTUP_TIMEOUT_S = float(os.environ.get("SGLANG_DISAGG_STARTUP_TIMEOUT", "600"
 # ---------------------------------------------------------------------------
 
 
-def _kill_tree(pid: int) -> None:
-    try:
-        os.killpg(os.getpgid(pid), signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-
-def _wait_for_log(path: Path, message: str, timeout: float) -> bool:
+def _wait_for_log(path: Path, message: str, timeout: float, process=None) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
         if path.exists():
@@ -69,6 +62,8 @@ def _wait_for_log(path: Path, message: str, timeout: float) -> bool:
                     return True
             except OSError:
                 pass
+        if process is not None and process.poll() is not None:
+            return False
         time.sleep(2)
     return False
 
@@ -105,12 +100,14 @@ class DisaggCluster:
         gpu_layout: dict[str, list[int]],
         extra_role_args: dict[str, list[str]] | None = None,
         startup_timeout: float = _STARTUP_TIMEOUT_S,
+        warmup_kwargs: dict | None = None,
     ) -> None:
         self.model = model
         self.name = name
         self.gpu_layout = gpu_layout
         self.extra_role_args = extra_role_args or {}
         self.startup_timeout = startup_timeout
+        self.warmup_kwargs = warmup_kwargs or {}
         self._procs: list[subprocess.Popen] = []
         self._fhs: list = []
         self._logs: dict[str, Path] = {}
@@ -119,11 +116,7 @@ class DisaggCluster:
     def _alloc_ports(self) -> None:
         self.base_port = find_free_port(HOST)
         self.api_port = find_free_port(HOST)
-        self._role_ports = {
-            "encoder": find_free_port(HOST),
-            "denoiser": find_free_port(HOST),
-            "decoder": find_free_port(HOST),
-        }
+        self._role_ports = {role: find_free_port(HOST) for role in self.gpu_layout}
 
     # -- context manager -----------------------------------------------------
 
@@ -165,7 +158,7 @@ class DisaggCluster:
         return proc
 
     def _launch_roles(self) -> None:
-        for role in ("encoder", "denoiser", "decoder"):
+        for role in self.gpu_layout:
             port = self._role_ports[role]
             gpus = self.gpu_layout[role]
             log = _LOG_DIR / f"disagg_{self.name}_{role}.log"
@@ -186,14 +179,16 @@ class DisaggCluster:
                 str(len(gpus)),
                 "--base-gpu-id",
                 str(gpus[0]),
+                "--master-port",
+                str(find_free_port(HOST)),
                 "--log-level",
                 "info",
                 *self.extra_role_args.get(role, []),
             ]
-            self._start_proc(cmd, log)
+            proc = self._start_proc(cmd, log)
 
             ready_msg = f"Role {role.upper()} ready"
-            if not _wait_for_log(log, ready_msg, self.startup_timeout):
+            if not _wait_for_log(log, ready_msg, self.startup_timeout, proc):
                 raise RuntimeError(
                     f"{role} failed to start for {self.name}. Log tail:\n"
                     f"{_tail_log(log)}"
@@ -202,10 +197,7 @@ class DisaggCluster:
     def _launch_server_head(self) -> None:
         log = _LOG_DIR / f"disagg_{self.name}_server.log"
         self._logs["server"] = log
-        # Role processes register their transfer work_endpoint with the
-        # derived value ``tcp://0.0.0.0:<port>`` (see server_args/disagg.py). The
-        # server head must advertise the same literal so ``_handle_register``'s
-        # endpoint_to_idx exact-string match succeeds.
+        # Match the literal hostname advertised by the workers.
         cmd = [
             "sglang",
             "serve",
@@ -213,12 +205,6 @@ class DisaggCluster:
             self.model,
             "--disagg-role",
             "server",
-            "--encoder-urls",
-            f"tcp://0.0.0.0:{self._role_ports['encoder']}",
-            "--denoiser-urls",
-            f"tcp://0.0.0.0:{self._role_ports['denoiser']}",
-            "--decoder-urls",
-            f"tcp://0.0.0.0:{self._role_ports['decoder']}",
             "--scheduler-port",
             str(self.base_port),
             "--port",
@@ -231,6 +217,8 @@ class DisaggCluster:
             "info",
             *self.extra_role_args.get("server", []),
         ]
+        for role, port in self._role_ports.items():
+            cmd.extend([f"--{role.replace('_', '-')}-urls", f"tcp://{HOST}:{port}"])
         self._start_proc(cmd, log)
         try:
             wait_for_server_health(
@@ -247,7 +235,7 @@ class DisaggCluster:
     def _warmup(self) -> None:
         """Send a warmup request to establish RDMA connections."""
         try:
-            _generate_image(self.api_port, self.model)
+            _generate_image(self.api_port, self.model, **self.warmup_kwargs)
         except Exception as e:
             raise RuntimeError(
                 f"Warmup request failed for {self.name}: {e}\n"
@@ -256,7 +244,7 @@ class DisaggCluster:
 
     def stop(self) -> None:
         for proc in self._procs:
-            _kill_tree(proc.pid)
+            terminate_and_kill_process_tree(proc)
         for fh in self._fhs:
             try:
                 fh.close()
@@ -273,7 +261,7 @@ class DisaggCluster:
 # ---------------------------------------------------------------------------
 
 
-def _generate_image(api_port: int, model: str) -> bytes:
+def _generate_image(api_port: int, model: str, **overrides) -> bytes:
     # Use raw requests (openai SDK pulls in a lot and complicates CI deps).
     resp = requests.post(
         f"http://{HOST}:{api_port}/v1/images/generations",
@@ -283,6 +271,7 @@ def _generate_image(api_port: int, model: str) -> bytes:
             "n": 1,
             "size": "1024x1024",
             "response_format": "b64_json",
+            **overrides,
         },
         timeout=600,
     )
@@ -315,6 +304,7 @@ class _DisaggTestBase(CustomTestCase):
     cluster_name: str = ""
     gpu_layout: dict[str, list[int]] = {}
     extra_role_args: dict[str, list[str]] = {}
+    warmup_kwargs: dict = {}
 
     cluster: DisaggCluster | None = None
 
@@ -327,6 +317,7 @@ class _DisaggTestBase(CustomTestCase):
             name=cls.cluster_name,
             gpu_layout=cls.gpu_layout,
             extra_role_args=cls.extra_role_args,
+            warmup_kwargs=cls.warmup_kwargs,
         )
         cls.cluster.__enter__()
 
@@ -387,6 +378,103 @@ class TestDisaggZImage2RankDenoiser(_DisaggTestBase):
         assert self.cluster is not None
         img = _generate_image(self.cluster.api_port, self.model)
         self.assertGreater(len(img), 1_000, f"image too small: {len(img)} bytes")
+
+
+class TestDisaggFlux3Image(_DisaggTestBase):
+    """Real four-role T2I/i2i versus the same monolithic model and workload."""
+
+    model = "black-forest-labs/flux-3-image-klein"
+    cluster_name = "flux3_split"
+    gpu_layout = {
+        "prompt_encoder": [0],
+        "image_encoder": [0],
+        "denoiser": [1],
+        "decoder": [0],
+    }
+    warmup_kwargs = dict(
+        size="256x256", num_inference_steps=2, seed=42, quality="exact"
+    )
+    extra_role_args = {
+        role: ["--warmup-mode", "off"] for role in (*gpu_layout, "server")
+    }
+
+    def test_t2i_and_edit_match_monolithic(self):
+        from io import BytesIO
+
+        import numpy as np
+        from PIL import Image
+
+        cluster = self.cluster
+        assert cluster is not None
+        kwargs = self.warmup_kwargs
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            generated, repeated = list(
+                executor.map(
+                    lambda _: _generate_image(cluster.api_port, self.model, **kwargs),
+                    range(2),
+                )
+            )
+        np.testing.assert_array_equal(
+            np.asarray(Image.open(BytesIO(generated))),
+            np.asarray(Image.open(BytesIO(repeated))),
+        )
+        reference = BytesIO()
+        Image.open(BytesIO(generated)).crop((0, 0, 247, 239)).save(
+            reference, format="PNG"
+        )
+        reference = reference.getvalue()
+
+        def edit(port):
+            response = requests.post(
+                f"http://{HOST}:{port}/v1/images/edits",
+                files={"image": ("reference.png", reference, "image/png")},
+                data=dict(
+                    model=self.model,
+                    prompt="Turn the scene into a watercolor painting",
+                    seed=42,
+                    num_inference_steps=2,
+                    quality="exact",
+                    response_format="b64_json",
+                ),
+                timeout=600,
+            )
+            response.raise_for_status()
+            return base64.b64decode(response.json()["data"][0]["b64_json"])
+
+        edited = edit(cluster.api_port)
+        self.assertEqual(Image.open(BytesIO(edited)).size, (247, 239))
+        cluster.stop()
+        port = find_free_port(HOST)
+        log = _LOG_DIR / "disagg_flux3_monolithic.log"
+        cluster._logs["monolithic"] = log
+        cluster._start_proc(
+            [
+                "sglang",
+                "serve",
+                "--model-path",
+                self.model,
+                "--port",
+                str(port),
+                "--num-gpus",
+                "1",
+                "--base-gpu-id",
+                "1",
+                "--warmup-mode",
+                "off",
+            ],
+            log,
+        )
+        wait_for_server_health(
+            f"http://{HOST}:{port}", path="/v1/models", timeout=cluster.startup_timeout
+        )
+        for actual, expected in (
+            (generated, _generate_image(port, self.model, **kwargs)),
+            (edited, edit(port)),
+        ):
+            np.testing.assert_array_equal(
+                np.asarray(Image.open(BytesIO(actual))),
+                np.asarray(Image.open(BytesIO(expected))),
+            )
 
 
 # ---------------------------------------------------------------------------

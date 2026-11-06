@@ -4,12 +4,9 @@ from typing import Any, Dict, Optional
 from sglang.srt.entrypoints.openai.transcription_adapters.whisper import (
     FUSED_AUTODETECT_FLAG,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.whisper import WhisperForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.utils import load_audio
 
