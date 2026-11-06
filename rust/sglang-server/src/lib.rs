@@ -303,7 +303,7 @@ impl Server {
     /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
     /// health answers 503 at once, requests are still admitted, and the
     /// listeners close once none is left in flight (see [`Server::drain_complete`]).
-    /// `force` (Python's `SGL_FORCE_SHUTDOWN`) closes them without waiting, as
+    /// `force` (Python's `SGLANG_FORCE_SHUTDOWN`) closes them without waiting, as
     /// does a failed last health probe. Idempotent.
     #[pyo3(signature = (force = false))]
     pub fn begin_drain(&self, force: bool) {
@@ -318,7 +318,7 @@ impl Server {
     }
 
     /// The drain's progress as bits: 1 a drain has begun, 2 it was begun
-    /// forced (`SGL_FORCE_SHUTDOWN`; a failed health probe does not set it),
+    /// forced (`SGLANG_FORCE_SHUTDOWN`; a failed health probe does not set it),
     /// 4 this server's listeners have closed, whether or not the drain's end
     /// is held. Attention-DP ranks share it through the MLP-sync gather.
     pub fn drain_state(&self) -> u8 {

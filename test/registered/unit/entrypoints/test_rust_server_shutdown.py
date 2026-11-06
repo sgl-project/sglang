@@ -114,7 +114,7 @@ def test_listener_drains_on_sigterm_and_stops_schedulers_once(restore_sigterm):
 
 
 def test_force_shutdown_env_forces_the_drain(restore_sigterm, monkeypatch):
-    monkeypatch.setenv("SGL_FORCE_SHUTDOWN", "1")
+    monkeypatch.setenv("SGLANG_FORCE_SHUTDOWN", "1")
     fake = _FakeServer()
     RustServer(fake, http_port=0).install_sigterm_drain()
     os.kill(os.getpid(), signal.SIGTERM)
@@ -127,7 +127,7 @@ NO_LISTENER = DRAIN_STATE_NO_LISTENER
 
 def _dp_listener(fake, *, hold, attn_dp_size=3, force_env=False, monkeypatch=None):
     if force_env:
-        monkeypatch.setenv("SGL_FORCE_SHUTDOWN", "1")
+        monkeypatch.setenv("SGLANG_FORCE_SHUTDOWN", "1")
     server = RustServer(fake, http_port=0)
     server._broadcasts_shutdown = hold
     with get_parallel().override(attn_dp_size=attn_dp_size):

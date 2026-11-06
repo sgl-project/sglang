@@ -13,7 +13,7 @@ import requests
 import torch
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import is_cuda_alike, is_gfx95_supported
+from sglang.srt.utils.device import is_cuda_alike, is_gfx95_supported
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

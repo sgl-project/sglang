@@ -66,7 +66,7 @@ pub struct Runtime {
 /// [`Runtime::drain_state`] bit: a drain has begun.
 pub const DRAIN_DRAINING: u8 = 1;
 /// [`Runtime::drain_state`] bit: the drain was begun forced
-/// (`SGL_FORCE_SHUTDOWN`); a failed health probe does not set it.
+/// (`SGLANG_FORCE_SHUTDOWN`); a failed health probe does not set it.
 pub const DRAIN_FORCE_REQUESTED: u8 = 2;
 /// [`Runtime::drain_state`] bit: this runtime's own listeners have closed,
 /// whether or not the drain's end is held.
@@ -864,7 +864,7 @@ mod tests {
         rt.request_shutdown();
     }
 
-    /// A forced drain (`SGL_FORCE_SHUTDOWN`, or a failed last health probe)
+    /// A forced drain (`SGLANG_FORCE_SHUTDOWN`, or a failed last health probe)
     /// does not wait: the listener closes with a request still in flight, and
     /// that request is cut.
     #[test]
