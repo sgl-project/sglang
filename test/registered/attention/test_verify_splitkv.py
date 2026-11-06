@@ -4,10 +4,10 @@
 causal (target-verify) path. These tests check:
   (a) numerical parity with ``extend_attention_fwd`` on the pure-causal path
       (the operative case at topk=1), across head dims / GQA ratios / prefix
-      lengths / extend lengths / KV scales;
+      lengths / extend lengths / KV scales / attention sinks / fp8 KV buffers;
   (b) ``can_handle()`` rejects cases the kernel cannot serve bit-equivalently
-      (non-causal, sinks, sliding-window, logit-cap, ragged extend), so the
-      backend falls back to ``extend_attention_fwd``.
+      (non-causal, sliding-window, logit-cap, ragged extend, mis-shaped
+      sinks), so the backend falls back to ``extend_attention_fwd``.
 
 The topk>1 case is gated off in the backend (TritonAttnBackend enables this path
 only when ``self.topk == 1``), since the kernel ignores the tree custom_mask;
@@ -16,6 +16,7 @@ that gate is exercised end-to-end by the nightly ROCm spec accuracy test.
 GPU + Triton required. Runs on the CUDA PR lane and the AMD MI35x lane.
 """
 
+import math
 import unittest
 
 import torch
@@ -42,7 +43,15 @@ RTOL = 1e-2
 
 
 def _build_verify_inputs(
-    prefix_lens, l_ext, h_q, h_kv, head_dim, v_head_dim, dtype, device
+    prefix_lens,
+    l_ext,
+    h_q,
+    h_kv,
+    head_dim,
+    v_head_dim,
+    dtype,
+    device,
+    kv_buffer_dtype=None,
 ):
     """Build a verify-shaped problem: a constant extend length ``l_ext`` per
     sequence, with the prefix cache addressed contiguously by ``kv_indices``.
@@ -56,6 +65,9 @@ def _build_verify_inputs(
     # kv_indices is int64 in production (TritonAttnBackend allocates int64) -- match it.
     k_buffer = torch.randn(total_prefix, h_kv, head_dim, dtype=dtype, device=device)
     v_buffer = torch.randn(total_prefix, h_kv, v_head_dim, dtype=dtype, device=device)
+    if kv_buffer_dtype is not None:
+        k_buffer = k_buffer.to(kv_buffer_dtype)
+        v_buffer = v_buffer.to(kv_buffer_dtype)
     kv_indptr = torch.zeros(B + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(prefix_lens_t, 0)
     kv_indices = torch.arange(total_prefix, dtype=torch.int64, device=device)
@@ -93,10 +105,20 @@ class TestVerifySplitKV(CustomTestCase):
         k_scale=1.0,
         v_scale=1.0,
         dtype=torch.bfloat16,
+        sinks=None,
+        kv_buffer_dtype=None,
     ):
         device = "cuda"
         q, k, v, kb, vb, qo, kvp, kvi, mle = _build_verify_inputs(
-            prefix_lens, l_ext, h_q, h_kv, head_dim, v_head_dim, dtype, device
+            prefix_lens,
+            l_ext,
+            h_q,
+            h_kv,
+            head_dim,
+            v_head_dim,
+            dtype,
+            device,
+            kv_buffer_dtype=kv_buffer_dtype,
         )
         sm_scale = 1.0 / (head_dim**0.5)
 
@@ -120,6 +142,7 @@ class TestVerifySplitKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=sm_scale,
+            sinks=sinks,
         )
 
         o_split = torch.empty_like(o_ref)
@@ -140,6 +163,7 @@ class TestVerifySplitKV(CustomTestCase):
             k_scale,
             v_scale,
             sm_scale=sm_scale,
+            sinks=sinks,
         )
         self.assertTrue(ran, "verify_splitkv_fwd must handle the topk=1 causal case")
         torch.testing.assert_close(o_split, o_ref, atol=ATOL, rtol=RTOL)
@@ -171,6 +195,44 @@ class TestVerifySplitKV(CustomTestCase):
         # the fp8 KV-cache path applies); both kernels must apply them identically.
         self._run_parity([1024, 2048], k_scale=0.5, v_scale=0.25)
 
+    @staticmethod
+    def _gpt_oss_sinks(h_q, prefix_lens):
+        # Centre the sink logits on the prefix log-sum-exp (~log(prefix_len) for
+        # these random inputs) so the sink term ranges from negligible to dominant.
+        lse = math.log(max(prefix_lens))
+        sinks = lse + 2.0 * torch.randn(h_q, device="cuda")
+        return sinks.to(torch.bfloat16)
+
+    def test_numerics_with_sinks(self):
+        # gpt-oss attention: head_dim 64, GQA 8, per-head sinks; 64/8 local heads
+        # at TP1 and 32/4 at TP2; 2 draft tokens + 1 verified token per sequence.
+        for h_q, h_kv in ((64, 8), (32, 4)):
+            for prefix_lens in ([512, 1024], [7500, 8192]):
+                with self.subTest(h_q=h_q, prefix_lens=prefix_lens):
+                    self._run_parity(
+                        prefix_lens,
+                        l_ext=3,
+                        h_q=h_q,
+                        h_kv=h_kv,
+                        head_dim=64,
+                        v_head_dim=64,
+                        sinks=self._gpt_oss_sinks(h_q, prefix_lens),
+                    )
+
+    def test_numerics_with_sinks_fp8_kv(self):
+        # The same shape with an fp8 (e4m3) KV cache, as gpt-oss is usually served.
+        prefix_lens = [7500, 8192]
+        self._run_parity(
+            prefix_lens,
+            l_ext=3,
+            h_q=32,
+            h_kv=4,
+            head_dim=64,
+            v_head_dim=64,
+            sinks=self._gpt_oss_sinks(32, prefix_lens),
+            kv_buffer_dtype=torch.float8_e4m3fn,
+        )
+
     # --- fallback: can_handle() must reject what the kernel can't serve --------
     # (topk>1 is gated off in the backend, not here -- can_handle never inspects
     #  the tree custom_mask; see verify_splitkv.can_handle docstring.)
@@ -185,25 +247,16 @@ class TestVerifySplitKV(CustomTestCase):
             can_handle(q, k, v, kb, vb, qo, kvp, kvi, None, False, None, mle)
         )
 
+    def test_sinks_accepted_and_shape_checked(self):
+        # One sink per local query head is served; any other shape falls back.
+        q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
+        args = (q, k, v, kb, vb, qo, kvp, kvi, None, True, None, mle)
+        self.assertTrue(can_handle(*args, sinks=torch.zeros(16, device="cuda")))
+        self.assertFalse(can_handle(*args, sinks=torch.zeros(8, device="cuda")))
+        self.assertFalse(can_handle(*args, sinks=torch.zeros(1, 16, device="cuda")))
+
     def test_fallback_exotic_features(self):
         q, k, v, kb, vb, qo, kvp, kvi, mle = self._inputs()
-        self.assertFalse(
-            can_handle(
-                q,
-                k,
-                v,
-                kb,
-                vb,
-                qo,
-                kvp,
-                kvi,
-                None,
-                True,
-                None,
-                mle,
-                sinks=torch.zeros(16, device="cuda"),
-            )
-        )
         self.assertFalse(
             can_handle(
                 q,
