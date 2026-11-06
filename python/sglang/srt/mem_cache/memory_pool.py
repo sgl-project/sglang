@@ -66,7 +66,7 @@ from sglang.srt.configs.mamba_utils import BaseLinearStateParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import aiter_can_use_preshuffle_paged_mqa
-from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k, maybe_dcp_kernel_indices
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     UnquantizedKVCacheMethod,
 )
@@ -5348,7 +5348,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
                 size
-                if dcp_replicated
+                if dcp_replicated or dsa_shards_index_k()
                 else (size + self.page_size) * dcp_size - self.page_size
             )
         self.index_buf_size = index_buf_size
@@ -5663,12 +5663,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 tail_score.device, non_blocking=True
             )
 
+    def _index_k_rows(self, indices):
+        if not dsa_shards_index_k():
+            return indices
+        return maybe_dcp_kernel_indices(
+            indices, self._write_loc_dcp_span, get_parallel().attn_dcp_rank
+        )
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         # Retraction reuses index-cache pages; offload index/scale with KV so resume cannot read another request's entries.
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
         cpu_copy = {
             "kv": kv_cache_cpu,
-            "index_k": self.index_key_cache.cpu_copy(indices),
+            "index_k": self.index_key_cache.cpu_copy(self._index_k_rows(indices)),
         }
         compress_tail = self._get_compress_tail_cpu_copy(req_pool_index)
         if compress_tail is not None:
@@ -5689,7 +5696,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             mamba_indices=mamba_indices,
             req_pool_index=req_pool_index,
         )
-        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+        self.index_key_cache.load_cpu_copy(
+            kv_cache_cpu_dict["index_k"], self._index_k_rows(indices)
+        )
         self._load_compress_tail_cpu_copy(
             kv_cache_cpu_dict.get("tail_k"),
             kv_cache_cpu_dict.get("tail_score"),
