@@ -207,6 +207,27 @@ class TestSRTPlatform(CustomTestCase):
 class TestCudaDeviceMixin(CustomTestCase):
     """Tests for CUDA device operation defaults."""
 
+    def test_memory_capacity_keeps_nvidia_smi_query(self):
+        """NVIDIA capacity keeps the nvidia-smi accounting, not torch's."""
+        from sglang.srt.utils import device as device_utils
+
+        with (
+            patch.object(device_utils, "current_platform", CudaSRTPlatform()),
+            patch.object(device_utils, "is_cuda", return_value=True),
+            patch.object(device_utils, "is_sail", return_value=False),
+            patch.object(
+                device_utils.subprocess,
+                "run",
+                return_value=MagicMock(returncode=0, stdout="143771\n"),
+            ),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                side_effect=AssertionError("NVIDIA must retain its nvidia-smi query"),
+            ),
+        ):
+            self.assertEqual(device_utils.get_device_memory_capacity("cuda"), 143771)
+
     def test_default_get_device_returns_cuda_device(self):
         base = CudaSRTPlatform()
         self.assertEqual(base.get_device(2), torch.device("cuda", 2))
@@ -240,6 +261,32 @@ class TestCudaDeviceMixin(CustomTestCase):
 
 class TestSailDeviceMixin(CustomTestCase):
     """Tests for SAIL device operation defaults (CUDA-compatible surface)."""
+
+    def test_memory_capacity_uses_visible_devices_without_nvidia_smi(self):
+        """CUDA-compatible SAIL reports the smallest visible capacity quietly."""
+        from sglang.srt.utils import device as device_utils
+
+        with (
+            patch.object(device_utils, "current_platform", SailSRTPlatform()),
+            patch.object(device_utils, "is_cuda", return_value=True),
+            patch.object(device_utils, "is_sail", return_value=True),
+            patch.object(torch.cuda, "device_count", return_value=2),
+            patch.object(
+                torch.cuda,
+                "get_device_properties",
+                side_effect=[
+                    MagicMock(total_memory=144 << 30),
+                    MagicMock(total_memory=96 << 30),
+                ],
+            ),
+            patch.object(
+                device_utils.subprocess,
+                "run",
+                side_effect=AssertionError("SAIL must not invoke nvidia-smi"),
+            ),
+            self.assertNoLogs(device_utils.logger, level="WARNING"),
+        ):
+            self.assertEqual(device_utils.get_device_memory_capacity("cuda"), 98304)
 
     def test_sail_identity_overrides_cuda_identity(self):
         base = SailSRTPlatform()

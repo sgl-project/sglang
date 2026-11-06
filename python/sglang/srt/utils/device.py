@@ -867,6 +867,14 @@ def get_nvgpu_memory_capacity():
         )
 
 
+def get_sail_memory_capacity():
+    """Return the minimum total memory of visible SAIL devices in MiB."""
+    return min(
+        torch.cuda.get_device_properties(i).total_memory
+        for i in range(torch.cuda.device_count())
+    ) // (1 << 20)
+
+
 def get_hpu_memory_capacity():
     try:
         # Run hl-smi and capture the output
@@ -1030,7 +1038,9 @@ def get_device_memory_capacity(device: str = None):
         if mem_bytes:
             return mem_bytes / (1 << 20)  # bytes -> MiB
         return None
-    if is_cuda():
+    if is_sail():
+        gpu_mem = get_sail_memory_capacity()
+    elif is_cuda():
         gpu_mem = get_nvgpu_memory_capacity()
     elif is_hip():
         gpu_mem = get_amdgpu_memory_capacity()
