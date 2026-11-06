@@ -64,6 +64,10 @@ if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
         CHUNK_SIZE as FLA_CHUNK_SIZE,
     )
+    from sglang.kernels.ops.attention.fla.index import (
+        prepare_chunk_indices,
+        prepare_chunk_offsets,
+    )
 
 if is_cuda() or is_hip() or is_xpu():
     from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
@@ -278,6 +282,12 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
             "--enable-deterministic-inference. Use "
             "--linear-attn-prefill-backend triton."
         )
+
+
+def _uses_host_chunk_tables(extend_kernel) -> bool:
+    """Whether eager extends hand FLA host-built chunk tables (the CUDA Triton
+    kernel; the CPU and NPU chunk kernels take no tables)."""
+    return not is_cpu() and not is_npu() and isinstance(extend_kernel, TritonGDNKernel)
 
 
 class GDNKernelDispatcher:
@@ -573,6 +583,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self._host_chunk_tables = _uses_host_chunk_tables(
+            self.kernel_dispatcher.extend_kernel
+        )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -1210,6 +1223,39 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return core_attn_out
 
+    def _get_extend_chunk_tables(self, forward_batch, forward_metadata, num_tokens):
+        """FLA chunk tables of an eager Triton extend, built once per forward from
+        the host lengths; otherwise the first GDN layer reads them back from the
+        device. Below one 64-token chunk the output kernel picks a smaller chunk,
+        so those batches keep deriving their own tables."""
+        if not self._host_chunk_tables:
+            return None, None
+        if forward_metadata.extend_chunk_tables is not None:
+            return forward_metadata.extend_chunk_tables
+        tables = (None, None)
+        if (
+            forward_metadata.host_extend_lens_trusted
+            and forward_metadata.logical_num_tokens == num_tokens
+            and num_tokens >= FLA_CHUNK_SIZE
+        ):
+            query_start_loc = forward_metadata.query_start_loc
+            lens = torch.tensor(
+                forward_batch.extend_seq_lens_cpu, dtype=query_start_loc.dtype
+            )
+            cu_seqlens = torch.cat([lens.new_zeros(1), lens.cumsum(0).to(lens.dtype)])
+            pin = is_pin_memory_available(query_start_loc.device)
+            tables = tuple(
+                (t.pin_memory() if pin else t).to(
+                    query_start_loc.device, non_blocking=pin
+                )
+                for t in (
+                    prepare_chunk_indices(cu_seqlens, FLA_CHUNK_SIZE),
+                    prepare_chunk_offsets(cu_seqlens, FLA_CHUNK_SIZE),
+                )
+            )
+        forward_metadata.extend_chunk_tables = tables
+        return tables
+
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1446,6 +1492,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
                     dtype=torch.float32,
                     device=ssm_states.device,
                 )
+            chunk_indices, chunk_offsets = self._get_extend_chunk_tables(
+                forward_batch=forward_batch,
+                forward_metadata=forward_metadata,
+                num_tokens=seq_len,
+            )
             core_attn_out, last_recurrent_state, h = self.kernel_dispatcher.extend(
                 q=query,
                 k=key,
@@ -1455,6 +1506,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                chunk_indices=chunk_indices,
+                chunk_offsets=chunk_offsets,
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
