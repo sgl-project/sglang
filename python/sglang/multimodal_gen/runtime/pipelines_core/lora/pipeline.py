@@ -1231,7 +1231,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     # auto already kept this adapter unmerged; that state matches
                     and not (
                         merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,
@@ -1265,7 +1264,6 @@ class LoRAPipeline(ComposedPipelineBase):
                     if (
                         effective_merge_weights
                         and merge_mode == "auto"
-                        and len(tgt_nicknames) == 1
                         and self._auto_merge_rounds_away(
                             module_name,
                             lora_layers_dict,

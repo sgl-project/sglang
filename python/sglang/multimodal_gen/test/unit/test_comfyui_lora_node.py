@@ -95,15 +95,18 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
 
     loader = nodes.SGLDLoraLoader()
     modes, mode_options = loader.INPUT_TYPES()["optional"]["merge_mode"]
-    assert modes == ["dynamic", "merge", "auto"]
-    assert mode_options["default"] == "dynamic"
+    assert modes == ["auto", "dynamic", "merge"]
+    assert mode_options["default"] == "auto"
     (first,) = loader.load_lora(base, "style.safetensors", 1.0, nickname="style")
+    # auto: one LoRA is left to the server's auto (merge unless it rounds away)
+    assert first.model_options["sgld_lora_input"]["merge_mode"] == "auto"
     (second,) = loader.load_lora(first, "detail.safetensors", 0.8, nickname="detail")
 
     assert calls == []
     desired = second.model_options["sgld_lora_input"]
     assert desired["lora_nickname"] == ["style", "detail"]
     assert desired["strength"] == [1.0, 0.8]
+    # auto: a chain runs dynamically instead of re-merging every combination
     assert desired["merge_mode"] == "dynamic"
     assert desired["lora_path"] == [
         "/loras/style.safetensors",
@@ -113,8 +116,9 @@ def test_chained_lora_nodes_keep_every_lora() -> None:
     assert set(second.patches) == {"style", "detail"}
     with pytest.raises(ValueError, match="same merge_mode"):
         loader.load_lora(first, "detail.safetensors", merge_mode="merge")
-    (auto,) = loader.load_lora(base, "style.safetensors", merge_mode="auto")
-    assert auto.model_options["sgld_lora_input"]["merge_mode"] == "auto"
+    (merged,) = loader.load_lora(base, "style.safetensors", merge_mode="merge")
+    (merged,) = loader.load_lora(merged, "detail.safetensors", merge_mode="merge")
+    assert merged.model_options["sgld_lora_input"]["merge_mode"] == "merge"
 
 
 class _TupleLinear(torch.nn.Linear):

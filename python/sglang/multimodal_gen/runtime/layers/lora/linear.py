@@ -57,26 +57,12 @@ LoRAWeightEntry = tuple[
 ]
 
 
-def _scale_rank_wide(hidden: torch.Tensor, rank_scale: torch.Tensor) -> torch.Tensor:
-    # FP32 product and one rounding, as ``hidden * float`` does for one adapter.
-    return (hidden.float() * rank_scale).to(hidden.dtype)
-
-
 def _compute_lora_delta(
-    x: torch.Tensor,
-    lora_A: torch.Tensor,
-    lora_B: torch.Tensor,
-    rank_scale: torch.Tensor | None = None,
+    x: torch.Tensor, lora_A: torch.Tensor, lora_B: torch.Tensor
 ) -> torch.Tensor:
-    """Apply a regular or stacked LoRA projection to the last dimension.
-
-    ``rank_scale`` ([rank], FP32) scales the rank-wide intermediate; adapters
-    stacked along the rank axis each get their own scale this way.
-    """
+    """Apply a regular or stacked LoRA projection to the last dimension."""
     if lora_A.dim() == 2 and lora_B.dim() == 2:
-        if rank_scale is None:
-            return x @ lora_A.T @ lora_B.T
-        return _scale_rank_wide(x @ lora_A.T, rank_scale) @ lora_B.T
+        return x @ lora_A.T @ lora_B.T
     if lora_A.dim() == 3 and lora_B.dim() == 3:
         if lora_A.shape[0] != lora_B.shape[0]:
             raise ValueError(
@@ -84,8 +70,6 @@ def _compute_lora_delta(
                 f"{lora_A.shape[0]} and {lora_B.shape[0]}"
             )
         hidden = torch.einsum("...i,nri->...nr", x, lora_A)
-        if rank_scale is not None:
-            hidden = _scale_rank_wide(hidden, rank_scale)
         delta = torch.einsum("...nr,nor->...no", hidden, lora_B)
         return delta.flatten(start_dim=-2)
     raise ValueError(
@@ -110,7 +94,6 @@ def _add_lora_delta_in_gemm(
     lora_A: torch.Tensor,
     lora_B: torch.Tensor,
     scale: float,
-    rank_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """``out + scale * delta``, accumulated onto ``out`` by the second GEMM.
 
@@ -119,8 +102,7 @@ def _add_lora_delta_in_gemm(
     through memory for each; here it is never materialized. The scale goes on
     the rank-wide intermediate as a tensor op, not as the GEMM's ``alpha``: a
     compiled forward reads the request scale as a symbolic float, which a
-    kwarg would freeze at its first value. ``rank_scale`` ([rank], FP32), when
-    given, multiplies ``scale`` per rank column, once per group.
+    kwarg would freeze at its first value.
     """
     out_2d = out.view(-1, out.shape[-1])
     x_2d = x.reshape(-1, x.shape[-1])
@@ -128,11 +110,7 @@ def _add_lora_delta_in_gemm(
         hidden = x_2d @ lora_A.t()
     else:
         hidden = x_2d @ lora_A.reshape(-1, lora_A.shape[-1]).t()
-    if rank_scale is not None:
-        if lora_A.dim() == 3:
-            rank_scale = rank_scale.repeat(lora_A.shape[0])
-        hidden = _scale_rank_wide(hidden, rank_scale * scale)
-    elif scale != 1.0:
+    if scale != 1.0:
         hidden = hidden * scale
     if lora_A.dim() == 2:
         groups = [(out_2d, hidden, lora_B)]
@@ -194,10 +172,6 @@ class BaseLayerWithLoRA(nn.Module):
         self.lora_output_offset = None
         self.has_lora_output_offset = False
         self._fused_lora_cache: tuple[tuple, torch.Tensor, torch.Tensor] | None = None
-        # (entries list, entry count, A, B, rank_scale): several dynamic adapters
-        # stacked along the rank axis; see _refresh_dynamic_stack.
-        self._dynamic_stack: tuple | None = None
-        self._fused_stack_cache: tuple | None = None
 
     @property
     def weight(self):
@@ -279,10 +253,6 @@ class BaseLayerWithLoRA(nn.Module):
                 self.lora_alpha,
                 self.strength,
             )
-        stack = self._current_dynamic_stack()
-        if stack is not None:
-            return self._add_stacked_lora_delta(out, x, runtime_lora_scale, stack)
-        # Adapters that cannot be stacked (mixed plain/grouped layouts) run one by one.
         for lora_A, lora_B, _, strength, rank, alpha, _ in self.lora_weights_list:
             out = self._add_single_lora_delta(
                 out,
@@ -318,95 +288,6 @@ class BaseLayerWithLoRA(nn.Module):
 
         delta = _compute_lora_delta(x_lora, lora_A, lora_B)
         delta = self._scale_lora_delta(delta, runtime_lora_scale, rank, alpha, strength)
-        return out + delta.to(dtype=out.dtype)
-
-    def _refresh_dynamic_stack(self) -> None:
-        """Stack every dynamic adapter along the rank axis.
-
-        ``sum_i c_i * B_i A_i x`` equals ``B (s * (A x))`` for ``A = [A_1; A_2; ...]``,
-        ``B = [B_1 | B_2 | ...]`` and a per-rank FP32 scale ``s`` holding
-        ``c_i = strength_i * alpha_i / rank_i`` over adapter i's rank columns. So
-        n adapters cost one shrink and one expand GEMM instead of 2n, the factors
-        keep their stored values, and a strength change only rebuilds ``s``.
-        The stack is sliced for this TP rank at forward time, like one adapter's
-        factors: the rank axis is never a sliced axis.
-        """
-        self._dynamic_stack = None
-        self._fused_stack_cache = None
-        entries = self.lora_weights_list
-        if self.merged or len(entries) < 2:
-            return
-        As, Bs, scales = [], [], []
-        for lora_A, lora_B, _, strength, rank, alpha, _ in entries:
-            if isinstance(lora_B, DTensor):
-                lora_A, lora_B = lora_A.to_local(), lora_B.to_local()
-            A, B = lora_A.detach(), lora_B.detach()
-            if not isinstance(B, torch.Tensor) or A.dim() != B.dim():
-                return
-            scale = strength
-            if alpha != rank:
-                scale *= alpha / rank  # type: ignore
-            As.append(A)
-            Bs.append(B)
-            scales.append((A.shape[-2], scale))
-        dims = {A.dim() for A in As}
-        groups = {A.shape[0] for A in As} if dims == {3} else {None}
-        if len(dims) != 1 or len(groups) != 1:
-            return
-        device = As[0].device
-        dtype = As[0].dtype
-        for t in As[1:] + Bs:
-            dtype = torch.promote_types(dtype, t.dtype)
-        # A is [..., rank, in] and B is [..., out, rank].
-        A = torch.cat([a.to(device=device, dtype=dtype) for a in As], dim=-2)
-        B = torch.cat([b.to(device=device, dtype=dtype) for b in Bs], dim=-1)
-        rank_scale = torch.cat(
-            [torch.full((r,), s, dtype=torch.float32, device=device) for r, s in scales]
-        )
-        self._dynamic_stack = (entries, len(entries), A, B, rank_scale)
-
-    def _current_dynamic_stack(self) -> tuple | None:
-        stack = self._dynamic_stack
-        # Valid only for the list it was built from; anything else runs one by one.
-        if (
-            stack is None
-            or stack[0] is not self.lora_weights_list
-            or stack[1] != len(self.lora_weights_list)
-        ):
-            return None
-        return stack
-
-    def set_dynamic_strength(self, strength: float) -> None:
-        """Give every dynamic adapter on this layer the same strength."""
-        self.strength = strength
-        self.lora_weights_list = [
-            (*entry[:3], strength, *entry[4:]) for entry in self.lora_weights_list
-        ]
-        self._refresh_dynamic_stack()
-
-    def _add_stacked_lora_delta(
-        self,
-        out: torch.Tensor,
-        x: torch.Tensor,
-        runtime_lora_scale: float,
-        stack: tuple,
-    ) -> torch.Tensor:
-        _, _, lora_A, lora_B, rank_scale = stack
-        lora_A = self.slice_lora_a_weights(
-            lora_A.to(device=x.device, non_blocking=True)
-        )
-        lora_B = self.slice_lora_b_weights(
-            lora_B.to(device=x.device, non_blocking=True)
-        )
-        rank_scale = rank_scale.to(device=x.device, non_blocking=True)
-        x_lora = x.to(dtype=lora_A.dtype)
-        if _can_add_lora_delta_in_gemm(out, lora_A, lora_B):
-            return _add_lora_delta_in_gemm(
-                out, x_lora, lora_A, lora_B, runtime_lora_scale, rank_scale
-            )
-        delta = _compute_lora_delta(
-            x_lora, lora_A, lora_B, rank_scale * runtime_lora_scale
-        )
         return out + delta.to(dtype=out.dtype)
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
@@ -459,29 +340,6 @@ class BaseLayerWithLoRA(nn.Module):
         self._fused_lora_cache = (key, A, B)
         return A, B
 
-    def _fused_stack_factors(
-        self, stack: tuple, device: torch.device, swiglu_rows: bool
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Stacked factors in the 2D layout ``_fused_lora_factors`` produces."""
-        key = (id(stack), swiglu_rows, device)
-        cached = self._fused_stack_cache
-        if cached is not None and cached[0] == key:
-            return cached[1]
-        _, _, A, B, rank_scale = stack
-        A = self.slice_lora_a_weights(A.to(device))
-        B = self.slice_lora_b_weights(B.to(device))
-        rank_scale = rank_scale.to(device)
-        if A.dim() == 3:
-            # Same block-diagonal expand as one adapter, one rank block per group.
-            rank_scale = rank_scale.repeat(A.shape[0])
-            A = A.reshape(-1, A.shape[-1])
-            B = torch.block_diag(*B.unbind(0))
-        if swiglu_rows:
-            B = self._interleave_swiglu_rows(B)
-        factors = (A.contiguous(), B.contiguous(), rank_scale)
-        self._fused_stack_cache = (key, factors)
-        return factors
-
     def fused_lora_delta(
         self, x: torch.Tensor, *, swiglu_rows: bool = False
     ) -> torch.Tensor | None:
@@ -499,30 +357,14 @@ class BaseLayerWithLoRA(nn.Module):
         x_2d = x.reshape(-1, x.shape[-1])
         delta = None
         if not self.merged:
-            stack = (
-                self._current_dynamic_stack()
-                if len(self.lora_weights_list) > 1
-                else None
-            )
-            if stack is not None:
-                A, B, rank_scale = self._fused_stack_factors(
-                    stack, device=x.device, swiglu_rows=swiglu_rows
-                )
-                hidden = x_2d.to(dtype=A.dtype) @ A.T
-                delta = _scale_rank_wide(hidden, rank_scale * runtime_lora_scale) @ B.T
-            elif len(self.lora_weights_list) > 1:
-                # Unstackable adapters: run them one by one into a local-width buffer.
-                _, B = self._fused_lora_factors(
-                    device=x.device, swiglu_rows=swiglu_rows
-                )
+            A, B = self._fused_lora_factors(device=x.device, swiglu_rows=swiglu_rows)
+            if len(self.lora_weights_list) > 1:
+                # Reuse the multi-adapter math; the factors above supply local width.
                 delta = B.new_zeros((x_2d.shape[0], B.shape[0]))
                 delta = self._add_lora_delta(delta, x_2d, runtime_lora_scale)
                 if swiglu_rows:
                     delta = self._interleave_swiglu_rows(delta.T).T
             else:
-                A, B = self._fused_lora_factors(
-                    device=x.device, swiglu_rows=swiglu_rows
-                )
                 scale = self.strength * runtime_lora_scale
                 if self.lora_alpha != self.lora_rank:
                     scale *= self.lora_alpha / self.lora_rank  # type: ignore
@@ -651,12 +493,16 @@ class BaseLayerWithLoRA(nn.Module):
             self.merge_lora_weights()
         elif self.merged:
             self.unmerge_lora_weights()
-        self._refresh_dynamic_stack()
+
+    def set_dynamic_strength(self, strength: float) -> None:
+        """Give every dynamic adapter on this layer the same strength."""
+        self.strength = strength
+        self.lora_weights_list = [
+            (*entry[:3], strength, *entry[4:]) for entry in self.lora_weights_list
+        ]
 
     def clear_lora_weights(self) -> None:
         self.lora_weights_list.clear()
-        self._dynamic_stack = None
-        self._fused_stack_cache = None
         # Also clear backward compatibility attributes
         self.lora_A = None
         self.lora_B = None

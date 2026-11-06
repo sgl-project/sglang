@@ -89,7 +89,17 @@ def _comfy_job_hooks() -> dict:
     }
 
 
-_LORA_MERGE_MODES = ("dynamic", "merge", "auto")
+_LORA_MERGE_MODES = ("auto", "dynamic", "merge")
+
+
+def _effective_merge_mode(merge_mode: str, adapter_count: int) -> str:
+    """auto: one LoRA merges unless the server sees that merging would round its
+    update away or the weights cannot be merged; a chain runs dynamically,
+    since re-merging a combination whenever it changes costs more than the
+    per-step adapter work it saves."""
+    if merge_mode == "auto" and adapter_count > 1:
+        return "dynamic"
+    return merge_mode
 
 
 class SGLDLoraLoader:
@@ -113,8 +123,8 @@ class SGLDLoraLoader:
                 "merge_mode": (
                     list(_LORA_MERGE_MODES),
                     {
-                        "default": "dynamic",
-                        "tooltip": "Dynamic keeps base weights unchanged; merge folds LoRA into weights; auto merges unless BF16 rounding would drop most of an adapter's update. Use the same mode for all LoRAs chained on one MODEL.",
+                        "default": "auto",
+                        "tooltip": "auto: one LoRA is merged (unless merging would round its update away), chained LoRAs run dynamically. dynamic keeps base weights unchanged; merge folds LoRAs into the weights. Use the same mode for all LoRAs chained on one MODEL.",
                     },
                 ),
             },
@@ -132,7 +142,7 @@ class SGLDLoraLoader:
         strength_model=1.0,
         nickname="",
         target="all",
-        merge_mode="dynamic",
+        merge_mode="auto",
     ):
         """Load LoRA adapter using SGLang Diffusion API."""
         if merge_mode not in _LORA_MERGE_MODES:
@@ -150,10 +160,9 @@ class SGLDLoraLoader:
             "lora_path": [],
             "strength": [],
             "target": [],
-            "merge_mode": merge_mode,
         }
         for nickname, lora_info in bi.patches.items():
-            mode = lora_info[3] if len(lora_info) > 3 else "dynamic"
+            mode = lora_info[3] if len(lora_info) > 3 else "auto"
             if mode != merge_mode:
                 raise ValueError(
                     "Chained SGLDLoraLoader nodes must use the same merge_mode"
@@ -163,6 +172,9 @@ class SGLDLoraLoader:
             lora_input["strength"].append(lora_info[1])
             lora_input["target"].append(lora_info[2])
 
+        lora_input["merge_mode"] = _effective_merge_mode(
+            merge_mode, len(lora_input["lora_nickname"])
+        )
         targets = set(lora_input["target"])
         if "all" in targets and len(targets) > 1:
             # set_lora groups adapters per target string; "all" overlapping a
