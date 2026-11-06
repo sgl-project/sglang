@@ -137,5 +137,67 @@ def test_dynamic_graph(m, stride):
         check(x, w, got)
 
 
+def _inputs(m, stride, kind):
+    x = torch.randn((m, stride), device="cuda", dtype=torch.float32)
+    if kind == "row_scaled":
+        x *= torch.exp(3 * torch.randn((m, 1), device="cuda"))
+    elif kind == "tiny":
+        x *= 1e-30
+    elif kind == "huge":
+        x *= 3e38
+    elif kind == "ties":
+        x = torch.round(x * 8) / 8
+    elif kind == "signed_zeros":
+        x[: m // 2] = 0
+        x[m // 2 :, ::3] = -0.0
+    return x.to(torch.bfloat16)[:, :1280]
+
+
+KINDS = ["normal", "row_scaled", "tiny", "huge", "ties", "signed_zeros"]
+
+
+def _reference_8warp(x, w):
+    """The kernel as it ran before: tl.sum order, 8 warps."""
+    from sglang.kernels.ops.layernorm.rmsnorm_mxfp8 import _rmsnorm_mxfp8_kernel
+
+    m, k = x.shape
+    y = torch.empty((m, k), dtype=x.dtype, device=x.device)
+    q = torch.empty((m, k), dtype=torch.float8_e4m3fn, device=x.device)
+    s = torch.full(
+        ((k // 32) * ((m + 127) // 128) * 128,),
+        0x55,
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    _rmsnorm_mxfp8_kernel[(m + (k // 32) * 128 // 512,)](
+        x,
+        w,
+        y,
+        q,
+        s,
+        SX=x.stride(0),
+        M=m,
+        K=k,
+        EPS=1e-6,
+        BLOCK=2048,
+        GROUPS=k // 32,
+        ORDER_8WARP=False,
+        num_warps=8,
+        enable_fp_fusion=False,
+    )
+    return y, q, s
+
+
+@pytest.mark.parametrize("m", [1, 37, 129, 1023, 1024, 4095, 4096, 16385])
+@pytest.mark.parametrize("stride", [1280, 1792])
+@pytest.mark.parametrize("kind", KINDS)
+def test_k1280_matches_8warp_tl_sum(m, stride, kind):
+    torch.manual_seed(m)
+    x = _inputs(m, stride, kind)
+    w = (torch.randn(1280, device="cuda") * 0.1 + 1).to(torch.bfloat16)
+    for a, b in zip(rmsnorm_mxfp8(x, w, 1e-6), _reference_8warp(x, w)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
