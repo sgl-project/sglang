@@ -2122,7 +2122,8 @@ class TestNonIntrusiveDumper(_NonIntrusiveTestBase):
 
 
 def _make_forward_batch():
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
     return ForwardBatch(
         forward_mode=ForwardMode.DECODE,

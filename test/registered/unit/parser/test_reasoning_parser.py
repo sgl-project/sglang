@@ -24,7 +24,7 @@ from sglang.srt.parser.reasoning_parser_names import REASONING_PARSER_NAMES
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class TestBaseReasoningFormatDetector(CustomTestCase):
@@ -1715,6 +1715,33 @@ class TestMuseSparkReasoningParser(CustomTestCase):
             "<|start|>assistant to=user<|message|>No tool needed.<|eot|>",
             (f"Consider {quoted}.", "No tool needed."),
         )
+
+
+_ERNIE5_TOOL_CALL = (
+    "<ernie:tool_call>\n"
+    '<invoke name="get_weather">\n'
+    '<parameter name="city">Beijing</parameter>\n'
+    "</invoke>\n"
+    "</ernie:tool_call>"
+)
+
+
+class TestErnie5_5ReasoningParser(CustomTestCase):
+    def test_splits_the_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>weighing it up</ernie:think>the answer"
+        )
+        self.assertEqual(reasoning.strip(), "weighing it up")
+        self.assertEqual(content.strip(), "the answer")
+
+    def test_a_tool_call_closes_an_open_think_block(self):
+        parser = ReasoningParser("ernie55")
+        reasoning, content = parser.parse_non_stream(
+            "<ernie:think>I need a tool" + _ERNIE5_TOOL_CALL
+        )
+        self.assertIn("I need a tool", reasoning)
+        self.assertIn("<ernie:tool_call>", content)
 
 
 class TestReasoningParserNames(CustomTestCase):
