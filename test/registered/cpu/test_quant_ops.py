@@ -169,6 +169,7 @@ class TestCPUFp8QuantOps(CustomTestCase):
             weight=torch.nn.Parameter(weight.clone(), requires_grad=False),
             weight_scale=torch.nn.Parameter(weight_scale.clone(), requires_grad=False),
             bias=torch.nn.Parameter(bias.clone(), requires_grad=False),
+            logical_widths=[32],
         )
         scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
         scheme.process_weights_after_loading(layer)
@@ -187,16 +188,24 @@ class TestCPUFp8QuantOps(CustomTestCase):
     @unittest.skipUnless(
         cpu_has_amx_support(), "CPU W8A16 FP8 requires the Intel AMX backend."
     )
-    def test_compressed_tensors_w8a16_fp8_cpu_rejects_multi_scale(self):
-        weight = (torch.randn(32, 64) / 4).to(torch.float8_e4m3fn)
+    def test_compressed_tensors_w8a16_fp8_cpu_fused_shards(self):
+        """Fused QKV/MLP shards with different scales are requantized to the max scale."""
+        x = torch.randn(5, 64, dtype=torch.bfloat16)
+        weight = torch.randn(32, 64).to(torch.float8_e4m3fn)
+        weight_scale = torch.tensor([0.1, 0.2], dtype=torch.float32)
         layer = SimpleNamespace(
-            weight=weight,
-            weight_scale=torch.tensor([0.02, 0.03], dtype=torch.float32),
+            weight=torch.nn.Parameter(weight.clone(), requires_grad=False),
+            weight_scale=torch.nn.Parameter(weight_scale.clone(), requires_grad=False),
+            logical_widths=[16, 16],
         )
         scheme = CompressedTensorsW8A16Fp8(QuantizationStrategy.TENSOR, False)
+        scheme.process_weights_after_loading(layer)
 
-        with self.assertRaisesRegex(NotImplementedError, "multiple weight scales"):
-            scheme.process_weights_after_loading(layer)
+        torch.testing.assert_close(layer.weight_scale, weight_scale.max())
+        out = scheme.apply_weights(layer, x, None)
+        dq_weight = weight.float() * weight_scale.repeat_interleave(16)[:, None]
+        ref = x.float() @ dq_weight.t()
+        torch.testing.assert_close(out.float(), ref, atol=0.1, rtol=0.05)
 
     def test_compressed_tensors_w8a8_fp8_cpu_unsupported(self):
         x = torch.randn(3, 64, dtype=torch.bfloat16)
