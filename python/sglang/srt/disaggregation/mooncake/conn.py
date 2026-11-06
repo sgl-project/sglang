@@ -1373,36 +1373,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 "must enable it and use the same page size and model spec."
             )
 
-    def _validate_mla_kv_item_len(
-        self,
-        dst_kv_item_len: Optional[int],
-        dst_device_kv_indices: Optional[npt.NDArray[np.int32]],
-    ) -> None:
-        """Reject an MLA peer whose per-page KV bytes differ from ours.
-
-        MLA KV is replicated across attention TP, so both sides hold the same
-        rows; a different item length means a different row layout (e.g. DSA
-        flashmla_kv 656 B vs trtllm 576 B per token), which a raw copy would
-        silently corrupt. HiSparse destinations (host-backed) and per-pool
-        registrations (item length 0) are not checked.
-        """
-        if not (self.is_mla_backend or self.is_hybrid_mla_backend):
-            return
-        src_item_lens = self.kv_args.kv_item_lens
-        if (
-            not dst_kv_item_len
-            or not src_item_lens
-            or dst_device_kv_indices is not None
-        ):
-            return
-        if src_item_lens[0] != dst_kv_item_len:
-            raise RuntimeError(
-                "PD MLA KV layout mismatch: prefill KV item_len="
-                f"{src_item_lens[0]}, decode item_len={dst_kv_item_len}. Prefill "
-                "and decode must use the same page size, KV cache dtype and DSA "
-                "backends."
-            )
-
     def _await_transfer_futures(self, futures) -> int:
         """Await a chunk's per-layer RDMA writes; return the first non-zero status.
         cancel() is a no-op for a running future, so with deferred release on we
@@ -1437,7 +1407,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
-        self._validate_mla_kv_item_len(dst_kv_item_len, dst_device_kv_indices)
         dst_device_kv_ptrs = None
         if dst_device_kv_indices is not None:
             compression_ratios = self.kv_args.mla_compression_ratios
