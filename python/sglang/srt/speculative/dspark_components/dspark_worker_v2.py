@@ -95,6 +95,7 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
+    is_hip,
     is_npu,
 )
 from sglang.srt.utils.device import async_h2d
@@ -363,7 +364,7 @@ class DSparkWorkerV2(BaseSpecWorker):
         self._greedy_draft = envs.SGLANG_DSPARK_USE_GREEDY_DRAFT.get()
         markov_head = self.draft_model.markov_head
         self._sharded_accept = (
-            envs.SGLANG_DSPARK_SHARDED_ACCEPT.get()
+            is_hip()
             and not self._greedy_draft
             and markov_head is not None
             and markov_head.vocab_shard is not None

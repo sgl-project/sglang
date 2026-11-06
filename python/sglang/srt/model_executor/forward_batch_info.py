@@ -64,7 +64,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -2264,10 +2263,7 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     return (
-        _is_hip
-        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
-        and get_parallel().attn_dp_size > 1
-        and get_moe_a2a_backend().is_none()
+        _is_hip and get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
     )
 
 

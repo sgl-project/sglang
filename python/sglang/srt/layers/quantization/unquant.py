@@ -375,11 +375,6 @@ def precompile_sm107_splitk_tactics() -> bool:
     )
 
 
-def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
-    """Return whether the optional Split-K path should be initialized."""
-    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
-
-
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
@@ -451,7 +446,7 @@ def initialize_bf16_gemm_config() -> None:
     _enable_bf16_splitk_gemm = False
     _use_sm107_splitk_tactics = False
     _active_warp_splitk_tactics = _BF16_WARP_SPLITK_TUNED_TACTICS
-    if should_enable_bf16_splitk_gemm(backend):
+    if backend.is_cutedsl():
         from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
             default_tactic,
             prefer_direct_bf16_gemm_sm100,
@@ -655,7 +650,7 @@ def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:
     slice, not the full checkpoint K. Non-contiguous weights, including ones
     already padded, come back unchanged, which keeps a reload from padding twice.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
@@ -676,7 +671,7 @@ def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:
     Also runs after every weight update; already-padded weights are skipped, so
     storage pointers stay stable for CUDA graphs.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return
     for head in _unquantized_lm_heads(model):
         head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)

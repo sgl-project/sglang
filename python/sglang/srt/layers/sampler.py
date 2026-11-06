@@ -82,7 +82,7 @@ if is_npu():
 
 logger = logging.getLogger(__name__)
 
-SYNC_TOKEN_IDS_ACROSS_TP = get_bool_env_var("SYNC_TOKEN_IDS_ACROSS_TP")
+SYNC_TOKEN_IDS_ACROSS_TP = envs.SGLANG_SYNC_TOKEN_IDS_ACROSS_TP.get()
 SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 
