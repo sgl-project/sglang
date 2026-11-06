@@ -26,9 +26,9 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_split_rows,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
-    dcp_all_visible,
     dcp_gather_request_rows,
     dcp_global_topk,
+    dcp_select_all_slots,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -1930,7 +1930,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # When length <= 2048, naive_topk_cuda directly generates [0,1,...,length-1,-1,...]
         seq_lens_expanded = metadata.get_seqlens_expanded()
         if dsa_shards_index_k() and forward_batch.forward_mode.is_decode_or_idle():
-            raw_topk_result = dcp_all_visible(
+            raw_topk_result = dcp_select_all_slots(
                 seq_lens_expanded,
                 metadata.get_page_table_64(),
                 self.index_topk,

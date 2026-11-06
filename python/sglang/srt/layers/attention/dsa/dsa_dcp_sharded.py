@@ -444,7 +444,7 @@ def dcp_global_topk(
     return out
 
 
-def dcp_all_visible(
+def dcp_select_all_slots(
     global_lens: torch.Tensor,
     page_table: torch.Tensor,
     topk: int,
