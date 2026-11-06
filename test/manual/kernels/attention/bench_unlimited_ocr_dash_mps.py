@@ -2,7 +2,9 @@
 
 Times one decode layer's route / sparse attend / page-summary refresh and the
 MoE expert compute at checkpoint geometry, once through the Metal kernels and
-once through the torch fallback in ``unlimited_ocr_dash/mps.py``.
+once through the torch fallback in ``unlimited_ocr_dash/mps.py``. Each loop
+repeats the same inputs, so caches stay warm: the numbers compare the two
+paths with each other, not with a serving step.
 
 Run on an Apple Silicon Mac:
     python test/manual/kernels/attention/bench_unlimited_ocr_dash_mps.py
