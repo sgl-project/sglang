@@ -381,6 +381,9 @@ class Envs:
     # value instead of asking the OS for a random port.  Useful to keep all
     # SGLang ports in a predictable range behind a firewall.
     SGLANG_PORT = EnvInt(None)
+    # Optional loopback XPUB port window per global distributed rank.
+    # Positive values require SGLANG_PORT; 0 retains the shared 8-port window.
+    SGLANG_SHM_PORTS_PER_RANK = EnvInt(0)
     SGLANG_BACKUP_PORT_BASE = EnvInt(10000)
 
     # ===================================================================
