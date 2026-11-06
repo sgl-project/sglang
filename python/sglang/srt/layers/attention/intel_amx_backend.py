@@ -9,7 +9,7 @@ from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -39,7 +39,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             IdSpaceKind.SLIDING_WINDOW
         )
         self.swa_out_cache_loc = None
-        self._swa_req_to_token = None
+        self._cpu_graph_swa_out_cache_loc = None
 
         self.num_head = (
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
@@ -149,12 +149,23 @@ class IntelAMXAttnBackend(AttentionBackend):
 
     def _init_swa_forward_metadata(self, out_cache_loc: torch.Tensor | None) -> None:
         if self.use_sliding_window_kv_pool and out_cache_loc is not None:
-            self.swa_out_cache_loc = self.runner_ids.ids_in(
+            translated = self.runner_ids.ids_in(
                 IdSpaceKind.SLIDING_WINDOW, out_cache_loc
             )
+            buffer = self._cpu_graph_swa_out_cache_loc
+            if buffer is None:
+                # Eager execution does not need a pointer-stable view.
+                self.swa_out_cache_loc = translated
+                return
+            if translated.numel() > buffer.numel():
+                raise RuntimeError(
+                    "SWA CPU graph write-location buffer is too small: "
+                    f"required={translated.numel()}, capacity={buffer.numel()}"
+                )
+            buffer[: translated.numel()].copy_(translated)
+            self.swa_out_cache_loc = buffer[: translated.numel()]
         else:
             self.swa_out_cache_loc = None
-        self._swa_req_to_token = None
 
     def _is_swa_layer(self, layer_id: int) -> bool:
         return (
@@ -163,36 +174,14 @@ class IntelAMXAttnBackend(AttentionBackend):
             == IdSpaceKind.SLIDING_WINDOW
         )
 
-    def _swa_kv_indices(
-        self,
-        req_to_token: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-    ):
-        """This batch's rows of ``req_to_token``, in the SWA pool's index space.
-
-        ``req_to_token`` holds full-pool indices, but a sliding-window layer's
-        K/V buffer only has ``swa_size`` rows. Feeding it full indices reads out
-        of bounds as soon as the allocator hands one out past that -- and since
-        the allocator walks its free list in order, that first happens long
-        after startup, once cumulative allocations exceed ``swa_size``.
-
-        Returns the compacted table plus the ``req_pool_indices`` that address
-        it; the kernels take their row stride from ``req_to_token.size(1)``.
-        """
-        cached = self._swa_req_to_token
-        if cached is not None and cached[0] is req_to_token:
-            return cached[1], cached[2]
-
-        rows = req_to_token[req_pool_indices, : int(seq_lens.max())]
-        translated = self.runner_ids.ids_in(IdSpaceKind.SLIDING_WINDOW, rows).to(
-            req_to_token.dtype
-        )
-        indices = torch.arange(
-            translated.shape[0], dtype=torch.int64, device=translated.device
-        )
-        self._swa_req_to_token = (req_to_token, translated, indices)
-        return translated, indices
+    @property
+    def full_to_swa_index_mapping(self) -> torch.Tensor | None:
+        mapping = getattr(self.token_to_kv_pool, "full_to_swa_index_mapping", None)
+        if mapping is None:
+            space = self.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
+            if space is not None and space.table is not None:
+                mapping = space.table
+        return mapping
 
     def get_cpu_graph_seq_len_fill_value(self):
         return 1
@@ -222,10 +211,45 @@ class IntelAMXAttnBackend(AttentionBackend):
         max_extend_len = -1
         self.forward_metadata = (attn_logits, max_extend_len)
         self.extend_metadata = None
+        self._ensure_cpu_graph_swa_out_cache_loc(num_tokens)
         self._init_swa_forward_metadata(out_cache_loc)
 
     def init_cpu_graph_state(self, max_bs: int, max_num_tokens: int):
-        pass
+        if not self.use_sliding_window_kv_pool:
+            return
+        self._ensure_cpu_graph_swa_out_cache_loc(max_num_tokens)
+
+    def _ensure_cpu_graph_swa_out_cache_loc(self, required_num_tokens: int) -> None:
+        if not self.use_sliding_window_kv_pool:
+            return
+        if self._cpu_graph_swa_out_cache_loc is not None:
+            if required_num_tokens > self._cpu_graph_swa_out_cache_loc.numel():
+                raise RuntimeError(
+                    "SWA CPU graph write-location buffer is too small: "
+                    f"required={required_num_tokens}, "
+                    f"capacity={self._cpu_graph_swa_out_cache_loc.numel()}"
+                )
+            return
+        # Decode and prefill graphs share this buffer. Keep one allocation
+        # alive before either graph is captured so replay never changes the
+        # pointer used by the compiled attention call.
+        max_prefill_tokens = int(get_schedule().max_prefill_tokens or 0)
+        prefill_buckets = get_exec().graph.cuda_graph_config.prefill.bs or []
+        decode_buckets = get_exec().graph.cuda_graph_config.decode.bs or []
+        max_prefill_bucket = max(prefill_buckets, default=0)
+        max_decode_bucket = max(decode_buckets, default=0)
+        max_reqs = int(getattr(self.req_to_token_pool, "size", 0))
+        capacity = max(
+            required_num_tokens,
+            self.max_context_len,
+            max_prefill_tokens,
+            max_prefill_bucket,
+            max_decode_bucket,
+            max_reqs,
+        )
+        self._cpu_graph_swa_out_cache_loc = torch.empty(
+            capacity, dtype=torch.int64, device=self.device
+        )
 
     def forward_extend(
         self,
@@ -284,9 +308,12 @@ class IntelAMXAttnBackend(AttentionBackend):
         req_to_token = self.req_to_token_pool.req_to_token
         req_pool_indices = forward_batch.req_pool_indices
         if self._is_swa_layer(layer.layer_id) and not layer.is_cross_attention:
-            req_to_token, req_pool_indices = self._swa_kv_indices(
-                req_to_token, req_pool_indices, seq_lens
+            full_to_swa_mapping = self.full_to_swa_index_mapping
+            assert full_to_swa_mapping is not None, (
+                f"Layer {layer.layer_id} is an SWA layer, but full_to_swa_index_mapping is None."
             )
+        else:
+            full_to_swa_mapping = None
         self.extend_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             k,
@@ -310,6 +337,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             sinks,
             tree_mask,
             is_causal,
+            full_to_swa_mapping,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
@@ -377,9 +405,12 @@ class IntelAMXAttnBackend(AttentionBackend):
             # When k/v survive the block above the kernel writes them itself, so
             # the write location needs the same translation set_kv_buffer got.
             cache_loc = self.swa_out_cache_loc
-            req_to_token, req_pool_indices = self._swa_kv_indices(
-                req_to_token, req_pool_indices, seq_lens
+            full_to_swa_mapping = self.full_to_swa_index_mapping
+            assert full_to_swa_mapping is not None, (
+                f"Layer {layer.layer_id} is an SWA layer, but full_to_swa_index_mapping is None."
             )
+        else:
+            full_to_swa_mapping = None
         self.decode_attention_fwd(
             q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
             key_buffer,
@@ -400,6 +431,7 @@ class IntelAMXAttnBackend(AttentionBackend):
             layer.sliding_window_size + 1,
             forward_batch.encoder_lens,
             sinks,
+            full_to_swa_mapping,
         )
         return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 

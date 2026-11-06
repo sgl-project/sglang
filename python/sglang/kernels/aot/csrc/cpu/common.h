@@ -433,4 +433,25 @@ inline T* conditional_data_ptr(const std::optional<at::Tensor>& opt) {
   return opt.has_value() ? opt.value().data_ptr<T>() : nullptr;
 }
 
+template <typename index_t>
+inline const index_t* get_swa_indices(
+    const index_t* __restrict__ raw_ind,
+    index_t* __restrict__ swa_buf,
+    int64_t n_size,
+    const int64_t* __restrict__ full_to_swa_mapping,
+    int64_t max_mapping_size,
+    int64_t max_total_num_tokens) {
+  if (full_to_swa_mapping == nullptr) {
+    return raw_ind;
+  }
+#pragma omp simd
+  for (int64_t j = 0; j < n_size; ++j) {
+    auto t_id = raw_ind[j];
+    index_t mapped =
+        (t_id >= 0 && t_id < max_mapping_size) ? static_cast<index_t>(full_to_swa_mapping[t_id]) : index_t(0);
+    swa_buf[j] = (mapped >= 0 && mapped < max_total_num_tokens) ? mapped : index_t(0);
+  }
+  return swa_buf;
+}
+
 }  // anonymous namespace
