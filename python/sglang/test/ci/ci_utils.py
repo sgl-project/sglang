@@ -162,10 +162,11 @@ def is_retriable_failure(output: str) -> tuple[bool, str]:
 
 def _relay_output(src, dst) -> None:
     """Copy a child's raw output to `dst` as it arrives."""
-    for chunk in iter(lambda: src.read1(1 << 16), b""):
-        dst.flush()
-        dst.buffer.write(chunk)
-        dst.buffer.flush()
+    with src:
+        for chunk in iter(lambda: src.read1(1 << 16), b""):
+            dst.flush()
+            dst.buffer.write(chunk)
+            dst.buffer.flush()
 
 
 def run_with_timeout(
