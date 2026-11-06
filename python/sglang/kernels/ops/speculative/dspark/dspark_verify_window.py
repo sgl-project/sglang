@@ -236,84 +236,6 @@ def build_ragged_verify_window_triton(
 _SEARCH_NBITS = 11
 
 
-class CompactRowIndex:
-    @classmethod
-    def execute(
-        cls, *args, **kwargs
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        verify_lens: torch.Tensor,
-        padded_total: int,
-        device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        return compact_row_index_triton(
-            verify_lens=verify_lens,
-            padded_total=padded_total,
-            device=device,
-        )
-
-
-class CompactVerifyIds:
-    @classmethod
-    def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
-            return cls.triton(*args, **kwargs)
-        return cls.torch(*args, **kwargs)
-
-    @classmethod
-    def torch(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
-
-    @classmethod
-    def triton(
-        cls,
-        *,
-        draft_block_ids: torch.Tensor,
-        draft_tokens: torch.Tensor,
-        layout: RaggedVerifyLayout,
-        device: str,
-    ) -> torch.Tensor:
-        return compact_verify_ids_triton(
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            layout=layout,
-            device=device,
-        )
-
-
 def compact_verify_ids(
     *,
     draft_block_ids: torch.Tensor,
@@ -753,6 +675,8 @@ def _commit_inject_layout_kernel(
     prefix = tl.load(prefix_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     pos_off = tl.load(block_pos_offsets_ptr + c, mask=mask, other=0).to(tl.int64)
     rp = tl.load(req_pool_ptr + r, mask=mask, other=0).to(tl.int64)
+    # Padded/uncommitted slots need no cache lookup. Their request-table
+    # entries may be stale or uninitialized, so mask before dereferencing them.
     commit_len = tl.load(commit_lens_ptr + r, mask=mask, other=0).to(tl.int64)
     committed = mask & (c.to(tl.int64) < commit_len)
     full_loc = tl.load(
@@ -803,7 +727,7 @@ def build_commit_inject_layout_triton(
 class BuildOutTokens:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs) and not _is_npu:
+        if inputs_on_cuda(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -835,6 +759,18 @@ class BuildOutTokens:
         verify_num_draft_tokens: int,
         gamma: int,
     ) -> torch.Tensor:
+        if _is_npu:
+            from sgl_kernel_npu.operators.sample import (
+                build_out_tokens_triton as npu_build_out_tokens_triton,
+            )
+
+            return npu_build_out_tokens_triton(
+                draft_tokens=draft_tokens,
+                correct_len=correct_len,
+                bonus=bonus,
+                verify_num_draft_tokens=verify_num_draft_tokens,
+                gamma=gamma,
+            )
         return build_out_tokens_triton(
             draft_tokens=draft_tokens,
             correct_len=correct_len,

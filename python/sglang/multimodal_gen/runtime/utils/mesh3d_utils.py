@@ -152,16 +152,15 @@ def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
     n = np.cross(v[f[:, 1]] - p0, v[f[:, 2]] - p0)
     n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
     plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
-    face_q = (plane[:, :, None] * plane[:, None, :]).reshape(len(f), 16)
     idx = f.T.ravel()
-    q = np.stack(
-        [
-            np.bincount(idx, weights=np.tile(face_q[:, c], 3), minlength=len(v))
-            for c in range(16)
-        ],
-        axis=1,
-    )
-    return q.reshape(-1, 4, 4)
+    q = np.empty((len(v), 4, 4), dtype=np.float64)
+    for i in range(4):
+        for j in range(i, 4):
+            weights = np.tile(plane[:, i] * plane[:, j], 3)
+            total = np.bincount(idx, weights=weights, minlength=len(v))
+            q[:, i, j] = total
+            q[:, j, i] = total
+    return q
 
 
 def _qem_collapse_targets(
@@ -617,7 +616,8 @@ class MeshRender:
     def get_texture(self) -> np.ndarray:
         """Get current texture as numpy array."""
         if self.tex is None:
-            return np.ones((*self.texture_size, 3), dtype=np.float32)
+            width, height = self.texture_size
+            return np.ones((height, width, 3), dtype=np.float32)
         return self.tex.cpu().numpy()
 
     def _get_pos_from_mvp(
@@ -958,8 +958,9 @@ class MeshRender:
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Fast texture baking by weighted averaging."""
         channel = textures[0].shape[-1]
-        texture_merge = torch.zeros(self.texture_size + (channel,)).to(self.device)
-        trust_map_merge = torch.zeros(self.texture_size + (1,)).to(self.device)
+        width, height = self.texture_size
+        texture_merge = torch.zeros(height, width, channel).to(self.device)
+        trust_map_merge = torch.zeros(height, width, 1).to(self.device)
 
         for texture, cos_map in zip(textures, cos_maps):
             view_sum = (cos_map > 0).sum()
@@ -1139,6 +1140,13 @@ class ImageProcessorV2:
             image = image.convert("RGBA")
             image = np.asarray(image)
             image, mask = self.recenter(image, border_ratio=border_ratio)
+        elif isinstance(image, np.ndarray):
+            image, mask = self.recenter(image, border_ratio=border_ratio)
+        else:
+            raise TypeError(
+                f"Unsupported image type {type(image).__name__}; "
+                "expected a path, PIL image or numpy array"
+            )
 
         image = cv2.resize(image, (self.size, self.size), interpolation=cv2.INTER_CUBIC)
         mask = cv2.resize(mask, (self.size, self.size), interpolation=cv2.INTER_NEAREST)

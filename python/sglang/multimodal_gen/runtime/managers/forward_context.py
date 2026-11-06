@@ -12,6 +12,10 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
     from sglang.multimodal_gen.runtime.pipelines_core import Req
 
+# Req.extra key for what models keep for one denoising loop (Wan's text K/V): the denoising
+# stage drops it when the loop ends; the leading "_" keeps it out of request transfers
+DENOISING_LOOP_STATE = "_denoising_loop_state"
+
 
 @dataclass
 class ForwardContext:
@@ -22,6 +26,7 @@ class ForwardContext:
         tuple[int, int, int, int],
         tuple[torch.Tensor, torch.Tensor, torch.Tensor],
     ] = field(default_factory=dict)
+    quality: str = field(default="exact", kw_only=True)
 
     @torch.compiler.disable
     def get_trtllm_gen_sequence_metadata(
@@ -65,7 +70,11 @@ def get_forward_context_or_none() -> "ForwardContext | None":
 
 @contextmanager
 def set_forward_context(
-    current_timestep, attn_metadata, forward_batch: Optional["Req"] = None
+    current_timestep,
+    attn_metadata,
+    forward_batch: Optional["Req"] = None,
+    *,
+    quality: str = "exact",
 ):
     """A context manager that stores the current forward context,
     can be attention metadata, etc.
@@ -77,6 +86,7 @@ def set_forward_context(
         current_timestep=current_timestep,
         attn_metadata=attn_metadata,
         forward_batch=forward_batch,
+        quality=quality,
     )
 
     try:

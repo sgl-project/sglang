@@ -441,7 +441,7 @@ MODELS = {
                 "aspect_ratio": "16:9",
                 "duration_seconds": 10.0,
             },
-            "num_inference_steps": 9,
+            "num_inference_steps": 8,
         },
         "extra_args": [
             "--num-gpus=4",
@@ -451,7 +451,7 @@ MODELS = {
         ],
         "force_eager": True,
     },
-    # OpenVDN paper workload: 1344x768, 14.375 s (latent_t 102), t2va, 9 grid points = 8 NFE
+    # OpenVDN paper workload: 1344x768, 14.375 s (latent_t 102), t2va, 8 steps = 8 NFE
     "vdn-h3": {
         "path": "OpenVDN/vdn-minimax-h3",
         "prompt": (
@@ -467,7 +467,7 @@ MODELS = {
                 "aspect_ratio": "16:9",
                 "duration_seconds": 14.375,
             },
-            "num_inference_steps": 9,
+            "num_inference_steps": 8,
         },
         "extra_args": [
             "--num-gpus=8",
