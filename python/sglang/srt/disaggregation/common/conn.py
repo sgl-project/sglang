@@ -701,7 +701,8 @@ class CommonKVManager(BaseKVManager):
                 # A new room lifecycle drops deferred-ACK state left by the
                 # previous request that used this bootstrap_room.
                 self._deferred_ack_targets.pop(bootstrap_room, None)
-                self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
+                if ~bootstrap_room not in self._deferred_ack_poisoned_rooms:
+                    self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
                 self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
             return
@@ -1108,6 +1109,7 @@ class CommonKVManager(BaseKVManager):
         accepted after the ACK is sent.
         """
         if room in self._deferred_ack_poisoned_rooms:
+            self._deferred_ack_poisoned_rooms.discard(~room)
             return
         # Replace instead of mutating in place: a concurrent drain pops the dict
         # and iterates it. If the pop wins, the caller's immediate
@@ -1119,8 +1121,10 @@ class CommonKVManager(BaseKVManager):
 
     def poison_deferred_ack_room(self, room: int) -> None:
         """Drop an ACK target when the backend cannot prove the room drained."""
-        self._deferred_ack_targets.pop(room, None)
+        had_target = self._deferred_ack_targets.pop(room, None) is not None
         self._deferred_ack_poisoned_rooms.add(room)
+        if not had_target:
+            self._deferred_ack_poisoned_rooms.add(~room)
 
     def get_kv_replica_factor(self) -> int:
         if self._kv_replica_factor is None:

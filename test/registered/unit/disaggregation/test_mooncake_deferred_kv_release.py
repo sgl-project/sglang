@@ -181,10 +181,10 @@ class TestMooncakeAbortNotification(
         # failed send must leave decode to its release timeout, whether the
         # ABORT arrived mid-send or only after the Failed status.
         target = AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION)
-        for name, abort_before_send in (("mid-send", True), ("after", False)):
+        for name in ("mid-send", "after", "after-reopen"):
             with self.subTest(name=name):
                 manager = _manager()
-                if abort_before_send:
+                if name == "mid-send":
                     manager._deferred_ack_targets[ROOM] = {
                         (target.ip, target.port): target
                     }
@@ -192,6 +192,10 @@ class TestMooncakeAbortNotification(
                 self._run_worker_with_failed_send(manager)
                 self.assertEqual(manager._sent, [])
                 self.assertNotIn(ROOM, manager._deferred_ack_targets)
+
+                if name == "after-reopen":
+                    manager.request_status.pop(ROOM, None)
+                    CommonKVManager.update_status(manager, ROOM, KVPoll.Bootstrapping)
 
                 self._dispatch_abort(manager)
                 self.assertEqual(manager._sent, [])
