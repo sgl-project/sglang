@@ -53,6 +53,27 @@ def _source_function(path, name, namespace):
     return namespace[name]
 
 
+def _complete_api(
+    x,
+    weight,
+    conv_state,
+    raw_gate,
+    raw_beta,
+    A_log,
+    dt_bias,
+    state_indices,
+    state,
+    output_gate,
+    norm_weight,
+    lower_bound,
+    norm_eps,
+    *,
+    backend,
+    state_indices_mode,
+):
+    raise AssertionError("capability probing must not launch a kernel")
+
+
 def _make_inputs():
     batch, heads, width, slots = 3, 12, 128, 5
     seg = heads * width
@@ -257,38 +278,40 @@ class TestFlashInferFusedKDAConsumer(CustomTestCase):
         kernel.assert_not_called()
 
     def test_partial_flashinfer_build_is_rejected_during_prepare(self):
-        def complete_api(
-            x,
-            weight,
-            conv_state,
-            raw_gate,
-            raw_beta,
-            A_log,
-            dt_bias,
-            state_indices,
-            state,
-            output_gate,
-            norm_weight,
-            lower_bound,
-            norm_eps,
-            *,
-            backend,
-            state_indices_mode,
-        ):
-            raise AssertionError("capability probing must not launch a kernel")
-
         for available in (True, False):
             adapter._get_fused_kda_decode.cache_clear()
             module = SimpleNamespace(
-                fused_kda_decode=complete_api,
+                fused_kda_decode=_complete_api,
                 _FUSED_KDA_DECODE_AVAILABLE=available,
             )
             with patch.dict(sys.modules, {"flashinfer.kda_decode": module}):
                 self.assertIs(
                     adapter._get_fused_kda_decode(),
-                    complete_api if available else None,
+                    _complete_api if available else None,
                 )
         adapter._get_fused_kda_decode.cache_clear()
+
+    def test_transient_probe_failure_does_not_disable_later_preparation(self):
+        """One import failure must not pin every later layer to native decode."""
+        model, _, _ = _make_inputs()
+        _prepare(model, None, backend="triton")
+        layer = model.attn
+        adapter._get_fused_kda_decode.cache_clear()
+        self.addCleanup(adapter._get_fused_kda_decode.cache_clear)
+        healthy = SimpleNamespace(fused_kda_decode=_complete_api)
+        with patch.object(
+            adapter,
+            "import_module",
+            side_effect=[RuntimeError("transient FlashInfer probe failure"), healthy],
+        ):
+            prepare_args = (layer._k3_fused_decode_args, layer.dt_bias)
+            prepare_kwargs = dict(has_conv_bias=False, lower_bound=layer.lower_bound)
+            self.assertIsNone(
+                adapter.prepare_fused_kda_decode(*prepare_args, **prepare_kwargs)
+            )
+            prepared = adapter.prepare_fused_kda_decode(*prepare_args, **prepare_kwargs)
+        self.assertIsNotNone(prepared)
+        self.assertIs(prepared.kernel, _complete_api)
 
     def test_misaligned_views_are_rejected_without_launch(self):
         for position in (0, 1, 4, 5):

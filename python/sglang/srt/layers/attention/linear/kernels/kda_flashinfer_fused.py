@@ -28,7 +28,7 @@ def _get_fused_kda_decode() -> Optional[Callable]:
             return None
         fused_kda_decode = getattr(module, "fused_kda_decode", None)
         parameters = inspect.signature(fused_kda_decode).parameters
-    except (ImportError, RuntimeError, TypeError, ValueError):
+    except (ImportError, TypeError, ValueError):
         return None
     required = {
         "x",
@@ -167,7 +167,12 @@ def prepare_fused_kda_decode(
     """Prepare once; old FlashInfer APIs and unsupported static inputs opt out."""
     if has_conv_bias:
         return None
-    kernel = _get_fused_kda_decode()
+    try:
+        kernel = _get_fused_kda_decode()
+    except RuntimeError:
+        # A transient probe failure keeps this layer on native decode without
+        # caching process-wide unavailability for later layer preparation.
+        return None
     if kernel is None:
         return None
     w_q, w_k, w_v, _conv_bias, A_log, norm_weight, norm_eps = fused_static
