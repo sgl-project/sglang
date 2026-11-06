@@ -15,6 +15,7 @@ register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-s
 
 
 class TestUniformExtendTranslation(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_pool_sizes_are_runtime_bounds(self):
         """Different virtual table lengths must share the warmed kernel.
         Negative, tombstoned and past-table slots map to the sink independently

@@ -64,6 +64,7 @@ def awq_dequantize_torch(
 
 
 class TestAWQTriton(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_dequantize(self):
         rows_list = [3584, 18944, 128, 256, 512, 1024]
         cols_list = [448, 576, 4736, 16, 32, 64, 128]
@@ -80,7 +81,6 @@ class TestAWQTriton(CustomTestCase):
                             group_size=group_size,
                         )
 
-    @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
     def _run_dequant_case(self, qweight_rows, qweight_cols, group_size):
         if group_size == -1:
             group_size = qweight_rows
@@ -114,6 +114,7 @@ class TestAWQTriton(CustomTestCase):
         # sanity
         self.assertFalse(torch.any(torch.isinf(tri)) or torch.any(torch.isnan(tri)))
         torch.testing.assert_close(ref, tri)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

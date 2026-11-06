@@ -271,12 +271,14 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_without_radix_tracking(self):
         meta, graph, out = self._capture(track=False)
         self._check_replay(
             meta, graph, out, lens=[129, 7], prefixes=[64, 0], track=None, seed=300
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_replays_match_eager(self):
         meta, graph, out = self._capture()
         cases = [
@@ -306,6 +308,7 @@ class TestKDAPrefillGraph(CustomTestCase):
                     seed=100 + i,
                 )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_replays_match_eager_4d_gate(self):
         """Kimi passes the gate as [1, T, H, K]; the graph must still apply the
         beta sigmoid the eager extend applies."""
@@ -321,6 +324,7 @@ class TestKDAPrefillGraph(CustomTestCase):
             seed=200,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_capacity(self):
         meta = KDAPrefillGraphMetadata.allocate(
             num_tokens=BUCKET,

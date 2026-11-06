@@ -59,6 +59,7 @@ def test_fp8_rope_128_heads_int64_offsets():
     torch.testing.assert_close(output[-2:].float(), q[-2:].float(), rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
 def test_sparse_tail_short_sequence_and_padding(dtype):
     # A short sequence has one valid SWA entry but still reserves 128 columns.

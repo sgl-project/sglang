@@ -27,6 +27,7 @@ def _make_inputs(rows: int):
     return x, scale, shift
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("rows", [1, 127, 512])
 @pytest.mark.parametrize(
     "input_scale_value", [0.005, 0.03125, 0.25, 0.4754464328289032, 1.0]

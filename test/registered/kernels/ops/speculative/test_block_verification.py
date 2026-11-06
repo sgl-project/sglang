@@ -99,6 +99,7 @@ def _reference(target, draft, candidates, coins, final_coins, *, block):
     return lengths, output, cdf
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize(
     "steps,vocab", [(0, 3), (1, 7), (3, 17), (5, 4099), (3, 131073)]
@@ -139,6 +140,7 @@ def test_matches_reference(steps, vocab, block):
     assert (final_coins <= upper + 1e-6).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_accepts_longer_prefix_after_rejection():
     target = torch.tensor([[[1 / 3, 2 / 3]] * 3], device=DEVICE)
     draft = torch.tensor([[[2 / 3, 1 / 3]] * 2], device=DEVICE)
@@ -154,6 +156,7 @@ def test_accepts_longer_prefix_after_rejection():
     assert token_lengths.item() == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_scales_residual_at_last_accepted_prefix():
     target = torch.tensor(
         [[[0.25, 0.5, 0.25], [0.6, 0.3, 0.1], [1.0, 0.0, 0.0]]], device=DEVICE
@@ -171,6 +174,7 @@ def test_scales_residual_at_last_accepted_prefix():
     assert output[0, :2].tolist() == [0, 0]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_selects_longest_accepted_prefix():
     steps = 5
     batch = steps + 1
@@ -196,6 +200,7 @@ def test_selects_longest_accepted_prefix():
     torch.testing.assert_close(output.cpu()[valid], expected[valid])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "target_next,draft_next,threshold",
     [([0.5, 0.5], [0.125, 0.875], 0.5), ([1.0, 0.0], [0.0, 1.0], 0.75)],
@@ -227,6 +232,7 @@ def test_prefix_acceptance_boundary(target_next, draft_next, threshold):
     torch.testing.assert_close(output.cpu()[valid], expected[valid])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("identical", [False, True])
 def test_zero_and_unit_prefix_probabilities(identical):
     target = torch.tensor([[[1.0, 0.0]] * 4], device=DEVICE)
@@ -243,6 +249,7 @@ def test_zero_and_unit_prefix_probabilities(identical):
     assert (output[0, : lengths.item() + 1] == 0).all()
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block,expected_length", [(False, 10 / 9), (True, 11 / 9)])
 def test_paper_example_distribution(block, expected_length):
     torch.manual_seed(123)
@@ -282,6 +289,7 @@ def test_paper_example_distribution(block, expected_length):
         assert abs(observed.item() - expected.item()) < 0.008
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("block", [False, True])
 @pytest.mark.parametrize("steps", [2, 5])
 def test_context_dependent_output_distribution(block, steps):
@@ -332,6 +340,7 @@ def test_context_dependent_output_distribution(block, steps):
         assert abs(observed.item() - expected.item()) < 0.008
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("any_greedy", [False, True])
 def test_dflash_family_accept_uses_block_verification(any_greedy):
     """The DFLASH-family accept path must reach the block sampler. Here r_1 = 1/2

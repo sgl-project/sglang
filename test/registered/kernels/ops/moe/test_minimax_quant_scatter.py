@@ -81,6 +81,7 @@ def test_sm120_mxfp8_dispatch_preserves_activation_scale_recipe(monkeypatch):
     ) == ((1, 128), (1, 32))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_tokens", [1, 7, 64, 256])
 @pytest.mark.parametrize("topk", [4, 5, 8])
 @pytest.mark.parametrize("hidden,group", [(6144, 32), (2048, 32), (4096, 128)])
@@ -145,6 +146,7 @@ def test_quant_scatter_matches_quant_plus_fill(num_tokens, topk, hidden, group):
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_standard_deepgemm_preprocess_quantizes_with_ue8m0_scale():
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if arch_major <= 9:
@@ -289,6 +291,7 @@ def test_standard_layout_auto_memory_policy(
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("weight_dtype", ["fp8", "bf16"])
 def test_standard_masked_runner_matches_compact_end_to_end(
     monkeypatch, weight_dtype, stated_tp_group

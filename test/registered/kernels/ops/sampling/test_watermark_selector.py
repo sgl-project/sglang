@@ -20,6 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_hash_near_uint32_max_does_not_override_probability():
     vocab_size = 149050
     probabilities = torch.zeros((1, vocab_size), dtype=torch.float32)
@@ -63,6 +64,7 @@ def test_hash_near_uint32_max_does_not_override_probability():
         assert torch.equal(actual_logits, expected_logits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     ("dtype", "vocab_size", "dual_key"),
     [
@@ -140,6 +142,7 @@ def test_fused_force_matches_torch_truncation(dtype, vocab_size, dual_key):
     assert torch.equal(actual_logits, expected_logits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("max_probability", [0.7, 1.0])
 def test_finite_top_k_fast_path_matches_sort_with_ties(dtype, max_probability):
@@ -236,6 +239,7 @@ def test_finite_top_k_fast_path_matches_sort_with_ties(dtype, max_probability):
     assert torch.equal(dual_fast_logits, dual_sort_logits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("max_top_k", [8191, 8192])
 def test_finite_top_k_boundary_matches_sort_with_ties(max_top_k):
     vocab_size = 8193
@@ -282,6 +286,7 @@ def test_finite_top_k_boundary_matches_sort_with_ties(max_top_k):
     assert torch.equal(fast_logits, sort_logits)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_fused_context_state_matches_torch():
     max_contexts = 2048
     reference = WatermarkState(

@@ -23,6 +23,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_input_scale_excludes_inactive_rows(self):
         """Only local-route rows affect the scale, without changing strided inputs."""
         experts, rows, width = 2, 11, 257
@@ -107,6 +108,7 @@ class TestCutlassW4A8InactiveRoutes(CustomTestCase):
                         value = values[:, :0]
                     prepare(value, route_ids, floor)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_input_scale_and_raw_route_packing_graph_replay(self):
         """Replays compact only live routes and reset the scale as routes change."""
         experts, rows, width = 2, 13, 257

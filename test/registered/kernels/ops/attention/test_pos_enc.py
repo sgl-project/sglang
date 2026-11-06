@@ -11,9 +11,6 @@ from sglang.kernels.ops.attention.rope import rotary_embedding
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 @triton.jit
@@ -257,6 +254,7 @@ def compare_results(jit_out, sgl_out, dtype):
     torch.testing.assert_close(jit_out, sgl_out, atol=atol, rtol=rtol)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype, device, batch_size, seq_len, num_q_heads, num_kv_heads",
     [

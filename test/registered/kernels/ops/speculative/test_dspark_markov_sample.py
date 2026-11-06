@@ -30,6 +30,7 @@ def _call(impl, *, base, bias, temps, step_dtype, offset=7, step=2, **kwargs):
 
 
 class TestMarkovSampleStep(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_triton_matches_torch_reference(self):
         g = torch.Generator(device=DEVICE).manual_seed(0)
         rows, padded, width = 64, 9000, 8990
@@ -74,6 +75,7 @@ class TestMarkovSampleStep(CustomTestCase):
             self.assertGreaterEqual(agree, 0.95)
             self.assertTrue(((t_tok >= 100) & (t_tok < 100 + width)).all())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_greedy_only_variant_matches_mixed_kernel(self):
         g = torch.Generator(device=DEVICE).manual_seed(3)
         base = torch.randn(16, 9000, generator=g, device=DEVICE).to(torch.bfloat16)
@@ -85,6 +87,7 @@ class TestMarkovSampleStep(CustomTestCase):
             greedy_only = _call(impl, has_sampled_rows=False, **kwargs)
             self.assertTrue(torch.equal(greedy_only, mixed))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_special_values_follow_argmax(self):
         base = torch.zeros(4, 16, device=DEVICE)
         base[0, 3] = float("nan")
@@ -102,6 +105,7 @@ class TestMarkovSampleStep(CustomTestCase):
             # Lowest NaN, then lowest index of a tie; column 15 is padding.
             self.assertEqual(tokens.tolist(), [3, 0, 5, 0])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_greedy_tie_across_blocks_takes_the_lower_index(self):
         base = torch.zeros(2, 9000, device=DEVICE)
         base[:, 1000] = base[:, 5000] = 5.0
@@ -116,6 +120,7 @@ class TestMarkovSampleStep(CustomTestCase):
             )
             self.assertEqual(tokens.tolist(), [1000, 1000])
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_strided_rows_match_contiguous(self):
         # The draft passes one step of a [bs, gamma, vocab] block, rows strided.
         g = torch.Generator(device=DEVICE).manual_seed(2)
@@ -144,6 +149,7 @@ class TestMarkovSampleStep(CustomTestCase):
         self.assertTrue(torch.equal(strided, contiguous))
         self.assertTrue(torch.equal(logits_block[:, 2], logits))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_sampling_follows_tempered_softmax(self):
         vocab, rows = 32, 1 << 16
         logits = torch.linspace(-3, 3, vocab, device=DEVICE)
@@ -162,6 +168,7 @@ class TestMarkovSampleStep(CustomTestCase):
             expected = torch.softmax(logits / temperature, dim=0)
             self.assertLess((freq - expected).abs().max().item(), 0.01)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_noise_changes_with_offset_row_and_step(self):
         rows, vocab = 256, 4096
         base = torch.zeros(rows, vocab, device=DEVICE)
@@ -186,6 +193,7 @@ class TestMarkovSampleStep(CustomTestCase):
             )
             self.assertLess((other == first).float().mean().item(), 0.01)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_sharded_vocab_matches_full_vocab(self):
         # Every rank must pick the full vocab's token: the noise is keyed by
         # global token id, so the shards draw what the full vocab draws.
@@ -227,6 +235,7 @@ class TestMarkovSampleStep(CustomTestCase):
         for rank in range(3):
             self.assertTrue(torch.equal(run(rank, lambda _: stacked), full))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_kept_sharded_logits_match_full_vocab(self):
         # Kept logits are gathered whole and every rank picks from them: the
         # same tokens and the same logits as the full vocab, both backends.

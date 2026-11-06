@@ -19,6 +19,7 @@ register_cuda_ci(est_time=2, stage="base-b-kernel-unit", runner_config="4-gpu-b2
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("keep_bf16", [True, False])
 def test_indexed_scale_shift_mxfp8_is_byte_exact(keep_bf16: bool) -> None:
     g = torch.Generator(device="cuda").manual_seed(3)

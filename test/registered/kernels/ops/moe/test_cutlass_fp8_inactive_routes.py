@@ -327,6 +327,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 with self.assertRaisesRegex((RuntimeError, ValueError), "contiguous"):
                     cutlass_prepare_moe_input(*invalid_args)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_masked_reduction_ignores_poisoned_slots(self):
         for dtype in (torch.float16, torch.bfloat16):
             with self.subTest(dtype=dtype):
@@ -348,6 +349,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                 ].expand_as(output)
                 torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_reduction_reuses_kernels_across_token_counts(self):
         """New lengths reuse the reduction and preserve mixed/empty route results."""
         kernel = _shuffle_weighted_sum_kernel
@@ -423,6 +425,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                             self.assertEqual(int(torch.count_nonzero(output)), 0)
                             self.assertEqual(len(cache), specialization_count)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_cuda_reduction_matches_triton_for_ragged_strided_views(self):
         """Guard masked gathers and exact slot arithmetic across dtype/layout keys."""
         for dtype in (torch.float16, torch.bfloat16):
@@ -525,6 +528,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                             )
                         self.assertEqual(int(torch.count_nonzero(output[2])), 0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_cuda_reduction_preserves_fma_denormals_and_slot_order(self):
         """FMA residuals and BF16 subnormal operands must survive the CUDA port."""
         for dtype, value in ((torch.float16, 1025.0), (torch.bfloat16, 129.0)):
@@ -583,6 +587,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
         # FP32 underflow creates -0 in slot0; the inactive +0 FMA restores +0.
         self.assertTrue(bool((output.view(torch.int16) == 0).all()))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_cuda_reduction_graph_changes_and_empty_routes(self):
         """A current-stream graph must rewrite poisoned output on every map change."""
         for dtype in (torch.float16, torch.bfloat16):
@@ -661,6 +666,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
         )
         torch.testing.assert_close(output, inputs / 2, rtol=0, atol=0)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_cuda_reduction_preserves_identity_alias_and_compiled_mutation(self):
         """Preserve safe in-place topk1 and expose the mutation to compile/fake."""
         dtype = torch.bfloat16
@@ -720,6 +726,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
             atol=0,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_reduction_fuses_score_cast_to_input_dtype(self):
         """The optional cast matches the previous explicit Torch conversion chain."""
         width, topk, rows = 17, 2, 5
@@ -846,6 +853,7 @@ class TestCutlassFp8InactiveRoutes(CustomTestCase):
                     )
                     self._assert_reduction_bits_equal(output, reference)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_reduction_score_cast_survives_graph_and_compile(self):
         """Captured score casts follow live metadata without changing borrowed tensors."""
         width = 17

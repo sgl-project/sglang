@@ -12,9 +12,6 @@ from sglang.test.kernels.moe_align import ceil_div, moe_align_block_size_triton
 register_cuda_ci(est_time=28, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=50, stage="nightly", runner_config="1-gpu-small")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 
 MOE_ALIGN_CASES = get_ci_test_range(
@@ -37,6 +34,7 @@ MOE_ALIGN_CASES = get_ci_test_range(
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts,pad_sorted_token_ids",
     MOE_ALIGN_CASES,
@@ -142,6 +140,7 @@ def test_moe_align_block_size_compare_implementations(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "block_size,num_tokens,topk,num_experts",
     list(

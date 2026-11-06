@@ -18,6 +18,7 @@ register_cuda_ci(est_time=3, stage="base-b-kernel-unit", runner_config="4-gpu-b2
 ROWS, HIDDEN = 333, 5376  # rows and scale columns both need padding
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_quantize_swizzled_is_byte_exact() -> None:
     g = torch.Generator(device="cuda").manual_seed(1)
     x = (torch.randn((ROWS, HIDDEN), device="cuda", generator=g) * 3).to(torch.bfloat16)

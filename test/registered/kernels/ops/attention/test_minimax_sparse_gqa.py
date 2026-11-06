@@ -207,6 +207,7 @@ CASES = [
 ]
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs,nqh,nkh,hd,blk,tk,with_sink,seq_pat,paged", CASES)
 def test_sparse_gqa_vs_reference(bs, nqh, nkh, hd, blk, tk, with_sink, seq_pat, paged):
     """Kernel output must match PyTorch reference (attend only to topk blocks)."""

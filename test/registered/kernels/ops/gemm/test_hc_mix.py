@@ -51,6 +51,7 @@ _TOLERANCES = {
 }
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 @pytest.mark.parametrize("num_tokens", [1, 4, 7, _FUSED_MIX_MAX_ROWS])
 def test_fused_hc_mix_matches_reference(dtype, num_tokens):
@@ -61,6 +62,7 @@ def test_fused_hc_mix_matches_reference(dtype, num_tokens):
     torch.testing.assert_close(out.to(torch.float64), ref, **_TOLERANCES[dtype])
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_fused_hc_mix_no_less_accurate_than_eager():
     """The fused kernel (fp32 accumulation throughout) must not be farther
     from the fp64 reference than the eager bf16 chain it replaces."""

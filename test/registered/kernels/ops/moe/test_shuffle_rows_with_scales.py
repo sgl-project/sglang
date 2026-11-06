@@ -72,6 +72,7 @@ def _assert_same_bytes(got, ref, what):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("k,num_src_rows,num_dst_rows", CASES)
 def test_matches_torch_gather(k, num_src_rows, num_dst_rows):
     q, scale, dst2src = _inputs(k, num_src_rows, num_dst_rows, seed=0)
@@ -91,6 +92,7 @@ CUDA_XCHECK_CASES = [
 assert CUDA_XCHECK_CASES, "no case survives the CUDA cross-check shape filter"
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("k,num_src_rows,num_dst_rows", CUDA_XCHECK_CASES)
 def test_matches_shuffle_rows_pair(k, num_src_rows, num_dst_rows):
     """Drop-in equivalence with the two launches this replaces."""
@@ -108,6 +110,7 @@ def test_matches_shuffle_rows_pair(k, num_src_rows, num_dst_rows):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_empty_destination_does_not_launch():
     """Zero rows takes the short circuit instead of a zero-sized grid."""
     q, scale, dst2src = _inputs(512, 4, 0, seed=2)

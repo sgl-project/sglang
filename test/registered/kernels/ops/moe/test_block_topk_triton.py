@@ -108,48 +108,56 @@ class TestBlockTopkTriton(CustomTestCase):
         self.assertEqual(weights_triton.dtype, torch.float32)
         torch.testing.assert_close(weights_triton, weights_ref, rtol=0.0, atol=2e-6)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_basic_small(self):
         """32 tokens, 16 experts, capacity=8, block_size=8, top_k=2."""
         self._run_case(
             num_tokens=32, num_experts=16, expert_capacity=8, block_size=8, top_k=2
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_single_expert_selection(self):
         """top_k=1 path."""
         self._run_case(
             num_tokens=32, num_experts=16, expert_capacity=8, block_size=8, top_k=1
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_large_expert_count(self):
         """256 experts (production-like config)."""
         self._run_case(
             num_tokens=64, num_experts=256, expert_capacity=48, block_size=32, top_k=8
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_capacity_equals_experts(self):
         """expert_capacity == num_experts means no routing restriction."""
         self._run_case(
             num_tokens=32, num_experts=16, expert_capacity=16, block_size=8, top_k=4
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_tight_capacity(self):
         """Very tight capacity (only top_k experts allowed per block)."""
         self._run_case(
             num_tokens=64, num_experts=64, expert_capacity=6, block_size=16, top_k=4
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_block_size_equals_one(self):
         """block_size=1 degenerates to per-token routing."""
         self._run_case(
             num_tokens=16, num_experts=32, expert_capacity=8, block_size=1, top_k=2
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_many_tokens(self):
         """Stress test with more tokens."""
         self._run_case(
             num_tokens=256, num_experts=128, expert_capacity=32, block_size=32, top_k=4
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_partial_block_and_non_power_of_two_experts(self):
         """Tail tokens and non-power-of-two expert counts are supported."""
         self._run_case(
@@ -160,6 +168,7 @@ class TestBlockTopkTriton(CustomTestCase):
             top_k=8,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_exact_ties_choose_lower_expert_id(self):
         logits = torch.zeros((33, 100), dtype=torch.float32, device="cuda")
         bias = torch.zeros((100,), dtype=torch.float32, device="cuda")
@@ -170,6 +179,7 @@ class TestBlockTopkTriton(CustomTestCase):
             weights, torch.full_like(weights, 1.0 / 8), rtol=0.0, atol=0.0
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_very_negative_logits_use_epsilon_normalization(self):
         """Very small sigmoid scores must not fall back to uniform weights."""
         logits = torch.full((32, 16), -90.0, dtype=torch.float32, device="cuda")
@@ -186,6 +196,7 @@ class TestBlockTopkTriton(CustomTestCase):
         # The old fallback returned 1 / top_k == 0.125 for this input.
         self.assertTrue(torch.all(weights < 1e-10))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_close_unequal_scores_are_not_reordered(self):
         logits = torch.full((32, 16), -20.0, dtype=torch.float32, device="cuda")
         bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
@@ -195,6 +206,7 @@ class TestBlockTopkTriton(CustomTestCase):
         _, ids = block_topk_triton(logits, bias, 32, 16, 1)
         self.assertTrue(torch.equal(ids, torch.ones_like(ids)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_capacity_cutoff_near_tie(self):
         """Phase 1 and phase 2 must use the same sigmoid at the cutoff."""
         logits = torch.full((8, 4), -20.0, dtype=torch.float32, device="cuda")
@@ -223,6 +235,7 @@ class TestBlockTopkTriton(CustomTestCase):
             atol=1e-7,
         )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_rejects_non_power_of_two_block_size(self):
         logits = torch.zeros((6, 4), dtype=torch.float32, device="cuda")
         bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
@@ -231,6 +244,7 @@ class TestBlockTopkTriton(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "positive power of two"):
                     block_topk_triton(logits, bias, block_size, 2, 1)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_empty_input_returns_fp32_weights(self):
         logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
         bias = torch.zeros((16,), dtype=torch.float32, device="cuda")

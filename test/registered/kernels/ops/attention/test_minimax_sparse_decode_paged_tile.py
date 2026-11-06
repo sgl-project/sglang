@@ -73,6 +73,7 @@ def _decode(inputs, page_size, hisparse_slots=None):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("page_size,engages", [(128, True), (256, True), (64, False)])
 def test_paged_tile_matches_slot_gather(page_size, engages):
     """A block read as one tile matches the slot gather; small pages fall back."""
@@ -93,6 +94,7 @@ def test_paged_tile_matches_slot_gather(page_size, engages):
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_hisparse_slots_override_paged_tile():
     """Pre-resolved HiSparse slots win over the paged tile."""
     torch.manual_seed(0)

@@ -15,6 +15,7 @@ from sglang.test.kernels.triton_sum import triton_sum
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("num_rows", [1, 7, 129, 4096])
 @pytest.mark.parametrize("num_cols", [1, 6, 8, 13, 31])
 def test_row_sum_matches_triton_sum_bitwise(num_rows, num_cols):

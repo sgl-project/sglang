@@ -29,6 +29,7 @@ def pillow_reference(array, height, width, *, crop=None, mean=None, std=None):
 
 
 class TestLanczosPreprocess(CustomTestCase):
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matches_pillow_geometry_and_rounding(self):
         rng = np.random.default_rng(9843)
         shapes = [
@@ -64,6 +65,7 @@ class TestLanczosPreprocess(CustomTestCase):
                     self.assertEqual(output.dtype, torch.uint8)
                     self.assertTrue(output.is_contiguous())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_optional_fusions_match_resize_then_crop_and_normalize(self):
         """Crop uses full-resize coordinates; normalization is channel-specific."""
         rng = np.random.default_rng(139)
@@ -86,6 +88,7 @@ class TestLanczosPreprocess(CustomTestCase):
                     )
                     self.assertTrue(output.is_contiguous())
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_padded_rows_and_borrowed_input_lifetime(self):
         rng = np.random.default_rng(72)
         array = rng.integers(0, 256, (61, 93, 3), dtype=np.uint8)
@@ -99,6 +102,7 @@ class TestLanczosPreprocess(CustomTestCase):
         borrowed.zero_()
         self.assertTrue(torch.equal(output.cpu(), pillow_reference(array, 40, 56)))
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_parameter_validation(self):
         with self.assertRaises(ValueError):
             lanczos_resize(torch.zeros((8, 8, 3), dtype=torch.uint8), 8, 8)
@@ -125,6 +129,7 @@ class TestLanczosPreprocess(CustomTestCase):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 lanczos_resize(image, 8, 8, **options)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_batch_matches_independent_frames_with_padded_strides(self):
         """Batch offsets must not mix frames, including gaps between rows/images."""
         rng = np.random.default_rng(458)

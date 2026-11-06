@@ -645,6 +645,7 @@ class TestQwenImageModulationCache(CustomTestCase):
                 hidden,
             )
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_matching_cfg_key_reuses_both_modulation_projections(self):
         block = self._block()
         timestep = torch.tensor([500.0], device="cuda")
@@ -662,6 +663,7 @@ class TestQwenImageModulationCache(CustomTestCase):
         self.assertEqual(block.img_mod[1].calls, 1)
         self.assertEqual(block.txt_mod[1].calls, 1)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_tensor_identity_version_and_condition_invalidate_cache(self):
         block = self._block()
         timestep = torch.tensor([500.0], device="cuda")
@@ -685,6 +687,7 @@ class TestQwenImageModulationCache(CustomTestCase):
         block._get_modulation_params(temb, temb, conditioned)
         self.assertEqual(block.img_mod[1].calls, 4)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_grad_enabled_path_disables_and_clears_cache(self):
         block = self._block()
         timestep = torch.tensor([500.0], device="cuda")
@@ -699,6 +702,7 @@ class TestQwenImageModulationCache(CustomTestCase):
         self.assertIsNone(block._modulation_cache)
         self.assertEqual(block.img_mod[1].calls, 2)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_inference_tensors_cache_and_graph_path_falls_back(self):
         block = self._block()
         with torch.inference_mode():
@@ -1901,6 +1905,7 @@ def qwen21_vae_gates(monkeypatch, qwen21_deterministic_cudnn):
     return gates
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_qwen21_vae_lossless_decode_is_bit_identical(qwen21_vae_gates):
@@ -1942,6 +1947,7 @@ def test_qwen21_vae_lossless_decode_is_bit_identical(qwen21_vae_gates):
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_qwen21_vae_mismatch_falls_back_to_the_eager_chain(
@@ -1968,6 +1974,7 @@ def test_qwen21_vae_mismatch_falls_back_to_the_eager_chain(
     assert bias_gate.disabled and not bias_gate.verified
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_qwen21_vae_extra_high_decode_is_close_and_lossless_is_restored(
@@ -1996,6 +2003,7 @@ def test_qwen21_vae_extra_high_decode_is_close_and_lossless_is_restored(
     assert not optimized.decoder._sgl_channels_last
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_qwen21_vae_folded_upsampler_follows_the_weights_and_moves(qwen21_vae_gates):
@@ -2466,6 +2474,7 @@ def _bits(x):
     return x.view(torch.int16)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_wan_fused_qkv_keeps_bits_and_frees_with_its_layers():
@@ -2513,6 +2522,7 @@ def test_wan_fused_qkv_keeps_bits_and_frees_with_its_layers():
         assert torch.equal(run(), ref)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_wan_chained_blocks_match_blocks_one_by_one():
@@ -2541,6 +2551,7 @@ def test_wan_chained_blocks_match_blocks_one_by_one():
     assert torch.equal(_bits(out), _bits(ref))
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_wan_projected_text_kv_keeps_bits():
@@ -2567,6 +2578,7 @@ class _WanTextKVModel(nn.Module):
         self.layerwise_offload_managers = []
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @requires_inline_ptx
 @torch.no_grad()
 def test_wan_text_kv_lives_for_one_loop_of_one_request():

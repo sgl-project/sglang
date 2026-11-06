@@ -37,9 +37,6 @@ from sglang.test.kernels.kv_canary._fixtures import (
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
 
 _DEVICE = torch.device("cuda")
 
@@ -204,6 +201,7 @@ def test_write_byte_equal_across_repeated_launches_10x() -> None:
         )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_plan_byte_equal_across_repeated_launches_10x() -> None:
     num_launches = 10
     req_pool_indices, prefix_lens, extend_seq_lens, req_to_token = _build_plan_fixtures(
@@ -382,6 +380,7 @@ def test_verify_check_disabled_byte_equal() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("per_req_present", [False, True])
 def test_plan_per_req_present_or_absent(per_req_present: bool) -> None:
     max_reqs = 4

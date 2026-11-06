@@ -96,6 +96,7 @@ class TestPi05ModelOptFp8CUDA(CustomTestCase):
     def tearDownClass(cls):
         restore_context(cls.saved_context)
 
+    @unittest.skipIf(not torch.cuda.is_available(), "Triton kernel requires CUDA")
     def test_calibrated_checkpoint_loader_and_mutable_graph_input(self):
         import modelopt.torch.quantization as mtq
 

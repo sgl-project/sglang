@@ -12,6 +12,7 @@ from sglang.kernels.ops.speculative.eagle import (
 )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 3, 128, 256])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -52,6 +53,7 @@ def test_prepare_integer_outputs(bs, width, dtype):
             torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 128, 257])
 @pytest.mark.parametrize("front", [0, 3])
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
@@ -289,6 +291,7 @@ def test_draft_cache_positions_graph(bs, steps, mrope):
             )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize("bs", [0, 1, 7, 128, 257])
 @pytest.mark.parametrize("width", [1, 4, 7])
 @pytest.mark.parametrize("interval", [0, 16, 512])

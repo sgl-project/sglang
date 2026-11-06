@@ -42,9 +42,7 @@ from sglang.test.kernels.kv_canary._fixtures import (
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="Test requires CUDA"
-)
+
 
 _DEVICE = torch.device("cuda")
 
@@ -341,6 +339,7 @@ def _stamp_linear_prefix(
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_basic_5_step_single_req() -> None:
     """Single req, prefix_len=0, extend_seq_len=5: basic plan→write→verify byte-equal."""
     _run_both_and_assert_pipeline_equal(
@@ -358,6 +357,7 @@ def test_pipeline_basic_5_step_single_req() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_multi_req_mixed_extend_decode() -> None:
     """bs=3: pure extend req, decode req (prefix+1 extend), and padding sentinel row."""
     max_seq_len = 16
@@ -385,6 +385,7 @@ def test_pipeline_multi_req_mixed_extend_decode() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_swa_window() -> None:
     """SWA window=4, prefix_len=6: verify covers window [2,6), write covers extend tokens."""
     max_seq_len = 16
@@ -413,6 +414,7 @@ def test_pipeline_swa_window() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_sweep_no_write() -> None:
     """All extend_seq_lens=0: write_step is no-op, verify sweeps prefix, buf unchanged."""
     prefix_len = 4
@@ -456,6 +458,7 @@ def test_pipeline_sweep_no_write() -> None:
     assert int(log_ref.slot_run_counter[0].item()) == prefix_len
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "real_kv_hash_mode",
     [
@@ -485,6 +488,7 @@ def test_pipeline_real_kv_mode(real_kv_hash_mode: consts.RealKvHashMode) -> None
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_pseudo_mode_on_match() -> None:
     """enable_write_verify_inputs=ON, expected==actual: zero violations, buf byte-equal."""
     input_ids = _t([1, 2, 3, 4])
@@ -509,6 +513,7 @@ def test_pipeline_pseudo_mode_on_match() -> None:
     assert int(log_ref.write_index[0].item()) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
     """enable_write_verify_inputs=ON, expected tokens all wrong: write records N violations."""
     n_tokens = 3
@@ -536,6 +541,7 @@ def test_pipeline_pseudo_mode_on_token_mismatch_then_verify_clean() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_empty_batch() -> None:
     """bs=1 with req_pool_idx=0 (padding): write and verify are no-op, kernel_run_counter == 2 (write+verify)."""
     input_ids, positions, out_cache_loc = _zero_no_write_inputs()
@@ -557,6 +563,7 @@ def test_pipeline_empty_batch() -> None:
     assert int(log_real.write_index[0].item()) == 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_negative_slot_swa_out_of_window() -> None:
     """SWA: some out_cache_loc entries map to -1 (out-of-window); write_step skips them, buf unchanged."""
     max_seq_len = 16
@@ -583,6 +590,7 @@ def test_pipeline_negative_slot_swa_out_of_window() -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_ring_overflow_via_real_plan() -> None:
     """Verify detects >capacity violations when prev_hash is pre-corrupted; write_index byte-equal, ring relaxed."""
     max_seq_len = 16
@@ -688,6 +696,7 @@ def test_pipeline_ring_overflow_via_real_plan() -> None:
     assert int(log_real.write_index[0].item()) == n_slots
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 @pytest.mark.parametrize(
     "kernel_kind", [CanaryLaunchTag.HEAD_K_FULL, CanaryLaunchTag.SWEEP_V_SWA]
 )
@@ -730,6 +739,7 @@ def test_pipeline_kernel_kind_propagates(kernel_kind: CanaryLaunchTag) -> None:
     )
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_token_mismatch_detected_via_pool() -> None:
     """plan-pool gather + verify-token check: stamped wrong token id raises VERIFY_TOKEN_MISMATCH."""
     max_seq_len = 16
@@ -793,6 +803,7 @@ def test_pipeline_token_mismatch_detected_via_pool() -> None:
     assert observed_pairs == expected_pairs
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="Triton kernel requires CUDA")
 def test_pipeline_eagle_offset_plus_1_byte_equal() -> None:
     """plan-pool + offset=+1 full pipeline: stamped tokens match pool[rp, pos+1], no violations CUDA vs ref byte-equal."""
     max_seq_len = 16
