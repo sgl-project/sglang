@@ -82,8 +82,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     patchelf \
     ccache \
     git-lfs \
-    # MPI and NUMA
-    libopenmpi-dev \
+    # NUMA
     libnuma1 \
     libnuma-dev \
     numactl \
@@ -106,7 +105,7 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libgtest-dev \
     libjsoncpp-dev \
     libunwind-dev \
-    libboost-all-dev \
+    libboost-dev \
     libssl-dev \
     libgrpc-dev \
     libgrpc++-dev \
@@ -118,7 +117,6 @@ RUN --mount=type=cache,target=/var/cache/apt,id=base-apt \
     libcurl4-openssl-dev \
     libczmq4 \
     libczmq-dev \
-    libfabric-dev \
     linux-libc-dev \
     # Package building tools
     devscripts \
