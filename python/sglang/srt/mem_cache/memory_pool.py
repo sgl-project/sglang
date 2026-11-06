@@ -2144,9 +2144,9 @@ def _set_mha_kv_buffer_prefix_valid(
     # fallback: eager quantization
     if cache_k.dtype != pool.dtype:
         if k_scale is not None:
-            cache_k.div_(k_scale)
+            cache_k = torch.div(cache_k, k_scale, out=torch.empty_like(cache_k))
         if v_scale is not None:
-            cache_v.div_(v_scale)
+            cache_v = torch.div(cache_v, v_scale, out=torch.empty_like(cache_v))
         if pool.dtype == fp8_dtype:
             # Saturate like the fused kernel above; see saturate_to_fp8_range.
             cache_k = saturate_to_fp8_range(cache_k, pool.dtype)
@@ -2925,10 +2925,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             return
 
         if cache_k.dtype != self.dtype:
+            # Out of place since the caller may still read cache_k/cache_v.
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k = torch.div(cache_k, k_scale, out=torch.empty_like(cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v = torch.div(cache_v, v_scale, out=torch.empty_like(cache_v))
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
 
@@ -3623,9 +3624,9 @@ class MHATokenToKVPoolFP4(MHATokenToKVPool):
             layer_id = layer.layer_id
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k = torch.div(cache_k, k_scale, out=torch.empty_like(cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v = torch.div(cache_v, v_scale, out=torch.empty_like(cache_v))
 
             from sglang.srt.layers.quantization.kvfp4_tensor import (
                 FP4MXBlock16KVQuantizeUtil,

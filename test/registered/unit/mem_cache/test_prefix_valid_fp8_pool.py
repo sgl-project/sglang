@@ -61,9 +61,7 @@ def _make_layer(k_scale, v_scale):
     )
 
 
-def _check_pool_commit(
-    pool, k, v, loc, lengths, k_scale, v_scale, *, inputs_mutated=False
-):
+def _check_pool_commit(pool, k, v, loc, lengths, k_scale, v_scale):
     return assert_prefix_commit(
         k,
         v,
@@ -73,7 +71,6 @@ def _check_pool_commit(
         lengths,
         k_scale,
         v_scale,
-        inputs_mutated=inputs_mutated,
     )
 
 
@@ -269,28 +266,24 @@ class TestPrefixValidFp8Pool(CustomTestCase):
                 unresolved,
                 unresolved.k_scale,
                 unresolved.v_scale,
-                True,
             ),
-            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale, True),
+            ("missing_k_scale", fp8_dtype, missing, None, missing.v_scale),
             (
                 "non_fp8_cache",
                 torch.bfloat16,
                 SimpleNamespace(layer_id=0),
                 None,
                 None,
-                False,
             ),
         )
         loc = torch.tensor([[2, 7, 9]], device=DEVICE)
         lengths = torch.tensor([2], dtype=torch.int32, device=DEVICE)
-        for name, dtype, layer, k_scale, v_scale, mutated in cases:
+        for name, dtype, layer, k_scale, v_scale in cases:
             with self.subTest(case=name):
                 pool = _make_pool(65, 12, dtype)
                 k = torch.randn((3, 1, 65), dtype=torch.bfloat16, device=DEVICE)
                 v = torch.randn_like(k)
-                with _check_pool_commit(
-                    pool, k, v, loc, lengths, k_scale, v_scale, inputs_mutated=mutated
-                ):
+                with _check_pool_commit(pool, k, v, loc, lengths, k_scale, v_scale):
                     pool.set_kv_buffer_prefix_valid(
                         layer, loc, lengths, k, v, k_scale, v_scale
                     )

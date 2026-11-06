@@ -377,6 +377,72 @@ class TestMHAView(CustomTestCase):
                         f"V (l={l}, p={p}, s={s}, ps={ps}) not at the envelope cell",
                     )
 
+    @unittest.skipUnless(_HAS_FP8, "requires torch.float8_e4m3fn")
+    def test_scaled_write_leaves_caller_kv_intact(self):
+        """A scaled fp8 write must not modify the caller's K/V: attention backends
+        read them after the write and do not keep a private copy."""
+        fp8 = torch.float8_e4m3fn
+        # Unified pools need 16-byte rows; one fp8 byte per element.
+        head_dim = 16 // _H
+        spec = MHASubPoolSpec(
+            name="full",
+            layer_num=_L,
+            head_num=_H,
+            head_dim=head_dim,
+            store_dtype=torch.uint8,
+            kv_cache_dtype=fp8,
+            grow_direction="down",
+        )
+        arena = _make_pool(full_spec=spec, device=_STORE_DEV)
+        pools = {
+            "unified": MHAView(
+                arena=arena,
+                spec=arena.spec("full"),
+                page_size=1,
+                model_layer_ids=tuple(range(_L)),
+                enable_alt_stream=False,
+            ),
+            "plain": mem_pool.MHATokenToKVPool(
+                size=_N_FULL,
+                page_size=1,
+                dtype=fp8,
+                head_num=_H,
+                head_dim=head_dim,
+                layer_num=_L,
+                device=_STORE_DEV,
+                enable_memory_saver=False,
+                enable_alt_stream=False,
+            ),
+        }
+        toks = torch.tensor([1, 4, 7], device=_STORE_DEV)
+        k_scale = torch.tensor(0.5, device=_STORE_DEV)
+        v_scale = torch.tensor(2.0, device=_STORE_DEV)
+        for name, pool in pools.items():
+            with self.subTest(pool=name):
+                k = torch.randn(
+                    (len(toks), _H, head_dim), dtype=_DTYPE, device=_STORE_DEV
+                )
+                v = torch.randn_like(k)
+                k_before, v_before = k.clone(), v.clone()
+                pool.set_kv_buffer(
+                    _layer(1),
+                    KVWriteLoc(toks, physical=True),
+                    k,
+                    v,
+                    k_scale,
+                    v_scale,
+                )
+                self.assertTrue(torch.equal(k, k_before), "caller's K was modified")
+                self.assertTrue(torch.equal(v, v_before), "caller's V was modified")
+                for got, src, scale in (
+                    (pool.get_key_buffer(1)[toks], k_before, k_scale),
+                    (pool.get_value_buffer(1)[toks], v_before, v_scale),
+                ):
+                    want = (src / scale).to(fp8)
+                    self.assertTrue(
+                        torch.equal(got.view(torch.uint8), want.view(torch.uint8))
+                    )
+
     def test_arena_moves_whole_envelopes(self):
         """Compaction names PHYSICAL pages of a band. The arena must relocate
         exactly the page envelopes named."""

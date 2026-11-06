@@ -424,10 +424,11 @@ class MHAView(MHAKVView):
             layer_id_override if layer_id_override is not None else layer.layer_id
         )
         if cache_k.dtype != self.dtype:
+            # Out of place since the caller may still read cache_k/cache_v.
             if k_scale is not None:
-                cache_k.div_(k_scale)
+                cache_k = torch.div(cache_k, k_scale, out=torch.empty_like(cache_k))
             if v_scale is not None:
-                cache_v.div_(v_scale)
+                cache_v = torch.div(cache_v, v_scale, out=torch.empty_like(cache_v))
             cache_k = cache_k.to(self.dtype)
             cache_v = cache_v.to(self.dtype)
         if self.store_dtype != self.dtype:

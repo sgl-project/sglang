@@ -1723,12 +1723,12 @@ class TritonAttnBackend(AttentionBackend):
                     self._set_kv_buffer(forward_batch, layer, loc_info, k, v)
                 elif self.use_mla:
                     # For MLA, scale K manually before storing since MLATokenToKVPool
-                    # doesn't accept scale parameters. Clone to protect k from mutation
-                    # since it's used later in the attention kernel.
+                    # doesn't accept scale parameters. Out of place since k is used
+                    # later in the attention kernel.
                     k_scaled = (
                         k
                         if layer.k_scale_float == 1.0
-                        else k.clone().div_(layer.k_scale)
+                        else torch.div(k, layer.k_scale, out=torch.empty_like(k))
                     )
                     self.kv_layers.layer(layer.layer_id).store(
                         layer,
@@ -1741,8 +1741,8 @@ class TritonAttnBackend(AttentionBackend):
                         forward_batch,
                         layer,
                         loc_info,
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
+                        k,
+                        v,
                         layer.k_scale,
                         layer.v_scale,
                     )
