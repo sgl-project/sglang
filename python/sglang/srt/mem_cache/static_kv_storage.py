@@ -85,19 +85,35 @@ def kv_storage_of(
 
 
 def acquire_rows(
-    table: ReqToTokenPool, state: Optional[StateStorage], reqs: List[Req]
+    table: ReqToTokenPool,
+    state: Optional[StateStorage],
+    reqs: List[Req],
+    *,
+    request_memory=None,
+    reset_request_parts: bool = True,
 ) -> Optional[List[int]]:
     """Bind the requests' rows in a static table and, with recurrent state,
     their state and tracking slots; None when the table has too few free rows.
     A request already holding a row or a slot keeps it. If the slots run out
     after the rows were bound, the rows and slots taken go back before
-    `StateSlotsExhausted` surfaces."""
+    `StateSlotsExhausted` surfaces. Unified storage supplies its fixed request
+    memory and disables the state's separate request-part reset."""
     fresh_rows = [req.kv.req_pool_idx is None for req in reqs]
     rows = table.alloc(reqs)
-    if rows is None or state is None:
+    if rows is None:
+        return None
+    if request_memory is not None:
+        request_memory.reset_rows(
+            [row for row, fresh in zip(rows, fresh_rows) if fresh]
+        )
+    if state is None:
         return rows
     try:
-        state.acquire(table, reqs, rows, fresh_rows)
+        if reset_request_parts:
+            # Preserve the default acquire contract of backend state overrides.
+            state.acquire(table, reqs, rows, fresh_rows)
+        else:
+            state.acquire(table, reqs, rows, fresh_rows, reset_request_parts=False)
     except StateSlotsExhausted:
         for req, fresh in zip(reqs, fresh_rows):
             if fresh:

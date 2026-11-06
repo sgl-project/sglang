@@ -76,7 +76,7 @@
 /python/sglang/srt/platforms @merrymercy @whybeyoung @alexnails
 /python/sglang/srt/ray @Qiaolin-Yu @xyuzh
 /python/sglang/srt/speculative @Ying1123 @merrymercy @hnyls2002 @Qiaolin-Yu
-/python/sglang/srt/utils/hf_transformers @JustinTong0323
+/python/sglang/srt/hf_transformers @JustinTong0323
 /python/sglang/srt/weight_cache @liusy58 @QiuMike @alexnails
 /python/sglang/kernels/aot @ispobock @BBuf @yizhang2077 @merrymercy @FlamingoPg @HaiShaw
 /python/sglang/kernels/aot/csrc/musa @yeahdongcn
