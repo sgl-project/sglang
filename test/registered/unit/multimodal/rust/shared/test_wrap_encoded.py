@@ -112,6 +112,30 @@ class TestWrapEncoded(CustomTestCase):
         features[0] = 99
         self.assertEqual(output.mm_items[0].feature[0, 0].item(), 99)
 
+    def test_video_item_matches_the_python_processor_fields(self):
+        """A video item reaches the scheduler as Python's own Qwen3-VL item does:
+        modality VIDEO, one offset per temporal patch, and `video_grid_thw` as a
+        [1, 3] int64 tensor."""
+        meta = msgspec.msgpack.decode(self.meta().tobytes())
+        meta["items"][0] = {
+            "modality": "video",
+            "hash": 303,
+            "identity": [7] * 32,
+            "offsets": [[2, 3], [5, 6]],
+            "model_specific_data": {"video_grid_thw": [2, 1, 2]},
+        }
+        buffers = {
+            "mm.mrope": np.arange(30, dtype=np.int64).reshape(3, 10),
+            "mm.meta": np.frombuffer(msgspec.msgpack.encode(meta), dtype=np.uint8),
+            **self.transport(np.arange(30, dtype=np.float32)),
+        }
+        video = RustMmProcessor.wrap_encoded(self.spec, buffers).mm_items[0]
+        self.assertEqual(video.modality, Modality.VIDEO)
+        self.assertEqual(video.offsets, [(2, 3), (5, 6)])
+        self.assertEqual(list(video.model_specific_data), ["video_grid_thw"])
+        grid = video.model_specific_data["video_grid_thw"]
+        self.assertEqual((grid.tolist(), str(grid.dtype)), ([[2, 1, 2]], "torch.int64"))
+
     def test_optional_pad_values_use_precomputed_hashes(self):
         # The whole point of worker-precomputed hashes is that the scheduler
         # loop never runs hash_feature — make any call a hard failure.
