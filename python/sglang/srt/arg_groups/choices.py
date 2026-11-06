@@ -196,6 +196,7 @@ RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "join
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
 LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
+    "flashqla",
     "triton",
     "cutedsl",
     "flashinfer",

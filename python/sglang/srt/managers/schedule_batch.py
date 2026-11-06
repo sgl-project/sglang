@@ -155,6 +155,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.dllm.config import DllmConfig
+    from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
@@ -291,6 +292,9 @@ class ReqKvInfo:
 
     # Mamba state: an independent resource; whether it is held is `holds_mamba`.
     mamba_pool_idx: Optional[torch.Tensor] = None  # shape (1)
+    mamba_pending_checkpoints: List[Tuple[int, torch.Tensor]] = dataclasses.field(
+        default_factory=list
+    )
     mamba_ping_pong_track_buffer: Optional[torch.Tensor] = None  # shape (2)
     # Per entry of the ping-pong buffer: True where it holds no slot (-1).
     mamba_ping_pong_empty: Optional[list[bool]] = None
@@ -1871,6 +1875,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
     reqs: List[Req]
+    prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # === Global config and shared resources (engine-lifetime; identical across batches) ===
     # Memory pool and cache
@@ -1972,6 +1977,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     mamba_track_buffer_indices: Optional[List[int]] = None  # shape: [b], 0 or 1
     mamba_track_mask: torch.Tensor = None  # shape: [b], bool
     mamba_track_seqlens: torch.Tensor = None  # shape: [b], int64
+    mamba_track_checkpoints: Optional[Tuple] = None
     # TBO rejects Mamba tracking; enabling it must also slice these CPU lists.
     mamba_track_seqlens_cpu: Optional[List[int]] = None
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
@@ -2267,6 +2273,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        self.prefill_cp_metadata = None
+        self.mamba_track_checkpoints = None
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():
@@ -2539,6 +2547,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.mamba_track_mask = torch.tensor(
                 mamba_track_mask_cpu, dtype=torch.bool, pin_memory=_pin
             ).to(self.device, non_blocking=True)
+            from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+            if is_gdn_cp_enabled():
+                self._prepare_mamba_cp_checkpoints(
+                    mamba_track_mask_cpu, mamba_track_seqlens_cpu
+                )
             self.mamba_track_seqlens = torch.tensor(
                 mamba_track_seqlens_cpu, dtype=torch.int64, pin_memory=_pin
             ).to(self.device, non_blocking=True)
@@ -2661,6 +2675,86 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             track_position=track_position,
             track_seqlen=mamba_track_seqlen,
         )
+
+    def _prepare_mamba_cp_checkpoints(
+        self, track_mask: List[bool], track_seqlens_cpu: List[int]
+    ):
+        schedule = get_schedule()
+        cp_size = get_parallel().attn_cp_size
+        cache_chunk_size = mamba_cache_chunk_size()
+        chunk_size = (
+            schedule.chunked_prefill_size
+            if schedule.chunked_prefill_size > 0
+            else schedule.max_prefill_tokens
+        )
+        min_spacing = max(
+            cache_chunk_size,
+            (chunk_size + cp_size - 1) // cp_size,
+        )
+        checkpoints = []
+        for i, (req, tracked) in enumerate(zip(self.reqs, track_mask)):
+            if not tracked:
+                checkpoints.append(())
+                continue
+            prefix = req.prefix_len
+            target = req.kv.mamba_last_track_seqlen
+            aligned_end = (
+                prefix + (req.extend_len // cache_chunk_size) * cache_chunk_size
+            )
+            preserve_chunk_end = aligned_end - target >= min_spacing
+            checkpoint_end = aligned_end if preserve_chunk_end else target
+            width = (req.extend_len + 64 * cp_size - 1) // (64 * cp_size) * 64
+            # Preserve the ordinary end/branch checkpoint. Admit complete shard
+            # ends at the configured chunk's density: short tails must not evict
+            # old states just to save several closely spaced optional snapshots.
+            positions = []
+            previous = prefix
+            for rank in range(1, cp_size):
+                position = prefix + rank * width
+                if (
+                    position < checkpoint_end
+                    and position % cache_chunk_size == 0
+                    and position - previous >= min_spacing
+                ):
+                    positions.append(position)
+                    previous = position
+            if preserve_chunk_end:
+                # A branch checkpoint must not truncate the entire CP chunk's
+                # cache publication. Reserve a snapshot for the branch and use
+                # the ordinary ping-pong slot for the aligned chunk end. Keep
+                # the existing snapshot bound and give the branch priority:
+                # prepare_mamba_checkpoints admits positions from the tail.
+                positions = [position for position in positions if position != target]
+                shard_budget = cp_size - 2
+                positions = (positions[-shard_budget:] if shard_budget else []) + [
+                    target
+                ]
+            if self.tree_cache.supports_mamba():
+                self.tree_cache.prepare_mamba_checkpoints(
+                    req,
+                    positions,
+                    reserve_slots=(
+                        1 + self.req_to_token_pool.mamba_ping_pong_track_buffer_size
+                    )
+                    * len(self.reqs),
+                )
+            if preserve_chunk_end and req.kv.mamba_pending_checkpoints:
+                assert req.kv.mamba_pending_checkpoints[-1][0] == target
+                req.kv.mamba_pending_checkpoints.sort(
+                    key=lambda checkpoint: checkpoint[0]
+                )
+                target = req.kv.mamba_last_track_seqlen = aligned_end
+                track_seqlens_cpu[i] = (
+                    target if target == prefix + req.extend_len else target + 1
+                )
+            checkpoints.append(
+                tuple(
+                    (position - prefix, slot)
+                    for position, slot in req.kv.mamba_pending_checkpoints
+                )
+                + ((target - prefix, self.mamba_track_indices[i : i + 1]),)
+            )
+        self.mamba_track_checkpoints = tuple(checkpoints)
 
     def _collect_deferred_mamba_cow_and_clear(self, reqs):
         """Collect deferred COW/clear info from requests."""
@@ -3164,6 +3258,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
 
     def prepare_for_decode(self):
+        self.prefill_cp_metadata = None
         self.forward_mode = ForwardMode.DECODE
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
@@ -3268,6 +3363,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         reqs_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        self.prefill_cp_metadata = None
         strip_beam_tail(self)
         if keep_indices is None:
             if isinstance(reqs_to_exclude, Req):
@@ -3323,6 +3419,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_checkpoints = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         self.mamba_track_mask_cpu = None
@@ -3352,6 +3449,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
 
     def merge_batch(self, other: ScheduleBatch):
+        self.prefill_cp_metadata = None
         strip_beam_tail(self)
         strip_beam_tail(other)
         # Penalizer orchestrator must be merged before Batch.reqs is merged. This is because
@@ -3391,6 +3489,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.mamba_track_buffer_indices = None
         self.mamba_track_mask = None
         self.mamba_track_seqlens = None
+        self.mamba_track_checkpoints = None
         self.mamba_track_seqlens_cpu = None
         self.mamba_prefill_track_mask_cpu = None
         self.mamba_track_mask_cpu = None
@@ -3463,6 +3562,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             mamba_track_buffer_indices=self.mamba_track_buffer_indices,
             mamba_track_mask=self.mamba_track_mask,
             mamba_track_seqlens=self.mamba_track_seqlens,
+            mamba_track_checkpoints=self.mamba_track_checkpoints,
+            prefill_cp_metadata=self.prefill_cp_metadata,
             mamba_track_seqlens_cpu=self.mamba_track_seqlens_cpu,
             mamba_prefill_track_mask_cpu=self.mamba_prefill_track_mask_cpu,
             mamba_track_mask_cpu=self.mamba_track_mask_cpu,

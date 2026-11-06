@@ -187,6 +187,35 @@ class PagedTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         self.staged_pages = []
         self.num_staged_pages = 0
 
+    def warmup(self, max_batch_size: int):
+        """Load extend kernels using scratch, without consuming live KV slots."""
+        bs = 1
+        while bs <= next_power_of_2(max_batch_size):
+            prefix_lens = torch.full(
+                (bs,), self.page_size - 1, dtype=torch.int64, device=self.device
+            )
+            seq_lens = torch.full_like(prefix_lens, 3 * self.page_size + 1)
+            last_loc = torch.full_like(prefix_lens, self.page_size - 2)
+            pages = torch.arange(1, 3 * bs + 2, device=self.device)
+            out_indices = torch.empty(
+                bs * (2 * self.page_size + 2),
+                dtype=torch.int64,
+                device=self.device,
+            )
+            # Slicing free_pages changes its pointer alignment. Load both
+            # int64 alignments as well as every batch-size specialization.
+            for offset in (0, 1):
+                alloc_extend_kernel[(bs,)](
+                    prefix_lens,
+                    seq_lens,
+                    last_loc,
+                    pages[offset:],
+                    out_indices,
+                    bs,
+                    self.page_size,
+                )
+            bs *= 2
+
     def alloc(self, need_size: int):
         # page-aligned allocation, returning contiguous indices of pages
         if self.debug_mode:

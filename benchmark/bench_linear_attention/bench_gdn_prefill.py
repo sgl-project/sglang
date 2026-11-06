@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import itertools
 import os
 import sys
 
@@ -33,6 +34,9 @@ from sglang.kernels.ops.attention.fla.chunk import (
     chunk_gated_delta_rule as triton_chunk_gated_delta_rule,
 )
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
+from sglang.srt.layers.cp.utils import (
+    ShardedContextParallelMetadata as ContextParallelMetadata,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -609,7 +613,24 @@ def main():
         nargs="+",
         default=[128, 256, 512, 1024],
     )
+    parser.add_argument(
+        "--component",
+        choices=["prefill", "peer", "checkpoints", "conv-halo"],
+        default="prefill",
+    )
+    parser.add_argument("--tokens", type=int, default=4096)
+    parser.add_argument("--cp-key-heads", type=int, default=16)
+    parser.add_argument("--cp-value-heads", type=int, default=64)
     args = parser.parse_args()
+    if args.component == "peer":
+        benchmark_peer(args.tokens)
+        return 0
+    if args.component == "checkpoints":
+        benchmark_cp_checkpoints(args.tokens, args.cp_key_heads, args.cp_value_heads)
+        return 0
+    if args.component == "conv-halo":
+        benchmark_conv_halo(args.tokens)
+        return 0
 
     if args.preset == "qwen3-next":
         args.head_size_k = 128
@@ -633,6 +654,323 @@ def main():
         run_benchmark(device, dtype, args)
 
     return 0
+
+
+def benchmark_conv_halo(tokens):
+    """Compare cloned history with projected halo views, excluding halo transport.
+
+    Physical row padding belongs to the producer projection. This benchmark
+    measures only convolution over valid tokens, not the projection GEMM.
+    """
+    import triton.testing
+
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        causal_conv1d_fn,
+        causal_conv1d_with_halo,
+    )
+
+    if tokens <= 0:
+        raise ValueError("Convolution benchmark requires positive valid-token count")
+    channels, halo_rows = 12288, 3
+    with torch.inference_mode():
+        weight = torch.randn(
+            channels, halo_rows + 1, device="cuda", dtype=torch.bfloat16
+        )
+        metadata = dict(
+            query_start_loc=torch.tensor([0, tokens], device="cuda", dtype=torch.int32),
+            seq_lens_cpu=[tokens],
+            has_initial_state=torch.ones(1, device="cuda", dtype=torch.bool),
+        )
+        logical_rows = tokens + halo_rows
+        for physical_rows in sorted(
+            {logical_rows, *((logical_rows + a - 1) // a * a for a in (16, 64, 128))}
+        ):
+            projection = torch.randn(
+                physical_rows, 20480, device="cuda", dtype=weight.dtype
+            )
+            halo = projection[:halo_rows, :channels].T.unsqueeze(0)
+            x = projection[halo_rows:logical_rows, :channels].T
+
+            def cloned_history():
+                return causal_conv1d_fn(
+                    x, weight, None, conv_states=halo.clone(), **metadata
+                )
+
+            def read_only_halo():
+                return causal_conv1d_with_halo(x, halo, weight, **metadata)
+
+            torch.testing.assert_close(
+                cloned_history(), read_only_halo(), rtol=0, atol=0
+            )
+            cloned_ms = triton.testing.do_bench_cudagraph(cloned_history)
+            halo_ms = triton.testing.do_bench_cudagraph(read_only_halo)
+            print(
+                f"valid_tokens={tokens} halo_rows={halo_rows} "
+                f"physical_rows={physical_rows} "
+                f"cloned_history_ms={cloned_ms:.6f} read_only_halo_ms={halo_ms:.6f}",
+                flush=True,
+            )
+
+
+def benchmark_cp_checkpoints(tokens, key_heads=16, value_heads=64):
+    """Measure shard-end export overhead with a fixed collective iteration count.
+
+    Run with torchrun --nproc-per-node=4 FILE --component checkpoints --tokens 4096.
+    Tokens is the local shard length; recurrence and communication are both timed.
+    """
+    import os
+
+    import torch.distributed as dist
+
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
+        FlashQLAGDNKernel,
+    )
+
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    try:
+        if world < 2 or tokens <= 0 or tokens % 64:
+            raise ValueError("Checkpoint benchmark requires CP>=2 and aligned shards")
+        torch.manual_seed(397 + rank)
+        with torch.inference_mode():
+            kernel = FlashQLAGDNKernel(fallback=None, cp_group=dist.group.WORLD)
+            q = torch.randn(
+                1, tokens, key_heads, 128, device="cuda", dtype=torch.bfloat16
+            )
+            v = torch.randn(1, tokens, value_heads, 128, device="cuda", dtype=q.dtype)
+            inputs = [q, torch.randn_like(q), v]
+            inputs += [
+                -torch.rand(1, tokens, value_heads, device="cuda") * 0.1,
+                torch.rand(1, tokens, value_heads, device="cuda"),
+            ]
+            initial = torch.randn(1, value_heads, 128, 128, device="cuda") * 0.1
+            dist.broadcast(initial, src=0)
+            full_inputs = []
+            for value in inputs:
+                gathered = [torch.empty_like(value) for _ in range(world)]
+                dist.all_gather(gathered, value)
+                full_inputs.append(torch.cat(gathered, dim=1))
+            reference = FlashQLAGDNKernel(fallback=None)
+            expected, expected_final = reference._sequence(full_inputs, initial)
+            for positions in ((), tuple(tokens * r for r in range(1, world))):
+                actual, final, checkpoints = kernel.extend(
+                    *inputs,
+                    ssm_states=initial,
+                    cache_indices=None,
+                    query_start_loc=None,
+                    cp_metadata=ContextParallelMetadata(
+                        group=kernel._group, rank=rank, world=world
+                    ),
+                    initial_state=initial,
+                    inplace_update=False,
+                    checkpoint_indices=positions,
+                )
+                torch.testing.assert_close(
+                    actual,
+                    expected[:, rank * tokens : (rank + 1) * tokens],
+                    atol=0.03,
+                    rtol=0.03,
+                )
+                torch.testing.assert_close(final, expected_final, atol=0.03, rtol=0.03)
+                for position, state in zip(positions, checkpoints):
+                    _, expected_state = reference._sequence(
+                        [x[:, :position].contiguous() for x in full_inputs], initial
+                    )
+                    torch.testing.assert_close(
+                        state, expected_state, atol=0.03, rtol=0.03
+                    )
+                if rank == 0:
+                    print(
+                        f"correctness PASS heads={key_heads}:{value_heads} checkpoints={positions}",
+                        flush=True,
+                    )
+                for _ in range(5):
+                    kernel.extend(
+                        *inputs,
+                        ssm_states=initial,
+                        cache_indices=None,
+                        query_start_loc=None,
+                        cp_metadata=ContextParallelMetadata(
+                            group=kernel._group, rank=kernel._rank, world=kernel._world
+                        ),
+                        initial_state=initial,
+                        inplace_update=False,
+                        checkpoint_indices=positions,
+                    )
+                dist.barrier()
+                start, end = (torch.cuda.Event(enable_timing=True) for _ in range(2))
+                start.record()
+                for _ in range(50):
+                    kernel.extend(
+                        *inputs,
+                        ssm_states=initial,
+                        cache_indices=None,
+                        query_start_loc=None,
+                        cp_metadata=ContextParallelMetadata(
+                            group=kernel._group, rank=kernel._rank, world=kernel._world
+                        ),
+                        initial_state=initial,
+                        inplace_update=False,
+                        checkpoint_indices=positions,
+                    )
+                end.record()
+                end.synchronize()
+                elapsed = torch.tensor(start.elapsed_time(end) / 50, device="cuda")
+                dist.all_reduce(elapsed, op=dist.ReduceOp.MAX)
+                if rank == 0:
+                    print(
+                        f"cp={world} tokens={tokens * world} "
+                        f"extra_checkpoints={len(positions)} ms={elapsed.item():.4f}",
+                        flush=True,
+                    )
+    finally:
+        dist.destroy_process_group()
+
+
+def benchmark_peer(tokens):
+    """Run with torchrun --nproc-per-node=4 FILE --component peer --tokens 4096."""
+    import os
+    from types import SimpleNamespace
+
+    import torch.distributed as dist
+    from flash_qla.ops.gated_delta_rule.chunk import correct_initial_states
+
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        autotune_causal_conv1d_peer,
+        causal_conv1d_peer_with_halo,
+    )
+    from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+        TorchSymmMemCommunicator,
+    )
+    from sglang.srt.layers.attention.linear.gdn_backend import warmup_gdn_prefill
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
+        FlashQLAGDNKernel,
+        _autotune_state_prefix,
+    )
+    from sglang.srt.layers.attention.mamba.causal_conv1d import causal_conv1d_fn
+
+    torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    dist.init_process_group("nccl")
+    rank, world = dist.get_rank(), dist.get_world_size()
+    if world != 4 or tokens < 64 or tokens % 64:
+        raise ValueError("Peer benchmark requires CP4 and complete 64-token blocks")
+    torch.manual_seed(397)
+    layer = SimpleNamespace(
+        num_q_heads=16,
+        num_k_heads=16,
+        num_v_heads=64,
+        head_q_dim=128,
+        head_k_dim=128,
+        head_v_dim=128,
+        conv_weights=torch.randn(12288, 4, device="cuda", dtype=torch.bfloat16) * 0.1,
+        bias=None,
+        activation="silu",
+    )
+    history = torch.randn(12288, 3, device="cuda", dtype=torch.bfloat16)
+    torch.manual_seed(397 + rank)
+    with torch.inference_mode():
+        kernel = FlashQLAGDNKernel(fallback=None, cp_group=dist.group.WORLD)
+        communicator = TorchSymmMemCommunicator.get(dist.group.WORLD, history.device)
+        workspace = communicator.allocate_peer_workspace(history.shape, history.dtype)
+        geometry = (16, 16, 64, 128, 128, 128)
+        try:
+            for stride in (12288, 20480):
+                raw = torch.randn(tokens, stride, device="cuda", dtype=torch.bfloat16)[
+                    :, :12288
+                ]
+                tails = [torch.empty_like(history) for _ in range(world)]
+                dist.all_gather(tails, raw[-3:].T.contiguous())
+                preceding = history if rank == 0 else tails[rank - 1]
+                expected = causal_conv1d_fn(
+                    raw.T,
+                    layer.conv_weights,
+                    None,
+                    activation="silu",
+                    conv_states=preceding.unsqueeze(0).clone(),
+                    has_initial_state=torch.ones(1, device="cuda", dtype=torch.bool),
+                    cache_indices=torch.zeros(1, device="cuda", dtype=torch.int32),
+                    query_start_loc=torch.tensor(
+                        [0, tokens], device="cuda", dtype=torch.int32
+                    ),
+                    seq_lens_cpu=[tokens],
+                ).T
+                tactic = autotune_causal_conv1d_peer(
+                    raw, history, layer.conv_weights, workspace, head_geometry=geometry
+                )
+                for bt, bc in itertools.product((4, 8, 16), (128, 256)):
+                    qkv, halo, terminal = causal_conv1d_peer_with_halo(
+                        raw,
+                        history,
+                        layer.conv_weights,
+                        workspace,
+                        head_geometry=geometry,
+                        tuning={"bt": bt, "bc": bc},
+                    )
+                    actual = torch.cat([x.flatten(2)[0] for x in qkv], dim=-1)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    torch.testing.assert_close(halo, preceding, rtol=0, atol=0)
+                    torch.testing.assert_close(terminal, tails[-1], rtol=0, atol=0)
+                print(f"rank={rank} stride={stride} conv_tactic={tactic}", flush=True)
+        finally:
+            workspace.close()
+        try:
+            packed = (
+                torch.randn(2, 64, 128, 128, device="cuda", dtype=torch.bfloat16) * 0.02
+            )
+            peers = [torch.empty_like(packed) for _ in range(world)]
+            dist.all_gather(peers, packed)
+            tactic = _autotune_state_prefix(kernel, packed)
+            # Publication counts must match even when prefix lengths differ.
+            for step in range(world):
+                pre = min(step, rank)
+                summaries = peers[rank - pre : rank + 1]
+                expected = correct_initial_states(
+                    raw_h0=None,
+                    ht_buffer=torch.stack([x[0] for x in summaries]),
+                    mt_buffer=torch.stack([x[1] for x in summaries]),
+                    fallback_mask=torch.ones(
+                        pre + 1, 64, device="cuda", dtype=torch.bool
+                    ),
+                    seq_map_r2c=torch.tensor(
+                        [0, pre + 1], device="cuda", dtype=torch.long
+                    ),
+                    state_v_first=True,
+                )[-1]
+                for tile in (32, 64, 128):
+                    kernel._prefix_tuning = {"bv": tile, "warps": 4}
+                    destination = torch.empty_like(expected)
+                    # Compile the reference before entering peer publication.
+                    dist.barrier()
+                    actual = kernel.state_prefix(packed, pre, out=destination)
+                    assert actual.data_ptr() == destination.data_ptr()
+                    torch.testing.assert_close(
+                        actual,
+                        expected,
+                        rtol=0,
+                        atol=0,
+                        msg=f"rank={rank} pre={pre} tile={tile}",
+                    )
+            print(f"rank={rank} prefix_tactic={tactic}", flush=True)
+        finally:
+            if kernel._prefix_workspace is not None:
+                kernel._prefix_workspace.close()
+                kernel._prefix_workspace = None
+        warmup_gdn_prefill(
+            device=torch.device("cuda", rank),
+            group=dist.group.WORLD,
+            dtype=torch.bfloat16,
+            state_dtype=torch.float32,
+            key_heads=16,
+            value_heads=64,
+            key_head_dim=128,
+            value_head_dim=128,
+            conv_kernel_size=4,
+            projection_stride=20480,
+            local_tokens=tokens,
+        )
+    print(f"rank={rank} peer parity and warmup passed", flush=True)
+    dist.destroy_process_group()
 
 
 if __name__ == "__main__":

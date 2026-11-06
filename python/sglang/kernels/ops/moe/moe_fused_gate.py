@@ -96,7 +96,9 @@ def _topk_gate_small_m(
     return weights, ids
 
 
-@triton.jit
+# The row count only controls masking. Reuse the startup kernel for short CP
+# shards instead of loading a specialization while peers wait in collectives.
+@triton.jit(do_not_specialize=["M"])
 def _router_triton_kernel(
     scores_ptr,  # [M, N] raw logits, fp32/fp16/bf16 (upcast to fp32 on load)
     bias_ptr,  # [N]    fp32/fp16/bf16 (upcast to fp32 on load)

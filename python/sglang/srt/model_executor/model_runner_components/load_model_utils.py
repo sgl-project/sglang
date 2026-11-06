@@ -5,6 +5,7 @@ import logging
 import os
 import socket
 import threading
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import msgspec
@@ -443,3 +444,196 @@ def dist_barrier_after_load(
             raise ValueError(
                 f"TP rank {tp_rank} could finish the model loading, but there are other ranks that didn't finish loading. It is likely due to unexpected failures (e.g., OOM) or a slow node."
             ) from None
+
+
+@torch.no_grad()
+def warmup_cp_unquantized_linears(model):
+    """Load local GEMV/GEMM paths before empty CP peers can queue collectives."""
+    from sglang.srt.layers.linear import LinearBase
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    warmed = set()
+    for module in model.modules():
+        if isinstance(module, LinearBase) and isinstance(
+            module.quant_method, UnquantizedLinearMethod
+        ):
+            bias = None if module.skip_bias_add else module.bias
+            apply = partial(module.quant_method.apply, module, bias=bias)
+        elif isinstance(module, torch.nn.Linear):
+            apply = module
+            bias = module.bias
+        else:
+            continue
+        weight = module.weight
+        if not weight.is_cuda or weight.ndim != 2:
+            continue
+        key = (
+            type(module),
+            weight.device,
+            weight.dtype,
+            tuple(weight.shape),
+            weight.stride(),
+            bias is not None,
+        )
+        if key in warmed:
+            continue
+        # A one-row router takes a different cuBLAS path from the full startup
+        # batch. Loading it after peers enter MoE can synchronize a CUDA context
+        # whose queued collectives are waiting for this rank to enqueue MoE.
+        for rows in (1, 2, 4, 8, 16, 17, 32, 64, 128, 256):
+            apply(
+                torch.zeros(
+                    (rows, weight.shape[1]), device=weight.device, dtype=weight.dtype
+                )
+            )
+        warmed.add(key)
+    torch.cuda.synchronize()
+    logger.info(
+        "CP local unquantized linear warmup complete: geometries=%d", len(warmed)
+    )
+
+
+def warmup_context_parallel(self):
+    """Warm the selected CP path with loaded layer geometry before KV allocation."""
+    import time
+
+    from sglang.kernels.ops.attention.fused_qk_rmsnorm_rope_gate import (
+        warmup_fused_qk_rmsnorm_rope_gate,
+    )
+    from sglang.kernels.ops.attention.merge_state import (
+        warmup_merge_state,
+    )
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        warmup_gdn_projection_norm,
+    )
+    from sglang.kernels.ops.elementwise.elementwise import (
+        warmup_fused_gate_sigmoid_mul,
+        warmup_fused_sigmoid_mul,
+    )
+    from sglang.srt.configs.mamba_utils import mamba2_state_dtype
+    from sglang.srt.distributed import get_attn_cp_group
+    from sglang.srt.layers.attention.linear.gdn_backend import (
+        warmup_gdn_prefill,
+    )
+    from sglang.srt.layers.cp.utils import TokenExchangeStream, warmup_copy_token_rows
+    from sglang.srt.layers.layernorm import warmup_indexed_add_rmsnorm
+    from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+    from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+    from sglang.srt.runtime_context import get_parallel, get_schedule
+
+    started = time.monotonic()
+    config = self.model_config.hf_text_config
+    cp_group = get_attn_cp_group()
+    key_dim = config.linear_key_head_dim * config.linear_num_key_heads
+    value_dim = config.linear_value_head_dim * config.linear_num_value_heads
+    device = torch.device(self.device)
+    warmup_cp_unquantized_linears(self.model)
+    warmup_indexed_add_rmsnorm(
+        device=device,
+        dtype=self.dtype,
+        hidden_size=config.hidden_size,
+        eps=config.rms_norm_eps,
+    )
+    warmup_merge_state(
+        device,
+        self.dtype,
+        config.num_attention_heads // get_parallel().attn_tp_size,
+        config.head_dim or config.hidden_size // config.num_attention_heads,
+    )
+    for dtype in {self.dtype, torch.float32}:
+        warmup_copy_token_rows(
+            device=device,
+            dtype=dtype,
+            features=config.hidden_size,
+            row_strides=(config.hidden_size, 2 * config.hidden_size),
+        )
+    chunk_size = get_schedule().chunked_prefill_size
+    tokens = chunk_size if (chunk_size or 0) > 0 else get_schedule().max_prefill_tokens
+    if (
+        get_exec().moe.enable_mxfp4_mega
+        and get_parallel().moe_tp_size == 1
+        and self.server_args.attn_cp_transport == "symm_rma"
+    ):
+        # Reserve before KV budgeting, shared by the hybrid attention backends.
+        # A ragged batch can put every short request on rank zero.
+        features = config.hidden_size * getattr(config, "hc_count", 1)
+        self.cp_residual_exchange = TokenExchangeStream(
+            group=cp_group.device_group,
+            device=device,
+            capacity=tokens,
+            features=features,
+            dtype=self.dtype,
+            transport="symm_rma",
+        )
+    alignment = 64 * cp_group.world_size
+    warmup_gdn_prefill(
+        device=device,
+        dtype=self.dtype,
+        key_heads=config.linear_num_key_heads,
+        value_heads=config.linear_num_value_heads,
+        key_head_dim=config.linear_key_head_dim,
+        value_head_dim=config.linear_value_head_dim,
+        conv_kernel_size=config.linear_conv_kernel_dim,
+        state_dtype=mamba2_state_dtype(config).temporal,
+        group=cp_group.device_group,
+        projection_stride=2 * key_dim + 2 * value_dim,
+        local_tokens=(tokens + alignment - 1) // alignment * 64,
+    )
+    for module in self.model.modules():
+        shared_gate = getattr(module, "shared_expert_gate", None)
+        if shared_gate is not None:
+            warmup_fused_gate_sigmoid_mul(
+                device=shared_gate.weight.device,
+                dtype=self.dtype,
+                weight_dtype=shared_gate.weight.dtype,
+                hidden_dim=shared_gate.weight.shape[-1],
+            )
+        if hasattr(module, "forward_prepare_cuda_fused"):
+            if module.attn_output_gate:
+                warmup_fused_sigmoid_mul(
+                    device=module.q_norm.weight.device,
+                    dtype=self.dtype,
+                    hidden_dim=module.num_heads * module.head_dim,
+                )
+            is_mrope = isinstance(module.rotary_emb, MRotaryEmbedding)
+            mrope_axes = (
+                tuple(module.rotary_emb.axis_map.tolist())
+                if is_mrope and module.rotary_emb.axis_map is not None
+                else None
+            )
+            if not is_mrope or mrope_axes is not None:
+                warmup_fused_qk_rmsnorm_rope_gate(
+                    device=module.q_norm.weight.device,
+                    dtype=self.dtype,
+                    weight_dtype=module.q_norm.weight.dtype,
+                    cache_dtype=module.rotary_emb.cos_sin_cache.dtype,
+                    num_heads=module.num_heads,
+                    num_kv_heads=module.num_kv_heads,
+                    head_size=module.head_dim,
+                    rotary_dim=module.rotary_emb.rotary_dim,
+                    eps=module.q_norm.variance_epsilon,
+                    has_gate=module.attn_output_gate,
+                    mrope_axes=mrope_axes,
+                )
+        attn = getattr(module, "attn", None)
+        if isinstance(attn, RadixLinearAttention):
+            warmup_gdn_projection_norm(
+                device=module.norm.weight.device,
+                dtype=self.dtype,
+                weight_dtype=module.norm.weight.dtype,
+                num_heads_qk=attn.num_k_heads,
+                num_heads_v=attn.num_v_heads,
+                head_qk=attn.head_k_dim,
+                head_v=attn.head_v_dim,
+                eps=module.norm.eps,
+                group_size=module.norm.group_size,
+                norm_before_gate=module.norm.norm_before_gate,
+                activation=module.norm.activation,
+            )
+
+    logger.info(
+        "CP kernel warmup complete: rank=%d/%d elapsed=%.3fs",
+        cp_group.rank_in_group,
+        cp_group.world_size,
+        time.monotonic() - started,
+    )

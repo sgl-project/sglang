@@ -40,9 +40,37 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, published_topology
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def setUpModule():
+    topology = published_topology()
+    topology.__enter__()
+    unittest.addModuleCleanup(topology.__exit__, None, None, None)
+
+
+def tearDownModule():
+    unittest.doModuleCleanups()
+
+
+@contextmanager
+def _cp_topology(*, attn_cp_rank=None, attn_cp_size=None, **fields):
+    # CP rank changes must preserve the TP factorization and rank mapping.
+    parallel = get_parallel()
+    rank = parallel.attn_cp_rank if attn_cp_rank is None else attn_cp_rank
+    size = parallel.attn_cp_size if attn_cp_size is None else attn_cp_size
+    with parallel.override(
+        tp_size=size,
+        tp_rank=rank,
+        attn_cp_size=size,
+        attn_cp_rank=rank,
+        moe_tp_size=size,
+        moe_tp_rank=rank,
+        **fields,
+    ):
+        yield
 
 
 class _ExtendMode:
@@ -172,7 +200,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         for rank in range(4):
             with (
                 self.subTest(rank=rank),
-                get_parallel().override(attn_cp_rank=rank, attn_cp_size=4),
+                _cp_topology(attn_cp_rank=rank, attn_cp_size=4),
             ):
                 # Uneven request boundaries must not round each request up
                 # independently: interleave shards their concatenation.
@@ -183,7 +211,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                     512,
                 )
                 self.assertTrue(runner.can_run_graph(batch))
-        with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+        with _cp_topology(attn_cp_rank=0, attn_cp_size=4):
             batch.extend_prefix_lens_cpu = [0, 1, 0]
             self.assertTrue(runner.can_run_graph(batch))
 
@@ -207,7 +235,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         ):
             selected_buckets = []
             for cp_rank in range(4):
-                with get_parallel().override(attn_cp_rank=cp_rank, attn_cp_size=4):
+                with _cp_topology(attn_cp_rank=cp_rank, attn_cp_size=4):
                     selected_buckets.append(
                         runner.prefill_cp_bcg_input.select_replay_bucket_for_batch(
                             num_tokens=2048,
@@ -218,7 +246,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
                     )
 
             self.assertEqual(selected_buckets, [2304, 2304, 2304, 2304])
-            with get_parallel().override(attn_cp_rank=0, attn_cp_size=4):
+            with _cp_topology(attn_cp_rank=0, attn_cp_size=4):
                 self.assertTrue(runner.can_run_graph(forward_batch))
 
     def test_bucket_search_preserves_two_x_padding_limit(self):
@@ -249,7 +277,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         self._enable_zigzag()
 
         with (
-            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            _cp_topology(attn_cp_rank=0, attn_cp_size=4),
             patch(
                 "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
@@ -279,7 +307,7 @@ class TestPrefillCPBCGReplay(CustomTestCase):
         self._enable_zigzag()
 
         with (
-            get_parallel().override(attn_cp_rank=0, attn_cp_size=4),
+            _cp_topology(attn_cp_rank=0, attn_cp_size=4),
             patch(
                 "sglang.srt.layers.cp.bcg.bcg.get_cp_padding_align_size",
                 return_value=8,
@@ -304,7 +332,7 @@ class TestCPZigzagStrategy(CustomTestCase):
 
     def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
         strategy = ZigzagCPStrategy(cp_size=cp_size)
-        with get_parallel().override(attn_cp_rank=rank):
+        with _cp_topology(attn_cp_rank=rank, attn_cp_size=cp_size):
             return strategy.build_metadata(
                 num_tokens=sum(extend_seq_lens),
                 seqs_len=seq_lens,
@@ -554,9 +582,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
 
             with (
-                get_parallel().override(
-                    attn_cp_group=_FakeCPGroup(padded_rank_tensors)
-                ),
+                _cp_topology(attn_cp_group=_FakeCPGroup(padded_rank_tensors)),
                 patch(
                     "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
                     return_value=torch.no_grad(),
@@ -587,9 +613,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
 
             with (
-                get_parallel().override(
-                    attn_cp_group=_FakeCPGroup(padded_rank_tensors)
-                ),
+                _cp_topology(attn_cp_group=_FakeCPGroup(padded_rank_tensors)),
                 patch(
                     "sglang.srt.distributed.device_communicators.pynccl_allocator.use_symmetric_memory",
                     return_value=torch.no_grad(),
@@ -609,7 +633,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             max_rank_len=[7, 7],
         )
 
-        with get_parallel().override(attn_cp_size=cp_size):
+        with _cp_topology(attn_cp_size=cp_size):
             align_size = get_cp_padding_align_size()
             pad_logical_token_to_physical(metadata)
 
@@ -823,7 +847,7 @@ class TestCPZigzagStrategy(CustomTestCase):
             seq_lens=[12],
             extend_seq_lens=[12],
         )
-        with get_parallel().override(attn_cp_size=cp_size):
+        with _cp_topology(attn_cp_size=cp_size):
             pad_logical_token_to_physical(metadata)
         fb = SimpleNamespace(attn_cp_metadata=metadata)
         q = torch.arange(8 * 2).view(8, 2)
@@ -882,6 +906,11 @@ class TestCPZigzagStrategy(CustomTestCase):
 
 class TestCPInterleaveStrategy(CustomTestCase):
     def setUp(self):
+        sharded_cp = patch(
+            "sglang.srt.layers.cp.utils.is_sharded_cp_enabled", return_value=False
+        )
+        sharded_cp.start()
+        self.addCleanup(sharded_cp.stop)
         init_cp_strategy(
             enable_prefill_cp=True,
             cp_size=4,
@@ -893,7 +922,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
 
     def _metadata_for_rank(self, rank, *, cp_size, seq_lens, extend_seq_lens):
         strategy = InterleaveCPStrategy(cp_size=cp_size)
-        with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+        with _cp_topology(attn_cp_rank=rank, attn_cp_size=cp_size):
             return strategy.build_metadata(
                 num_tokens=sum(extend_seq_lens),
                 seqs_len=seq_lens,
@@ -922,7 +951,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
                 metas.append(metadata)
                 fb = self._forward_batch(metadata, extend_seq_lens)
                 strategy = InterleaveCPStrategy(cp_size=cp_size)
-                with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+                with _cp_topology(attn_cp_rank=rank, attn_cp_size=cp_size):
                     per_rank.append(strategy.shard_hidden_states(x, fb))
         return metas, per_rank
 
@@ -963,7 +992,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
             patchers[1],
             patchers[2],
             patchers[3],
-            get_parallel().override(attn_cp_group=object()),
+            _cp_topology(attn_cp_group=object()),
         ):
             yield
 
@@ -998,7 +1027,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         )
 
         with (
-            get_parallel().override(
+            _cp_topology(
                 attn_cp_rank=2, attn_cp_size=4, enable_cp_tp_group_sharing=False
             ),
             patch(
@@ -1037,7 +1066,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
             expected_positions = positions[rank::cp_size]
 
             with (
-                get_parallel().override(
+                _cp_topology(
                     attn_cp_rank=rank,
                     attn_cp_size=cp_size,
                 ),
@@ -1056,6 +1085,34 @@ class TestCPInterleaveStrategy(CustomTestCase):
             self.assertTrue(torch.equal(local_positions, expected_positions))
             self.assertTrue(torch.equal(helper_x, expected_x))
             self.assertTrue(torch.equal(helper_positions, expected_positions))
+
+    def test_interleave_shards_mrope_positions_along_token_axis(self):
+        for cp_size in (2, 4):
+            for total_tokens in (1, 8, 11):
+                positions = torch.arange(3 * total_tokens).reshape(3, total_tokens)
+                for rank in range(cp_size):
+                    with self.subTest(cp_size=cp_size, tokens=total_tokens, rank=rank):
+                        metadata = self._metadata_for_rank(
+                            rank,
+                            cp_size=cp_size,
+                            seq_lens=[total_tokens],
+                            extend_seq_lens=[total_tokens],
+                        )
+                        batch = self._forward_batch(metadata, [total_tokens])
+                        with _cp_topology(attn_cp_rank=rank, attn_cp_size=cp_size):
+                            pad_logical_token_to_physical(metadata)
+                            local = InterleaveCPStrategy(cp_size).shard_position_ids(
+                                positions, batch
+                            )
+                        expected = positions[:, rank::cp_size]
+                        self.assertEqual(local.shape[0], 3)
+                        self.assertEqual(local.stride(-1), 1)
+                        self.assertTrue(
+                            torch.equal(local[:, : expected.shape[1]], expected)
+                        )
+                        self.assertEqual(
+                            torch.count_nonzero(local[:, expected.shape[1] :]), 0
+                        )
 
     def test_interleave_padding_preserves_shard_and_gather(self):
         cp_size = 4
@@ -1077,7 +1134,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
             ):
                 pad_logical_token_to_physical(metadata)
             fb = self._forward_batch(metadata, [total_tokens])
-            with get_parallel().override(attn_cp_rank=rank, attn_cp_size=cp_size):
+            with _cp_topology(attn_cp_rank=rank, attn_cp_size=cp_size):
                 local_x = InterleaveCPStrategy(cp_size=cp_size).shard_hidden_states(
                     x, fb
                 )
@@ -1092,7 +1149,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         for rank in range(cp_size):
             fb = self._forward_batch(metas[rank], [total_tokens])
             with (
-                get_parallel().override(
+                _cp_topology(
                     attn_cp_rank=rank,
                     attn_cp_size=cp_size,
                 ),
@@ -1128,7 +1185,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         for rank in range(cp_size):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
             with (
-                get_parallel().override(
+                _cp_topology(
                     attn_cp_rank=rank,
                     attn_cp_size=cp_size,
                 ),
@@ -1155,7 +1212,7 @@ class TestCPInterleaveStrategy(CustomTestCase):
         for rank in range(cp_size):
             fb = self._forward_batch(metas[rank], extend_seq_lens)
             with (
-                get_parallel().override(
+                _cp_topology(
                     attn_cp_rank=rank,
                     attn_cp_size=cp_size,
                 ),

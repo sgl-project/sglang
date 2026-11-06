@@ -404,3 +404,82 @@ def chunk_gated_delta_rule_fwd_h(
         TRACK_STATE=track_state is not None,
     )
     return h, v_new
+
+
+@triton.jit
+def _gated_delta_rule_state_prefix_kernel(
+    Peers,
+    Out,
+    FIRST: tl.constexpr,
+    RANK: tl.constexpr,
+    HEADS: tl.constexpr,
+    D: tl.constexpr,
+    BV: tl.constexpr,
+):
+    h = tl.program_id(0)
+    v = tl.program_id(1) * BV + tl.arange(0, BV)
+    k = tl.arange(0, D)
+    state = tl.full((BV, D), 0, tl.float32)
+    for owner in tl.static_range(FIRST, RANK):
+        base = tl.load(Peers + owner).to(tl.pointer_type(tl.bfloat16))
+        h_next = tl.load(base + h * D * D + v[:, None] * D + k[None, :]).to(tl.float32)
+        if owner == FIRST:
+            state = h_next
+        else:
+            # State is V,K; transition is K_out,K_in. The reference rounds
+            # the prior state to BF16 before this multiplication as well.
+            m = tl.load(base + HEADS * D * D + h * D * D + k[:, None] + k[None, :] * D)
+            state = tl.dot(state.to(tl.bfloat16), m, acc=h_next)
+    tl.store(Out + h * D * D + v[:, None] * D + k[None, :], state)
+
+
+def warmup_gated_delta_rule_state_prefix(cp_rank, heads, tile):
+    for first in range(cp_rank + 1):
+        compiled = _gated_delta_rule_state_prefix_kernel.warmup(
+            torch.uint64,
+            torch.float32,
+            first,
+            cp_rank,
+            heads,
+            128,
+            tile,
+            num_warps=4,
+            grid=(heads, 128 // tile),
+        )
+        _ = compiled.run
+
+
+def gated_delta_rule_state_prefix(
+    peer_ptrs, *, rank, pre, heads, out=None, value_tile=64, num_warps=4
+):
+    """Compose published BF16 H/M summaries in sequence order into FP32 state.
+
+    Peer publication and lifetime ordering belong to the caller's communicator.
+    The first summary includes the cached initial state; later summaries apply
+    their transition after rounding the preceding state to BF16.
+    """
+    if not 0 <= pre <= rank or rank >= peer_ptrs.numel():
+        raise ValueError("Invalid state prefix topology")
+    if value_tile not in (16, 32, 64, 128) or num_warps not in (4, 8):
+        raise ValueError("Unsupported state prefix tile")
+    if (
+        not peer_ptrs.is_cuda
+        or peer_ptrs.dtype != torch.uint64
+        or not peer_ptrs.is_contiguous()
+    ):
+        raise ValueError("State prefix requires contiguous CUDA peer pointers")
+    if out is None:
+        out = torch.empty(
+            (heads, 128, 128), device=peer_ptrs.device, dtype=torch.float32
+        )
+    if (
+        out.shape != (heads, 128, 128)
+        or out.dtype != torch.float32
+        or not out.is_contiguous()
+        or out.device != peer_ptrs.device
+    ):
+        raise ValueError("Invalid state prefix output")
+    _gated_delta_rule_state_prefix_kernel[(heads, 128 // value_tile)](
+        peer_ptrs, out, rank - pre, rank, heads, 128, value_tile, num_warps=num_warps
+    )
+    return out

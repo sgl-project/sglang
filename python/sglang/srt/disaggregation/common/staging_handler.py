@@ -1,5 +1,5 @@
 """
-Staging handler for heterogeneous TP KV cache transfer.
+Staging handler for CP and heterogeneous TP KV cache transfer.
 
 Isolates staging scatter lifecycle from decode.py and conn.py.
 Generic (backend-agnostic) code is at the top; mooncake-specific
@@ -9,6 +9,7 @@ protocol code is at the bottom.
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import struct
 import threading
@@ -17,10 +18,10 @@ from collections import deque
 from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
+import zmq
 
-from sglang.srt.runtime_context import (
-    get_schedule,
-)
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_disagg, get_schedule
 from sglang.srt.utils import (
     create_device_event,
     create_device_stream,
@@ -32,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Bounded wait for a watermark advance before re-enqueueing a deferred staging
 # chunk, so the re-enqueue retry does not busy-spin a core.
 STAGING_WATERMARK_WAIT_S = 0.001
+# A capacity failure, distinct from a transport/registration/protocol error.
+STAGING_MEMORY_UNAVAILABLE = -2
 
 if TYPE_CHECKING:
     from sglang.srt.disaggregation.decode import DecodeRequest
@@ -40,6 +43,26 @@ if TYPE_CHECKING:
 # ======================================================================
 # Generic staging state and handler (backend-agnostic)
 # ======================================================================
+
+
+def staging_enabled(*, is_mla: bool) -> bool:
+    configured = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+    if (
+        get_disagg().disaggregation_require_bulk
+        or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+    ) and not configured:
+        raise ValueError(
+            "--disaggregation-require-bulk requires SGLANG_DISAGG_STAGING_BUFFER=1"
+        )
+    if is_mla:
+        if configured:
+            raise ValueError("KV staging requires an MHA/GQA KV pool")
+        return False
+    if configured is not None:
+        return configured
+    # Preserve the 397B deployment default. Bulk staging changes the completion
+    # protocol and must be enabled on both prefill and decode during rollout.
+    return False
 
 
 @dataclasses.dataclass
@@ -93,10 +116,11 @@ class DecodeStagingHandler:
         self.total_kv_heads = total_kv_heads
         self.tp_rank = tp_rank
         self.scheduler = scheduler
+        # Submission, event publication and teardown must share a host lock.
+        # Synchronizing a CUDA stream alone cannot exclude a future submission.
+        self._lock = threading.RLock()
         # Same stall->Failed semantics (and knob) as _check_waiting_timeout,
         # which is unreachable once the receiver has concluded Success.
-        from sglang.srt.environ import envs
-
         self.completion_timeout = float(
             envs.SGLANG_DISAGGREGATION_WAITING_TIMEOUT.get()
         )
@@ -105,17 +129,20 @@ class DecodeStagingHandler:
         # before unregister runs, but release_room still needs it.
         self._room_to_receiver: dict = {}
         self._wm_subscribers: dict = {}
-        # room -> chunk_idx -> [(page_start, num_pages, writer_id)] fan-in
-        # arrivals; handler-owned so room teardown can purge them.
+        self._pending_watermarks: dict = {}
+        # room -> chunk_idx -> writer_id -> completion metadata. Keeping each
+        # writer once prevents duplicated notifications from triggering scatter.
         self._writer_counts: dict = {}
-        self._staging_lifecycle = threading.Condition()
+        self._staging_lifecycle = threading.Condition(self._lock)
         self._room_tokens: dict[int, object] = {}
         self._inflight_submits: dict[object, int] = {}
         self._claimed_chunks: set[tuple[object, int]] = set()
         self._closing_rooms: set[int] = set()
         self._defer_scatter = envs.SGLANG_PLB_SCATTER_DEFER.get()
         # Keep each queued chunk tied to its original room generation.
-        self._pending_scatters: deque[tuple[object, int, int, int, int]] = deque()
+        self._pending_scatters: deque[tuple[object, int, int, int, int, object]] = (
+            deque()
+        )
 
         k_buffers = kv_buffer_info["k_buffers"]
         assert k_buffers, "k_buffers must not be empty"
@@ -126,22 +153,27 @@ class DecodeStagingHandler:
         )
         self.device_module = torch.get_device_module(self.device)
         self.gpu_id = self.device.index
+        self._completed_chunks: dict = {}
 
     def register_wm_subscriber(self, receiver, session_id: str) -> None:
         """Register a prefill's bootstrap connection for watermark broadcasts."""
-        if receiver is None or not receiver.bootstrap_infos:
+        if receiver is None or not getattr(receiver, "bootstrap_infos", None):
             return
-        key = tuple(str(bi) for bi in receiver.bootstrap_infos)
-        if key in self._wm_subscribers:
-            return
+        key = self._watermark_peer_key(receiver)
+        with self._lock:
+            previous = self._wm_subscribers.get(key)
+            if previous is not None and previous[1] == session_id:
+                return
+            self._wm_subscribers[key] = (receiver, session_id)
+            # A new session must receive the current watermark even if no
+            # allocation is freed after it registers.
+            self._pending_watermarks[key] = self.staging_allocator.get_watermark()
+            self._flush_watermarks()
 
-        self._wm_subscribers[key] = (receiver, session_id)
-        # Watermark state is per prefill session. Send the current value so a
-        # new session's first allocation cannot wait on a missed update.
-        self._send_watermark(
-            receiver,
-            session_id,
-            self.staging_allocator.get_watermark(),
+    @staticmethod
+    def _watermark_peer_key(receiver) -> tuple:
+        return tuple(
+            (info["rank_ip"], info["rank_port"]) for info in receiver.bootstrap_infos
         )
 
     def num_writers_for(self, receiver) -> int:
@@ -153,7 +185,12 @@ class DecodeStagingHandler:
         else:
             tp_writers = 1
         pp_writers = prefill_info.pp_size // self.kv_manager.pp_size
-        return tp_writers * pp_writers
+        cp_writers = (
+            prefill_info.attn_cp_size
+            if getattr(prefill_info, "ring_cp_sharded", False)
+            else 1
+        )
+        return tp_writers * pp_writers * cp_writers
 
     @classmethod
     def create(cls, kv_manager, scheduler, tp_rank: int) -> DecodeStagingHandler:
@@ -192,7 +229,10 @@ class DecodeStagingHandler:
     # ------------------------------------------------------------------
 
     def register_decode_req(self, room: int, decode_req: DecodeRequest) -> None:
-        # Called once per room from pop_preallocated, before send_metadata.
+        # Called before send_metadata; extend can encounter the same request.
+        with self._staging_lifecycle:
+            if self._room_to_decode_req.get(room) is decode_req:
+                return
         decode_req._staging_all_success = False
         decode_req._staging_success_ts = 0.0
         decode_req._staging_failed = False
@@ -233,6 +273,7 @@ class DecodeStagingHandler:
             decode_req = self._room_to_decode_req.pop(room, None)
             receiver = self._room_to_receiver.pop(room, None)
             self._writer_counts.pop(room, None)
+            self._completed_chunks.pop(room, None)
             self._pending_scatters = deque(
                 entry for entry in self._pending_scatters if entry[1] != room
             )
@@ -242,6 +283,17 @@ class DecodeStagingHandler:
         try:
             if decode_req is not None:
                 self.release_room(room, decode_req, receiver)
+            if receiver is not None and getattr(receiver, "bootstrap_infos", None):
+                key = self._watermark_peer_key(receiver)
+                if not any(
+                    getattr(peer, "bootstrap_infos", None)
+                    and self._watermark_peer_key(peer) == key
+                    for peer in self._room_to_receiver.values()
+                ):
+                    # Do not keep broadcasting to a P process after its last
+                    # transfer ends. A later request registers the latest value.
+                    self._wm_subscribers.pop(key, None)
+                    self._pending_watermarks.pop(key, None)
             self.kv_manager._staging_ctx.room_receivers.pop(room, None)
             self.kv_manager._staging_ctx.room_bootstrap.pop(room, None)
         finally:
@@ -289,7 +341,7 @@ class DecodeStagingHandler:
             with self._staging_lifecycle:
                 if not self._pending_scatters:
                     return
-                room_token, room, chunk_idx, page_start, num_pages = (
+                room_token, room, chunk_idx, page_start, num_pages, mask = (
                     self._pending_scatters.popleft()
                 )
                 if self._room_tokens.get(room) is not room_token:
@@ -301,6 +353,7 @@ class DecodeStagingHandler:
                 num_pages,
                 stream=stream,
                 room_token=room_token,
+                writer_slot_mask=mask,
             )
 
     def submit_chunk_scatter(
@@ -311,6 +364,7 @@ class DecodeStagingHandler:
         num_pages: int,
         stream=None,
         room_token: object | None = None,
+        writer_slot_mask=None,
     ) -> bool:
         """Submit a claimed chunk and publish its completion event."""
         from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
@@ -336,6 +390,15 @@ class DecodeStagingHandler:
             ):
                 return False
             alloc_id, staging_offset, _, _, _ = chunk_infos[chunk_idx]
+            if staging_offset == STAGING_MEMORY_UNAVAILABLE:
+                chunk_infos[chunk_idx] = (
+                    -1,
+                    StagingAllocator.CHUNK_SCATTERED,
+                    0,
+                    -1,
+                    0,
+                )
+                return True
             claim = (token, chunk_idx)
             if staging_offset < 0 or alloc_id < 0 or claim in self._claimed_chunks:
                 return False
@@ -344,7 +407,13 @@ class DecodeStagingHandler:
 
         try:
             ok = self._scatter_region(
-                staging_offset, page_start, num_pages, decode_req, receiver, stream
+                staging_offset,
+                page_start,
+                num_pages,
+                decode_req,
+                receiver,
+                stream,
+                writer_slot_mask,
             )
             if ok:
                 event = create_device_event(self.device)
@@ -392,6 +461,9 @@ class DecodeStagingHandler:
         page_start: int,
         num_pages: int,
         writer_id: str,
+        staged: bool = True,
+        writer_index: Optional[int] = None,
+        slot_indices: Optional[List[int]] = None,
     ) -> bool:
         """Fan in all writers, then submit or queue a complete chunk."""
         submit_now = False
@@ -407,18 +479,38 @@ class DecodeStagingHandler:
                     chunk_idx,
                 )
                 return False
-            room_counts = self._writer_counts.setdefault(room, {})
-            arrivals = room_counts.setdefault(chunk_idx, [])
-            arrivals.append((page_start, num_pages, writer_id))
-            num_writers = self.num_writers_for(receiver)
-            if len(arrivals) < num_writers:
+            completed = self._completed_chunks.setdefault(room, set())
+            if chunk_idx in completed:
                 return False
+            room_counts = self._writer_counts.setdefault(room, {})
+            arrivals = room_counts.setdefault(chunk_idx, {})
+            arrival = (page_start, num_pages, staged, writer_index, slot_indices)
+            if writer_id in arrivals:
+                if arrivals[writer_id] != arrival:
+                    raise ValueError(
+                        "Conflicting staging writer completion: "
+                        f"room={room}, chunk={chunk_idx}, writer={writer_id!r}, "
+                        f"previous={arrivals[writer_id]!r}, incoming={arrival!r}"
+                    )
+                return False
+            if any(a[:2] != arrival[:2] for a in arrivals.values()):
+                received_ranges = {writer: a[:2] for writer, a in arrivals.items()}
+                raise ValueError(
+                    "Staging writers disagree on chunk page range: "
+                    f"room={room}, chunk={chunk_idx}, writer={writer_id!r}, "
+                    f"incoming={arrival[:2]!r}, received={received_ranges!r}"
+                )
+            arrivals[writer_id] = arrival
+            if len(arrivals) < self.num_writers_for(receiver):
+                return False
+            mask = self._writer_slot_mask(receiver, arrivals.values())
             if self._defer_scatter:
                 self._pending_scatters.append(
-                    (room_token, room, chunk_idx, page_start, num_pages)
+                    (room_token, room, chunk_idx, page_start, num_pages, mask)
                 )
             else:
                 submit_now = True
+            completed.add(chunk_idx)
             del room_counts[chunk_idx]
 
         if submit_now:
@@ -428,28 +520,53 @@ class DecodeStagingHandler:
                 page_start,
                 num_pages,
                 room_token=room_token,
+                writer_slot_mask=mask,
             )
         return True
+
+    def _writer_slot_mask(self, receiver, arrivals):
+        # New Mooncake messages identify the exact packed slots. A writer that
+        # ran out of source memory wrote KV directly and must never be scattered.
+        if all(a[3] is None for a in arrivals):
+            return None  # Existing transport protocol.
+        cp_size = (
+            receiver.prefill_info.attn_cp_size
+            if getattr(receiver.prefill_info, "ring_cp_sharded", False)
+            else 1
+        )
+        writers = max(cp_size, receiver.prefill_info.attn_tp_size // self.decode_tp)
+        slots = len(self.kv_buffer_info["k_buffers"]) * 2
+        mask = [[False] * slots for _ in range(writers)]
+        for _, _, staged, writer, indices in arrivals:
+            if writer is None or not 0 <= writer < writers:
+                raise ValueError("Invalid staging writer index")
+            for index in indices or []:
+                if not 0 <= index < slots:
+                    raise ValueError("Invalid staging layer slot")
+                if staged:
+                    mask[writer][index] = True
+        return mask
 
     def submit_last_scatter_async(self, room: int) -> bool:
         """Record all-ranks Success. Scatter is fully arrival-driven (every
         chunk, including the last); advance_scatter completes the room once
         no allocation is still waiting for its arrival."""
-        decode_req = self._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "[STAGING] submit_last_scatter_async: room=%s not registered. "
-                "This should not happen if register_decode_req is called at "
-                "kv_receiver.init() time.",
-                room,
-            )
-            return False
-        if not decode_req._staging_all_success:
-            # Set the timestamp before the flag so the deadline check never
-            # reads a zero ts.
-            decode_req._staging_success_ts = time.monotonic()
-            decode_req._staging_all_success = True
-        return True
+        with self._lock:
+            decode_req = self._room_to_decode_req.get(room)
+            if decode_req is None:
+                logger.warning(
+                    "[STAGING] submit_last_scatter_async: room=%s not registered. "
+                    "This should not happen if register_decode_req is called at "
+                    "kv_receiver.init() time.",
+                    room,
+                )
+                return False
+            if not decode_req._staging_all_success:
+                # Set the timestamp before the flag so the deadline check never
+                # reads a zero ts.
+                decode_req._staging_success_ts = time.monotonic()
+                decode_req._staging_all_success = True
+            return True
 
     # ------------------------------------------------------------------
     # Event check + free: called from main thread (pop_transferred)
@@ -471,32 +588,34 @@ class DecodeStagingHandler:
         keeps it open while a CHUNK_READY is still in flight after Success.
         Rooms incomplete past the disaggregation waiting timeout are failed.
         """
-        chunk_events = decode_req._chunk_events
-        if chunk_events:
-            for i in range(len(chunk_events) - 1, -1, -1):
-                event, alloc_id = chunk_events[i]
-                if event.query():
-                    chunk_events.pop(i)
-                    self._free_and_send_watermark(alloc_id, decode_req)
+        with self._lock:
+            self._flush_watermarks()
+            chunk_events = decode_req._chunk_events
+            if chunk_events:
+                for i in range(len(chunk_events) - 1, -1, -1):
+                    event, alloc_id = chunk_events[i]
+                    if event.query():
+                        chunk_events.pop(i)
+                        self._free_and_send_watermark(alloc_id, decode_req)
 
-        if not decode_req._staging_all_success:
-            return
-        room = decode_req.req.bootstrap_room
-        receiver = self._room_to_receiver.get(room)
-        chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
-        incomplete = bool(chunk_events) or any(info[0] >= 0 for info in chunk_infos)
-        if not incomplete:
-            decode_req._staging_scatter_done = True
-            return
-        elapsed = time.monotonic() - decode_req._staging_success_ts
-        if elapsed > self.completion_timeout:
-            logger.error(
-                "[STAGING] room=%s not complete %.0fs after all-ranks Success "
-                "(a scatter never arrived); failing the request.",
-                room,
-                elapsed,
-            )
-            decode_req._staging_failed = True
+            if not decode_req._staging_all_success:
+                return
+            room = decode_req.req.bootstrap_room
+            receiver = self._room_to_receiver.get(room)
+            chunk_infos = receiver.chunk_staging_infos if receiver is not None else []
+            incomplete = bool(chunk_events) or any(info[0] >= 0 for info in chunk_infos)
+            if not incomplete:
+                decode_req._staging_scatter_done = True
+                return
+            elapsed = time.monotonic() - decode_req._staging_success_ts
+            if elapsed > self.completion_timeout:
+                logger.error(
+                    "[STAGING] room=%s not complete %.0fs after all-ranks Success "
+                    "(a scatter never arrived); failing the request.",
+                    room,
+                    elapsed,
+                )
+                decode_req._staging_failed = True
 
     # ------------------------------------------------------------------
     # Internal methods
@@ -510,6 +629,7 @@ class DecodeStagingHandler:
         decode_req: DecodeRequest,
         receiver,
         stream=None,
+        writer_slot_mask=None,
     ) -> bool:
         """Scatter on the supplied forward stream or the background stream."""
         from sglang.srt.disaggregation.common.staging_buffer import (
@@ -563,6 +683,16 @@ class DecodeStagingHandler:
                 self.decode_tp,
                 dst_tp_rank,
                 self.total_kv_heads,
+                cp_size=(
+                    receiver.prefill_info.attn_cp_size
+                    if getattr(receiver.prefill_info, "ring_cp_sharded", False)
+                    else 1
+                ),
+                writer_slot_mask=(
+                    torch.tensor(writer_slot_mask, device=self.device, dtype=torch.bool)
+                    if writer_slot_mask is not None
+                    else None
+                ),
             )
 
         return True
@@ -573,23 +703,42 @@ class DecodeStagingHandler:
         """Free a staging allocation and broadcast watermark to all prefills."""
         self.staging_allocator.free(alloc_id)
         post_wm = self.staging_allocator.get_watermark()
-        for receiver, session_id in list(self._wm_subscribers.values()):
-            self._send_watermark(receiver, session_id, post_wm)
+        for key in self._wm_subscribers:
+            self._pending_watermarks[key] = post_wm
+        self._flush_watermarks()
+
+    def _flush_watermarks(self) -> None:
+        # Watermarks are cumulative: retain only the newest value per peer and
+        # retry from scatter polling, including polls with no newly freed slots.
+        for key, watermark in list(self._pending_watermarks.items()):
+            receiver, session_id = self._wm_subscribers[key]
+            if self._send_watermark(receiver, session_id, watermark):
+                del self._pending_watermarks[key]
 
     @staticmethod
-    def _send_watermark(receiver, session_id: str, watermark) -> None:
-        """Send one allocator watermark to a registered prefill session."""
+    def _send_watermark(receiver, session_id: str, watermark) -> bool:
+        """Try every writer without blocking the decode scheduler on a peer."""
         wm_round, wm_tail = watermark
         wm_round_b = str(wm_round).encode("ascii")
         wm_tail_b = str(wm_tail).encode("ascii")
         sid_b = session_id.encode("ascii")
+        sent = True
         for bootstrap_info in receiver.bootstrap_infos:
             try:
                 sock, lock = receiver._connect_to_bootstrap_server(bootstrap_info)
-                with lock:
-                    sock.send_multipart([b"WATERMARK", wm_round_b, wm_tail_b, sid_b])
-            except Exception:
-                pass
+                if not lock.acquire(blocking=False):
+                    sent = False
+                    continue
+                try:
+                    sock.send_multipart(
+                        [b"WATERMARK", wm_round_b, wm_tail_b, sid_b],
+                        flags=zmq.NOBLOCK,
+                    )
+                finally:
+                    lock.release()
+            except zmq.ZMQError:
+                sent = False
+        return sent
 
 
 def is_watermark_ready(
@@ -670,13 +819,34 @@ class StagingRegisterInfo:
 
     base_ptr: int = 0
     total_size: int = 0
-    # Staging slots stay [all K, all V] after draft buffers alter kv_data_ptrs order;
-    # older peers leave this empty and callers fall back to kv_layer_ids.
+    # Version 0 peers advertise only the first entry stride and target count.
+    # Version 1 describes the scatter order, which differs from registered
+    # [K_target, V_target, K_draft, V_draft] pointer order.
     slot_layer_ids: List[int] = dataclasses.field(default_factory=list)
+    layout_version: int = 0
+    slot_ids: list = dataclasses.field(default_factory=list)
+    slot_item_lens: List[int] = dataclasses.field(default_factory=list)
+
+    def layout_bytes(self) -> bytes:
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            validate_staging_kv_entries,
+        )
+
+        if self.layout_version != 1:
+            raise ValueError("Cannot publish an unsupported staging layout version")
+        validate_staging_kv_entries(self.slot_ids, self.slot_item_lens)
+        return json.dumps(
+            {"version": 1, "slots": self.slot_ids, "item_lens": self.slot_item_lens},
+            separators=(",", ":"),
+        ).encode("utf-8")
 
     @classmethod
     def from_zmq_fields(
-        cls, msg: list, msg_start_offset: int, slot_ids_index: Optional[int] = None
+        cls,
+        msg: list,
+        msg_start_offset: int,
+        layout_index: Optional[int] = None,
+        slot_ids_index: Optional[int] = None,
     ) -> Optional[StagingRegisterInfo]:
         i = msg_start_offset
         base_ptr = (
@@ -689,16 +859,41 @@ class StagingRegisterInfo:
         )
         if base_ptr == 0 and total_size == 0:
             return None
-        slot_layer_ids: List[int] = []
-        if (
-            slot_ids_index is not None
-            and len(msg) > slot_ids_index
-            and len(msg[slot_ids_index]) > 0
-        ):
-            raw = msg[slot_ids_index]
-            slot_layer_ids = list(struct.unpack(f"{len(raw) // 8}Q", raw))
+        layout_version, slot_ids, slot_item_lens = 0, [], []
+        if layout_index is not None and len(msg) > layout_index and msg[layout_index]:
+            from sglang.srt.disaggregation.common.staging_buffer import (
+                validate_staging_kv_entries,
+            )
+
+            layout = json.loads(msg[layout_index])
+            if (
+                not isinstance(layout, dict)
+                or type(layout.get("version")) is not int
+                or layout["version"] != 1
+            ):
+                raise ValueError("Unsupported staging layout protocol version")
+            slot_item_lens = layout.get("item_lens")
+            if not isinstance(slot_item_lens, list):
+                raise ValueError("Missing staging slot byte strides")
+            slot_ids = validate_staging_kv_entries(layout.get("slots"), slot_item_lens)
+            layout_version = 1
         return cls(
-            base_ptr=base_ptr, total_size=total_size, slot_layer_ids=slot_layer_ids
+            base_ptr=base_ptr,
+            total_size=total_size,
+            slot_layer_ids=(
+                list(
+                    struct.unpack(
+                        f"{len(msg[slot_ids_index]) // 8}Q", msg[slot_ids_index]
+                    )
+                )
+                if slot_ids_index is not None
+                and len(msg) > slot_ids_index
+                and msg[slot_ids_index]
+                else []
+            ),
+            layout_version=layout_version,
+            slot_ids=slot_ids,
+            slot_item_lens=slot_item_lens,
         )
 
 
@@ -716,7 +911,7 @@ class PrefillStagingStrategy:
 
         self.kv_manager = kv_manager
         self.staging_buffer = staging_buffer
-        page_size = kv_manager.kv_buffer_tensors["page_size"]
+        page_size = kv_manager.kv_args.page_size
         self.full_chunk_pages = (
             staging_grid_tokens(get_schedule().chunked_prefill_size, page_size)
             // page_size
@@ -780,9 +975,24 @@ class PrefillStagingStrategy:
     ) -> int:
         """Execute staged transfer (gather + RDMA).
 
-        Returns 0 on success, -1 to signal fallback to slice path.
+        Mooncake returns STAGING_MEMORY_UNAVAILABLE for GPU capacity failures;
+        registration, layout and transport failures propagate to the caller.
         """
         try:
+            kwargs = {"staging_buffer": self.staging_buffer}
+            if target_info.staging is not None and target_info.staging.layout_version:
+                kwargs.update(
+                    num_dst_target_kv_layers=-1,
+                    dst_num_entries=len(target_info.dst_kv_ptrs),
+                    dst_slot_ids=target_info.staging.slot_ids,
+                    dst_slot_item_lens=target_info.staging.slot_item_lens,
+                )
+            else:
+                kwargs["dst_slot_layer_ids"] = (
+                    target_info.staging.slot_layer_ids
+                    if target_info.staging is not None
+                    else None
+                )
             return self.kv_manager.send_kvcache_staged(
                 session_id,
                 prefill_kv_indices,
@@ -792,12 +1002,7 @@ class PrefillStagingStrategy:
                 target_info.dst_attn_tp_size,
                 target_info.dst_kv_item_len,
                 target_info.dst_kv_layer_ids,
-                staging_buffer=self.staging_buffer,
-                dst_slot_layer_ids=(
-                    target_info.staging.slot_layer_ids
-                    if target_info.staging is not None
-                    else None
-                ),
+                **kwargs,
             )
         except Exception as e:
             raise RuntimeError(
@@ -842,6 +1047,7 @@ def init_staging_buffers(
     chunked_prefill_size: int,
     *,
     device_type: str,
+    allow_oom_fallback: bool = False,
 ) -> list:
     """Create prefill-side staging buffers, each sized to one prefill chunk.
 
@@ -859,13 +1065,27 @@ def init_staging_buffers(
 
     buffers = []
     for _ in range(count):
-        buf = StagingBuffer(size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool)
+        try:
+            buf = StagingBuffer(
+                size_bytes, device, gpu_id, custom_mem_pool=custom_mem_pool
+            )
+        except torch.OutOfMemoryError:
+            if not allow_oom_fallback:
+                raise
+            logger.warning(
+                "Staging GPU allocation failed (%s bytes); this worker uses direct KV writes",
+                size_bytes,
+            )
+            buffers.append(None)
+            continue
         register_fn(buf.get_ptr(), buf.get_size())
         buffers.append(buf)
     return buffers
 
 
-def init_staging_allocator(register_fn, kv_args, *, device_type: str):
+def init_staging_allocator(
+    register_fn, kv_args, *, device_type: str, allow_oom_fallback: bool = False
+):
     """Create decode-side staging ring-buffer allocator and register with transport.
 
     ``register_fn`` is called as ``register_fn(ptr, size)`` to hand the region to
@@ -880,9 +1100,24 @@ def init_staging_allocator(register_fn, kv_args, *, device_type: str):
     device = f"{_bare_device_type(device_type)}:{gpu_id}"
 
     custom_mem_pool, _ = _get_custom_mem_pool(device)
-    allocator = StagingAllocator(pool_size_bytes, device, gpu_id, custom_mem_pool)
-    register_fn(allocator.get_base_ptr(), allocator.get_total_size())
-    return allocator
+    while pool_size_bytes > 0:
+        try:
+            allocator = StagingAllocator(
+                pool_size_bytes, device, gpu_id, custom_mem_pool
+            )
+        except torch.OutOfMemoryError:
+            if not allow_oom_fallback:
+                raise
+            # Keep bulk available with a smaller pool when possible. Chunks
+            # larger than the surviving pool negotiate direct writes.
+            pool_size_bytes //= 2
+            if pool_size_bytes < 64 * 1024 * 1024:
+                logger.warning("No GPU memory for KV staging; using direct KV writes")
+                return None
+            continue
+        register_fn(allocator.get_base_ptr(), allocator.get_total_size())
+        return allocator
+    raise ValueError("Staging pool size must be positive")
 
 
 def handle_staging_req(
@@ -966,6 +1201,14 @@ def handle_staging_req(
             chunk_tokens,
             bytes_per_head_per_token,
             num_kv_layers,
+            slot_head_bytes=[
+                n // (page_size * dst_heads_per_rank) for n in kv_item_lens
+            ],
+            cp_size=(
+                receiver.prefill_info.attn_cp_size
+                if getattr(receiver.prefill_info, "ring_cp_sharded", False)
+                else 1
+            ),
         )
         result = staging_allocator.assign(required)
         if result is None:
@@ -1038,27 +1281,21 @@ class StagingManagerMixin:
         assert handler is not None, (
             "STAGING_REQ received before staging handler initialized"
         )
-        decode_req = handler._room_to_decode_req.get(room)
-        if decode_req is None:
-            logger.warning(
-                "STAGING_REQ received for unregistered room=%s, skipping",
-                room,
+        with handler._lock:
+            receiver = handler._room_to_receiver.get(room)
+            if receiver is None:
+                logger.warning("STAGING_REQ received for unregistered room=%s", room)
+                return
+            handle_staging_req(
+                msg,
+                self._staging_ctx.allocator,
+                self.kv_args,
+                self.attn_tp_size,
+                receiver.prefill_info.attn_tp_size,
+                getattr(self, "kv_buffer_tensors", None),
+                self._staging_ctx.room_receivers,
+                self._staging_ctx.room_bootstrap,
             )
-            return
-        prefill_tp = decode_req.kv_receiver.prefill_info.attn_tp_size
-        handle_staging_req(
-            msg,
-            self._staging_ctx.allocator,
-            self.kv_args,
-            self.attn_tp_size,
-            prefill_tp,
-            getattr(self, "kv_buffer_tensors", None),
-            self._staging_ctx.room_receivers,
-            self._staging_ctx.room_bootstrap,
-        )
-
-        receiver = self._staging_ctx.room_receivers.get(room)
-        if receiver is not None:
             handler.register_wm_subscriber(receiver, session_id)
 
 
@@ -1071,6 +1308,7 @@ def prefetch_staging_reqs(
     prefetch_sockets: dict,
     requester_pp_rank: Optional[int] = None,
     upto_tokens: Optional[int] = None,
+    logical_page_size: Optional[int] = None,
 ) -> None:
     """Send STAGING_REQ for all chunks before the prefill forward starts.
 
@@ -1085,7 +1323,7 @@ def prefetch_staging_reqs(
     from sglang.srt.disaggregation.common.staging_buffer import staging_grid_tokens
     from sglang.srt.utils.network import NetworkAddress
 
-    page_size = kv_buffer_tensors["page_size"]
+    page_size = logical_page_size or kv_buffer_tensors["page_size"]
     full_chunk_pages = staging_grid_tokens(chunked_prefill_size, page_size) // page_size
 
     for session_id, tinfo in transfer_infos[room].items():

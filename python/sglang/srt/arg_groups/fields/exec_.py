@@ -893,6 +893,11 @@ class ExecMoe(msgspec.Struct):
             resolvable=True,
         ),
     ] = "none"
+    enable_mxfp4_mega: A[
+        bool,
+        "Convert W4AFP8 experts to MXFP4 and use the SM90 FlashInfer MegaMoE "
+        "kernel with single-node pure EP and sharded CP prefill.",
+    ] = False
     enable_w4a4_mxfp4_megamoe: A[
         bool,
         "Enable the W4A4 MXFP4 MegaMoE path with DeepGEMM's "

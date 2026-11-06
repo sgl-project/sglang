@@ -1474,6 +1474,36 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
+    def prepare_mamba_checkpoints(self, req, positions, *, reserve_slots):
+        self.components[ComponentType.MAMBA].prepare_mamba_checkpoints(
+            req, positions, reserve_slots=reserve_slots
+        )
+
+    def _cache_pending_mamba_checkpoints(self, req, params):
+        pending = req.kv.mamba_pending_checkpoints
+        if not pending:
+            return
+        for position, slot in pending:
+            assert 0 < position < len(params.value) and position % self.page_size == 0
+            result = self.insert(
+                replace(
+                    params,
+                    key=RadixKey(
+                        req.full_untruncated_fill_ids[:position],
+                        req.extra_key,
+                        is_bigram=self.tree_core.is_eagle,
+                        cache_salt=req.cache_salt,
+                    ),
+                    value=params.value[:position],
+                    mamba_value=slot,
+                    prev_prefix_len=len(params.value),
+                    inserted_len=len(params.value),
+                )
+            )
+            if result.mamba_exist:
+                self.components[ComponentType.MAMBA]._free_mamba_value(slot)
+        req.kv.mamba_pending_checkpoints = []
+
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
         move its tree lock onto the node the insert ended on."""
@@ -1579,6 +1609,8 @@ class UnifiedRadixCache(BasePrefixCache):
                     req, is_finished=is_finished, insert_params=insert_params
                 )
             return
+        if self.is_mamba_enabled:
+            self._cache_pending_mamba_checkpoints(req, insert_params)
         req.kv.record_insert(page_aligned_len)
 
         # Split the leaf at the prompt boundary so eviction can drop the output

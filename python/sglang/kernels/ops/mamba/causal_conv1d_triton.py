@@ -20,7 +20,7 @@ PAD_SLOT_ID = -1
 CAUSAL_CONV1D_FWD_BLOCK_M = 8
 
 
-@triton.jit()
+@triton.jit(do_not_specialize=["token_block_start"])
 def _causal_conv1d_fwd_kernel(  # continuous batching
     # Pointers to matrices
     x_ptr,  # (dim, cu_seqlen) holding `batch` of actual sequences + padded sequences
@@ -56,6 +56,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     SILU_ACTIVATION: tl.constexpr,
     HAS_INITIAL_STATES: tl.constexpr,
     HAS_CACHE: tl.constexpr,
+    UPDATE_CONV_STATES: tl.constexpr,
     IS_CONTINUOUS_BATCHING: tl.constexpr,
     USE_PAD_SLOT: tl.constexpr,
     NP2_STATELEN: tl.constexpr,
@@ -63,6 +64,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     BLOCK_N: tl.constexpr,
     USE_BLOCK_TABLE: tl.constexpr = False,
     OUTPUT_SPLIT_SIZE: tl.constexpr = 0,
+    token_block_start: tl.int32 = 0,
 ):
     conv_states_ptr = initial_states_ptr
     conv_state_indices_ptr = cache_indices_ptr
@@ -86,7 +88,7 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
     else:
         # single-sequence id
         idx_seq = tl.program_id(0)
-        chunk_offset = tl.program_id(1)
+        chunk_offset = tl.program_id(1) + token_block_start
 
     # BLOCK_N elements along the feature-dimension (channel)
     idx_feats = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -218,7 +220,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
 
             mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[None, :]
             tl.debug_barrier()  #  NOTE: use this due to bug in Triton compiler
-            tl.store(conv_states_ptrs_target, new_conv_state, mask)
+            if UPDATE_CONV_STATES:
+                tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
         else:
             if load_init_state:
@@ -263,7 +266,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
                     None, :
                 ]
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                if UPDATE_CONV_STATES:
+                    tl.store(conv_states_ptrs_target, new_conv_state, mask)
             else:  # load_init_state == False
                 # update conv_state by shifting left, BUT
                 # set cols prior to 'x' as zeros + cols from 'x'
@@ -290,7 +294,8 @@ def _causal_conv1d_fwd_kernel(  # continuous batching
                 mask = (idx_tokens_conv < state_len)[:, None] & (idx_feats < dim)[
                     None, :
                 ]
-                tl.store(conv_states_ptrs_target, new_conv_state, mask)
+                if UPDATE_CONV_STATES:
+                    tl.store(conv_states_ptrs_target, new_conv_state, mask)
 
     else:  # chunk_offset > 0
         # read prior-token data from `x`
@@ -428,6 +433,9 @@ def causal_conv1d_fn(
     validate_data=False,
     block_table: Optional[torch.Tensor] = None,
     output_split_size: int = 0,
+    out: Optional[torch.Tensor] = None,
+    token_block_range: Optional[tuple[int, int]] = None,
+    update_conv_states: bool = True,
     **kwargs,
 ):
     """support varlen + continuous batching when x is 2D tensor
@@ -476,22 +484,48 @@ def causal_conv1d_fn(
         plane, or zero for the original layout. Must divide dim.
     out: same shape as `x`, or (dim // output_split_size, cu_seq_len,
         output_split_size) when output_split_size is nonzero.
+        Optional destination shared by disjoint token-block launches.
+    token_block_range: optional [begin, end) range of 8-token blocks per sequence.
+        Block zero owns the initial-state read and final conv-state write.
+        Interior blocks only read local input, permitting halo exchange overlap.
+    update_conv_states: whether to write final history back to conv_states.
+        Disable for read-only halo views into a projected input buffer.
     """
     if isinstance(activation, bool) and activation:
         activation = "silu"
 
-    is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     dim, cu_seqlen = x.shape
     if output_split_size:
         if output_split_size < 0 or dim % output_split_size:
             raise ValueError("output_split_size must be positive and divide dim")
-        out = torch.empty(
-            (dim // output_split_size, cu_seqlen, output_split_size),
-            dtype=x.dtype,
-            device=x.device,
-        )
+        output_shape = (dim // output_split_size, cu_seqlen, output_split_size)
     else:
-        out = torch.empty_like(x)
+        output_shape = x.shape
+    if out is None:
+        out = (
+            torch.empty(output_shape, dtype=x.dtype, device=x.device)
+            if output_split_size
+            else torch.empty_like(x)
+        )
+    elif out.shape != output_shape or out.dtype != x.dtype or out.device != x.device:
+        raise ValueError(
+            "Convolution output must match the output shape, dtype and device"
+        )
+    if block_table is not None:
+        if token_block_range is not None:
+            raise ValueError("Token block ranges cannot be combined with a block table")
+        block_start = block_end = 0
+    else:
+        num_blocks = triton.cdiv(
+            max(seq_lens_cpu, default=0), CAUSAL_CONV1D_FWD_BLOCK_M
+        )
+        block_start, block_end = token_block_range or (0, num_blocks)
+        if not 0 <= block_start <= block_end <= num_blocks:
+            raise ValueError("Convolution token block range exceeds the input")
+        if block_start == block_end:
+            return out
+
+    is_channel_last = (x.stride(0) == 1) & (x.stride(1) > 1)
     _, width = weight.shape
     state_len = width - 1
     np2_statelen = triton.next_power_of_2(state_len)
@@ -561,10 +595,9 @@ def causal_conv1d_fn(
         if block_table is not None:
             # (num_blocks, 1, feature blocks): no host-side sequence lengths.
             return (block_table.shape[0], 1, triton.cdiv(dim, META["BLOCK_N"]))
-        max_seq_len = max(seq_lens_cpu)
         return (
             len(seq_lens_cpu),  # batch_size
-            (max_seq_len + META["BLOCK_M"] - 1) // META["BLOCK_M"],
+            block_end - block_start,
             triton.cdiv(dim, META["BLOCK_N"]),
         )
 
@@ -603,6 +636,7 @@ def causal_conv1d_fn(
         SILU_ACTIVATION=activation in ["silu", "swish"],
         HAS_INITIAL_STATES=has_initial_state is not None,
         HAS_CACHE=conv_states is not None,
+        UPDATE_CONV_STATES=update_conv_states,
         IS_CONTINUOUS_BATCHING=cache_indices is not None,
         USE_PAD_SLOT=pad_slot_id is not None,
         NP2_STATELEN=np2_statelen,
@@ -611,9 +645,70 @@ def causal_conv1d_fn(
         BLOCK_N=256,
         USE_BLOCK_TABLE=block_table is not None,
         OUTPUT_SPLIT_SIZE=output_split_size,
+        token_block_start=block_start,
         num_stages=2,
     )
     return out
+
+
+def causal_conv1d_with_halo(
+    x: torch.Tensor,
+    halo: torch.Tensor,
+    weight: torch.Tensor,
+    *,
+    query_start_loc: torch.Tensor,
+    seq_lens_cpu: List[int],
+    has_initial_state: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    activation: Optional[str] = "silu",
+    out: Optional[torch.Tensor] = None,
+    token_block_range: Optional[tuple[int, int]] = None,
+):
+    """Convolve valid tokens with read-only per-sequence predecessor rows.
+
+    x is [channels, sum(seq_lens_cpu)]; halo is [sequences, channels, width-1]
+    in chronological order. Both may be strided views of one projection buffer.
+    query_start_loc and seq_lens_cpu describe only valid tokens, excluding halo
+    and physical padding. has_initial_state selects halo versus zero history.
+    Output contains only valid tokens; out must not alias x or halo. The caller
+    retains ownership of any persistent convolution state and final-history store.
+    """
+    if x.ndim != 2 or weight.ndim != 2 or weight.shape[0] != x.shape[0]:
+        raise ValueError("Convolution expects [channels, tokens] and [channels, width]")
+    if weight.shape[1] not in (2, 3, 4):
+        raise ValueError("Read-only halo convolution supports widths 2, 3 and 4")
+    sequences = len(seq_lens_cpu)
+    if halo.shape != (sequences, x.shape[0], weight.shape[1] - 1):
+        raise ValueError("Halo must contain width-1 predecessor rows per sequence")
+    if halo.dtype != x.dtype or halo.device != x.device:
+        raise ValueError("Halo must match the input dtype and device")
+    if (
+        not sequences
+        or any(length < 0 for length in seq_lens_cpu)
+        or sum(seq_lens_cpu) != x.shape[1]
+        or query_start_loc.shape != (sequences + 1,)
+        or has_initial_state.shape != (sequences,)
+        or query_start_loc.device != x.device
+        or has_initial_state.device != x.device
+        or query_start_loc.dtype not in (torch.int32, torch.int64)
+        or has_initial_state.dtype != torch.bool
+    ):
+        raise ValueError("Convolution metadata must describe the valid input tokens")
+    if activation not in (None, "silu", "swish"):
+        raise ValueError("Convolution activation must be None, silu or swish")
+    return causal_conv1d_fn(
+        x,
+        weight,
+        bias,
+        conv_states=halo,
+        query_start_loc=query_start_loc,
+        seq_lens_cpu=seq_lens_cpu,
+        has_initial_state=has_initial_state,
+        activation=activation,
+        out=out,
+        token_block_range=token_block_range,
+        update_conv_states=False,
+    )
 
 
 # HAS_EAGLE_TREE_CUSTOM_ATTN_MASK is added to support eagle tree attention mask
@@ -1303,3 +1398,307 @@ def causal_conv1d_update(
     if unsqueeze:
         out = out.squeeze(-1)
     return out
+
+
+@triton.jit(do_not_specialize=["N"])
+def _causal_conv1d_peer_qkv_kernel(
+    X,
+    W,
+    History,
+    Peers,
+    Q,
+    K,
+    V,
+    N,
+    C: tl.constexpr,
+    SX: tl.constexpr,
+    QD: tl.constexpr,
+    KD: tl.constexpr,
+    RANK: tl.constexpr,
+    BT: tl.constexpr,
+    BC: tl.constexpr,
+):
+    """Load the three predecessor rows directly and emit packed Q/K/V once.
+
+    The producer publishes only 3 * C BF16 halo values. There is no all-gather,
+    intermediate convolved projection, or later layout-copy kernel. Independent
+    token/channel tiles naturally overlap their remote halo loads with interior
+    compute; all cross-rank lifetime ordering remains in the symmetric-memory communicator.
+    """
+    rows = tl.program_id(0) * BT + tl.arange(0, BT)
+    channels = tl.program_id(1) * BC + tl.arange(0, BC)
+    if RANK > 0:
+        previous = tl.load(Peers + RANK - 1).to(tl.pointer_type(tl.bfloat16))
+    else:
+        previous = History
+    acc = tl.full((BT, BC), 0, tl.float32)
+    for j in tl.static_range(4):
+        source = rows + j - 3
+        local = tl.load(
+            X + source[:, None] * SX + channels[None, :],
+            (rows[:, None] < N) & (source[:, None] >= 0) & (channels[None, :] < C),
+            0,
+        )
+        halo = tl.load(
+            previous + channels[None, :] * 3 + (source[:, None] + 3),
+            (rows[:, None] < N) & (source[:, None] < 0) & (channels[None, :] < C),
+            0,
+        )
+        x = tl.where(source[:, None] >= 0, local, halo)
+        weight = tl.load(W + channels * 4 + j, channels < C, 0)
+        # Match causal_conv1d_fn's BF16 multiplicands and ordered accumulation.
+        acc += x * weight[None, :]
+    acc = acc / (1 + tl.exp(-acc))
+    valid = (rows[:, None] < N) & (channels[None, :] < C)
+    tl.store(
+        Q + rows[:, None] * QD + channels[None, :],
+        acc,
+        valid & (channels[None, :] < QD),
+    )
+    tl.store(
+        K + rows[:, None] * KD + channels[None, :] - QD,
+        acc,
+        valid & (channels[None, :] >= QD) & (channels[None, :] < QD + KD),
+    )
+    tl.store(
+        V + rows[:, None] * (C - QD - KD) + channels[None, :] - QD - KD,
+        acc,
+        valid & (channels[None, :] >= QD + KD),
+    )
+
+
+def warmup_causal_conv1d_peer(cp_rank, channels, projection_stride, bt, bc):
+    """Compile both projection strides with the selected peer convolution tactic."""
+    for stride in sorted({channels, projection_stride}):
+        compiled = _causal_conv1d_peer_qkv_kernel.warmup(
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.uint64,
+            torch.bfloat16,
+            torch.bfloat16,
+            torch.bfloat16,
+            64,
+            channels,
+            stride,
+            2048,
+            2048,
+            cp_rank,
+            bt,
+            bc,
+            num_warps=4,
+            grid=(triton.cdiv(64, bt), triton.cdiv(channels, bc)),
+        )
+        _ = compiled.run
+
+
+def supports_causal_conv1d_peer(
+    raw, history, weight, *, head_geometry, bias=None, activation="silu"
+):
+    # Total projection width alone does not identify the Q/K/V layout.
+    # The kernel below packs 16 Q/K heads and 64 V heads, each of width 128.
+    return (
+        head_geometry == (16, 16, 64, 128, 128, 128)
+        and raw.ndim == 2
+        and raw.shape[1] == 12288
+        and raw.shape[0] >= 64
+        and raw.shape[0] % 64 == 0
+        and raw.dtype == history.dtype == weight.dtype == torch.bfloat16
+        and raw.device == history.device == weight.device
+        and raw.stride(1) == 1
+        and weight.shape == (12288, 4)
+        and weight.is_contiguous()
+        and history.shape == (12288, 3)
+        and history.is_contiguous()
+        and bias is None
+        and activation == "silu"
+    )
+
+
+def causal_conv1d_peer(
+    raw,
+    history,
+    weight,
+    peer_ptrs,
+    *,
+    rank,
+    head_geometry,
+    bias=None,
+    activation="silu",
+    token_tile=8,
+    channel_tile=256,
+):
+    """Convolve equal contiguous shards using a published predecessor halo.
+
+    Peer buffers contain [channels, 3] BF16 values. The caller publishes and
+    protects them; halo rows do not become output tokens or update cached state.
+    """
+    if not supports_causal_conv1d_peer(
+        raw,
+        history,
+        weight,
+        head_geometry=head_geometry,
+        bias=bias,
+        activation=activation,
+    ):
+        raise ValueError("Unsupported peer convolution shape, layout, or dtype")
+    if (
+        not raw.is_cuda
+        or not 0 <= rank < peer_ptrs.numel()
+        or peer_ptrs.dtype != torch.uint64
+        or peer_ptrs.device != raw.device
+        or not peer_ptrs.is_contiguous()
+    ):
+        raise ValueError("Invalid convolution peer pointers or rank")
+    if token_tile not in (4, 8, 16) or channel_tile not in (128, 256):
+        raise ValueError("Unsupported peer convolution tile")
+    n = raw.shape[0]
+    q = torch.empty((1, n, 16, 128), device=raw.device, dtype=raw.dtype)
+    k = torch.empty_like(q)
+    v = torch.empty((1, n, 64, 128), device=raw.device, dtype=raw.dtype)
+    _causal_conv1d_peer_qkv_kernel[
+        (triton.cdiv(n, token_tile), triton.cdiv(raw.shape[1], channel_tile))
+    ](
+        raw,
+        weight,
+        history,
+        peer_ptrs,
+        q,
+        k,
+        v,
+        n,
+        raw.shape[1],
+        raw.stride(0),
+        2048,
+        2048,
+        rank,
+        token_tile,
+        channel_tile,
+        num_warps=4,
+    )
+    return [q, k, v]
+
+
+def warmup_causal_conv1d_context_parallel(
+    device, dtype, channels, kernel_size, projection_stride
+):
+    """Compile contiguous and projected halos, ragged and empty local shards."""
+    weights = torch.zeros((channels, kernel_size), device=device, dtype=dtype)
+    indices = torch.zeros(1, device=device, dtype=torch.int32)
+    initial = torch.ones(1, device=device, dtype=torch.bool)
+    for count in (0, 1, 17, 64):
+        for stride in sorted({channels, projection_stride}):
+            raw = torch.zeros((count, stride), device=device, dtype=dtype)[:, :channels]
+            history = torch.zeros(
+                (1, channels, kernel_size - 1), device=device, dtype=dtype
+            )
+            arguments = dict(
+                x=raw.T,
+                weight=weights,
+                bias=None,
+                conv_states=history,
+                query_start_loc=torch.tensor(
+                    [0, count], device=device, dtype=torch.int32
+                ),
+                seq_lens_cpu=[count],
+                cache_indices=indices,
+                has_initial_state=initial,
+                activation="silu",
+            )
+            convolved = causal_conv1d_fn(**arguments)
+            causal_conv1d_with_halo(
+                raw.T,
+                history,
+                weights,
+                query_start_loc=arguments["query_start_loc"],
+                seq_lens_cpu=[count],
+                has_initial_state=initial,
+            )
+            # A producer can prepend projected halo rows without a history copy.
+            # Its strides differ from the contiguous cached-state layout above.
+            halo_width = kernel_size - 1
+            projected = torch.zeros(
+                (count + halo_width, stride), device=device, dtype=dtype
+            )
+            causal_conv1d_with_halo(
+                projected[halo_width:, :channels].T,
+                projected[:halo_width, :channels].T.unsqueeze(0),
+                weights,
+                query_start_loc=arguments["query_start_loc"],
+                seq_lens_cpu=[count],
+                has_initial_state=initial,
+            )
+            if count > 8:
+                out = causal_conv1d_fn(
+                    **arguments, token_block_range=(1, (count + 7) // 8)
+                )
+                causal_conv1d_fn(**arguments, out=out, token_block_range=(0, 1))
+
+
+_CONV_PEER_TACTICS = {}
+
+
+def causal_conv1d_peer_with_halo(
+    raw,
+    history,
+    weight,
+    workspace,
+    *,
+    head_geometry,
+    bias=None,
+    activation="silu",
+    tuning=None,
+):
+    """Publish the predecessor halo and return QKV plus independent final history."""
+    communicator = workspace.communicator
+    if len(workspace.peers) != 4:
+        raise ValueError("Peer convolution requires four contiguous shards")
+    if not supports_causal_conv1d_peer(
+        raw,
+        history,
+        weight,
+        head_geometry=head_geometry,
+        bias=bias,
+        activation=activation,
+    ):
+        raise ValueError("Unsupported peer convolution shape, layout, or dtype")
+    tuning = tuning or _CONV_PEER_TACTICS.get(
+        (raw.device.index, raw.shape[1]), {"bt": 8, "bc": 256}
+    )
+    communicator.publish(workspace, raw[-3:].T.contiguous())
+    rank = communicator.rank
+    qkv = causal_conv1d_peer(
+        raw,
+        history,
+        weight,
+        workspace.peer_ptrs,
+        rank=rank,
+        head_geometry=head_geometry,
+        bias=bias,
+        activation=activation,
+        token_tile=tuning["bt"],
+        channel_tile=tuning["bc"],
+    )
+    preceding = history if rank == 0 else workspace.peers[rank - 1]
+    return qkv, preceding, workspace.peers[-1].clone()
+
+
+def autotune_causal_conv1d_peer(raw, history, weight, workspace, *, head_geometry):
+    import torch.distributed as dist
+
+    from sglang.srt.layers.cp.utils import select_cp_tactic
+
+    rank, group = workspace.communicator.rank, workspace.communicator.group
+    for bt in (4, 8, 16):
+        for bc in (128, 256):
+            warmup_causal_conv1d_peer(rank, raw.shape[1], raw.stride(0), bt, bc)
+    dist.barrier(group=group)
+    tuning = select_cp_tactic(
+        [{"bt": bt, "bc": bc} for bt in (4, 8, 16) for bc in (128, 256)],
+        lambda tactic: causal_conv1d_peer_with_halo(
+            raw, history, weight, workspace, head_geometry=head_geometry, tuning=tactic
+        ),
+        group,
+    )
+    _CONV_PEER_TACTICS[(raw.device.index, raw.shape[1])] = tuning
+    return tuning

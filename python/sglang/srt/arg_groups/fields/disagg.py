@@ -52,6 +52,9 @@ class Disagg(msgspec.Struct):
     # -------------------------------------------------------------------------
     # PD disaggregation
     # -------------------------------------------------------------------------
+    disaggregation_require_bulk: A[
+        bool, "Require bulk KV staging; fail instead of falling back to direct writes."
+    ] = False
     disaggregation_mode: A[
         Literal["null", "prefill", "decode"],
         'Only used for PD disaggregation. "prefill" for prefill-only server, and "decode" for decode-only server. If not specified, it is not PD disaggregated',

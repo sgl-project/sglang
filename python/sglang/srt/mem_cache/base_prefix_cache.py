@@ -760,3 +760,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
             available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"
+
+    def prepare_mamba_checkpoints(
+        self, req: Req, positions: list[int], *, reserve_slots: int
+    ) -> None:
+        """Reserve optional prefix states before submitting a prefill batch."""
+        raise NotImplementedError()

@@ -538,6 +538,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_schedule,
     get_serving,
     publish,
 )
@@ -2328,6 +2329,17 @@ async def _send_disaggregation_warmup_requests(
         else ssl.create_default_context(cafile=ssl_verify)
     )
 
+    input_ids = [10, 11, 12, 13]
+    if (
+        get_disagg().disaggregation_mode == "prefill"
+        and get_parallel().attn_cp_size > 1
+    ):
+        chunk_size = get_schedule().chunked_prefill_size
+        if chunk_size is None or chunk_size <= 0:
+            chunk_size = get_schedule().max_prefill_tokens
+        context_len = _global_state.tokenizer_manager.model_config.context_len
+        input_ids = [10] * max(1, min(chunk_size, context_len - 8))
+
     async def send_request(session: aiohttp.ClientSession, dp_rank: int) -> int:
         json_data = {
             "sampling_params": {
@@ -2337,7 +2349,7 @@ async def _send_disaggregation_warmup_requests(
             },
             "bootstrap_host": FAKE_BOOTSTRAP_HOST,
             "bootstrap_room": dp_rank,
-            "input_ids": [10, 11, 12, 13],
+            "input_ids": input_ids,
             "routed_dp_rank": dp_rank,
         }
         async with session.post(

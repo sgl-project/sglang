@@ -49,6 +49,7 @@ from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
@@ -481,6 +482,7 @@ class MambaAttnBackendBase(AttentionBackend):
 
         return indices.clamp(0, query_start_loc[-1] - 1)
 
+    @profile_method("sglang.mamba.prepare_state_tracking")
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
     ):
@@ -1277,6 +1279,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
+        self.cp_metadata_plan = None
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
@@ -1305,6 +1308,71 @@ class HybridLinearAttnBackend(AttentionBackend):
                 "Breakable prefill CUDA graphs capture the %s extend.",
                 type(linear_attn_backend).__name__,
             )
+
+    def prepare_cp_metadata(self, batch, *, lengths=None, prefixes=None):
+        """Prepare one batch-owned layout for full attention, GDN and MoE."""
+        from sglang.srt.distributed import get_attn_cp_group
+        from sglang.srt.layers.attention.linear.gdn_backend import (
+            make_gdn_cp_conv_metadata,
+        )
+        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
+        from sglang.srt.runtime_context import get_parallel
+
+        if not batch.forward_mode.is_extend_without_speculative():
+            return
+        if batch.prefill_cp_metadata is not None:
+            return
+        lengths = batch.extend_lens if lengths is None else lengths
+        prefixes = batch.prefix_lens if prefixes is None else prefixes
+        full = self.full_attn_backend
+        linear = self.linear_attn_backend
+        world = get_attn_cp_group().world_size
+        strategy = get_parallel().cp_strategy
+        options = {}
+        residual_exchange = linear._cp_residual_exchange
+        if full.cp_exchange is not None:
+            cp_mode = full.prefill_cp_mode
+            options = dict(
+                request_indices=[req.kv.req_pool_idx for req in batch.reqs],
+                request_stride=self.req_to_token_pool.req_to_token.shape[1],
+                packed_kv=full.cp_packed_kv,
+                needs_kv_descale=full.kv_cache_dtype == torch.float8_e4m3fn,
+            )
+            residual_exchange = full.residual_exchange
+        else:
+            if strategy not in ("interleave", "zigzag"):
+                raise ValueError(f"Unsupported prefill CP strategy: {strategy}")
+            cp_mode = "in-seq-split" if strategy == "zigzag" else "round-robin-split"
+            if strategy == "interleave":
+                # Shared CP/TP splits the packed token stream, whereas sharded KV
+                # attention preserves each request's round-robin ownership.
+                options["attention_indices"] = tuple(
+                    tuple(range(rank, sum(lengths), world)) for rank in range(world)
+                )
+        metadata = ShardedContextParallelMetadata.plan_prefill(
+            lengths,
+            prefixes,
+            linear.device,
+            cp_mode=cp_mode,
+            residual_exchange=residual_exchange,
+            previous=self.cp_metadata_plan,
+            **options,
+        )
+        if (
+            full.cp_exchange is not None
+            and metadata.layout.capacity > full.cp_exchange.capacity
+        ):
+            raise ValueError("CP frame exceeds the startup KV workspace")
+        metadata.gdn_conv_metadata = tuple(
+            make_gdn_cp_conv_metadata(metadata, device="cpu")
+        )
+        metadata.upload()
+        if full.cp_exchange is not None:
+            metadata.resolve_kv_slots(
+                self.req_to_token_pool.req_to_token, batch.out_cache_loc
+            )
+        batch.prefill_cp_metadata = metadata
+        self.cp_metadata_plan = metadata
 
     @property
     def data_type(self):
@@ -1429,6 +1497,10 @@ class HybridLinearAttnBackend(AttentionBackend):
                 spec_info=spec_info, cuda_graph_bs=cuda_graph_bs
             )
 
+    def warmup(self, model_runner: ModelRunner):
+        for attn_backend in self.attn_backend_list:
+            attn_backend.warmup(model_runner)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         if forward_batch.forward_mode.is_draft_extend_v2():
             # DRAFT_EXTEND_V2 runs only full-attn layers in the draft model; skip
@@ -1446,9 +1518,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         init = getattr(self.full_attn_backend, "init_mha_chunk_metadata", None)
         if init is not None:
             init(forward_batch, disable_flashinfer_ragged)
-
-    def get_indexer_metadata(self, layer_id, forward_batch):
-        return self.full_attn_backend.get_indexer_metadata(layer_id, forward_batch)
 
     def init_cuda_graph_state(self, max_bs: int, max_num_tokens: int):
         for attn_backend in self.attn_backend_list:

@@ -1,7 +1,9 @@
+from functools import cache
 from typing import Optional, Tuple, Union
 
 import msgspec
 import torch
+import torch.distributed as dist
 
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
@@ -12,13 +14,19 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn as causal_conv1d_fn_triton,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+    causal_conv1d_peer_with_halo,
     causal_conv1d_update,
+    causal_conv1d_with_halo,
+    supports_causal_conv1d_peer,
 )
 from sglang.kernels.ops.mamba.gdn_prefill_track import (
     gdn_track_conv_window,
     gdn_track_ssm_state,
 )
 from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+    TorchSymmMemCommunicator,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
 from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
@@ -42,6 +50,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
+from sglang.srt.layers.cp.utils import _cp_metadata_tensor
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
@@ -51,6 +60,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
     get_memory,
+    get_parallel,
     get_schedule,
     mamba_cache_chunk_size,
 )
@@ -59,6 +69,7 @@ from sglang.srt.utils.device import is_pin_memory_available
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method, profile_range
 
 if not is_cpu():
     from sglang.kernels.ops.attention.fla.chunk_delta_h import (
@@ -280,6 +291,145 @@ def _validate_gdn_linear_attn_backends(backends: LinearAttnBackends) -> None:
         )
 
 
+def _tail(history, rows, width):
+    # Copy only the convolution halo, not the full projected chunk.
+    if width == 0:
+        return history[:, :0].clone()
+    if rows.shape[0] >= width:
+        return rows[-width:].T.contiguous()
+    return torch.cat((history[:, -(width - rows.shape[0]) :], rows.T), dim=1)
+
+
+def _padded_inputs(inputs, width):
+    padded = []
+    for x in inputs:
+        if x.shape[0] == width:
+            padded.append(x.unsqueeze(0).contiguous())
+            continue
+        y = x.new_zeros((1, width, *x.shape[1:]))
+        y[0, : x.shape[0]] = x
+        padded.append(y)
+    return padded
+
+
+@profile_method("sglang.cp.gdn_pack_qkv")
+def _prepare_qkv_inputs(convolved, layer, width, *, fused=True):
+    """Split once into FlashQLA's packed inputs, retaining zero-padded tails."""
+    count = convolved.shape[0]
+    if count == width and count > 0 and convolved.shape[-1] <= 16384 and fused:
+        from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+            fused_qkv_split_gdn_prefill,
+        )
+
+        # Full-head CP has a wider projection than TP. The 16K-element split
+        # fits the supported Hopper/Blackwell kernel without changing values.
+        return list(
+            fused_qkv_split_gdn_prefill(
+                convolved,
+                layer.num_q_heads,
+                layer.num_k_heads,
+                layer.num_v_heads,
+                layer.head_q_dim,
+                layer.head_k_dim,
+                layer.head_v_dim,
+            )
+        )
+    q, k, v = convolved.split((layer.q_dim, layer.k_dim, layer.v_dim), dim=-1)
+    return _padded_inputs(
+        [
+            q.reshape(count, layer.num_q_heads, layer.head_q_dim),
+            k.reshape(count, layer.num_k_heads, layer.head_k_dim),
+            v.reshape(count, layer.num_v_heads, layer.head_v_dim),
+        ],
+        width,
+    )
+
+
+def make_gdn_cp_conv_metadata(frame, *, device=None):
+    """Cache length-dependent launch tensors to avoid per-layer blocking H2D copies."""
+    device = frame.device if device is None else device
+    has_initial_state = _cp_metadata_tensor([True], device=device, dtype=torch.bool)
+    by_count, metadata = {}, []
+    for length in frame.lengths:
+        width = (length + 64 * frame.world - 1) // (64 * frame.world) * 64
+        count = min(width, max(0, length - frame.rank * width))
+        if count not in by_count:
+            by_count[count] = dict(
+                query_start_loc=_cp_metadata_tensor(
+                    [0, count], device=device, dtype=torch.int32
+                ),
+                has_initial_state=has_initial_state,
+                seq_lens_cpu=[count],
+            )
+        metadata.append(by_count[count])
+    return metadata
+
+
+def convolve_gdn_context_shard(
+    frame, layer, local_raw, history, length, width, metadata, *, halo_exchange=None
+):
+    """Exchange raw convolution halos while evaluating independent local blocks."""
+    overlap = halo_exchange is not None
+    count = local_raw.shape[0]
+    history_width = layer.conv_weights.shape[-1] - 1
+    # Only the last kernel_width-1 raw projection rows cross a rank boundary.
+    local_tail = _tail(history, local_raw, history_width)
+    convolved = None
+    if overlap:
+        with profile_range("sglang.cp.conv_halo.prepare"):
+            pending = halo_exchange.prepare(local_tail)
+        if count > CAUSAL_CONV1D_FWD_BLOCK_M:
+            with profile_range("sglang.cp.conv_interior"):
+                convolved = causal_conv1d_with_halo(
+                    local_raw.T,
+                    history.unsqueeze(0),
+                    layer.conv_weights,
+                    bias=layer.bias,
+                    activation=layer.activation,
+                    token_block_range=(
+                        1,
+                        (count + CAUSAL_CONV1D_FWD_BLOCK_M - 1)
+                        // CAUSAL_CONV1D_FWD_BLOCK_M,
+                    ),
+                    **metadata,
+                )
+        with profile_range("sglang.cp.conv_halo.submit"):
+            pending.start()
+        with profile_range("sglang.cp.conv_halo.wait"):
+            tails = pending.wait()
+    else:
+        tails = [torch.empty_like(local_tail) for _ in range(frame.world)]
+        with profile_range("sglang.cp.conv_halo.all_gather"):
+            dist.all_gather(tails, local_tail, group=frame.group)
+    # A final shard can have fewer rows than the convolution history. Carry
+    # earlier rows through it; padding must never replace real history.
+    terminal_history = history
+    for peer, tail in enumerate(tails):
+        if peer == frame.rank:
+            preceding = terminal_history
+        peer_count = min(width, max(0, length - peer * width))
+        if peer_count:
+            valid = min(peer_count, history_width)
+            terminal_history = torch.cat((terminal_history, tail[:, -valid:]), dim=1)[
+                :, -history_width:
+            ].contiguous()
+    if count:
+        with profile_range("sglang.cp.conv_boundary" if overlap else "sglang.cp.conv"):
+            convolved = causal_conv1d_with_halo(
+                local_raw.T,
+                preceding.unsqueeze(0),
+                layer.conv_weights,
+                bias=layer.bias,
+                activation=layer.activation,
+                out=convolved,
+                token_block_range=(0, 1) if overlap else None,
+                **metadata,
+            ).T
+    else:
+        convolved = local_raw
+    return convolved, preceding, terminal_history
+
+
 class GDNKernelDispatcher:
     """Dispatches GDN kernel calls to the appropriate backend per mode."""
 
@@ -289,6 +439,7 @@ class GDNKernelDispatcher:
         prefill_backend: LinearAttnKernelBackend,
         verify_backend: Optional[LinearAttnKernelBackend] = None,
     ):
+        self.use_context_parallel = False
         triton_kernel = TritonGDNKernel()
         self.tree_verify_kernel = triton_kernel
 
@@ -335,6 +486,18 @@ class GDNKernelDispatcher:
             # See the decode branch above: intel_xpu uses Triton as its
             # dispatcher-level fallback kernel.
             self.extend_kernel = triton_kernel
+
+        elif prefill_backend.is_flashqla():
+            from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
+                FlashQLAGDNKernel,
+            )
+
+            cp_group = get_parallel().attn_cp_group
+            self.use_context_parallel = cp_group.world_size > 1
+            self.extend_kernel = FlashQLAGDNKernel(
+                fallback=triton_kernel,
+                cp_group=cp_group.device_group if self.use_context_parallel else None,
+            )
         elif prefill_backend.is_cutedsl():
             if not is_cuda():
                 raise ValueError("GDN CuTe DSL backend requires CUDA")
@@ -573,6 +736,17 @@ class GDNAttnBackend(MambaAttnBackendBase):
         validate_gdn_mis_backend(backends.prefill)
         self.linear_attn_backends = backends
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        self._cp_residual_exchange = None
+        if self.kernel_dispatcher.use_context_parallel:
+            from sglang.srt.distributed import get_attn_cp_group
+            from sglang.srt.layers.cp.utils import TokenExchangeStream
+
+            self._cp_residual_exchange = (
+                model_runner.cp_residual_exchange
+                or TokenExchangeStream(
+                    group=get_attn_cp_group().device_group, device=self.device
+                )
+            )
         # Sized past the pool for attn_tp-padded warmup/MLP-sync batches (see helper).
         self.verify_intermediate_state_indices = (
             build_verify_intermediate_state_indices(
@@ -580,6 +754,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 model_runner.device,
             )
         )
+        self._conv_workspace = None
         self._use_strided_target_verify_qkv = False
         # A prefill batch never holds more requests than the pool.
         self.prefill_graph_max_seqs = min(
@@ -592,6 +767,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             envs.SGLANG_ENABLE_GDN_PREFILL_GRAPH_EXTEND.get()
             # drafts keep their eager GDN extend; only the target's is captured
             and not self.is_draft_worker
+            and not self.kernel_dispatcher.use_context_parallel
             and self._prefill_graph_extend_supported()
         )
 
@@ -731,9 +907,72 @@ class GDNAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
         self._init_target_verify_qkv_routing(forward_batch)
 
+    def warmup(self, model_runner: ModelRunner):
+        if not self.kernel_dispatcher.use_context_parallel:
+            return
+        args = get_schedule()
+        # Dynamic chunking and unchunked first requests can exceed the ordinary
+        # batch budget. Cover their full supported sequence length at startup.
+        tokens = (
+            model_runner.model_config.context_len
+            if args.enable_dynamic_chunking or (args.chunked_prefill_size or 0) <= 0
+            else args.chunked_prefill_size
+        )
+        self.kernel_dispatcher.extend_kernel.warmup_cp_contexts(
+            device=torch.device(model_runner.device),
+            max_tokens=tokens,
+            value_heads=model_runner.model_config.hf_text_config.linear_num_value_heads,
+        )
+        pool = self.state_pool
+        if pool.cp_size > 1:
+            # Slot zero is reserved: compile peer gather, owner store and COW
+            # without modifying any request or cached prefix.
+            index = torch.zeros(1, dtype=torch.int64, device=model_runner.device)
+            pool.clear_slots(index)
+            pool.copy_from(index, index)
+            state = pool.load_layer_state(0, index)
+            pool.store_layer_state(0, index, conv=state.conv, temporal=state.temporal)
+            pool.synchronize()
+
+    @profile_method("sglang.attention.prepare_gdn_metadata")
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         # An eager forward never runs on a graph bucket's tables.
         self.prefill_graph_metadata = None
+        cp_prefill = forward_batch.forward_mode.is_extend_without_speculative()
+        cp_metadata = forward_batch.prefill_cp_metadata
+        if cp_metadata is not None and not cp_prefill:
+            raise ValueError("Sharded GDN metadata is only valid for ordinary prefill")
+        if cp_prefill and cp_metadata is not None:
+            if not self.kernel_dispatcher.use_context_parallel:
+                raise ValueError(
+                    "GDN CP metadata requires FlashQLA prefill with a multi-rank CP group"
+                )
+            # Previous batches may have written the source on another owner.
+            # Finish those stores before COW, then publish COW/clear before reads.
+            self.state_pool.synchronize()
+            # CP exports its own recurrence checkpoints. The ordinary GDN
+            # tracking indices are unused here and their mask/nonzero queries
+            # would synchronize the forward stream with the host.
+            self.forward_metadata = None
+            cp_metadata.original_non_padded = forward_batch.num_token_non_padded
+            cp_metadata.record_stream(torch.cuda.current_stream())
+            self.cp_metadata = cp_metadata
+            self.cp_conv_metadata = cp_metadata.gdn_conv_metadata
+            if len(self.cp_conv_metadata) != forward_batch.batch_size:
+                raise ValueError(
+                    "GDN convolution metadata must be prepared with the CP batch"
+                )
+            self.cp_state_slots = self.req_to_token_pool.get_mamba_indices(
+                forward_batch.req_pool_indices
+            ).long()
+            self.cp_checkpoints = forward_batch.mamba_track_checkpoints
+            if self.cp_checkpoints is None:
+                if forward_batch.mamba_track_mask is not None:
+                    raise ValueError("GDN CP requires scheduler checkpoint metadata")
+                self.cp_checkpoints = ((),) * forward_batch.batch_size
+            if len(self.cp_checkpoints) != forward_batch.batch_size:
+                raise ValueError("GDN CP checkpoint metadata must match the batch")
+            return
         super().init_forward_metadata(forward_batch)
         self._init_target_verify_qkv_routing(forward_batch)
         self.mis_metadata = None
@@ -1210,6 +1449,140 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         return core_attn_out
 
+    def _forward_extend_cp(self, layer, batch, raw, a, b):
+        """GDN core only: convolution halos, FlashQLA recurrence and radix state."""
+        frame = self.cp_metadata
+        kernel = self.kernel_dispatcher.extend_kernel
+        cache = self.state_layer_cache(layer.layer_id)
+        pool = self.state_pool
+        cache_layer = self.req_to_token_pool.mamba_map[layer.layer_id]
+        if raw.shape[0]:
+            g, beta = fused_gdn_gating(layer.A_log, a, b, layer.dt_bias)
+            g, beta = g[0], beta[0]
+        else:
+            g = beta = raw.new_empty((0, layer.num_v_heads), dtype=torch.float32)
+        results, start = [], 0
+        history_width = layer.conv_weights.shape[-1] - 1
+        head_geometry = (
+            layer.num_q_heads,
+            layer.num_k_heads,
+            layer.num_v_heads,
+            layer.head_q_dim,
+            layer.head_k_dim,
+            layer.head_v_dim,
+        )
+        for sequence, length in enumerate(frame.lengths):
+            if not length:
+                continue
+            width = (length + 64 * frame.world - 1) // (64 * frame.world) * 64
+            count = min(width, max(0, length - frame.rank * width))
+            local_raw = raw[start : start + count]
+            # Keep pool indices on device; Python slicing a CUDA scalar would
+            # read it back and wait for previously queued forward work.
+            slot = self.cp_state_slots[sequence : sequence + 1]
+            state = pool.load_layer_state(cache_layer, slot, temporal=frame.rank == 0)
+            initial = state.temporal.float()
+            history = state.conv[0][0]
+            if frame.prefixes[sequence] == 0:
+                initial = torch.zeros_like(initial)
+                history = torch.zeros_like(history)
+
+            # The global length check makes every rank choose the same exchange.
+            # Ragged and empty shards retain the general convolution path.
+            if (
+                frame.world == 4
+                and length % (64 * frame.world) == 0
+                and kernel.symm_state_enabled()
+                and supports_causal_conv1d_peer(
+                    local_raw,
+                    history,
+                    layer.conv_weights,
+                    head_geometry=head_geometry,
+                    bias=layer.bias,
+                    activation=layer.activation,
+                )
+                and not torch.cuda.is_current_stream_capturing()
+            ):
+                if self._conv_workspace is None:
+                    communicator = TorchSymmMemCommunicator.get(frame.group, raw.device)
+                    self._conv_workspace = communicator.allocate_peer_workspace(
+                        (raw.shape[1], history_width), raw.dtype
+                    )
+                qkv, preceding, terminal_history = causal_conv1d_peer_with_halo(
+                    local_raw,
+                    history,
+                    layer.conv_weights,
+                    self._conv_workspace,
+                    head_geometry=head_geometry,
+                    bias=layer.bias,
+                    activation=layer.activation,
+                )
+            else:
+                convolved, preceding, terminal_history = convolve_gdn_context_shard(
+                    frame,
+                    layer,
+                    local_raw,
+                    history,
+                    length,
+                    width,
+                    self.cp_conv_metadata[sequence],
+                )
+                qkv = _prepare_qkv_inputs(convolved, layer, width)
+            inputs = qkv + _padded_inputs(
+                [g[start : start + count], beta[start : start + count]], width
+            )
+            checkpoints = self.cp_checkpoints[sequence]
+            internal_positions = tuple(
+                position for position, _ in checkpoints if 0 < position < length
+            )
+            output, final, states = self.kernel_dispatcher.extend(
+                *inputs,
+                ssm_states=cache.temporal,
+                cache_indices=slot,
+                query_start_loc=self.cp_conv_metadata[sequence]["query_start_loc"],
+                cp_metadata=frame,
+                initial_state=initial,
+                inplace_update=False,
+                checkpoint_indices=internal_positions,
+                state_dtype=cache.temporal.dtype,
+            )
+            results.append(output[0, :count])
+            pool.store_layer_state(
+                cache_layer, slot, conv=[terminal_history.unsqueeze(0)], temporal=final
+            )
+
+            state_iter = iter(states)
+            for target_length, target_slot in checkpoints:
+                if target_length == 0:
+                    checkpoint_state, checkpoint_conv = initial, history
+                elif target_length == length:
+                    checkpoint_state, checkpoint_conv = final, terminal_history
+                elif 0 < target_length < length:
+                    checkpoint_state = next(state_iter)
+                    owner = (target_length - 1) // width
+                    local_end = min(count, max(0, target_length - frame.rank * width))
+                    checkpoint_conv = _tail(
+                        preceding, local_raw[:local_end], history_width
+                    )
+                    kernel.broadcast_state(checkpoint_conv, owner)
+                else:
+                    raise ValueError("Invalid GDN radix checkpoint inside CP chunk")
+                pool.store_layer_state(
+                    cache_layer,
+                    target_slot,
+                    conv=[checkpoint_conv.unsqueeze(0)],
+                    temporal=checkpoint_state,
+                )
+            start += count
+        if start != raw.shape[0]:
+            raise ValueError("GDN CP layout does not cover local token rows")
+        if not start:
+            return raw.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
+        return (
+            results[0] if len(results) == 1 else torch.cat(results, dim=0)
+        ).unsqueeze(0)
+
+    @profile_method("sglang.attention.gdn.extend")
     def forward_extend(
         self,
         layer: RadixLinearAttention,
@@ -1220,6 +1593,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ):
         assert isinstance(mixed_qkv, torch.Tensor)
+        if (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and self.kernel_dispatcher.use_context_parallel
+        ):
+            if forward_batch.prefill_cp_metadata is None:
+                raise ValueError("GDN CP prefill requires initialized batch metadata")
+            return self._forward_extend_cp(layer, forward_batch, mixed_qkv, a, b)
         seq_len = mixed_qkv.shape[0]
 
         if _is_hip and seq_len == 0:
@@ -1455,6 +1835,12 @@ class GDNAttnBackend(MambaAttnBackendBase):
                 ssm_states=ssm_states_contig,
                 cache_indices=state_cache_indices,
                 query_start_loc=query_start_loc,
+                return_cp_output=kwargs.get("return_cp_output", False),
+                seq_lens_cpu=forward_batch.extend_seq_lens_cpu,
+                output_intermediate_states=(
+                    forward_metadata.has_mamba_track_mask
+                    and forward_metadata.track_ssm_h_src.numel() > 0
+                ),
                 state_checkpoint_cu_starts=(
                     forward_metadata.state_checkpoint_cu_starts
                 ),
@@ -1797,3 +2183,93 @@ class GDNAttnBackend(MambaAttnBackendBase):
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
+
+
+@cache
+def warmup_gdn_prefill(
+    *,
+    device,
+    dtype,
+    key_heads,
+    value_heads,
+    key_head_dim,
+    value_head_dim,
+    conv_kernel_size,
+    state_dtype,
+    group,
+    projection_stride,
+    local_tokens,
+):
+    """Warm the selected prefill operators before the runner allocates live KV/state."""
+    from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+        warmup_gdn_projection,
+    )
+    from sglang.kernels.ops.mamba.causal_conv1d_triton import (
+        autotune_causal_conv1d_peer,
+        warmup_causal_conv1d_context_parallel,
+    )
+    from sglang.srt.layers.attention.linear.kernels.gdn_flashqla import (
+        _warmup_flashqla_gdn,
+    )
+
+    geometry = (key_heads, value_heads, key_head_dim, value_head_dim)
+    channels = 2 * key_heads * key_head_dim + value_heads * value_head_dim
+    with torch.cuda.device(device), torch.inference_mode():
+        warmup_gdn_projection(device, dtype, geometry, projection_stride)
+        warmup_causal_conv1d_context_parallel(
+            device, dtype, channels, conv_kernel_size, projection_stride
+        )
+        _warmup_flashqla_gdn(
+            device,
+            geometry=geometry,
+            dtype=dtype,
+            state_dtype=state_dtype,
+            cp_group=group,
+            cp_size=dist.get_world_size(group),
+            cp_rank=dist.get_rank(group),
+        )
+        if TorchSymmMemCommunicator.multicast_unavailable_reason(group) is None:
+            communicator = TorchSymmMemCommunicator.get(group, device)
+            history = torch.zeros(
+                (channels, conv_kernel_size - 1), device=device, dtype=dtype
+            )
+            workspace = communicator.allocate_broadcast_workspace(
+                history.numel() * history.element_size() * 2
+            )
+            try:
+                for owner in range(dist.get_world_size(group)):
+                    communicator.broadcast(workspace, history, owner)
+            finally:
+                workspace.close()
+            if (
+                dist.get_world_size(group) == 4
+                and (*geometry, conv_kernel_size) == (16, 64, 128, 128, 4)
+                and dtype == torch.bfloat16
+            ):
+                raw = torch.zeros(
+                    (max(64, local_tokens), projection_stride),
+                    device=device,
+                    dtype=dtype,
+                )[:, :channels]
+                weight = torch.zeros(
+                    (channels, conv_kernel_size), device=device, dtype=dtype
+                )
+                workspace = communicator.allocate_peer_workspace(history.shape, dtype)
+                try:
+                    autotune_causal_conv1d_peer(
+                        raw,
+                        history,
+                        weight,
+                        workspace,
+                        head_geometry=(
+                            key_heads,
+                            key_heads,
+                            value_heads,
+                            key_head_dim,
+                            key_head_dim,
+                            value_head_dim,
+                        ),
+                    )
+                finally:
+                    workspace.close()
+        torch.cuda.synchronize(device)

@@ -35,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -163,6 +164,7 @@ class QSAIndexer(MultiPlatformOp):
         self._rope_axis_map_cache = axis_map.to(device)
         return self._rope_axis_map_cache
 
+    @profile_method("sglang.attention.qsa.prepare_qk")
     def project_qk(
         self,
         hidden_states: torch.Tensor,
@@ -172,16 +174,22 @@ class QSAIndexer(MultiPlatformOp):
         q_heads_padded: int | None = None,
         ensure_cos_sin_cache: bool = True,
     ) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        if hidden_states.shape[0] == 0:
+            q_dtype = (
+                pool.qsa_compressed_dtype if pool is not None else hidden_states.dtype
+            )
+            return (
+                hidden_states.new_empty(
+                    (0, self.index_n_heads, self.index_head_dim), dtype=q_dtype
+                ),
+                hidden_states.new_empty((0, self.index_kv_heads, self.index_head_dim)),
+                False,
+            )
         qk, _ = self.index_qk_proj(hidden_states)
         token_k = qk[:, self.index_n_heads * self.index_head_dim :].reshape(
             -1, self.index_kv_heads, self.index_head_dim
         )
-        if (
-            pool is not None
-            and cache_loc is not None
-            and qk.shape[0] > 0
-            and self._use_fused_prep(qk)
-        ):
+        if pool is not None and qk.shape[0] > 0 and self._use_fused_prep(qk):
             from sglang.kernels.ops.attention.qsa_indexer import (
                 qsa_index_q_norm_rope_store,
             )
@@ -201,7 +209,7 @@ class QSAIndexer(MultiPlatformOp):
                 self.rotary_emb.cos_sin_cache,
                 self._rope_axis_map(qk.device),
                 self.q_layernorm.weight.data,
-                cache_loc[: qk.shape[0]].long(),
+                cache_loc[: qk.shape[0]].long() if cache_loc is not None else None,
                 key_state_buffer.view(key_state_buffer.shape[0], -1),
                 pool.qsa_rope_position_buffer,
                 self.index_n_heads,
@@ -211,7 +219,7 @@ class QSAIndexer(MultiPlatformOp):
                 q_heads_padded=q_heads_padded,
                 out_dtype=pool.qsa_compressed_dtype,
             )
-            return q, token_k, True
+            return q, token_k, cache_loc is not None
         q_raw = qk[:, : self.index_n_heads * self.index_head_dim]
         q = self.q_layernorm(q_raw.reshape(-1, self.index_head_dim)).reshape(
             -1, self.index_n_heads, self.index_head_dim
@@ -413,6 +421,8 @@ class QSAIndexer(MultiPlatformOp):
         positions: torch.Tensor,
         tensor: torch.Tensor,
         ensure_cos_sin_cache: bool = True,
+        *,
+        rope_max_position: int | None = None,
     ) -> torch.Tensor:
         if tensor.numel() == 0:
             return tensor
@@ -427,7 +437,9 @@ class QSAIndexer(MultiPlatformOp):
             and not get_is_capture_mode()
             and hasattr(self.rotary_emb, "_ensure_cos_sin_cache_length")
         ):
-            self.rotary_emb._ensure_cos_sin_cache_length(int(positions.max().item()))
+            if rope_max_position is None:
+                rope_max_position = int(positions.max().item())
+            self.rotary_emb._ensure_cos_sin_cache_length(rope_max_position)
 
         # position_cos/position_sin repeat cos/sin to the full rotary width;
         # apply_rotary_emb consumes one half.
@@ -595,11 +607,11 @@ class QSAIndexer(MultiPlatformOp):
         indexer_metadata,
         global_rope_positions: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill CP: score only this rank's zigzag query rows.
+        """Prefill CP: score only this rank's query rows.
 
         ``hidden_states``/``positions`` are the local (padded) rows and their
         RoPE positions. Index q/k are projected for the local rows only; the raw
-        keys are all-gathered into global token order so the pending-group ring
+        keys are exchanged into global token order so the pending-group ring
         store and the block compression run on the batch's global write plan
         exactly as without CP (every rank ends up with the complete compressed-K
         cache). Selection then scores the local rows against all compressed
@@ -607,14 +619,23 @@ class QSAIndexer(MultiPlatformOp):
         with the local query rows the sparse attention consumes.
         """
         strategy = get_cp_strategy()
-        if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
+        if strategy is None or strategy.kind not in (
+            ContextParallelStrategyKind.ZIGZAG,
+            ContextParallelStrategyKind.INTERLEAVE,
+        ):
             strategy_name = strategy.name if strategy is not None else "none"
             raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
+                "QSA prefill CP supports zigzag and interleave strategies; "
                 f"got {strategy_name}."
             )
         meta = forward_batch.attn_cp_metadata
-        num_local = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        num_global = indexer_metadata.get_token_to_batch_idx().numel()
+        interleave = strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+        num_local = (
+            len(range(strategy.cp_rank, num_global, strategy.cp_size))
+            if interleave
+            else int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
+        )
         global_logical = getattr(forward_batch, "positions", None)
         global_logical = (
             global_logical[0] if global_logical.ndim == 2 else global_logical
@@ -642,10 +663,28 @@ class QSAIndexer(MultiPlatformOp):
         # Raw keys of all new tokens in global packed order: the ring store
         # and compression use the global write plan unchanged. Cached prefix
         # groups already reside in the compressed-K pool on every rank.
-        token_k_local = token_k.reshape(num_local, -1).contiguous()
-        token_k_full = cp_materialize_global_token_order(
-            token_k_local, forward_batch
-        ).reshape(-1, self.index_kv_heads, self.index_head_dim)
+        token_k_local = token_k.reshape(
+            num_local, self.index_kv_heads * self.index_head_dim
+        ).contiguous()
+        if interleave:
+            exchange = indexer_metadata.cp_key_exchange
+            if exchange is None:
+                raise RuntimeError("QSA indexer ring workspace was not prepared")
+            local = token_k_local.reshape(-1, self.index_kv_heads, self.index_head_dim)
+            # Indexer exchanges only raw K; it has no V plane.
+            token_k_full = local.new_empty(
+                (num_global, self.index_kv_heads, self.index_head_dim)
+            )
+            active = (num_global + strategy.cp_size - 1) // strategy.cp_size
+            for owner, payload in exchange.shards(
+                local.unsqueeze(0), active_tokens=active
+            ):
+                count = len(range(owner, num_global, strategy.cp_size))
+                token_k_full[owner :: strategy.cp_size].copy_(payload[0, :count])
+        else:
+            token_k_full = cp_materialize_global_token_order(
+                token_k_local, forward_batch
+            ).reshape(-1, self.index_kv_heads, self.index_head_dim)
         global_rope = (
             global_rope_positions[:, :num_global]
             if global_rope_positions.ndim == 2
@@ -661,7 +700,9 @@ class QSAIndexer(MultiPlatformOp):
         )
         compressed_keys, row_starts, row_ends, sequence_lengths = (
             indexer_metadata.get_prefill_mqa_inputs(
-                self.layer_id, local_logical, query_sequence_ids=local_sequence_ids
+                self.layer_id,
+                local_logical,
+                query_sequence_ids=local_sequence_ids,
             )
         )
         row_sequence_lengths = sequence_lengths.index_select(

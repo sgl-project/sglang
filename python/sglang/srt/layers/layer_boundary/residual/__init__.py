@@ -137,6 +137,10 @@ class ResidualReadout(Protocol):
     # Reads that run on this rank's attention-TP slice and gather what they
     # read; empty when the read offers none.
     gathering_reads: Tuple
+    # Optional capability: update_and_read accepts on_residual_ready and calls
+    # it after the producer update, before the read. The callback may submit a
+    # read-only transfer; it must not modify the residual or synchronize the CPU.
+    publishes_residual_before_read: bool = False
 
     def init_residual(self, hidden_states) -> torch.Tensor:
         """The residual the layer stack starts from, given its input."""

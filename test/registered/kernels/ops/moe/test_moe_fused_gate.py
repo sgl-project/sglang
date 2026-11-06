@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import sys
 from typing import Tuple
+from unittest.mock import patch
 
 import pytest
 import torch
+import triton
 
 from sglang.kernels.jit.utils import get_ci_test_range
 from sglang.kernels.ops.moe.moe_fused_gate import moe_fused_gate
@@ -330,6 +332,31 @@ def test_moe_fused_gate_softmax_matches_aot(
     torch.testing.assert_close(
         dense_tri, _scatter_by_expert(aot_w, aot_i, num_experts), rtol=1e-3, atol=1e-3
     )
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_softmax_reuses_loaded_kernel_for_ragged_rows(dtype: torch.dtype) -> None:
+    """Short CP shards must not load a module after peers queue collectives."""
+    scores = torch.randn(4096, 512, dtype=dtype, device=DEVICE)
+    kwargs = dict(topk=8, scoring_func="softmax", renormalize=True)
+    moe_fused_gate(scores[:64], None, **kwargs)
+    torch.cuda.synchronize()
+    with patch.object(
+        triton.runtime.driver.active.utils,
+        "load_binary",
+        side_effect=AssertionError("Serving a new row count loaded a CUDA module"),
+    ):
+        for rows in (1, 2, 17, 65, 4096):
+            weights, indices = moe_fused_gate(scores[:rows], None, **kwargs)
+            expected_weights, expected_indices = _reference_softmax(
+                scores[:rows], 8, True
+            )
+            torch.testing.assert_close(
+                _scatter_by_expert(weights, indices, 512),
+                _scatter_by_expert(expected_weights, expected_indices, 512),
+                atol=1e-3,
+                rtol=1e-3,
+            )
 
 
 @pytest.mark.parametrize("M", [1, 8, 32])

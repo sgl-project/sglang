@@ -70,12 +70,13 @@ from sglang.srt.utils import (
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
     from sglang.srt.layers.cp.base import BaseContextParallelMetadata
+    from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
     from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
@@ -435,6 +436,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # "Borrowed" into a dedicated "Forward-resolved snapshot" group.
     # The original sequence length without being chunked. Qwen-1M related.
     orig_seq_lens: Optional[torch.Tensor] = None
+    prefill_cp_metadata: Optional[ShardedContextParallelMetadata] = None
 
     # This iteration's KV ids, translated once per sub-pool (`IterationIds`).
     # Every forward of the iteration holds the same plan; `out_cache_loc` is
@@ -462,6 +464,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     mamba_track_seqlens: Optional[torch.Tensor] = None  # shape: [b], int64
     mamba_prefill_track_mask_cpu: Optional[List[bool]] = None
     mamba_track_seqlens_cpu: Optional[List[int]] = None
+    mamba_track_checkpoints: Optional[
+        Tuple[Tuple[Tuple[int, torch.Tensor], ...], ...]
+    ] = None
     # Deferred mamba init ops: COW pairs and clear indices (performed on forward stream)
     mamba_cow_src_indices: Optional[torch.Tensor] = None
     mamba_cow_dst_indices: Optional[torch.Tensor] = None
@@ -890,6 +895,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         self.can_run_dp_draft_cuda_graph = batch.can_run_dp_draft_cuda_graph
 
     @classmethod
+    @profile_method("sglang.batch.prepare_forward_inputs")
     def init_new(
         cls,
         batch: ScheduleBatch,
@@ -984,6 +990,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             req_pool_indices=batch.req_pool_indices,
             seq_lens=batch.seq_lens,
             out_cache_loc=batch.out_cache_loc,
+            prefill_cp_metadata=batch.prefill_cp_metadata,
             seq_lens_sum=batch.seq_lens_sum,
             # Inputs aliased by reference from ScheduleBatch
             seq_lens_cpu=seq_lens_cpu,
@@ -1010,6 +1017,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 if batch.mamba_track_seqlens_cpu is not None
                 else None
             ),
+            mamba_track_checkpoints=batch.mamba_track_checkpoints,
             mamba_cow_src_indices=batch.mamba_cow_src_indices,
             mamba_cow_dst_indices=batch.mamba_cow_dst_indices,
             mamba_clear_indices=batch.mamba_clear_indices,
@@ -1371,11 +1379,27 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             sharded=sharded,
         )
 
+    @property
+    def layer_cp_metadata(self):
+        """Token ownership used by hybrid attention and FFN boundaries."""
+        metadata = self.prefill_cp_metadata
+        # Physical KV sharding owns rows from the first layer. Shared CP/TP
+        # paths activate layer-wide ownership only after the model splits rows;
+        # ordinary MoE keeps its existing attention-local row transport.
+        if metadata is not None and (
+            metadata.kv_read_slots is not None or metadata.current is not None
+        ):
+            return metadata
+        return None
+
     def moe_num_token_non_padded(self) -> Optional[torch.Tensor]:
         """Bound for masking a sparse MoE's padded rows, or None when the MoE
         input is a gathered buffer whose real rows are not a prefix of it."""
         from sglang.srt.layers.layer_boundary import batch_gathers_over_moe_cp
         from sglang.srt.layers.moe.utils import is_moe_input_scattered_across_dp_ranks
+
+        if self.layer_cp_metadata is not None:
+            return self.num_token_non_padded
 
         if (
             is_moe_input_scattered_across_dp_ranks()

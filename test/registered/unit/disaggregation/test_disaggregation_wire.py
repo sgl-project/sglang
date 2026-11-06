@@ -11,6 +11,7 @@ from unittest.mock import ANY, Mock, call, patch
 import numpy as np
 import torch
 import torch.distributed as dist
+import zmq
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import CommonKVManager
@@ -1169,6 +1170,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager = object.__new__(CommonKVManager)
                 manager.attn_cp_size = cp_size
                 manager.attn_cp_rank = cp_rank
+                manager.kv_args = SimpleNamespace(state_cp_size=1)
                 with get_context().override_server_args(
                     enable_dsa_cache_layer_split=layer_split,
                     enable_cp_tp_group_sharing=sharing,
@@ -1183,6 +1185,7 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
         manager.attn_cp_size = 8
         manager.attn_cp_rank = 3
         manager.is_hybrid_mla_backend = False
+        manager.kv_args = SimpleNamespace(state_cp_size=1)
 
         with get_context().override_server_args(
             enable_dsa_cache_layer_split=False,
@@ -1191,6 +1194,29 @@ class TestCPReplicatedStateTransfer(unittest.TestCase):
                 manager._get_dsa_cache_transfer_skip_flags(None),
                 (False, True),
             )
+
+    def test_sharded_mamba_state_is_sent_by_its_owner(self):
+        for slot in range(1, 9):
+            with self.subTest(slot=slot):
+                senders = []
+                for rank in range(4):
+                    manager = object.__new__(MooncakeKVManager)
+                    manager.attn_cp_size = 4
+                    manager.attn_cp_rank = rank
+                    manager.is_hybrid_mla_backend = False
+                    manager.kv_args = SimpleNamespace(
+                        state_cp_size=4, state_cp_rank=rank
+                    )
+                    with get_context().override_server_args(
+                        enable_dsa_cache_layer_split=False,
+                        enable_cp_tp_group_sharing=False,
+                    ):
+                        _, skip_state = manager._get_dsa_cache_transfer_skip_flags(None)
+                    if not skip_state:
+                        indices = manager.local_mamba_state_indices([slot])
+                        if indices is not None:
+                            senders.append((rank, indices))
+                self.assertEqual(senders, [((slot - 1) % 4, [(slot - 1) // 4 + 1])])
 
 
 class TestQwen4StateWire(unittest.TestCase):
@@ -1627,6 +1653,7 @@ class TestHeteroTpSwaStateTransfer(CustomTestCase):
             state_dim_per_tensor=[[]],
             state_layer_ids=[[]],
             swa_kv_cache_layout="nhd",
+            state_cp_size=1,
         )
         return prefill
 
@@ -1819,7 +1846,7 @@ class TestStagingWatermark(unittest.TestCase):
 
     def test_new_watermark_subscriber_receives_current_allocator_state(self):
         sock = Mock()
-        bootstrap_info = {"host": "prefill", "port": 7200}
+        bootstrap_info = {"rank_ip": "prefill", "rank_port": 7200}
         receiver = Mock(
             bootstrap_infos=[bootstrap_info],
         )
@@ -1827,13 +1854,16 @@ class TestStagingWatermark(unittest.TestCase):
         handler = object.__new__(DecodeStagingHandler)
         handler.staging_allocator = Mock()
         handler.staging_allocator.get_watermark.return_value = (3, 0)
+        handler._lock = threading.RLock()
         handler._wm_subscribers = {}
+        handler._pending_watermarks = {}
 
         handler.register_wm_subscriber(receiver, "session-new")
 
         sock.send_multipart.assert_called_once_with(
-            [b"WATERMARK", b"3", b"0", b"session-new"]
+            [b"WATERMARK", b"3", b"0", b"session-new"], flags=zmq.NOBLOCK
         )
+        self.assertEqual(handler._pending_watermarks, {})
 
 
 class TestStagingScatterLifecycle(CustomTestCase):
@@ -1851,7 +1881,9 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler.tp_rank = 0
         handler._room_to_decode_req = {room: SimpleNamespace(_chunk_events=[])}
         handler._room_to_receiver = {room: receiver}
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         handler._room_tokens = {room: object()}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
@@ -1895,8 +1927,11 @@ class TestStagingScatterLifecycle(CustomTestCase):
         handler.tp_rank = 0
         handler._room_to_decode_req = {room: decode_req}
         handler._room_to_receiver = {room: receiver}
+        handler._completed_chunks = {}
         handler._writer_counts = {room: {}}
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         token = object()
         handler._room_tokens = {room: token}
         handler._inflight_submits = {}
@@ -1956,10 +1991,13 @@ class TestStagingScatterLifecycle(CustomTestCase):
                 room_receivers={room: receiver}, room_bootstrap={room: object()}
             )
         )
-        handler._staging_lifecycle = threading.Condition()
+        handler._lock = threading.RLock()
+        handler._pending_watermarks = {}
+        handler._staging_lifecycle = threading.Condition(handler._lock)
         handler._room_to_decode_req = {room: request}
         handler._room_to_receiver = {room: receiver}
         handler._room_tokens = {room: object()}
+        handler._completed_chunks = {}
         handler._writer_counts = {}
         handler._inflight_submits = {}
         handler._claimed_chunks = set()
@@ -1980,7 +2018,7 @@ class TestStagingScatterLifecycle(CustomTestCase):
         stream = Mock()
         handler.flush_pending_scatters(stream)
         handler._scatter_region.assert_called_once_with(
-            4096, 0, 3, request, receiver, stream
+            4096, 0, 3, request, receiver, stream, None
         )
         event = make_event.return_value
         event.record.assert_called_once_with(stream)
@@ -2107,6 +2145,7 @@ class TestMooncakePPStaging(unittest.TestCase):
         sock = Mock()
         receiver = SimpleNamespace(
             chunk_staging_infos=[],
+            prefill_info=SimpleNamespace(ring_cp_sharded=False),
             _connect_to_bootstrap_server=Mock(return_value=(sock, threading.Lock())),
         )
         allocator = SimpleNamespace(
@@ -2139,13 +2178,16 @@ class TestMooncakePPStaging(unittest.TestCase):
     )
     def test_pp_stage_writes_its_global_layer_slots(self, gather):
         manager = object.__new__(MooncakeKVManager)
-        tensor = SimpleNamespace(shape=(1, 1, 8), element_size=lambda: 2)
+        tensor = torch.empty((6, 4, 8), dtype=torch.bfloat16)
         manager.kv_buffer_tensors = {
             "k_buffers": [tensor],
             "v_buffers": [tensor],
             "page_size": 2,
+            "slot_ids": [("target", "k", 7), ("target", "v", 7)],
         }
         manager.attn_tp_size = 1
+        manager.attn_cp_size, manager.attn_cp_rank = 1, 0
+        manager.ring_cp_sharded = False
         manager.pp_size = 16
         manager.kv_args = SimpleNamespace(
             engine_rank=0,
@@ -2153,6 +2195,7 @@ class TestMooncakePPStaging(unittest.TestCase):
             total_kv_head_num=4,
             kv_head_num=4,
             kv_layer_ids=[7, 7],
+            page_size=2,
         )
         manager._transfer_data = Mock(return_value=0)
         staging = SimpleNamespace(fits=lambda size: True, get_ptr=lambda: 0x9000)
@@ -2164,7 +2207,7 @@ class TestMooncakePPStaging(unittest.TestCase):
             dst_staging_size=1 << 20,
             dst_tp_rank=0,
             dst_attn_tp_size=16,
-            dst_kv_item_len=128,
+            dst_kv_item_len=32,
             dst_layer_ids=[3, 7, 11, 3, 7, 11],
             staging_buffer=staging,
         )

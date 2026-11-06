@@ -11,10 +11,45 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""PyTorch hooks for layerwise NVTX profiling."""
+"""PyTorch profiler spans and hooks for layerwise NVTX profiling."""
+
+from contextlib import nullcontext
+from functools import wraps
 
 import torch
 import torch.cuda.nvtx as nvtx
+
+_NULL_CONTEXT = nullcontext()
+_NVTX_RANGES_ENABLED = False
+
+
+def enable_nvtx_ranges(enabled: bool):
+    """Use the existing layerwise NVTX option for explicit operation ranges too."""
+    global _NVTX_RANGES_ENABLED
+    _NVTX_RANGES_ENABLED = enabled
+
+
+def profile_range(debug_name: str):
+    """Record a CPU scope for Torch profiling or explicitly enabled NVTX."""
+    if torch.autograd._profiler_enabled():
+        return torch.profiler.record_function(debug_name)
+    if _NVTX_RANGES_ENABLED:
+        return nvtx.range(debug_name)
+    return _NULL_CONTEXT
+
+
+def profile_method(debug_name: str):
+    """Decorator form of :func:`profile_range`."""
+
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            with profile_range(debug_name):
+                return func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator
 
 
 class PytHooks(object):

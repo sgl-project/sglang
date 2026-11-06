@@ -347,3 +347,61 @@ class TestMMPadding(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCPPrecomputedEmbedding(CustomTestCase):
+    def test_precomputed_indices_match_chunked_token_positions(self):
+        from sglang.srt.managers.mm_schedule import _get_precomputed_embedding_indices
+
+        prompts = [
+            [9, 111, 111, 8, 222, 222, 222, 7],
+            [5, 333, 333, 333, 4],
+        ]
+        offsets = [[(1, 2), (4, 6)], [(1, 3)]]
+        for prefixes, lengths in (([0, 0], [8, 5]), ([2, 3], [4, 2]), ([7, 4], [1, 1])):
+            with self.subTest(prefixes=prefixes, lengths=lengths):
+                tokens = torch.tensor(
+                    [
+                        token
+                        for prompt, prefix, length in zip(prompts, prefixes, lengths)
+                        for token in prompt[prefix : prefix + length]
+                    ]
+                )
+                expected = torch.where(
+                    torch.isin(tokens, torch.tensor([111, 222, 333]))
+                )[0]
+                indices = _get_precomputed_embedding_indices(
+                    tokens, prefixes, lengths, offsets
+                )
+                torch.testing.assert_close(indices, expected)
+        self.assertIsNone(
+            _get_precomputed_embedding_indices(torch.zeros(10), [0], [8], [offsets[0]])
+        )
+        self.assertIsNone(
+            _get_precomputed_embedding_indices(
+                torch.zeros(8), [0], [8], [[(1, 3), (3, 4)]]
+            )
+        )
+
+    def test_cpu_segments_preserve_shard_rows_and_chunk_offsets(self):
+        from sglang.srt.managers.mm_schedule import (
+            _scatter_precomputed_embedding_segments_direct_h2d,
+            _select_precomputed_embedding_segments,
+        )
+
+        features = torch.arange(36, dtype=torch.float32).reshape(12, 3)
+        indices = torch.tensor([1, 2, 3, 7, 8, 9])
+        segments = [(features, 2, 5), (features, 8, 11)]
+        full = torch.zeros(11, 3)
+        full[indices] = torch.cat([features[2:5], features[8:11]])
+        for owned in ([0, 2, 3, 8], [1, 7, 9, 10], []):
+            local_indices, local_segments = _select_precomputed_embedding_segments(
+                indices, segments, owned
+            )
+            local = torch.zeros(len(owned), 3)
+            _scatter_precomputed_embedding_segments_direct_h2d(
+                local, local_indices, local_segments
+            )
+            torch.testing.assert_close(
+                local, full[torch.tensor(owned, dtype=torch.long)]
+            )

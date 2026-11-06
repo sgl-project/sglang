@@ -99,8 +99,13 @@ from sglang.srt.models.qwen4_exp_ple_table import (
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
 )
-from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
+from sglang.srt.runtime_context import (
+    get_exec,
+    get_parallel,
+    linear_attn_parallel_group,
+)
 from sglang.srt.utils import get_bool_env_var, is_cuda, is_hip, logger
+from sglang.srt.utils.nvtx_utils import profile_method, profile_range
 
 _is_cuda = is_cuda()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
@@ -1500,6 +1505,14 @@ def _shards_rows_over_cp(forward_batch: ForwardBatch) -> bool:
 def _linear_attn_options():
     """Linear attention scans the sequence in token order, and its output owes
     the sum over the group its heads are partitioned over."""
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    if is_gdn_cp_enabled():
+        from sglang.srt.layers.layer_boundary.row_transport import (
+            contiguous_context_parallel_transport,
+        )
+
+        return dict(row_transport=contiguous_context_parallel_transport())
     return dict(
         tp_group=(
             SumGroup.TP if linear_attn_parallel_group() == "tp" else SumGroup.ATTN_TP
@@ -1521,10 +1534,28 @@ def _qwen4_exp_stage_facts(config, layer_id, *, residual=None, linear_attention=
             attn_reads_every_row=_has_ple(layer_id, config)
         )
     sparse = _qwen3_5_is_moe(config)
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    cp_layout = (
+        ("contiguous" if linear_attention else "attention")
+        if is_gdn_cp_enabled() and get_exec().moe.enable_mxfp4_mega
+        else None
+    )
+    next_layout = None
+    if cp_layout is not None:
+        next_layout = (
+            "contiguous"
+            if layer_id + 1 < config.num_hidden_layers
+            and config.layers_block_type[layer_id + 1] != "attention"
+            else "attention"
+        )
     return (
         declare_attn(
             read=residual.attn_readout,
             update=residual.attn_update,
+            cp_layout=cp_layout,
+            # Ordinary/short batches still need the original compute-row
+            # transport when attention CP does not shard the layer stack.
             **(_linear_attn_options() if linear_attention else {}),
         ),
         declare_ffn(
@@ -1532,6 +1563,8 @@ def _qwen4_exp_stage_facts(config, layer_id, *, residual=None, linear_attention=
             next_layer_sparse=sparse,
             read=residual.ffn_readout,
             update=residual.ffn_update,
+            cp_layout="current" if cp_layout is not None else None,
+            cp_next_layout=next_layout,
         ),
     )
 
@@ -1628,6 +1661,7 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
+                ffn_norm=self.mlp_hyper_connection.normalize_residual,
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
@@ -1721,9 +1755,25 @@ class Qwen4ExpLayerExtensionMixin:
         if _shards_rows_over_cp(forward_batch):
             # The n-gram window and the short conv read the sequence in global
             # token order: run on the gathered rows, keep this rank's rows.
-            full_rows = cp_gather_after_forward(residual, forward_batch)
-            embedding = self.ple(full_rows, forward_batch, ple_batch)
-            return residual + cp_shard_hidden_states(embedding, forward_batch)
+            metadata = forward_batch.layer_cp_metadata
+            if metadata is not None:
+                plan = metadata.token_collectives()
+                local_rows = plan.local_rows
+                full_rows = plan.gather(residual[:local_rows])
+                embedding = self.ple(full_rows, forward_batch, ple_batch)
+                indices = plan.reduce_indices.narrow(
+                    0, metadata.rank * plan.padded_rows, local_rows
+                )
+                local_embedding = embedding.index_select(0, indices)
+                if local_rows != residual.shape[0]:
+                    local_embedding = torch.nn.functional.pad(
+                        local_embedding, (0, 0, 0, residual.shape[0] - local_rows)
+                    )
+            else:
+                full_rows = cp_gather_after_forward(residual, forward_batch)
+                embedding = self.ple(full_rows, forward_batch, ple_batch)
+                local_embedding = cp_shard_hidden_states(embedding, forward_batch)
+            return residual + local_embedding
         return residual + self.ple(residual, forward_batch, ple_batch)
 
     def _prepare_attn_stage(
@@ -1742,6 +1792,7 @@ class Qwen4ExpLayerExtensionMixin:
         finally:
             self._ple_forward_batch = self._ple_batch = None
 
+    @profile_method("sglang.layer.mlp")
     def _run_ffn_stage(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
@@ -1807,14 +1858,15 @@ class Qwen4ExpLinearDecoderLayer(
     ):
         forward_batch = kwargs.get("forward_batch", None)
 
-        hidden_states = self._prepare_attn_stage(
-            hidden_states, forward_batch, kwargs.get("ple_batch")
-        )
+        with profile_range("sglang.layer.attention.gdn"):
+            hidden_states = self._prepare_attn_stage(
+                hidden_states, forward_batch, kwargs.get("ple_batch")
+            )
 
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.linear_attn(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.linear_attn(hidden_states, forward_batch)
 
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
@@ -1888,6 +1940,7 @@ class Qwen4ExpAttentionDecoderLayer(
             forward_batch=forward_batch,
         )
 
+    @profile_method("sglang.attention.qsa.indexer")
     def _compute_qsa_topk_indices_eager(
         self,
         hidden_states: torch.Tensor,
@@ -2008,18 +2061,19 @@ class Qwen4ExpAttentionDecoderLayer(
         forward_batch: ForwardBatch,
         **kwargs: Any,
     ):
-        hidden_states = self._prepare_attn_stage(
-            hidden_states, forward_batch, kwargs.get("ple_batch")
-        )
-
-        if not forward_batch.forward_mode.is_idle():
-            hidden_states = self.self_attention(
-                positions=positions,
-                hidden_states=hidden_states,
-                forward_batch=forward_batch,
+        with profile_range("sglang.layer.attention.qsa"):
+            hidden_states = self._prepare_attn_stage(
+                hidden_states, forward_batch, kwargs.get("ple_batch")
             )
 
-        hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
+            if not forward_batch.forward_mode.is_idle():
+                hidden_states = self.self_attention(
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    forward_batch=forward_batch,
+                )
+
+            hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         return self._run_ffn_stage(hidden_states, forward_batch)
 
 
@@ -2107,6 +2161,12 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hidden_states, positions = cp_split_before_forward(
                 hidden_states, positions, forward_batch
             )
+            if (
+                forward_batch.prefill_cp_metadata is not None
+                and get_exec().moe.enable_mxfp4_mega
+            ):
+                metadata = forward_batch.prefill_cp_metadata
+                metadata.current = metadata.layout_names["attention"]
 
         breakable_ple = (
             self.has_ple

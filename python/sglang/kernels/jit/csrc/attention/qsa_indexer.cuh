@@ -231,7 +231,7 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
   device::PDLWaitPrimary<kUsePDL>();
 
   const int64_t qk_row = static_cast<int64_t>(token) * (params.num_q_heads + 1) * kHeadDim;
-  const int64_t loc = params.cache_loc[token];
+  const int64_t loc = params.cache_loc ? params.cache_loc[token] : 0;
   int64_t pos[3];
 #pragma unroll
   for (int a = 0; a < 3; ++a) {
@@ -254,16 +254,16 @@ __global__ __launch_bounds__(128) void qsa_index_q_prep_kernel(const QsaIndexQPr
     }
   }
 
-  // Raw token-K and RoPE coordinates are stored for every token, whether or
-  // not the token completes a compression group.
-  if (warp == 0) {
+  // CP can defer stores until the raw keys have been exchanged. Otherwise
+  // keep every token, whether or not it completes a compression group.
+  if (params.cache_loc && warp == 0) {
     vec_t kv;
     kv.load(
         static_cast<const T*>(params.qk) + qk_row + params.num_q_heads * kHeadDim,
         lane);  // offset is in vector units
     kv.store(static_cast<T*>(params.key_state_buffer) + loc * kHeadDim, lane);
   }
-  if (warp == 1 && lane < 3) {
+  if (params.cache_loc && warp == 1 && lane < 3) {
     params.rope_position_buffer[loc * 3 + lane] = pos[lane];
   }
 
@@ -407,7 +407,10 @@ void qsa_index_q_prep(
   TensorMatcher({cache_rows, rotary_dim}).with_dtype<fp32_t>().with_device(device).verify(cos_sin_cache);
   TensorMatcher({rotary_dim / 2}).with_dtype<int32_t>().with_device(device).verify(axis_map);
   TensorMatcher({num_axes, tokens}).with_dtype<int64_t>().with_device(device).with_strides({-1, 1}).verify(positions);
-  TensorMatcher({tokens}).with_dtype<int64_t>().with_device(device).verify(cache_loc);
+  auto cache_tokens = SymbolicSize{"cache_tokens"};
+  TensorMatcher({cache_tokens}).with_dtype<int64_t>().with_device(device).verify(cache_loc);
+  CHECK_HOST(cache_tokens.unwrap() == 0 || cache_tokens.unwrap() == tokens.unwrap())
+      << "qsa_index_q_prep: cache slots must be empty or match token count";
   auto slots = SymbolicSize{"state_slots"};
   TensorMatcher({slots, D}).with_dtype<T>().with_device(device).verify(key_state_buffer);
   TensorMatcher({slots, 3}).with_dtype<int64_t>().with_device(device).verify(rope_position_buffer);
@@ -428,7 +431,7 @@ void qsa_index_q_prep(
       .cos_sin_cache = static_cast<const float*>(cos_sin_cache.data_ptr()),
       .axis_map = static_cast<const int32_t*>(axis_map.data_ptr()),
       .positions = static_cast<const int64_t*>(positions.data_ptr()),
-      .cache_loc = static_cast<const int64_t*>(cache_loc.data_ptr()),
+      .cache_loc = cache_tokens.unwrap() ? static_cast<const int64_t*>(cache_loc.data_ptr()) : nullptr,
       .key_state_buffer = key_state_buffer.data_ptr(),
       .rope_position_buffer = static_cast<int64_t*>(rope_position_buffer.data_ptr()),
       .positions_stride = positions.stride(0),

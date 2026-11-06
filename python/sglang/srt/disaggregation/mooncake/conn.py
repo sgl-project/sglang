@@ -26,6 +26,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVSender,
 )
 from sglang.srt.disaggregation.common.staging_handler import (
+    STAGING_MEMORY_UNAVAILABLE,
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
     PrefillStagingContext,
@@ -75,6 +76,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_memory,
     get_observability,
     get_parallel,
@@ -231,8 +233,18 @@ class KVArgsRegisterInfo:
                 else []
             ),
             # Note: always put the staging field at the final
-            staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
+            staging=StagingRegisterInfo.from_zmq_fields(
+                msg, 15, slot_ids_index=19, layout_index=21
+            ),
         )
+
+
+def _check_direct_kv_allowed():
+    if (
+        get_disagg().disaggregation_require_bulk
+        or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+    ):
+        raise RuntimeError("Bulk KV transfer is required; direct writes are disabled")
 
 
 def _uses_flat_entry_layout(
@@ -284,6 +296,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
+        if (
+            get_disagg().disaggregation_require_bulk
+            or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+        ) and not self.enable_staging:
+            raise ValueError("Bulk KV transfer requires SGLANG_DISAGG_STAGING_BUFFER=1")
         self.max_transfer_batch_indices = (
             envs.SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES.get()
         )
@@ -563,6 +580,29 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             "page_size": page_size,
             "slot_layer_ids": list(slot_layer_ids or []),
         }
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            get_kv_bytes_per_head,
+        )
+
+        ids = list(slot_layer_ids or [])
+        if not ids:
+            layers = range(
+                self.kv_args.prefill_start_layer,
+                self.kv_args.prefill_start_layer + len(k_buffers),
+            )
+            ids = list(layers) * 2
+        if len(ids) != len(k_buffers) + len(v_buffers):
+            raise ValueError("Staging layer identities do not match buffer entries")
+        self.kv_buffer_tensors["slot_ids"] = [
+            ("target", "k" if i < len(k_buffers) else "v", layer)
+            for i, layer in enumerate(ids)
+        ]
+        self.kv_buffer_tensors["slot_item_lens"] = [
+            page_size * b.shape[1] * width
+            for b, width in zip(
+                k_buffers + v_buffers, get_kv_bytes_per_head(k_buffers + v_buffers)
+            )
+        ]
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
         self.engine.batch_register([ptr], [size])
@@ -578,6 +618,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             count,
             get_schedule().chunked_prefill_size,
             device_type=get_device().device,
+            allow_oom_fallback=not (
+                get_disagg().disaggregation_require_bulk
+                or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+            ),
         )
         self.kv_buffer_tensors = None
 
@@ -590,7 +634,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._register_staging_memory,
             self.kv_args,
             device_type=get_device().device,
+            allow_oom_fallback=not (
+                get_disagg().disaggregation_require_bulk
+                or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+            ),
         )
+        if self._staging_ctx.allocator is None:
+            self.enable_staging = False
         self.kv_buffer_tensors = None
 
     def _try_create_staging_strategy(self, staging_buffer):
@@ -612,55 +662,64 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         executor,
         queue,
     ):
-        """Execute staging transfer for one chunk. Returns (ret, deferred).
-
-        Handles readiness check, transfer, and CHUNK_READY notification; a chunk
-        that cannot fit returns -1 (the caller fails only this room) instead of
-        falling back to the slice path, which would leak the decode-side
-        allocation. deferred=True means caller should re-enqueue and break.
-        """
+        """Transfer through staging, falling back only for capacity failures."""
+        if (
+            target_info.staging is None
+            or target_info.staging.total_size == STAGING_MEMORY_UNAVAILABLE
+        ):
+            return (
+                self._send_direct_kvcache(
+                    req, kv_chunk, target_info, chunked_dst_kv_indice, executor
+                ),
+                False,
+            )
+        if staging_strategy is None:
+            raise RuntimeError("Bulk KV transfer has no source tensor metadata")
         ready, chunk_idx, c_offset, _, _ = staging_strategy.check_ready(
             req,
             kv_chunk.index_slice.start,
             len(kv_chunk.prefill_kv_indices),
         )
-        if not ready:
-            from sglang.srt.disaggregation.common.staging_buffer import StagingAllocator
-
-            if c_offset == StagingAllocator.ALLOC_OVERSIZED:
-                # Fail this room, not the worker thread: the same prefill still
-                # serves other (same-TP, non-staging) decode instances.
-                logger.warning_once(
-                    "[Staging] a chunk exceeds the staging ring; failing affected "
-                    "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
-                    "reduce chunked_prefill_size."
-                )
-                return (-1, False)
-            # Not ready yet: wait (bounded) for a watermark advance, then
-            # re-enqueue to retry. A plain block-until-ready would head-of-line
-            # block other rooms on this single worker thread.
+        memory_fallback = c_offset == STAGING_MEMORY_UNAVAILABLE
+        if not ready and not memory_fallback:
+            # Bootstrap may finish after the scheduler's pre-forward prefetch.
+            # At this point metadata is available; ensure allocation is requested.
+            self._prefetch_staging_reqs(req.room)
             with self._staging_ctx.watermark_cv:
                 self._staging_ctx.watermark_cv.wait(STAGING_WATERMARK_WAIT_S)
             queue.put(kv_chunk)
             return (-1, True)
-
-        ret = staging_strategy.transfer(
-            req.mooncake_session_id,
-            kv_chunk.prefill_kv_indices,
-            target_info.staging_base_ptr + c_offset,
-            target_info.staging_total_size - c_offset,
-            target_info,
-        )
-        if ret == -1:
-            # Doesn't fit the ring: fail this room (caller's ret != 0 path), do
-            # not fall back to the slice path (leaks the decode-side allocation).
-            logger.warning_once(
-                "[Staging] a chunk does not fit the staging ring; failing affected "
-                "requests. Increase SGLANG_DISAGG_STAGING_POOL_SIZE_MB or "
-                "reduce chunked_prefill_size."
+        ret = STAGING_MEMORY_UNAVAILABLE
+        if not memory_fallback:
+            ret = staging_strategy.transfer(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                target_info.staging.base_ptr + c_offset,
+                target_info.staging.total_size - c_offset,
+                target_info,
             )
-            return (-1, False)
+        staged = ret != STAGING_MEMORY_UNAVAILABLE
+        if not staged:
+            logger.warning(
+                "KV staging memory exhausted; using direct page/token writes"
+            )
+        if not staged:
+            ret = self._send_direct_kvcache(
+                req,
+                kv_chunk,
+                target_info,
+                chunked_dst_kv_indice,
+                executor,
+            )
         if ret == 0:
+            writer_index, slots = (
+                self._staging_writer_metadata(target_info)
+                if staged
+                else (
+                    self.attn_cp_rank if self.ring_cp_sharded else self.attn_tp_rank,
+                    [],
+                )
+            )
             self.send_chunk_ready(
                 room=req.room,
                 chunk_idx=chunk_idx,
@@ -668,6 +727,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 num_pages=len(kv_chunk.prefill_kv_indices),
                 writer_id=req.mooncake_session_id,
                 targets=[(req.endpoint, req.dst_port)],
+                staged=staged,
+                writer_index=writer_index,
+                slot_indices=slots,
             )
         return (ret, False)
 
@@ -679,8 +741,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         needs_staging = any(
             not tinfo.is_dummy
             and self.decode_kv_args_table.get(tinfo.mooncake_session_id) is not None
-            and self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
-            != self.attn_tp_size
+            and (
+                self.ring_cp_sharded
+                or get_disagg().disaggregation_require_bulk
+                or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+                or self.decode_kv_args_table[tinfo.mooncake_session_id].dst_attn_tp_size
+                != self.attn_tp_size
+            )
             for tinfo in room_infos.values()
         )
         if not needs_staging:
@@ -699,6 +766,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
             upto_tokens=upto_tokens,
+            logical_page_size=self.kv_args.page_size,
         )
 
     def send_kvcache_staged(
@@ -710,20 +778,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         dst_kv_item_len: int,
-        dst_layer_ids: List[int],
+        dst_layer_ids: Optional[List[int]] = None,
         staging_buffer=None,
         dst_slot_layer_ids: Optional[List[int]] = None,
+        num_dst_target_kv_layers: int = -1,
+        dst_num_entries: int = 0,
+        dst_slot_ids=None,
+        dst_slot_item_lens=None,
     ) -> int:
         """Transfer KV cache via staging buffers (gather -> bulk RDMA -> scatter on decode)."""
         from sglang.srt.disaggregation.common.staging_buffer import (
-            compute_head_slice_params,
+            compute_staging_entry_byte_offsets,
             compute_staging_layout,
+            get_kv_bytes_per_head,
             resolve_total_kv_heads,
         )
+        from sglang.srt.layers.cp.utils import (
+            KVRearrangeMetadata,
+            compute_kv_head_overlap,
+        )
 
-        if self.kv_buffer_tensors is None or staging_buffer is None:
-            return -1
-
+        if self.kv_buffer_tensors is None:
+            raise RuntimeError("Missing source staging tensor metadata")
         k_buffers = self.kv_buffer_tensors["k_buffers"]
         v_buffers = self.kv_buffer_tensors["v_buffers"]
         page_size = self.kv_buffer_tensors["page_size"]
@@ -732,9 +808,20 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dtype_size = k_buffers[0].element_size()
 
         total_kv_heads = resolve_total_kv_heads(self.kv_args, self.attn_tp_size)
-
+        cp_size = self.attn_cp_size if self.ring_cp_sharded else 1
+        dst_heads = max(1, total_kv_heads // dst_attn_tp_size)
+        if (
+            page_size * cp_size != self.kv_args.page_size
+            or dst_kv_item_len
+            != self.kv_args.page_size * dst_heads * head_dim * dtype_size
+        ):
+            raise ValueError(
+                "Bulk KV transfer requires matching page/head/dtype geometry"
+            )
+        if cp_size > 1 and self.attn_tp_size != 1:
+            raise ValueError("Ring CP staging requires prefill attention TP1")
         local_tp_rank = self.kv_args.engine_rank % self.attn_tp_size
-        src_head_start, num_heads_to_send, _, _ = compute_head_slice_params(
+        src_head_start, num_heads_to_send, _ = compute_kv_head_overlap(
             self.attn_tp_size,
             dst_attn_tp_size,
             local_tp_rank,
@@ -743,83 +830,104 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
 
         num_tokens = len(prefill_kv_indices) * page_size
-        per_layer_bytes = num_tokens * num_heads_to_send * head_dim * dtype_size
-        local_bytes = per_layer_bytes * num_layers * 2
+        source_head_bytes = get_kv_bytes_per_head(k_buffers + v_buffers)
+        source_offsets = compute_staging_entry_byte_offsets(
+            [num_heads_to_send * b for b in source_head_bytes], num_tokens
+        )
+        local_bytes = source_offsets[-1]
 
-        if self.pp_size > 1:
-            # Pair staging slots in [all K, all V] order; draft buffers make
-            # kv_data_ptrs diverge from this layout.
-            src_slot_ids = (
-                self.kv_buffer_tensors.get("slot_layer_ids")
-                or self.kv_args.kv_layer_ids
-            )
-            dst_slot_ids = dst_slot_layer_ids or dst_layer_ids
-            pairs = build_transfer_entry_pairs(
-                src_slot_ids,
-                dst_slot_ids,
-                num_layers * 2,
-                len(dst_slot_ids),
-            )
-            dst_num_layers = len(dst_slot_ids) // 2
-        else:
-            pairs = None
-            dst_num_layers = num_layers
-
+        if dst_slot_ids is None and (dst_slot_layer_ids or dst_layer_ids):
+            layer_ids = dst_slot_layer_ids or dst_layer_ids
+            half = len(layer_ids) // 2
+            dst_slot_ids = [
+                ("target", "k" if i < half else "v", lid)
+                for i, lid in enumerate(layer_ids)
+            ]
+            dst_slot_item_lens = [dst_kv_item_len] * len(layer_ids)
+            dst_num_entries = len(layer_ids)
+        pairs, dst_slot_item_lens = self._staging_destination_layout(
+            dst_kv_item_len,
+            dst_num_entries,
+            num_dst_target_kv_layers,
+            dst_slot_ids,
+            dst_slot_item_lens,
+        )
+        dst_num_layers = len(dst_slot_item_lens) // 2
+        denominator = self.kv_args.page_size * dst_heads
+        if len(dst_slot_item_lens) != dst_num_layers * 2 or any(
+            n <= 0 or n % denominator for n in dst_slot_item_lens
+        ):
+            raise ValueError("Invalid decode staging slot byte strides")
+        destination_head_bytes = [n // denominator for n in dst_slot_item_lens]
+        if any(source_head_bytes[i] != destination_head_bytes[j] for i, j in pairs):
+            raise ValueError("Source/decode KV entry dtype or head dimension differs")
+        destination_offsets = compute_staging_entry_byte_offsets(
+            [num_heads_to_send * b for b in destination_head_bytes], num_tokens
+        )
         num_writers, writer_rank_bytes, total_staging_needed = compute_staging_layout(
             self.attn_tp_size,
             dst_attn_tp_size,
             dst_tp_rank,
             total_kv_heads,
-            num_tokens,
+            num_tokens * (self.attn_cp_size if self.ring_cp_sharded else 1),
             head_dim * dtype_size,
             dst_num_layers,
+            cp_size=self.attn_cp_size if self.ring_cp_sharded else 1,
+            slot_head_bytes=destination_head_bytes,
         )
-        writer_idx = local_tp_rank % num_writers if num_writers > 1 else 0
+        writer_idx = (
+            self.attn_cp_rank if self.ring_cp_sharded else local_tp_rank
+        ) % num_writers
         rank_offset = sum(writer_rank_bytes[:writer_idx])
 
+        if staging_buffer is None:
+            return STAGING_MEMORY_UNAVAILABLE
         if not staging_buffer.fits(local_bytes):
             logger.warning(
                 f"Prefill staging too small for {local_bytes} bytes, falling back"
             )
-            return -1
+            return STAGING_MEMORY_UNAVAILABLE
         if dst_staging_size < total_staging_needed:
-            logger.warning(
-                f"Decode staging too small: need {total_staging_needed} bytes "
-                f"for {dst_num_layers} layers, have {dst_staging_size}, falling back"
+            raise ValueError(
+                f"Invalid decode staging region: need {total_staging_needed} bytes "
+                f"for {dst_num_layers} layers, have {dst_staging_size}"
             )
-            return -1
 
         from sglang.srt.disaggregation.common.staging_buffer import (
             gather_all_layers_to_staging,
         )
 
-        gather_all_layers_to_staging(
-            k_buffers,
-            v_buffers,
-            prefill_kv_indices,
-            staging_buffer,
-            src_head_start,
-            num_heads_to_send,
-            page_size,
-        )
+        try:
+            gather_all_layers_to_staging(
+                k_buffers,
+                v_buffers,
+                prefill_kv_indices,
+                staging_buffer,
+                src_head_start,
+                num_heads_to_send,
+                page_size,
+            )
+        except torch.OutOfMemoryError:
+            return STAGING_MEMORY_UNAVAILABLE
 
-        if pairs is None:
-            transfer_blocks = [
-                (
-                    staging_buffer.get_ptr(),
-                    dst_staging_ptr + rank_offset,
-                    local_bytes,
-                )
-            ]
-        else:
-            transfer_blocks = [
-                (
-                    staging_buffer.get_ptr() + src_idx * per_layer_bytes,
-                    dst_staging_ptr + rank_offset + dst_idx * per_layer_bytes,
-                    per_layer_bytes,
-                )
-                for src_idx, dst_idx in pairs
-            ]
+        rearrange_metadata = KVRearrangeMetadata.from_kv_entries(
+            pairs, source_offsets, destination_offsets
+        )
+        transfer_blocks = rearrange_metadata.build_transfer_blocks(
+            staging_buffer.get_ptr(), dst_staging_ptr + rank_offset
+        )
+        if not getattr(self, "_bulk_layout_logged", False):
+            logger.info(
+                "[KV-BULK] CP%d writer=%d/%d bytes=%d rdma_blocks=%d entries=%d destination_slots=%d",
+                self.attn_cp_rank,
+                writer_idx,
+                num_writers,
+                local_bytes,
+                len(transfer_blocks),
+                len(source_head_bytes),
+                len(destination_head_bytes),
+            )
+            self._bulk_layout_logged = True
         ret = self._transfer_data(mooncake_session_id, transfer_blocks)
         if ret != 0:
             raise RuntimeError(
@@ -829,6 +937,168 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"The decode staging buffer may not be properly registered."
             )
         return ret
+
+    def _staging_writer_metadata(self, peer):
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            compute_staging_layout,
+            resolve_total_kv_heads,
+        )
+
+        count = len(self.kv_buffer_tensors["k_buffers"])
+        writers, _, _ = compute_staging_layout(
+            self.attn_tp_size,
+            peer.dst_attn_tp_size,
+            peer.dst_tp_rank,
+            resolve_total_kv_heads(self.kv_args, self.attn_tp_size),
+            self.kv_args.page_size,
+            1,
+            count,
+            cp_size=self.attn_cp_size if self.ring_cp_sharded else 1,
+        )
+        rank = self.attn_cp_rank if self.ring_cp_sharded else self.attn_tp_rank
+        slot_ids = peer.staging.slot_ids or None
+        slot_item_lens = peer.staging.slot_item_lens or None
+        if slot_ids is None and peer.staging.slot_layer_ids:
+            ids = peer.staging.slot_layer_ids
+            slot_ids = [
+                ("target", "k" if i < len(ids) // 2 else "v", lid)
+                for i, lid in enumerate(ids)
+            ]
+            slot_item_lens = [peer.dst_kv_item_len] * len(ids)
+        pairs, _ = self._staging_destination_layout(
+            peer.dst_kv_item_len,
+            len(peer.dst_kv_ptrs),
+            -1,
+            slot_ids,
+            slot_item_lens,
+        )
+        return rank % writers, [destination for _, destination in pairs]
+
+    def _staging_destination_layout(
+        self,
+        dst_kv_item_len,
+        dst_num_entries,
+        dst_num_target_kv_layers,
+        dst_slot_ids=None,
+        dst_slot_item_lens=None,
+    ):
+        """Resolve the exact scatter slots before packing or acknowledging KV."""
+        from sglang.srt.disaggregation.common.staging_buffer import (
+            build_staging_kv_entry_ids,
+            get_kv_bytes_per_head,
+            map_src_to_dst_kv_entries,
+            validate_staging_kv_entries,
+        )
+
+        buffers = self.kv_buffer_tensors
+        count = len(buffers["k_buffers"])
+        target_count = getattr(self.kv_args, "num_target_kv_layers", count)
+        source_ids = buffers.get("slot_ids") or build_staging_kv_entry_ids(
+            count, target_count, getattr(self.kv_args, "prefill_start_layer", 0)
+        )
+        if dst_slot_ids is None and dst_slot_item_lens is None:
+            # Legacy registration cannot describe draft holes or nonuniform
+            # entry widths. Only a target-only, identical PP1 layout is safe.
+            widths = get_kv_bytes_per_head(buffers["k_buffers"] + buffers["v_buffers"])
+            if (
+                target_count != count
+                or dst_num_target_kv_layers not in (-1, count)
+                or self.pp_size != 1
+                or dst_num_entries != 2 * count
+                or len(set(widths)) != 1
+            ):
+                raise ValueError(
+                    "Decode peer lacks version-1 staging layout metadata for "
+                    "asymmetric target/draft or nonuniform KV entries"
+                )
+            dst_slot_ids = build_staging_kv_entry_ids(count, count)
+            dst_slot_item_lens = [dst_kv_item_len] * (2 * count)
+        elif dst_slot_ids is None or dst_slot_item_lens is None:
+            raise ValueError("Incomplete decode staging slot metadata")
+        dst_slot_ids = validate_staging_kv_entries(dst_slot_ids, dst_slot_item_lens)
+        if len(dst_slot_ids) != dst_num_entries:
+            raise ValueError("Decode staging slot count differs from KV registration")
+        target_layers = sum(
+            model == "target" and kind == "k" for model, kind, _ in dst_slot_ids
+        )
+        if dst_num_target_kv_layers >= 0 and target_layers != dst_num_target_kv_layers:
+            raise ValueError("Decode staging target count differs from KV registration")
+        return map_src_to_dst_kv_entries(source_ids, dst_slot_ids), dst_slot_item_lens
+
+    def _send_direct_kvcache(self, req, kv_chunk, peer, destination_pages, executor):
+        _check_direct_kv_allowed()
+        if self.ring_cp_sharded:
+            return self._send_ring_cp_kvcache(
+                req, kv_chunk.prefill_kv_indices, destination_pages, peer
+            )
+        if self.attn_tp_size == peer.dst_attn_tp_size:
+            return self.send_kvcache(
+                req.mooncake_session_id,
+                kv_chunk.prefill_kv_indices,
+                peer.dst_kv_ptrs,
+                destination_pages,
+                executor,
+                dst_layer_ids=peer.dst_kv_layer_ids,
+            )
+        return self.send_kvcache_slice(
+            req.mooncake_session_id,
+            kv_chunk.prefill_kv_indices,
+            peer.dst_kv_ptrs,
+            destination_pages,
+            peer.dst_tp_rank,
+            peer.dst_attn_tp_size,
+            peer.dst_kv_item_len,
+            executor,
+            dst_layer_ids=peer.dst_kv_layer_ids,
+        )
+
+    def _send_ring_cp_kvcache(self, req, source_pages, destination_pages, peer):
+        _check_direct_kv_allowed()
+        from sglang.srt.layers.cp.utils import build_cp_kv_rearrange_metadata
+
+        if self.attn_tp_size != 1 or self.pp_size != 1:
+            raise ValueError("Ring CP requires attention TP1 and PP1")
+        if len(source_pages) != len(destination_pages):
+            raise ValueError("CP source and destination page counts differ")
+        pairs = build_transfer_entry_pairs(
+            self.kv_args.kv_layer_ids,
+            peer.dst_kv_layer_ids,
+            len(self.kv_args.kv_data_ptrs),
+            len(peer.dst_kv_ptrs),
+        )
+        src_ptrs = [self.kv_args.kv_data_ptrs[i] for i, _ in pairs]
+        dst_ptrs = [peer.dst_kv_ptrs[j] for _, j in pairs]
+        heads = self.kv_args.total_kv_head_num or self.kv_args.kv_head_num
+        if len(set(self.kv_args.kv_item_lens)) != 1:
+            raise ValueError("Legacy decode registration requires uniform KV entries")
+        geo = dict(
+            page_size=self.kv_args.page_size,
+            cp_size=self.attn_cp_size,
+            cp_rank=self.attn_cp_rank,
+            total_kv_heads=heads,
+            dst_tp_size=peer.dst_attn_tp_size,
+            dst_tp_rank=peer.dst_tp_rank,
+            src_page_bytes=self.kv_args.kv_item_lens[0],
+            dst_page_bytes=peer.dst_kv_item_len,
+        )
+        # Resolve every chunk before the first write. Reuse each token/head
+        # mapping across all K/V layers; only allocation pointers differ.
+        rearrange_metadata = [
+            build_cp_kv_rearrange_metadata(
+                src_pages=source_pages[start : start + 32],
+                dst_pages=destination_pages[start : start + 32],
+                **geo,
+            )
+            for start in range(0, len(source_pages), 32)
+        ]
+        for metadata in rearrange_metadata:
+            blocks = []
+            for src, dst in zip(src_ptrs, dst_ptrs):
+                blocks.extend(metadata.build_transfer_blocks(src, dst))
+            status = self._transfer_data(req.mooncake_session_id, blocks)
+            if status:
+                return status
+        return 0
 
     def _transfer_data(self, mooncake_session_id, transfer_blocks):
         if not transfer_blocks:
@@ -2069,6 +2339,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             indices = (
                 prefill_state_indices[i] if i < len(prefill_state_indices) else None
             )
+            if st == StateType.MAMBA and indices is not None:
+                indices = self.local_mamba_state_indices(indices)
             if indices is None:
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
@@ -2786,6 +3058,31 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             or skip_kv
                         ):
                             ret = 0
+                        elif (
+                            self.ring_cp_sharded
+                            or get_disagg().disaggregation_require_bulk
+                            or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+                        ):
+                            if self.enable_staging:
+                                ret, deferred = self._do_staging_transfer(
+                                    staging_strategy,
+                                    kv_chunk,
+                                    req,
+                                    target_rank_registration_info,
+                                    chunked_dst_kv_indice,
+                                    executor,
+                                    queue,
+                                )
+                                if deferred:
+                                    staging_deferred = True
+                                    break
+                            else:
+                                ret = self._send_ring_cp_kvcache(
+                                    req,
+                                    kv_chunk.prefill_kv_indices,
+                                    chunked_dst_kv_indice,
+                                    target_rank_registration_info,
+                                )
                         elif is_dcp_transfer:
                             dcp_token_item_lens = (
                                 target_rank_registration_info.dcp_token_item_lens
@@ -3377,6 +3674,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             packed_staging_base_ptr = b""
             staging_total_size_str = b""
         staging_slots = getattr(self, "kv_buffer_tensors", None) or {}
+        packed_staging_layout = (
+            StagingRegisterInfo(
+                layout_version=1,
+                slot_ids=staging_slots["slot_ids"],
+                slot_item_lens=staging_slots["slot_item_lens"],
+            ).layout_bytes()
+            if staging_slots.get("slot_ids")
+            else b""
+        )
         packed_staging_slot_layer_ids = b"".join(
             struct.pack("Q", layer_id)
             for layer_id in (staging_slots.get("slot_layer_ids") or [])
@@ -3414,6 +3720,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            packed_staging_layout,
         ]
 
     def build_receiver_metadata_message(

@@ -63,7 +63,8 @@ from sglang.srt.speculative.ragged_verify import (
 )
 from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import get_compiler_backend
-from sglang.srt.utils.device import get_device_capability
+from sglang.srt.utils.common import get_device_capability
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
@@ -175,6 +176,18 @@ class FlashAttentionBackend(AttentionBackend):
         fa_impl_ver=3,
     ):
         super().__init__()
+        self.cp_exchange = getattr(model_runner, "cp_kv_exchange", None)
+        if self.cp_exchange is not None:
+            if fa_impl_ver != 3:
+                raise ValueError(
+                    "Sharded CP uses FA3 on Hopper; select trtllm_mha on Blackwell"
+                )
+            self.fa_impl_ver = fa_impl_ver
+            self._init_flash_attention_functions(
+                torch.cuda.get_device_capability(model_runner.device)
+            )
+            self._init_cp_attention(model_runner)
+            return
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -898,6 +911,8 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        if self.cp_exchange is not None:
+            return self._init_cp_forward_metadata(forward_batch)
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1483,6 +1498,29 @@ class FlashAttentionBackend(AttentionBackend):
                 return None
         return (*buffers, locations)
 
+    @profile_method("sglang.attention.fa3.shard")
+    def _forward_cp_shard(
+        self, *, q, kv, segments, scale, k_descale=None, v_descale=None
+    ):
+        partial, partial_lse, *_ = self.flash_attn_with_kvcache(
+            q=q,
+            k_cache=kv[0].unsqueeze(0),
+            v_cache=kv[1].unsqueeze(0),
+            cu_seqlens_q=segments.cu_q,
+            max_seqlen_q=segments.max_q,
+            cache_batch_idx=segments.cache_batch_idx,
+            cache_leftpad=segments.cache_leftpad,
+            cache_seqlens=segments.cache_seqlens,
+            softmax_scale=scale,
+            k_descale=k_descale,
+            v_descale=v_descale,
+            causal=True,
+            num_splits=0,
+            return_softmax_lse=True,
+            ver=3,
+        )
+        return partial, partial_lse.T
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1504,6 +1542,8 @@ class FlashAttentionBackend(AttentionBackend):
         rel_bias_event=None,
         return_lse: bool = False,
     ):
+        if self.cp_exchange is not None:
+            return self.forward_cp(q, k, v, layer, forward_batch, save_kv_cache)
         if score_mod is not None and self.fa_impl_ver != 4:
             raise RuntimeError("score_mod is only supported by the FA4 backend.")
         if return_lse and self.use_mla:

@@ -607,6 +607,24 @@ class FusedMoE(torch.nn.Module):
         )
         self.supports_deferred_finalize = False
 
+        if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.quantization.humming import HummingMoEMethod
+            from sglang.srt.layers.quantization.w4afp8 import W4AFp8Mxfp4MegaMoEMethod
+
+            native_mxfp4 = (
+                isinstance(self.quant_method, HummingMoEMethod)
+                and self.quant_method.native_mxfp4_mega
+            )
+            if not (
+                isinstance(self.quant_method, W4AFp8Mxfp4MegaMoEMethod) or native_mxfp4
+            ):
+                raise ValueError(
+                    "This MegaMoE implementation supports only MXFP4 expert weights; "
+                    "load native MXFP4 with Humming or enable explicit W4AFP8 conversion."
+                )
+            if self.moe_tp_size != 1:
+                raise ValueError("MXFP4 MegaMoE requires pure EP")
+
         self.quant_method.create_weights(
             layer=self,
             num_experts=self.num_local_experts,
@@ -1744,11 +1762,37 @@ class FusedMoE(torch.nn.Module):
         hidden_states: torch.Tensor,
         topk_output: TopKOutput,
         pre_quant_input: Optional[Tuple] = None,
+        *,
+        output_layout=None,
+        shared_output=None,
+        shared_gate=None,
     ):
+        if output_layout is not None and not get_exec().moe.enable_mxfp4_mega:
+            raise ValueError("Mapped MoE output requires an MXFP4 Mega workspace")
         if self._use_ascend_fuseep:
             from sglang.srt.hardware_backend.npu.moe.fuseep import forward_fuseep
 
             return forward_fuseep(self, hidden_states, topk_output)
+        if get_exec().moe.enable_mxfp4_mega:
+            from sglang.srt.layers.moe.sm90_mxfp4_mega import (
+                prepare_workspace,
+                run_experts,
+            )
+
+            workspace = prepare_workspace(
+                self, hidden_states, num_experts=self.num_experts, top_k=self.top_k
+            )
+            # The symmetric workspace is shared by layers. Return owned storage
+            # before the model adds shared experts or the next layer reuses it.
+            return run_experts(
+                self,
+                hidden_states,
+                topk_output,
+                workspace,
+                output_layout=output_layout,
+                shared_output=shared_output,
+                shared_gate=shared_gate,
+            ).clone()
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_bypassed(topk_output) and (
                 topk_output.expert_location_dispatch_info is not None

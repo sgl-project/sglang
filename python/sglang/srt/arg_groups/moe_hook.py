@@ -343,6 +343,20 @@ def handle_a2a_moe(server_args: Any):
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 
+    from sglang.srt.arg_groups.mega_moe_hook import validate_mxfp4_mega_compat
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    validate_mxfp4_mega_compat(server_args)
+    if is_gdn_cp_enabled(server_args) and cfg.moe_a2a_backend not in (
+        "none",
+        "deepep",
+        "megamoe",
+    ):
+        raise ValueError(
+            f"{cfg.moe_a2a_backend} has no GDN CP FFN row-transport integration; "
+            "use TP/EP experts with --moe-a2a-backend none, DeepEP, or MegaMoE"
+        )
+
     # The a2a-driven shared-experts fusion adjustments moved to the
     # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
     # invoked here at the legacy write slots.

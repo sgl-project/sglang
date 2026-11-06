@@ -284,6 +284,18 @@ class ExitPolicy:
     ) -> ExitDecision:
         """Decide once, before the FFN runs, what completes its output's sum:
         the next layer's input, or this layer's postprocess step."""
+        if getattr(forward_batch, "layer_cp_metadata", None) is not None:
+            from sglang.srt.layers.layer_boundary.row_transport import (
+                finish_sharded_cp_ffn,
+            )
+
+            return ExitDecision(
+                defer_moe_finalize=False,
+                sum_in_reduce_scatter=forward_batch.layer_cp_metadata.moe_tp,
+                complete=partial(
+                    finish_sharded_cp_ffn, forward_batch=forward_batch, update=update
+                ),
+            )
         dp_step = self._dp_reduce_scatter_step(forward_batch, steps)
         sum_in_reduce_scatter = self._sum_in_reduce_scatter(steps, dp_step)
         complete_now = partial(
@@ -628,7 +640,11 @@ class FfnExit:
         self._complete = completion.complete
         # A reduce-scatter that completes the sum on the way back is the
         # next input's only on an input-scattered batch.
-        self._declared_sum = steps.exit.sum_left_to_next_input
+        self._declared_sum = (
+            None
+            if getattr(forward_batch, "layer_cp_metadata", None) is not None
+            else steps.exit.sum_left_to_next_input
+        )
         self._scope = get_forward().scoped(defer_moe_finalize=self.defer_moe_finalize)
 
     def __enter__(self) -> FfnExit:

@@ -72,7 +72,7 @@ def qsa_index_q_norm_rope_store(
     cos_sin_cache: torch.Tensor,
     axis_map: torch.Tensor,
     weight: torch.Tensor,
-    cache_loc: torch.Tensor,
+    cache_loc: Optional[torch.Tensor],
     key_state_buffer: torch.Tensor,
     rope_position_buffer: torch.Tensor,
     num_q_heads: int,
@@ -94,7 +94,7 @@ def qsa_index_q_norm_rope_store(
     cos_sin_cache   : CUDA fp32 [capacity, rotary_dim] RoPE cache
     axis_map        : CUDA int32 [rotary_dim // 2] position-axis per pair index
     weight          : [head_dim] gemma norm weight (kernel applies 1 + w)
-    cache_loc       : CUDA int64 [tokens] state slots of each token
+    cache_loc       : CUDA int64 [tokens] state slots; None skips both stores
     key_state_buffer : CUDA [slots, head_dim] raw-K state buffer (written)
     rope_position_buffer : CUDA int64 [slots, 3] position buffer (written)
     num_q_heads     : number of index query heads
@@ -116,6 +116,9 @@ def qsa_index_q_norm_rope_store(
         q_heads_padded = num_q_heads
     if positions.ndim == 1:
         positions = positions.unsqueeze(0)
+    if cache_loc is None:
+        # An empty view requests Q prep alone, without a dummy cache allocation.
+        cache_loc = positions[0, :0]
     if out_dtype is None:
         out_dtype = qk.dtype
     q_out = torch.empty(

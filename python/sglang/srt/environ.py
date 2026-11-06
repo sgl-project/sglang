@@ -913,6 +913,7 @@ class Envs:
     # KV-transfer staging and Mooncake transport
     # ===================================================================
     # Staging buffer for heterogeneous TP KV transfer
+    SGLANG_DISAGG_REQUIRE_BULK = EnvBool(False)
     SGLANG_DISAGG_STAGING_BUFFER = EnvBool(False)
     SGLANG_DISAGG_STAGING_POOL_SIZE_MB = EnvInt(4096)
     # Queue incoming KV scatters between forwards; disabled by default.

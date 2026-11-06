@@ -1,4 +1,4 @@
-"""CPU checks for QSA's zigzag-only context parallel entrypoints."""
+"""CPU checks for QSA context parallel entrypoints."""
 
 import sys
 from contextlib import contextmanager
@@ -27,7 +27,6 @@ register_cpu_ci(est_time=13, suite="base-a-test-cpu")
     "strategy",
     [
         None,
-        SimpleNamespace(name="interleave", kind=ContextParallelStrategyKind.INTERLEAVE),
     ],
 )
 @pytest.mark.parametrize("entrypoint", ["indexer", "attention"])
@@ -40,7 +39,8 @@ def test_qsa_cp_rejects_unsupported_strategy_before_metadata_or_collectives(
     monkeypatch.setattr(module, "cp_materialize_global_token_order", gather)
     # None metadata and tensors ensure rejection precedes zigzag-specific access.
     with pytest.raises(
-        NotImplementedError, match="QSA prefill CP only supports the zigzag strategy"
+        NotImplementedError,
+        match="QSA prefill CP supports zigzag and interleave strategies",
     ):
         if entrypoint == "indexer":
             QSAIndexer.forward_cuda_cp(None, None, None, None, None, None)
@@ -241,9 +241,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         index_qk_proj=lambda value: (torch.cat([value, value], dim=-1), None),
         q_layernorm=lambda value: value,
         apply_rope=Mock(side_effect=lambda positions, value, **kwargs: value),
-        _use_fused_prep=Mock(
-            side_effect=AssertionError("local keys must not be stored")
-        ),
+        _use_fused_prep=Mock(return_value=False),
         update_key_state_and_compress=Mock(
             side_effect=lambda *args, **kwargs: events.append("compress")
         ),
@@ -269,9 +267,7 @@ def test_cp_indexer_matches_compressed_dtype_without_storing_local_keys(
         row_ends,
     )
     torch.testing.assert_close(actual, expected)
-    indexer._use_fused_prep.assert_not_called()
-    # Sizing the RoPE cache reads positions.max() on the host: a device sync per layer.
-    assert indexer.apply_rope.call_args.kwargs["ensure_cos_sin_cache"] is False
+    indexer._use_fused_prep.assert_called_once()
     update = indexer.update_key_state_and_compress.call_args
     torch.testing.assert_close(update.args[0], hidden.unsqueeze(1))
     assert update.kwargs["state_stored"] is False
@@ -544,3 +540,63 @@ def test_qsa_cp_forward_metadata_joins_leftover_prefetch(monkeypatch):
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
+
+
+def test_indexer_rope_uses_host_bound_without_device_scalar_read(monkeypatch):
+    positions = torch.tensor([3, 7])
+    value = torch.randn(2, 1, 4)
+    rotary = SimpleNamespace(
+        _ensure_cos_sin_cache_length=Mock(),
+        get_cos_sin_with_position=Mock(),
+        rotary_dim=4,
+        is_neox_style=True,
+        position_cos=torch.ones(2, 4),
+        position_sin=torch.zeros(2, 4),
+    )
+    monkeypatch.setattr(qsa_indexer, "get_is_capture_mode", lambda: False)
+    monkeypatch.setattr(qsa_indexer, "apply_rotary_emb", lambda x, *args: x)
+    with monkeypatch.context() as guard:
+        guard.setattr(
+            torch.Tensor, "item", Mock(side_effect=AssertionError("device scalar read"))
+        )
+        actual = QSAIndexer.apply_rope(
+            SimpleNamespace(rotary_emb=rotary), positions, value, rope_max_position=7
+        )
+    rotary._ensure_cos_sin_cache_length.assert_called_once_with(7)
+    torch.testing.assert_close(actual, value)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 2, 3])
+def test_interleave_attention_inputs_follow_global_query_rows(monkeypatch, rank):
+    module = qwen_sparse_attn_backend
+    monkeypatch.setattr(module, "is_cp_active", lambda batch: True)
+    monkeypatch.setattr(
+        module,
+        "get_cp_strategy",
+        lambda: SimpleNamespace(
+            kind=ContextParallelStrategyKind.INTERLEAVE, cp_size=4, cp_rank=rank
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda value: value)
+    extend, prefix = [3, 2, 2], [5, 0, 7]
+    lengths = [p + n for p, n in zip(prefix, extend)]
+    batch = SimpleNamespace(
+        extend_seq_lens_cpu=extend,
+        extend_seq_lens=torch.tensor(extend),
+        seq_lens_cpu=torch.tensor(lengths),
+        seq_lens=torch.tensor(lengths),
+    )
+    plan = QwenSparseAttnBackend._extend_attn_inputs_from_batch(batch)
+    positions = torch.cat([torch.arange(p, p + n) for p, n in zip(prefix, extend)])
+    actual = torch.cat(
+        [
+            plan.cp_first_positions[i]
+            + torch.arange(int(plan.cu_seqlens_q[i + 1] - plan.cu_seqlens_q[i])) * 4
+            for i in range(len(extend))
+        ]
+    )
+    torch.testing.assert_close(actual.long(), positions[rank::4])
+    assert plan.cp_num_queries == len(positions[rank::4])
+    assert plan.cp_num_tokens == sum(extend)
+    assert plan.cp_prefix_tokens == sum(prefix)
+    assert plan.cu_seqlens_k.tolist() == [0, 8, 10, 19]

@@ -514,6 +514,7 @@ class ReqToTokenPool:
 
 
 class MambaPool:
+    cp_size = 1
     host_capacity_tokens: Optional[int] = None
     host_capacity_bytes: Optional[int] = None
 
@@ -663,6 +664,7 @@ class MambaPool:
         envelope_layout: bool = False,
         enable_linear_replayssm_spec: bool = False,
         replayssm_request_ring: bool = False,
+        context_parallel_group=None,
     ):
         conv_state_shape = cache_params.shape.conv
         temporal_state_shape = cache_params.shape.temporal
@@ -690,6 +692,42 @@ class MambaPool:
         )
         _replayssm_on = enable_linear_replayssm or enable_linear_replayssm_spec
         self.replayssm_request_ring = False
+        self.cp_size = (
+            torch.distributed.get_world_size(context_parallel_group)
+            if context_parallel_group is not None
+            else 1
+        )
+        self.cp_rank = (
+            torch.distributed.get_rank(context_parallel_group)
+            if context_parallel_group is not None
+            else 0
+        )
+        self.local_size = (size + self.cp_size - 1) // self.cp_size
+        self._state_workspaces = []
+        if self.cp_size > 1:
+            if (
+                enable_memory_saver
+                or speculative_num_draft_tokens is not None
+                or _replayssm_on
+                or envelope_layout
+            ):
+                raise ValueError(
+                    "Sharded Mamba state requires eager prefill storage without memory saver or speculation"
+                )
+            from sglang.srt.distributed.device_communicators.torch_symm_mem import (
+                TorchSymmMemCommunicator,
+            )
+
+            communicator = TorchSymmMemCommunicator.get(context_parallel_group, device)
+
+        def allocate_state(shape, dtype):
+            if self.cp_size == 1:
+                return torch.zeros(shape, dtype=dtype, device=device)
+            workspace = communicator.allocate_peer_workspace(
+                shape, dtype, rdma_compatible=True
+            )
+            self._state_workspaces.append(workspace)
+            return workspace.buffers.zero_()
 
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
@@ -734,10 +772,9 @@ class MambaPool:
                 )
             else:
                 conv_state = [
-                    torch.zeros(
-                        size=(num_mamba_layers, size + 1) + conv_shape,
-                        dtype=conv_dtype,
-                        device=device,
+                    allocate_state(
+                        (num_mamba_layers, self.local_size + 1) + conv_shape,
+                        conv_dtype,
                     )
                     for conv_shape in conv_state_shape
                 ]
@@ -760,10 +797,9 @@ class MambaPool:
                     # CPU uses a different layout of conv_state for kernel optimization
                     conv_state = _init_amx_conv_state(conv_state)
 
-                temporal_state = torch.zeros(
-                    size=(num_mamba_layers, size + 1) + temporal_state_shape,
-                    dtype=ssm_dtype,
-                    device=device,
+                temporal_state = allocate_state(
+                    (num_mamba_layers, self.local_size + 1) + temporal_state_shape,
+                    ssm_dtype,
                 )
 
             # GDN ReplaySSM ring buffers (slice 1a). Allocated only when the
@@ -1169,6 +1205,9 @@ class MambaPool:
 
     def clear_slots(self, indices: torch.Tensor):
         """Zero out mamba state at the given pool indices. Must run on forward stream."""
+        if self.cp_size > 1:
+            self._transfer_state_slots("clear", dst_indices=indices)
+            return
         for sibling in self._slot_siblings:
             sibling.reset_slots(indices)
         idx64 = indices.to(torch.int64)
@@ -1194,6 +1233,11 @@ class MambaPool:
         caps the donate to the last flush boundary. The dst cursor is reset to 0
         (the copied checkpoint has no pending ring entries).
         """
+        if self.cp_size > 1:
+            self._transfer_state_slots(
+                "copy", src_indices=src_indices, dst_indices=dst_indices
+            )
+            return
         if self.replayssm_write_pos is not None and self.debug_memory_pool:
             # Debug-only (syncs): catch any copy of an active, un-flushed slot.
             src_wp = self.replayssm_write_pos[src_indices]
@@ -1297,6 +1341,93 @@ class MambaPool:
 
         for sibling in self._slot_siblings:
             yield from sibling.iter_transfer_state_entries()
+
+    def synchronize(self):
+        """Order peer state access on the current CUDA stream, without a host wait."""
+        if self.cp_size > 1:
+            self._state_workspaces[0].data_handle.barrier(channel=0, timeout_ms=30000)
+
+    def _transfer_state_slots(self, operation, **kwargs):
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            transfer_sharded_mamba_state_slots,
+        )
+
+        for workspace in self._state_workspaces:
+            transfer_sharded_mamba_state_slots(
+                workspace.buffers,
+                workspace.peer_ptrs,
+                operation=operation,
+                rank=self.cp_rank,
+                world=self.cp_size,
+                **kwargs,
+            )
+
+    def load_layer_state(self, layer, indices, *, temporal=True):
+        """Restore a logical prefix from its owner; only CP rank zero needs S0."""
+        if self.cp_size == 1:
+            cache = self.mamba2_layer_cache(layer)
+            return self.State(
+                conv=[value.index_select(0, indices) for value in cache.conv],
+                temporal=cache.temporal.index_select(0, indices),
+            )
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            transfer_sharded_mamba_state_slots,
+        )
+
+        states = []
+        for i, workspace in enumerate(self._state_workspaces):
+            if i == len(self._state_workspaces) - 1 and not temporal:
+                states.append(
+                    workspace.buffers.new_zeros(
+                        (indices.numel(), *workspace.buffers.shape[2:])
+                    )
+                )
+                continue
+            states.append(
+                transfer_sharded_mamba_state_slots(
+                    workspace.buffers,
+                    workspace.peer_ptrs,
+                    operation="gather",
+                    rank=self.cp_rank,
+                    world=self.cp_size,
+                    src_indices=indices,
+                    layer=layer,
+                )[0]
+            )
+        return self.State(conv=states[:-1], temporal=states[-1])
+
+    def store_layer_state(self, layer, indices, *, conv, temporal):
+        """Persist each logical slot exactly once, on its owning CP rank."""
+        if self.cp_size == 1:
+            cache = self.mamba2_layer_cache(layer)
+            for target, value in zip(cache.conv, conv):
+                target.index_copy_(0, indices, value.to(target.dtype))
+            cache.temporal.index_copy_(0, indices, temporal.to(cache.temporal.dtype))
+            return
+        from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+            transfer_sharded_mamba_state_slots,
+        )
+
+        if len(conv) != len(self.mamba_cache.conv):
+            raise ValueError("Mamba convolution state count does not match the pool")
+        for workspace, value in zip(self._state_workspaces, [*conv, temporal]):
+            transfer_sharded_mamba_state_slots(
+                workspace.buffers,
+                workspace.peer_ptrs,
+                operation="scatter",
+                rank=self.cp_rank,
+                world=self.cp_size,
+                dst_indices=indices,
+                values=value.unsqueeze(0).contiguous(),
+                layer=layer,
+            )
+
+    def close(self):
+        if self._state_workspaces:
+            torch.cuda.synchronize(self.device)
+            for workspace in self._state_workspaces:
+                workspace.close()
+            self._state_workspaces = []
 
     def get_contiguous_buf_infos(self):
         """Get transferable state buffer information for RDMA registration."""
@@ -1410,6 +1541,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        context_parallel_group=None,
     ):
         super().__init__(
             size=size,
@@ -1449,6 +1581,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             ngram_context_len=ngram_context_len,
             ngram_eos_token_id=ngram_eos_token_id,
             replayssm_request_ring=replayssm_request_ring,
+            context_parallel_group=context_parallel_group,
         )
 
     def _init_mamba_pool(
@@ -1470,6 +1603,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         ngram_context_len: int = 0,
         ngram_eos_token_id: int = 0,
         replayssm_request_ring: bool = False,
+        context_parallel_group=None,
     ):
         self.state = StateStorage.empty(self.state_sub_pool)
         self.mamba_pool = self.mamba_pool_cls(
@@ -1486,6 +1620,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
             envelope_layout=mamba_envelope_layout,
             enable_linear_replayssm_spec=enable_linear_replayssm_spec,
             replayssm_request_ring=replayssm_request_ring,
+            context_parallel_group=context_parallel_group,
         )
         self.mamba_allocator = MambaSlotAllocator(
             size=mamba_size,
@@ -4155,7 +4290,16 @@ class HybridLinearKVPool(KVCache):
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
         post_capture_active: bool = False,
+        full_attention_cp_size: int = 1,
     ):
+        if full_attention_cp_size < 1 or (
+            full_attention_cp_size > 1
+            and (use_mla or page_size % full_attention_cp_size or size % page_size)
+        ):
+            raise ValueError(
+                "CP KV storage requires MHA and page-aligned capacity with page_size divisible by CP"
+            )
+        self.full_attention_cp_size = full_attention_cp_size
         self.size = size
         self.dtype = dtype
         self.device = device
@@ -4186,8 +4330,8 @@ class HybridLinearKVPool(KVCache):
                 {"post_capture_active": True} if post_capture_active else {}
             )
             self.full_kv_pool = TokenToKVPoolClass(
-                size=size,
-                page_size=self.page_size,
+                size=size // full_attention_cp_size,
+                page_size=self.page_size // full_attention_cp_size,
                 dtype=dtype,
                 head_num=head_num,
                 head_dim=head_dim,

@@ -1,3 +1,5 @@
+from functools import cache
+
 import torch
 import triton
 import triton.language as tl
@@ -214,16 +216,22 @@ def _launch_fused_gate_sigmoid_mul(
     output: torch.Tensor,
     *,
     do_add: bool,
+    gate_only: bool = False,
 ) -> None:
     assert hidden_states.is_contiguous(), "hidden_states must be contiguous"
     assert gate_weight.is_contiguous(), "gate_weight must be contiguous"
-    assert shared_output.is_contiguous(), "shared_output must be contiguous"
     assert output.is_contiguous(), "output must be contiguous"
 
     num_tokens, hidden_dim = hidden_states.shape
     assert gate_weight.shape == (hidden_dim,)
-    assert shared_output.shape == (num_tokens, hidden_dim)
-    assert output.shape == (num_tokens, hidden_dim)
+    if gate_only:
+        assert output.shape == (num_tokens,) and output.dtype == torch.float32
+    else:
+        assert shared_output.is_contiguous(), "shared_output must be contiguous"
+        assert shared_output.shape == (num_tokens, hidden_dim)
+        assert output.shape == (num_tokens, hidden_dim)
+    if num_tokens == 0:
+        return
 
     max_warps = 16 if _is_hip else 32
     config = {
@@ -247,7 +255,7 @@ def _launch_fused_gate_sigmoid_mul(
         hidden_dim=hidden_dim,
         DO_ADD=do_add,
         USE_PDL=use_pdl,
-        GATE_ONLY=False,
+        GATE_ONLY=gate_only,
         **config,
         **pdl_kwargs,
     )
@@ -284,3 +292,34 @@ def fused_gate_sigmoid_mul_add(
         final_hidden_states,
         do_add=True,
     )
+
+
+@cache
+@torch.no_grad()
+def warmup_fused_gate_sigmoid_mul(*, device, dtype, weight_dtype, hidden_dim):
+    """Load both token-count launch configurations before CP collectives."""
+    weight = torch.zeros(hidden_dim, device=device, dtype=weight_dtype)
+    for rows in (1, 1024):
+        hidden = torch.zeros((rows, hidden_dim), device=device, dtype=dtype)
+        shared = torch.zeros_like(hidden)
+        fused_gate_sigmoid_mul(hidden, weight, shared)
+        fused_gate_sigmoid_mul_add(hidden, weight, shared, torch.zeros_like(hidden))
+        _launch_fused_gate_sigmoid_mul(
+            hidden,
+            weight,
+            None,
+            torch.empty(rows, device=device, dtype=torch.float32),
+            do_add=False,
+            gate_only=True,
+        )
+    torch.cuda.synchronize(device)
+
+
+@cache
+@torch.no_grad()
+def warmup_fused_sigmoid_mul(*, device, dtype, hidden_dim):
+    """Warm the flat output gate produced by fused CP QK/RoPE preparation."""
+    for rows in (1, 1024):
+        output = torch.zeros((rows, hidden_dim), device=device, dtype=dtype)
+        fused_sigmoid_mul(output, torch.zeros_like(output), inplace=True)
+    torch.cuda.synchronize(device)
