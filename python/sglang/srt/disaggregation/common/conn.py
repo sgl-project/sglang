@@ -2982,8 +2982,7 @@ class CommonKVReceiver(BaseKVReceiver):
         self.kv_mgr.addr_to_rooms_tracker[self.bootstrap_addr].discard(
             self.bootstrap_room
         )
-        if self.kv_mgr.defer_decode_allocation:
-            self._owns_bootstrap_room = False
+        self._owns_bootstrap_room = False
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
