@@ -8,6 +8,15 @@ logger = get_logger("sgl_simulator")
 
 class Envs:
     @classmethod
+    def evidence_compression(cls) -> str:
+        value = os.getenv("SGLANG_SIMULATOR_EVIDENCE_COMPRESSION", "none")
+        if value not in {"none", "gzip"}:
+            raise ValueError(
+                "SGLANG_SIMULATOR_EVIDENCE_COMPRESSION must be none or gzip"
+            )
+        return value
+
+    @classmethod
     def token_events_path(cls) -> str | None:
         return os.getenv("SGLANG_SIMULATOR_TOKEN_EVENTS") or None
 

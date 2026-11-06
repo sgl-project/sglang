@@ -1,5 +1,6 @@
 """Retain exact verbose evidence while reducing only small metric summaries."""
 
+import gzip
 import io
 import json
 import tracemalloc
@@ -66,6 +67,29 @@ def test_export_failure_preserves_evidence_and_retry(tmp_path):
     output = io.StringIO()
     store.write_jsonl(output)
     assert json.loads(output.getvalue())["native_worker_event"]["event_committed"]
+    store.clear()
+
+
+def test_compressed_profile_export_preserves_jsonl(tmp_path, monkeypatch):
+    from sglang_simulator.simulation.manager.env import Envs
+
+    rows = [{"forward_latency": 0.1, "evidence": "x" * 1000000} for _ in range(3)]
+    store = IterationStats(lambda: tmp_path)
+    for row in rows:
+        store.append(row)
+    monkeypatch.setenv("SGLANG_SIMULATOR_EVIDENCE_COMPRESSION", "gzip")
+    assert Envs.evidence_compression() == "gzip"
+    with gzip.open(
+        tmp_path / "iteration.jsonl.gz", "wt", encoding="utf-8", compresslevel=1
+    ) as output:
+        store.write_jsonl(output)
+    assert (
+        gzip.decompress((tmp_path / "iteration.jsonl.gz").read_bytes())
+        == ("".join(json.dumps(row) + "\n" for row in rows)).encode()
+    )
+    monkeypatch.setenv("SGLANG_SIMULATOR_EVIDENCE_COMPRESSION", "unknown")
+    with pytest.raises(ValueError, match="none or gzip"):
+        Envs.evidence_compression()
     store.clear()
 
 

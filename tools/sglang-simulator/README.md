@@ -561,6 +561,16 @@ The spool is removed after a successful export and profile reset. Export or
 spool-write failures preserve it for diagnosis and must not be treated as a
 completed profile.
 
+For long runs, explicitly set `SGLANG_SIMULATOR_EVIDENCE_COMPRESSION=gzip`
+to export `iteration.jsonl.gz` instead. Decompression recovers the unchanged
+JSONL records; metrics and virtual execution are unaffected. The default is
+`none`, retaining `iteration.jsonl`. For native evaluated-cost evidence, an
+explicit path ending in `.gz` selects complete concatenated gzip members,
+one per original JSONL row. Its reported byte count and SHA-256 cover the
+uncompressed JSONL, explicitly identified by `digest_scope`. Artifact custody
+must additionally hash the actual compressed file. An interrupted or failed
+stream is still incomplete and cannot establish successful execution.
+
 For coordinated OFFLINE runs, set
 `SGLANG_SIMULATOR_TOKEN_EVENTS=/absolute/path/to/token_events.jsonl` to retain
 native visible output-token commits. The parent directory must exist and the

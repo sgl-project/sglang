@@ -4,6 +4,7 @@ No graph, native query construction, cost resolver or acceptance law lives here.
 Evaluated query records are deliberately distinct from committed native events.
 """
 
+import gzip
 import hashlib
 import json
 from pathlib import Path
@@ -77,10 +78,12 @@ class SimOpusNativeCostAdapter:
         self._sink = None
         self._sink_path = None
         self._sink_failed = False
+        self._sink_gzip = False
         self._digest = hashlib.sha256()
         self._bytes = 0
         if cost_evidence_path is not None:
             self._sink_path = str(Path(cost_evidence_path).absolute())
+            self._sink_gzip = self._sink_path.endswith(".gz")
             try:
                 self._sink = open(self._sink_path, "xb", buffering=0)  # noqa: SIM115 -- run-owned sink
             except OSError as error:
@@ -262,7 +265,13 @@ class SimOpusNativeCostAdapter:
             raise PredictorError("data_unavailable", "evaluated-cost evidence failed")
         if self._sink is not None:
             try:
-                if self._sink.write(line) != len(line):
+                # Complete members preserve prior rows on interrupted teardown.
+                payload = (
+                    gzip.compress(line, compresslevel=1, mtime=0)
+                    if self._sink_gzip
+                    else line
+                )
+                if self._sink.write(payload) != len(payload):
                     raise OSError("short evaluated-cost evidence write")
                 self._sink.flush()
             except (OSError, ValueError) as error:
@@ -298,6 +307,11 @@ class SimOpusNativeCostAdapter:
                 "sha256": self._digest.hexdigest(),
                 "persisted": self._sink is not None,
                 "write_failed": self._sink_failed,
+                **(
+                    {"compression": "gzip", "digest_scope": "uncompressed_jsonl"}
+                    if self._sink_gzip
+                    else {}
+                ),
             },
         }
 

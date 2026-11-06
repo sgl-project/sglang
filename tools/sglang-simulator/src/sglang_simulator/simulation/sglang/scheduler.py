@@ -1,3 +1,4 @@
+import gzip
 import heapq
 import importlib
 import json
@@ -1162,7 +1163,16 @@ class C_SchedulerHook(BaseHook):
                     with open(f"{output_dir}/metrics.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
-                    with open(f"{output_dir}/iteration.jsonl", "w") as f:
+                    with (
+                        gzip.open(
+                            f"{output_dir}/iteration.jsonl.gz",
+                            "wt",
+                            encoding="utf-8",
+                            compresslevel=1,
+                        )
+                        if Envs.evidence_compression() == "gzip"
+                        else open(f"{output_dir}/iteration.jsonl", "w")
+                    ) as f:
                         if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats):
                             C_SchedulerHook.ITERATION_STATS.write_jsonl(f)
                         else:

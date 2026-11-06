@@ -1,6 +1,8 @@
 """Frozen CPU source contracts and synthetic leaves, never timing admission."""
 
 import copy
+import gzip
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -57,14 +59,16 @@ def public_adapter(request, monkeypatch):
             "0" * 64,
         ),
     )
-    options = dict(
-        execution_profile=DecodeExecutionProfile.from_dict(fixture["capture_profile"]),
-        native_segment_profile_id=fixture["profile"]["sha256"],
-        source_binding=dict(
+    options = {
+        "execution_profile": DecodeExecutionProfile.from_dict(
+            fixture["capture_profile"]
+        ),
+        "native_segment_profile_id": fixture["profile"]["sha256"],
+        "source_binding": dict(
             root=str(root.resolve()),
             **{k: fixture[k] for k in ("profile", "cohort", "stack")},
         ),
-    )
+    }
     adapter = SimOpusNativeCostAdapter.from_sdk(
         database, "deepseek-ai/DeepSeek-V4.1-Flash", **options
     )
@@ -167,6 +171,30 @@ def leaves(monkeypatch):
 
 
 @pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
+def test_compressed_evidence_preserves_original_rows_and_digest(
+    public_adapter, leaves, mode, tmp_path
+):
+    adapter, _, _ = public_adapter
+    step = step_for(adapter, mode)
+    paths = [tmp_path / "plain.jsonl", tmp_path / "compressed.jsonl.gz"]
+    producers = [
+        SimOpusNativeCostAdapter(adapter.model, adapter.assets, cost_evidence_path=path)
+        for path in paths
+    ]
+    timings = [producer.predict_step(step) for producer in producers]
+    for producer in producers:
+        producer.close()
+    assert timings[0] == timings[1]
+    raw = paths[0].read_bytes()
+    assert gzip.decompress(paths[1].read_bytes()) == raw
+    evidence = producers[1].get_cost_metrics()["evaluated_evidence"]
+    assert evidence["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert evidence["bytes"] == len(raw)
+    assert evidence["compression"] == "gzip"
+    assert evidence["digest_scope"] == "uncompressed_jsonl"
+
+
+@pytest.mark.parametrize("mode", ["EXTEND", "DECODE"])
 def test_public_nine_stages_keep_ordered_work_and_full_evidence(
     public_adapter, leaves, mode
 ):
@@ -188,7 +216,7 @@ def test_public_nine_stages_keep_ordered_work_and_full_evidence(
             is False
         )
         assert prediction["runtime_input"]["requests"] == [
-            dict(prefix_len=r.target_prefix_len, extend_len=r.extend_len)
+            {"prefix_len": r.target_prefix_len, "extend_len": r.extend_len}
             for r in step.requests
         ]
         assert (
@@ -235,7 +263,7 @@ def test_late_missing_cost_retains_evaluation_without_progress_or_commit(
 def test_public_source_policy_cannot_be_enabled_without_golden_originals(
     public_adapter,
 ):
-    adapter, database, options = public_adapter
+    _adapter, database, options = public_adapter
     from simopus.sdk.native_segment_module import SOURCE_WORK_POLICY
 
     with pytest.raises(PredictorError):
