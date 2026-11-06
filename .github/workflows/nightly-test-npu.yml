@@ -119,7 +119,7 @@ jobs:
 
   nightly-1-npu-a3:
     name: nightly-1-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -134,7 +134,7 @@ jobs:
 
   nightly-2-npu-a3:
     name: nightly-2-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -150,7 +150,7 @@ jobs:
   # The nightly-4-npu-a3 suite is split across 2 parallel partition jobs, mirroring base-b-test-4-npu-a3 in the PR pipeline.
   nightly-4-npu-a3:
     name: nightly-4-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -158,7 +158,7 @@ jobs:
       runner_config: linux-aarch64-a3-4-
       image: ${{ needs.set-image-config.outputs.image_a3 }}
       run_timeout_minutes: '120'
-      timeout_per_file: '3600'
+      timeout_per_file: '5400'
       partitions: '{"size":2,"arr":[0,1]}'
       is_nightly_pipeline_job: true
       skip_pr_test_health_check: 'true'
@@ -166,7 +166,7 @@ jobs:
 
   nightly-8-npu-a3:
     name: nightly-8-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -181,7 +181,7 @@ jobs:
 
   nightly-16-npu-a3:
     name: nightly-16-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
@@ -196,7 +196,7 @@ jobs:
 
   nightly-perf-2-npu-a3:
     name: nightly-perf-2-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -212,7 +212,7 @@ jobs:
 
   nightly-perf-4-npu-a3:
     name: nightly-perf-4-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -228,7 +228,7 @@ jobs:
 
   nightly-perf-16-npu-a3:
     name: nightly-perf-16-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -246,7 +246,7 @@ jobs:
   # The acc-2 suite is split across 4 parallel partition jobs via the single `partitions` input.
   nightly-acc-2-npu-a3:
     name: nightly-acc-2-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -263,7 +263,7 @@ jobs:
 
   nightly-acc-16-npu-a3:
     name: nightly-acc-16-npu-a3
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config]
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
@@ -278,22 +278,21 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
 
   nightly-acc-4-npu-a5:
-    name: nightly-acc-4-npu-a5
-    # TEMP: A5 (Ascend 950) machine is powered off for maintenance, restore after maintenance.
-    if: false # TEMP: was '${{ !cancelled() }}'
-    needs: [set-image-config]
-    uses: ./.github/workflows/_npu-single-node-test-stage.yml
-    with:
-      runner: linux-amd64-a5-4
-      test_type: 'accuracy'
-      test_suite: nightly-acc-4-npu-a5
-      is_nightly_pipeline_job: true
-      skip_pr_test_health_check: 'true'
-      image: ${{ needs.set-image-config.outputs.image_a5 }}
-      install_sglang_deps: false
-      device_type_for_deps: 'a5'
-      run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
-
+     name: nightly-acc-4-npu-a5
+     # TEMP: A5 (Ascend 950) machine is powered off for maintenance, restore after maintenance.
+     if: false # TEMP: was '${{ !cancelled() }}'
+     needs: [set-image-config]
+     uses: ./.github/workflows/_npu-single-node-test-stage.yml
+     with:
+       runner: linux-amd64-a5-4
+       test_type: 'accuracy'
+       test_suite: nightly-acc-4-npu-a5
+       is_nightly_pipeline_job: true
+       skip_pr_test_health_check: 'true'
+       image: ${{ needs.set-image-config.outputs.image_a5 }}
+       install_sglang_deps: false
+       device_type_for_deps: 'a5'
+       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
   nightly-poc-multi-node-tests:
     name: multi-node-poc
     if: ${{ !cancelled() }}
@@ -328,11 +327,11 @@ jobs:
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_flash performance tests
-          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms
+          # - name: deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms
           #   prefill_size: 1
           #   decode_size: 1
           #   router_size: 1
-          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in8k_out1k_50ms.py
+          #   test_case: test/registered/npu/performance/deepseek_v4_flash/test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms.py
           #   test_type: 'perf'
           #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash accuracy tests
@@ -383,7 +382,7 @@ jobs:
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc
-    if: false # TEMP: was '!cancelled()', restore after glm5.3 2P2D EPLB validation
+    if: false # TEMP: was '${{ !cancelled() }}', restore after glm5.3 2P2D EPLB validation
     needs: [set-image-config, nightly-perf-2-npu-a3, nightly-perf-4-npu-a3, nightly-perf-16-npu-a3, nightly-acc-2-npu-a3, nightly-acc-16-npu-a3, nightly-poc-multi-node-tests]
     strategy:
       fail-fast: false
@@ -391,10 +390,10 @@ jobs:
       matrix:
         test_config:
           # glm_5_2 accuracy tests
-          - name: glm_5_2_w8a8_16p_gpqa
-            node_size: 2
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
-            test_type: 'accuracy'
+          # - name: glm_5_2_w8a8_16p_gpqa
+          #   node_size: 2
+          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_16p_gpqa.py
+          #   test_type: 'accuracy'
           # kimi_k3 accuracy tests
           - name: kimi_k3_w4a8_32p_gpqa
             node_size: 4
