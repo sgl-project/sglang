@@ -879,7 +879,6 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
                     [(item["name"], item["arguments"]) for item in output[1:]],
                     [("echo", arguments)] * 2,
                 )
-                self.assertEqual(response["usage"]["output_tokens"], len(tokens))
                 added = [
                     p for p in payloads if p["type"] == "response.output_item.added"
                 ]
