@@ -127,6 +127,63 @@ def test_v2_jit_matches_aot(dtype, num_tokens, hidden, fuse_silu_and_mul, scale_
 #      covered by test_v2_jit_matches_aot above.
 
 
+# Column-major fp32 power-of-two scales (SM90 DeepGEMM block-FP8 activations):
+# same UE8M0 rounding and fp8 codes as the row-major fp32 flavor, stored MN-major
+# and TMA-aligned so DeepGEMM uses them without transposing.
+COL_FP32_UE8M0_CASES = get_ci_test_range(
+    list(
+        itertools.product(
+            [torch.bfloat16, torch.float16],
+            [1, 7, 38, 333, 4097],
+            [1024, 2048, 7168],
+            [32, 128],
+        )
+    ),
+    [
+        (torch.bfloat16, 1, 1024, 32),
+        (torch.bfloat16, 7, 2048, 128),
+        (torch.bfloat16, 333, 7168, 32),
+        (torch.float16, 4097, 1024, 128),
+    ],
+)
+
+
+@pytest.mark.parametrize("dtype,num_tokens,hidden,group", COL_FP32_UE8M0_CASES)
+def test_v2_column_major_fp32_ue8m0_matches_row_major(dtype, num_tokens, hidden, group):
+    torch.manual_seed(num_tokens + hidden + group)
+    x = torch.randn(num_tokens, hidden, device="cuda", dtype=dtype) * 3
+    shape = (num_tokens, hidden)
+
+    def run(column_major):
+        q = torch.zeros(shape, device="cuda", dtype=fp8_dtype)
+        s = create_per_token_group_quant_fp8_output_scale(
+            x_shape=shape,
+            device="cuda",
+            group_size=group,
+            column_major_scales=column_major,
+            scale_tma_aligned=column_major,
+            # Column-major fp32 storage is allocated as the non-UE8M0 layout.
+            scale_ue8m0=not column_major,
+        )
+        per_token_group_quant_8bit_v2(
+            x, q, s, group, 1e-10, float(fp8_min), float(fp8_max), scale_ue8m0=True
+        )
+        return q, s
+
+    q_row, s_row = run(column_major=False)
+    q_col, s_col = run(column_major=True)
+    torch.cuda.synchronize()
+
+    assert s_col.dtype == torch.float32 and s_col.stride(0) == 1
+    assert s_col.stride(1) % 4 == 0, "scales must be TMA-aligned along M"
+    assert torch.equal(q_col.view(torch.int8), q_row.view(torch.int8)), (
+        "fp8 codes differ"
+    )
+    assert torch.equal(s_col.contiguous(), s_row), "scales differ"
+    mantissa = s_col.contiguous().view(torch.int32) & 0x7FFFFF
+    assert torch.all(mantissa == 0), "scales must be powers of two"
+
+
 # Masked (EP-MoE) path: the v2 op only has a masked scheduler for the
 # column-major + ue8m0 + fused-silu+mul + masked combination. Input is 3D
 # [num_experts, tokens_padded, hidden*2]; only tokens < masked_m[e] are processed

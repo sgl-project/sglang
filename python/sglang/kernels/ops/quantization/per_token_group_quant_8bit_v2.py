@@ -104,6 +104,9 @@ def _per_token_group_quant_8bit_v2_custom_op(
         int(num_tokens_per_expert),
         int(scale_expert_stride),
         int(scale_hidden_stride),
+        # Column-major UE8M0 into an fp32 buffer: power-of-two fp32 scales (SM90 DeepGEMM)
+        # instead of the packed int32 UE8M0 layout.
+        bool(scale_ue8m0 and is_column_major and output_s.dtype == torch.float32),
     )
 
 
