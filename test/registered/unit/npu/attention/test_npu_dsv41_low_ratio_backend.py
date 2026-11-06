@@ -1565,6 +1565,19 @@ class TestVerifyGraphGuards(unittest.TestCase):
     ragged verify is rejected at startup.
     """
 
+    class _GraphMode:
+        def __init__(self, target_verify):
+            self._target_verify = target_verify
+
+        def is_decode(self):
+            return not self._target_verify
+
+        def is_target_verify(self):
+            return self._target_verify
+
+        def is_decode_or_idle(self):
+            return self.is_decode()
+
     _REFRESHES = (
         "_refresh_cycle_state_block_table",
         "_refresh_graph_seq_metadata",
@@ -1588,10 +1601,6 @@ class TestVerifyGraphGuards(unittest.TestCase):
         backend = _low_ratio_backend()
         backend._dsv4_has_low_ratio = has_low_ratio
         backend._is_dspark_algorithm = dspark
-        backend.forward_metadata = SimpleNamespace(
-            start_pos=torch.zeros(1, dtype=torch.int32),
-            seqused=torch.zeros(1, dtype=torch.int32),
-        )
         calls = []
         for name in self._REFRESHES:
             setattr(backend, name, (lambda ctx, _n=name: calls.append(_n)))
@@ -1602,11 +1611,30 @@ class TestVerifyGraphGuards(unittest.TestCase):
         backend._clear_graph_dsv41_verify_metadata = lambda ctx: verify_calls.append(
             "clear"
         )
+        backend.is_hybrid_swa = False
+        backend.speculative_num_draft_tokens = 2
+        backend.req_to_token = torch.arange(256).reshape(2, 128)
+        graph_mode = self._GraphMode(verify)
+        forward_batch = SimpleNamespace(
+            batch_size=1,
+            req_pool_indices=torch.tensor([1], dtype=torch.int64),
+            seq_lens=torch.tensor([7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([7], dtype=torch.int32),
+            forward_mode=graph_mode,
+            spec_info=None,
+        )
+        metadata = SimpleNamespace(
+            block_tables=torch.full((1, 2), -1, dtype=torch.int32),
+            dsv4_cycle_state_block_table=torch.zeros(1, dtype=torch.int32),
+            start_pos=torch.zeros(1, dtype=torch.int32),
+            seqused=torch.zeros(1, dtype=torch.int32),
+        )
+        backend.graph_metadata[1] = metadata
         ctx = SimpleNamespace(
-            fm=backend.forward_metadata,
+            fm=metadata,
             bs=1,
-            forward_batch=SimpleNamespace(),
-            graph_mode=_Mode("target_verify" if verify else "decode"),
+            forward_batch=forward_batch,
+            graph_mode=graph_mode,
             is_idle_replay=is_idle,
             live_seq_lens=torch.tensor([8], dtype=torch.int32),
             tokens_per_bs=6,
@@ -1618,7 +1646,9 @@ class TestVerifyGraphGuards(unittest.TestCase):
         )
         backend._build_dsv4_graph_replay_ctx = lambda fb: ctx
         with patch.object(dsv4_backend, "is_npu_arch35", lambda: False):
-            backend._apply_dsv4_graph_metadata(None)
+            backend._apply_dsv4_graph_metadata(
+                metadata_key=1, forward_batch=forward_batch, in_capture=False
+            )
         return calls, verify_calls
 
     def test_dspark_verify_replay_refreshes(self):

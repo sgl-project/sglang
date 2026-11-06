@@ -319,7 +319,10 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
                 self.index_scale_buffer,
                 page_slots=self._kernel_page_size,
                 layout="pa_nd",
-            ),
+            )
+            # A3 V4.1 BF16 index K has no scale payload to transfer.
+            if self.index_scale_buffer[0].numel()
+            else None,
         )
 
     @property
