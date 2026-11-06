@@ -296,6 +296,7 @@ class UnifiedRadixCache(BasePrefixCache):
             name=self._tree_core_backend,
             params=tree_params,
             components=self.components,
+            resolve=False,  # a second probe could disagree with the peers
         )
         # Components execute boundary actions through the tree core.
         for component in self.components.values():
@@ -400,6 +401,10 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Init Unified Radix Cache. Components: {self.tree_components}. "
             f"Tree Core: {type(self.tree_core).__name__}"
         )
+
+    @property
+    def tree_core_backend(self) -> str:
+        return self._tree_core_backend
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False

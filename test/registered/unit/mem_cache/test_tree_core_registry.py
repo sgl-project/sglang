@@ -1,21 +1,30 @@
 """Unit tests for the tree-core backend registry."""
 
+import datetime
+import json
+import multiprocessing
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import torch.distributed as dist
+
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
 from sglang.srt.mem_cache.unified_cache import tree_core_registry
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
 from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
     _TREE_CORE_REGISTRY,
+    agree_tree_core_backend,
+    check_tree_core_backend_matches,
     create_tree_core,
     register_tree_core_backend,
     registered_tree_core_backends,
@@ -24,6 +33,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
@@ -31,7 +41,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:
@@ -95,6 +105,150 @@ class _StubMambaComponent(_StubFullComponent):
 
 class _StubAuxiliarySWAComponent(_StubFullComponent):
     component_type = ComponentType.AUXILIARY_SWA
+
+
+# Multi-rank agreement fixtures, at module level so spawned ranks can import them.
+
+REQUEST_MISMATCH = "request mismatch"
+BACKEND_MISMATCH = "backend mismatch"
+# TP2 x PP4 (rank = pp * 2 + tp) where PP stage 1 holds only SWA layers: the real
+# factory builds a PureSWARadixCache (no TreeCore) there and a UnifiedRadixCache
+# on the other stages.
+_PURE_SWA_RANKS = {2, 3}
+_RUST, _PYTHON, _PURE_SWA = (
+    "UnifiedRadixCache/rust",
+    "UnifiedRadixCache/python",
+    "PureSWARadixCache/None",
+)
+# ranks whose Rust probe fails, ranks requesting "python", ranks with a custom
+# Full component, expected result per rank.
+_SCENARIOS = {
+    "all_rust": (set(), set(), set(), [_RUST] * 2 + [_PURE_SWA] * 2 + [_RUST] * 4),
+    "all_python": (
+        set(),
+        set(range(8)),
+        set(),
+        [_PYTHON] * 2 + [_PURE_SWA] * 2 + [_PYTHON] * 4,
+    ),
+    "mixed_request_inside_tp": (set(), {1}, set(), [REQUEST_MISMATCH] * 8),
+    "probe_fails_on_the_pure_swa_stage": (
+        {3},
+        set(),
+        set(),
+        [_PYTHON] * 2 + [_PURE_SWA] * 2 + [_PYTHON] * 4,
+    ),
+    "mixed_request_across_stages": (set(), {6, 7}, set(), [REQUEST_MISMATCH] * 8),
+    "custom_component_on_one_rank": (set(), set(), {4}, [BACKEND_MISMATCH] * 8),
+}
+
+
+def _agreement_worker(rank: int, init_file: str, out_dir: str) -> None:
+    """build_kv_cache's sequence on one rank: agree, the real cache factory, check."""
+    timeout = datetime.timedelta(seconds=60)  # a missing rank fails, not hangs
+    dist.init_process_group(
+        "gloo",
+        init_method=f"file://{init_file}",
+        rank=rank,
+        world_size=8,
+        timeout=timeout,
+    )
+    tp, pp = None, None
+    for ranks in ([0, 1], [2, 3], [4, 5], [6, 7]):
+        group = dist.new_group(ranks, backend="gloo", timeout=timeout)
+        tp = group if rank in ranks else tp
+    for ranks in ([0, 2, 4, 6], [1, 3, 5, 7]):
+        group = dist.new_group(ranks, backend="gloo", timeout=timeout)
+        pp = group if rank in ranks else pp
+    override = get_context().override_server_args(
+        radix_cache_backend=None,
+        enable_lmcache=False,
+        enable_flexkv=False,
+        enable_unified_cache_external_linker=False,
+        enable_streaming_session=False,
+    )
+    override.install()
+    pure_swa = rank in _PURE_SWA_RANKS
+    results = {}
+    testcase = unittest.TestCase()
+    for name, (probe_fails, python, custom, expected) in _SCENARIOS.items():
+        params = CacheInitParams(
+            disable=True,
+            req_to_token_pool=ReqToTokenPool(
+                size=2,
+                max_context_len=64,
+                device="cpu",
+                enable_memory_saver=False,
+            ),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                device="cpu", storage=None, page_size=1, size=64
+            ),
+            page_size=1,
+            sliding_window_size=4,
+            component_registry_override=(
+                {FAMILY_OF[ComponentType.FULL]: _StubFullComponent}
+                if rank in custom
+                else None
+            ),
+            tp_cache_group=tp,
+            attn_tp_cache_group=tp,
+            pp_cache_group=pp,
+        )
+        ctx = TreeCacheBuildContext(
+            server_args=None,
+            params=params,
+            is_hybrid_swa=pure_swa,
+            is_hybrid_ssm=False,
+            is_dsa=False,
+            enable_hierarchical_cache=False,
+            disable_radix_cache=True,
+            tp_worker=mock.MagicMock(),
+            model_config=mock.MagicMock(),
+            tp_size=2,
+            tp_rank=rank % 2,
+            tp_group=None,
+            full_tokens_per_layer=0 if pure_swa else None,
+        )
+        with (
+            envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.override(
+                "python" if rank in python else "rust"
+            ),
+            mock.patch.object(
+                tree_core_registry,
+                "_rust_runtime_fallback_reason",
+                return_value="probe failed" if rank in probe_fails else None,
+            ) as probe,
+            # No Rust toolchain in CPU CI: a stand-in core marks the Rust choice.
+            mock.patch.dict(
+                _TREE_CORE_REGISTRY,
+                {"rust": mock.MagicMock(side_effect=lambda *_: mock.MagicMock())},
+            ),
+        ):
+            if expected[rank] == REQUEST_MISMATCH:
+                with testcase.assertRaisesRegex(
+                    ValueError, "request different TreeCore backends"
+                ):
+                    agree_tree_core_backend(params)
+                results[name] = REQUEST_MISMATCH
+            else:
+                agree_tree_core_backend(params)
+                cache = create_tree_cache(ctx)
+                if expected[rank] == BACKEND_MISMATCH:
+                    with testcase.assertRaisesRegex(
+                        RuntimeError, "built different TreeCore backends"
+                    ):
+                        check_tree_core_backend_matches(params, cache)
+                    results[name] = BACKEND_MISMATCH
+                else:
+                    check_tree_core_backend_matches(params, cache)
+                    backend = getattr(cache, "tree_core_backend", None)
+                    results[name] = f"{type(cache).__name__}/{backend}"
+            if rank in python:
+                probe.assert_not_called()
+            else:
+                probe.assert_called_once_with(params)
+    override.restore()
+    Path(out_dir, f"{rank}.json").write_text(json.dumps(results))
+    dist.destroy_process_group()
 
 
 class TreeCoreRegistryTest(CustomTestCase):
@@ -358,6 +512,35 @@ class UnifiedRadixCacheTreeCoreSelectionTest(CustomTestCase):
                 self.assertIsInstance(cache.tree_core, UnifiedTreeCore)
                 self.assertEqual(cache._tree_core_backend, "python")
                 rust_factory.assert_not_called()
+
+    def test_ranks_sharing_a_tree_agree_through_the_real_factory(self):
+        """8 gloo ranks under one deadline; leftovers are killed, so a hang fails fast."""
+        ctx = multiprocessing.get_context("spawn")
+        with tempfile.TemporaryDirectory() as tmp:
+            init_file = os.path.join(tmp, "store")
+            procs = [
+                ctx.Process(target=_agreement_worker, args=(rank, init_file, tmp))
+                for rank in range(8)
+            ]
+            deadline = time.monotonic() + 240
+            try:
+                for proc in procs:
+                    proc.start()
+                for proc in procs:
+                    proc.join(max(0.0, deadline - time.monotonic()))
+            finally:
+                for proc in procs:
+                    if proc.is_alive():
+                        proc.kill()
+                for proc in procs:
+                    proc.join(5)
+            self.assertEqual([proc.exitcode for proc in procs], [0] * 8)
+            by_rank = [
+                json.loads(Path(tmp, f"{rank}.json").read_text()) for rank in range(8)
+            ]
+        for name, (*_, expected) in _SCENARIOS.items():
+            with self.subTest(scenario=name):
+                self.assertEqual([r[name] for r in by_rank], expected)
 
 
 class TreeCoreDefaultCompatibilityTest(CustomTestCase):

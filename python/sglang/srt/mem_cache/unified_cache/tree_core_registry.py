@@ -13,6 +13,7 @@ import logging
 import re
 import subprocess
 import sys
+import zlib
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -46,6 +47,11 @@ NATIVE_SLOTS = {"FULL": TREE_TOKEN, "SWA": TREE_WINDOW, "MAMBA": TREE_STATE}
 
 
 def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    return _rust_config_fallback_reason(params) or _rust_runtime_fallback_reason(params)
+
+
+def _rust_config_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    """Gaps from the cache configuration, known once the factory fills the slots."""
     if params.enable_session_radix_cache:
         return "session-aware caching requires the Python TreeCore"
     if params.tree_slots is not None and any(
@@ -54,6 +60,11 @@ def _rust_fallback_reason(params: CacheInitParams) -> Optional[str]:
         return "the configured components require the Python TreeCore"
     if params.component_registry_override:
         return "custom components require the Python TreeCore"
+    return None
+
+
+def _rust_runtime_fallback_reason(params: CacheInitParams) -> Optional[str]:
+    """Gaps from the rank's runtime; the toolchain probe can fail on one rank only."""
     if sys.platform != "linux":
         return "the Rust TreeCore supports Linux only"
     from sglang.srt.rust_extensions.torch_build import (
@@ -123,14 +134,110 @@ def resolve_tree_core_backend(name: str, params: CacheInitParams) -> str:
     return name
 
 
-def select_tree_core_backend(params: CacheInitParams) -> str:
-    """Resolve the instance override or default through the shared fallback policy."""
-    name = (
-        params.tree_core_backend
-        if params.tree_core_backend is not None
-        else envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+def _requested_tree_core_backend(params: CacheInitParams) -> str:
+    if params.tree_core_backend is not None:
+        return params.tree_core_backend
+    return envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
+
+
+def _tree_peer_groups(params: CacheInitParams) -> list:
+    """The groups whose ranks share one prefix tree (those the HiCache syncs use)."""
+    dist = torch.distributed
+    if not (dist.is_available() and dist.is_initialized()):
+        return []
+    groups = []
+    for group in (
+        params.tp_cache_group,
+        params.attn_tp_cache_group,
+        params.attn_cp_cache_group,
+        params.pp_cache_group,
+    ):
+        if (
+            group is not None
+            and all(group is not seen for seen in groups)
+            and dist.get_world_size(group=group) > 1
+        ):
+            groups.append(group)
+    return groups
+
+
+def _all_reduce_min_across_tree_peers(
+    values: list[int], params: CacheInitParams
+) -> list[int]:
+    state = torch.tensor(values, dtype=torch.int64)
+    for group in _tree_peer_groups(params):
+        torch.distributed.all_reduce(
+            state, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+    return state.tolist()
+
+
+# Tag of a rank whose cache has no TreeCore, e.g. PureSWARadixCache on a PP stage
+# holding only SWA layers. It is above any crc32, so in
+# check_tree_core_backend_matches such a rank takes part without winning a MIN.
+_NO_TREE_CORE_TAG = 1 << 62
+
+
+def agree_tree_core_backend(params: CacheInitParams) -> None:
+    """Agree the backend before the cache factory; collective on every rank.
+
+    Ranks probe the Rust toolchain on their own, and concurrent probes racing to
+    install it can fail on some ranks only. Mixed cores break the HiCache syncs
+    that assume identical trees, so one failed probe moves every rank sharing
+    the tree to Python. Ranks requesting different backends fail here.
+    """
+    requested = _requested_tree_core_backend(params)
+    reason = _rust_runtime_fallback_reason(params) if requested == "rust" else None
+    if reason is not None:
+        logger.info("Using the Python TreeCore: %s", reason)
+    tag = zlib.crc32(requested.encode())
+    runtime_ok, min_tag, neg_max_tag = _all_reduce_min_across_tree_peers(
+        [int(reason is None), tag, -tag], params
     )
-    return resolve_tree_core_backend(name, params)
+    if min_tag != -neg_max_tag:
+        raise ValueError(
+            "Ranks sharing a prefix tree request different TreeCore backends "
+            f"(this rank: {requested!r})"
+        )
+    if requested == "rust":
+        if reason is None and not runtime_ok:
+            logger.info(
+                "Using the Python TreeCore: another rank sharing this prefix tree "
+                "cannot use the Rust TreeCore"
+            )
+        params.peers_can_use_rust_tree_core = bool(runtime_ok)
+
+
+def check_tree_core_backend_matches(params: CacheInitParams, tree_cache) -> None:
+    """Check the built backends after the cache factory; collective on every rank.
+
+    The configuration fallbacks are decided per cache, so ranks with differing
+    cache configurations could still mix cores: fail startup instead.
+    """
+    backend = getattr(tree_cache, "tree_core_backend", None)
+    tag = _NO_TREE_CORE_TAG if backend is None else zlib.crc32(backend.encode())
+    min_tag, neg_max_tag = _all_reduce_min_across_tree_peers(
+        [tag, _NO_TREE_CORE_TAG if backend is None else -tag], params
+    )
+    if min_tag != _NO_TREE_CORE_TAG and min_tag != -neg_max_tag:
+        raise RuntimeError(
+            "Ranks sharing a prefix tree built different TreeCore backends "
+            f"(this rank: {backend!r}); make their cache configuration match or "
+            "set SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python"
+        )
+
+
+def select_tree_core_backend(params: CacheInitParams) -> str:
+    """Resolve the instance override or default through the shared fallback
+    policy, reusing the runtime verdict agree_tree_core_backend recorded."""
+    name = _requested_tree_core_backend(params)
+    if name != "rust" or params.peers_can_use_rust_tree_core is None:
+        return resolve_tree_core_backend(name, params)
+    reason = _rust_config_fallback_reason(params)
+    if reason is not None:
+        logger.info("Using the Python TreeCore: %s", reason)
+        return "python"
+    return "rust" if params.peers_can_use_rust_tree_core else "python"
 
 
 def register_tree_core_backend(name: str, factory: TreeCoreFactory) -> None:
@@ -178,9 +285,13 @@ def create_tree_core(
     name: str,
     params: CacheInitParams,
     components: dict[ComponentType, TreeComponent],
+    *,
+    resolve: bool = True,
 ) -> UnifiedTreeCoreInterface:
-    """Resolve compatibility and construct the registered TreeCore."""
-    name = resolve_tree_core_backend(name, params)
+    """Resolve compatibility (unless the caller already did) and construct the
+    registered TreeCore."""
+    if resolve:
+        name = resolve_tree_core_backend(name, params)
     factory = get_tree_core_factory(name)
     if factory is None:
         raise ValueError(

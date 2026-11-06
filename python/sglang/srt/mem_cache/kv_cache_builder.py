@@ -52,6 +52,10 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
+    agree_tree_core_backend,
+    check_tree_core_backend_matches,
+)
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -482,6 +486,9 @@ def build_kv_cache(
             sliding_window_size,
         )
 
+    # Collective on every rank, whichever cache class it builds below.
+    agree_tree_core_backend(params)
+
     tree_context = TreeCacheBuildContext(
         server_args=server_args,
         params=params,
@@ -511,6 +518,8 @@ def build_kv_cache(
                 tree_cache=tree_cache,
                 draft_plan=hicache_draft_plan,
             )
+
+    check_tree_core_backend_matches(params, tree_cache)
 
     if retraction_backup == "host_pool":
         if not isinstance(tree_cache, UnifiedRadixCache):

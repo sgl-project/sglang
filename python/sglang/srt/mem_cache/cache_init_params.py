@@ -68,6 +68,11 @@ class CacheInitParams:
     # backend's state, a block sidecar).
     component_registry_override: Optional[dict[str, type[TreeComponent]]] = None
     tree_core_backend: Optional[str] = dataclasses.field(default=None, kw_only=True)
+    # Set by agree_tree_core_backend: whether all ranks sharing the tree can run
+    # the Rust TreeCore.
+    peers_can_use_rust_tree_core: Optional[bool] = dataclasses.field(
+        default=None, kw_only=True
+    )
 
     mtp_draft_device_pools: tuple[object, ...] = ()
     # Draft KV pools that share the target KV slots but are stored apart from it.
