@@ -1279,7 +1279,7 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.full_attn_layers = full_attn_layers
         self.full_attn_backend = full_attn_backend
         self.linear_attn_backend = linear_attn_backend
-        self._cp_metadata_plan = None
+        self.cp_metadata_plan = None
         self.attn_backend_list = [full_attn_backend, linear_attn_backend]
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
@@ -1355,7 +1355,7 @@ class HybridLinearAttnBackend(AttentionBackend):
             linear.device,
             cp_mode=cp_mode,
             residual_exchange=residual_exchange,
-            previous=self._cp_metadata_plan,
+            previous=self.cp_metadata_plan,
             **options,
         )
         if (
@@ -1372,7 +1372,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 self.req_to_token_pool.req_to_token, batch.out_cache_loc
             )
         batch.prefill_cp_metadata = metadata
-        self._cp_metadata_plan = metadata
+        self.cp_metadata_plan = metadata
 
     @property
     def data_type(self):

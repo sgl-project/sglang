@@ -492,7 +492,7 @@ def _check_backend(cache, packed, seq_lens, query_lens, expected, reference):
         device=backend.device, _cp_residual_exchange=None
     )
     hybrid.req_to_token_pool = backend.req_to_token_pool
-    hybrid._cp_metadata_plan = None
+    hybrid.cp_metadata_plan = None
     hybrid.prepare_cp_metadata(
         batch, lengths=query_lens, prefixes=batch.extend_prefix_lens_cpu
     )
@@ -1481,7 +1481,7 @@ class TestContextParallelMetadata(unittest.TestCase):
             device=table.device, _cp_residual_exchange=None
         )
         hybrid.req_to_token_pool = pool
-        hybrid._cp_metadata_plan = None
+        hybrid.cp_metadata_plan = None
         runner = SimpleNamespace(
             server_args=SimpleNamespace(
                 attn_cp_size=2,

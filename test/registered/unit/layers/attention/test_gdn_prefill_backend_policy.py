@@ -571,7 +571,7 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
                             backend.linear_attn_backend = SimpleNamespace(
                                 device="cpu", _cp_residual_exchange=None
                             )
-                            backend._cp_metadata_plan = None
+                            backend.cp_metadata_plan = None
                             batch = SimpleNamespace(
                                 forward_mode=ForwardMode.EXTEND,
                                 prefill_cp_metadata=None,
@@ -701,7 +701,7 @@ class TestFlashQLAGDNPrefillPolicy(CustomTestCase):
                 hybrid.full_attn_backend = full
                 hybrid.linear_attn_backend = linear
                 hybrid.req_to_token_pool = pool
-                hybrid._cp_metadata_plan = None
+                hybrid.cp_metadata_plan = None
                 runner = SimpleNamespace(server_args=None, attn_backend=hybrid)
                 batch = SimpleNamespace(
                     forward_mode=ForwardMode.EXTEND,
