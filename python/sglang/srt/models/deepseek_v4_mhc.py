@@ -44,7 +44,11 @@ from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import compile_in_capture_mode
 from sglang.srt.model_executor.runner_utils.prefill_graph import (
@@ -75,8 +79,16 @@ def fused_mxfp8_rows(rows: int) -> bool:
     return rows <= FUSED_MXFP8_PRODUCER_MAX_ROWS
 
 
-def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
-    """Empty DeepGEMM-packed UE8M0 scales for ``rows`` x ``cols`` fp8 data."""
+def empty_deepgemm_mxfp8_scales(
+    rows: int, cols: int, device, flashinfer: bool = False
+) -> torch.Tensor:
+    """Empty UE8M0 scales for ``rows`` x ``cols`` fp8 data from a DeepGEMM producer:
+    DeepGEMM-packed, or ``[ceil(rows / 128), cols / 128, 32, 4]`` int32 in
+    FlashInfer's 128x4 layout."""
+    if flashinfer:
+        return torch.empty(
+            (-(-rows // 128), cols // 128, 32, 4), device=device, dtype=torch.int32
+        )
     return create_per_token_group_quant_fp8_output_scale(
         (rows, cols),
         device,
@@ -88,11 +100,11 @@ def empty_deepgemm_mxfp8_scales(rows: int, cols: int, device) -> torch.Tensor:
 
 
 def empty_deepgemm_mxfp8_pair(
-    rows: int, cols: int, device
+    rows: int, cols: int, device, flashinfer: bool = False
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Empty fp8 rows and DeepGEMM-packed UE8M0 scales for a producer to fill."""
+    """Empty fp8 rows and UE8M0 scales for a DeepGEMM producer to fill."""
     data = torch.empty((rows, cols), device=device, dtype=torch.float8_e4m3fn)
-    return data, empty_deepgemm_mxfp8_scales(rows, cols, device)
+    return data, empty_deepgemm_mxfp8_scales(rows, cols, device, flashinfer=flashinfer)
 
 
 def fused_mhc_tp_ok(tp_size: int) -> bool:
@@ -711,7 +723,11 @@ def _post_fusion(
         next_hc = next.hc
         y_fp8 = y_sf = moe_input = None
         if next.accepts_mxfp8_deepgemm and fused_mxfp8_rows(y.shape[0]):
-            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(*y.shape, y.device)
+            y_fp8, y_sf = empty_deepgemm_mxfp8_pair(
+                *y.shape,
+                y.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
+            )
         elif next.mega_moe_input is not None:
             moe_input = next.mega_moe_input(y)
         updated, normalized, stats = mhc_mega_boundary(
@@ -733,7 +749,8 @@ def _post_fusion(
             moe_input=None if moe_input is None else moe_input.views(),
         )
         if y_fp8 is not None:
-            return HcState(updated, pre, HcQuantized(normalized, (y_fp8, y_sf)), stats)
+            pair = deepgemm_mxfp8_linear_input(y_fp8, y_sf)
+            return HcState(updated, pre, HcQuantized(normalized, pair), stats)
         if moe_input is not None:
             moe_input.mark(normalized)
         return HcState(updated, pre, HcNormed(normalized), stats)
