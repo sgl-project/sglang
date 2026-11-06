@@ -704,13 +704,25 @@ class HybridCacheController(BaseHiCacheController):
         extra_pools: Optional[list[PoolTransfer]] = None,
         flush: bool = True,
         start_owner: Optional[int] = None,
+        on_allocated: Optional[Callable[[torch.Tensor], None]] = None,
     ) -> Optional[torch.Tensor]:
+        """``on_allocated(host_indices)`` runs before the write is queued; if it
+        raises, the host slots are returned and nothing is queued."""
         allocation = self.allocate_host_transfers(
             device_indices, extra_pools, start_owner=start_owner
         )
         if allocation is None:
             return None
         host_indices, pool_transfers = allocation
+        if on_allocated is not None:
+            try:
+                on_allocated(host_indices)
+            except Exception:
+                try:
+                    self.mem_pool_host.release_transfers(pool_transfers)
+                finally:
+                    self.mem_pool_host.free(host_indices)
+                raise
 
         self.write_queue.append(
             CacheOperation(
@@ -1165,11 +1177,13 @@ class HybridCacheController(BaseHiCacheController):
         *,
         device_indices: Optional[torch.Tensor] = None,
         anchor_indices: Optional[torch.Tensor] = None,
+        on_allocated: Optional[Callable[[torch.Tensor], None]] = None,
     ) -> Optional[torch.Tensor]:
         """Queue an H2D of ``host_indices`` into freshly allocated FULL rows,
         or into caller-owned ``device_indices`` (kept on failure); side pools
         bind their device slots against ``anchor_indices`` (default: the KV
-        destination rows)."""
+        destination rows). ``on_allocated(device_indices)`` runs before the
+        load is queued; if it raises, freshly allocated rows are freed."""
         need_load_kv = host_indices.numel() > 0
         caller_owned = device_indices is not None
 
@@ -1194,6 +1208,14 @@ class HybridCacheController(BaseHiCacheController):
                 device_indices = full_allocator.alloc(len(host_indices))
             if device_indices is None:
                 return None
+
+        if on_allocated is not None:
+            try:
+                on_allocated(device_indices)
+            except Exception:
+                if need_load_kv and not caller_owned:
+                    full_allocator.free(device_indices)
+                raise
 
         pool_transfers = self._resolve_device_transfers(
             extra_pools,

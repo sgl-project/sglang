@@ -384,6 +384,7 @@ from sglang.srt.speculative.spec_sampling_mask import (
     validate_spec_sampling_mask_request,
 )
 from sglang.srt.speculative.uno_validation import validate_uno_request
+from sglang.srt.state_capturer import hicache_carry
 from sglang.srt.state_capturer.indexer_topk import destroy_global_indexer_capturer
 from sglang.srt.state_capturer.routed_experts import destroy_global_experts_capturer
 from sglang.srt.utils import (
@@ -3974,7 +3975,9 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
         else:
-            checkpoint_kv_cache(req, self.tree_cache)
+            # Under overlap or pipelining this chunk's capture may not be finalized yet.
+            with hicache_carry.deferring_inflight(req, lambda: self.req_to_token_pool):
+                checkpoint_kv_cache(req, self.tree_cache)
 
     def process_pending_chunked_abort(self) -> None:
         """Abort an in-flight chunked-prefill request once it is safe to do so.

@@ -122,6 +122,7 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
+from sglang.srt.state_capturer import hicache_carry
 from sglang.srt.utils.common import ceil_align, get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
@@ -1913,6 +1914,9 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
             )
             completion.finish_event.synchronize()
+            hicache_carry.backup(
+                device_indices, host_indices, self.cache_controller.mem_pool_host.size
+            )
         except Exception:
             self.discard_kv_cache_backup(backup)
             raise
@@ -1957,6 +1961,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_host_indices=backup.host_indices,
         )
         assert resolved is not None or not restored_transfers
+        hicache_carry.load(backup.host_indices, device_indices)
 
         operation = CacheOperation(
             backup.host_indices,
@@ -2103,6 +2108,9 @@ class UnifiedRadixCache(BasePrefixCache):
             node_id=node_id,
             extra_pools=aux_xfers or None,
             flush=False,
+            on_allocated=lambda host_indices: hicache_carry.backup(
+                device_value, host_indices, self.cache_controller.mem_pool_host.size
+            ),
             **shard_kwargs,
         )
 
@@ -2255,13 +2263,20 @@ class UnifiedRadixCache(BasePrefixCache):
         # Load H→D
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
-        device_indices = self.cache_controller.load(
-            host_indices=kv_xfer.host_indices,
-            node_id=node_id,
-            extra_pools=aux_xfers or None,
-        )
-
-        self.dec_lock_ref(node_id, ancestor_lock_params)
+        try:
+            device_indices = self.cache_controller.load(
+                host_indices=kv_xfer.host_indices,
+                node_id=node_id,
+                extra_pools=aux_xfers or None,
+                on_allocated=lambda device: hicache_carry.load(
+                    kv_xfer.host_indices, device
+                ),
+            )
+        except Exception:
+            self.dec_host_lock_ref(node_id, host_anchor_params)
+            raise
+        finally:
+            self.dec_lock_ref(node_id, ancestor_lock_params)
         if device_indices is None:
             self.dec_host_lock_ref(node_id, host_anchor_params)
             return False

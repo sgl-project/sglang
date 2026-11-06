@@ -69,6 +69,16 @@ def handle_hicache(server_args: Any):
 
     validate_hicache_host_memory_mode(server_args)
 
+    if cfg.hicache_storage_backend is not None and (
+        cfg.enable_return_routed_experts or cfg.enable_return_indexer_topk
+    ):
+        # Captured rows follow KV between device and host only; a storage
+        # prefetch would load KV whose routing was never carried.
+        raise ValueError(
+            "--enable-return-routed-experts and --enable-return-indexer-topk do "
+            "not support --hicache-storage-backend."
+        )
+
     if cfg.disaggregation_decode_host_receive_threshold < 1:
         # The shared host pool must match KV transfer's per-layer buffers.
         declare_resolution(
