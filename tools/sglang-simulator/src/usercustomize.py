@@ -41,3 +41,12 @@ def apply_cpu_simulation_compat() -> None:
 
 
 apply_cpu_simulation_compat()
+
+# Register the CPU-only argument adapter before native ServerArgs resolution.
+if (
+    os.getenv("SGLANG_SIMULATOR_BOOTSTRAP") == "1"
+    and os.getenv("SGLANG_USE_CPU_ENGINE") == "1"
+):
+    from sglang_simulator.simulation.sglang.dspark_args import install_cpu_dspark_args
+
+    install_cpu_dspark_args()

@@ -138,6 +138,7 @@ def sdk_double(monkeypatch):
         provenance=SimpleNamespace(
             to_dict=lambda: {
                 "verified_revision": None,
+                "infercast_revision": _REVISION,
                 "config_sha256": sdk.resources.provenance.config_sha256,
             }
         ),

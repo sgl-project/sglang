@@ -53,6 +53,10 @@ for its required execution profiles. Model-forward latency and KV capacity use
 separate SDK contracts. Native V4.1 worker regions are a separate follow-up and
 are not enabled by changing this example's model name.
 
+The bounded native follow-up is configured separately; see
+[source-bound native staged execution](docs/simopus-native.md) for its explicit
+source/FIT inputs, progress policies, cold-buffer limit and CPU acceptance scope.
+
 ### AISimulate estimator SDK
 
 The estimator SDK is optional. Replay with an explicit `max_total_tokens` does
@@ -484,6 +488,7 @@ Supported predictors:
 | `aisimulate` | Operator and module performance-database estimation. |
 | `ml` | A trained sklearn-compatible 18-feature latency model. |
 | `replay` | Exact or nearest-neighbor batch-composition replay. |
+| `simopus` | Public SimOpus forward latency; the optional [native staged route](docs/simopus-native.md) keeps source and progress scope explicit. |
 
 Relative predictor paths are resolved from the simulator configuration location.
 Environment variables in paths use `${NAME}` syntax.

@@ -283,6 +283,74 @@ class ConfigManager:
                 miss_knn_k=predictor_config.get("miss_knn_k", 3),
             )
         elif predictor_name == "simopus":
+            if predictor_config.get("native_segment_profile_id") is not None:
+                from sglang_simulator.time_predictor.simopus_dspark import (
+                    SimOpusDSparkTimePredictor,
+                )
+
+                fields = {
+                    "name",
+                    "model_id",
+                    "model_revision",
+                    "provider_revision",
+                    "systems_root",
+                    "database_mode",
+                    "native_segment_profile_id",
+                    "native_capture_profile",
+                    "progress_kind",
+                    "progress_artifact",
+                    "given_acceptance",
+                    "model_seed",
+                    "native_source_binding",
+                    "native_analytic_model",
+                    "native_source_work_policy",
+                    "native_cost_evidence_path",
+                    "output_token_id",
+                    "model_config_root",
+                }
+                unknown = sorted(predictor_config.keys() - fields)
+                if unknown:
+                    raise ValueError(
+                        "unknown native SimOpus fields: " + ", ".join(unknown)
+                    )
+                options = {
+                    key: value
+                    for key, value in predictor_config.items()
+                    if key != "name"
+                }
+                options["systems_root"] = cls.resolve_simopus_path(
+                    options.get("systems_root")
+                )
+                for key in (
+                    "native_capture_profile",
+                    "progress_artifact",
+                    "given_acceptance",
+                    "native_analytic_model",
+                ):
+                    if options.get(key) is not None:
+                        options[key] = {
+                            **options[key],
+                            "path": cls.resolve_simopus_path(options[key].get("path")),
+                        }
+                if options.get("native_source_binding") is not None:
+                    binding = options["native_source_binding"]
+                    options["native_source_binding"] = {
+                        **binding,
+                        "root": cls.resolve_simopus_path(binding.get("root")),
+                    }
+                for key in ("native_cost_evidence_path", "model_config_root"):
+                    if options.get(key) is not None:
+                        options[key] = cls.resolve_simopus_path(options[key])
+                return SimOpusDSparkTimePredictor(
+                    model,
+                    hw,
+                    sched_config,
+                    system=config.get("platform", {})
+                    .get("accelerator", {})
+                    .get("name"),
+                    **options,
+                )
+
             from sglang_simulator.time_predictor.simopus import (
                 SimOpusTimePredictor,
             )

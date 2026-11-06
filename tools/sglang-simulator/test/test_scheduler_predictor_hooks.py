@@ -1,6 +1,7 @@
 """Exercise installed scheduler hooks without importing the GPU runtime."""
 
 import importlib
+from dataclasses import FrozenInstanceError, replace
 from types import SimpleNamespace
 
 import pytest
@@ -11,7 +12,11 @@ from sglang_simulator.simulation.sglang.prepared_batch import (
     capture_prepared_batch,
 )
 from sglang_simulator.simulation.types import SimulationMode
-from sglang_simulator.time_predictor.base import ScheduleBatch, ScheduleRequest
+from sglang_simulator.time_predictor.base import (
+    PredictorError,
+    ScheduleBatch,
+    ScheduleRequest,
+)
 
 
 @pytest.fixture
@@ -51,8 +56,32 @@ def hooked_scheduler(monkeypatch):
         def _prefetch_kvcache(self, req):
             pass
 
+        def _release_aborted_request(self, req):
+            self.released_request_id = req.rid
+
         def get_new_batch_prefill(self):
             return None
+
+        def get_next_batch_to_run(self, running_batch=None, last_batch=None):
+            if hasattr(self, "prefill_decode_interval"):
+                self.selection_calls.append("native selection")
+                if self._should_defer_prefill():
+                    return SimpleNamespace(batch_to_run=None)
+            return self.plan
+
+        def _should_defer_prefill(self, running_batch=None):
+            self.selection_calls.append("native defer")
+            if self._prefill_decode_interval_remaining == 0:
+                return False
+            self._prefill_decode_interval_remaining -= 1
+            return True
+
+        def _arm_prefill_decode_interval(self, batch):
+            if self.prefill_decode_interval and batch is not None:
+                self._prefill_decode_interval_remaining = self.prefill_decode_interval
+
+        def is_disable_overlap_for_batch(self, batch, **kwargs):
+            return self.disable_overlap
 
         def run_batch(self, batch):
             advance(0.2)
@@ -68,11 +97,18 @@ def hooked_scheduler(monkeypatch):
                 self.after_forward(batch, result)
             return result
 
-        def process_batch_result(self, batch):
+        def process_batch_result(self, batch, result=None):
             advance(0.01)
+            if getattr(self, "process_error", None) is not None:
+                raise self.process_error
+            if getattr(self, "after_process", None) is not None:
+                self.after_process(batch, result)
 
         def event_loop_normal(self):
             pass
+
+        def event_loop_overlap(self):
+            return "native overlap"
 
         def on_idle(self):
             pass
@@ -138,6 +174,89 @@ def make_batch(rid="request"):
     )
 
 
+@pytest.mark.parametrize("interval", [0, 1, 192])
+@pytest.mark.parametrize("reference", [False, True])
+def test_cadence_and_reference_hooks_compose_without_replacing_native_selection(
+    hooked_scheduler, interval, reference
+):
+    from sglang_simulator.simulation.sglang.coordinated import (
+        _validate_prefill_cadence_runtime,
+    )
+
+    test = hooked_scheduler
+    target = test.target
+    target.prefill_decode_interval = interval
+    target._prefill_decode_interval_remaining = min(interval, 1)
+    target.selection_calls = []
+    target.plan = SimpleNamespace(batch_to_run=make_batch())
+    bridge = SimpleNamespace(
+        _in_scheduler_pass=False, _cadence_deferred=False, _cadence_only_pass=False
+    )
+    test.hook.COORDINATOR = bridge
+    selected = []
+
+    def selected_batch(owner, batch, *, prior_requests):
+        assert owner is target
+        assert not bridge._in_scheduler_pass
+        selected.append(batch)
+
+    if reference:
+        test.predictor.dspark_runtime = SimpleNamespace(
+            reference_driver=SimpleNamespace(selected=selected_batch)
+        )
+
+    _validate_prefill_cadence_runtime(target)
+    first = target.get_next_batch_to_run(running_batch=None, last_batch=None)
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert bridge._in_scheduler_pass is False
+    assert bridge._cadence_deferred is bool(interval)
+    assert bridge._cadence_only_pass is bool(interval)
+    assert first.batch_to_run is (None if interval else target.plan.batch_to_run)
+    assert selected == ([first.batch_to_run] if reference else [])
+
+    target.selection_calls.clear()
+    second = target.get_next_batch_to_run(None, None)
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert target._prefill_decode_interval_remaining == 0
+    assert bridge._cadence_deferred is False
+    assert bridge._cadence_only_pass is False
+    assert second is target.plan
+    assert selected == ([first.batch_to_run, second.batch_to_run] if reference else [])
+
+
+def test_composed_selection_error_keeps_native_exception_and_clears_cadence(
+    hooked_scheduler,
+):
+    test = hooked_scheduler
+    error = RuntimeError("native selection failed")
+
+    class FailingTrace(list):
+        def append(self, value):
+            super().append(value)
+            if value == "native defer":
+                raise error
+
+    target = test.target
+    target.prefill_decode_interval = 1
+    target._prefill_decode_interval_remaining = 0
+    target.selection_calls = FailingTrace()
+    bridge = SimpleNamespace(
+        _in_scheduler_pass=False, _cadence_deferred=False, _cadence_only_pass=False
+    )
+    test.hook.COORDINATOR = bridge
+    test.predictor.dspark_runtime = SimpleNamespace(
+        reference_driver=SimpleNamespace(
+            selected=lambda *args, **kwargs: pytest.fail("failed selection published")
+        )
+    )
+    with pytest.raises(RuntimeError) as caught:
+        target.get_next_batch_to_run(None, None)
+    assert caught.value is error
+    assert target.selection_calls == ["native selection", "native defer"]
+    assert bridge._in_scheduler_pass is False
+    assert bridge._cadence_only_pass is False
+
+
 def test_prepared_metadata_is_opt_in(hooked_scheduler):
     test = hooked_scheduler
     batch = make_batch()
@@ -150,39 +269,410 @@ def test_prepared_metadata_is_opt_in(hooked_scheduler):
     assert test.predictor.last_batch.forward_mode == "EXTEND"
 
 
-def test_prepared_prediction_uses_before_work_snapshot_after_native_mutation(
-    hooked_scheduler,
-):
+def test_prepared_snapshot_survives_post_forward_batch_mutation(hooked_scheduler):
     test = hooked_scheduler
     test.predictor.requires_prepared_batch = True
-    batch = make_batch()
 
-    def mutate_after_forward(native, result):
-        native.prefix_lens[:] = [900]
-        native.extend_lens[:] = [2]
-        native.prepared_forward.seq_lens_cpu[:] = [902]
-        native.prepared_forward.extend_prefix_lens_cpu[:] = [900]
-        native.prepared_forward.extend_seq_lens_cpu[:] = [2]
+    def mutate(batch, result):
+        batch.prepared_forward.seq_lens_cpu[0] = 999
+        batch.prepared_forward.extend_seq_lens_cpu[0] = 999
+        batch.extend_lens[0] = 500
+        batch.prefix_lens[0] = 499
 
-    test.target.after_forward = mutate_after_forward
-    test.target.run_batch(batch)
+    test.target.after_forward = mutate
+    test.target.run_batch(make_batch())
     assert test.predictor.last_batch.request_info() == [[8, 0]]
 
 
-def test_missing_prepared_snapshot_refuses_cost_before_clock_commit(hooked_scheduler):
+@pytest.mark.parametrize("local_idle", [False, True])
+def test_dspark_uses_complete_staged_timing_without_ordinary_forward_query(
+    hooked_scheduler, local_idle
+):
+    from sglang_simulator.simulation.sglang.dspark import (
+        STEP_ATTRIBUTE,
+        DSparkGroup,
+        DSparkPhaseCost,
+        DSparkProgress,
+        DSparkRequest,
+        DSparkStep,
+        DSparkStepResult,
+        DSparkStepTiming,
+        DSparkTopology,
+    )
+
+    test = hooked_scheduler
+    test.predictor.supports_dspark = True
+    request = DSparkRequest("request", 512, 6, 0, 512, 1, 20, '{"max_new_tokens":20}')
+    groups = (DSparkGroup(0, "TARGET_VERIFY", (request,), '{"path":"CPU fixture"}'),)
+    if local_idle:
+        groups += (DSparkGroup(1, "IDLE", (), '{"path":"coordinated idle"}'),)
+    before = DSparkStep(
+        0, DSparkTopology(2, 2 if local_idle else 1), groups, '{"source":"CPU fixture"}'
+    )
+    result = DSparkStepResult(
+        before,
+        DSparkStepTiming(
+            0,
+            tuple(
+                DSparkPhaseCost(p, 0.01, "CPU fixture") for p in before.required_phases
+            ),
+        ),
+        DSparkProgress(0, (("request", 2),), "CPU fixture"),
+        local_attention_dp_rank=1 if local_idle else 0,
+        prediction_wall_seconds=0.3,
+    )
+
+    def attach(batch, native_result):
+        test.clock.now += 0.3
+        setattr(native_result, STEP_ATTRIBUTE, result)
+
+    test.target.after_forward = attach
+    batch = make_batch()
+    batch.forward_mode.name = "IDLE" if local_idle else "DECODE"
+    if local_idle:
+        batch.reqs = []
+    test.target.run_batch(batch)
+    assert not hasattr(test.predictor, "last_batch")
+    assert StateManager.get_current_inference_dur() == pytest.approx(0.05)
+    assert StateManager.get_iteration() == 1
+    assert test.hook.CURRENT_PREDICTOR_TIME_COST == pytest.approx(0.3)
+    assert test.hook.SIMULATION_BATCH.forward_mode == (
+        "IDLE" if local_idle else "TARGET_VERIFY"
+    )
+
+
+def test_dspark_result_cannot_relabel_an_extend_batch(hooked_scheduler):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+    from test_dspark_step import session, step
+
+    test = hooked_scheduler
+    test.predictor.supports_dspark = True
+    before = step(requests=None)
+    result = session(before).execute(before)
+    test.target.after_forward = lambda batch, ret: setattr(ret, STEP_ATTRIBUTE, result)
+    batch = make_batch("a")
+    batch.forward_mode.name = "EXTEND"
+    with pytest.raises(PredictorError, match="worker mode differs"):
+        test.target.run_batch(batch)
+    assert StateManager.get_iteration() == 0
+
+
+def dspark_prediction(fid, *, prefixes, seconds, wall_seconds):
+    from sglang_simulator.simulation.sglang.dspark import (
+        DSparkPhaseCost,
+        DSparkStepTiming,
+    )
+    from test_dspark_step import request, session, step
+
+    before = step(
+        fid=fid,
+        requests=tuple(request(rid, prefix=prefix) for rid, prefix in prefixes),
+    )
+    prediction = session(before).predict(before)
+    return replace(
+        prediction,
+        timing=DSparkStepTiming(
+            fid,
+            tuple(
+                DSparkPhaseCost(
+                    phase, seconds / len(before.required_phases), "CPU fixture"
+                )
+                for phase in before.required_phases
+            ),
+        ),
+        prediction_wall_seconds=wall_seconds,
+    )
+
+
+def launch_dspark(test, prediction, *, preprocess=0.0, evaluated_costs=()):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+
+    test.predictor.supports_dspark = True
+    group = prediction.local_group
+    batch = make_batch(group.requests[0].rid)
+    batch.forward_mode.name = "DECODE"
+    batch.reqs = [
+        SimpleNamespace(rid=request.rid, output_ids=[9]) for request in group.requests
+    ]
+
+    def attach(batch, native_result):
+        test.clock.now += prediction.prediction_wall_seconds
+        setattr(native_result, STEP_ATTRIBUTE, prediction)
+        native_result._simopus_evaluated_costs = tuple(evaluated_costs)
+
+    test.target.after_forward = attach
+    test.hook.GET_NEW_BATCH_PREFILL_TIME_COST = preprocess
+    for request in group.requests:
+        scheduler.request_stats_manager.get_req_stats(request.rid).last_event_time = 100
+    return batch, test.target.run_batch(batch)
+
+
+def test_evaluated_sdk_evidence_is_bound_to_each_committed_result(hooked_scheduler):
+    import json
+
+    test = hooked_scheduler
+    first = dspark_prediction(0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3)
+    raw = json.dumps(
+        {
+            "forward_id": 0,
+            "committed_event": False,
+            "prediction": {"nodes": [{"queries": ["source-owned-query"]}]},
+        }
+    )
+    batch, result = launch_dspark(test, first, evaluated_costs=(raw,))
+    result._simopus_evaluated_costs = ()  # Result accounting owns the launch snapshot.
+    test.target.process_batch_result(batch, result)
+    evidence = test.hook.ITERATION_STATS[0]["native_worker_event"]
+    assert evidence["event_committed"] is True and evidence["forward_id"] == 0
+    assert evidence["evaluated_costs"] == [json.loads(raw)]
+    assert evidence["evaluated_costs"][0]["committed_event"] is False
+
+
+@pytest.mark.parametrize("launch_both_first", [False, True])
+def test_dspark_processing_uses_each_result_and_excludes_each_launch_wall_once(
+    hooked_scheduler, launch_both_first
+):
+    test = hooked_scheduler
+    first = dspark_prediction(0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3)
+    second = dspark_prediction(
+        1, prefixes=(("b", 1024), ("c", 2048)), seconds=0.15, wall_seconds=0.7
+    )
+    batch0, result0 = launch_dspark(test, first, preprocess=0.02)
+    if not launch_both_first:
+        test.target.process_batch_result(batch0, result0)
+    batch1, result1 = launch_dspark(test, second, preprocess=0.07)
+    if launch_both_first:
+        test.hook.CURRENT_PREDICTED_LATENCY = 99
+        test.hook.CURRENT_PREDICTOR_TIME_COST = 99
+        test.hook.SIMULATION_BATCH = None
+        test.hook.GET_NEW_BATCH_PREFILL_TIME_COST = 99
+        test.target.process_batch_result(batch0, result0)
+    test.target.process_batch_result(batch1, result1)
+
+    first_stats, second_stats = test.hook.ITERATION_STATS
+    assert first_stats["requests"] == [[6, 512]]
+    assert second_stats["requests"] == [[6, 1024], [6, 2048]]
+    assert (
+        first_stats["forward_mode"] == second_stats["forward_mode"] == "TARGET_VERIFY"
+    )
+    assert first_stats["predicted_forward_latency"] == pytest.approx(0.05)
+    assert second_stats["predicted_forward_latency"] == pytest.approx(0.15)
+    assert first_stats["forward_latency"] == pytest.approx(0.05)
+    assert second_stats["forward_latency"] == pytest.approx(0.15)
+    assert first_stats["preprocess_latency"] == pytest.approx(0.02)
+    assert second_stats["preprocess_latency"] == pytest.approx(0.07)
+    assert [row["cpu_overhead"] for row in test.hook.ITERATION_STATS] == pytest.approx(
+        [0.41, 0.01] if launch_both_first else [0.21, 0.21]
+    )
+    assert StateManager.get_global_clock() == pytest.approx(100.62)
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
+    assert test.hook.TOTAL_PREDICTOR_TIME_COST == pytest.approx(1.0)
+    assert not hasattr(test.predictor, "last_batch")
+    assert getattr(result0, scheduler._DSPARK_ACCOUNTING).prediction is first
+    with pytest.raises(FrozenInstanceError):
+        getattr(result0, scheduler._DSPARK_ACCOUNTING).forward_duration = 5
+
+
+@pytest.mark.parametrize("change", ["order", "mode", "prediction", "accounting"])
+def test_dspark_process_revalidates_exact_result_and_ordered_batch_before_processing(
+    hooked_scheduler, change
+):
+    from sglang_simulator.simulation.sglang.dspark import STEP_ATTRIBUTE
+
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512), ("b", 1024)), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    if change == "order":
+        batch.reqs.reverse()
+    elif change == "mode":
+        batch.forward_mode.name = "EXTEND"
+    elif change == "prediction":
+        setattr(result, STEP_ATTRIBUTE, replace(prediction))
+    else:
+        delattr(result, scheduler._DSPARK_ACCOUNTING)
+    now = test.clock.now
+    with pytest.raises(PredictorError):
+        test.target.process_batch_result(batch, result)
+    assert test.clock.now == now
+    assert test.hook.ITERATION_STATS == []
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_result_accounting_cannot_be_consumed_twice(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result=result)
+    now = test.clock.now
+    with pytest.raises(PredictorError, match="already consumed"):
+        test.target.process_batch_result(batch, result)
+    assert test.clock.now == now
+    assert len(test.hook.ITERATION_STATS) == 1
+
+
+def test_dspark_failed_native_processing_preserves_unconsumed_accounting(
+    hooked_scheduler,
+):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_error = RuntimeError("native processing failed")
+    with pytest.raises(RuntimeError, match="native processing failed"):
+        test.target.process_batch_result(batch, result)
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == pytest.approx(0.3)
+    assert test.hook.ITERATION_STATS == []
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_coordinator_processing_keeps_existing_delegation(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    observed = []
+
+    def process(actual_batch, actual_result, *, process, duration):
+        assert duration == pytest.approx(0.05)
+        observed.append((actual_batch, actual_result))
+        process()
+        return "coordinator result"
+
+    test.hook.COORDINATOR = SimpleNamespace(process_batch_result=process)
+    assert test.target.process_batch_result(batch, result) == "coordinator result"
+    assert observed == [(batch, result)]
+    assert len(test.hook.ITERATION_STATS) == 1
+    assert (
+        test.hook.ITERATION_STATS[0]["native_worker_event"]["event_committed"] is True
+    )
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is True
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 0
+    assert StateManager.get_global_clock() == 100
+
+
+def test_dspark_result_cannot_be_processed_by_a_different_scheduler(hooked_scheduler):
+    test = hooked_scheduler
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    other = type(test.target).__new__(type(test.target))
+    with pytest.raises(PredictorError, match="accounting"):
+        other.process_batch_result(batch, result)
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 1
+    assert getattr(result, scheduler._DSPARK_ACCOUNTED) is False
+
+
+def mock_profile_output(monkeypatch):
+    original_import = importlib.import_module
+    monkeypatch.setattr(
+        scheduler.importlib,
+        "import_module",
+        lambda name: (
+            SimpleNamespace(ProfileReqOutput=SimpleNamespace)
+            if name == "sglang.srt.managers.io_struct"
+            else original_import(name)
+        ),
+    )
+
+
+def test_dspark_profile_reset_requires_pending_results_to_drain(
+    hooked_scheduler, monkeypatch, tmp_path
+):
+    test = hooked_scheduler
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    profile = next(iter(test.target._request_dispatcher._mapping.values()))
+    rejected = profile(test.profile_req)
+    assert rejected.success is False
+    assert "must drain" in rejected.message
+    assert StateManager.get_global_clock() == 100
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == pytest.approx(0.3)
+    assert not list(tmp_path.iterdir())
+
+    test.target.process_batch_result(batch, result)
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS) == 0
+    assert profile(test.profile_req).success is True
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT) == 0
+
+
+def test_coordinator_active_at_dspark_launch_consumes_result_owned_accounting(
+    hooked_scheduler, monkeypatch, tmp_path
+):
+    test = hooked_scheduler
+    mock_profile_output(monkeypatch)
+    monkeypatch.setattr(
+        scheduler.Envs, "output_dir", classmethod(lambda cls: str(tmp_path))
+    )
+    observed = []
+
+    def process(batch, result, *, process, duration):
+        observed.append((batch, result, duration))
+        value = process()
+        for req in batch.reqs:
+            scheduler.request_stats_manager.get_req_stats(
+                req.rid
+            ).gen_token_latencies = [0.05]
+        return value
+
+    test.hook.COORDINATOR = SimpleNamespace(process_batch_result=process)
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result)
+    assert observed == [(batch, result, pytest.approx(0.05))]
+    assert getattr(test.target, scheduler._DSPARK_PENDING_RESULTS, 0) == 0
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT, 0) == 0
+    assert len(test.hook.ITERATION_STATS) == 1
+    assert (
+        test.hook.ITERATION_STATS[0]["native_worker_event"]["event_committed"] is True
+    )
+    profile = next(iter(test.target._request_dispatcher._mapping.values()))
+    assert profile(test.profile_req).success is True
+
+
+def test_dspark_blocking_keeps_native_host_time_in_result_duration(hooked_scheduler):
+    test = hooked_scheduler
+    test.hook.SIM_MODE = SimulationMode.BLOCKING
+    prediction = dspark_prediction(
+        0, prefixes=(("a", 512),), seconds=0.05, wall_seconds=0.3
+    )
+    batch, result = launch_dspark(test, prediction)
+    test.target.process_batch_result(batch, result)
+    stats = test.hook.ITERATION_STATS[-1]
+    assert stats["forward_latency"] == pytest.approx(0.55)
+    assert stats["cpu_overhead"] == pytest.approx(0.01)
+    assert StateManager.get_global_clock() == pytest.approx(100.56)
+    assert getattr(test.target, scheduler._DSPARK_WALL_CREDIT, 0) == 0
+
+
+@pytest.mark.parametrize("snapshot", [None, object()])
+def test_prepared_predictor_rejects_missing_or_invalid_result_snapshot(
+    hooked_scheduler, snapshot
+):
     test = hooked_scheduler
     test.predictor.requires_prepared_batch = True
-    batch = make_batch()
-
-    def remove_snapshot(native, result):
-        delattr(result.logits_output, SNAPSHOT_ATTRIBUTE)
-
-    test.target.after_forward = remove_snapshot
-    before = StateManager.get_global_clock()
-    with pytest.raises(scheduler.PredictorError, match="prepared snapshot"):
-        test.target.run_batch(batch)
-    assert StateManager.get_global_clock() == before
+    test.target.after_forward = lambda batch, result: setattr(
+        result.logits_output, SNAPSHOT_ATTRIBUTE, snapshot
+    )
+    with pytest.raises(PredictorError, match="prepared snapshot"):
+        test.target.run_batch(make_batch())
     assert not hasattr(test.predictor, "last_batch")
+    assert StateManager.get_iteration() == 0
 
 
 def test_legacy_negative_prediction_remains_supported(hooked_scheduler):
