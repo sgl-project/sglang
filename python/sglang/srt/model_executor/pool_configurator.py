@@ -1327,9 +1327,6 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             )
             # Keep the separate metadata/scratch reserve, but bound the budget
             # below by the exact packed pages, tags and capture workspace.
-            from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-                select_dsv4_kv_layout,
-            )
             from sglang.srt.mem_cache.dsv41_request_window import (
                 RequestWindowSpec,
                 request_window_workspace_rows,
