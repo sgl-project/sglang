@@ -12,6 +12,7 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
+from sglang.kernels.arch import current_arch
 
 try:
     from triton.language.extra.cuda import libdevice
@@ -21,7 +22,6 @@ except Exception:  # noqa: BLE001
     # Triton prunes, so a None placeholder keeps the kernel importable on gfx950.
     libdevice = None
 
-from sglang.kernels.arch import current_arch
 
 def _pdl_supported() -> bool:
     """Check if Programmatic Dependent Launch is supported (NVIDIA SM >= 90)."""
