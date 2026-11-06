@@ -9,7 +9,7 @@ from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.plugins import load_plugins
 from sglang.srt.server_args import prepare_server_args
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.common import suppress_noisy_warnings
+from sglang.srt.utils.log_utils import suppress_noisy_warnings
 
 suppress_noisy_warnings()
 
