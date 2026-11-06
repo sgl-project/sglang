@@ -24,7 +24,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import arena_of
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 _BACKEND = "sglang.srt.layers.attention.linear.inkling_sconv_backend"
 
@@ -675,6 +675,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
+        from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 
         model_runner = SimpleNamespace(
             device="cuda",
@@ -694,7 +695,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
             speculative_algorithm=SimpleNamespace(is_standalone=lambda: False),
             seed_dsa_topk_from_draft_extend=False,
             mtp_model_runner=lambda step: model_runner,
-            megakernel=None,
+            draft_runtime=STOCK_EAGLE_DRAFT_RUNTIME,
         )
         runtime = SimpleNamespace(
             mamba=SimpleNamespace(enable_mamba_extra_buffer=tracking),
@@ -766,6 +767,7 @@ class TestInklingCheckpointIndices(CustomTestCase):
         from sglang.srt.speculative import (
             multi_layer_eagle_draft_extend_cuda_graph_runner as multi,
         )
+        from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 
         backend, allocator, pool, slots = self.make_backend(
             lazy=True, static=static, slot_count=12, draft_token_num=4, fused=fused
@@ -798,8 +800,8 @@ class TestInklingCheckpointIndices(CustomTestCase):
             else eagle.EAGLEDraftExtendCudaGraphRunner
         )
         runner = cls.__new__(cls)
-        runner.megakernel = None
-        runner.megakernel_served = frozenset()
+        runner.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
+        runner.specialized_batches = frozenset()
         runner.buffers = buffers
         runner.captured_req_width = 4
         runner.forward_mode = ForwardMode.DRAFT_EXTEND_V2
