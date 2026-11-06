@@ -1027,9 +1027,19 @@ class DefaultModelLoader(BaseModelLoader):
                     quant_config,
                 )
 
-            self.load_weights_and_postprocess(
-                model, self._get_all_weights(model_config, model), target_device
+            from sglang.srt.model_loader.batched_expert_loader import (
+                batch_expert_weight_loading,
+                can_batch_expert_load,
             )
+
+            weights = self._get_all_weights(model_config, model)
+            if can_batch_expert_load(model):
+                with batch_expert_weight_loading(model) as complete_weights:
+                    self.load_weights_and_postprocess(
+                        model, complete_weights(weights), target_device
+                    )
+            else:
+                self.load_weights_and_postprocess(model, weights, target_device)
 
         self.counter_after_loading_weights = time.perf_counter()
         return model.eval()
