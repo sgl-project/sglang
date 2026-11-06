@@ -700,9 +700,15 @@ class CommonKVManager(BaseKVManager):
             if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
                 # A new room lifecycle drops deferred-ACK state left by the
                 # previous request that used this bootstrap_room.
+                poisoned = bootstrap_room in self._deferred_ack_poisoned_rooms
                 self._deferred_ack_targets.pop(bootstrap_room, None)
                 self._deferred_ack_poisoned_rooms.discard(bootstrap_room)
-                self._staging_outstanding.pop(bootstrap_room, None)
+                # Keep a positive count from a non-poisoned previous lifecycle:
+                # its in-flight chunk will still run its finally decrement, and
+                # popping it here would drive the counter to -1 and allow the
+                # new lifecycle's ABORT to be ACKed while a chunk is writing.
+                if poisoned or self._staging_outstanding.get(bootstrap_room, 0) <= 0:
+                    self._staging_outstanding.pop(bootstrap_room, None)
                 self.request_status[bootstrap_room] = status
             return
         if status == KVPoll.Failed:
