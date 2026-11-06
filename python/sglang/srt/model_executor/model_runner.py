@@ -174,6 +174,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
+    reserve_rope_cache_for_long_sequences,
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
@@ -251,7 +252,6 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
-    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )

@@ -58,15 +58,38 @@ from sglang.srt.runtime_context import (
     get_spec,
     max_speculative_num_draft_tokens,
 )
-from sglang.srt.utils.common import (
-    ceil_align,
-    ceil_div,
-    spec_decode_alloc_len_per_request,
-)
+from sglang.srt.utils.common import ceil_align, ceil_div
 from sglang.srt.utils.device import is_float4_e2m1fn_x2, is_hip, is_npu
 
 _is_hip = is_hip()
 _is_npu = is_npu()
+
+
+def spec_decode_alloc_len_per_request(
+    *,
+    page_size,
+    speculative_num_steps,
+    speculative_eagle_topk,
+    speculative_num_draft_tokens,
+) -> int:
+    """Per-request KV tokens a (spec-v1) decode step allocates: the draft-decode
+    topk*num_steps peak vs. the verify num_draft_tokens, page-aligned. A pure
+    function of the resolved values its one caller reads off the bags.
+    """
+    len_per_topk = speculative_num_steps or 1
+    spec_topk = speculative_eagle_topk or 1
+    spec_tokens = speculative_num_draft_tokens or 1
+
+    if page_size > 1 and spec_topk > 1:
+        # last partial page and ceil alignment
+        len_per_topk = ceil_align(len_per_topk + page_size, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+    elif page_size > 1:
+        # only page alignment
+        len_per_topk = ceil_align(len_per_topk, page_size)
+        spec_tokens = ceil_align(spec_tokens, page_size)
+
+    return max(len_per_topk * spec_topk, spec_tokens)
 
 
 @dataclass

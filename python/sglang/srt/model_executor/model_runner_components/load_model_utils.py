@@ -39,6 +39,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
@@ -54,6 +55,49 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
+    from sglang.srt.environ import envs
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        get_model().context_length
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
