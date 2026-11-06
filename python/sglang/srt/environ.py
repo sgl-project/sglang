@@ -2204,6 +2204,10 @@ class Envs:
     # That FP8 extend on the gfx950 Gluon kernel (P kept in registers between the two MFMAs) instead of aiter's
     # unified 2D kernel.
     SGLANG_MUSE_EXTEND_GLUON = EnvBool(True)
+    # Sliding layers on that Gluon kernel too (its 2047-token window variant, FP8 Q), 1.6x the aiter 2D kernel.
+    SGLANG_MUSE_EXTEND_SWA_GLUON = EnvBool(True)
+    # Full-layer FP8 extend on the FlyDSL kernel; =0 keeps the Gluon kernel there.
+    SGLANG_MUSE_EXTEND_FLYDSL = EnvBool(True)
     # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
     SGLANG_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
     # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).

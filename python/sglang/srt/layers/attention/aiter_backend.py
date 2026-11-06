@@ -104,6 +104,13 @@ try:
 except ImportError:  # Triton without Gluon's CDNA4 ops
     muse_extend_attention = None
 
+try:
+    from sglang.kernels.ops.attention.muse_extend_flydsl import (
+        muse_extend_attention_fly,
+    )
+except ImportError:
+    muse_extend_attention_fly = None
+
 from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
@@ -943,6 +950,16 @@ class AiterAttnBackend(AttentionBackend):
             and envs.SGLANG_MUSE_EXTEND_GLUON.get()
         )
         self._muse_extend_fp8_logged = False
+        # sliding-layer extend on the Gluon kernel's window variant (FP8 Q like the full layers)
+        self.muse_extend_swa_gluon = (
+            bool(self.muse_extend_gluon) and envs.SGLANG_MUSE_EXTEND_SWA_GLUON.get()
+        )
+        # full layers on the FlyDSL extend kernel
+        self.muse_extend_fly = (
+            bool(self.muse_extend_gluon)
+            and muse_extend_attention_fly is not None
+            and envs.SGLANG_MUSE_EXTEND_FLYDSL.get()
+        )
         self.muse_verify_kernels = frozenset(
             name
             for name, env in (
@@ -1699,9 +1716,11 @@ class AiterAttnBackend(AttentionBackend):
             dtype=self.input_dtype,
         )
         q_descale = None
+        # sliding layers take the FP8 extend only on the Gluon kernel (its window variant)
+        swa_gluon = self.muse_extend_swa_gluon and uni_window == (2046, 0)
         if (
             self.muse_extend_fp8_q
-            and uni_window == (-1, -1)
+            and (uni_window == (-1, -1) or swa_gluon)
             and forward_batch.forward_mode == ForwardMode.EXTEND
             and forward_batch.spec_info is None
             and q_u.shape[0] >= _MUSE_EXTEND_FP8_MIN_Q
@@ -1727,7 +1746,8 @@ class AiterAttnBackend(AttentionBackend):
             if not self._muse_extend_fp8_logged:
                 self._muse_extend_fp8_logged = True
                 logger.info(
-                    "Muse extend FP8 (a8) for full layers, q=%d max_q=%d",
+                    "Muse extend FP8 (a8) for full%s layers, q=%d max_q=%d",
+                    " and sliding" if self.muse_extend_swa_gluon else "",
                     q_u.shape[0],
                     self.forward_metadata.max_q_len,
                 )
@@ -1742,7 +1762,12 @@ class AiterAttnBackend(AttentionBackend):
             and self.muse_extend_gluon
             and muse_extend_applies(q_u, k_paged)
         ):
-            muse_extend_attention(
+            extend = (
+                muse_extend_attention_fly
+                if self.muse_extend_fly and not swa_gluon
+                else muse_extend_attention
+            )
+            extend(
                 q_u,
                 k_paged,
                 v_paged,
@@ -1754,6 +1779,7 @@ class AiterAttnBackend(AttentionBackend):
                 k_descale,
                 v_descale,
                 layer.scaling,
+                window=uni_window[0] + 1 if swa_gluon else 0,
             )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         unified_attention(
