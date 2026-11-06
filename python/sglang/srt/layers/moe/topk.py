@@ -2063,7 +2063,10 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    radix4_bias: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """``radix4_bias``: ``correction_bias`` already in the gating dtype, so the
+    radix4 router does not cast it per call."""
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
@@ -2257,27 +2260,33 @@ def biased_grouped_topk_gpu(
             f"Number of tokens mismatch: hidden_states.shape[0] = {hidden_states.shape[0]}, gating_output.shape[0] = {gating_output.shape[0]}"
         )
         scaling = routed_scaling_factor if routed_scaling_factor is not None else 1.0
-        # Preserve fp32 bias precision on both routers; dispatch must not change
-        # a token's routing when its batch crosses the radix4 size limit.
+
+        if envs.SGLANG_K3_RADIX4_TOPK.get():
+            from sglang.kernels.ops.moe import moe_route_radix4
+
+            # radix4 routes in the gating dtype, while the aiter fallback below
+            # keeps an fp32 bias. A token's experts can therefore differ between
+            # batches on either side of the radix4 size limit.
+            if radix4_bias is None:
+                radix4_bias = correction_bias.to(dtype=gating_output.dtype)
+            # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
+            # ungrouped) is the only config covered for now; anything else
+            # falls back to aiter.
+            if moe_route_radix4.available() and moe_route_radix4.covered(
+                gating_output, radix4_bias, topk, num_expert_group, topk_group
+            ):
+                return moe_route_radix4.route_radix4(
+                    gating_output, radix4_bias, topk, renormalize, scaling
+                )
+
+        # Don't re-downcast an fp32 bias for aiter: an offset bias loses too
+        # many levels in bf16 and reorders top-k.
         if correction_bias.dtype == torch.float32:
             route_logits = gating_output.to(torch.float32)
             route_bias = correction_bias
         else:
             route_logits = gating_output
             route_bias = correction_bias.to(dtype=gating_output.dtype)
-
-        if envs.SGLANG_K3_RADIX4_TOPK.get():
-            from sglang.kernels.ops.moe import moe_route_radix4
-
-            # Gated on the routing shape. Kimi-K3 (896 experts, top-16,
-            # ungrouped) is the only config covered for now; anything else
-            # falls back to aiter.
-            if moe_route_radix4.available() and moe_route_radix4.covered(
-                route_logits, route_bias, topk, num_expert_group, topk_group
-            ):
-                return moe_route_radix4.route_radix4(
-                    route_logits, route_bias, topk, renormalize, scaling
-                )
 
         topk_weights = torch.empty((token, topk), dtype=torch.float32, device=device)
         topk_ids = torch.empty((token, topk), dtype=torch.int32, device=device)
@@ -3026,16 +3035,22 @@ def select_experts(
     # Only aiter_biased_grouped_topk wants the bias in the gating dtype. The JIT
     # router returns before it in biased_grouped_topk_gpu and upcasts the bias
     # in-register, so downcasting here would only buy it a per-call cast back.
-    # An fp32 bias stays fp32: biased_grouped_topk_gpu then routes in fp32.
+    # An fp32 bias stays fp32 for aiter; radix4 gets the cached gating-dtype copy.
+    radix4_bias = None
     if (
         _use_aiter
         and use_grouped_topk
         and correction_bias is not None
-        and correction_bias.dtype != torch.float32
         and not envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         and dynamic_expert_bias is None
     ):
-        correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
+        if correction_bias.dtype != torch.float32:
+            correction_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
+        elif (
+            envs.SGLANG_K3_RADIX4_TOPK.get()
+            and correction_bias is topk_config.correction_bias
+        ):
+            radix4_bias = topk_config.correction_bias_for_dtype(router_logits.dtype)
 
     fold_scale_after_routing = False
     num_routed_topk = top_k - num_shared_topk_slots
@@ -3084,6 +3099,7 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
+            radix4_kwargs = {} if radix4_bias is None else dict(radix4_bias=radix4_bias)
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3095,6 +3111,7 @@ def select_experts(
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **radix4_kwargs,
             )
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True

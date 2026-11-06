@@ -22,7 +22,7 @@ def _routing_inputs(bias_dtype, device, *, num_tokens=4, radix4=False):
         ids.zero_()
 
     def radix4_kernel(logits, bias, topk, *args):
-        seen.update(route="radix4", dtypes=(logits.dtype, bias.dtype))
+        seen.update(route="radix4", dtypes=(logits.dtype, bias.dtype), bias=bias)
         return (
             torch.zeros((num_tokens, topk), device=device),
             torch.zeros((num_tokens, topk), dtype=torch.int32, device=device),
@@ -60,6 +60,7 @@ def _routing_inputs(bias_dtype, device, *, num_tokens=4, radix4=False):
             ),
             topk_config=config,
         )
+    seen["config"] = config
     return seen
 
 
@@ -111,15 +112,23 @@ class CorrectionBiasCacheTestMixin:
             (torch.bfloat16, torch.bfloat16),
         )
 
-    def test_fp32_precision_survives_radix4_batch_cutoff(self):
-        """Crossing the radix4 batch limit must preserve the router input precision."""
-        for num_tokens, route in ((1024, "radix4"), (1025, "aiter")):
+    def test_radix4_routes_fp32_bias_in_logits_dtype(self):
+        """radix4 takes the cached bf16 bias with bf16 logits, so nothing is cast
+        per call; past its batch limit aiter still gets the fp32 bias."""
+        cases = (
+            (1024, "radix4", (torch.bfloat16, torch.bfloat16)),
+            (1025, "aiter", (torch.float32, torch.float32)),
+        )
+        for num_tokens, route, dtypes in cases:
             with self.subTest(num_tokens=num_tokens, route=route):
                 seen = _routing_inputs(
                     torch.float32, self.device, num_tokens=num_tokens, radix4=True
                 )
                 self.assertEqual(seen["route"], route)
-                self.assertEqual(seen["dtypes"], (torch.float32, torch.float32))
+                self.assertEqual(seen["dtypes"], dtypes)
+                if route == "radix4":
+                    cached = seen["config"].correction_bias_for_dtype(torch.bfloat16)
+                    self.assertIs(seen["bias"], cached)
 
 
 class TestCorrectionBiasCacheCPU(CorrectionBiasCacheTestMixin, CustomTestCase):
