@@ -161,16 +161,6 @@ SGL_DEVICE float2 coarse_bin_bounds(uint32_t bin) {
   return {bin <= kNegInfBin ? -infinity_value() : bin > kInfBin ? nan : lo_edge, bin >= kInfBin ? nan : hi_edge};
 }
 
-/// The score pointer, asserted global. Loads through a pointer that crossed an asm
-/// memory clobber (the PDL wait) or a call otherwise lose the global address space
-/// and become generic LD.E; call this on a local copy after the clobber.
-SGL_DEVICE const float* assume_global(const float* ptr) {
-#if !defined(USE_ROCM)
-  __builtin_assume(__isGlobal(ptr));
-#endif
-  return ptr;
-}
-
 SGL_DEVICE uint32_t warp_sum_bool(bool pred, uint32_t mask = 0xFFFFFFFF) {
 #ifdef USE_ROCM
   // The ballot covers the whole hardware wave, which on wave64 holds two of
