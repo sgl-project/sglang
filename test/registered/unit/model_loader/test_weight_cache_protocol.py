@@ -472,13 +472,13 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
 
     def test_daemon_mode_missing_daemon_raises_instead_of_disk_load(self):
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
         missing_socket = get_socket_path(self.KEY)
         if os.path.exists(missing_socket):
             os.unlink(missing_socket)
 
-        loader = IpcModelLoader(
+        loader = WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             socket_path=missing_socket,
             weight_cache_mode="daemon",
@@ -498,9 +498,9 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         from unittest import mock
 
         from sglang.srt.configs.load_config import LoadConfig, LoadFormat
-        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+        from sglang.srt.weight_cache.ipc_loader import WeightCacheModelLoader
 
-        loader = IpcModelLoader(
+        loader = WeightCacheModelLoader(
             load_config=LoadConfig(load_format=LoadFormat.IPC_CACHE),
             weight_cache_mode="client",
             fallback_load_format="auto",
