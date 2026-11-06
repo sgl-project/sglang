@@ -3353,6 +3353,35 @@ class KVCacheConfigurator:
             assert get_spec().speculative_num_draft_tokens is not None
             assert get_schedule().max_running_requests is not None
 
+        # A PD decode (or a role-switch launch that builds the decode pool shape)
+        # sizes the mamba pools from the decode-side demand, not from K alone:
+        # HybridMambaDecodeReqToTokenPool raises the main pool to
+        # (num_reqs + extra_slots) * slots_per_req and builds intermediate_ssm
+        # over (num_reqs + extra_slots) requests, where num_reqs is the request
+        # count later capped by resolve_max_num_reqs (min of the per-worker
+        # max_running_requests and K // ratio). Charge the same numbers here;
+        # otherwise the KV pool is sized against a budget the pools later
+        # exceed and the server dies with a CUDA OOM while building them.
+        disagg = get_disagg()
+        is_pd_decode = (
+            disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch
+        )
+        decode_pre_alloc_size = (
+            (disagg.disaggregation_decode_extra_slots or 0) if is_pd_decode else 0
+        )
+        if is_pd_decode:
+            from sglang.srt.mem_cache.allocation_sizing import (
+                get_mamba_tracking_slots,
+            )
+
+            decode_slots_per_req = 1 + get_mamba_tracking_slots(
+                extra_buffer=get_exec().mamba.enable_mamba_extra_buffer,
+                overlap=not get_schedule().disable_overlap_schedule,
+                lazy=False,
+            )
+        else:
+            decode_slots_per_req = 1
+
         if get_schedule().max_mamba_cache_size is not None:
             # Use explicitly set max_mamba_cache_size
             get_context().override(
@@ -3371,7 +3400,7 @@ class KVCacheConfigurator:
                 )
                 intermediate_size = (
                     stage_per_req
-                    * (capped_reqs + 1)
+                    * (capped_reqs + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3391,7 +3420,7 @@ class KVCacheConfigurator:
             if reserves_spec_state:
                 intermediate_size = (
                     stage_per_req
-                    * (get_schedule().max_mamba_cache_size + 1)
+                    * (get_schedule().max_mamba_cache_size + decode_pre_alloc_size + 1)
                     * get_spec().speculative_num_draft_tokens
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
@@ -3426,7 +3455,9 @@ class KVCacheConfigurator:
                     max(1, get_schedule().max_running_requests // self.attn_dp_size),
                     get_schedule().max_mamba_cache_size // ratio,
                 )
-                intermediate_size = per_req * (capped_reqs + 1) * D
+                intermediate_size = (
+                    per_req * (capped_reqs + decode_pre_alloc_size + 1) * D
+                )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
             else:
                 per_slot = per_req + extra_per_slot
@@ -3454,10 +3485,27 @@ class KVCacheConfigurator:
                 f"(4) use GPUs with more memory."
             )
 
-        # +1 accounts for each pool's padding slot.
+        # +1 accounts for each pool's padding slot. On PD decode the pool
+        # builder raises the main pool to (num_reqs + pre_alloc) * slots_per_req
+        # (HybridMambaDecodeReqToTokenPool); bound num_reqs by the same caps
+        # resolve_max_num_reqs applies (per-worker max_running_requests and
+        # K // ratio) so the charge covers the raise without treating K itself
+        # as the request count, which would overcharge whenever num_reqs < K.
+        main_slots = get_schedule().max_mamba_cache_size
+        if is_pd_decode:
+            decode_req_bound = main_slots // self._calculate_mamba_ratio()
+            if get_schedule().max_running_requests is not None:
+                decode_req_bound = min(
+                    decode_req_bound,
+                    max(1, get_schedule().max_running_requests // self.attn_dp_size),
+                )
+            main_slots = max(
+                main_slots,
+                (max(1, decode_req_bound) + decode_pre_alloc_size)
+                * decode_slots_per_req,
+            )
         mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
-            + replayssm_fixed_bytes
+            (main_slots + 1) * (stage_per_req + extra_per_slot) + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
