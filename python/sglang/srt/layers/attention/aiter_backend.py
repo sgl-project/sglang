@@ -45,7 +45,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -92,6 +92,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_qua
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
+    PagedGluonMlaDecode,
     log_mla_gluon_capability,
     mla_gluon_decode,
     prefer_mla_gluon_decode,
@@ -581,6 +582,7 @@ class AiterAttnBackend(AttentionBackend):
             self.swa_kv_pool is not None
             and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
+        self.paged_gluon_mla_decode: Optional[PagedGluonMlaDecode] = None
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
@@ -747,7 +749,13 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            if self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
+            # Must run before use_any_mla_persist: it may turn the PS kernel off.
+            if is_gfx1250_supported():
+                self.paged_gluon_mla_decode = self._create_paged_gluon_mla_decode(
+                    kv_lora_rank=model_runner.model_config.kv_lora_rank,
+                    qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
+                )
+            elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
                 if (
@@ -856,6 +864,25 @@ class AiterAttnBackend(AttentionBackend):
             q.reshape(q.shape[0], -1).contiguous(), self.q_scale
         )
         return q_fp8.view(q.shape), self.q_scale
+
+    def _create_paged_gluon_mla_decode(
+        self, *, kv_lora_rank: int, qk_rope_head_dim: int
+    ) -> Optional[PagedGluonMlaDecode]:
+        """gfx1250 paged Gluon MLA decode, or None when it does not fit.
+
+        When created it turns the PS kernel off: aiter ships no persistent-scheduling
+        MLA ASM kernel for gfx1250, and the paged kernel serves decode only, so
+        verify and draft extend run the non-persist ASM decode.
+        """
+        global _use_mla_ps_kernel, fast_mode, intra_batch_mode
+        paged = PagedGluonMlaDecode.create(
+            self, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+        )
+        if paged is not None:
+            _use_mla_ps_kernel = False
+            fast_mode = False
+            intra_batch_mode = False
+        return paged
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -1664,6 +1691,22 @@ class AiterAttnBackend(AttentionBackend):
     ):
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+
+        paged = self.paged_gluon_mla_decode
+        if paged is not None and paged.accepts(forward_batch=forward_batch):
+            o = q.new_empty(
+                (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
+                dtype=self.input_dtype,
+            )
+            paged.forward(
+                q=q,
+                o=o,
+                layer=layer,
+                forward_batch=forward_batch,
+                kv_descale=k_descale,
+            )
+            return o
+
         max_q_len = self.forward_metadata.max_q_len or 1
 
         if prefer_mla_gluon_decode(
