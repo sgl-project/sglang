@@ -602,9 +602,18 @@ class HiCacheController:
                 )
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
-            if storage_backend not in ("file", "mooncake"):
+            if storage_backend == "dynamic":
+                import importlib
+
+                extra = storage_backend_extra_config or {}
+                module = importlib.import_module(extra["module_path"])
+                supported = getattr(module, extra["class_name"]).supports_dcp
+            else:
+                supported = storage_backend in ("file", "mooncake")
+            if not supported:
                 raise NotImplementedError(
-                    "HiCache L3 with DCP requires file or Mooncake storage."
+                    "HiCache L3 with DCP requires file, Mooncake or a dynamic "
+                    "storage backend with supports_dcp = True."
                 )
             if (
                 not isinstance(self.storage_host_pool, MLATokenToKVPoolHost)

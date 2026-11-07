@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -145,6 +146,10 @@ class TestDcpKernelIndices(CustomTestCase):
             )
 
 
+class _DcpStorage(HiCacheStorage):
+    supports_dcp = True
+
+
 class TestHostPoolSizingUnderDcp(CustomTestCase):
     def test_storage_shard_identity_follows_mla_layout(self):
         """Unified and static MLA keep one storage writer per DCP shard."""
@@ -205,7 +210,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                             )
 
     @staticmethod
-    def _attach_storage(pool, mode="cache"):
+    def _attach_storage(pool, mode="cache", backend="file", extra_config=None):
         cc = HiCacheController.__new__(HiCacheController)
         cc.mem_pool_host = cc.storage_host_pool = pool
         cc.page_size = pool.logical_page_size
@@ -229,7 +234,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                 "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
             ),
         ):
-            cc.attach_storage_backend("file")
+            cc.attach_storage_backend(
+                backend, storage_backend_extra_config=extra_config
+            )
         return cc
 
     def test_unified_mla_dcp_keeps_native_l3_host_layout(self):
@@ -361,6 +368,15 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                         operation, pool.logical_size + pool.logical_page_size
                     )
                 )
+
+    def test_dynamic_backend_needs_supports_dcp(self):
+        pool = _make_host_pool(0, dcp_size=2)
+        extra = {"module_path": __name__, "class_name": "HiCacheStorage"}
+        with self.assertRaisesRegex(NotImplementedError, "supports_dcp"):
+            self._attach_storage(pool, backend="dynamic", extra_config=extra)
+        extra["class_name"] = "_DcpStorage"
+        cc = self._attach_storage(pool, backend="dynamic", extra_config=extra)
+        self.assertTrue(cc.enable_storage)
 
     def test_runtime_attach_rejects_dcp_buffer_only(self):
         for dcp_size in (2, 8):

@@ -356,6 +356,11 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # Whether a dynamic backend handles DCP (--dcp-size > 1): it keys objects
+    # by DCP shard and logical page size, and addresses pages by logical index
+    # through the host pool.
+    supports_dcp: bool = False
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
