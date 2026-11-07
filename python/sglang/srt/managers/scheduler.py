@@ -258,7 +258,12 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    DRAIN_STATE_NO_LISTENER,
+    MLP_SYNC_CARRIES_DRAIN_STATE,
+    SchedulerDPAttnAdapter,
+    should_skip_scheduler_all_gather,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -2553,7 +2558,8 @@ class Scheduler(
             self, frontend_cpu_share=frontend_cpu_share
         )
         rust_server.install_sigterm_drain(
-            notify=drain_notify_name(port_args.instance_id)
+            notify=drain_notify_name(port_args.instance_id),
+            hold_drain_end=self._holds_rust_drain_end(),
         )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
@@ -2564,6 +2570,31 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
+
+    def _holds_rust_drain_end(self) -> bool:
+        """Whether this listener's drain ends only once every attention-DP
+        listener closed (``RustServer.on_drain_rows``): its ``ShutdownReq``
+        stops every rank. The DP groups share their drain state through the
+        MLP-sync gather of every step, which PP > 1 and
+        ``SGLANG_SCHEDULER_SKIP_ALL_GATHER`` do not run."""
+        parallel = get_parallel()
+        if parallel.attn_dp_size == 1 or parallel.tp_rank != 0:
+            return False
+        if (
+            parallel.dp_size == 1
+            and len(self.rust_server_endpoints) == parallel.attn_dp_size
+            and self.require_mlp_sync
+            and not should_skip_scheduler_all_gather(parallel.num_dp_ranks)
+            and parallel.pp_size == 1
+            and MLP_SYNC_CARRIES_DRAIN_STATE
+        ):
+            return True
+        logger.warning(
+            "rust server: no per-step MLP-sync gather between the attention-DP "
+            "listeners; DP rank 0's drain ends once its own listener closed, so "
+            "the other DP listeners' last requests may be cut"
+        )
+        return False
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return UocrPrefillAdder if self.uocr_runtime is not None else PrefillAdder
@@ -2649,7 +2680,20 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            **self._dp_drain_column_callbacks(),
         )
+
+    def _dp_drain_column_callbacks(self) -> dict:
+        """The listener drain state this rank gathers (``DPDrainColumn``), and
+        on a listener-hosting rank what to do with every DP group's."""
+        if self.rust_server is not None:
+            return dict(
+                get_drain_state=self.rust_server.drain_state,
+                on_drain_rows=self.rust_server.on_drain_rows,
+            )
+        if envs.SGLANG_RUST_SERVER.get():
+            return dict(get_drain_state=lambda: DRAIN_STATE_NO_LISTENER)
+        return {}
 
     def init_pool_stats_observer(self) -> None:
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
