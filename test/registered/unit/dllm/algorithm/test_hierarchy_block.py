@@ -12,6 +12,7 @@ from sglang.srt.dllm.algorithm.hierarchy_block import HierarchyBlock
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -395,6 +396,23 @@ class TestHierarchyBlockResultProcessing(unittest.TestCase):
         )
 
         self.assertIsNone(req.dllm_algo_state)
+
+    def test_worker_passes_carried_state_into_sync_runs(self):
+        def worker(carries):
+            algorithm = Mock(fdfo=False, carries_block_state=carries)
+            algorithm.run.return_value = (None, [], None, None, False)
+            return SimpleNamespace(dllm_algorithm=algorithm, model_runner=Mock())
+
+        batch = SimpleNamespace(
+            reqs=[
+                SimpleNamespace(dllm_algo_state=5),
+                SimpleNamespace(dllm_algo_state=None),
+            ]
+        )
+        for carries, expected in ((True, [5, None]), (False, None)):
+            tp_worker = worker(carries)
+            TpModelWorker._forward_batch_generation_dllm(tp_worker, Mock(), batch)
+            self.assertEqual(tp_worker.dllm_algorithm.run.call_args.args[2], expected)
 
 
 if __name__ == "__main__":

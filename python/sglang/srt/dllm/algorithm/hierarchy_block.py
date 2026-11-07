@@ -14,7 +14,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 if TYPE_CHECKING:
-    from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.server_args import ServerArgs
 
 
@@ -51,12 +50,6 @@ class HierarchyBlock(DllmAlgorithm):
         for phase in Phase.ALL:
             graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
         declare_resolution(server_args, cls.__name__, cuda_graph_config=graph_config)
-
-    @classmethod
-    def validate_request(cls, req: Req) -> Optional[str]:
-        if req.multimodal_inputs is not None:
-            return "HierarchyBlock does not support image or video inputs yet"
-        return None
 
     def __init__(self, config: DllmConfig):
         super().__init__(config)
