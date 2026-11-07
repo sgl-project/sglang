@@ -944,6 +944,11 @@ def destroy_model_parallel() -> None:
 
     IPC_A2A.reset()
     IPC_A2A_MULTI.reset()
+    from sglang.multimodal_gen.runtime.layers.attention.backends.xpu_deepsymm_ring import (
+        clear_deepsymm_ring_cache,
+    )
+
+    clear_deepsymm_ring_cache()
 
     destroyed_groups = []
     for group in (
