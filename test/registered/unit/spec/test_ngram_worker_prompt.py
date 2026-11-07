@@ -1,6 +1,8 @@
 import unittest
 from array import array
+from collections import deque
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import torch
@@ -13,6 +15,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.speculative.cpp_ngram.external_corpus import SEPARATOR_TOKEN as SEP
 from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
@@ -82,6 +85,41 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         req.output_ids.append(6)
                     self.assertEqual(req.origin_input_ids, padded)
                     self.assertEqual(list(req.origin_input_ids_unpadded), [1, 2, 3])
+
+    def test_extend_inserts_unpadded_tail_after_last_chunk(self):
+        req = Req("mm", "", array("q", [1, 2, 3]), SamplingParams())
+        req.origin_input_ids = array("q", [1, 1 << 60, 2, 3])
+        other = Req("text", "", array("q", [4, 5]), SamplingParams())
+        for chunked_req, expected in [(req, [[4, 5]]), (None, [[1, 2, 3], [4, 5]])]:
+            worker = object.__new__(NGRAMWorker)
+            worker.ngram_corpus = MagicMock()
+            worker._insert_extend_prompt_tails(
+                SimpleNamespace(reqs=[req, other], chunked_req=chunked_req)
+            )
+            worker.ngram_corpus.batch_put.assert_called_once_with(expected)
+
+    def test_external_corpus_trie_follows_lifecycle(self):
+        worker = object.__new__(NGRAMWorker)
+        worker.max_trie_depth = 12
+        worker.ngram_corpus = MagicMock()
+        worker._corpus_trie_docs, worker._staged_corpus_trie_docs = {}, {}
+        worker._corpus_trie_tokens, worker._corpus_trie_token_budget = 0, 8
+        worker._corpus_trie_backlog = backlog = deque()
+
+        # [7, 8, 9] spans a chunk boundary; 32 is past the token budget.
+        chunks = [[1, 2, 3, SEP, 7, 8], [9, SEP, 30, 31, 32]]
+        docs = [[1, 2, 3], [7, 8, 9], [30, 31]]
+        worker.commit_corpus_load("a", worker.add_external_corpus("a", chunks))
+        self.assertEqual(list(backlog), docs)
+        worker._feed_corpus_trie()
+        worker.ngram_corpus.batch_put.assert_called_once_with(docs)
+
+        # A flush re-queues the corpus; removing it drops it and frees its budget.
+        worker.clear_cache_pool()
+        self.assertEqual(list(backlog), docs)
+        worker.remove_external_corpus("a")
+        self.assertEqual(list(backlog), [])
+        self.assertEqual(worker._corpus_trie_tokens, 0)
 
 
 if __name__ == "__main__":
