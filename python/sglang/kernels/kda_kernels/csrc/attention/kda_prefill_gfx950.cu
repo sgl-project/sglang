@@ -2,9 +2,9 @@
 // KDA (Kimi Delta Attention) chunked prefill for gfx950 (MI350X / MI355X).
 //
 // Inputs are bf16 q, k, v, raw gates and raw beta of shape [1, T, H, 128] with cu_seqlens; the gate (A_log,
-// dt_bias, lower bound -5), the beta sigmoid and the q / k L2 norms are applied here.  Each sequence's fp32
-// [128, 128] state per head is read from its slot of the state pool and overwritten with the final state;
-// optionally the state after one chunk is copied to track_state.
+// dt_bias, lower bound -5), the beta sigmoid and the q / k L2 norms are applied here.  Each sequence's
+// [128, 128] state per head is read from its slot of the fp32 or bf16 state pool, carried in fp32, and
+// overwritten with the final state; optionally the fp32 state after one chunk is copied to track_state.
 //
 // Two phases.  kda_intra_kernel computes the intra-chunk terms of every (64-token chunk, head) into a workspace
 // block (normalized q and k, decayed keys, the UT transform of the chunk's delta rule, intra-chunk attention).  A
@@ -142,6 +142,25 @@ DEVI u32x4 acc_pair_to_bf16(f32x4 lo, f32x4 hi) {
   r[2] = pk_bf16(hi[0], hi[1]);
   r[3] = pk_bf16(hi[2], hi[3]);
   return r;
+}
+// four consecutive state-pool elements: fp32, or bf16 bits rounded to nearest even on store
+DEVI f32x4 ld_state4(const float* p) {
+  return *(const f32x4*)p;
+}
+DEVI f32x4 ld_state4(const uint16_t* p) {
+  const u32x2 r = *(const u32x2*)p;
+  f32x4 s;
+  s[0] = bf_lo(r[0]);
+  s[1] = bf_hi(r[0]);
+  s[2] = bf_lo(r[1]);
+  s[3] = bf_hi(r[1]);
+  return s;
+}
+DEVI void st_state4(float* p, f32x4 s) {
+  *(f32x4*)p = s;
+}
+DEVI void st_state4(uint16_t* p, f32x4 s) {
+  *(u32x2*)p = pack4(s[0], s[1], s[2], s[3]);
 }
 DEVI f32x4 zero4() {
   f32x4 z;
@@ -1258,16 +1277,16 @@ DEVI RecurSeq recur_seq(int p, const int* __restrict__ cu, int N) {
 // 5. Whole-head and value-half walks (vs1, vs2)
 // =====================================================================================================================
 
-template <int VS, int PFD>
+template <int VS, int PFD, class ST>
 DEVI void kda_recur_body_t(
     char* smem,
     const char* __restrict__ gbuf,
     const uint16_t* __restrict__ v,
-    const float* h0,
+    const ST* h0,
     const int* __restrict__ cu,
     const int* __restrict__ slots,
     uint16_t* __restrict__ o,
-    float* ht,
+    ST* ht,
     float* __restrict__ track_state,
     const long long* __restrict__ track_chunk_idx,
     char* __restrict__ trash,
@@ -1303,10 +1322,10 @@ DEVI void kda_recur_body_t(
   const int len = (int)sq.len;
   const int nch = sq.nch;
   f32x4 S[8];
-  const float* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
+  const ST* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
   for (int mt = 0; mt < 8; ++mt)
-    S[mt] = *(const f32x4*)(h0p + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
+    S[mt] = ld_state4(h0p + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
   const long long track_c = track_chunk_idx ? track_chunk_idx[n] : -1;
   if (nch > 0) {
     const size_t bstride = (size_t)H * GB_BYTES;
@@ -1384,10 +1403,10 @@ DEVI void kda_recur_body_t(
 #undef CH_FETCH
 #undef CH_L
   }
-  float* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
+  ST* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
   for (int mt = 0; mt < 8; ++mt)
-    *(f32x4*)(htp + (16 * sw + lr) * KD + 16 * mt + 4 * lg) = S[mt];
+    st_state4(htp + (16 * sw + lr) * KD + 16 * mt + 4 * lg, S[mt]);
 }
 
 // =====================================================================================================================
@@ -1405,16 +1424,16 @@ DEVI void recur_wg_map(int bid, int N, int H, int& ph, int& pt) {
     ph = full / VS + (bid - full) / VS;
   }
 }
-template <int VS>
+template <int VS, class ST>
 DEVI void kda_recur_body_ws(
     char* smem,
     const char* __restrict__ gbuf,
     const uint16_t* __restrict__ v,
-    const float* h0,
+    const ST* h0,
     const int* __restrict__ cu,
     const int* __restrict__ slots,
     uint16_t* __restrict__ o,
-    float* ht,
+    ST* ht,
     char* __restrict__ trash,
     int T,
     int H,
@@ -1444,10 +1463,10 @@ DEVI void kda_recur_body_ws(
   if (wu < NM) {
     const int sw = wu + NM * pt;
     f32x4 S[8];
-    const float* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
+    const ST* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
     for (int mt = 0; mt < 8; ++mt)
-      S[mt] = *(const f32x4*)(h0p + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
+      S[mt] = ld_state4(h0p + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
     if (nch > 0) {
       StageNone st;
       SYNC();
@@ -1457,10 +1476,10 @@ DEVI void kda_recur_body_ws(
         SYNC();
       }
     }
-    float* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
+    ST* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
     for (int mt = 0; mt < 8; ++mt)
-      *(f32x4*)(htp + (16 * sw + lr) * KD + 16 * mt + 4 * lg) = S[mt];
+      st_state4(htp + (16 * sw + lr) * KD + 16 * mt + 4 * lg, S[mt]);
   } else if (nch > 0) {
     const int lt = tid - 64 * NM;
 #define CH_FETCH_L(Pd, VPd, BPd, c) \
@@ -1668,16 +1687,16 @@ DEVI void grp_load(
 // the end state B_g from a zero state and the transition M_g = prod_c (diag(decay_c) - W_c^T Kg_c) (the same
 // step from the identity with zero values).  kda_recur_grp_scan chains E_{g+1} = E_g M_g + B_g, then pass 1
 // walks groups 1..G-1 from E_g.  gst holds E, B and M as three [G, H, 128, 128] fp32 arrays.
-template <int VS>
+template <int VS, class ST>
 DEVI void kda_recur_body_grp(
     char* smem,
     const char* __restrict__ gbuf,
     const uint16_t* __restrict__ v,
-    const float* h0,
+    const ST* h0,
     const int* __restrict__ cu,
     const int* __restrict__ slots,
     uint16_t* __restrict__ o,
-    float* ht,
+    ST* ht,
     float* __restrict__ track_state,
     const long long* __restrict__ track_chunk_idx,
     float* __restrict__ gst,
@@ -1714,12 +1733,16 @@ DEVI void kda_recur_body_grp(
   if (wu < NM) {
     const int sw = wu + NM * pt;
     f32x4 S[8];
-    const float* src =
-        pass ? gst + ((size_t)grp * H + h) * hs : (mode == 0 ? h0 + ((size_t)slots[0] * H + h) * hs : nullptr);
-    if (src) {
+    if (pass) {
+      const float* src = gst + ((size_t)grp * H + h) * hs;
 #pragma unroll
       for (int mt = 0; mt < 8; ++mt)
-        S[mt] = *(const f32x4*)(src + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
+        S[mt] = ld_state4(src + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
+    } else if (mode == 0) {
+      const ST* src = h0 + ((size_t)slots[0] * H + h) * hs;
+#pragma unroll
+      for (int mt = 0; mt < 8; ++mt)
+        S[mt] = ld_state4(src + (16 * sw + lr) * KD + 16 * mt + 4 * lg);
     } else {
 #pragma unroll
       for (int mt = 0; mt < 8; ++mt)
@@ -1748,12 +1771,18 @@ DEVI void kda_recur_body_grp(
           grp_walk<VS, false, false>(S, smem, o, trash, nullptr, -1, bos, len, nch, H, h, sw, wu, lane, lg, lr);
       }
     }
-    float* dst = pass ? (grp == G - 1 ? ht + ((size_t)slots[0] * H + h) * hs : nullptr)
-                      : gst + (size_t)mode * gs + ((size_t)(mode ? grp : 1) * H + h) * hs;
-    if (dst) {
+    if (pass) {
+      if (grp == G - 1) {
+        ST* dst = ht + ((size_t)slots[0] * H + h) * hs;
+#pragma unroll
+        for (int mt = 0; mt < 8; ++mt)
+          st_state4(dst + (16 * sw + lr) * KD + 16 * mt + 4 * lg, S[mt]);
+      }
+    } else {
+      float* dst = gst + (size_t)mode * gs + ((size_t)(mode ? grp : 1) * H + h) * hs;
 #pragma unroll
       for (int mt = 0; mt < 8; ++mt)
-        *(f32x4*)(dst + (16 * sw + lr) * KD + 16 * mt + 4 * lg) = S[mt];
+        st_state4(dst + (16 * sw + lr) * KD + 16 * mt + 4 * lg, S[mt]);
     }
   } else if constexpr (VS > 1) {
     if (nch > 0) {
@@ -2257,6 +2286,7 @@ struct FusedPF2 {
     fused_load_qk(r, t0n, Ln, q, k, H, h, w, lg, lr);
   }
 };
+template <class ST>
 DEVI void kda_fused_body_pipe(
     char* smem,
     const uint16_t* __restrict__ q,
@@ -2266,11 +2296,11 @@ DEVI void kda_fused_body_pipe(
     const uint16_t* __restrict__ beta,
     const float* __restrict__ A_log,
     const float* __restrict__ dt_bias,
-    const float* h0,
+    const ST* h0,
     const int* __restrict__ cu,
     const int* __restrict__ slots,
     uint16_t* __restrict__ o,
-    float* ht,
+    ST* ht,
     char* __restrict__ trash,
     int T,
     int H,
@@ -2313,11 +2343,11 @@ DEVI void kda_fused_body_pipe(
     f32x4 S0[8], S1[8];
     {
       const int l0 = opq_lane(opq_pre(smem, wu));
-      const float* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
+      const ST* h0p = h0 + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
       for (int mt = 0; mt < 8; ++mt) {
-        S0[mt] = *(const f32x4*)(h0p + (16 * sw0 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4));
-        S1[mt] = *(const f32x4*)(h0p + (16 * sw1 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4));
+        S0[mt] = ld_state4(h0p + (16 * sw0 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4));
+        S1[mt] = ld_state4(h0p + (16 * sw1 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4));
       }
     }
     if (nch > 0) {
@@ -2369,11 +2399,11 @@ DEVI void kda_fused_body_pipe(
     }
     {
       const int l0 = opq_lane(opq_pre(smem, wu));
-      float* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
+      ST* htp = ht + ((size_t)slots[n] * H + h) * (KD * KD);
 #pragma unroll
       for (int mt = 0; mt < 8; ++mt) {
-        *(f32x4*)(htp + (16 * sw0 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4)) = S0[mt];
-        *(f32x4*)(htp + (16 * sw1 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4)) = S1[mt];
+        st_state4(htp + (16 * sw0 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4), S0[mt]);
+        st_state4(htp + (16 * sw1 + (l0 & 15)) * KD + 16 * mt + 4 * (l0 >> 4), S1[mt]);
       }
     }
   }
@@ -2405,15 +2435,15 @@ extern "C" __global__ void __launch_bounds__(256, 3) kda_intra_kernel(
 
 // one (sequence, head) chain per workgroup (VS = 1) or per value half (VS = 2).  The value-half build has
 // a two-wave register budget so that its MFMAs keep the state in VGPRs.
-#define KDA_RECUR_KERNEL(NAME, BOUND, VS, SMEM)                                                                      \
+#define KDA_RECUR_KERNEL(NAME, BOUND, VS, SMEM, ST)                                                                  \
   extern "C" __global__ void BOUND NAME(                                                                             \
       const char* __restrict__ gbuf,                                                                                 \
       const uint16_t* __restrict__ v,                                                                                \
-      const float* h0,                                                                                               \
+      const ST* h0,                                                                                                  \
       const int* __restrict__ cu,                                                                                    \
       const int* __restrict__ slots,                                                                                 \
       uint16_t* __restrict__ o,                                                                                      \
-      float* ht,                                                                                                     \
+      ST* ht,                                                                                                        \
       float* __restrict__ track_state,                                                                               \
       const long long* __restrict__ track_chunk_idx,                                                                 \
       char* __restrict__ trash,                                                                                      \
@@ -2423,21 +2453,23 @@ extern "C" __global__ void __launch_bounds__(256, 3) kda_intra_kernel(
     __shared__ __attribute__((aligned(16))) char smem[SMEM];                                                         \
     kda_recur_body_t<VS, 1>(smem, gbuf, v, h0, cu, slots, o, ht, track_state, track_chunk_idx, trash, T, H, N, BID); \
   }
-KDA_RECUR_KERNEL(kda_recur_kernel_vs2, __launch_bounds__(256, 2), 2, SMEM_B2)
-KDA_RECUR_KERNEL(kda_recur_kernel_vs1, __launch_bounds__(512), 1, SMEM_B1)
+KDA_RECUR_KERNEL(kda_recur_kernel_vs2, __launch_bounds__(256, 2), 2, SMEM_B2, float)
+KDA_RECUR_KERNEL(kda_recur_kernel_vs1, __launch_bounds__(512), 1, SMEM_B1, float)
+KDA_RECUR_KERNEL(kda_recur_kernel_vs2_bf16, __launch_bounds__(256, 2), 2, SMEM_B2, uint16_t)
+KDA_RECUR_KERNEL(kda_recur_kernel_vs1_bf16, __launch_bounds__(512), 1, SMEM_B1, uint16_t)
 
 // warp-specialized value-part workgroups: NM math waves + NM loader waves (NM = 8 / VS).
 // ws2: value halves, 512 threads (two waves per SIMD, so at most 256 registers each, VGPR-form
 // MFMAs); ws4: value quarters (4 N H <= #CU), 256 threads, two-wave budget.
-#define KDA_RECUR_WS_KERNEL(NAME, BOUND, VS, SMEM)                                      \
+#define KDA_RECUR_WS_KERNEL(NAME, BOUND, VS, SMEM, ST)                                  \
   extern "C" __global__ void BOUND NAME(                                                \
       const char* __restrict__ gbuf,                                                    \
       const uint16_t* __restrict__ v,                                                   \
-      const float* h0,                                                                  \
+      const ST* h0,                                                                     \
       const int* __restrict__ cu,                                                       \
       const int* __restrict__ slots,                                                    \
       uint16_t* __restrict__ o,                                                         \
-      float* ht,                                                                        \
+      ST* ht,                                                                           \
       char* __restrict__ trash,                                                         \
       int T,                                                                            \
       int H,                                                                            \
@@ -2445,19 +2477,21 @@ KDA_RECUR_KERNEL(kda_recur_kernel_vs1, __launch_bounds__(512), 1, SMEM_B1)
     __shared__ __attribute__((aligned(16))) char smem[SMEM];                            \
     kda_recur_body_ws<VS>(smem, gbuf, v, h0, cu, slots, o, ht, trash, T, H, N, BID, N); \
   }
-KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws2, __launch_bounds__(512), 2, SMEM_B2)
-KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws4, __launch_bounds__(256, 2), 4, SMEM_B4)
+KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws2, __launch_bounds__(512), 2, SMEM_B2, float)
+KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws4, __launch_bounds__(256, 2), 4, SMEM_B4, float)
+KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws2_bf16, __launch_bounds__(512), 2, SMEM_B2, uint16_t)
+KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws4_bf16, __launch_bounds__(256, 2), 4, SMEM_B4, uint16_t)
 
 // sequence-group passes of one long sequence (kda_recur_body_grp), same workgroup shapes as ws2 / ws4 / vs1
-#define KDA_RECUR_GRP_KERNEL(NAME, BOUND, VS, SMEM)                                                          \
+#define KDA_RECUR_GRP_KERNEL(NAME, BOUND, VS, SMEM, ST)                                                      \
   extern "C" __global__ void BOUND NAME(                                                                     \
       const char* __restrict__ gbuf,                                                                         \
       const uint16_t* __restrict__ v,                                                                        \
-      const float* h0,                                                                                       \
+      const ST* h0,                                                                                          \
       const int* __restrict__ cu,                                                                            \
       const int* __restrict__ slots,                                                                         \
       uint16_t* __restrict__ o,                                                                              \
-      float* ht,                                                                                             \
+      ST* ht,                                                                                                \
       float* __restrict__ track_state,                                                                       \
       const long long* __restrict__ track_chunk_idx,                                                         \
       float* __restrict__ gst,                                                                               \
@@ -2470,9 +2504,12 @@ KDA_RECUR_WS_KERNEL(kda_recur_kernel_ws4, __launch_bounds__(256, 2), 4, SMEM_B4)
     kda_recur_body_grp<VS>(                                                                                  \
         smem, gbuf, v, h0, cu, slots, o, ht, track_state, track_chunk_idx, gst, trash, H, G, gc, pass, BID); \
   }
-KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws2, __launch_bounds__(512), 2, SMEM_B2)
-KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws4, __launch_bounds__(256, 2), 4, SMEM_B4)
-KDA_RECUR_GRP_KERNEL(kda_recur_grp_vs1, __launch_bounds__(512), 1, SMEM_B1)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws2, __launch_bounds__(512), 2, SMEM_B2, float)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws4, __launch_bounds__(256, 2), 4, SMEM_B4, float)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_vs1, __launch_bounds__(512), 1, SMEM_B1, float)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws2_bf16, __launch_bounds__(512), 2, SMEM_B2, uint16_t)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_ws4_bf16, __launch_bounds__(256, 2), 4, SMEM_B4, uint16_t)
+KDA_RECUR_GRP_KERNEL(kda_recur_grp_vs1_bf16, __launch_bounds__(512), 1, SMEM_B1, uint16_t)
 
 // entry states of the sequence groups, E_{g+1} = E_g M_g + B_g for g = 1..G-2 in fp32: one 512-thread
 // workgroup per (head, 16 value rows), wave w computes the key columns 16 w .. 16 w + 15
@@ -2525,27 +2562,56 @@ extern "C" __global__ void __launch_bounds__(512) kda_recur_grp_scan(float* __re
 // pipelined fused kernel: one 512-thread workgroup per (sequence, head) keeps the
 // chunk's block in LDS (one workgroup per CU); waves 0-3 run the intra phase of chunk c + 1 while waves 4-7 run
 // the recurrence step of chunk c (two 16-column state tiles each)
-extern "C" __global__ void __launch_bounds__(512) kda_fusedp_kernel(
-    const uint16_t* __restrict__ q,
-    const uint16_t* __restrict__ k,
-    const uint16_t* __restrict__ v,
-    const uint16_t* __restrict__ g,
-    const uint16_t* __restrict__ beta,
-    const float* __restrict__ A_log,
-    const float* __restrict__ dt_bias,
-    const float* h0,
-    const int* __restrict__ cu,
-    const int* __restrict__ slots,
-    uint16_t* __restrict__ o,
-    float* ht,
-    char* __restrict__ trash,
-    int T,
-    int H,
-    int N,
-    float scale) {
-  __shared__ __attribute__((aligned(16))) char smem[SMEM_FP];
-  kda_fused_body_pipe(smem, q, k, v, g, beta, A_log, dt_bias, h0, cu, slots, o, ht, trash, T, H, N, scale, BID);
-}
+#define KDA_FUSEDP_KERNEL(NAME, ST)                                                                                \
+  extern "C" __global__ void __launch_bounds__(512) NAME(                                                          \
+      const uint16_t* __restrict__ q,                                                                              \
+      const uint16_t* __restrict__ k,                                                                              \
+      const uint16_t* __restrict__ v,                                                                              \
+      const uint16_t* __restrict__ g,                                                                              \
+      const uint16_t* __restrict__ beta,                                                                           \
+      const float* __restrict__ A_log,                                                                             \
+      const float* __restrict__ dt_bias,                                                                           \
+      const ST* h0,                                                                                                \
+      const int* __restrict__ cu,                                                                                  \
+      const int* __restrict__ slots,                                                                               \
+      uint16_t* __restrict__ o,                                                                                    \
+      ST* ht,                                                                                                      \
+      char* __restrict__ trash,                                                                                    \
+      int T,                                                                                                       \
+      int H,                                                                                                       \
+      int N,                                                                                                       \
+      float scale) {                                                                                               \
+    __shared__ __attribute__((aligned(16))) char smem[SMEM_FP];                                                    \
+    kda_fused_body_pipe(smem, q, k, v, g, beta, A_log, dt_bias, h0, cu, slots, o, ht, trash, T, H, N, scale, BID); \
+  }
+KDA_FUSEDP_KERNEL(kda_fusedp_kernel, float)
+KDA_FUSEDP_KERNEL(kda_fusedp_kernel_bf16, uint16_t)
+
+// the recurrence entry points for one state-pool element type
+template <class ST>
+struct KdaRecurKernels;
+template <>
+struct KdaRecurKernels<float> {
+  static constexpr auto fused = kda_fusedp_kernel;
+  static constexpr auto vs1 = kda_recur_kernel_vs1;
+  static constexpr auto vs2 = kda_recur_kernel_vs2;
+  static constexpr auto ws2 = kda_recur_kernel_ws2;
+  static constexpr auto ws4 = kda_recur_kernel_ws4;
+  static constexpr auto grp_vs1 = kda_recur_grp_vs1;
+  static constexpr auto grp_ws2 = kda_recur_grp_ws2;
+  static constexpr auto grp_ws4 = kda_recur_grp_ws4;
+};
+template <>
+struct KdaRecurKernels<uint16_t> {
+  static constexpr auto fused = kda_fusedp_kernel_bf16;
+  static constexpr auto vs1 = kda_recur_kernel_vs1_bf16;
+  static constexpr auto vs2 = kda_recur_kernel_vs2_bf16;
+  static constexpr auto ws2 = kda_recur_kernel_ws2_bf16;
+  static constexpr auto ws4 = kda_recur_kernel_ws4_bf16;
+  static constexpr auto grp_vs1 = kda_recur_grp_vs1_bf16;
+  static constexpr auto grp_ws2 = kda_recur_grp_ws2_bf16;
+  static constexpr auto grp_ws4 = kda_recur_grp_ws4_bf16;
+};
 
 // =====================================================================================================================
 // 10. Host: path selection and launch
@@ -2592,6 +2658,7 @@ static KdaPath kda_recur_path(int64_t T, int64_t H, int64_t N, int64_t max_seqle
 }
 
 // state[slots[n]] holds the initial state of sequence n and receives its final state
+template <class ST>
 static void kda_fwd_launch(
     const uint16_t* q,
     const uint16_t* k,
@@ -2600,7 +2667,7 @@ static void kda_fwd_launch(
     const uint16_t* beta,
     const float* A_log,
     const float* dt_bias,
-    float* state,
+    ST* state,
     const int* cu,
     const int* slots,
     uint16_t* o,
@@ -2615,13 +2682,14 @@ static void kda_fwd_launch(
     int ncu,
     hipStream_t stream) {
   if (N <= 0 || H <= 0) return;
+  using K = KdaRecurKernels<ST>;
   const KdaPath path = kda_recur_path(T, H, N, max_seqlen, track_state != nullptr, ncu);
   const int nwork = (T / KC + N) * H;
   // rows past the end of a sequence are stored to this scratch slot, right after the per-(chunk, head) blocks
   char* trash = gbuf + (size_t)nwork * GB_BYTES;
   if (path == KDA_FUSED) {
     hipLaunchKernelGGL(
-        kda_fusedp_kernel,
+        K::fused,
         dim3(N * H),
         dim3(512),
         0,
@@ -2696,11 +2764,11 @@ static void kda_fwd_launch(
       pass)
         const int vs = kda_grp_vs(items, H, ncu);
         if (vs == 4)
-          KDA_LAUNCH_GRP(kda_recur_grp_ws4, 4);
+          KDA_LAUNCH_GRP(K::grp_ws4, 4);
         else if (vs == 2)
-          KDA_LAUNCH_GRP(kda_recur_grp_ws2, 2);
+          KDA_LAUNCH_GRP(K::grp_ws2, 2);
         else
-          KDA_LAUNCH_GRP(kda_recur_grp_vs1, 1);
+          KDA_LAUNCH_GRP(K::grp_vs1, 1);
 #undef KDA_LAUNCH_GRP
       }
       break;
@@ -2708,46 +2776,16 @@ static void kda_fwd_launch(
     case KDA_WS4:
       // 2 math + 2 loader waves per workgroup, the four parts of a head on one XCD
       hipLaunchKernelGGL(
-          kda_recur_kernel_ws4,
-          dim3(N * H * 4),
-          dim3(256),
-          0,
-          stream,
-          gbuf,
-          v,
-          state,
-          cu,
-          slots,
-          o,
-          state,
-          trash,
-          T,
-          H,
-          N);
+          K::ws4, dim3(N * H * 4), dim3(256), 0, stream, gbuf, v, state, cu, slots, o, state, trash, T, H, N);
       break;
     case KDA_WS2:
       // 4 math + 4 loader waves per workgroup
       hipLaunchKernelGGL(
-          kda_recur_kernel_ws2,
-          dim3(N * H * 2),
-          dim3(512),
-          0,
-          stream,
-          gbuf,
-          v,
-          state,
-          cu,
-          slots,
-          o,
-          state,
-          trash,
-          T,
-          H,
-          N);
+          K::ws2, dim3(N * H * 2), dim3(512), 0, stream, gbuf, v, state, cu, slots, o, state, trash, T, H, N);
       break;
     case KDA_VS2:
       hipLaunchKernelGGL(
-          kda_recur_kernel_vs2,
+          K::vs2,
           dim3(N * H * 2),
           dim3(256),
           0,
@@ -2768,7 +2806,7 @@ static void kda_fwd_launch(
       break;
     default:
       hipLaunchKernelGGL(
-          kda_recur_kernel_vs1,
+          K::vs1,
           dim3(N * H),
           dim3(512),
           0,
@@ -2822,7 +2860,8 @@ torch::Tensor kda_prefill_gfx950(
   TORCH_CHECK(
       beta.dim() == 3 && beta.size(0) == 1 && beta.size(1) == q.size(1) && beta.size(2) == q.size(2),
       "beta must have shape [1, T, H]");
-  TORCH_CHECK(ssm_states.scalar_type() == at::ScalarType::Float, "ssm_states must be fp32");
+  const bool bf16_state = ssm_states.scalar_type() == at::ScalarType::BFloat16;
+  TORCH_CHECK(bf16_state || ssm_states.scalar_type() == at::ScalarType::Float, "ssm_states must be fp32 or bf16");
   TORCH_CHECK(
       ssm_states.dim() == 4 && ssm_states.size(1) == q.size(2) && ssm_states.size(2) == 128 &&
           ssm_states.size(3) == 128,
@@ -2868,28 +2907,34 @@ torch::Tensor kda_prefill_gfx950(
       torch::empty({gbuf_bytes + 4096 + kda_grp_state_bytes(T, H, N, ncu)}, q.options().dtype(at::ScalarType::Byte));
   const hipStream_t stream = at::hip::getCurrentHIPStream();
 
-  kda_fwd_launch(
-      reinterpret_cast<const uint16_t*>(q.data_ptr()),
-      reinterpret_cast<const uint16_t*>(k.data_ptr()),
-      reinterpret_cast<const uint16_t*>(v.data_ptr()),
-      reinterpret_cast<const uint16_t*>(g.data_ptr()),
-      reinterpret_cast<const uint16_t*>(beta.data_ptr()),
-      A_log.data_ptr<float>(),
-      dt_bias.data_ptr<float>(),
-      ssm_states.data_ptr<float>(),
-      cu_seqlens.data_ptr<int>(),
-      cache_indices.data_ptr<int>(),
-      reinterpret_cast<uint16_t*>(output.data_ptr()),
-      tracking ? track_state.data_ptr<float>() : nullptr,
-      tracking ? reinterpret_cast<const long long*>(track_chunk_idx.data_ptr<int64_t>()) : nullptr,
-      reinterpret_cast<char*>(workspace.data_ptr()),
-      (int)T,
-      (int)H,
-      (int)N,
-      (int)max_seqlen,
-      (float)scale,
-      ncu,
-      stream);
+  const auto launch = [&](auto* state) {
+    kda_fwd_launch(
+        reinterpret_cast<const uint16_t*>(q.data_ptr()),
+        reinterpret_cast<const uint16_t*>(k.data_ptr()),
+        reinterpret_cast<const uint16_t*>(v.data_ptr()),
+        reinterpret_cast<const uint16_t*>(g.data_ptr()),
+        reinterpret_cast<const uint16_t*>(beta.data_ptr()),
+        A_log.data_ptr<float>(),
+        dt_bias.data_ptr<float>(),
+        state,
+        cu_seqlens.data_ptr<int>(),
+        cache_indices.data_ptr<int>(),
+        reinterpret_cast<uint16_t*>(output.data_ptr()),
+        tracking ? track_state.data_ptr<float>() : nullptr,
+        tracking ? reinterpret_cast<const long long*>(track_chunk_idx.data_ptr<int64_t>()) : nullptr,
+        reinterpret_cast<char*>(workspace.data_ptr()),
+        (int)T,
+        (int)H,
+        (int)N,
+        (int)max_seqlen,
+        (float)scale,
+        ncu,
+        stream);
+  };
+  if (bf16_state)
+    launch(reinterpret_cast<uint16_t*>(ssm_states.data_ptr()));
+  else
+    launch(ssm_states.data_ptr<float>());
   return output;
 }
 
