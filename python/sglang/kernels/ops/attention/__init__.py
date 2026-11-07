@@ -629,3 +629,11 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_q_quant_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)

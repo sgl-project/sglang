@@ -92,6 +92,7 @@ from sglang.srt.layers.attention.dsa.kpool_plan import (
 from sglang.srt.layers.attention.dsa.utils import (
     can_dsa_prefill_cp_interleave,
     compute_dsa_seqlens,
+    dsa_cache_seqlens_may_be_padded,
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
     pad_dsa_cache_seqlens,
@@ -206,44 +207,99 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
-def _trim_trtllm_decode_dp_padding(
-    q_all: torch.Tensor,
-    topk_indices: Optional[torch.Tensor],
-    real_batch_size: int,
-) -> Tuple[torch.Tensor, Optional[torch.Tensor], int]:
-    """Align eager decode inputs with metadata planned before DP padding."""
-    physical_batch_size = q_all.shape[0]
-    assert real_batch_size <= physical_batch_size, (
-        f"DSA metadata batch size ({real_batch_size}) exceeds q batch size "
-        f"({physical_batch_size})"
+def _trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65–127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
+
+
+@dataclass(frozen=True)
+class _RowPlan:
+    """How the query rows of a sparse DSA kernel line up with its metadata rows.
+
+    Both mismatches follow one rule: compute on the live rows, zero the padded
+    rows, and reject anything else.
+    """
+
+    live_rows: int  # rows both the query and the metadata cover
+    q_pad_rows: int  # trailing query rows without metadata (DP / MLP-sync)
+    meta_pad_rows: int  # trailing zero-length metadata rows without a query
+
+
+def _plan_live_rows(
+    q_rows: int, meta_rows: int, forward_batch: ForwardBatch
+) -> _RowPlan:
+    """Reconcile query rows with the rows the DSA metadata was planned on.
+
+    q > metadata: DP / MLP-sync padding of q; the metadata covers the real rows.
+    metadata > q: the zero-length rows of a CP physical shard (prefill graph
+    metadata, or pad_dsa_cache_seqlens) or of the DP padded token count, whose
+    query rows a prefill graph bridge has already narrowed away. Any other
+    metadata surplus is a planning bug.
+    """
+    if q_rows >= meta_rows:
+        return _RowPlan(meta_rows, q_rows - meta_rows, 0)
+    from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
+        is_in_breakable_cuda_graph,
     )
-    if topk_indices is not None:
-        assert real_batch_size <= topk_indices.shape[0], (
-            f"DSA metadata batch size ({real_batch_size}) exceeds topk batch size "
-            f"({topk_indices.shape[0]})"
+
+    if not (
+        getattr(forward_batch, "attn_cp_metadata", None) is not None
+        or dsa_cache_seqlens_may_be_padded(forward_batch)
+        # A breakable prefill graph replays on a view without
+        # global_num_tokens_cpu, but its metadata was planned on the real batch
+        # (DP padded count included) and the eager bridge narrows q to the
+        # live rows.
+        or is_in_breakable_cuda_graph()
+    ):
+        raise AssertionError(
+            f"DSA metadata rows ({meta_rows}) exceed q rows ({q_rows})"
         )
-
-    num_padding_rows = physical_batch_size - real_batch_size
-    if num_padding_rows == 0:
-        return q_all, topk_indices, 0
-
-    return (
-        q_all[:real_batch_size],
-        topk_indices[:real_batch_size] if topk_indices is not None else None,
-        num_padding_rows,
-    )
+    return _RowPlan(q_rows, 0, meta_rows - q_rows)
 
 
-def _restore_trtllm_decode_dp_padding(
-    output: torch.Tensor, num_padding_rows: int
-) -> torch.Tensor:
-    """Restore the physical DP shape required by downstream MLP collectives."""
-    if num_padding_rows == 0:
+def _apply_q_row_plan(
+    plan: _RowPlan, q: torch.Tensor, indices: Optional[torch.Tensor]
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    """Fit q and its top-k rows to kernels that take one row per metadata row.
+
+    Padded q rows are dropped; missing ones are fed as zero queries with -1
+    indices, which attend to no keys.
+    """
+    if indices is not None and indices.shape[0] < plan.live_rows:
+        raise AssertionError(
+            f"DSA top-k rows ({indices.shape[0]}) do not cover the "
+            f"{plan.live_rows} live rows"
+        )
+    if plan.q_pad_rows:
+        q = q[: plan.live_rows]
+        indices = indices[: plan.live_rows] if indices is not None else None
+    elif plan.meta_pad_rows:
+        pad = plan.meta_pad_rows
+        q = torch.cat([q, q.new_zeros((pad, *q.shape[1:]))])
+        if indices is not None:
+            indices = torch.cat(
+                [
+                    indices[: plan.live_rows],
+                    indices.new_full((pad, *indices.shape[1:]), -1),
+                ]
+            )
+    return q, indices
+
+
+def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.Tensor:
+    """Return the output on the caller's q rows: drop the rows computed for
+    metadata padding and zero-fill the dropped q padding, which downstream MLP
+    collectives still expect."""
+    if plan is None:
         return output
-    return torch.cat(
-        [output, output.new_zeros((num_padding_rows, *output.shape[1:]))],
-        dim=0,
-    )
+    if plan.meta_pad_rows:
+        return output[: plan.live_rows]
+    if plan.q_pad_rows:
+        return torch.cat(
+            [output, output.new_zeros((plan.q_pad_rows, *output.shape[1:]))],
+            dim=0,
+        )
+    return output
 
 
 @dataclass(frozen=True)
@@ -2645,6 +2701,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
                 dcp_partial=self.dsa_shards_index_k
                 and forward_batch.forward_mode.is_target_verify(),
             )
@@ -2835,6 +2892,7 @@ class DeepseekSparseAttnBackend(
                 layer=layer,
                 metadata=metadata,
                 page_table_1=page_table_1,
+                forward_batch=forward_batch,
                 dcp_partial=self.dsa_shards_index_k,
             )
         elif dsa_impl == "tilelang":
@@ -3489,6 +3547,7 @@ class DeepseekSparseAttnBackend(
         layer,
         metadata: DSAMetadata,
         page_table_1,
+        forward_batch: ForwardBatch,
         dcp_partial: bool = False,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         # dcp_partial: DCP decode, q gathered from the group attends over this
@@ -3536,6 +3595,13 @@ class DeepseekSparseAttnBackend(
         if dcp_partial:
             tile_scheduler_metadata = self._call_get_mla_metadata()[0]
 
+        plan = None
+        if not dcp_partial:
+            plan = _plan_live_rows(
+                q_input.shape[0], cache_seqlens.shape[0], forward_batch
+            )
+            q_input, indices = _apply_q_row_plan(plan, q_input, indices)
+
         o, lse = self._call_flash_mla_with_kvcache(
             q=q_input,
             k_cache=kv_cache,
@@ -3548,16 +3614,15 @@ class DeepseekSparseAttnBackend(
             indices=indices,
             # doc says it is not used, but if pass in None then error
             block_table=torch.empty(
-                (q_all.shape[0], 0), dtype=torch.int32, device=q_all.device
+                (q_input.shape[0], 0), dtype=torch.int32, device=q_all.device
             ),
             is_fp8_kvcache=True,
             kv_format=self.flashmla_kv_format,
         )
-
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
         if not dcp_partial:
-            return o
+            return _restore_live_rows(o, plan)
 
         # Partial result for the DCP merge: [T, H, D] and its natural-log LSE
         # [T, H], both views into the padded kernel output. A row with no local
@@ -4208,15 +4273,20 @@ class DeepseekSparseAttnBackend(
         if (self.use_fused_topk or not is_prefill) and topk_indices is not None:
             topk_indices = self._pad_topk_indices(topk_indices, q.shape[0])
 
-        num_decode_padding_rows = 0
-        if not is_prefill:
-            q_all, topk_indices, num_decode_padding_rows = (
-                _trim_trtllm_decode_dp_padding(
-                    q_all,
-                    topk_indices,
-                    metadata.cache_seqlens_int32.shape[0],
+        # Plan against the rows the kernel reads: prefill passes the per-token
+        # dsa_cache_seqlens_int32, while cache_seqlens_int32 has one row per
+        # request.
+        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
+        row_plan = _plan_live_rows(q_all.shape[0], seq_lens.shape[0], forward_batch)
+        if row_plan.q_pad_rows:
+            if is_prefill:
+                raise AssertionError(
+                    f"DSA prefill q rows ({q_all.shape[0]}) exceed metadata rows "
+                    f"({row_plan.live_rows})"
                 )
-            )
+            # Eager decode under DP: run on the metadata-backed rows; the
+            # output is zero-filled back to the physical batch below.
+            q_all, topk_indices = _apply_q_row_plan(row_plan, q_all, topk_indices)
 
         if self.use_fused_topk:
             page_table_1 = self._get_fused_topk_page_table(topk_indices)
@@ -4268,14 +4338,18 @@ class DeepseekSparseAttnBackend(
 
         multi_ctas_kv_counter_buffer = self._multi_ctas_kv_counter_for(batch_size)
 
-        q = q_all.view(batch_size, 1, num_heads, head_dim)
+        kernel_heads = _trtllm_padded_heads(num_heads)
+        if kernel_heads != num_heads:
+            padded_q = q_all.new_zeros((batch_size, kernel_heads, head_dim))
+            padded_q[:, :num_heads].copy_(q_all)
+            q_all = padded_q
+        q = q_all.view(batch_size, 1, kernel_heads, head_dim)
         kv = kv_cache.view(-1, 1, self.physical_page_size, self.kv_cache_dim)
         block_tables = page_table_1.unsqueeze(1)
-        seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
-        if is_prefill:
+        if row_plan.meta_pad_rows:
             # CP graph metadata includes the physical shard's padding; its
             # eager attention bridge can narrow Q to the live local rows.
-            seq_lens = seq_lens[:batch_size]
+            seq_lens = seq_lens[: row_plan.live_rows]
 
         attention_kwargs = dict(
             kv_cache=kv,
@@ -4300,14 +4374,20 @@ class DeepseekSparseAttnBackend(
                 cu_seqlens_q=self.get_device_int32_arange(batch_size + 1),
                 **attention_kwargs,
             )
-            if num_decode_padding_rows:
+            # Q may already contain head padding from the fused FP8 builder.
+            # Restore the layer's logical head count for both Q preparation paths.
+            output_heads = layer.tp_q_head_num
+            if kernel_heads != output_heads:
+                out = out[..., :output_heads, :].contiguous()
+                lse = lse[:, :output_heads].contiguous()
+            if row_plan.q_pad_rows:
                 lse = torch.cat(
                     [
                         lse,
-                        lse.new_full((num_decode_padding_rows, num_heads), -torch.inf),
+                        lse.new_full((row_plan.q_pad_rows, output_heads), -torch.inf),
                     ]
                 )
-            return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows), lse
+            return _restore_live_rows(out, row_plan), lse
 
         out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
@@ -4315,8 +4395,9 @@ class DeepseekSparseAttnBackend(
             seq_lens=seq_lens,
             **attention_kwargs,
         )
-
-        return _restore_trtllm_decode_dp_padding(out, num_decode_padding_rows)
+        if kernel_heads != layer.tp_q_head_num:
+            out = out[..., : layer.tp_q_head_num, :].contiguous()
+        return _restore_live_rows(out, row_plan)
 
     def _pad_topk_indices(
         self, topk_indices: torch.Tensor, num_tokens: int
