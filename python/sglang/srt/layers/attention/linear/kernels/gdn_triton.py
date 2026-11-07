@@ -11,7 +11,7 @@ if not is_cpu():
         fused_recurrent_gated_delta_rule_packed_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
-        fused_recurrent_gdn_replayssm_decode,
+        fused_recurrent_linear_replayssm_decode,
     )
     from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
@@ -99,7 +99,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             and replayssm_g is not None
             and replayssm_write_pos is not None
         ):
-            fused_recurrent_gdn_replayssm_decode(
+            fused_recurrent_linear_replayssm_decode(
                 mixed_qkv=mixed_qkv,
                 a=a,
                 b=b,
@@ -183,6 +183,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
         recurrent_state = ssm_states
         recurrent_state_indices_args = {"initial_state_indices": cache_indices}
         inplace_update_args = {"inplace_update": inplace_update}
+        # Static tables of a CUDA-graph captured prefill (gdn_prefill_graph.py).
+        graph_table_args = {}
+        if kwargs.get("chunk_indices") is not None:
+            graph_table_args = {
+                "chunk_indices": kwargs["chunk_indices"],
+                "chunk_offsets": kwargs["chunk_offsets"],
+            }
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -212,6 +219,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             use_qk_l2norm_in_kernel=True,
             **recurrent_state_indices_args,
             **inplace_update_args,
+            **graph_table_args,
         )
 
     def target_verify(

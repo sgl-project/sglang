@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import torch
 
 from sglang.kernels.ops.memory.virtual_slot import translate_token_ids
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -51,15 +51,15 @@ class TestUniformExtendPlan(CustomTestCase):
                 write=lambda ids: translate_token_ids(loc=ids, v2p=table, page_size=ps),
             )
 
-        source = KVIndexTranslator.__new__(KVIndexTranslator)
+        source = RunnerIds.__new__(RunnerIds)
         source.page_size = ps
         source.req_to_token = req_to_token
         source._spaces = {full_kind: space("full", full)}
         if swa_enabled:
             source._spaces[swa_kind] = space("swa", swa)
-        fused = KVIndexTranslator.__new__(KVIndexTranslator)
+        fused = RunnerIds.__new__(RunnerIds)
         fused._spaces = {full_kind: source.space(full_kind)}
-        private = KVIndexTranslator.__new__(KVIndexTranslator)
+        private = RunnerIds.__new__(RunnerIds)
         private._spaces = {full_kind: IdSpace(key="private")}
         rows = torch.tensor([2, 1, 0], device="cuda")
         lengths = torch.tensor([ps - 1, ps + 1, 0], device="cuda")

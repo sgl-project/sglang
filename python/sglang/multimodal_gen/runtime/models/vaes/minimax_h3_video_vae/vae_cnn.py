@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # 3D causal CNN encoder for the MiniMax H3 visual VAE (inference-only bundle).
+import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 from .conv import BaseConv3d
-from .norm import get_group_norm_3d, get_spatial_norm_3d
+from .norm import TemporalIsolatedGroupNorm, get_group_norm_3d, get_spatial_norm_3d
 
 # ============================================================================
 # 3D CNN Components
@@ -16,6 +17,25 @@ def norm_silu(x, norm, cond=None):
         return F.silu(norm(x), inplace=True)
     else:
         return F.silu(norm(x, cond), inplace=True)
+
+
+def norm_silu_conv(x, norm, conv, cond=None):
+    if (
+        cond is None
+        and isinstance(norm, TemporalIsolatedGroupNorm)
+        and x.is_cuda
+        and torch.version.hip is None
+        and not torch.is_grad_enabled()
+        and x.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        and min(x.shape[-2:]) > 1
+        and conv.causal
+        and conv.padding == (1, 1, 1)
+        and conv.kernel_size == (3, 3, 3)
+        and conv.pad_mode == "reflect"
+        and conv.pad_mode_t == "constant"
+    ):
+        return conv(norm(x, silu_pad=True), pre_padded=True)
+    return conv(norm_silu(x, norm, cond))
 
 
 class Downsample3D(nn.Module):
@@ -128,15 +148,8 @@ class ResnetBlock3D(nn.Module):
             )
 
     def forward(self, x, zq=None):
-        h = x
-
-        h = norm_silu(h, self.norm1, zq)
-
-        h = self.conv1(h)
-
-        h = norm_silu(h, self.norm2, zq)
-
-        h = self.conv2(h)
+        h = norm_silu_conv(x, self.norm1, self.conv1, zq)
+        h = norm_silu_conv(h, self.norm2, self.conv2, zq)
 
         if self.in_channels != self.out_channels:
             x = self.nin_shortcut(x)

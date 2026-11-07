@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -253,33 +252,12 @@ class SchedulerInternalStateController:
         )
 
     def _has_active_sampling_mask_request(self) -> bool:
-        """Whether any unfinished request holding a sampling mask is queued or
-        running, including PP micro-batches and PD decode queues."""
-        scheduler = self.scheduler
-        batches = [scheduler.running_batch, scheduler.last_batch]
-        batches.extend(getattr(scheduler, "running_mbs", ()))
-        batches.extend(getattr(scheduler, "mbs", ()))
-        batches.extend(getattr(scheduler, "last_mbs", ()))
-        queued = [
-            *(req for batch in batches if batch is not None for req in batch.reqs),
-            *scheduler.waiting_queue,
-            *scheduler.grammar_manager.grammar_queue,
-        ]
-        if scheduler.chunked_req is not None:
-            queued.append(scheduler.chunked_req)
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            prealloc_queue = scheduler.disagg_decode_prealloc_queue
-            queued.extend(
-                decode_req.req
-                for decode_req in (
-                    *prealloc_queue.queue,
-                    *prealloc_queue.pending_reqs,
-                    *scheduler.disagg_decode_transfer_queue.queue,
-                )
-            )
-            queued.extend(prealloc_queue.retracted_queue)
-            queued.extend(prealloc_queue.held_rebootstrap_reqs)
-        return any(req.return_sampling_mask and not req.finished() for req in queued)
+        """Whether any unfinished live request holds a sampling mask."""
+        return any(
+            req.return_sampling_mask and not req.finished()
+            for reqs in self.scheduler.request_lists().values()
+            for req in reqs
+        )
 
 
 class _UpdateHandler:

@@ -1,5 +1,7 @@
 """MXFP8 epilogues stay bitwise identical to FlashInfer's standalone quantizer."""
 
+import os
+import subprocess
 import sys
 
 import flashinfer
@@ -27,7 +29,8 @@ STREAMS = 4
 
 # 9-128 pins the single-tile scale-swizzle bound hc_combine_norm_mxfp8 was
 # widened to; 128 is the last row the swizzle addresses without a block offset.
-@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 96, 127, 128])
+# 8/9 and 48/49 straddle the changes of the row's grid split.
+@pytest.mark.parametrize("m", [1, 2, 5, 6, 8, 9, 17, 33, 48, 49, 96, 127, 128])
 @pytest.mark.parametrize("scale", [1e-3, 1.0, 1e3])
 @pytest.mark.parametrize("backend", ["cuda", "cute-dsl"])
 def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: str):
@@ -62,6 +65,44 @@ def test_bitwise_identical_to_norm_then_quantize(m: int, scale: float, backend: 
     assert torch.equal(sf, sf_ref.reshape(-1))
 
 
+_PADDING_REPLAY = """
+import torch
+from sglang.kernels.ops.layernorm import hc_combine_norm as mod
+
+alloc = mod._alloc
+
+
+def poisoned_alloc(m, k, device):
+    q, s = alloc(m, k, device)
+    return q, s.fill_(0xFF)
+
+
+mod._alloc = poisoned_alloc
+for m in (1, 49, 127):
+    g = torch.Generator().manual_seed(m)
+    x = torch.randn((m, 4 * 5120), dtype=torch.bfloat16, generator=g)
+    pre = torch.randn((m, 4), dtype=torch.bfloat16, generator=g)
+    w = torch.randn((5120,), dtype=torch.bfloat16, generator=g)
+    for parts in (1, 2, 4):
+        mod._parts_for = lambda m, k, p=parts: p
+        sf = mod.hc_combine_norm_mxfp8(x, pre, w, 1e-6)[2]
+        # A live scale byte is never 0xFF and, for these inputs, never 0.
+        assert not (sf == 0xFF).any(), f"m={m} parts={parts}: scale bytes unwritten"
+        live = int(sf.count_nonzero())
+        assert live == m * 160, f"m={m} parts={parts}: {m * 160 - live} live bytes zeroed"
+"""
+
+
+def test_combine_norm_mxfp8_padding_disjoint_from_live_rows():
+    replay = subprocess.run(
+        [sys.executable, "-c", _PADDING_REPLAY],
+        env={**os.environ, "TRITON_INTERPRET": "1"},
+        capture_output=True,
+        text=True,
+    )
+    assert replay.returncode == 0, replay.stderr[-3000:]
+
+
 def check(x, w, got):
     y, q, sf = got
     expected = flashinfer.norm.rmsnorm(x, w, 1e-6)
@@ -94,6 +135,40 @@ def test_dynamic_graph(m, stride):
         w.copy_(torch.randn_like(w))
         graph.replay()
         check(x, w, got)
+
+
+def _inputs(m, stride, kind):
+    x = torch.randn((m, stride), device="cuda", dtype=torch.float32)
+    if kind == "row_scaled":
+        x *= torch.exp(3 * torch.randn((m, 1), device="cuda"))
+    elif kind == "tiny":
+        x *= 1e-30
+    elif kind == "huge":
+        x *= 3e38
+    elif kind == "ties":
+        x = torch.round(x * 8) / 8
+    elif kind == "signed_zeros":
+        x[: m // 2] = 0
+        x[m // 2 :, ::3] = -0.0
+    return x.to(torch.bfloat16)[:, :1280]
+
+
+@pytest.mark.parametrize("m", [1024, 4095, 4096, 16385])
+@pytest.mark.parametrize("stride", [1280, 1792])
+@pytest.mark.parametrize(
+    "kind", ["normal", "row_scaled", "tiny", "huge", "ties", "signed_zeros"]
+)
+def test_k1280_matches_8warp_tl_sum(m, stride, kind, monkeypatch):
+    from sglang.kernels.ops.layernorm import rmsnorm_mxfp8 as module
+
+    torch.manual_seed(m)
+    x = _inputs(m, stride, kind)
+    w = (torch.randn(1280, device="cuda") * 0.1 + 1).to(torch.bfloat16)
+    got = rmsnorm_mxfp8(x, w, 1e-6)
+    # the kernel as it ran before: tl.sum order, 8 warps
+    monkeypatch.setattr(module, "_num_warps", lambda m, block: 8)
+    for a, b in zip(got, rmsnorm_mxfp8(x, w, 1e-6)):
+        assert torch.equal(a.view(torch.uint8), b.view(torch.uint8))
 
 
 if __name__ == "__main__":

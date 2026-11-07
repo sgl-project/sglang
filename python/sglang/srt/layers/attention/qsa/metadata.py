@@ -127,6 +127,21 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
             raise ValueError("QSA top-k transform requires row_starts and row_ends")
         return qsa_fast_topk(logits, row_starts, row_ends, topk=self.block_topk)
 
+    def prefill_max_row_keys(self, host_sequence_lengths=None) -> Optional[int]:
+        """Longest request's compressed-block count, from host lengths: the width
+        of request-relative prefill logits. Uses the prefill length tuple when set,
+        else ``host_sequence_lengths`` (the scheduler's ``seq_lens_cpu``; padding
+        entries only raise the bound). None when neither exists: reading the
+        device lengths would sync the host."""
+        lengths = self.prefill_sequence_lengths_cpu
+        if lengths is None:
+            lengths = host_sequence_lengths
+        if lengths is None or len(lengths) == 0:
+            return None
+        if isinstance(lengths, torch.Tensor):
+            return int(lengths.max()) // self.compress_ratio
+        return max(int(length) for length in lengths) // self.compress_ratio
+
     def get_prefill_mqa_inputs(
         self,
         layer_id: int,
