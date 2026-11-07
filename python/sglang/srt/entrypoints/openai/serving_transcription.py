@@ -83,7 +83,8 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
     def _validate_request(self, request: TranscriptionRequest) -> Optional[str]:
         """Validate transcription request."""
-        # Validation is done in the route handler for form data
+        if request.task == "translate" and not self._adapter.supports_translation:
+            return "Speech translation is only supported by Whisper models."
         return None
 
     def _convert_to_internal_request(
@@ -137,6 +138,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         stream: bool,
         raw_request: Request,
         timestamp_granularities: Optional[List[str]] = None,
+        task: str = "transcribe",
     ) -> Union[
         TranscriptionResponse,
         TranscriptionVerboseResponse,
@@ -145,6 +147,14 @@ class OpenAIServingTranscription(OpenAIServingBase):
         ORJSONResponse,
     ]:
         """Main entry point for transcription requests."""
+        if task not in ("transcribe", "translate"):
+            return self.create_error_response(
+                "Task must be 'transcribe' or 'translate'."
+            )
+        if task == "translate" and not self._adapter.supports_translation:
+            return self.create_error_response(
+                "Speech translation is only supported by Whisper models."
+            )
         # Calculate audio duration for usage reporting. Run in a thread:
         # the fallback path decodes the full file and would block the
         # event loop on long inputs.
@@ -224,6 +234,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             audio_data=audio_data,
             model=model,
             language=language,
+            task=task,
             response_format=response_format,
             temperature=temperature,
             timestamp_granularities=timestamp_granularities,
@@ -308,6 +319,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
             text,
             ts_variant=getattr(request, "_fused_ts_variant", False),
             strip=strip,
+            task=request.task,
         )
         if visible is None:
             logger.warning(
@@ -329,7 +341,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
         """Clone the adapted request for one audio chunk.
 
         ``sampling_params`` must be a fresh dict per chunk: the multimodal
-        processor pops transcription-level keys (language,
+        processor pops transcription-level keys (language, task,
         timestamp_granularities, the fused-autodetect flag) out of it while
         building each chunk's decoder prompt.
         """
@@ -517,7 +529,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
 
                 if fused_mode:
                     lang, visible = self._adapter.parse_fused_output(
-                        cumulative_text, ts_variant=ts_variant
+                        cumulative_text, ts_variant=ts_variant, task=request.task
                     )
                     if visible is None:
                         # Prefix not yet locatable. Keep buffering until the
@@ -664,6 +676,7 @@ class OpenAIServingTranscription(OpenAIServingBase):
                             cumulative_text,
                             ts_variant=ts_variant,
                             strip=strip_chunk,
+                            task=request.task,
                         )
                         if visible is None:
                             if not chunk_finish_reason:
