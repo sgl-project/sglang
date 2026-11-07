@@ -643,7 +643,13 @@ def fused_recurrent_kda_packed_decode(
     # (reduction order); small batches keep triton (launch-bound anyway).
     # Safe-gate layers stay on triton: at GLM-5.3-Flash's 8-32 heads per rank it
     # is faster than the row-streaming kernel at every batch on H200 and B200.
-    if use_qk_l2norm_in_kernel and lower_bound is None:
+    # On SM90 and SM10x the layers without the safe gate stay on triton too: it
+    # is faster there as well, on H20 and B300 at 2-32 heads per rank
+    # (Kimi-Linear's 32 heads at TP1-TP8) and batch 8-512.
+    keep_triton = is_cuda() and (
+        torch.cuda.get_device_capability(initial_state.device)[0] in (9, 10)
+    )
+    if use_qk_l2norm_in_kernel and lower_bound is None and not keep_triton:
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(

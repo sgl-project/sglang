@@ -714,7 +714,8 @@ class TestKDAPackedDecode(unittest.TestCase):
     @unittest.skipIf(torch.version.hip, "Safe-gate packed decode is CUDA-only")
     def test_safe_gate_packed_decode_stays_on_triton(self):
         """Safe-gate layers take packed decode on CUDA, on the triton kernel: the
-        row-streaming kernel is slower at their 8-32 heads per rank."""
+        row-streaming kernel is slower at their 8-32 heads per rank. On SM90 and
+        SM10x the layers without the safe gate stay on triton too."""
         from sglang.kernels.ops.attention import kda_packed_decode as row_kernel
         from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
         from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
@@ -728,9 +729,13 @@ class TestKDAPackedDecode(unittest.TestCase):
         inputs[5] = inputs[5].float()
         with patch.object(row_kernel, "kda_packed_decode", side_effect=AssertionError):
             self._run_packed(*inputs, 8, 128, 128, lower_bound=-5.0)
-            # Without the safe gate the same inputs reach the row kernel.
-            with self.assertRaises(AssertionError):
+            if torch.cuda.get_device_capability()[0] in (9, 10):
+                # SM90 and SM10x keep triton without the safe gate as well.
                 self._run_packed(*inputs, 8, 128, 128)
+            else:
+                # Elsewhere the same inputs reach the row kernel.
+                with self.assertRaises(AssertionError):
+                    self._run_packed(*inputs, 8, 128, 128)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
