@@ -11,7 +11,10 @@ from sglang.srt.runtime_context import (
     get_model,
     get_spec,
 )
-from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+from sglang.srt.speculative.dflash_utils import (
+    get_dflash_attention_sliding_window_size,
+    parse_dflash_draft_config,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
@@ -31,21 +34,53 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_uses_compressed_kv_attention() -> bool:
-    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+def _draft_hf_config() -> Optional[Any]:
     from sglang.srt.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
     if not draft_model_path:
-        return False
-    draft_hf_config = get_config(
+        return None
+    return get_config(
         draft_model_path,
         trust_remote_code=get_model().trust_remote_code,
         revision=get_spec().speculative_draft_model_revision,
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
     )
+
+
+def draft_uses_compressed_kv_attention() -> bool:
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
+
+    draft_hf_config = _draft_hf_config()
     return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
+
+
+def _translated_draft_hf_config() -> Optional[Any]:
+    # Mirrors the MiniMax DSpark rewrite ModelConfig applies to the draft.
+    draft_hf_config = _draft_hf_config()
+    architectures = _cfg_get(draft_hf_config, "architectures") or [None]
+    if architectures[0] == "DSparkMiniMaxDraftModel":
+        from sglang.srt.configs.minimax_vl import configure_minimax_m3_dspark
+
+        draft_hf_config = configure_minimax_m3_dspark(draft_hf_config)
+    return draft_hf_config
+
+
+def draft_is_mla() -> bool:
+    draft_hf_config = _translated_draft_hf_config()
+    return (
+        draft_hf_config is not None
+        and parse_dspark_draft_config(draft_hf_config=draft_hf_config).is_mla
+    )
+
+
+def draft_has_sliding_window() -> bool:
+    draft_hf_config = _translated_draft_hf_config()
+    return (
+        draft_hf_config is not None
+        and get_dflash_attention_sliding_window_size(draft_hf_config) is not None
+    )
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
