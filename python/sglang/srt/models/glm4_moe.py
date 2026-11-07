@@ -36,6 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -59,6 +60,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -71,9 +73,12 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import precompile_sm107_splitk_tactics
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -86,7 +91,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
@@ -95,9 +99,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -1284,6 +1286,17 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The GLM target Gluon kernels consume the rank-local appended shared
+        # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
+        # models whose kernels have not implemented that ABI.
+        return hf_config.n_shared_experts or 0
+
+    def precompile_kernels_after_loading(self) -> None:
+        if precompile_sm107_splitk_tactics():
+            logger.info("Precompiled SM107 BF16 split-K GEMM tactics for GLM-5")
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     # ModelConfig rewrites a GLM draft's architecture to this class's own name,
@@ -1296,6 +1309,15 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
+        # model-level loader decision as well as the layer-level decision so
+        # the checkpoint remap cannot append it to the routed expert bank.
+        if get_moe_runner_backend().is_gluon():
+            return 0
+        return super().num_fusable_shared_experts(hf_config)
 
     @classmethod
     def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):

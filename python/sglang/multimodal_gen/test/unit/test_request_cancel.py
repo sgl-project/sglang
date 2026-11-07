@@ -31,8 +31,10 @@ from sglang.multimodal_gen.runtime.managers import scheduler as scheduler_module
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.request_cancel import (
     CancelListener,
-    RequestCancelledError,
     raise_if_cancelled,
+)
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.pipelines_core.executors import (

@@ -126,8 +126,6 @@ export const config = {
     const env = [
       "HSA_NO_SCRATCH_RECLAIM=0",
       "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
-      "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-      "SGLANG_OPT_USE_AITER_BATCHED_GEMM=1",
       "AITER_BF16_FP8_MOE_BOUND=0",
       "TORCH_BLAS_PREFER_HIPBLASLT=1",
       ...(dp ? [
@@ -151,7 +149,6 @@ export const config = {
         ]),
       ] : []),
       ...(dp && prefill ? [
-        "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
         "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
         "MORI_SHMEM_HEAP_SIZE=8G",
       ] : []),
@@ -232,7 +229,7 @@ export const config = {
   // Reproduce commands for the Benchmark card's "⚡ Reproduce" modal.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -471,10 +468,8 @@ sgl-eval run mmmu_pro \\
           //
           // Two implementations sit behind one option. On Blackwell it is the
           // DeepGEMM MegaMoE, tuned through the Quantization knob below. On
-          // MI355X it is Aiter MegaMoEv2 (sgl-project/sglang#35619), and the
-          // a2a backend alone only selects the hook: without
-          // SGLANG_AMD_USE_FLYDSL_MEGA_MOE the call falls through to the
-          // DeepGEMM path, which has no ROCm kernel. MTPR has to cover the
+          // MI355X it is Aiter MegaMoEv2 (sgl-project/sglang#35619), which the
+          // a2a backend selects on ROCm. MTPR has to cover the
           // per-rank prefill chunk (--chunked-prefill-size / dp_size, i.e.
           // 65536 / 8 on the DP8 recipes); tokens past it silently fall back to
           // fused MoE. MegaMoEv2 also addresses its dispatch/combine buffers
@@ -490,14 +485,12 @@ sgl-eval run mmmu_pro \\
                           label: "MORI MegaMoE" }],
             flags: ["--moe-a2a-backend megamoe"],
             requiresHw: ["b200", "b300", "gb200", "gb300", "mi355x"],
-            env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
-                  "SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
+            env: ["SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=8192",
                   "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
                   "MORI_SHMEM_HEAP_SIZE=8G"],
             envOverrides: [
               { when: { hw: ["mi355x"], variant: ["pro", "pro-official"], quant: ["fp4"] },
-                env: ["SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
-                      "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4", "MORI_SHMEM_HEAP_SIZE=8G"] },
+                env: ["SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4", "MORI_SHMEM_HEAP_SIZE=8G"] },
             ],
             envWhen: { hw: ["mi355x"] } },
           { id: "flashinfer_mxfp4",  label: "FlashInfer (MXFP4)",
@@ -847,7 +840,6 @@ sgl-eval run mmmu_pro \\
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           env: ["SGLANG_DSV4_UNIFIED_KV_FP8=1",
-                "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1",
                 // Default MTPR 8192 covers the per-rank chunk: 65536 / 8.
                 "SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4",
                 // Static heap mode is the default. The 8 GiB size overrides
@@ -2134,7 +2126,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2153,7 +2145,7 @@ sgl-eval run mmmu_pro \\
       // DSpark is incompatible with DP attention -> target-only.
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2171,7 +2163,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2421,7 +2413,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2444,7 +2436,7 @@ sgl-eval run mmmu_pro \\
       // DSpark + DP Attention is documented in cookbook §3.7, not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2471,7 +2463,7 @@ sgl-eval run mmmu_pro \\
       // above (§3.8), not this cell.
       match: { hw: "mi355x", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0", "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true", "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1", "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1"],
+      env: ["SGLANG_USE_ROCM700A=0", "TORCH_BLAS_PREFER_HIPBLASLT=1", "SGLANG_SHARED_EXPERT_TP1=1", "SGLANG_DP_SHARED_EXPERT_LOCAL=1", "SGLANG_DP_USE_GATHERV=1", "SGLANG_DP_USE_REDUCE_SCATTER=1", "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton", "AITER_BF16_FP8_MOE_BOUND=0"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -3070,7 +3062,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3100,7 +3091,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3133,7 +3123,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_GATHERV=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3167,9 +3156,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3194,9 +3180,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3229,9 +3212,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3266,9 +3246,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3307,9 +3284,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3344,9 +3318,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3383,9 +3354,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3418,9 +3386,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3459,9 +3424,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3498,9 +3460,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3534,9 +3493,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3575,9 +3531,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3614,9 +3567,6 @@ sgl-eval run mmmu_pro \\
         "TORCH_BLAS_PREFER_HIPBLASLT=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3649,9 +3599,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3690,9 +3637,6 @@ sgl-eval run mmmu_pro \\
         "SGLANG_DP_USE_REDUCE_SCATTER=1",
         "SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton",
         "AITER_BF16_FP8_MOE_BOUND=0",
-        "SGLANG_OPT_USE_AITER_BATCHED_GEMM=true",
-        "SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1",
-        "SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -3745,16 +3689,14 @@ sgl-eval run mmmu_pro \\
     //   Verified on the v2 image with the cookbook Reproduce commands:
     //   sgl-eval gsm8k 97.5% (200 q), sgl-eval mmmu_pro 85% / 0% errors
     //   (20-q subset, --reasoning-effort max, temp 1.0, top-p 0.95).
-    // Env: b12x attention + FP8 wo_a opt-in + MHC post/pre fusion are the GB10
-    // tuning knobs; SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
+    // Env: FP8 wo_a opt-in + MHC post/pre fusion are the GB10 tuning knobs;
+    // SGLANG_B12X_MAX_TOKENS must track --chunked-prefill-size;
     // expandable_segments avoids unified-memory fragmentation OOMs.
     {
       match: { hw: "dgx-spark", variant: "flash-official", quant: "fp4", strategy: "balanced", nodes: "multi-2" },
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build (2x GB10, TP=2 over ConnectX-7) — do not use it on other hardware. Use Docker mode: the bare Python command needs the b12x kernel package this image ships. See [DGX Spark notes](#spark-note).",
       env: [
-        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
-        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
@@ -3783,8 +3725,6 @@ sgl-eval run mmmu_pro \\
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. NVFP4 on DGX Spark needs the three extra MoE flags shown (cutlass runner for the NVFP4 experts, b12x for the DSpark draft's MXFP4 MTP experts, shared-experts fusion off). See [DGX Spark notes](#spark-note).",
       env: [
-        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
-        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
@@ -3814,8 +3754,6 @@ sgl-eval run mmmu_pro \\
       verified: true,
       warn: "The Docker image lmsysorg/sglang:dev-v4f-2dgx-v2 is a DGX Spark-only preview build — do not use it on other hardware, and use Docker mode. Images go in as OpenAI image_url content on /v1/chat/completions (see Vision below); text-only requests work unchanged. See [DGX Spark notes](#spark-note).",
       env: [
-        "SGLANG_SM120_FLASHMLA_BACKEND=b12x",
-        "B12X_MLA_SM120_DSV4_H16_NATIVE=1",
         "SGLANG_OPT_FUSE_MHC_POST_PRE=1",
         "SGLANG_OPT_FP8_WO_A_GEMM=1",
         "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK=1",
@@ -4128,7 +4066,6 @@ sgl-eval run mmmu_pro \\
       verificationStatus: "in-progress",
       env: [
         "SGLANG_RAGGED_VERIFY_MODE=static",
-        "SGLANG_DSPARK_FAST_KERNEL=0",
         "SGLANG_DSV4_FP4_EXPERTS=False",
       ],
       flags: [
