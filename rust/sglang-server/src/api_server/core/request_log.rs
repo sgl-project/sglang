@@ -1,8 +1,11 @@
-//! Python `TokenizerManager`'s request log (`--log-requests`, text format to
-//! stdout) and crash-dump recording (`--crash-dump-folder`), taken at the same
-//! request boundaries: `Receive` before any preprocessing, `Finish` on the
-//! terminal output (scheduler aborts included), and, for a dump, the finished
-//! requests of the last five minutes plus every unfinished one.
+//! Python `TokenizerManager`'s request log (`--log-requests`, in its text or
+//! JSON format, to stdout and/or hourly-rotated files) and crash-dump
+//! recording (`--crash-dump-folder`), taken at the same request boundaries:
+//! `Receive` before any preprocessing, `Finish` on the terminal output
+//! (scheduler aborts included), and, for a dump, the finished requests of the
+//! last five minutes plus every unfinished one. From level 2 an OpenAI
+//! request also gets its own line as received, before it is adapted
+//! (Python's `serving_base`).
 //!
 //! A request is described in Python's `GenerateReqInput` terms: a native
 //! `/generate` body as the client sent it, with the values Python's
@@ -11,19 +14,27 @@
 //! The lines are rendered with Python's rules (`request_logger.py`) from the
 //! settings Python hands over ([`RequestLogConfig`]). Strings print as
 //! Python's `repr` does, except that non-ASCII characters print as they are
-//! (Python escapes the rare non-printable ones).
+//! (Python escapes the rare non-printable ones). An OpenAI request's line is
+//! its model's `model_dump(exclude_none=True)` at the top level (declared
+//! fields in order, defaults filled in, the validators that set
+//! `routed_dp_rank` and the chat `tool_choice`); nested objects print as the
+//! client sent them.
 //!
 //! The crash dump itself is written by Python (`RustServer
 //! .dump_requests_before_crash`), from [`RequestLog::crash_dump_snapshot`].
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
 use std::io::Write as _;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
+use serde::ser::{SerializeMap, SerializeSeq}; // codespell:ignore ser
+use serde_json::ser::Formatter; // codespell:ignore ser
 use serde_json::{Map, Value};
 
 use super::frame::CoreOutput;
@@ -101,17 +112,29 @@ impl ReceivedAs {
     }
 }
 
+/// Which OpenAI request model a body is logged as.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum OpenAiRequest {
+    ChatCompletion,
+    Completion,
+}
+
 impl RequestLog {
-    /// `None` when neither `--log-requests` nor `--crash-dump-folder` is set.
-    pub(crate) fn from_server_args(args: &ServerArgs) -> Option<Arc<Self>> {
+    /// `None` when neither `--log-requests` nor `--crash-dump-folder` is set;
+    /// an error when a log file cannot be opened.
+    pub(crate) fn from_server_args(args: &ServerArgs) -> Result<Option<Arc<Self>>, String> {
         if args.request_log.is_none() && !args.crash_dump {
-            return None;
+            return Ok(None);
         }
-        Some(Arc::new(Self {
-            logger: args
-                .request_log
-                .clone()
-                .map(|config| RequestLogger::new(config, LogSink::Stdout)),
+        let logger = match args.request_log.clone() {
+            Some(config) => {
+                let targets = Arc::new(Targets::open(&config)?);
+                Some(RequestLogger::new(config, LogSink::Targets(targets))?)
+            }
+            None => None,
+        };
+        Ok(Some(Arc::new(Self {
+            logger,
             recorder: args
                 .crash_dump
                 .then(|| CrashRecorder::omitting(args.server_added_custom_params.clone())),
@@ -119,7 +142,7 @@ impl RequestLog {
             default_priority: args.default_priority_value,
             weight_version: args.weight_version.as_deref().map(Arc::from),
             incremental_streaming_output: args.incremental_streaming_output,
-        }))
+        })))
     }
 
     /// Lines kept in memory instead of printed.
@@ -137,8 +160,9 @@ impl RequestLog {
     ) -> Arc<Self> {
         let omitted: Vec<String> = omitted.iter().map(|key| key.to_string()).collect();
         Arc::new(Self {
-            logger: config
-                .map(|config| RequestLogger::new(config, LogSink::Memory(Mutex::default()))),
+            logger: config.map(|config| {
+                RequestLogger::new(config, LogSink::Memory(Mutex::default())).expect("valid config")
+            }),
             recorder: crash_dump.then(|| CrashRecorder::omitting(omitted.clone())),
             server_added_custom_params: omitted,
             default_priority: None,
@@ -151,7 +175,7 @@ impl RequestLog {
     pub(crate) fn logged_lines(&self) -> Vec<String> {
         match &self.logger.as_ref().expect("logging").sink {
             LogSink::Memory(lines) => std::mem::take(&mut *lock(lines)),
-            LogSink::Stdout => unreachable!("tests log to memory"),
+            LogSink::Targets(_) => unreachable!("tests log to memory"),
         }
     }
 
@@ -215,6 +239,34 @@ impl RequestLog {
                 })
                 .collect(),
         )
+    }
+
+    /// Whether OpenAI requests get their own line (from level 2).
+    pub(crate) fn logs_openai_requests(&self) -> bool {
+        self.logger
+            .as_ref()
+            .is_some_and(|logger| logger.config.openai_requests)
+    }
+
+    /// Log an OpenAI request's `body` as received (Python
+    /// `log_openai_received_request`), when [`Self::logs_openai_requests`].
+    /// A body that is not a JSON object is not logged.
+    pub(crate) fn openai_received(
+        &self,
+        request: OpenAiRequest,
+        body: &[u8],
+        headers: &http::HeaderMap,
+    ) {
+        let Some(logger) = self
+            .logger
+            .as_ref()
+            .filter(|logger| logger.config.openai_requests)
+        else {
+            return;
+        };
+        if let Ok(body) = serde_json::from_slice::<Map<String, Value>>(body) {
+            logger.openai_received(request, body, &self.logged_headers(headers));
+        }
     }
 
     /// Log `Receive` for `requests` (one line for a whole batch) and start one
@@ -703,20 +755,54 @@ struct RequestLogger {
     out_skip_names: HashSet<String>,
     batch_item_fields: HashSet<String>,
     batch_shared_fields: HashSet<String>,
+    /// The JSON format's `config.fields` defaults, parsed (empty for text).
+    json_defaults: Vec<Value>,
+    /// The OpenAI request models' fields with their defaults (`Null` for
+    /// none).
+    chat_completion_fields: Vec<(String, Value)>,
+    completion_fields: Vec<(String, Value)>,
     sink: LogSink,
 }
 
 impl RequestLogger {
-    fn new(config: RequestLogConfig, sink: LogSink) -> Self {
+    fn new(config: RequestLogConfig, sink: LogSink) -> Result<Self, String> {
         let set = |names: &[String]| names.iter().cloned().collect();
-        Self {
+        let parse = |name: &str, json: &str| {
+            serde_json::from_str(json)
+                .map_err(|e| format!("request log: field {name} has an invalid default: {e}"))
+        };
+        let model_fields = |fields: &[(String, Option<String>)]| {
+            fields
+                .iter()
+                .map(|(name, default)| {
+                    let default = match default {
+                        Some(json) => parse(name, json)?,
+                        None => Value::Null,
+                    };
+                    Ok((name.clone(), default))
+                })
+                .collect::<Result<Vec<_>, String>>()
+        };
+        let json_defaults = if config.json {
+            config
+                .fields
+                .iter()
+                .map(|(name, json)| parse(name, json))
+                .collect::<Result<_, _>>()?
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
             skip_names: set(&config.skip_names),
             out_skip_names: set(&config.out_skip_names),
             batch_item_fields: set(&config.batch_item_fields),
             batch_shared_fields: set(&config.batch_shared_fields),
+            json_defaults,
+            chat_completion_fields: model_fields(&config.chat_completion_fields)?,
+            completion_fields: model_fields(&config.completion_fields)?,
             config,
             sink,
-        }
+        })
     }
 
     /// Item `i`'s own fields of a batch body, as Python's `obj[i]` takes
@@ -755,7 +841,12 @@ impl RequestLogger {
     }
 
     fn received(&self, obj: &PyObj, headers: &[(String, String)]) {
-        self.sink.emit(&self.received_line(obj, headers));
+        let line = if self.config.json {
+            self.json_line("request.received", obj, headers, None)
+        } else {
+            self.received_line(obj, headers)
+        };
+        self.sink.emit(&line);
     }
 
     fn finished(
@@ -769,7 +860,104 @@ impl RequestLogger {
         if exceeded_ms > 0 && e2e_latency * 1000.0 < exceeded_ms as f64 {
             return;
         }
-        self.sink.emit(&self.finished_line(obj, headers, out));
+        let line = if self.config.json {
+            self.json_line("request.finished", obj, headers, Some(out))
+        } else {
+            self.finished_line(obj, headers, out)
+        };
+        self.sink.emit(&line);
+    }
+
+    /// Python `log_openai_received_request`'s message.
+    fn openai_received(
+        &self,
+        request: OpenAiRequest,
+        body: Map<String, Value>,
+        headers: &[(String, String)],
+    ) {
+        let obj = self.openai_dump(request, body);
+        let max_length = self.config.max_length;
+        let line = if self.config.json {
+            let obj = JsonObject::transformed(obj.iter(), max_length);
+            JsonLine::new("request.received.openai", obj, headers).render()
+        } else {
+            let mut line = String::from("Receive OpenAI: obj=");
+            write_dict(&mut line, obj.iter(), max_length, false);
+            write_headers(&mut line, headers);
+            line
+        };
+        self.sink.emit(&line);
+    }
+
+    /// The request model's `model_dump(exclude_none=True)` of `body`: its
+    /// fields in declaration order, the client's value or the default, the
+    /// `None`s and undeclared keys left out; after the `mode="before"`
+    /// validators that set top-level fields.
+    fn openai_dump(
+        &self,
+        request: OpenAiRequest,
+        mut body: Map<String, Value>,
+    ) -> Map<String, Value> {
+        let is_null = |value: Option<&Value>| value.is_none_or(Value::is_null);
+        // `_migrate_deprecated_dp_rank`.
+        if !is_null(body.get("data_parallel_rank")) && is_null(body.get("routed_dp_rank")) {
+            let rank = body["data_parallel_rank"].clone();
+            body.insert("routed_dp_rank".into(), rank);
+        }
+        let fields = match request {
+            OpenAiRequest::ChatCompletion => {
+                // `set_tool_choice_default`.
+                if is_null(body.get("tool_choice")) {
+                    let tools = !is_null(body.get("tools"))
+                        || has_message_level_tools(body.get("messages"));
+                    let choice = if tools { "auto" } else { "none" };
+                    body.insert("tool_choice".into(), choice.into());
+                }
+                &self.chat_completion_fields
+            }
+            OpenAiRequest::Completion => &self.completion_fields,
+        };
+        fields
+            .iter()
+            .filter_map(|(name, default)| {
+                let value = body.remove(name).unwrap_or_else(|| default.clone());
+                (!value.is_null()).then(|| (name.clone(), value))
+            })
+            .collect()
+    }
+
+    /// Python `log_json`'s object for a request line: the request object
+    /// (each field's value or the class default), its headers and, for
+    /// `Finish`, the output.
+    fn json_line(
+        &self,
+        event: &str,
+        obj: &PyObj,
+        headers: &[(String, String)],
+        out: Option<&Map<String, Value>>,
+    ) -> String {
+        let max_length = self.config.max_length;
+        let fields = self
+            .config
+            .fields
+            .iter()
+            .zip(&self.json_defaults)
+            .filter(|((name, _), _)| !self.skip_names.contains(name))
+            .map(|((name, _), default)| match obj.get(name) {
+                Some(value) => (name.as_str(), value, false),
+                None => (name.as_str(), default, true),
+            })
+            .collect();
+        let obj_fields = JsonObject { fields, max_length };
+        let mut line = JsonLine::new(event, obj_fields, headers);
+        line.rid = Some(obj.get("rid").unwrap_or(&Value::Null));
+        line.out = out.map(|out| {
+            let kept = out
+                .iter()
+                .filter(|(name, _)| !self.out_skip_names.contains(name.as_str()));
+            JsonObject::transformed(kept, max_length)
+        });
+        line.render()
     }
 
     /// Python `log_received_request`'s message.
@@ -843,13 +1031,207 @@ fn write_headers(line: &mut String, headers: &[(String, String)]) {
     line.push('}');
 }
 
-/// Where the lines go: stdout through the process's request-log writer (see
-/// [`StdoutWriter`]), each line prefixed with the local time as Python's
-/// request-log formatter does.
+/// Python `datetime.isoformat()`: microseconds unless they are zero.
+fn iso_timestamp(at: chrono::DateTime<chrono::Local>) -> String {
+    if at.timestamp_subsec_micros() == 0 {
+        at.format("%Y-%m-%dT%H:%M:%S").to_string()
+    } else {
+        at.format("%Y-%m-%dT%H:%M:%S%.6f").to_string()
+    }
+}
+
+/// Python `ChatCompletionRequest.set_tool_choice_default`'s `has_message_level_tools` check.
+fn has_message_level_tools(messages: Option<&Value>) -> bool {
+    let Some(Value::Array(messages)) = messages else {
+        return false;
+    };
+    messages.iter().any(|message| {
+        let role = message.get("role").and_then(Value::as_str);
+        role.is_some_and(|role| {
+            matches!(
+                role.to_lowercase().as_str(),
+                "root" | "system" | "developer"
+            )
+        }) && message.get("tools").is_some_and(is_truthy)
+    })
+}
+
+/// Python truthiness of a JSON value.
+fn is_truthy(value: &Value) -> bool {
+    match value {
+        Value::Null => false,
+        Value::Bool(b) => *b,
+        Value::Number(n) => n.as_f64().is_some_and(|f| f != 0.0),
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+    }
+}
+
+/// Where the lines go: the process's request-log writer (see [`Writer`]),
+/// each line prefixed with the local time as Python's request-log formatter
+/// does.
 enum LogSink {
-    Stdout,
+    Targets(Arc<Targets>),
     #[cfg(test)]
     Memory(Mutex<Vec<String>>),
+}
+
+/// `--log-requests-target`: stdout, and the files Python names for the
+/// target directories, opened at startup as Python's handlers are.
+struct Targets {
+    stdout: bool,
+    paths: Vec<String>,
+    /// The files at `paths`; only the writer thread writes them.
+    files: Mutex<Vec<RotatingFile>>,
+}
+
+impl Targets {
+    fn open(config: &RequestLogConfig) -> Result<Self, String> {
+        let files = config
+            .files
+            .iter()
+            .map(|path| RotatingFile::open(PathBuf::from(path), SystemTime::now()))
+            .collect::<Result<_, _>>()?;
+        Ok(Self {
+            stdout: config.stdout,
+            paths: config.files.clone(),
+            files: Mutex::new(files),
+        })
+    }
+
+    /// Whether `other` writes to the same places.
+    fn same_as(&self, other: &Self) -> bool {
+        self.stdout == other.stdout && self.paths == other.paths
+    }
+}
+
+/// The writer thread's output: each line to every target. A target that
+/// fails does not keep the line from the others; a file's first failure is
+/// reported.
+struct TargetsWriter(Arc<Targets>);
+
+impl std::io::Write for TargetsWriter {
+    fn write(&mut self, line: &[u8]) -> std::io::Result<usize> {
+        if self.0.stdout {
+            let _ = std::io::stdout().write_all(line);
+        }
+        let now = SystemTime::now();
+        for file in lock(&self.0.files).iter_mut() {
+            if let Err(error) = file.write_line(line, now)
+                && !std::mem::replace(&mut file.failed, true)
+            {
+                let path = file.path.display();
+                tracing::warn!(%path, %error, "request log file write failed; not reported again");
+            }
+        }
+        Ok(line.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.0.stdout {
+            std::io::stdout().flush()?;
+        }
+        Ok(())
+    }
+}
+
+/// How often `TimedRotatingFileHandler(when="H")` rolls a file over.
+const ROTATE_INTERVAL: Duration = Duration::from_secs(3600);
+
+/// A log file in append mode that `TimedRotatingFileHandler(when="H",
+/// backupCount=0)` rolls over: an hour after the existing file was last
+/// modified (or after it was created), then an hour after each rollover (not
+/// on the hour), renaming it `<name>.%Y-%m-%d_%H` after the hour it started
+/// and keeping every old one.
+struct RotatingFile {
+    path: PathBuf,
+    /// Closed by a rollover; the next line opens the file again, so a failed
+    /// reopen is retried rather than losing the file for good.
+    file: Option<File>,
+    rollover_at: SystemTime,
+    /// A write failed (and was reported).
+    failed: bool,
+}
+
+impl RotatingFile {
+    fn open(path: PathBuf, now: SystemTime) -> Result<Self, String> {
+        let modified = std::fs::metadata(&path)
+            .and_then(|m| m.modified())
+            .unwrap_or(now);
+        let modified = whole_seconds(modified);
+        let file = open_append(&path)
+            .map_err(|e| format!("cannot open request log file {}: {e}", path.display()))?;
+        Ok(Self {
+            path,
+            file: Some(file),
+            rollover_at: modified + ROTATE_INTERVAL,
+            failed: false,
+        })
+    }
+
+    fn write_line(&mut self, line: &[u8], now: SystemTime) -> std::io::Result<()> {
+        let now = whole_seconds(now);
+        if now >= self.rollover_at {
+            self.roll_over(now, local_offset)?;
+        }
+        let file = match &mut self.file {
+            Some(file) => file,
+            None => self.file.insert(open_append(&self.path)?),
+        };
+        file.write_all(line)
+    }
+
+    /// Python's `doRollover`: the file is renamed after the local hour its
+    /// interval started, shifted by an hour across a DST change (toward the
+    /// offset now, whatever size the change) as Python shifts it. A file
+    /// already gone is not
+    /// renamed (Python's `rotate`). Python takes a name that already exists as
+    /// already rolled over and leaves the file be; so does this, instead of
+    /// replacing that file, and tries again an hour later (Python never
+    /// does). `offset_at` is the local UTC offset at a time.
+    fn roll_over(
+        &mut self,
+        now: SystemTime,
+        offset_at: impl Fn(SystemTime) -> chrono::FixedOffset,
+    ) -> std::io::Result<()> {
+        let started = self.rollover_at - ROTATE_INTERVAL;
+        let change = offset_at(now).local_minus_utc() - offset_at(started).local_minus_utc();
+        let named = chrono::DateTime::<chrono::Utc>::from(started)
+            + chrono::TimeDelta::hours(i64::from(change.signum()));
+        let named = named.with_timezone(&offset_at(named.into()));
+        let mut rotated = self.path.clone().into_os_string();
+        rotated.push(named.format(".%Y-%m-%d_%H").to_string());
+        if !std::path::Path::new(&rotated).exists() {
+            // Closed first, as Python closes it.
+            self.file = None;
+            match std::fs::rename(&self.path, &rotated) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+                _ => {}
+            }
+        }
+        self.rollover_at = now + ROTATE_INTERVAL;
+        Ok(())
+    }
+}
+
+/// `at` in whole seconds, as Python's handler reads the clock and the file
+/// time (`int(...)`).
+fn whole_seconds(at: SystemTime) -> SystemTime {
+    let seconds = at
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    UNIX_EPOCH + Duration::from_secs(seconds)
+}
+
+/// The local UTC offset at `at`.
+fn local_offset(at: SystemTime) -> chrono::FixedOffset {
+    use chrono::Offset as _;
+    chrono::DateTime::<chrono::Local>::from(at).offset().fix()
+}
+
+fn open_append(path: &std::path::Path) -> std::io::Result<File> {
+    OpenOptions::new().create(true).append(true).open(path)
 }
 
 /// One background writer for the process, so lines from every listener keep
@@ -857,8 +1239,10 @@ enum LogSink {
 /// request thread as Python's synchronous logging would, rather than
 /// buffering without bound. The first line starts it; a server's shutdown
 /// stops it (see [`flush_request_log`]) and the next line starts it again.
-struct StdoutWriter {
+struct Writer {
     writer: tracing_appender::non_blocking::NonBlocking,
+    /// The targets it writes to.
+    targets: Arc<Targets>,
     /// Dropped to stop the writer, which writes out what is still buffered.
     _guard: tracing_appender::non_blocking::WorkerGuard,
 }
@@ -867,17 +1251,18 @@ struct StdoutWriter {
 /// blocks on Python's synchronous logging handler.
 const BUFFERED_LINES: usize = 1024;
 
-static STDOUT: Mutex<Option<StdoutWriter>> = Mutex::new(None);
+static WRITER: Mutex<Option<Writer>> = Mutex::new(None);
 
-impl StdoutWriter {
-    fn new() -> Self {
+impl Writer {
+    fn new(targets: Arc<Targets>) -> Self {
         let (writer, guard) = tracing_appender::non_blocking::NonBlockingBuilder::default()
             .lossy(false)
             .buffered_lines_limit(BUFFERED_LINES)
             .thread_name("request-log")
-            .finish(std::io::stdout());
+            .finish(TargetsWriter(targets.clone()));
         Self {
             writer,
+            targets,
             _guard: guard,
         }
     }
@@ -888,17 +1273,25 @@ impl StdoutWriter {
 /// starts a new writer.
 pub(crate) fn flush_request_log() {
     // Held while the old writer drains, so no line can overtake its lines.
-    drop(lock(&STDOUT).take());
+    drop(lock(&WRITER).take());
 }
 
 impl LogSink {
     fn emit(&self, message: &str) {
         match self {
-            Self::Stdout => {
+            Self::Targets(targets) => {
                 let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S");
                 let line = format!("[{now}] {message}\n");
-                let mut stdout = lock(&STDOUT);
-                let writer = &mut stdout.get_or_insert_with(StdoutWriter::new).writer;
+                let mut writer = lock(&WRITER);
+                // A server started in the same process after another one's
+                // shutdown may write elsewhere.
+                if !writer
+                    .as_ref()
+                    .is_some_and(|writer| writer.targets.same_as(targets))
+                {
+                    *writer = Some(Writer::new(targets.clone()));
+                }
+                let writer = &mut writer.as_mut().expect("set above").writer;
                 let _ = writer.write_all(line.as_bytes());
             }
             #[cfg(test)]
@@ -1110,6 +1503,234 @@ fn write_float(out: &mut String, f: f64) {
         out.push_str(&digits[..point as usize]);
         out.push('.');
         out.push_str(&digits[point as usize..]);
+    }
+}
+
+// --- Python's JSON format (`_transform_data_for_logging`, `log_json`) -------
+
+/// One field or dict entry as `_transform_data_for_logging` returns it,
+/// serialized without building it: `"<redacted>"` for a watermark secret (as
+/// [`write_field`] redacts), else the [`Transformed`] value.
+struct TransformedField<'a> {
+    name: &'a str,
+    value: &'a Value,
+    max_length: usize,
+    in_watermark: bool,
+}
+
+impl serde::Serialize for TransformedField<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if is_watermark_secret(self.name, self.in_watermark) {
+            return serializer.serialize_str("<redacted>");
+        }
+        let in_watermark = self.in_watermark || self.name == "watermark";
+        Transformed::new(self.value, self.max_length, in_watermark).serialize(serializer)
+    }
+}
+
+/// A value as `_transform_data_for_logging` returns it, serialized without
+/// building it: a string or list longer than `max_length` keeps its two
+/// halves around `"..."`, at every depth.
+struct Transformed<'a> {
+    value: &'a Value,
+    max_length: usize,
+    in_watermark: bool,
+}
+
+impl<'a> Transformed<'a> {
+    fn new(value: &'a Value, max_length: usize, in_watermark: bool) -> Self {
+        Self {
+            value,
+            max_length,
+            in_watermark,
+        }
+    }
+}
+
+impl serde::Serialize for Transformed<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let max_length = self.max_length;
+        match self.value {
+            Value::String(s) => {
+                let len = s.chars().count();
+                if len <= max_length {
+                    return serializer.serialize_str(s);
+                }
+                let (head, tail) = halves(len, max_length);
+                let mut cut: String = s.chars().take(head).collect();
+                cut.push_str("...");
+                cut.extend(s.chars().skip(tail));
+                serializer.serialize_str(&cut)
+            }
+            Value::Array(items) => {
+                let item = |item| Transformed::new(item, max_length, self.in_watermark);
+                let mut seq = serializer.serialize_seq(None)?;
+                if items.len() > max_length {
+                    let (head, tail) = halves(items.len(), max_length);
+                    for value in &items[..head] {
+                        seq.serialize_element(&item(value))?;
+                    }
+                    seq.serialize_element("...")?;
+                    for value in &items[tail..] {
+                        seq.serialize_element(&item(value))?;
+                    }
+                } else {
+                    for value in items {
+                        seq.serialize_element(&item(value))?;
+                    }
+                }
+                seq.end()
+            }
+            Value::Object(map) => {
+                let mut entries = serializer.serialize_map(Some(map.len()))?;
+                for (name, value) in map {
+                    entries.serialize_entry(
+                        name,
+                        &TransformedField {
+                            name,
+                            value,
+                            max_length,
+                            in_watermark: self.in_watermark,
+                        },
+                    )?;
+                }
+                entries.end()
+            }
+            scalar => scalar.serialize(serializer),
+        }
+    }
+}
+
+/// A JSON-format line: `log_json`'s `timestamp` and `event`, then the
+/// logger's fields in its order.
+#[derive(serde::Serialize)]
+struct JsonLine<'a> {
+    timestamp: String,
+    event: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rid: Option<&'a Value>,
+    obj: JsonObject<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    headers: Option<JsonHeaders<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    out: Option<JsonObject<'a>>,
+}
+
+impl<'a> JsonLine<'a> {
+    fn new(event: &'a str, obj: JsonObject<'a>, headers: &'a [(String, String)]) -> Self {
+        Self {
+            timestamp: iso_timestamp(chrono::Local::now()),
+            event,
+            rid: None,
+            obj,
+            headers: (!headers.is_empty()).then_some(JsonHeaders(headers)),
+            out: None,
+        }
+    }
+
+    /// `json.dumps(line, ensure_ascii=False)`.
+    fn render(&self) -> String {
+        let mut out = Vec::new();
+        let mut serializer = serde_json::Serializer::with_formatter(&mut out, PythonJsonFormatter);
+        serde::Serialize::serialize(self, &mut serializer).expect("a log line serializes");
+        String::from_utf8(out).expect("serde_json writes UTF-8")
+    }
+}
+
+/// The whitelisted headers as a JSON object.
+struct JsonHeaders<'a>(&'a [(String, String)]);
+
+impl serde::Serialize for JsonHeaders<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_map(self.0.iter().map(|(name, value)| (name, value)))
+    }
+}
+
+/// A dict or dataclass as `_transform_data_for_logging` returns it: each
+/// field's value transformed, or (`verbatim`) already Python's.
+struct JsonObject<'a> {
+    fields: Vec<(&'a str, &'a Value, bool)>,
+    max_length: usize,
+}
+
+impl<'a> JsonObject<'a> {
+    fn transformed(
+        entries: impl Iterator<Item = (&'a String, &'a Value)>,
+        max_length: usize,
+    ) -> Self {
+        Self {
+            fields: entries
+                .map(|(name, value)| (name.as_str(), value, false))
+                .collect(),
+            max_length,
+        }
+    }
+}
+
+impl serde::Serialize for JsonObject<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(self.fields.len()))?;
+        for &(name, value, verbatim) in &self.fields {
+            if verbatim {
+                map.serialize_entry(name, value)?;
+            } else {
+                let field = TransformedField {
+                    name,
+                    value,
+                    max_length: self.max_length,
+                    in_watermark: false,
+                };
+                map.serialize_entry(name, &field)?;
+            }
+        }
+        map.end()
+    }
+}
+
+/// `json.dumps`' default separators (`", "`, `": "`) and float spelling
+/// (`repr`). Its string escapes are serde_json's.
+struct PythonJsonFormatter;
+
+impl Formatter for PythonJsonFormatter {
+    fn begin_array_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_key<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        first: bool,
+    ) -> std::io::Result<()> {
+        if first {
+            Ok(())
+        } else {
+            writer.write_all(b", ")
+        }
+    }
+
+    fn begin_object_value<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+    ) -> std::io::Result<()> {
+        writer.write_all(b": ")
+    }
+
+    fn write_f64<W: ?Sized + std::io::Write>(
+        &mut self,
+        writer: &mut W,
+        value: f64,
+    ) -> std::io::Result<()> {
+        let mut out = String::new();
+        write_float(&mut out, value);
+        writer.write_all(out.as_bytes())
     }
 }
 

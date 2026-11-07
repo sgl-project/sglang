@@ -24,7 +24,7 @@ use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::{CoreError, ReceivedAs};
+use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
@@ -165,6 +165,10 @@ pub(super) async fn chat(
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
     let (mut generate, mut responder) = lower(state, body.clone(), routing_key, sglext_ids).await?;
+    // Python logs the request once it validates, before adapting it.
+    state
+        .core
+        .log_openai_request(OpenAiRequest::ChatCompletion, body, headers);
 
     let stream = generate["stream"] == true;
     if let Err(error) = copy_prompt_per_choice(&mut generate) {

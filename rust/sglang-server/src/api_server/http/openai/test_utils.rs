@@ -530,7 +530,8 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
 }
 
 /// The OpenAI routes log their requests with the whitelisted headers of the
-/// HTTP request, as Python's tokenizer manager does.
+/// HTTP request, as Python's tokenizer manager does, and from level 2 the
+/// OpenAI request first, as Python's `serving_base` does.
 #[tokio::test]
 async fn openai_request_lines_carry_whitelisted_headers() {
     let log = crate::api_server::core::RequestLog::for_test(
@@ -538,12 +539,18 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             max_length: 1 << 30,
             skip_names: vec!["text".into()],
             out_skip_names: vec!["text".into(), "output_ids".into()],
+            json: false,
             class_name: "GenerateReqInput".into(),
             fields: vec![("rid".into(), "None".into())],
             batch_item_fields: Vec::new(),
             batch_shared_fields: Vec::new(),
             headers: vec!["x-smg-routing-key".into()],
             exceeded_ms: -1,
+            openai_requests: true,
+            chat_completion_fields: vec![("model".into(), None)],
+            completion_fields: vec![("model".into(), None)],
+            stdout: true,
+            files: Vec::new(),
         }),
         false,
     );
@@ -566,13 +573,17 @@ async fn openai_request_lines_carry_whitelisted_headers() {
         let response = oneshot(app.clone(), req).await;
         assert_eq!(response.status(), StatusCode::OK, "{path}");
         let lines = log.logged_lines();
-        assert_eq!(lines.len(), 2, "{path}: {lines:?}");
+        assert_eq!(lines.len(), 3, "{path}: {lines:?}");
         assert!(
-            lines[0].starts_with("Receive: obj=GenerateReqInput(rid="),
+            lines[0].starts_with("Receive OpenAI: obj={'model': 'model'}"),
             "{path}"
         );
         assert!(
-            lines[1].starts_with("Finish: obj=GenerateReqInput(rid="),
+            lines[1].starts_with("Receive: obj=GenerateReqInput(rid="),
+            "{path}"
+        );
+        assert!(
+            lines[2].starts_with("Finish: obj=GenerateReqInput(rid="),
             "{path}"
         );
         for line in &lines {
@@ -582,4 +593,72 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             );
         }
     }
+
+    // As in Python, a request its model and `_validate_request` accept is
+    // logged even when a later check refuses it; one they refuse is not.
+    for (path, body, logged) in [
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "temperature": -1.0}),
+            true,
+        ),
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": ["", ""]}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "tool_choice": "required"}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": [{"role": "user", "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+            ]}]}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": [{"role": "user", "content": [
+                {"type": "input_audio", "input_audio": {"data": "QUJD", "format": "wav"}},
+            ]}]}),
+            false,
+        ),
+        // Media only as Python finds it, in message content parts: not a tool
+        // parameter named `file`, which this server refuses after logging.
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": [
+                {"role": "system", "content": "", "tools": [{"type": "function", "function": {
+                    "name": "f",
+                    "parameters": {"type": "object", "properties": {"file": {"type": "string"}}},
+                }}]},
+                {"role": "user", "content": "hi"},
+            ], "tool_choice": "none"}),
+            true,
+        ),
+    ] {
+        let response = post_json(app.clone(), path, body.clone()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let lines = log.logged_lines();
+        assert_eq!(lines.len(), usize::from(logged), "{body}: {lines:?}");
+    }
+
+    // A body that is not JSON is refused before it is read, as `Json` does.
+    let unreadable = futures::stream::once(async {
+        Err::<axum::body::Bytes, _>(std::io::Error::other("reset"))
+    });
+    let req = Request::builder()
+        .method("POST")
+        .uri("/v1/completions")
+        .body(Body::from_stream(unreadable))
+        .unwrap();
+    let response = body_json(oneshot(app.clone(), req).await).await;
+    let message = response["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("Content-Type: application/json"),
+        "{message}"
+    );
 }
