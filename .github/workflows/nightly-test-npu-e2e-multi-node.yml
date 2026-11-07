@@ -203,7 +203,7 @@ jobs:
           if [ "$container_patches" != "" ]; then
             # The value is appended to a string that is later eval'ed, so it
             # must be strictly validated here instead of only inside the pods.
-            if ! echo "${container_patches}" | grep -Eq '^[a-z0-9_]+(,[a-z0-9_]+)*$'; then
+            if ! echo "${container_patches}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*(,[a-z0-9_]+(\.[a-z0-9_]+)*)*$'; then
               echo "Invalid container_patches: ${container_patches}"
               exit 1
             fi

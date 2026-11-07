@@ -10,7 +10,9 @@ set -euo pipefail
 #
 # Notes:
 #   * The set name comes from a workflow input, so only names matching
-#     ^[a-z0-9_]+$ that resolve to a file in the patch directory are executed.
+#     ^[a-z0-9_]+(\.[a-z0-9_]+)*$ (dots allowed for version suffixes, e.g.
+#     mooncake_memfabric_1.3.1) that resolve to a file in the patch directory
+#     are executed.
 #   * Patch resources are cached in the pod-local filesystem (PATCH_CACHE_DIR,
 #     /tmp by default) instead of the shared disk, so the four pods never race
 #     on the same file. Each pod downloads once and reuses it for re-runs.
@@ -37,7 +39,7 @@ while IFS= read -r set_name; do
         continue
     fi
 
-    if ! echo "${set_name}" | grep -Eq '^[a-z0-9_]+$'; then
+    if ! echo "${set_name}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*$'; then
         echo "Invalid container patch set name: ${set_name}" >&2
         exit 1
     fi
