@@ -1423,9 +1423,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
 
         return attn_backend.resolve_prefill_shared_read_ends(
-            forward_batch,
-            num_qo_tokens=shape_key.size,
-            build_snapshot=build_snapshot,
+            forward_batch, build_snapshot=build_snapshot
         )
 
     @staticmethod

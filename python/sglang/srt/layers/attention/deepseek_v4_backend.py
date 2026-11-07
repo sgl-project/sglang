@@ -3050,7 +3050,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
         # first layer. CP shards the query layout that this global snapshot
@@ -3064,10 +3064,11 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
-        if metadata.real_num_tokens is not None:
-            # The runner passes the padded row count; attention queries only the
-            # rows the metadata covers.
-            num_qo_tokens = metadata.real_num_tokens
+        num_qo_tokens = (
+            metadata.real_num_tokens
+            if metadata.real_num_tokens is not None
+            else forward_batch.positions.shape[0]
+        )
         if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
