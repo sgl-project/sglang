@@ -2242,6 +2242,20 @@ class ModelConfig:
                 "quant_method", "" if not self.quantization else self.quantization
             ).lower()
 
+            # Hybrid FP8+NVFP4 checkpoints already ship packed NVFP4 experts and
+            # load through the checkpoint's fp8 path; modelopt_fp4 here would
+            # requantize them online from the "fp8" quant_method.
+            if (
+                self.nvfp4_moe_meta is not None
+                and self.quantization == "modelopt_fp4"
+                and quant_method == "fp8"
+            ):
+                logger.info(
+                    "Hybrid FP8+NVFP4 checkpoint: loading serialized NVFP4 MoE "
+                    "experts through quant_method=fp8 for --quantization modelopt_fp4."
+                )
+                self.quantization = None
+
             # ModelOpt FP4 and mixed checkpoints can quantize only the target
             # model; an embedded MTP draft may stay unquantized, so an explicit
             # nvfp4_online opt-in for the draft wins over checkpoint detection.
