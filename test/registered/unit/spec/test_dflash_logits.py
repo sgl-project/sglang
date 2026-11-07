@@ -360,6 +360,7 @@ def test_selector_accept_uses_greedy_fallback_without_staged_sample(monkeypatch)
         ),
         _tp_sync=SimpleNamespace(sync=lambda site, tensor: sync_sites.append(site)),
         _use_triton_accept_bonus=False,
+        _verify_argmax=lambda logits: torch.argmax(logits, dim=-1),
         block_size=2,
     )
 
