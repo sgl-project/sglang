@@ -23,6 +23,7 @@ for mod in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
     "sglang.srt.speculative",
@@ -66,6 +67,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendMultiStepDraftBackend,
     _apply_hadamard,
     _build_cycle_state_block_table,
+    _fill_verify_positions_cmp_padding_one_fused,
     _get_kv_indices,
     _sparse_attn_kv_quant_kwargs,
     _sparse_attn_ops,
@@ -85,6 +87,7 @@ class TestVerifyCompressPositions(unittest.TestCase):
     def _backend():
         backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
         backend._dsv4_compress_ratios = (4, 128)
+        backend.device = torch.device("cpu")
         return backend
 
     def _assert_device_path_matches_cpu_reference(
@@ -125,8 +128,7 @@ class TestVerifyCompressPositions(unittest.TestCase):
         self.assertEqual(actual.tolist(), expected.tolist())
 
     def test_uses_group_start_rope_position(self):
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend._dsv4_compress_ratios = (4, 128)
+        backend = self._backend()
 
         # Two linear three-token verify trees.  Their completed C4 groups end
         # at token positions 7 and 11, whose compressed RoPE positions are the
@@ -146,8 +148,7 @@ class TestVerifyCompressPositions(unittest.TestCase):
         self.assertEqual(dst.tolist(), [4, 8, 0, 0])
 
     def test_c128_uses_group_start_rope_position(self):
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend._dsv4_compress_ratios = (4, 128)
+        backend = self._backend()
         dst = torch.full((2,), -1, dtype=torch.int64)
 
         backend._fill_verify_positions_cmp_padding_one(
@@ -161,8 +162,7 @@ class TestVerifyCompressPositions(unittest.TestCase):
         self.assertEqual(dst.tolist(), [0, 0])
 
     def test_no_completed_group_clears_destination(self):
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend._dsv4_compress_ratios = (4, 128)
+        backend = self._backend()
         dst = torch.full((2,), -1, dtype=torch.int64)
 
         backend._fill_verify_positions_cmp_padding_one(
@@ -176,8 +176,7 @@ class TestVerifyCompressPositions(unittest.TestCase):
         self.assertEqual(dst.tolist(), [0, 0])
 
     def test_zero_length_graph_padding_does_not_emit_a_position(self):
-        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-        backend._dsv4_compress_ratios = (4, 128)
+        backend = self._backend()
         dst = torch.full((2,), -1, dtype=torch.int64)
 
         backend._fill_verify_positions_cmp_padding_one(
@@ -277,6 +276,78 @@ class TestVerifyCompressPositions(unittest.TestCase):
                 expected = torch.zeros_like(dst)
                 expected[: selected.numel()].copy_(selected)
                 self.assertEqual(dst.tolist(), expected.tolist())
+
+    def test_fused_dispatch_falls_back_on_cpu_without_touching_dst(self):
+        positions = torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.int64)
+        live_seq_lens = torch.tensor([7, 10], dtype=torch.int32)
+        dst = torch.full((4,), -1, dtype=torch.int64)
+
+        ran = _fill_verify_positions_cmp_padding_one_fused(
+            positions, live_seq_lens, dst, ratio=4, n_draft=3
+        )
+
+        self.assertFalse(ran)
+        # The dispatcher must leave the buffer to the aten fallback path.
+        self.assertEqual(dst.tolist(), [-1, -1, -1, -1])
+
+    def test_device_variant_skips_aten_chain_when_fused_path_runs(self):
+        backend = self._backend()
+        positions = torch.tensor([7, 8, 9, 10, 11, 12], dtype=torch.int64)
+        live_seq_lens = torch.tensor([7, 10], dtype=torch.int32)
+        dst = torch.full((4,), -1, dtype=torch.int64)
+
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend"
+            "._fill_verify_positions_cmp_padding_one_fused",
+            return_value=True,
+        ) as mock_fused:
+            backend._fill_verify_positions_cmp_padding_one_device(
+                positions, dst, ratio=4, live_seq_lens=live_seq_lens, n_draft=3
+            )
+
+        mock_fused.assert_called_once()
+        # The aten chain (which would zero-fill dst) must not have run.
+        self.assertEqual(dst.tolist(), [-1, -1, -1, -1])
+
+
+class TestH2DPinnedAsync(unittest.TestCase):
+    @staticmethod
+    def _backend():
+        backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        return backend
+
+    def test_casts_dtype_and_preserves_values(self):
+        out = self._backend()._h2d_pinned_async(
+            torch.tensor([5, 0, 131071, 42], dtype=torch.int64), torch.int32
+        )
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.tolist(), [5, 0, 131071, 42])
+
+    def test_preserves_int64_for_gather_indices(self):
+        values = [2**33, 7, 0]
+        out = self._backend()._h2d_pinned_async(
+            torch.tensor(values, dtype=torch.int64), torch.int64
+        )
+        self.assertEqual(out.dtype, torch.int64)
+        self.assertEqual(out.tolist(), values)
+
+    def test_preserves_input_shape_across_dtypes(self):
+        out = self._backend()._h2d_pinned_async(
+            torch.tensor([[1, 2], [3, 4]], dtype=torch.int64), torch.int32
+        )
+        self.assertEqual(out.shape, (2, 2))
+        self.assertEqual(out.dtype, torch.int32)
+        self.assertEqual(out.tolist(), [[1, 2], [3, 4]])
+
+    def test_upload_is_non_blocking(self):
+        backend = self._backend()
+        with patch.object(torch.Tensor, "to") as mock_to:
+            mock_to.return_value = torch.zeros(3, dtype=torch.int32)
+            backend._h2d_pinned_async(
+                torch.tensor([7, 8, 9], dtype=torch.int64), torch.int32
+            )
+        mock_to.assert_called_once_with(torch.device("cpu"), non_blocking=True)
 
 
 class TestMultiStepDraftCompressedLocs(unittest.TestCase):
