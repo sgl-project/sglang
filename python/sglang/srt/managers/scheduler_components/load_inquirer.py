@@ -5,7 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Callable
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
     LoadSnapshot,
@@ -14,6 +14,7 @@ from sglang.srt.managers.load_snapshot import (
     QueueMetrics,
     SpeculativeMetrics,
 )
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.runtime_context import get_lora, get_parallel
 
 if TYPE_CHECKING:
@@ -22,6 +23,7 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
     from sglang.srt.server_args import ServerArgs
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
@@ -45,15 +47,16 @@ class SchedulerLoadInquirer:
     get_recent_cache_hit_rate: Callable
     get_stats: Callable
     get_chunked_req: Callable
-    get_disagg_prefill_bootstrap_queue: Callable
-    get_disagg_prefill_inflight_queue: Callable
+    get_request_lists: Callable
     get_disagg_decode_prealloc_queue: Callable
-    get_disagg_decode_transfer_queue: Callable
     get_spec_total_num_accept_tokens: Callable
     get_spec_total_num_forward_ct: Callable
     get_total_prefill_uncached_tokens: Callable
     get_total_prefill_busy_us: Callable
     get_decode_moment_totals: Callable
+    get_waiting_storage_span: (
+        Callable[[CacheRequestHandle], tuple[int, int] | None] | None
+    ) = None
 
     def _get_num_pending_tokens(self, chunk_deduct: int = 0) -> int:
         """Get the total number of tokens pending prefill.
@@ -84,9 +87,19 @@ class SchedulerLoadInquirer:
         num_tokens = 0
         for req in self.get_waiting_queue():
             if waiting_queue_prefix_matched:
-                num_tokens += max(0, req.seqlen - req.num_matched_prefix_tokens)
+                matched = req.num_matched_prefix_tokens
+                uncached = max(0, req.seqlen - matched)
+                if self.get_waiting_storage_span is not None:
+                    span = self.get_waiting_storage_span(req.cache_request_handle)
+                    if span is not None:
+                        storage_tokens = max(
+                            0, min(span[1], req.seqlen) - max(span[0], matched)
+                        )
+                        uncached -= storage_tokens
             else:
-                num_tokens += int(req.seqlen * cache_miss_rate)
+                # The historical hit rate already includes admitted storage hits.
+                uncached = int(req.seqlen * cache_miss_rate)
+            num_tokens += uncached
         cr = self.get_chunked_req()
         if cr is not None:
             num_tokens += max(0, cr.seqlen - cr.prefix_len)
@@ -97,19 +110,18 @@ class SchedulerLoadInquirer:
         stats = self.get_stats()
         num_running_reqs = len(self.get_running_batch().reqs)
 
+        lists = self.get_request_lists()
         waiting_queues = [self.get_waiting_queue()]
         pending_token_queues = [self.get_waiting_queue()]
         awaiting_kv_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            prefill_bootstrap_queue = self.get_disagg_prefill_bootstrap_queue().queue
+            prefill_bootstrap_queue = lists[ListKind.PD_BOOTSTRAP]
             waiting_queues.append(prefill_bootstrap_queue)
             pending_token_queues.append(prefill_bootstrap_queue)
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
-            decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
-            decode_retracted_queue = (
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+            decode_prealloc_queue = lists[ListKind.PD_PREALLOC]
+            decode_transfer_queue = lists[ListKind.PD_RECEIVING]
+            decode_retracted_queue = lists[ListKind.PD_RETRACTED]
             waiting_queues.append(decode_prealloc_queue)
             waiting_queues.append(decode_transfer_queue)
             waiting_queues.append(decode_retracted_queue)
@@ -174,18 +186,16 @@ class SchedulerLoadInquirer:
         num_prealloc_ready_tokens = 0
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             mode_str = "prefill"
-            prefill_bootstrap = len(self.get_disagg_prefill_bootstrap_queue().queue)
-            prefill_inflight = len(self.get_disagg_prefill_inflight_queue())
+            prefill_bootstrap = len(lists[ListKind.PD_BOOTSTRAP])
+            prefill_inflight = len(lists[ListKind.PD_SENDING])
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             mode_str = "decode"
-            decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
-            decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
-            decode_retracted = len(
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+            decode_prealloc = len(lists[ListKind.PD_PREALLOC])
+            decode_transfer = len(lists[ListKind.PD_RECEIVING])
+            decode_retracted = len(lists[ListKind.PD_RETRACTED])
             ready_reqs = [
                 decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue
+                for decode_req in self.get_disagg_decode_prealloc_queue().queue.items()
                 if decode_req.waiting_for_input
             ]
             decode_prealloc_ready = len(ready_reqs)

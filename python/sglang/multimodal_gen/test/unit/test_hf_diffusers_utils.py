@@ -483,3 +483,80 @@ def test_modelscope_selected_partition_cache_hit_requires_a_file(monkeypatch, tm
         )
 
     assert result == str(tmp_path)
+
+
+def test_unreachable_hub_falls_back_to_cached_model_index(monkeypatch, tmp_path):
+    """An unreachable Hub must fall back to the cached model_index.json."""
+    cached = tmp_path / "model_index.json"
+    cached.write_text("{}")
+
+    def offline(**kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr(
+        "huggingface_hub.try_to_load_from_cache",
+        lambda repo_id, filename: (
+            str(cached) if filename == "model_index.json" else None
+        ),
+    )
+
+    assert hf_diffusers_utils._resolve_remote_repo_model_index_path("org/model") == str(
+        cached
+    )
+
+
+@pytest.mark.parametrize("cached_single_model", [True, False])
+def test_unreachable_hub_model_index(
+    monkeypatch, tmp_path, recording_snapshot_download, cached_single_model
+):
+    """Offline, a cached single model loads; a cache miss is reported, not a -Diffusers hint."""
+
+    def offline(*args, **kwargs):
+        raise LocalEntryNotFoundError("offline")
+
+    monkeypatch.setattr(
+        hf_diffusers_utils, "maybe_load_overlay_model_index", lambda *a, **k: None
+    )
+    monkeypatch.setattr(hf_diffusers_utils, "hf_hub_download", offline)
+    monkeypatch.setattr("huggingface_hub.try_to_load_from_cache", lambda **k: None)
+
+    if cached_single_model:
+        (tmp_path / "config.json").write_text(json.dumps({"architectures": ["M"]}))
+        calls = recording_snapshot_download(tmp_path)
+        config = hf_diffusers_utils.maybe_download_model_index("org/model")
+        assert config == {"architectures": ["M"]}
+        assert calls == ["probe"]
+    else:
+        monkeypatch.setattr(hf_diffusers_utils, "snapshot_download", offline)
+        with pytest.raises(ValueError, match="not found in local cache"):
+            hf_diffusers_utils.maybe_download_model_index("org/model")
+
+
+def test_component_config_ignores_scheduler_in_parent_directory(tmp_path):
+    """Only the component dir name, not a parent dir, selects scheduler_config.json."""
+    component = tmp_path / "scheduler_ablation" / "unet"
+    component.mkdir(parents=True)
+    (component / "config.json").write_text(json.dumps({"_class_name": "UNet"}))
+
+    config = hf_diffusers_utils.get_diffusers_component_config(str(component))
+
+    assert config["_class_name"] == "UNet"
+
+
+def test_modelopt_config_patch_does_not_write_through_cache_symlink(tmp_path):
+    """Normalizing config.json must not modify the shared HF cache blob."""
+    blob = tmp_path / "blob"
+    original = json.dumps(
+        {"quantization_config": {"quant_method": "modelopt", "quant_algo": "FP8"}}
+    )
+    blob.write_text(original)
+    component = tmp_path / "snapshot" / "transformer"
+    component.mkdir(parents=True)
+    (component / "config.json").symlink_to(blob)
+
+    hf_diffusers_utils.prepare_diffusers_component_path_for_loading(str(component))
+
+    patched = json.loads((component / "config.json").read_text())
+    assert patched["quantization_config"]["quant_type"] == "FP8"
+    assert blob.read_text() == original

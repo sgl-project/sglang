@@ -16,7 +16,7 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     concat_cast_kv_fp8_pad,
     gather_cast_kv_fp8_pad_paged,
 )
-from sglang.kernels.ops.kvcache.cache_ops import concat_and_cast_q_fp8_pad
+from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_pad
 from sglang.srt.utils import is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -107,6 +107,8 @@ def _make_backend():
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend._q8kv8_born_q_stash = None
     backend._q8kv8_born_q_buf = None
     backend._q8kv8_qpad_buf = None
