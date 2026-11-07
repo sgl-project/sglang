@@ -3189,21 +3189,25 @@ class MultiHeadCrossAttention(nn.Module):
             is_cross_attention=True,
         )
 
+    def project_kv(self, cond: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, _, D = cond.shape
+        k, v = self.kv_linear(cond).view(B, -1, 2, D).unbind(2)
+        k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim)
+        return k, v.view(B, -1, self.num_heads, self.head_dim)
+
     def forward(
         self,
         x: torch.Tensor,  # (B, N, D)
         cond: torch.Tensor,  # (B, L, D)
         mask: Optional[torch.Tensor] = None,
+        context_kv: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         B, N, D = x.shape
 
         q = self.q_linear(x)
-        kv = self.kv_linear(cond).view(B, -1, 2, D)
-        k, v = kv.unbind(2)
+        k, v = self.project_kv(cond) if context_kv is None else context_kv
         # LocalAttention takes (B, N, H, D).
         q = self.q_norm(q).view(B, N, self.num_heads, self.head_dim)
-        k = self.k_norm(k).view(B, -1, self.num_heads, self.head_dim)
-        v = v.view(B, -1, self.num_heads, self.head_dim)
 
         attn_mask = mask.bool() if mask is not None else None
         out = self.attn(q, k, v, attn_mask=attn_mask)  # (B, N, H, D)

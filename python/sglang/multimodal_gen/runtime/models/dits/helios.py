@@ -706,29 +706,6 @@ class HeliosTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     # projection and every block's cross-attn K/V are computed once per request
     # (keyed by encoder-tensor identity) and reused across steps.
 
-    @staticmethod
-    def _request_cache(forward_batch, name):
-        """Per-request cache dict on ``forward_batch.extra``.
-
-        Returns None (-> caller recomputes, caching disabled) when there is no
-        forward batch or gradients are enabled."""
-        if forward_batch is None or torch.is_grad_enabled():
-            return None
-        extra = getattr(forward_batch, "extra", None)
-        return None if extra is None else extra.setdefault(name, {})
-
-    @staticmethod
-    def _tensor_key(t):
-        """Identity key for ``t``; equal only for the same underlying tensor."""
-        return (
-            t.data_ptr(),
-            tuple(t.shape),
-            tuple(t.stride()),
-            t.dtype,
-            t.device.type,
-            t.device.index,
-        )
-
     def _get_cross_attn_key_values(self, encoder_hidden_states, forward_batch):
         """Per-block cross-attn (key, value) for ``encoder_hidden_states``.
 
