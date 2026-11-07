@@ -296,6 +296,67 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
         boundary = lambda m: (np.bincount(m.edges_unique_inverse) == 1).sum()
         self.assertEqual(boundary(mesh), boundary(half))
 
+    def test_qem_first_unique_face_indices_match_numpy_axis_zero(self):
+        faces = np.array(
+            [[0, 1, 2], [2, 1, 0], [3, 4, 5], [5, 4, 3]],
+            dtype=np.int64,
+        )
+        expected = np.unique(np.sort(faces, axis=1), axis=0, return_index=True)[1]
+        actual = mesh3d_utils._qem_first_unique_face_indices(faces, nv=6)
+        np.testing.assert_array_equal(actual, expected)
+
+        int32_faces = np.array([[0, 10, 100], [1, 10, 100]], dtype=np.int32)
+        expected = np.unique(np.sort(int32_faces, axis=1), axis=0, return_index=True)[1]
+        actual = mesh3d_utils._qem_first_unique_face_indices(int32_faces, nv=65536)
+        np.testing.assert_array_equal(actual, expected)
+
+        overflow_faces = np.array([[2, 5, 7], [8, 9, 10], [7, 2, 5]], dtype=np.int64)
+        expected = np.unique(
+            np.sort(overflow_faces, axis=1), axis=0, return_index=True
+        )[1]
+        actual = mesh3d_utils._qem_first_unique_face_indices(
+            overflow_faces, nv=3_000_000
+        )
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_qem_unique_edge_keys_match_sorted_numpy_edges(self):
+        faces = np.array(
+            [[0, 1, 2], [2, 1, 0], [2, 1, 3], [3, 2, 1], [4, 5, 6]],
+            dtype=np.int64,
+        )
+        nv = 8
+        edges = np.sort(
+            np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]),
+            axis=1,
+        )
+        expected_keys, expected_counts = np.unique(
+            edges[:, 0] * nv + edges[:, 1], return_counts=True
+        )
+        actual_keys, actual_counts = mesh3d_utils._qem_unique_edge_keys(faces, nv)
+        np.testing.assert_array_equal(actual_keys, expected_keys)
+        np.testing.assert_array_equal(actual_counts, expected_counts)
+
+    def test_qem_symmetric_determinant_mask_matches_numpy(self):
+        threshold = 1e-12
+        below = np.nextafter(threshold, 0.0)
+        above = np.nextafter(threshold, np.inf)
+        matrices = np.array(
+            [
+                [[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]],
+                [[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [3.0, 6.0, 9.0]],
+                np.diag([1.0, 1.0, 1e-14]),
+                np.diag([1.0, 1.0, below]),
+                np.diag([1.0, 1.0, threshold]),
+                np.diag([1.0, 1.0, above]),
+                # The determinant is near the threshold after cancellation of ~1 terms.
+                [[1.0, 1.0, 0.0], [1.0, 1.0 + threshold, 0.0], [0.0, 0.0, 1.0]],
+            ],
+            dtype=np.float64,
+        )
+        expected = np.abs(np.linalg.det(matrices)) > threshold
+        actual = mesh3d_utils._qem_symmetric_determinant_mask(matrices)
+        np.testing.assert_array_equal(actual, expected)
+
     def test_vertex_quadrics_match_reference_exactly(self):
         closed = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
         open_boundary = trimesh.Trimesh(

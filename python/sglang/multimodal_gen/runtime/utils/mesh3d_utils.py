@@ -163,6 +163,41 @@ def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
     return q
 
 
+def _qem_unique_edge_keys(f: np.ndarray, nv: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return sorted packed keys and incidence counts for undirected edges."""
+    fa, fb, fc = f.T
+    edge_keys = np.concatenate(
+        [
+            np.minimum(fa, fb) * nv + np.maximum(fa, fb),
+            np.minimum(fb, fc) * nv + np.maximum(fb, fc),
+            np.minimum(fc, fa) * nv + np.maximum(fc, fa),
+        ]
+    )
+    return np.unique(edge_keys, return_counts=True)
+
+
+def _qem_symmetric_determinant_mask(a: np.ndarray) -> np.ndarray:
+    """Check symmetric 3x3 solvability, using NumPy near the threshold."""
+    a00, a01, a02 = a[:, 0, 0], a[:, 0, 1], a[:, 0, 2]
+    a11, a12, a22 = a[:, 1, 1], a[:, 1, 2], a[:, 2, 2]
+    p0, p1 = a11 * a22, a12 * a12
+    p2, p3 = a01 * a22, a12 * a02
+    p4, p5 = a01 * a12, a11 * a02
+    det = a00 * (p0 - p1) - a01 * (p2 - p3) + a02 * (p4 - p5)
+    scale = (
+        np.abs(a00) * (np.abs(p0) + np.abs(p1))
+        + np.abs(a01) * (np.abs(p2) + np.abs(p3))
+        + np.abs(a02) * (np.abs(p4) + np.abs(p5))
+    )
+    # Conservative cancellation margin; defer near-threshold cases to NumPy.
+    margin = 128 * np.finfo(np.float64).eps * scale
+    uncertain = (~np.isfinite(det)) | (np.abs(np.abs(det) - 1e-12) <= margin)
+    solvable = np.abs(det) > 1e-12
+    if uncertain.any():
+        solvable[uncertain] = np.abs(np.linalg.det(a[uncertain])) > 1e-12
+    return solvable
+
+
 def _qem_collapse_targets(
     q: np.ndarray, va: np.ndarray, vb: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -170,7 +205,7 @@ def _qem_collapse_targets(
     mid = (va + vb) / 2
     x = mid.copy()
     a = q[:, :3, :3]
-    solvable = np.abs(np.linalg.det(a)) > 1e-12
+    solvable = _qem_symmetric_determinant_mask(a)
     if solvable.any():
         x[solvable] = np.linalg.solve(a[solvable], -q[solvable, :3, 3:])[:, :, 0]
         # an optimum far from the edge is unstable; use the midpoint instead
@@ -178,6 +213,16 @@ def _qem_collapse_targets(
         x[far] = mid[far]
     xh = np.concatenate([x, np.ones((len(x), 1))], axis=1)
     return x, np.maximum(np.einsum("ni,nij,nj->n", xh, q, xh), 0)
+
+
+def _qem_first_unique_face_indices(f: np.ndarray, nv: int) -> np.ndarray:
+    """Return the first index for each face, ignoring vertex order."""
+    sorted_f = np.sort(f, axis=1)
+    if nv**3 > np.iinfo(np.int64).max:
+        return np.unique(sorted_f, axis=0, return_index=True)[1]
+    sorted_f = sorted_f.astype(np.int64, copy=False)
+    keys = (sorted_f[:, 0] * nv + sorted_f[:, 1]) * nv + sorted_f[:, 2]
+    return np.unique(keys, return_index=True)[1]
 
 
 def _qem_decimate(
@@ -196,8 +241,7 @@ def _qem_decimate(
         if len(f) <= target_faces:
             break
         nv = len(v)
-        e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
-        key, count = np.unique(e[:, 0] * nv + e[:, 1], return_counts=True)
+        key, count = _qem_unique_edge_keys(f, nv)
         e = np.stack([key // nv, key % nv], axis=1)
         on_boundary = np.zeros(nv, dtype=bool)
         on_boundary[e[count == 1].ravel()] = True
@@ -253,7 +297,7 @@ def _qem_decimate(
         if len(idx) == 0 or len(bad):
             break
         # collapses can leave two faces on the same vertices; keep one
-        _, first = np.unique(np.sort(new_f, axis=1), axis=0, return_index=True)
+        first = _qem_first_unique_face_indices(new_f, nv)
         v, f = new_v, new_f[np.sort(first)]
     used = np.unique(f)
     remap = np.full(len(v), -1)
