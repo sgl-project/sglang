@@ -24,13 +24,21 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 class ScoringManager(TokenizerManagerScoreMixin):
     """Replace only model execution; keep request construction and score extraction real."""
 
-    def __init__(self, enable_mis=False, generation=True):
-        self.server_args = ServerArgs(model_path="dummy", enable_mis=enable_mis)
+    def __init__(self, enable_mis=False, generation=True, **server_args):
+        self.server_args = ServerArgs(
+            model_path="dummy", enable_mis=enable_mis, **server_args
+        )
         publish(self.server_args, role="test")
         self.is_generation = generation
         self.tokenizer = SimpleNamespace(vocab_size=8)
         self.logits = torch.tensor([-1000.0, -999.0, -997.0, -996.0, 0, 1, 2, 3])
         self.requests = []
+
+    def label_logprobs(self, labels, position=None):
+        # Setwise anchors get position-dependent rows so grouping and order show.
+        logits = self.logits if position is None else self.logits / (1 + position)
+        values = torch.log_softmax(logits, dim=0)
+        return [(values[token].item(), token, None) for token in labels]
 
     async def generate_request(self, request, raw_request):
         self.requests.append(request)
@@ -41,13 +49,19 @@ class ScoringManager(TokenizerManagerScoreMixin):
             if self.is_generation:
                 assert request.sampling_params[index]["max_new_tokens"] == 0
                 labels = request.token_ids_logprob[index]
-                values = torch.log_softmax(self.logits, dim=0)
-                logprobs = [(values[token].item(), token, None) for token in labels]
-                if self.server_args.enable_mis:
+                pool = request.token_indices_to_pool
+                if pool:
+                    meta["input_token_ids_logprobs"] = [
+                        self.label_logprobs(labels, position)
+                        for position in pool[index]
+                    ]
+                elif self.server_args.enable_mis:
                     count = len(request.multi_item_delimiter_indices[index])
-                    meta["input_token_ids_logprobs"] = [logprobs] * count
+                    meta["input_token_ids_logprobs"] = [
+                        self.label_logprobs(labels)
+                    ] * count
                 else:
-                    meta["output_token_ids_logprobs"] = [logprobs]
+                    meta["output_token_ids_logprobs"] = [self.label_logprobs(labels)]
                 results.append({"meta_info": meta})
             else:
                 embedding = [1.0, 3.0]
@@ -89,6 +103,53 @@ class TestTokenScoring(unittest.IsolatedAsyncioTestCase):
                         torch.log_softmax(manager.logits, dim=0)[labels],
                     )
                 self.assertEqual(body["usage"]["completion_tokens"], 0)
+
+    async def test_http_setwise_token_logprobs_follow_scores(self):
+        # Token 6 marks each candidate. Anchor positions in the sequences built
+        # from query [4]: batched [4,5,6] and [4,6,7,6]; fused [4,D,5,6,D,6,7,6,D].
+        anchors = {False: [[2], [1, 3]], True: [[3], [5, 7]]}
+        for enable_mis in (False, True):
+            with self.subTest(enable_mis=enable_mis):
+                manager = ScoringManager(
+                    enable_mis=enable_mis,
+                    disable_radix_cache=True,
+                    chunked_prefill_size=-1,
+                )
+                manager.tokenizer = SimpleNamespace(
+                    vocab_size=8,
+                    unk_token_id=None,
+                    convert_tokens_to_ids={"<pick>": 6}.get,
+                )
+                request = ScoringRequest(
+                    query=[4],
+                    items=[[5, 6], [6, 7, 6]],
+                    label_token_ids=[[3, 1], [0, 2, 1]],
+                    apply_softmax=True,
+                    temperature=2.0,
+                    return_token_logprobs=True,
+                    score_extraction_token="<pick>",
+                )
+                response = await OpenAIServingScore(
+                    manager
+                )._handle_non_streaming_request(request, request, None)
+                self.assertEqual(response.status_code, 200)
+                body = json.loads(response.body)
+                for labels, positions, scores, logprobs in zip(
+                    request.label_token_ids,
+                    anchors[enable_mis],
+                    body["scores"],
+                    body["token_logprobs"],
+                    strict=True,
+                ):
+                    for position, score_row, logprob_row in zip(
+                        positions, scores, logprobs, strict=True
+                    ):
+                        row = manager.label_logprobs(labels, position)
+                        expected = torch.tensor([lp for lp, _, _ in row])
+                        torch.testing.assert_close(torch.tensor(logprob_row), expected)
+                        torch.testing.assert_close(
+                            torch.tensor(score_row), torch.softmax(expected / 2, dim=0)
+                        )
 
     async def test_default_scores_are_vocabulary_probabilities(self):
         manager = ScoringManager()

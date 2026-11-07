@@ -37,8 +37,9 @@ class ScoreResult:
     # Pre-head CPU tensors parallel to scores; kept as tensors so in-process
     # consumers avoid a .tolist() round-trip (the HTTP path converts before JSON).
     pooled_hidden_states: Optional[PooledHiddenStateOutput] = None
-    # uncalibrated full-vocabulary logprobs, in each item's candidate order
-    token_logprobs: Optional[List[List[float]]] = None
+    # Uncalibrated full-vocabulary logprobs in each item's candidate order,
+    # shaped like scores (one row per item, or one matrix per item for setwise).
+    token_logprobs: Optional[ScoreOutput] = None
 
 
 class TokenizerManagerScoreMixin:
@@ -265,6 +266,7 @@ class TokenizerManagerScoreMixin:
         label_token_ids: Optional[List[List[int]]] = None,
         temperature: float = 1.0,
         return_pooled_hidden_states: bool = False,
+        return_token_logprobs: bool = False,
     ) -> ScoreResult:
         """Process a fused multi-item score-extraction request (``--enable-mis``).
 
@@ -295,23 +297,25 @@ class TokenizerManagerScoreMixin:
                     f"{len(anchor_logprobs)}. Request ID: {request_id}"
                 )
             scores = []
+            token_logprobs = [] if return_token_logprobs else None
             offset = 0
             for labels, count in zip(label_token_ids, per_item_anchor_counts):
-                scores.append(
-                    [
-                        self._convert_logprobs_to_scores(
-                            self._extract_logprobs_for_tokens(
-                                anchor_logprobs[offset + j], labels
-                            ),
-                            labels,
-                            apply_softmax,
-                            temperature,
-                        )
-                        for j in range(count)
-                    ]
+                item_scores, item_logprobs = self._score_anchor_rows(
+                    anchor_logprobs[offset : offset + count],
+                    labels,
+                    apply_softmax,
+                    temperature,
+                    return_token_logprobs,
                 )
+                scores.append(item_scores)
+                if return_token_logprobs:
+                    token_logprobs.append(item_logprobs)
                 offset += count
-            return ScoreResult(scores=scores, prompt_tokens=prompt_tokens)
+            return ScoreResult(
+                scores=scores,
+                prompt_tokens=prompt_tokens,
+                token_logprobs=token_logprobs,
+            )
 
         embedding = single_result.get("embedding")
         if embedding is None:
@@ -384,16 +388,16 @@ class TokenizerManagerScoreMixin:
                             f"input_token_ids_logprobs is empty for request "
                             f"{meta.get('id', '<unknown>')}."
                         )
-                    item_matrix = [
-                        self._convert_logprobs_to_scores(
-                            self._extract_logprobs_for_tokens(pos_logprobs, labels),
-                            labels,
-                            apply_softmax,
-                            temperature,
-                        )
-                        for pos_logprobs in anchor_logprobs
-                    ]
-                    scores.append(item_matrix)
+                    item_scores, item_logprobs = self._score_anchor_rows(
+                        anchor_logprobs,
+                        labels,
+                        apply_softmax,
+                        temperature,
+                        return_token_logprobs,
+                    )
+                    scores.append(item_scores)
+                    if return_token_logprobs:
+                        token_logprobs.append(item_logprobs)
                     continue
 
                 # Pointwise: logprobs are in output_token_ids_logprobs (last position)
@@ -1229,6 +1233,7 @@ class TokenizerManagerScoreMixin:
                 label_token_ids=label_token_ids,
                 temperature=temperature,
                 return_pooled_hidden_states=return_pooled_hidden_states,
+                return_token_logprobs=return_token_logprobs,
             )
         elif use_multi_item_scoring:
             # Multi-item scoring: extract scores from input_token_ids_logprobs or embedding
@@ -1283,6 +1288,28 @@ class TokenizerManagerScoreMixin:
             ]
 
         return score_list
+
+    def _score_anchor_rows(
+        self,
+        anchor_logprobs: List[List],
+        label_token_ids: List[int],
+        apply_softmax: bool,
+        temperature: float,
+        return_token_logprobs: bool,
+    ) -> Tuple[List[List[float]], List[List[float]]]:
+        """Score each setwise anchor's label logprobs; the raw logprobs are kept
+        only when requested."""
+        scores, token_logprobs = [], []
+        for row in anchor_logprobs:
+            logprobs = self._extract_logprobs_for_tokens(row, label_token_ids)
+            scores.append(
+                self._convert_logprobs_to_scores(
+                    logprobs, label_token_ids, apply_softmax, temperature
+                )
+            )
+            if return_token_logprobs:
+                token_logprobs.append([logprobs[token] for token in label_token_ids])
+        return scores, token_logprobs
 
     def _extract_logprobs_for_tokens(
         self, logprobs_data: List, label_token_ids: List[int]

@@ -606,6 +606,37 @@ class TestGenerationSetwiseResults(CustomTestCase):
                 label_token_ids=[[10], [10]],
             )
 
+    def test_generation_setwise_token_logprobs_grouped_per_item(self):
+        # Raw logprobs follow each item's label order, one row per anchor, and
+        # stay None unless requested, in both the batched and fused paths.
+        rows = [
+            [(-0.1, 10, "a"), (-2.0, 20, "b")],  # item 0, anchor 0
+            [(-0.5, 10, "a"), (-1.0, 20, "b")],  # item 0, anchor 1
+            [(-0.3, 10, "a"), (-1.5, 20, "b")],  # item 1, anchor 0
+        ]
+        labels = [[20, 10], [10, 20]]
+        expected = [[[-2.0, -0.1], [-1.0, -0.5]], [[-0.3, -1.5]]]
+        for requested in (True, False):
+            with self.subTest(requested=requested):
+                batched = self.h._process_single_item_scoring_results(
+                    [self._result(rows[:2]), self._result(rows[2:])],
+                    label_token_ids=labels,
+                    apply_softmax=False,
+                    per_item_matrix=True,
+                    return_token_logprobs=requested,
+                )
+                fused = self.h._process_multi_item_extraction_results(
+                    [self._result(rows)],
+                    per_item_anchor_counts=[2, 1],
+                    apply_softmax=False,
+                    label_token_ids=labels,
+                    return_token_logprobs=requested,
+                )
+                for result in (batched, fused):
+                    self.assertEqual(
+                        result.token_logprobs, expected if requested else None
+                    )
+
 
 class TestSetwisePooledHiddenStatesRoundTrip(CustomTestCase):
     """Validate per-position pooled hidden states survive scheduler serialization.
