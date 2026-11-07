@@ -122,8 +122,9 @@ def make_indexer_cp(backend, runner, sparse_cfg):
     cp = MiniMaxIndexerCP(parallel.attn_tp_group)
     cp.warmup()
     logger.info(
-        "MiniMax indexer CP enabled: TP%d, decode-only, replicated index cache, "
-        "query gather + candidate gather, top-k 16; index-value layers use TP",
+        "MiniMax indexer CP enabled: attention TP%d, decode-only, "
+        "replicated index cache, query gather + candidate gather, top-k 16; "
+        "index-value layers use TP",
         cp.world,
     )
     return cp
