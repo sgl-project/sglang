@@ -175,6 +175,9 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
             package_output=package_output,
         )
 
+    # `audio_sample_rate` and `discard_alpha_channel` only mirror the legacy mixin's
+    # `_load_media_lists` signature: the strategy holds both and its loaders read them.
+    # TODO: drop them together with that legacy signature.
     def _submit_mm_data_loading_tasks_simple(
         self,
         data_list,
@@ -183,7 +186,6 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         discard_alpha_channel,
         video_decode_device=None,
     ):
-        # The strategy's loaders carry the options the mixin's loader takes here.
         return [
             (
                 modality,
