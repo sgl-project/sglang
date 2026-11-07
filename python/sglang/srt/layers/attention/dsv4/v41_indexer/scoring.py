@@ -12,6 +12,7 @@ import torch
 
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    finish_prefill_indexer_topk,
     flat_selection_slots,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
@@ -22,6 +23,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -487,6 +489,22 @@ def write_prefill(
     idx: torch.Tensor,
 ) -> None:
     k, lc = request.k, request.lc
+    if (
+        envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
+        and idx.is_cuda
+        and get_platform().is_sm90
+        and k <= 4096
+    ):
+        finish_prefill_indexer_topk(
+            idx,
+            request.slots,
+            chunk.tok,
+            chunk.lens,
+            inputs.out_raw_indices,
+            inputs.out_page_indices,
+            lc,
+        )
+        return
     idx = idx.sort(dim=-1).values
     reach = idx < chunk.lens[:, None]
     if inputs.out_page_indices is not None:
