@@ -13,6 +13,7 @@ import sys
 import unittest
 from functools import partial
 from types import SimpleNamespace
+from unittest import mock
 
 from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
@@ -314,6 +315,93 @@ class TestTokenizerLatencyAccounting(_TokenizerCollectorCase):
             **self._LABELS, is_streaming="false"
         )
         return sum(b.get() for b in his._buckets)
+
+    def _run_reasoning(self, steps, *, stream=True, finish_type=None, times=None):
+        """Feed (completion_tokens, reasoning_tokens) batches to collect_metrics,
+        reading ``times[j]`` as the clock at batch ``j`` when given."""
+        collector = self._build_collector(force_fallback=False)
+        manager = SimpleNamespace(
+            metrics_collector=collector,
+            disaggregation_mode=DisaggregationMode("null"),
+            enable_priority_scheduling=False,
+            _request_has_grammar=lambda obj: False,
+        )
+        state = SimpleNamespace(
+            obj=SimpleNamespace(stream=stream),
+            ttft_observed=False,
+            ttfat_observed=False,
+            last_completion_tokens=1,
+            finished=False,
+            time_stats=SimpleNamespace(
+                created_time=0.0,
+                get_first_token_latency=lambda: 0.2,
+                get_interval=lambda: 0.2,
+                get_e2e_latency=lambda: 1.0,
+                get_time_per_output_token=lambda completion_tokens: None,
+                set_last_time=lambda: None,
+            ),
+        )
+        request_stats = SimpleNamespace(
+            prompt_tokens=100, cached_tokens=0, cached_tokens_details=None
+        )
+        for j, (completion, reasoning) in enumerate(steps):
+            last = j == len(steps) - 1
+            state.finished = last and finish_type is not None
+            recv = SimpleNamespace(
+                finished_reasons=[{"type": finish_type} if state.finished else None],
+                completion_tokens=[completion],
+                reasoning_tokens=[reasoning],
+            )
+            clock = times[j] if times else 0.0
+            with mock.patch("time.perf_counter", return_value=clock):
+                TokenizerManager.collect_metrics(manager, state, recv, 0, request_stats)
+        return collector
+
+    def _ttfat_sum(self, collector):
+        return collector.histogram_time_to_first_answer_token.labels(
+            **self._LABELS, is_streaming="true"
+        )._sum.get()
+
+    def _ttfat_count(self, collector, is_streaming="true"):
+        his = collector.histogram_time_to_first_answer_token.labels(
+            **self._LABELS, is_streaming=is_streaming
+        )
+        return sum(b.get() for b in his._buckets)
+
+    def test_ttfat_observed_once_at_first_answer_batch(self):
+        """Reasoning-only batches add no sample; the first batch with a token past
+        the reasoning end marker adds exactly one, and later batches add none."""
+        collector = self._run_reasoning(
+            [(5, 5), (10, 10), (12, 10), (20, 10)], times=[1.0, 2.0, 3.0, 9.0]
+        )
+        self.assertEqual(self._ttfat_count(collector), 1)
+        # Recorded at the first answer batch (t=3.0), not a later one.
+        self.assertAlmostEqual(self._ttfat_sum(collector), 3.0)
+
+    def test_ttfat_observed_when_answer_starts_in_first_batch(self):
+        collector = self._run_reasoning([(8, 3), (16, 3)])
+        self.assertEqual(self._ttfat_count(collector), 1)
+
+    def test_ttfat_keeps_sample_when_abort_follows_the_answer(self):
+        collector = self._run_reasoning([(12, 5), (20, 5)], finish_type="abort")
+        self.assertEqual(self._ttfat_count(collector), 1)
+
+    def test_ttfat_skips_requests_without_an_answer(self):
+        cases = [
+            ("reasoning_only", [(5, 5), (10, 10)], None, True),
+            ("no_reasoning_count", [(5, 0), (10, 0)], None, True),
+            ("non_streaming", [(10, 3)], "stop", False),
+            ("abort", [(10, 3)], "abort", True),
+            # TTFT is already observed here, so only TTFAT's own guard stops it.
+            ("abort_after_reasoning", [(5, 5), (12, 10)], "abort", True),
+        ]
+        for name, steps, finish_type, stream in cases:
+            with self.subTest(name):
+                collector = self._run_reasoning(
+                    steps, stream=stream, finish_type=finish_type
+                )
+                self.assertEqual(self._ttfat_count(collector), 0)
+                self.assertEqual(self._ttfat_count(collector, "false"), 0)
 
     def test_ttft_skips_only_aborted_requests(self):
         """Aborts must not add a TTFT sample, but embedding and zero-output
