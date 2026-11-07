@@ -406,8 +406,13 @@ class TestServeDirectLaunch(CustomTestCase):
 
 class TestExportedCookbookCommands(CustomTestCase):
     def test_every_command_parses_as_server_args(self):
-        commands = resources.files("sglang.cli").joinpath("_commands.json").read_text()
-        exported = json.loads(commands)
+        exported = {
+            path.name.removesuffix(".json").replace("--", "/"): json.loads(
+                path.read_text()
+            )
+            for path in resources.files("sglang.cli").joinpath("_commands").iterdir()
+            if path.name.endswith(".json")
+        }
         self.assertTrue(exported)
         for model, entries in exported.items():
             for entry in entries:

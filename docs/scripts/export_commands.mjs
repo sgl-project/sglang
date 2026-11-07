@@ -1,13 +1,14 @@
-// Writes python/sglang/cli/_commands.json, the Cookbook commands `sglang serve <model>` launches.
-// The export-cookbook-commands pre-commit hook runs it; never edit the JSON by hand.
-import { readFileSync, readdirSync, writeFileSync } from "node:fs";
+// Writes python/sglang/cli/_commands/, the Cookbook commands `sglang serve <model>` launches,
+// one JSON file per checkpoint. The export-cookbook-commands pre-commit hook runs it; never
+// edit the files by hand.
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const root = fileURLToPath(new URL("../..", import.meta.url));
 const docs = join(root, "docs");
 const configsDir = join(docs, "src/snippets/configs");
-const outputPath = join(root, "python/sglang/cli/_commands.json");
+const outputDir = join(root, "python/sglang/cli/_commands");
 const MODES = ["balanced", "low-latency", "high-throughput"];
 // TODO(Yichi): export every LLM/VLM config once the CLI Guide covers them.
 const EXPORTED_CONFIGS = ["Qwen/qwen3.8-flash-next.jsx"];
@@ -90,13 +91,40 @@ const exportConfig = async (name) => {
   return [...entries.values()];
 };
 
+// "Qwen/Qwen3-8B" -> "Qwen--Qwen3-8B.json"; Hugging Face names never contain "--".
+const fileName = (model) => {
+  if (!/^[\w.-]+\/[\w.-]+$/.test(model) || model.includes("--")) {
+    throw new Error(`${model}: expected an org/name model path`);
+  }
+  return `${model.replace("/", "--")}.json`;
+};
+
 const byModel = {};
 for (const name of EXPORTED_CONFIGS) {
   for (const { model, ...entry } of await exportConfig(name)) (byModel[model] ||= []).push(entry);
 }
-const body = Object.entries(byModel)
-  .map(([model, entries]) => `  ${JSON.stringify(model)}: [\n${entries.map((e) => `    ${JSON.stringify(e)}`).join(",\n")}\n  ]`)
-  .join(",\n");
-const json = `{\n${body}\n}\n`;
-writeFileSync(outputPath, json);
-console.log(`Wrote ${relative(root, outputPath)} (${(json.length / 1024).toFixed(0)} KB)`);
+const files = Object.fromEntries(
+  Object.entries(byModel).map(([model, entries]) => [
+    fileName(model),
+    `[\n${entries.map((e) => `  ${JSON.stringify(e)}`).join(",\n")}\n]\n`,
+  ]),
+);
+mkdirSync(outputDir, { recursive: true });
+const changed = [];
+for (const name of readdirSync(outputDir)) {
+  if (name in files) continue;
+  rmSync(join(outputDir, name));
+  changed.push(`removed ${name}`);
+}
+for (const [name, json] of Object.entries(files)) {
+  const path = join(outputDir, name);
+  if (existsSync(path) && readFileSync(path, "utf8") === json) continue;
+  writeFileSync(path, json);
+  changed.push(`wrote ${name}`);
+}
+console.log(`${relative(root, outputDir)}: ${Object.keys(files).length} files, ${changed.length} changed`);
+// pre-commit only notices edits to tracked files, so a new file would pass unless this fails.
+if (changed.length) {
+  console.log(`  ${changed.join("\n  ")}`);
+  process.exit(1);
+}
