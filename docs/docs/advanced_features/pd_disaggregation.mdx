@@ -181,7 +181,7 @@ These limitations apply whenever `MOONCAKE_PROTOCOL=efa`, including in the EFA D
 
 The current libfabric EFA provider cannot transfer CUDA VMM-backed buffers. Until [libfabric issue #12853](https://github.com/ofiwg/libfabric/issues/12853) is resolved, apply these settings to both prefill and decode workers:
 
-- Do not set `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` to `NVLINK` or `BAREX`.
+- Do not set `SGLANG_CUSTOM_MEM_POOL` to `NVLINK` or `BAREX`.
   `INTRA_NODE_NVLINK` is supported because it uses the default CUDA allocator.
 - Do not enable `expandable_segments:True` in `PYTORCH_CUDA_ALLOC_CONF` or `PYTORCH_ALLOC_CONF`.
 - Post-capture KV sizing is automatically disabled for the EFA protocol because
@@ -293,17 +293,17 @@ PD Disaggregation with Mooncake supports the following environment variables for
 To enable NVLink transport for KV cache transfers with the mooncake backend (recommended for NVL72 deployments), set the following environment variables. Note that auxiliary data transfer will still use TCP as a temporary workaround.
 
 ```bash Command
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=NVLINK
+export SGLANG_CUSTOM_MEM_POOL=NVLINK
 export MC_FORCE_MNNVL=True
 ```
 
 To utilize Intra-Node NVLink for KV cache transfers with the Mooncake backend (recommended for A100, H20, H100, etc.), set the following environment variables. Please note that auxiliary data still needs to be transferred via TCP.
 
 ```bash
-export SGLANG_MOONCAKE_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
+export SGLANG_CUSTOM_MEM_POOL=INTRA_NODE_NVLINK
 export MC_INTRANODE_NVLINK=true
 ```
-The `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. These pools use Mooncake's CUDA allocators and are CUDA-only; do not set them on Intel XPU.
+The `SGLANG_CUSTOM_MEM_POOL` environment variable enables the custom memory pool. Supported values are `NVLINK` (or `True`), `BAREX`, and `INTRA_NODE_NVLINK`. These pools use Mooncake's CUDA allocators and are CUDA-only; do not set them on Intel XPU. The former name `SGLANG_MOONCAKE_CUSTOM_MEM_POOL` is still accepted with a deprecation warning.
 
 #### Prefill Server Configuration
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
@@ -595,6 +595,16 @@ For NVIDIA CUDA and AMD ROCm deployments using NIXL UCX, `--disaggregation-ib-de
 A non-empty `UCX_NET_DEVICES` takes precedence over this CLI option. SGLang leaves the environment variable unchanged and skips the CLI mapping, including per-GPU mappings, with a warning. This preserves interfaces such as `lo` in an existing configuration like `rdma0:1,rdma4:1,lo`, which some RoCE hosts need for NIXL's self-endpoint.
 
 To use per-GPU CLI selection, unset `UCX_NET_DEVICES`; keep it configured on hosts that require the loopback entry. An explicit `device_list` in `SGLANG_DISAGGREGATION_NIXL_BACKEND_PARAMS` is left unchanged and still overrides `UCX_NET_DEVICES`; do not set it if you rely on the environment's complete device list.
+
+#### NVLink (MNNVL) KV Transfer
+
+On multi-node NVLink systems (e.g. GB200/GB300 NVL72), set `SGLANG_CUSTOM_MEM_POOL=NVLINK` on both the prefill and decode servers. The KV cache is then allocated as fabric-exportable memory (`cuMemCreate` with `CU_MEM_HANDLE_TYPE_FABRIC`), and NIXL's UCX backend uses MNNVL for KV transfers automatically; no Mooncake-specific knobs such as `MC_FORCE_MNNVL` are needed.
+
+```bash
+export SGLANG_CUSTOM_MEM_POOL=NVLINK
+```
+
+The allocator is currently provided by the `mooncake-transfer-engine` package, which must be installed even when NIXL is the transfer backend.
 
 ## ASCEND
 

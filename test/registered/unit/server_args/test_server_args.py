@@ -564,7 +564,7 @@ class TestPrepareServerArgs(CustomTestCase):
 
     @staticmethod
     def _check_with_custom_mem_pool(device: str, pool: str) -> None:
-        with patch.dict(os.environ, {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": pool}):
+        with patch.dict(os.environ, {"SGLANG_CUSTOM_MEM_POOL": pool}):
             ServerArgs(
                 model_path="dummy",
                 served_model_name="dummy",
@@ -578,7 +578,7 @@ class TestPrepareServerArgs(CustomTestCase):
             with (
                 self.subTest(pool=pool),
                 self.assertRaisesRegex(
-                    ValueError, "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported"
+                    ValueError, "SGLANG_CUSTOM_MEM_POOL is not supported"
                 ),
             ):
                 self._check_with_custom_mem_pool("xpu", pool)
@@ -4832,7 +4832,7 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                 return_value=True,
             ),
             patch.object(
-                envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL,
+                envs.SGLANG_CUSTOM_MEM_POOL,
                 "get",
                 return_value=None,
             ),

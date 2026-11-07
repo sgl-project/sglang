@@ -1934,7 +1934,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         and cfg.nnodes == 1
         and envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.get()
         and not cfg.enable_memory_saver
-        and envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is None
+        and envs.SGLANG_CUSTOM_MEM_POOL.get() is None
     )
     if "NCCL_CUMEM_ENABLE" not in os.environ or cfg.enable_symm_mem:
         if kv_shard_symmetric_scratch and not cfg.enable_symm_mem:
