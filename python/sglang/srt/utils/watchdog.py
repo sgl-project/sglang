@@ -12,7 +12,11 @@ from typing import Callable, List, Optional
 
 import psutil
 
-from sglang.srt.utils.cudacore_pyspy_dump_utils import pyspy_dump_schedulers
+from sglang.srt.environ import envs
+from sglang.srt.utils.cudacore_pyspy_dump_utils import (
+    allow_pyspy_attach,
+    pyspy_dump_schedulers,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +122,12 @@ class WatchdogRaw:
         self.dump_info = dump_info
 
         self.parent_process = psutil.Process().parent()
+        # On timeout this process py-spy dumps itself, and a scheduler is also
+        # dumped by TokenizerManager on crash. Without this, both are refused on
+        # CI runners (Yama ptrace_scope=1, no CAP_SYS_PTRACE). Kept to CI so
+        # deployments keep their ptrace restrictions.
+        if envs.SGLANG_IS_IN_CI.get():
+            allow_pyspy_attach()
         t = threading.Thread(target=self._watchdog_thread, daemon=True)
         t.start()
 

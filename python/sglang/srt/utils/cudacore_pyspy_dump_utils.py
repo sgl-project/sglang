@@ -15,10 +15,12 @@
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import platform
 import subprocess
+import sys
 import time
 from errno import ENXIO
 from pathlib import Path
@@ -27,6 +29,33 @@ from typing import List
 import psutil
 
 logger = logging.getLogger(__name__)
+
+# Yama's prctl option and "any process" value, from <linux/prctl.h>.
+_PR_SET_PTRACER = 0x59616D61
+_PR_SET_PTRACER_ANY = ctypes.c_ulong(-1)
+
+
+def allow_pyspy_attach() -> None:
+    """Let a py-spy started by this process or a sibling attach to this process.
+
+    Under Yama ``ptrace_scope=1`` (the Ubuntu default), a process may only
+    ptrace its descendants unless it has ``CAP_SYS_PTRACE``, which Docker drops
+    by default. The watchdog runs py-spy as a child of the process it dumps,
+    and the crash dump runs it as a sibling of the schedulers, so both are
+    refused with "Permission denied (os error 13)". ``PR_SET_PTRACER_ANY`` opts
+    this process in. It has no effect under ``ptrace_scope`` 2 or 3, and prctl
+    fails harmlessly with EINVAL when Yama isn't enabled.
+    """
+    if sys.platform != "linux":
+        return
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(_PR_SET_PTRACER, _PR_SET_PTRACER_ANY, 0, 0, 0) != 0:
+            logger.debug(
+                "prctl(PR_SET_PTRACER_ANY) failed: %s", os.strerror(ctypes.get_errno())
+            )
+    except (OSError, AttributeError) as e:
+        logger.debug("prctl(PR_SET_PTRACER_ANY) unavailable: %s", e)
 
 
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
