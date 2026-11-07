@@ -78,9 +78,10 @@ jobs:
             decode_size: 2
             router_size: 1
             test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_mooncake_gpqa.py
-            # The current image lacks the mooncake + TENT transfer stack; drop
-            # this once docker/npu.Dockerfile ships it.
-            container_patches: mooncake_memfabric_1.3.1
+            # The current image lacks the mooncake + TENT transfer stack and the
+            # blake3 dependency the checkout imports; drop these once
+            # docker/npu.Dockerfile ships them.
+            container_patches: blake3_dependency,mooncake_memfabric_1.3.1
           # Add performance / more key models here, e.g.:
           # - name: <model>_w8a8_1p1d_32p_in1k_out1k
           #   test_type: perf
