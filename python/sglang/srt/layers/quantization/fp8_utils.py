@@ -2144,6 +2144,20 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+# (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
+# prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
+_SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
+_SM107_CUDNN_MXFP8_MIN_M = 8192
+
+
+@lru_cache(maxsize=1)
+def _cudnn_mxfp8_reuses_graphs() -> bool:
+    # Without override-shape support cuDNN builds a new graph for every distinct M.
+    from flashinfer.gemm import gemm_base
+
+    return getattr(gemm_base, "_is_cudnn_override_shape_available", lambda: False)()
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -2185,6 +2199,15 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
+
+    if (
+        backend == "cute-dsl"
+        and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
+        and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
+        and get_platform().device_sm == 107
+        and _cudnn_mxfp8_reuses_graphs()
+    ):
+        backend = "cudnn"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
