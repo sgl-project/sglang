@@ -19,6 +19,7 @@ from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConf
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     maybe_unpad_latents,
+    normalize_model_id_for_matching,
     pack_latents_2x2,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
@@ -870,6 +871,45 @@ class QwenImageLayeredPipelineConfig(QwenImageEditPipelineConfig):
         return latents
 
 
+def _is_qwen_image_model(hf_id: str) -> bool:
+    # Local directory names may use "_" where the published repo id uses "."
+    # (e.g. "Qwen-Image-2_1"), so compare normalized ids; the 2.1 exclusion
+    # must use the normalized form or the v1 config would claim 2.1 dirs.
+    normalized = normalize_model_id_for_matching(hf_id)
+    return (
+        "qwen-image" in normalized
+        and "edit" not in normalized
+        and "layered" not in normalized
+        and "2512" not in normalized
+        and "qwen-image-2-1" not in normalized
+    )
+
+
+def _is_qwen_image_2512_model(hf_id: str) -> bool:
+    return "qwen-image-2512" in normalize_model_id_for_matching(hf_id)
+
+
+def _is_qwen_image_edit_model(hf_id: str) -> bool:
+    normalized = normalize_model_id_for_matching(hf_id)
+    return (
+        "qwen-image-edit" in normalized
+        and "2509" not in normalized
+        and "2511" not in normalized
+    )
+
+
+def _is_qwen_image_edit_2509_model(hf_id: str) -> bool:
+    return "qwen-image-edit-2509" in normalize_model_id_for_matching(hf_id)
+
+
+def _is_qwen_image_edit_2511_model(hf_id: str) -> bool:
+    return "qwen-image-edit-2511" in normalize_model_id_for_matching(hf_id)
+
+
+def _is_qwen_image_layered_model(hf_id: str) -> bool:
+    return "qwen-image-layered" in normalize_model_id_for_matching(hf_id)
+
+
 def register():
     from sglang.multimodal_gen.configs.sample.qwenimage import (
         QwenImage2512SamplingParams,
@@ -883,51 +923,37 @@ def register():
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image", "nvidia/Qwen-Image-NVFP4"],
-        model_detectors=[
-            lambda hf_id: (
-                "qwen-image" in hf_id.lower()
-                and "edit" not in hf_id.lower()
-                and "layered" not in hf_id.lower()
-                and "2512" not in hf_id.lower()
-                and "qwen-image-2.1" not in hf_id.lower()
-            )
-        ],
+        model_detectors=[_is_qwen_image_model],
     )
     register_configs(
         sampling_param_cls=QwenImage2512SamplingParams,
         pipeline_config_cls=QwenImagePipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-2512"],
-        model_detectors=[lambda hf_id: "qwen-image-2512" in hf_id.lower()],
+        model_detectors=[_is_qwen_image_2512_model],
     )
     register_configs(
         sampling_param_cls=QwenImageSamplingParams,
         pipeline_config_cls=QwenImageEditPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit"],
-        model_detectors=[
-            lambda hf_id: (
-                "qwen-image-edit" in hf_id.lower()
-                and "2509" not in hf_id.lower()
-                and "2511" not in hf_id.lower()
-            )
-        ],
+        model_detectors=[_is_qwen_image_edit_model],
     )
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlusPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2509"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2509" in hf_id.lower()],
+        model_detectors=[_is_qwen_image_edit_2509_model],
     )
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,
         pipeline_config_cls=QwenImageEditPlus_2511_PipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Edit-2511"],
-        model_detectors=[lambda hf_id: "qwen-image-edit-2511" in hf_id.lower()],
+        model_detectors=[_is_qwen_image_edit_2511_model],
     )
     register_configs(
         sampling_param_cls=QwenImageLayeredSamplingParams,
         pipeline_config_cls=QwenImageLayeredPipelineConfig,
         hf_model_paths=["Qwen/Qwen-Image-Layered"],
-        model_detectors=[lambda hf_id: "qwen-image-layered" in hf_id.lower()],
+        model_detectors=[_is_qwen_image_layered_model],
     )
     register_configs(
         sampling_param_cls=QwenImageEditPlusSamplingParams,

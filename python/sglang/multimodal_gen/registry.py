@@ -27,7 +27,10 @@ from typing import (
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.server_args import Backend
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.pipeline_configs.base import (
+    PipelineConfig,
+    normalize_model_id_for_matching,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_action import (
     FLUX3_ACTION_HF_PATHS,
     is_flux3_action_package,
@@ -383,11 +386,19 @@ def _match_registered_hf_path(model_path: str) -> Optional[str]:
         return model_path
 
     # 2. Partial match: find the best (longest) match against all registered model hf paths.
-    model_short_name = get_model_short_name(model_path.lower())
+    # Compare normalized ids: a local directory may use "_" where the published
+    # repo id uses "." (e.g. "Qwen-Image-2_1" vs "Qwen-Image-2.1"); without
+    # normalization the specific entry is missed and the shorter generic entry
+    # (e.g. "Qwen/Qwen-Image") wins, routing the model to the wrong config.
+    model_short_name = normalize_model_id_for_matching(
+        get_model_short_name(model_path.lower())
+    )
     for registered_model_hf_id in all_model_hf_paths:
         if registered_model_hf_id.lower() in SENSENOVA_U1_MODEL_IDS:
             continue
-        registered_model_name = get_model_short_name(registered_model_hf_id.lower())
+        registered_model_name = normalize_model_id_for_matching(
+            get_model_short_name(registered_model_hf_id.lower())
+        )
 
         if registered_model_name in model_short_name:
             logger.debug(
