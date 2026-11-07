@@ -340,7 +340,7 @@ def swa_verify_flydsl(
 
 
 def use_balanced_full(num_seqs: int, kv_heads: int) -> bool:
-    return num_seqs >= (4 if kv_heads >= 4 else 8)
+    return num_seqs >= (4 if kv_heads >= 4 else 6)
 
 
 def use_flydsl_sliding(num_seqs: int, kv_heads: int) -> bool:
