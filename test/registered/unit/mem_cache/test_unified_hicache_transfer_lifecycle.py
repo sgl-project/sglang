@@ -46,7 +46,6 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _swa_allocation_callbacks,
 )
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -128,7 +127,7 @@ class _Rows:
         return self.allocator.full_attn_allocator.ids.translate(ids.to(torch.int64))
 
     def swa_rows(self, ids: torch.Tensor) -> torch.Tensor:
-        return self.allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(ids)
+        return self.allocator.id_spaces()[self.allocator.roles.window].ids(ids)
 
     def markers(self, base: int, count: int) -> torch.Tensor:
         # One value per token row; float16 holds these integers exactly.
@@ -231,7 +230,7 @@ class TestPhysicalReservation(_ConfigCase):
             # Queued: compaction waits on the copy, then relocates rows.
             self.assertGreater(swa._flush(urgent=True), 0)
         self.assertEqual(waits[0], ("wait", load_done))
-        self.assertIn(("move", "swa"), moves)
+        self.assertIn(("move", swa.sub_pool_name), moves)
         _, target_swa = rows.read(target)
         self.assertTrue(torch.equal(target_swa, rows.markers(300, 2 * PAGE)))
         self.assertTrue(torch.equal(rows.read(head)[1], expected_head[1]))

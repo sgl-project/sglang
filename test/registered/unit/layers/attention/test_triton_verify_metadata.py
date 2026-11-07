@@ -269,6 +269,7 @@ def test_replicated_draft_metadata_and_writes_share_physical_ids():
     runner_ids.page_size = 4
     runner_ids.device = "cpu"
     runner_ids._spaces = {IdSpaceKind.FULL: replicated.space(IdSpaceKind.FULL)}
+    runner_ids._role_sub_pools = {}
     runner_ids.is_translating = True
     runner_ids.defer_read_translate = False
     plan = runner_ids.plan(
