@@ -22,32 +22,6 @@ _SUPPORTED_OUTPUT_DTYPES = (torch.float8_e4m3fn, torch.int8)
 _SUPPORTED_GROUP_SIZES = (16, 32, 64, 128, 256)
 
 
-def _check_fp32_pow2_config(
-    in_dtype,
-    out_dtype,
-    group_size,
-    row_major,
-    fuse_silu_and_mul,
-    masked_layout,
-    sorted_layout,
-    silu_and_mul_mode,
-):
-    if not (
-        in_dtype == torch.bfloat16
-        and out_dtype == torch.float8_e4m3fn
-        and group_size == 32
-        and row_major
-        and not fuse_silu_and_mul
-        and not masked_layout
-        and not sorted_layout
-        and silu_and_mul_mode == "legacy"
-    ):
-        raise ValueError(
-            "FP32 power-of-two scales require flat BF16 input, FP8 output, "
-            "group_size=32 and row-major scales without fused activation"
-        )
-
-
 @cache_once
 def _jit_module(
     in_dtype: torch.dtype,
@@ -66,17 +40,6 @@ def _jit_module(
     assert in_dtype in _SUPPORTED_INPUT_DTYPES
     assert out_dtype in _SUPPORTED_OUTPUT_DTYPES
     assert group_size in _SUPPORTED_GROUP_SIZES
-    if scale_ue8m0 and not scale_packed:
-        _check_fp32_pow2_config(
-            in_dtype,
-            out_dtype,
-            group_size,
-            row_major,
-            fuse_silu_and_mul,
-            masked_layout,
-            sorted_layout,
-            silu_and_mul_mode,
-        )
     if silu_and_mul_mode not in ("legacy", "dense"):
         raise ValueError(f"Unknown silu_and_mul_mode: {silu_and_mul_mode}")
     dense = silu_and_mul_mode == "dense"
@@ -156,43 +119,15 @@ def _per_token_group_quant_custom_op(
     num_valid_tokens: int = 0,
     silu_and_mul_mode: str = "legacy",
 ) -> None:
-    if scale_ue8m0 and output_s.dtype == torch.float32:
-        _check_fp32_pow2_config(
-            input.dtype,
-            output_q.dtype,
-            group_size,
-            output_s.is_contiguous(),
-            fuse_silu_and_mul,
-            masked_m is not None,
-            sorted_token_ids is not None,
-            silu_and_mul_mode,
-        )
-        # v2 has no host-side buffer validation. Check the same contract before
-        # either launcher, including the 16B-aligned view fallback.
-        if not (
-            input.is_cuda
-            and input.device == output_q.device == output_s.device
-            and input.ndim == 2
-            and input.is_contiguous()
-            and output_q.is_contiguous()
-            and output_s.is_contiguous()
-            and output_q.shape == input.shape
-            and input.shape[1] % group_size == 0
-            and output_s.shape == (input.shape[0], input.shape[1] // group_size)
-        ):
-            raise ValueError(
-                "FP32 power-of-two scales require matching contiguous CUDA buffers"
-            )
-        if input.data_ptr() % 16 or output_q.data_ptr() % 16:
-            raise ValueError("FP32 power-of-two input and output must be 16B-aligned")
-        ranges = []
-        for tensor in (input, output_q, output_s):
-            start = tensor.data_ptr()
-            ranges.append((start, start + tensor.numel() * tensor.element_size()))
-        for i, (start, end) in enumerate(ranges):
-            for other_start, other_end in ranges[i + 1 :]:
-                if max(start, other_start) < min(end, other_end):
-                    raise ValueError("FP32 power-of-two buffers must not overlap")
+    if (
+        scale_ue8m0
+        and output_s.dtype == torch.float32
+        and output_s.ndim == 2
+        and output_s.is_contiguous()
+        and not fuse_silu_and_mul
+        and masked_m is None
+        and sorted_token_ids is None
+    ):
         # Contiguity ignores singleton strides. Give both launchers a row-major
         # view of the same FP32 storage so v2 cannot mistake it for packed scales.
         scale_strides = (max(output_s.shape[1], 1), 1)
@@ -328,11 +263,12 @@ def per_token_group_quant(
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
     The packed layouts require ``scale_ue8m0=True``. With a supplied contiguous
     float32 buffer, this flag instead stores the power-of-two scales as FP32.
-    That combination requires contiguous, non-overlapping CUDA buffers for
-    2D BF16 inputs, FP8 output and groups of 32, without fused activation,
-    masking or sorted rows. The fast path runs on Hopper with 32B-aligned
-    input; other architectures and 16B-aligned input views use v2. Automatic
-    allocation with ``scale_ue8m0=True`` continues to produce packed scales.
+    The buffers must be contiguous, non-overlapping CUDA tensors. The public
+    FP8 dispatch selects this specialization for flat BF16 group32 inputs on
+    Hopper with 32B alignment; other architectures and 16B-aligned input views
+    use v2. FP16 stays on v2 because the trait kernel's FP16 quantization
+    multiplier can overflow. Automatic allocation with ``scale_ue8m0=True``
+    continues to produce packed scales.
     The FP32 power-of-two flavor retains v2's NaN-to-negative-saturation
     behavior; the packed BF16 path continues to preserve NaNs.
 

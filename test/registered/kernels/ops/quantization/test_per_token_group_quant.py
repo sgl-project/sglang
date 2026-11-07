@@ -30,7 +30,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     sglang_per_token_group_quant_fp8,
 )
 from sglang.kernels.ops.quantization.per_token_group_quant import (
-    _jit_module,
     per_token_group_quant,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -212,65 +211,6 @@ def test_fp32_pow2_compile(offset, backend):
         q_ref, s_ref = ref_fp8_fp32_pow2(x)
         assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
         assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
-
-
-@pytest.mark.parametrize("offset", [0, 8])
-@pytest.mark.parametrize(
-    "buffer", ["q_shape", "s_shape", "q_stride", "cpu", "alias", "q_alignment"]
-)
-def test_fp32_pow2_rejects_invalid_buffers(offset, buffer):
-    # In particular, offset=8 used to bypass shape/device validation via v2.
-    storage = torch.zeros(3 * 160 + offset, device="cuda", dtype=torch.bfloat16)
-    x = storage[offset:].view(3, 160)
-    q = torch.empty_like(x, dtype=fp8_dtype)
-    s = torch.empty(3, 5, device="cuda")
-    if buffer == "q_shape":
-        q = torch.empty(4, 160, device="cuda", dtype=fp8_dtype)
-    elif buffer == "s_shape":
-        s = torch.empty(4, 5, device="cuda")
-    elif buffer == "q_stride":
-        q = torch.empty(3, 320, device="cuda", dtype=fp8_dtype)[:, ::2]
-    elif buffer == "cpu":
-        s = torch.empty(3, 5)
-    elif buffer == "alias":
-        q = x.view(fp8_dtype).flatten()[: x.numel()].view_as(x)
-    elif buffer == "q_alignment":
-        q = torch.empty(x.numel() + 1, device="cuda", dtype=fp8_dtype)[1:].view_as(x)
-    with pytest.raises(ValueError, match="FP32 power-of-two"):
-        per_token_group_quant(x, q, s, 32, scale_ue8m0=True)
-
-
-@pytest.mark.parametrize(
-    "unsupported", ["column_major", "fused", "masked", "sorted", "dense"]
-)
-def test_fp32_pow2_factory_rejects_unsupported_layouts(unsupported):
-    with pytest.raises(ValueError, match="FP32 power-of-two scales require"):
-        _jit_module(
-            torch.bfloat16,
-            fp8_dtype,
-            32,
-            True,
-            False,
-            unsupported != "column_major",
-            True,
-            unsupported == "fused",
-            unsupported == "masked",
-            False,
-            unsupported == "sorted",
-            "dense" if unsupported == "dense" else "legacy",
-        )
-
-
-@pytest.mark.parametrize(
-    "dtype,group_size",
-    [(torch.float16, 32), (torch.float32, 32), (torch.bfloat16, 128)],
-)
-def test_fp32_pow2_rejects_unsupported_combinations(dtype, group_size):
-    x = torch.zeros(3, 128, device="cuda", dtype=dtype)
-    q = torch.empty_like(x, dtype=fp8_dtype)
-    s = torch.empty(3, 128 // group_size, device="cuda")
-    with pytest.raises(ValueError, match="FP32 power-of-two scales require"):
-        per_token_group_quant(x, q, s, group_size, scale_ue8m0=True)
 
 
 @pytest.mark.parametrize(

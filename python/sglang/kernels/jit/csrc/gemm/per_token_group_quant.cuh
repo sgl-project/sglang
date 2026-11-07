@@ -262,6 +262,9 @@ struct QuantTrait {
   static_assert(kGroupSize % kVecSize == 0 && 1 <= kNumLanes && kNumLanes <= device::kWarpThreads);
   static_assert(!kUe8m0 || std::is_same_v<QuantType, fp8_e4m3_t>, "ue8m0 scales imply fp8 output");
   static_assert(!kPackedScale || kUe8m0, "packed scale storage requires ue8m0 rounding");
+  static_assert(
+      !kUe8m0 || kPackedScale || !std::is_same_v<InputType, fp16_t>,
+      "FP16 with FP32 power-of-two scales must use v2 to avoid quantization multiplier overflow");
 
   SGL_DEVICE static void
   run(const QuantKernelParams& params,
@@ -557,6 +560,7 @@ QuantHostContext<Trait> build_quant_context( //
   }
   if constexpr (Trait::kUe8m0 && !Trait::kPackedScale) {
     TensorMatcher({N, H}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({N, H}).with_dtype<Q>().with_device(device).ensure_alignment(16).verify(output_q);
     TensorMatcher({N, G}).with_dtype<S>().with_device(device).verify(output_s);
   }
   // The 32B/lane vectorized loads need every input row to start 32B-aligned
