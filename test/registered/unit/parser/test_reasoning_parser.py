@@ -1043,6 +1043,32 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
         one_shot = make_detector().detect_and_parse(text)
         self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), expected)
 
+    def test_force_nonempty_closed_block_content_matches_one_shot(self):
+        """force_nonempty_content: a stream whose think block closes with nothing
+        after it must end with detect_and_parse's content, not an empty answer.
+        Streamed reasoning cannot be taken back, so only content is compared."""
+        for text in (
+            "<think>All reasoning, no answer</think>",
+            "<think><think>All reasoning, no answer</think>",
+            "<think>Reasoning here</think>The answer is 42.",
+        ):
+            for stream_reasoning in (True, False):
+
+                def make_detector():
+                    return Nemotron3Detector(
+                        force_nonempty_content=True, stream_reasoning=stream_reasoning
+                    )
+
+                expected = make_detector().detect_and_parse(text).normal_text
+                for chunk_size in self.CHUNK_SIZES:
+                    with self.subTest(
+                        text=text,
+                        stream_reasoning=stream_reasoning,
+                        chunk_size=chunk_size,
+                    ):
+                        _, normal = self._feed(make_detector(), text, chunk_size)
+                        self.assertEqual(normal, expected)
+
     def test_think_end_split_across_chunks(self):
         """`</think>` straddling a chunk boundary must still end the block."""
         self._assert_invariant(
