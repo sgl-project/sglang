@@ -1096,6 +1096,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def is_backuped(self, node_id: NodeId) -> bool:
         return self._binding.node_backuped(node_id)
 
+    def node_hit_count(self, node_id: NodeId) -> int:
+        return self._binding.node_hit_count(node_id)
+
     def is_root(self, node_id: NodeId) -> bool:
         return self._binding.is_root(node_id)
 

@@ -1808,6 +1808,11 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                py.detach(|| self.core().node_hit_count(node_id))
+                    .map_err(node_access_error)
+            }
+
             /// Whether the node is a (default or named) root.
             fn is_root(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().is_root(node_id))
@@ -3236,6 +3241,10 @@ macro_rules! tree_core_binding {
             /// Whether the node's Full KV is present on host.
             fn node_backuped(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 catch_native_panic(|| self.inner.node_backuped(py, node_id))
+            }
+
+            fn node_hit_count(&self, py: Python<'_>, node_id: NodeId) -> PyResult<i64> {
+                catch_native_panic(|| self.inner.node_hit_count(py, node_id))
             }
 
             /// Whether the node is a (default or named) root.

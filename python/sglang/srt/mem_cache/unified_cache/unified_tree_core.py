@@ -642,6 +642,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Whether the node's KV is already backed up to host."""
         return self._node_arena[node_id].backuped
 
+    def node_hit_count(self, node_id: NodeId) -> int:
+        return self._node_arena[node_id].hit_count
+
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         return self.node_by_id(node_id) is self.root_node

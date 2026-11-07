@@ -207,6 +207,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    _mamba_request_end_only: bool = False
+    _insert_params: Optional[InsertParams] = None
+
     # Unlimited-OCR v2 split-document KV reuse; None for every other model.
     uocr_doc_reuse: Optional[DocReuse] = None
 
@@ -222,6 +225,7 @@ class UnifiedRadixCache(BasePrefixCache):
         if is_cp_sharded_padded():
             self.logical_page_size *= get_cp_strategy().cp_size
         self.disable = params.disable
+        self._mamba_request_end_only = envs.SGLANG_HICACHE_MAMBA_REQUEST_END_ONLY.get()
 
         if params.enable_metrics:
             self.init_metrics_collector()
@@ -749,6 +753,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.buffer_pipeline.begin_insert_walk()
         # External linker offloads (BackupKV) issued by this insert carry its session.
         self.insert_session_id = params.session_id
+        self._insert_params = params
         # Pump the resumable insert, applying each step's actions at its barrier.
         try:
             step = self.tree_core.begin_insert(params)
@@ -757,6 +762,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 if step.result is not None:
                     # Walk actions flow through the steps; the result is action-free.
                     assert not step.result.cache_actions
+                    self._retry_request_end_mamba_backup(step.result)
                     return step.result
                 step = self.tree_core.resume_insert()
         finally:
@@ -765,6 +771,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._apply_cache_actions(self.tree_core.end_insert())
             finally:
                 self.insert_session_id = None
+                self._insert_params = None
             if self.buffer_pipeline is not None:
                 self.buffer_pipeline.end_insert_walk()
 
@@ -1499,6 +1506,13 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            is_request_end=(
+                is_finished
+                or (
+                    get_disagg().disaggregation_mode == "prefill"
+                    and up_to >= len(req.origin_input_ids)
+                )
+            ),
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -2049,6 +2063,36 @@ class UnifiedRadixCache(BasePrefixCache):
             self.tree_core.build_backup_kv_action(node_id)
         )
 
+    def _should_backup_mamba(self, node_id: NodeId) -> bool:
+        params = self._insert_params
+        if not self._mamba_request_end_only or params is None:
+            return True
+        if params.is_request_end is None:
+            return True
+        if not params.is_request_end:
+            return False
+        (path,) = self.tree_core.collect_path_info([node_id])
+        return bool(path) and path[-1].path_end == len(params.key)
+
+    def _retry_request_end_mamba_backup(self, result: InsertResult) -> None:
+        # An earlier KV backup may have skipped this endpoint's Mamba state.
+        params = self._insert_params
+        if (
+            not self._mamba_request_end_only
+            or self.cache_controller is None
+            or params is None
+            or params.is_request_end is not True
+            or result.rotation_tail_declined
+            or self.is_write_back
+        ):
+            return
+        node_id = result.last_device_node
+        if self.tree_core.node_hit_count(node_id) < self.write_through_threshold:
+            return
+        self._execute_and_commit_kv_backup(
+            self.tree_core.build_backup_kv_action(node_id)
+        )
+
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> int:
@@ -2064,10 +2108,15 @@ class UnifiedRadixCache(BasePrefixCache):
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
+            if not self._should_backup_mamba(node_id):
+                comp_xfers.pop(ComponentType.MAMBA, None)
             # Overlapping chain actions may revisit nodes with Full KV already
             # backed up. Skip only when no transfer remains.
             if device_value.numel() == 0 and not comp_xfers:
                 continue
+            # Finish the previous ack before replacing its lock ownership.
+            if node_id in self.ongoing_write_through:
+                self.writing_check(write_back=True)
             sidecar_xfers = self._build_backup_sidecar(device_value, comp_xfers)
             host_indices = self._execute_kv_backup(
                 node_id, device_value, comp_xfers, sidecar_xfers

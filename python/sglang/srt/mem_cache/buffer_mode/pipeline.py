@@ -720,6 +720,8 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         span = (snapshot.node_id, len(snapshot.key))
         for pool, keys in intents:
+            if pool == PoolName.MAMBA and not self._cache._should_backup_mamba(node_id):
+                continue
             if pool in pending:
                 continue
             intent_tokens = len(keys) * page_size
@@ -874,6 +876,13 @@ class BufferModePipeline:
                 keys = dict(self._write_intents(piece)).get(intent.pool)
                 if not keys:
                     continue  # covered since admission
+                if (
+                    intent.pool == PoolName.MAMBA
+                    and self._cache._mamba_request_end_only
+                ):
+                    # Keep only the original endpoint's state after a split.
+                    if any(key not in intent.keys for key in keys):
+                        continue
                 repaired = _UnifiedBackupIntent(
                     snapshot=piece, pool=intent.pool, keys=list(keys)
                 )

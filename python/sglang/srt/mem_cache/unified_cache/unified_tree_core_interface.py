@@ -244,6 +244,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def node_hit_count(self, node_id: NodeId) -> int:
+        """Hit count used by the write-through threshold."""
+        ...
+
+    @abstractmethod
     def is_root(self, node_id: NodeId) -> bool:
         """Whether the node is the tree root."""
         ...
