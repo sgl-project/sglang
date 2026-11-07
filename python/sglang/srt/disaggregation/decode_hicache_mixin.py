@@ -32,6 +32,8 @@ class DecodePrefixMatch:
     last_device_node: Any
     last_host_node: Any = None
     prefetch_registered: bool = False
+    prefetch_ticketed: bool = False
+    host_lock_receipt: Any = None
 
     @property
     def l1_prefix_len(self) -> int:
@@ -68,7 +70,12 @@ class DecodeHiCachePreallocMixin:
     """HiCache hooks for ``DecodePreallocQueue``: issue prefetch + reserve tokens."""
 
     def _build_decode_prefix_match(
-        self, req: Req, result: Any, *, max_prefix_len: Optional[int] = None
+        self,
+        req: Req,
+        result: Any,
+        *,
+        max_prefix_len: Optional[int] = None,
+        query_storage: bool = True,
     ) -> DecodePrefixMatch:
         """Convert a ``match_kv_cache`` result into ``DecodePrefixMatch``.
 
@@ -81,7 +88,11 @@ class DecodeHiCachePreallocMixin:
 
         l3_storage_hit_length = 0
         last_host_node = None
-        if self.scheduler.enable_decode_hicache and self.tree_cache.enable_storage:
+        if (
+            query_storage
+            and self.scheduler.enable_decode_hicache
+            and self.tree_cache.enable_storage
+        ):
             last_host_node = result.last_host_node
             if self.tree_cache.is_backuped(last_host_node) or self.tree_cache.is_root(
                 last_host_node
@@ -109,17 +120,19 @@ class DecodeHiCachePreallocMixin:
             l3_storage_hit_length=l3_storage_hit_length,
             last_device_node=result.last_device_node,
             last_host_node=(
-                result.last_host_node if l3_storage_hit_length > 0 else None
+                result.last_host_node
+                if l2_host_hit_length + l3_storage_hit_length > 0
+                else None
             ),
         )
 
     def _start_hicache_prefetch(
         self, req: Req, prefix_match: Optional[DecodePrefixMatch]
     ) -> None:
-        """Issue L3 storage prefetch after admission succeeds.
+        """Issue L3 storage prefetch after the preliminary capacity checks.
 
-        Clears the L3 span unless the prefetch was taken, so prefill is never
-        promised tokens nothing will load.
+        A registered or ticketed attempt must settle before admission. A
+        declined attempt immediately falls back to the resident prefix.
         """
         if (
             prefix_match is None
@@ -151,6 +164,7 @@ class DecodeHiCachePreallocMixin:
             prefix_match.prefetch_registered = self.tree_cache.has_ongoing_prefetch(
                 req.cache_request_handle
             )
+            prefix_match.prefetch_ticketed = bool(ticketed)
             if not (prefix_match.prefetch_registered or ticketed):
                 # Declined (below prefetch_threshold or rate limited): nothing loads.
                 prefix_match.l3_storage_hit_length = 0
@@ -162,6 +176,46 @@ class DecodeHiCachePreallocMixin:
             )
             prefix_match.l3_storage_hit_length = 0
             prefix_match.prefetch_registered = False
+            prefix_match.prefetch_ticketed = False
+
+    def _poll_hicache_prefetch(self, dr: DecodeRequest) -> bool:
+        """Settle the storage attempt before matching a publishable prefix.
+
+        check_prefetch_progress uses the cache's rank-agreed completion path.
+        Completion includes revoked/short reads: only the following local
+        rematch decides what can be promised to prefill.
+        """
+        if not dr.hicache_prefetch_pending:
+            return True
+        req = dr.req
+        if not self.tree_cache.check_prefetch_progress(req.cache_request_handle):
+            return False
+        loaded_tokens, loaded_start = self.tree_cache.pop_prefetch_loaded_span(
+            req.cache_request_handle
+        )
+        req.storage_hit_length = loaded_tokens
+        req.storage_hit_start = loaded_start
+        self.tree_cache.unlock(req.lock)
+        req.lock = None
+        dr.prefix_match = None
+        dr.hicache_prefetch_pending = False
+        dr.hicache_prefetch_done = True
+        return True
+
+    def _cancel_hicache_admission(self, dr: DecodeRequest) -> None:
+        if not dr.hicache_prefetch_pending:
+            return
+        self.tree_cache.finish(dr.req.cache_request_handle, CacheRequestOutcome.ABORT)
+        self.tree_cache.unlock(dr.req.lock)
+        dr.req.lock = None
+        dr.prefix_match = None
+        dr.hicache_prefetch_pending = False
+
+    def _pin_hicache_host_prefix(self, pm: Optional[DecodePrefixMatch]) -> None:
+        if pm is not None and pm.l2_host_hit_length > 0:
+            pm.host_lock_receipt = self.tree_cache.inc_host_lock_ref(
+                pm.last_host_node
+            ).to_dec_params()
 
     def _hicache_pending_restore_tokens(self) -> int:
         """Total device tokens reserved for pending HiCache L2/L3 load_back."""
@@ -194,7 +248,14 @@ class HiCacheRestoreGatedKVReceiver:
 class DecodeHiCacheTransferMixin:
     """HiCache hooks for ``DecodeTransferQueue``: drive restore state machine."""
 
+    def _release_hicache_host_prefix(self, decode_req: DecodeRequest) -> None:
+        pm = decode_req.prefix_match
+        if pm is not None and pm.host_lock_receipt is not None:
+            self.tree_cache.dec_host_lock_ref(pm.last_host_node, pm.host_lock_receipt)
+            pm.host_lock_receipt = None
+
     def _clean_hicache_prefetch_resources(self, decode_req: DecodeRequest) -> None:
+        self._release_hicache_host_prefix(decode_req)
         if (
             decode_req.prefix_match is not None
             and decode_req.prefix_match.prefetch_registered
@@ -250,6 +311,8 @@ class DecodeHiCacheTransferMixin:
             )
         finally:
             dr.req.last_node = owned_node
+            # A queued H2D owns its own host reference until its copy completes.
+            self._release_hicache_host_prefix(dr)
         # Failback: total coverage < required prefix means device alloc likely failed.
         if rematch.device_prefix_len + loaded_len < pm.decode_prefix_len:
             logger.warning(

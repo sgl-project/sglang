@@ -72,7 +72,8 @@ class TestDecodeHiCacheTreeCore(CustomTestCase):
             path_device_indices=Mock(return_value=restored_path),
             lock=Mock(return_value="restore-lock"),
         )
-        harness = SimpleNamespace(tree_cache=tree_cache)
+        harness = DecodeHiCacheTransferMixin()
+        harness.tree_cache = tree_cache
         req = SimpleNamespace(
             rid="req-0",
             cache_request_handle=CacheRequestHandle("req-0", 0),
