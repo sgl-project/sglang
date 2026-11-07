@@ -1,10 +1,13 @@
+import gzip
 import heapq
 import importlib
 import json
 import os
 import time
-from dataclasses import asdict
-from typing import Any
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from functools import partial, wraps
+from typing import Any, ClassVar
 
 from sglang_simulator.compat import validate_simulator_server_args
 from sglang_simulator.hook import (
@@ -13,7 +16,15 @@ from sglang_simulator.hook import (
     validate_required_class_hooks,
 )
 from sglang_simulator.hook.utils import get_obj_from_args
+from sglang_simulator.simulation.iteration_stats import IterationStats
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.dspark import (
+    DSparkStepResult,
+    dspark_result_from_native,
+)
+from sglang_simulator.simulation.sglang.prepared_batch import (
+    predictor_batch_from_result,
+)
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -27,17 +38,168 @@ from sglang_simulator.simulation.utils import (
     calc_iteration_metrics,
     calc_metrics,
 )
-from sglang_simulator.time_predictor import InferTimePredictor
-from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleBatch
-from sglang_simulator.time_predictor import ScheduleRequest
+from sglang_simulator.time_predictor.base import (
+    InferTimePredictor,
+    PredictorError,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleBatch as SimulationScheduleBatch,
+)
+from sglang_simulator.time_predictor.base import (
+    ScheduleRequest,
+)
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
 
 logger = get_logger("sgl_simulator")
 
+_DSPARK_ACCOUNTING = "_sglang_simulator_dspark_accounting"
+
+
+_DSPARK_ACCOUNTED = "_sglang_simulator_dspark_accounted"
+
+
+_DSPARK_WALL_CREDIT = "_sglang_simulator_dspark_wall_credit"
+
+
+_DSPARK_ACCOUNTING_OWNER = "_sglang_simulator_dspark_accounting_owner"
+
+
+_DSPARK_PENDING_RESULTS = "_sglang_simulator_dspark_pending_results"
+
+
+@dataclass(frozen=True)
+class _DSparkResultAccounting:
+    owner: object
+    prediction: DSparkStepResult
+    forward_duration: float
+    previous_inference_duration: float
+    preprocess_duration: float
+    evaluated_costs: tuple = ()
+
+
+def _has_pending_dspark_work(owner, predictor):
+    runtime = getattr(predictor, "dspark_runtime", None)
+    driver = getattr(runtime, "reference_driver", None)
+    if driver is not None:
+        driver.check()
+        ledger = driver.adapter.ledger
+        if (
+            driver.selection is not None
+            or driver.processing is not None
+            or ledger.prepared is not None
+            or ledger.pending
+        ):
+            return True
+    return bool(getattr(owner, _DSPARK_PENDING_RESULTS, 0))
+
+
+def _validate_dspark_batch(prediction, batch):
+    group = prediction.local_group
+    source_mode = getattr(batch.forward_mode, "name", None)
+    allowed_modes = {
+        "DECODE": {"TARGET_VERIFY"},
+        "TARGET_VERIFY": {"TARGET_VERIFY"},
+        "EXTEND": {"EXTEND", "MIXED"},
+        "MIXED": {"MIXED"},
+        "IDLE": {"IDLE"},
+    }
+    if group.forward_mode not in allowed_modes.get(source_mode, set()):
+        raise PredictorError(
+            "invalid_dspark_step", "DSPark worker mode differs from the native batch"
+        )
+    if tuple(req.rid for req in batch.reqs) != tuple(
+        request.rid for request in group.requests
+    ):
+        raise PredictorError(
+            "invalid_dspark_step", "DSPark result does not match the native local batch"
+        )
+
+
+def _dspark_simulation_batch(prediction):
+    group = prediction.local_group
+    return SimulationScheduleBatch(
+        reqs=[
+            ScheduleRequest(r.extend_len, r.target_prefix_len) for r in group.requests
+        ],
+        forward_mode=group.forward_mode,
+    )
+
 
 def simulation_mode_log_message(mode: SimulationMode) -> str:
     return f"SGLang Simulator simulation mode: {mode.value}"
+
+
+def _host_int(value):
+    value = value.item() if hasattr(value, "item") else value
+    if type(value) is not int:
+        raise PredictorError("invalid_batch", "prepared token lengths must be integers")
+    return value
+
+
+def _request_prefix_len(req):
+    value = getattr(req, "prefix_len", None)
+    if value is None:
+        value = len(req.prefix_indices)
+    return _host_int(value)
+
+
+def build_predictor_batch(batch) -> SimulationScheduleBatch:
+    """Copy prepared SGLang forward metadata into the predictor contract."""
+    mode = getattr(getattr(batch, "forward_mode", None), "name", None)
+    batch_size = len(batch.reqs)
+
+    if mode in {"EXTEND", "MIXED"}:
+        extend_lens = getattr(batch, "extend_lens", None)
+        prefix_lens = getattr(batch, "prefix_lens", None)
+        if (
+            extend_lens is None
+            or prefix_lens is None
+            or len(extend_lens) != batch_size
+            or len(prefix_lens) != batch_size
+        ):
+            raise PredictorError(
+                "invalid_batch",
+                "prepared extend and prefix lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=_host_int(extend),
+                past_kv_length=_host_int(prefix),
+            )
+            for extend, prefix in zip(extend_lens, prefix_lens)
+        ]
+    elif mode == "DECODE":
+        seq_lens = getattr(batch, "seq_lens_cpu", None)
+        if seq_lens is None or len(seq_lens) != batch_size:
+            raise PredictorError(
+                "invalid_batch",
+                "prepared decode lengths must match batch size",
+                forward_mode=mode,
+                batch_size=batch_size,
+            )
+        reqs = [
+            ScheduleRequest(
+                extend_length=1,
+                # prepare_for_decode increments seq_lens_cpu for the token
+                # entering this forward. SimOpus history is the KV length
+                # before that token.
+                past_kv_length=_host_int(seq_len) - 1,
+            )
+            for seq_len in seq_lens
+        ]
+    elif mode == "IDLE":
+        reqs = []
+    else:
+        raise PredictorError(
+            "unsupported_forward_mode",
+            f"unsupported SGLang forward mode {mode!r}",
+            forward_mode=mode,
+        )
+
+    return SimulationScheduleBatch(reqs=reqs, forward_mode=mode)
 
 
 def effective_l2_load_delay(
@@ -74,7 +236,7 @@ class C_SglangPrefillAdderHook(BaseHook):
                 **kwargs,
             )
             req_infos = request_stats_manager.get_req_stats(req.rid)
-            req_infos.before_adder_device_hit_len = req.prefix_len
+            req_infos.before_adder_device_hit_len = _request_prefix_len(req)
             req_infos.final_host_hit_len = req.host_hit_length
 
             return original_add_one_req(self, *args, **kwargs)
@@ -262,6 +424,10 @@ class C_SchedulerRequestReceiver(BaseHook):
         original_recv_requests = target.recv_requests
 
         def wrapped_recv_requests(self, *args, **kwargs):
+            if C_SchedulerHook.COORDINATOR is not None:
+                return C_SchedulerHook.COORDINATOR.receive(
+                    lambda: original_recv_requests(self, *args, **kwargs)
+                )
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerRequestReceiver.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerRequestReceiver.REQ_DISPATCHER.dispatch()
@@ -274,9 +440,12 @@ class C_SchedulerHook(BaseHook):
     HOOK_MODULE_NAME = "sglang.srt.managers.scheduler"
 
     INFERENCE_PREDICTOR: InferTimePredictor = None
+    COORDINATOR = None
 
-    ITERATION_STATS: list[dict] = []
+    ITERATION_STATS: ClassVar[IterationStats] = IterationStats(Envs.output_dir)
     TOTAL_PREDICTOR_TIME_COST = 0
+    CURRENT_PREDICTOR_TIME_COST = 0
+    CURRENT_PREDICTED_LATENCY = 0
     GET_NEW_BATCH_PREFILL_TIME_COST = 0
 
     SIMULATION_BATCH: SimulationScheduleBatch = None
@@ -293,10 +462,93 @@ class C_SchedulerHook(BaseHook):
         original_get_new_batch_prefill = target.get_new_batch_prefill
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
+        original_event_loop_overlap = getattr(target, "event_loop_overlap", None)
+        original_overlap_decision = getattr(
+            target, "is_disable_overlap_for_batch", None
+        )
         original_event_loop_normal = target.event_loop_normal
         original_init_request_dispatcher = target.init_request_dispatcher
+        original_on_idle = target.on_idle
+        from sglang_simulator.simulation.sglang.coordinated import (
+            install_prefill_cadence_hooks,
+        )
+
+        install_prefill_cadence_hooks(target, lambda: C_SchedulerHook.COORDINATOR)
+        original_get_next_batch = getattr(target, "get_next_batch_to_run", None)
+
+        def reference_driver():
+            runtime = getattr(
+                C_SchedulerHook.INFERENCE_PREDICTOR, "dspark_runtime", None
+            )
+            return getattr(runtime, "reference_driver", None)
+
+        @wraps(original_get_next_batch)
+        def wrapped_get_next_batch(self, *args, **kwargs):
+            driver = reference_driver()
+            prior_requests = ()
+            if driver is not None:
+                prior_requests = tuple(
+                    req
+                    for native_batch in (
+                        kwargs.get("running_batch"),
+                        kwargs.get("last_batch"),
+                        *args,
+                    )
+                    if native_batch is not None
+                    for req in getattr(native_batch, "reqs", ())
+                )
+            plan = original_get_next_batch(self, *args, **kwargs)
+            if driver is not None:
+                started = time.perf_counter()
+                try:
+                    driver.selected(
+                        self, plan.batch_to_run, prior_requests=prior_requests
+                    )
+                    if original_overlap_decision is None:
+                        # Current SGLang drains an early result before selection.
+                        # After selection its loop always launches before draining
+                        # the remaining previous result; no late sync is inferred.
+                        driver.overlap_decision(plan.batch_to_run, False)
+                except Exception as error:
+                    driver.fail("native selection/preparation", error)
+                    raise
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + time.perf_counter()
+                    - started,
+                )
+            return plan
+
+        def wrapped_overlap_decision(self, batch, *args, **kwargs):
+            decision = original_overlap_decision(self, batch, *args, **kwargs)
+            driver = reference_driver()
+            if driver is not None:
+                started = time.perf_counter()
+                try:
+                    driver.overlap_decision(batch, decision)
+                except Exception as error:
+                    driver.fail("native overlap decision", error)
+                    raise
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + time.perf_counter()
+                    - started,
+                )
+            return decision
 
         def override_event_loop_overlap(self, *args, **kwargs):
+            driver = reference_driver()
+            if driver is not None:
+                driver.bind(self)
+                if original_event_loop_overlap is None:
+                    raise PredictorError(
+                        "invalid_reference_state", "native overlap loop is unavailable"
+                    )
+                return original_event_loop_overlap(self, *args, **kwargs)
             # To reduce the complexity of the simulation, the overlapping schedule is not needed.
             return original_event_loop_normal(self, *args, **kwargs)
 
@@ -343,13 +595,54 @@ class C_SchedulerHook(BaseHook):
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
                     ConfigManager.get_inference_time_predictor(model, hw, sched_config)
                 )
+                if getattr(
+                    C_SchedulerHook.INFERENCE_PREDICTOR, "supports_dspark", False
+                ):
+                    from sglang_simulator.simulation.sglang.dspark_worker import (
+                        C_DSparkDraftInputHook,
+                        C_DSparkRequestRetirerHook,
+                        C_DSparkWorkerHook,
+                    )
+
+                    missing = [
+                        hook.__name__
+                        for hook in (
+                            C_DSparkWorkerHook,
+                            C_DSparkDraftInputHook,
+                            C_DSparkRequestRetirerHook,
+                        )
+                        if not is_class_hook_matched(hook)
+                    ]
+                    if missing:
+                        raise PredictorError(
+                            "incompatible_runtime",
+                            "native simulator hooks did not match",
+                            hooks=missing,
+                        )
+                if Envs.coordinator_endpoint():
+                    from sglang_simulator.simulation.sglang.coordinated import (
+                        CoordinatedScheduler,
+                    )
+
+                    C_SchedulerHook.COORDINATOR = CoordinatedScheduler(
+                        scheduler=self,
+                        endpoint=Envs.coordinator_endpoint(),
+                        timeout_s=Envs.coordinator_wall_timeout(),
+                        pending_work=lambda: _has_pending_dspark_work(
+                            self, C_SchedulerHook.INFERENCE_PREDICTOR
+                        ),
+                    )
             except Exception as e:
                 logger.error(
                     f"Failed to initialize inference time predictor. Error: {e}"
                 )
-                raise e
+                raise
 
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
+            if C_SchedulerHook.COORDINATOR is not None:
+                return C_SchedulerHook.COORDINATOR.receive(
+                    lambda: original_recv_requests(self, *args, **kwargs)
+                )
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerHook.REQ_DISPATCHER.dispatch()
@@ -380,6 +673,8 @@ class C_SchedulerHook(BaseHook):
                     else:
                         # Chunked request
                         pass
+            elif C_SchedulerHook.COORDINATOR is not None:
+                pass  # Only the coordinator may advance virtual time.
             elif len(running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
                 # Prefetching
                 StateManager.step_global_clock(0.005)
@@ -411,51 +706,92 @@ class C_SchedulerHook(BaseHook):
                 **kwargs,
             )
             req_stats = request_stats_manager.get_req_stats(req.rid)
-            req_stats.recv_device_hit_len = req.prefix_len
+            req_stats.recv_device_hit_len = _request_prefix_len(req)
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
-            ret = original_run_batch(self, *args, **kwargs)
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
+            try:
+                ret = original_run_batch(self, *args, **kwargs)
+            except Exception as error:
+                driver = reference_driver()
+                if driver is not None:
+                    driver.fail("native run_batch", error)
+                raise
 
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
 
             if ret.__class__.__name__ == "GenerationBatchResult":
-                simulation_batch = SimulationScheduleBatch(reqs=[])
-                if batch.forward_mode.is_extend():
-                    for req in batch.reqs:
-                        extend_length = getattr(req, "extend_input_len", None)
-                        if extend_length is None:
-                            extend_length = req.extend_len
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=extend_length,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
-                            )
+                speculative_step = dspark_result_from_native(ret)
+                prepared_batch = getattr(
+                    C_SchedulerHook.INFERENCE_PREDICTOR,
+                    "requires_prepared_batch",
+                    False,
+                )
+                if speculative_step is not None:
+                    if not getattr(
+                        C_SchedulerHook.INFERENCE_PREDICTOR, "supports_dspark", False
+                    ):
+                        raise PredictorError(
+                            "unsupported_execution_profile",
+                            "predictor does not support DSPark steps",
                         )
-                elif batch.forward_mode.is_decode():
-                    for req in batch.reqs:
-                        simulation_batch.reqs.append(
-                            ScheduleRequest(
-                                extend_length=1,
-                                past_kv_length=req.prefix_len + len(req.output_ids),
+                    _validate_dspark_batch(speculative_step, batch)
+                    simulation_batch = _dspark_simulation_batch(speculative_step)
+                    prepared_batch = True
+                elif prepared_batch:
+                    simulation_batch = predictor_batch_from_result(
+                        ret, expected_batch_size=len(batch.reqs)
+                    )
+                else:
+                    simulation_batch = SimulationScheduleBatch(reqs=[])
+                    if batch.forward_mode.is_extend():
+                        for req in batch.reqs:
+                            extend_length = getattr(req, "extend_input_len", None)
+                            if extend_length is None:
+                                extend_length = req.extend_len
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=extend_length,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
                             )
-                        )
+                    elif batch.forward_mode.is_decode():
+                        for req in batch.reqs:
+                            simulation_batch.reqs.append(
+                                ScheduleRequest(
+                                    extend_length=1,
+                                    past_kv_length=req.prefix_len + len(req.output_ids),
+                                )
+                            )
 
-                if not simulation_batch.is_empty():
-                    StateManager.inc_iteration()
+                if not simulation_batch.is_empty() or speculative_step is not None:
+                    if not prepared_batch:
+                        StateManager.inc_iteration()
                     pred_start = time.perf_counter()
                     predicted_latency = (
-                        C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
+                        speculative_step.timing.seconds
+                        if speculative_step is not None
+                        else C_SchedulerHook.INFERENCE_PREDICTOR.predict_infer_time(
                             simulation_batch
                         )
                     )
-                    # Accumulate predictor execution time for performance analysis.
-                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += (
-                        time.perf_counter() - pred_start
+                    predictor_time_cost = (
+                        speculative_step.prediction_wall_seconds
+                        if speculative_step is not None
+                        else time.perf_counter() - pred_start
                     )
+                    C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST += predictor_time_cost
+                    if prepared_batch:
+                        C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = (
+                            predictor_time_cost
+                        )
                     predicted_latency = float(predicted_latency)
+                    if prepared_batch:
+                        StateManager.inc_iteration()
+                    C_SchedulerHook.CURRENT_PREDICTED_LATENCY = predicted_latency
 
                     forward_latency = 0
                     if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
@@ -466,6 +802,42 @@ class C_SchedulerHook(BaseHook):
                     else:
                         forward_latency = predicted_latency
 
+                    if speculative_step is not None:
+                        owner = getattr(self, _DSPARK_ACCOUNTING_OWNER, None)
+                        if owner is None:
+                            owner = object()
+                            setattr(self, _DSPARK_ACCOUNTING_OWNER, owner)
+                        setattr(
+                            ret,
+                            _DSPARK_ACCOUNTING,
+                            _DSparkResultAccounting(
+                                owner,
+                                speculative_step,
+                                forward_latency,
+                                StateManager.get_current_inference_dur(),
+                                C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
+                                tuple(getattr(ret, "_simopus_evaluated_costs", ())),
+                            ),
+                        )
+                        setattr(ret, _DSPARK_ACCOUNTED, False)
+                        setattr(
+                            self,
+                            _DSPARK_PENDING_RESULTS,
+                            getattr(self, _DSPARK_PENDING_RESULTS, 0) + 1,
+                        )
+                        if (
+                            C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
+                            and C_SchedulerHook.COORDINATOR is None
+                        ):
+                            # The next host accounting interval can contain several
+                            # launches. Exclude their replacement work once there,
+                            # rather than when each corresponding result is retired.
+                            setattr(
+                                self,
+                                _DSPARK_WALL_CREDIT,
+                                getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                                + predictor_time_cost,
+                            )
                     StateManager.set_current_inference_dur(forward_latency)
 
                 C_SchedulerHook.SIMULATION_BATCH = simulation_batch
@@ -473,47 +845,219 @@ class C_SchedulerHook(BaseHook):
             return ret
 
         def wrapped_process_batch_result(self, *args, **kwargs):
-            process_batch_result_start = time.perf_counter()
-            ret = original_process_batch_result(self, *args, **kwargs)
-            process_batch_result_end = time.perf_counter()
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            native_result = args[1] if len(args) > 1 else kwargs.get("result")
+            prediction = dspark_result_from_native(native_result)
+            accounting = getattr(native_result, _DSPARK_ACCOUNTING, None)
+            if prediction is not None or accounting is not None:
+                if (
+                    type(accounting) is not _DSparkResultAccounting
+                    or accounting.prediction is not prediction
+                    or accounting.owner
+                    is not getattr(self, _DSPARK_ACCOUNTING_OWNER, None)
+                    or getattr(self, _DSPARK_PENDING_RESULTS, 0) <= 0
+                    or getattr(native_result, _DSPARK_ACCOUNTED, None) is not False
+                ):
+                    raise PredictorError(
+                        "invalid_dspark_step",
+                        "DSPark result accounting is missing, changed or already consumed",
+                    )
+                _validate_dspark_batch(prediction, batch)
+            simulation_batch = (
+                _dspark_simulation_batch(prediction)
+                if accounting is not None
+                else C_SchedulerHook.SIMULATION_BATCH
+            )
+            current_inference_dur = (
+                accounting.forward_duration
+                if accounting is not None
+                else StateManager.get_current_inference_dur()
+            )
+            previous_inference_dur = (
+                accounting.previous_inference_duration
+                if accounting is not None
+                else StateManager.get_last_inference_dur()
+            )
+            predicted_latency = (
+                prediction.timing.seconds
+                if accounting is not None
+                else C_SchedulerHook.CURRENT_PREDICTED_LATENCY
+            )
+            preprocess_duration = (
+                accounting.preprocess_duration
+                if accounting is not None
+                else C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST
+            )
+            driver = reference_driver()
+            native_output_before = None
+            reference_wall = 0.0
+
+            def process_native_result():
+                nonlocal native_output_before, reference_wall
+                if driver is not None:
+                    started = time.perf_counter()
+                    try:
+                        native_output_before = {
+                            id(req): (len(req.output_ids), req.finished())
+                            for req in batch.reqs
+                        }
+                        driver.before_result(batch, native_result)
+                    except Exception as error:
+                        driver.fail("native result preparation", error)
+                        raise
+                    reference_wall += time.perf_counter() - started
+                try:
+                    ret = original_process_batch_result(self, *args, **kwargs)
+                    if driver is not None:
+                        started = time.perf_counter()
+                        driver.after_result()
+                        reference_wall += time.perf_counter() - started
+                        reference_wall += driver.take_callback_wall_seconds()
+                    return ret
+                except BaseException as error:
+                    if driver is not None:
+                        driver.fail("native result processing", error)
+                    raise
+
+            def consume_accounting():
+                if accounting is not None:
+                    setattr(native_result, _DSPARK_ACCOUNTED, True)
+                    setattr(
+                        self,
+                        _DSPARK_PENDING_RESULTS,
+                        getattr(self, _DSPARK_PENDING_RESULTS) - 1,
+                    )
+
+            def native_event_evidence():
+                if accounting is None:
+                    return {}
+                return {
+                    "native_worker_event": {
+                        "forward_id": prediction.step.forward_id,
+                        "event_committed": True,
+                        "step": asdict(prediction.step),
+                        "timing": asdict(prediction.timing),
+                        "progress": asdict(prediction.progress),
+                        "evaluated_costs": [
+                            json.loads(row) for row in accounting.evaluated_costs
+                        ],
+                        "scope": "modeled regional event; SDK scope retains unmodeled worker regions",
+                    }
+                }
+
+            if C_SchedulerHook.COORDINATOR is not None:
+
+                def process_and_account():
+                    ret = process_native_result()
+                    if accounting is not None:
+                        C_SchedulerHook.ITERATION_STATS.append(
+                            {
+                                "forward_mode": simulation_batch.forward_mode,
+                                "requests": simulation_batch.request_info(),
+                                "forward_latency": current_inference_dur,
+                                "predicted_forward_latency": predicted_latency,
+                                "l2_load_latency": 0.0,
+                                "l2_backup_latency": 0.0,
+                                "preprocess_latency": preprocess_duration,
+                                "postprocess_latency": 0.0,
+                                "cpu_overhead": 0.0,
+                                **native_event_evidence(),
+                            }
+                        )
+                    consume_accounting()
+                    return ret
+
+                try:
+                    ret = C_SchedulerHook.COORDINATOR.process_batch_result(
+                        batch,
+                        native_result,
+                        duration=current_inference_dur,
+                        process=process_and_account,
+                    )
+                except BaseException as error:
+                    if driver is not None:
+                        driver.fail("coordinated native result", error)
+                    raise
+                # OFFLINE coordination excludes replacement CPU work entirely.
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                return ret
+            blocked_l2_wall_dur = 0.0
+            if (
+                C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING
+                and batch is not None
+                and batch.reqs
+            ):
+                # Native result processing sends responses. Pace cache loads
+                # before delivery so a dependent request cannot arrive early.
+                blocked_l2_wall_dur = block_on_l2_load(
+                    C_SchedulerHook.SIM_MODE,
+                    effective_l2_load_delay(
+                        StateManager.get_hicache_l2_load_dur(),
+                        previous_inference_dur,
+                        C_SchedulerHook.OVERLAP_SCHEDULE,
+                    ),
+                )
+            process_batch_result_start = time.perf_counter()
+            ret = process_native_result()
+            if driver is not None:
+                setattr(
+                    self,
+                    _DSPARK_WALL_CREDIT,
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0) + reference_wall,
+                )
+            process_batch_result_end = time.perf_counter()
+
             if batch is not None:
-                if len(batch.reqs) == 0:
+                if len(batch.reqs) == 0 and accounting is None:
                     return ret
 
                 hicache_l2_load_dur = StateManager.pop_hicache_l2_load_dur()
                 hicache_l2_load_stats = StateManager.pop_hicache_l2_load_stats()
                 hicache_l2_backup_dur = StateManager.pop_hicache_l2_backup_dur()
-                current_inference_dur = StateManager.get_current_inference_dur()
                 visible_l2_load_dur = effective_l2_load_delay(
                     hicache_l2_load_dur,
-                    StateManager.get_last_inference_dur(),
+                    previous_inference_dur,
                     C_SchedulerHook.OVERLAP_SCHEDULE,
                 )
-                blocked_l2_wall_dur = block_on_l2_load(
-                    C_SchedulerHook.SIM_MODE,
-                    visible_l2_load_dur,
-                )
-
                 StateManager.step_global_clock(visible_l2_load_dur)
                 StateManager.step_global_clock(current_inference_dur)
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
+                predictor_wall_dur = (
+                    getattr(self, _DSPARK_WALL_CREDIT, 0.0)
+                    + (
+                        0.0
+                        if accounting is not None
+                        else C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST
+                    )
+                    if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE
+                    else 0
+                )
                 cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
+                    now
+                    - StateManager.get_last_real_time_ts()
+                    - blocked_l2_wall_dur
+                    - predictor_wall_dur,
                     0.0,
                 )
                 StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
 
                 request_response_time = StateManager.get_global_clock()
                 # Request statistics
                 for req in batch.reqs:
-                    if len(req.output_ids) != 0:  # not chunked
+                    if native_output_before is not None:
+                        count_before, finished_before = native_output_before[id(req)]
+                        emitted_output = (
+                            not finished_before and len(req.output_ids) > count_before
+                        )
+                    else:
+                        emitted_output = len(req.output_ids) != 0
+                    if emitted_output:
                         req_stats = request_stats_manager.get_req_stats(req.rid)
                         req_stats.gen_token_latencies.append(
                             request_response_time
@@ -526,33 +1070,60 @@ class C_SchedulerHook(BaseHook):
                 # Iteration statistics
                 C_SchedulerHook.ITERATION_STATS.append(
                     {
-                        "requests": C_SchedulerHook.SIMULATION_BATCH.request_info(),
+                        **(
+                            {
+                                "forward_mode": simulation_batch.forward_mode,
+                                "predicted_forward_latency": predicted_latency,
+                            }
+                            if simulation_batch.forward_mode is not None
+                            else {}
+                        ),
+                        "requests": simulation_batch.request_info(),
                         "forward_latency": current_inference_dur,
                         "l2_load_latency": hicache_l2_load_dur,
                         "l2_blocking_wall_latency": blocked_l2_wall_dur,
                         **hicache_l2_load_stats,
                         "l2_backup_latency": hicache_l2_backup_dur,
-                        "preprocess_latency": C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST,
+                        "preprocess_latency": preprocess_duration,
                         "postprocess_latency": process_batch_result_end
                         - process_batch_result_start,
                         "cpu_overhead": cpu_overhead,
+                        **native_event_evidence(),
                     }
                 )
             else:
                 now = time.time()
                 StateManager.step_global_clock(
-                    now - StateManager.get_last_real_time_ts()
+                    max(
+                        now
+                        - StateManager.get_last_real_time_ts()
+                        - getattr(self, _DSPARK_WALL_CREDIT, 0.0),
+                        0.0,
+                    )
                 )
                 StateManager.set_last_real_time_ts(now)
+                setattr(self, _DSPARK_WALL_CREDIT, 0.0)
+
+            consume_accounting()
 
             return ret
 
-        def override_profile(req, *args, **kwargs):
+        def override_profile(req, *args, _scheduler=None, **kwargs):
+            if _has_pending_dspark_work(
+                _scheduler, C_SchedulerHook.INFERENCE_PREDICTOR
+            ):
+                ProfileReqOutput = importlib.import_module(
+                    "sglang.srt.managers.io_struct"
+                ).ProfileReqOutput
+                return ProfileReqOutput(
+                    success=False,
+                    message="Native results must drain before profile reset",
+                )
             is_start_profile = req.req_type.name == "START_PROFILE"
             stats: list[RequestStats] = []
             for item in request_stats_manager.get_all_req_stats():
                 if item.rid is not None and item.input_length > 0:
-                    stats.append(item)
+                    stats.append(deepcopy(item))
 
             stats = sorted(stats, key=lambda req: req.created_time)
 
@@ -576,17 +1147,37 @@ class C_SchedulerHook(BaseHook):
                     C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST
                 )
                 metrics.update(
-                    calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
+                    calc_iteration_metrics(
+                        C_SchedulerHook.ITERATION_STATS.metric_rows()
+                        if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats)
+                        else C_SchedulerHook.ITERATION_STATS,
+                        metrics,
+                    )
                 )
                 metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
+                memory_budget = ConfigManager.get_memory_budget_metrics()
+                if memory_budget is not None:
+                    metrics["memory_budget"] = memory_budget
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:
                         f.write(json.dumps(metrics, cls=CustomJsonEncoder) + "\n")
 
-                    with open(f"{output_dir}/iteration.jsonl", "w") as f:
-                        for item in C_SchedulerHook.ITERATION_STATS:
-                            f.write(json.dumps(item) + "\n")
+                    with (
+                        gzip.open(
+                            f"{output_dir}/iteration.jsonl.gz",
+                            "wt",
+                            encoding="utf-8",
+                            compresslevel=1,
+                        )
+                        if Envs.evidence_compression() == "gzip"
+                        else open(f"{output_dir}/iteration.jsonl", "w")
+                    ) as f:
+                        if isinstance(C_SchedulerHook.ITERATION_STATS, IterationStats):
+                            C_SchedulerHook.ITERATION_STATS.write_jsonl(f)
+                        else:
+                            for item in C_SchedulerHook.ITERATION_STATS:
+                                f.write(json.dumps(item) + "\n")
 
                     with open(f"{output_dir}/request.jsonl", "w") as f:
                         for item in stats:
@@ -595,7 +1186,14 @@ class C_SchedulerHook(BaseHook):
                     logger.info(f"Simulation results saved to {output_dir}.")
 
                 except Exception as e:
-                    logger.error(f"Failed to dump results. Error: {e}")
+                    logger.exception("Failed to dump results")
+                    ProfileReqOutput = importlib.import_module(
+                        "sglang.srt.managers.io_struct"
+                    ).ProfileReqOutput
+                    return ProfileReqOutput(
+                        success=False,
+                        message=f"Failed to save simulation results: {e}",
+                    )
             else:
                 logger.warning("No request statistics available.")
 
@@ -604,14 +1202,18 @@ class C_SchedulerHook(BaseHook):
             request_stats_manager.reset()
             C_SchedulerHook.ITERATION_STATS.clear()
             C_SchedulerHook.TOTAL_PREDICTOR_TIME_COST = 0
+            C_SchedulerHook.CURRENT_PREDICTOR_TIME_COST = 0
             C_SchedulerHook.REQ_DISPATCHER.reset()
             C_SchedulerHook.REQ_DISPATCHER.profile_active = is_start_profile
             C_SchedulerHook.INFERENCE_PREDICTOR.reset_metrics()
+            setattr(_scheduler, _DSPARK_WALL_CREDIT, 0.0)
+            driver = reference_driver()
+            if driver is not None:
+                driver.take_callback_wall_seconds()
 
-            ProfileReqOutput = getattr(
-                importlib.import_module("sglang.srt.managers.io_struct"),
-                "ProfileReqOutput",
-            )
+            ProfileReqOutput = importlib.import_module(
+                "sglang.srt.managers.io_struct"
+            ).ProfileReqOutput
             result = {
                 "total_request": len(stats),
                 "output_directory": output_dir,
@@ -628,11 +1230,24 @@ class C_SchedulerHook(BaseHook):
             _request_dispatcher = getattr(self, "_request_dispatcher", None)
 
             if _request_dispatcher is not None:
-                for ty in _request_dispatcher._mapping.keys():
+                for ty in _request_dispatcher._mapping:
                     if ty.__name__ == "ProfileReq":
-                        _request_dispatcher._mapping[ty] = override_profile
+                        _request_dispatcher._mapping[ty] = partial(
+                            override_profile, _scheduler=self
+                        )
             return ret
 
+        def wrapped_on_idle(self, *args, **kwargs):
+            ret = original_on_idle(self, *args, **kwargs)
+            if C_SchedulerHook.COORDINATOR is not None:
+                C_SchedulerHook.COORDINATOR.on_idle()
+            return ret
+
+        if original_get_next_batch is not None:
+            target.get_next_batch_to_run = wrapped_get_next_batch
+        if original_overlap_decision is not None:
+            target.is_disable_overlap_for_batch = wrapped_overlap_decision
+        target.on_idle = wrapped_on_idle
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill

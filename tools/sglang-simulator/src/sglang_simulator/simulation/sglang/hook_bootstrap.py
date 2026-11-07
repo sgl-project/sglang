@@ -5,23 +5,29 @@ import os
 # Spawned interpreters inherit this marker before usercustomize runs.
 os.environ["SGLANG_SIMULATOR_BOOTSTRAP"] = "1"
 
+from usercustomize import apply_cpu_simulation_compat
+
+apply_cpu_simulation_compat()
+
+from sglang_simulator.simulation.sglang import sgl_kernel_hook
+
+sgl_kernel_hook.install_load_utils_stub()
+
 import sglang_simulator.hook as sglang_simulator_hook
 from sglang_simulator.simulation.sglang import (
     cache_controller,
+    dspark_worker,
     hicache_storage,
     mem_cache_allocator,
     mem_pool_host,
     model_runner,
     scheduler,
-    sgl_kernel_hook,
     unified_radix_cache,
 )
 
 # A spawned worker imports this module while unpickling its target. ModelConfig
 # can import GPU kernels while later arguments are still being unpickled, before
 # the target wrapper executes, so the loader stub must already be present here.
-sgl_kernel_hook.install_load_utils_stub()
-
 _HOOKS_INSTALLED = False
 
 
@@ -38,10 +44,14 @@ def install_simulator_hooks() -> None:
     sglang_simulator_hook.install_class_hooks(
         [
             scheduler.C_SchedulerHook,
+            dspark_worker.C_DSparkWorkerHook,
+            dspark_worker.C_DSparkDraftInputHook,
+            dspark_worker.C_DSparkRequestRetirerHook,
             scheduler.C_SglangPrefillAdderHook,
             scheduler.C_SchedulerRequestReceiver,
             model_runner.C_ModelRunnerHook,
             model_runner.C_KVCacheConfiguratorHook,
+            model_runner.C_DSV4PayloadHook,
             hicache_storage.C_StorageBackendFactory,
             cache_controller.C_HiCacheController,
             cache_controller.C_HybridCacheController,
@@ -49,10 +59,19 @@ def install_simulator_hooks() -> None:
             mem_cache_allocator.C_PagedTokenToKVPoolAllocatorHook,
             mem_pool_host.C_MHATokenToKVPoolHostHook,
             mem_pool_host.C_HostKVCacheHook,
-            mem_pool_host.C_PackedSingleKVPoolHook,
             mem_pool_host.C_GenericHostKVCacheSubclassHook,
         ]
     )
+    if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        from sglang_simulator.simulation.sglang.timing_metadata import (
+            C_TimingChatHook,
+            C_TimingOutputStreamerHook,
+            C_TimingTokenizerHook,
+        )
+
+        sglang_simulator_hook.install_class_hooks(
+            [C_TimingOutputStreamerHook, C_TimingTokenizerHook, C_TimingChatHook]
+        )
     _HOOKS_INSTALLED = True
 
 

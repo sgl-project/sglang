@@ -1,0 +1,2 @@
+# Checksum-addressed source-contract originals must survive every checkout intact.
+tools/sglang-simulator/test/fixtures/simopus-native-source/tp*/_meta/*.json -text

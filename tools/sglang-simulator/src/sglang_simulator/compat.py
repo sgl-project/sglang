@@ -1,7 +1,11 @@
 """Early compatibility checks for the SGLang surfaces used by the simulator."""
 
 import inspect
+import ipaddress
+import json
+import os
 from importlib import metadata
+from urllib.parse import urlsplit
 
 SIMULATOR_SERVER_ARG_OVERRIDES = {
     # The simulator models the target deployment topology separately through
@@ -25,6 +29,99 @@ class SGLangCompatibilityError(RuntimeError):
     pass
 
 
+def _native_predictor_config(target=None):
+    """Read the explicit predictor selection before native argument resolution.
+
+    A CLI config path is established here because ServerArgs resolution invokes
+    the CPU DSPark handler before launch_server's later config logging.
+    """
+    path = os.getenv("SGLANG_SIMULATOR_CONFIG_PATH")
+    if not path or not os.path.isfile(path):
+        candidate = (
+            target.get("sim_config_path")
+            if isinstance(target, dict)
+            else getattr(target, "sim_config_path", None)
+        )
+        if candidate:
+            path = os.path.abspath(candidate)
+            os.environ["SGLANG_SIMULATOR_CONFIG_PATH"] = path
+    if not path:
+        return {}
+    with open(path, encoding="utf-8") as stream:
+        return json.load(stream).get("predictor", {})
+
+
+def native_reference_requested(target=None) -> bool:
+    predictor = _native_predictor_config(target)
+    return (
+        predictor.get("name") == "simopus"
+        and predictor.get("native_segment_profile_id") is not None
+    )
+
+
+def _simulator_overrides(target=None):
+    overrides = SIMULATOR_SERVER_ARG_OVERRIDES
+    if native_reference_requested(target):
+        overrides = {**overrides, "disable_overlap_schedule": False}
+    return overrides
+
+
+def validate_coordinator_endpoint(endpoint: str) -> str:
+    """Limit the initial single-driver protocol to explicit loopback TCP."""
+    try:
+        parsed = urlsplit(endpoint)
+        address = ipaddress.ip_address(parsed.hostname or "")
+        valid = (
+            parsed.scheme == "tcp"
+            and address.is_loopback
+            and parsed.port is not None
+            and 0 < parsed.port < 65536
+            and not parsed.path
+            and not parsed.query
+            and not parsed.fragment
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError:
+        valid = False
+    if not valid:
+        raise ValueError("coordinator endpoint must be tcp://<loopback IP>:<port>")
+    return endpoint
+
+
+def _validate_coordinator_server_args(args, endpoint: str) -> None:
+    validate_coordinator_endpoint(endpoint)
+    if os.getenv("SGLANG_SIMULATOR_OUTPUT_MODE", "OFFLINE").upper() != "OFFLINE":
+        raise ValueError("coordinator requires OFFLINE")
+    for name in (
+        "enable_hierarchical_cache",
+        "enable_lora",
+    ):
+        if getattr(args, name, None):
+            raise ValueError(f"coordinator does not support {name}")
+    if getattr(args, "enable_dp_attention", None):
+        raise ValueError("coordinator does not support enable_dp_attention")
+    algorithm = getattr(args, "speculative_algorithm", None)
+    if algorithm and not (algorithm == "DSPARK" and native_reference_requested(args)):
+        raise ValueError("coordinator requires source-bound native DSPark speculation")
+    interval = getattr(args, "prefill_decode_interval", None)
+    if interval is not None and (type(interval) is not int or interval < 0):
+        raise ValueError(
+            "coordinator requires a nonnegative integer prefill_decode_interval"
+        )
+    if getattr(args, "disaggregation_mode", "null") != "null":
+        raise ValueError("coordinator does not support disaggregation")
+    if not getattr(args, "skip_server_warmup", False):
+        raise ValueError("coordinator requires skip_server_warmup")
+    if not getattr(args, "enable_cache_report", False):
+        raise ValueError("coordinator requires enable_cache_report")
+    for name in ("SGLANG_REQ_WAITING_TIMEOUT", "SGLANG_REQ_RUNNING_TIMEOUT"):
+        if float(os.getenv(name, "-1")) > 0:
+            raise ValueError(
+                f"coordinator requires a virtual deadline instead of {name}"
+            )
+
+
 def _sglang_version() -> str:
     try:
         return metadata.version("sglang")
@@ -45,19 +142,28 @@ def _require_parameters(function, required: set[str], surface: str) -> None:
 
 def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
+    overrides = _simulator_overrides(target)
+    if os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        overrides = {
+            **overrides,
+            "skip_server_warmup": True,
+            "enable_cache_report": True,
+        }
     if isinstance(target, dict):
-        target.update(SIMULATOR_SERVER_ARG_OVERRIDES)
+        target.update(overrides)
         return
 
-    for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
+    for name, value in overrides.items():
         setattr(target, name, value)
 
 
 def validate_simulator_server_args(server_args) -> None:
     """Fail early if a process bypassed a simulator-owned launch entry point."""
+    if endpoint := os.getenv("SGLANG_SIMULATOR_COORDINATOR"):
+        _validate_coordinator_server_args(server_args, endpoint)
     mismatches = [
         f"{name}={getattr(server_args, name, None)!r} (expected {expected!r})"
-        for name, expected in SIMULATOR_SERVER_ARG_OVERRIDES.items()
+        for name, expected in _simulator_overrides(server_args).items()
         if getattr(server_args, name, None) != expected
     ]
     if mismatches:

@@ -97,3 +97,38 @@ jobs:
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_cache_hit_ratio.py
           python3 -m pytest -q tools/sglang-simulator/test/test_simulation_offline_blocking.py
           python3 -m pytest -q tools/sglang-simulator/test/test_aisimulate_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_blocking_agentic.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_blocking_pacing.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinator.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_predictor_imports.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_packed_geometry.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_packed_payload.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_iteration_stats.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_timing_metadata.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_token_events.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_bridge.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_coordinated_serving.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_fork_join_example.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simulation_closed_loop_example.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_predictor_contract.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_cpu_bootstrap.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_scheduler_predictor_hooks.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simopus_predictor.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_resource_budget.py
+          python3 -m pytest -q tools/sglang-simulator/test/test_simopus_e2e.py
+
+      - name: Run bounded native stage contract controls
+        timeout-minutes: 10
+        env:
+          MALLOC_ARENA_MAX: "2"
+          MAX_JOBS: "1"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTEST_ADDOPTS: "-s"
+          TORCH_EXTENSIONS_DIR: ${{ runner.temp }}/torch-extensions
+        # The optional SDK controls declare their dependency and skip when it
+        # is absent. Pure event/progress and native type controls still run.
+        run: |
+          OMP_NUM_THREADS=2 python3 -m pytest -q \
+            tools/sglang-simulator/test/test_dspark_*.py \
+            tools/sglang-simulator/test/test_native_*.py \
+            tools/sglang-simulator/test/test_simopus_native_factory.py
