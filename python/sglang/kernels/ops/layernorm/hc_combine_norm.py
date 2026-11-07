@@ -8,6 +8,21 @@ from sglang.kernels.ops.quantization.mxfp8_epilogue import mxfp8_epilogue
 
 
 @triton.jit
+def _combine(X, P, h, mask, K: tl.constexpr):
+    # All four stream loads go out before the scalar pre loads they are scaled by.
+    x0 = tl.load(X + 0 * K + h, mask, 0).to(tl.float32)
+    x1 = tl.load(X + 1 * K + h, mask, 0).to(tl.float32)
+    x2 = tl.load(X + 2 * K + h, mask, 0).to(tl.float32)
+    x3 = tl.load(X + 3 * K + h, mask, 0).to(tl.float32)
+    value = tl.full(h.shape, 0, tl.float32)
+    value += x0 * tl.load(P + 0).to(tl.float32)
+    value += x1 * tl.load(P + 1).to(tl.float32)
+    value += x2 * tl.load(P + 2).to(tl.float32)
+    value += x3 * tl.load(P + 3).to(tl.float32)
+    return value
+
+
+@triton.jit
 def _hc_combine_norm(
     X,
     P,
@@ -20,16 +35,13 @@ def _hc_combine_norm(
 ):
     row, part = tl.program_id(0), tl.program_id(1)
     h = tl.arange(0, 8192)
-    value = tl.full((8192,), 0, tl.float32)
-    for c in tl.static_range(4):
-        pre = tl.load(P + row * SP + c).to(tl.float32)
-        x = tl.load(X + row * SX + c * 5120 + h, h < 5120, 0).to(tl.float32)
-        value += x * pre
+    mask = (h >= part * (5120 // PARTS)) & (h < (part + 1) * (5120 // PARTS))
+    # Issued before the reduction so its latency overlaps the cross-warp sum.
+    weight = tl.load(W + h, mask, 0).to(tl.float32)
+    value = _combine(X + row * SX, P + row * SP, h, h < 5120, 5120)
     # The unfused combine stores BF16 before RMSNorm reads it.
     value = value.to(tl.bfloat16).to(tl.float32)
     inv_rms = tl.rsqrt(tl.sum(value * value, 0) / 5120 + EPS)
-    mask = (h >= part * (5120 // PARTS)) & (h < (part + 1) * (5120 // PARTS))
-    weight = tl.load(W + h, mask, 0).to(tl.float32)
     tl.store(Y + row * 5120 + h, value * inv_rms * weight, mask)
 
 
@@ -101,17 +113,14 @@ def _hc_combine_norm_mxfp8_kernel(
     if row < M:
         h = tl.arange(0, BLOCK)
         m = h < K
-        value = tl.full((BLOCK,), 0, tl.float32)
-        for c in tl.static_range(4):
-            pre = tl.load(P + row * SP + c).to(tl.float32)
-            x = tl.load(X + row * SX + c * K + h, m, 0).to(tl.float32)
-            value += x * pre
+        slice_mask = (h >= part * SLICE) & (h < (part + 1) * SLICE)
+        # Issued before the reduction so its latency overlaps the cross-warp sum.
+        weight = tl.load(W + h, m & slice_mask, 0).to(tl.float32)
+        value = _combine(X + row * SX, P + row * SP, h, m, K)
         # The unfused combine stores BF16 before RMSNorm reads it.
         value = value.to(tl.bfloat16).to(tl.float32)
         inv_rms = tl.rsqrt(tl.sum(value * value, 0) / K + EPS)
-        weight = tl.load(W + h, m, 0).to(tl.float32)
         y = (value * inv_rms * weight).to(tl.bfloat16)
-        slice_mask = (h >= part * SLICE) & (h < (part + 1) * SLICE)
         tl.store(Y + row * K + h, y, m & slice_mask)
         g_lo, g_hi = part * (SLICE // 32), (part + 1) * (SLICE // 32)
         mxfp8_epilogue(y, row, Q, S, K, BLOCK, GROUPS, g_lo, g_hi)
