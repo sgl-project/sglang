@@ -29,10 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.kv.alloc import band as band_module
-from sglang.srt.mem_cache.kv.alloc.band import (
-    relieve_for_alloc,
-    settle_pending_for_recovery,
-)
+from sglang.srt.mem_cache.kv.alloc.band import settle_pending_for_recovery
 from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.pricing import no_relief_plan
 from sglang.srt.mem_cache.layout.fused_draft import (
@@ -878,40 +875,6 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         flt.free(v[:2], _pages=v[:2])
         with _strict(), self.assertRaises(AssertionError):
             flt._make_room("low", flt.entry_bytes_per_page)
-
-    def test_a_pinned_end_donor_is_left_out_of_the_recovery(self):
-        """An owner shortfall asks its pinned window to flush, which reclaims
-        nothing: the recovery reads nothing of the window and leaves its
-        pending pages pending (no forward wait)."""
-        allocator = build_swa_pool(page_size=4, lazy=True)
-        owner, window = allocator.full_attn_allocator, allocator.swa_attn_allocator
-        ids = allocator.alloc(allocator.available_size())
-        _launch(allocator.forward_steps)
-        allocator.free_window(window.sub_pool_name, ids[:8])
-        window.add_pin_source(lambda: True)
-        pending = window._pending_until_retire
-        events = []
-        band = type(window)
-        real_settle, real_tolist = band.settle_pending, torch.Tensor.tolist
-        with (
-            _strict(),
-            mock.patch.object(
-                band,
-                "settle_pending",
-                autospec=True,
-                side_effect=lambda b, *a, **k: (
-                    events.append(("settle", b)) or real_settle(b, *a, **k)
-                ),
-            ),
-            mock.patch.object(
-                torch.Tensor,
-                "tolist",
-                lambda t: events.append(("read", None)) or real_tolist(t),
-            ),
-        ):
-            relieve_for_alloc(owner, 4)
-        self.assertIs(window._pending_until_retire, pending)
-        self.assertEqual(events, [])
 
     def test_a_drained_move_source_keeps_the_host_view(self):
         """A partial compaction under an unfinished forward leaves its moved

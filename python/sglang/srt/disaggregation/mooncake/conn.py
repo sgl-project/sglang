@@ -2997,7 +2997,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if staging_deferred:
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                # A room started anew since this chunk was counted no longer
+                # counts it: the decrement and the report find nothing.
+                if kv_chunk.room in self._staging_outstanding:
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                self.note_send_finished(kv_chunk.room, kv_chunk.send_record)
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3287,8 +3291,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                send_record=self.send_record(bootstrap_room),
             )
         )
+        self.note_send_enqueued(bootstrap_room)
 
     def get_session_id(self):
         return self.engine.get_session_id()

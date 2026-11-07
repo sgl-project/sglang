@@ -112,7 +112,6 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
-    disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
 )
@@ -518,6 +517,8 @@ class Scheduler(
         self.is_initializing = True
         # init_soft_watchdog starts a daemon thread that reads these on its first tick.
         self.forward_ct: int = 0
+        # Beats while the scheduler waits inside a step (`feed_watchdog`).
+        self.watchdog_heartbeats: int = 0
         # Prefill tokens processed so far; used as the aging axis for the HRRN scheduling policy. Reqs snapshot this at waiting_queue entry.
         self.processed_tokens_counter: int = 0
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
@@ -730,7 +731,6 @@ class Scheduler(
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
-        self.maybe_init_disaggregation_pin_source()
 
         # Init overlap schedule
         self.init_overlap()
@@ -1543,6 +1543,11 @@ class Scheduler(
 
         self.new_token_ratio_tracker = NewTokenRatioTracker.from_config()
 
+    def feed_watchdog(self) -> None:
+        """Tell the watchdogs the scheduler is alive while it waits on the host
+        inside a step (a page move waiting for network transfers)."""
+        self.watchdog_heartbeats += 1
+
     def init_soft_watchdog(self):
         if (x := get_device().soft_watchdog_timeout) is not None:
             self.soft_watchdog = create_scheduler_watchdog(
@@ -1706,9 +1711,6 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            # Requests with a sent chunk that are not yet on the transfer queue.
-            self.disagg_prefill_pending_chunk_rids: Set[str] = set()
-
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
@@ -1721,16 +1723,6 @@ class Scheduler(
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
-            )
-
-    def maybe_init_disaggregation_pin_source(self):
-        # A role switch rebuilds PD queues, but the allocator keeps its pins.
-        if self.disaggregation_mode != DisaggregationMode.NULL:
-            storage = kv_storage_of(
-                self.req_to_token_pool, self.token_to_kv_pool_allocator
-            )
-            storage.add_pin_source(
-                storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
 
     def init_overlap(self):

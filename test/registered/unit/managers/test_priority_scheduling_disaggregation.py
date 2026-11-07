@@ -383,7 +383,6 @@ class TestOptimisticPrefillCacheOwnership(unittest.TestCase):
         scheduler = SimpleNamespace(
             tree_cache=cache,
             request_retirer=release_only_retirer(cache),
-            clear_pending_chunk_send=MagicMock(),
             ps=SimpleNamespace(tp_rank=0),
             req_to_metadata_buffer_idx_allocator=MagicMock(),
             output_streamer=MagicMock(),

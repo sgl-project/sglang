@@ -29,7 +29,11 @@ from sglang.srt.mem_cache.kv.alloc.page_usage import (
     PageUsage,
     Wait,
 )
-from sglang.srt.mem_cache.kv.alloc.signals import StreamTransfer, signals_of
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkTransfer,
+    StreamTransfer,
+    signals_of,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -104,24 +108,25 @@ class _Waits:
     def __init__(self):
         self.keys = []
 
-    def __call__(self, key, stream=None):
+    def __call__(self, key, stream=None, *, network_waiter=None):
         for signal in signals_of(key):
-            if not signal.query():
+            if isinstance(signal, NetworkTransfer):
+                if not signal.released:
+                    self.keys.append(signal)
+                    signal.released = True
+            elif not signal.query():
                 self.keys.append(signal)
-
-
-# Hazards a fence records here; a network transfer is recorded by PD's
-# transfers, and a fixed page is not a fence.
-_FENCED = (H.FORWARD, H.COPY_READ, H.COPY_WRITE)
 
 
 def _fence(usage: PageUsage, hazard: Hazard):
     """One fence of ``hazard`` over bytes [0, 8) of ``usage``; its key."""
-    key = _Event()
     if hazard is H.FORWARD:
+        key = _Event()
         usage.register_forward(key)
+    elif hazard is H.NETWORK:
+        key = NetworkTransfer()
     else:
-        key = StreamTransfer(key)
+        key = StreamTransfer(_Event())
     writes = hazard is H.COPY_WRITE
     usage.vacate(key, [(0, 1)], page_bytes=8, writes=writes)
     return key
@@ -185,7 +190,7 @@ class TestClearanceTable(CustomTestCase):
         whether the fence stays for the next writer."""
         for consumer, row in _EXPECTED.items():
             for hazard, wait in row.items():
-                if hazard not in _FENCED:
+                if hazard is H.FIXED:
                     continue
                 with self.subTest(consumer=consumer, hazard=hazard):
                     usage = PageUsage()
@@ -216,17 +221,21 @@ class TestClearanceTable(CustomTestCase):
         forgotten forward as retired: the forward question refuses it, and
         a release key holding one asks each member its own question."""
         usage = PageUsage()
-        usage.record_transfer(_Event(), [0], writes=False)
+        usage.record_transfer(
+            _Event(), [0], writes=False, release=None, unit_tokens=None
+        )
         (copy,) = usage.transfers()
-        forward = _Event()
+        forward, network = _Event(), NetworkTransfer()
         usage.register_forward(forward)
-        for key in (copy.signal, (forward, copy.signal)):
+        for key in (copy.signal, network, (forward, copy.signal)):
             with self.subTest(key=key), self.assertRaises(TypeError):
                 usage.forward_retired(key)
         self.assertTrue(usage.ended(copy.signal))
         self.assertFalse(usage.ended((forward, copy.signal)))
+        self.assertFalse(usage.ended(network))
         usage.retire_forward(forward)
-        self.assertTrue(usage.ended((forward, copy.signal)))
+        network.released = True
+        self.assertTrue(usage.ended((forward, copy.signal, network)))
         with self.assertRaises(TypeError):
             usage.transfer_ended(forward)
 
@@ -245,7 +254,7 @@ class TestClearanceTable(CustomTestCase):
     def test_the_pure_read_matches_the_consuming_one(self):
         for consumer, row in _EXPECTED.items():
             for hazard in row:
-                if hazard not in _FENCED:
+                if hazard is H.FIXED:
                     continue
                 usage = PageUsage()
                 _fence(usage, hazard)
@@ -580,6 +589,25 @@ class TestTakesReadNoEventCompletion(_Bands):
         self.assertEqual(full_part, sorted(full_part, reverse=True))
         full_whole, _ = fired["whole"]
         self.assertEqual(full_whole, sorted(full_whole, reverse=True))
+
+
+class TestReservationRelease(_Bands):
+    def test_a_cancelled_reservation_fences_the_transfer_on_it(self):
+        """A reservation given back while a host copy still writes it: the
+        free records the copy, and the next writer of the page waits it."""
+        alloc = _chain()
+        flt = alloc.swa_attn_allocator
+        alloc.alloc(4)
+        reserved = flt.alloc_physical(2)
+        pages = sorted(set((reserved // flt.page_size).tolist()))
+        copy = _Event()
+        flt.record_transfer(
+            copy, torch.tensor(pages), writes=True, unit_tokens=flt.page_size
+        )
+        flt.cancel_physical_reservation(reserved)
+        self.assertEqual(self.waits.keys, [])
+        clearance = flt._range_clearance(pages[0], pages[0] + 1, (C.FORWARD,))
+        self.assertEqual([key.events for key in clearance.stream], [copy])
 
 
 class TestEndBandsCompactLazily(CustomTestCase):

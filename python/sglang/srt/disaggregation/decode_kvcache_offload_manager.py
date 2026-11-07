@@ -153,10 +153,6 @@ class DecodeKVCacheOffloadManager:
         # Page-aligned prompt length; the prefill instance offloaded this part.
         return len(req.origin_input_ids) // self.page_size * self.page_size
 
-    def has_inflight_device_transfer(self) -> bool:
-        """Whether a device-to-host copy may still read unified KV pages."""
-        return bool(self.ongoing_offload)
-
     def _resolve_offload_transfers(
         self, virtual_indices: torch.Tensor
     ) -> tuple[torch.Tensor, list[PoolTransfer]]:

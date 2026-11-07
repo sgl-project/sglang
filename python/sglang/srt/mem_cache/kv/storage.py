@@ -20,6 +20,11 @@ from sglang.srt.mem_cache.kv.advance import (
     coalesce_ranges,
     retire_window_rows,
 )
+from sglang.srt.mem_cache.kv.alloc.signals import (
+    NetworkTransfer,
+    NetworkWaiter,
+    ReceiveHold,
+)
 from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
@@ -94,6 +99,16 @@ class KVStorage:
         self.requests = requests
         self.scratch = scratch
         self._request_memory = request_memory
+        # Both registries below are keyed by the request object (`_lifetime`),
+        # never by ``rid``: a retry may reuse a ``rid`` while the earlier
+        # request's rows are still in deferred release, and ending one request
+        # must never end another's transfers or hold.
+        # Network transfers in flight, per request, one per send or receive:
+        # each is released where every rank sees it end.
+        self._network_transfers: Dict[int, Tuple[Any, List[NetworkTransfer]]] = {}
+        # Receive rows held for a destination publish still to come, per
+        # request: their logical release.
+        self._receive_holds: Dict[int, Tuple[Any, ReceiveHold]] = {}
         # Readers reaching a window further back than its own layers (a fused
         # draft's front rows), by sub-pool, and the length of a window the
         # model does not state: bound once at startup (`bind_window_retention`).
@@ -319,9 +334,14 @@ class KVStorage:
             ),
         )
 
-    def release_row(self, req: Req) -> None:
-        """Give back the request's row; its ids went back before."""
-        self.requests.free(req)
+    def release_row(self, holder) -> None:
+        """Give back the row of ``holder`` (a request, or a streaming
+        session's slot); its ids went back before. A request's network
+        transfers end here at the latest, and only its own: another request
+        with the same ``rid`` keeps its own. A session's slot has none, since
+        its request ended them when the row passed on."""
+        self.end_network_transfer(holder)
+        self.requests.free(holder)
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few
@@ -861,14 +881,99 @@ class KVStorage:
             return ids
         return ids // band.page_size * band.pool_page_size
 
-    def add_pin_source(
-        self, sub_pools: Sequence[str], busy: Callable[[], bool]
+    def record_network_transfer(
+        self,
+        req: Req,
+        *,
+        pages,
+        page_size: int,
+        states: Sequence[Tuple[str, object]] = (),
+        writes: bool,
+        peer=None,
     ) -> None:
-        """Keep the named sub-pools' device rows where they are whenever
-        ``busy()`` holds: a DMA engine (a PD transfer, a HiCache copy) reads
-        or writes the addresses it was handed. Register each initiator once,
-        over the queues that live across iterations; tree locks are not pins."""
-        self._allocator.add_pin_source(sub_pools, busy)
+        """Record one send (or with ``writes`` one receive) a network engine
+        runs for ``req`` outside every stream: it reads (writes) the owner's
+        physical ``pages`` of ``page_size`` tokens and each ``(sub_pool,
+        slots)`` of ``states`` until it ends. The rows may still move: a copy of
+        a row the engine writes, or a reuse of the bytes a moved row it reads
+        leaves, waits on the host for the transfer (`set_network_waiter`, which
+        judges it by ``peer``). Every one of the request's transfers ends with
+        `end_network_transfer`. ``pages`` and ``slots`` may be device tensors
+        the schedule stream produced."""
+        transfer = NetworkTransfer(peer)
+        self._network_transfers.setdefault(_lifetime(req), (req, []))[1].append(
+            transfer
+        )
+        rows = [(self.owner, pages, page_size)]
+        rows += [
+            (sub_pool, slots, self.unit_tokens(sub_pool)) for sub_pool, slots in states
+        ]
+        for sub_pool, units, unit_tokens in rows:
+            self._member(sub_pool).record_transfer(
+                transfer,
+                units,
+                writes=writes,
+                release=transfer,
+                unit_tokens=unit_tokens,
+            )
+
+    def set_network_waiter(self, waiter: Optional[NetworkWaiter]) -> None:
+        """What a move waits with, on the host, for a network transfer it
+        cannot avoid: installed by whatever runs the transfers, judging each
+        by the ``peer`` it was recorded with, alike on every rank."""
+        self._allocator.set_network_waiter(waiter)
+
+    def hold_receive_rows(
+        self, req: Req, *, token_start: int, token_end: int, signal
+    ) -> None:
+        """A decode node took ``req``'s receive rows (its tokens
+        ``[token_start, token_end)``, every window's rows among them, and its
+        state slots) and will publish their physical ids to the peer later,
+        reading them back off the schedule stream. Until `end_receive_hold` an
+        opportunistic compaction leaves their bands alone. A move an
+        allocation needs may still move them, waiting for nothing, since no
+        peer has their ids yet: it bumps `move_epoch`, and the publish orders
+        its readback after the schedule stream. ``signal`` is the allocation's
+        event. The rows are recorded by id, so nothing pays a device read for
+        them."""
+        release = ReceiveHold()
+        self._receive_holds[_lifetime(req)] = (req, release)
+        tokens = self.requests.req_to_token[req.kv.req_pool_idx, token_start:token_end]
+        roles = self._allocator.roles
+        members = [roles.owner, *self._allocator.window_allocators]
+        for sub_pool in members:
+            # Request rows are alloc-surface ids (DCP-widened under DCP).
+            self._member(sub_pool).record_transfer(
+                signal, tokens, writes=True, release=release, widened=True
+            )
+        if roles.state is not None and req.kv.holds_mamba:
+            slots = self.requests.req_index_to_mamba_index_mapping[
+                req.kv.req_pool_idx
+            ].reshape(-1)
+            self._member(roles.state).record_transfer(
+                signal, slots, writes=True, release=release
+            )
+
+    def end_receive_hold(self, req: Req) -> None:
+        """The hold `hold_receive_rows` took ends: the publish recorded the
+        rows' transfer itself, or the request left before publishing."""
+        held = self._receive_holds.pop(_lifetime(req), None)
+        if held is not None:
+            held[1].released = True
+
+    def end_network_transfer(self, req: Req) -> None:
+        """The request's network transfers ended, or its row is released (the
+        release point of a failed transfer): every rank reaches this alike.
+        Only ``req``'s own: a request reusing its ``rid`` keeps its own."""
+        self.end_receive_hold(req)
+        _, transfers = self._network_transfers.pop(_lifetime(req), (req, ()))
+        for transfer in transfers:
+            transfer.released = True
+
+    def unit_tokens(self, sub_pool: str) -> int:
+        """Tokens one transfer unit of ``sub_pool`` spans: its page, or one for
+        a state slot."""
+        return self._plan.sub_pool(sub_pool).unit
 
     def _member(self, sub_pool: str):
         """The chain member that holds ``sub_pool``'s rows."""
@@ -911,6 +1016,14 @@ class KVStorage:
             state_writes_unknown=state_writes_unknown,
         )
 
+    def move_epoch(self) -> int:
+        """How many page-move batches may have moved a held receive row (see
+        `hold_receive_rows`): ones issued while a hold was open. A held row's
+        ids, resolved on another stream, stay valid while it is unchanged;
+        after such a move the reader must order itself after the schedule
+        stream."""
+        return sum(band.held_row_moves for band in self._allocator.bands)
+
     def retire_forward(self, forward_done: torch.cuda.Event) -> None:
         """The scheduler processed the result of the forward recorded with
         ``forward_done``: it and every forward recorded before it retire. Page
@@ -931,6 +1044,13 @@ class KVStorage:
             slots = self._allocator.state_slots
             return slots.alloc, slots.free
         return None
+
+
+def _lifetime(req) -> int:
+    """The key of one request's lifetime in the transfer registries: its
+    identity, not its ``rid``. Each entry keeps the request beside its records,
+    so the key cannot name another object while the entry lives."""
+    return id(req)
 
 
 def _page_pairs(
