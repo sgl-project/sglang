@@ -114,6 +114,28 @@ def test_repeated_source_bytes_count_only_local_slots(shard_rank, expected_bytes
     assert controller._transfer_num_bytes(op) == expected_bytes
 
 
+@pytest.mark.parametrize("dcp_size", [1, 2, 4])
+def test_dcp_transfer_bytes(dcp_size):
+    controller = object.__new__(HybridCacheController)
+    controller.is_kv_sharded = False
+    kv = SimpleNamespace(
+        name=PoolName.KV,
+        host_pool=SimpleNamespace(size_per_token=16, dcp_size=dcp_size),
+    )
+    state = SimpleNamespace(host_pool=SimpleNamespace(size_per_token=8))
+    controller.mem_pool_host = SimpleNamespace(
+        anchor_entry=kv, entry_map={PoolName.MAMBA: state}
+    )
+    op = CacheOperation(
+        host_indices=torch.arange(8),
+        device_indices=torch.arange(8),
+        node_id=0,
+        pool_transfers=[PoolTransfer(PoolName.MAMBA, host_indices=torch.arange(2))],
+    )
+    # KV rows are sharded; recurrent state slots are not.
+    assert controller._transfer_num_bytes(op) == 8 // dcp_size * 16 + 2 * 8
+
+
 if __name__ == "__main__":
     args = [arg for arg in sys.argv[1:] if arg != "-f"]
     raise SystemExit(pytest.main([__file__, "-v", "-x", *args]))
