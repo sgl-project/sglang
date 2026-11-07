@@ -182,6 +182,14 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
         x_valid = x_target if self.learned_padding else x_length
         cap_valid = cap_target if self.learned_padding else cap_length
         x_freqs, cap_freqs = self.rotary_emb(x_ids), self.rotary_emb(cap_ids)
+        # Freqs are rebuilt every forward, so the identity-keyed _get_rope_cache
+        # would never hit.
+        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
+            self._build_rope_cache(x_freqs)
+        )
+        cap_rope_cos_sin_cache, cap_rope_positions, cap_rope_freqs_complex = (
+            self._build_rope_cache(cap_freqs)
+        )
         x_mask, x_meta = self._get_attn_mask_and_meta(
             "_ming_x_mask", [x_valid] * batch_size, x_target, x.device
         )
@@ -196,12 +204,23 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
                 x,
                 x_freqs,
                 adaln,
+                rope_cos_sin_cache=x_rope_cos_sin_cache,
+                rope_positions=x_rope_positions,
                 attn_mask=x_mask,
                 attn_mask_meta=x_meta,
                 skip_sequence_parallel_override=True,
+                rope_freqs_complex=x_rope_freqs_complex,
             )
         for layer in self.context_refiner:
-            cap = layer(cap, cap_freqs, attn_mask=cap_mask, attn_mask_meta=cap_meta)
+            cap = layer(
+                cap,
+                cap_freqs,
+                rope_cos_sin_cache=cap_rope_cos_sin_cache,
+                rope_positions=cap_rope_positions,
+                attn_mask=cap_mask,
+                attn_mask_meta=cap_meta,
+                rope_freqs_complex=cap_rope_freqs_complex,
+            )
         if sp_size > 1:
             # masked alignment rows never contribute; learned registers must stay
             x, cap = x[:, :x_valid], cap[:, :cap_valid]
@@ -224,13 +243,19 @@ class MingImageTransformer2DModel(ZImageTransformer2DModel):
             unified, shard = shard_seq(unified)
             freqs = tuple(shard_like(freq, shard, dim=0) for freq in freqs)
             mask, meta = None, tail_attn_meta(shard, batch_size, x.device)
+        rope_cos_sin_cache, rope_positions, rope_freqs_complex = self._build_rope_cache(
+            freqs
+        )
         for layer in self.layers:
             unified = layer(
                 unified,
                 freqs,
                 adaln,
+                rope_cos_sin_cache=rope_cos_sin_cache,
+                rope_positions=rope_positions,
                 attn_mask=mask,
                 attn_mask_meta=meta,
+                rope_freqs_complex=rope_freqs_complex,
             )
         if sp_size == 1:
             unified = unified[:, :x_target]

@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.layers.attention import (
     build_varlen_mask_meta_from_ranges,
 )
 from sglang.multimodal_gen.runtime.layers.layernorm import (
+    apply_qk_norm,
     apply_qk_norm_with_optional_rope,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
@@ -32,10 +33,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.nunchaku_config i
     NunchakuConfig,
     is_nunchaku_available,
 )
-from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
-    _apply_rotary_emb,
-    apply_flashinfer_rope_qk_inplace,
-)
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
@@ -334,6 +332,13 @@ class ZImageAttention(nn.Module):
             causal=False,
         )
 
+        self.rotary_emb = RotaryEmbedding(
+            head_size=self.head_dim,
+            rotary_dim=self.head_dim,
+            is_neox_style=False,
+            use_precomputed_cache=False,
+        )
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -345,13 +350,15 @@ class ZImageAttention(nn.Module):
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
+        *,
+        rope_freqs_complex: Optional[torch.Tensor] = None,
     ):
         # The fused native qk-norm kernel reads the strided fused-qkv slices
         # directly and writes contiguous outputs, so q/k materialization is
-        # deferred to it on the main (rope-cache) path.
+        # deferred to it on CUDA.
         try_native_qk_norm = (
             self.qk_norm
-            and rope_cos_sin_cache is not None
+            and _is_cuda
             and self.enable_zimage_qk_fusion
             and not torch.compiler.is_compiling()
         )
@@ -377,120 +384,50 @@ class ZImageAttention(nn.Module):
         k = k.view(*k.shape[:-1], self.local_num_kv_heads, self.head_dim)
         v = v.view(*v.shape[:-1], self.local_num_kv_heads, self.head_dim)
 
-        if rope_cos_sin_cache is not None:
-            if self.qk_norm:
-                fused_qk = None
-                if try_native_qk_norm:
-                    fused_qk = zimage_native_qk_rmsnorm(
-                        q, k, self.norm_q, self.norm_k, self.head_dim
-                    )
-                if fused_qk is not None:
-                    q, k = fused_qk
-                    # positions=None is handled identically to the eager
-                    # fallback (arange over seqlen, repeated across batch).
-                    q, k = apply_flashinfer_rope_qk_inplace(
-                        q,
-                        k,
-                        rope_cos_sin_cache,
-                        head_size=self.head_dim,
-                        is_neox=False,
-                        positions=rope_positions,
-                    )
-                else:
-                    q = q.contiguous()
-                    k = k.contiguous()
-                    q, k = apply_qk_norm_with_optional_rope(
-                        q=q,
-                        k=k,
-                        q_norm=self.norm_q,
-                        k_norm=self.norm_k,
-                        head_dim=self.head_dim,
-                        cos_sin_cache=rope_cos_sin_cache,
-                        is_neox=False,
-                        positions=rope_positions,
-                        allow_inplace=False,
-                    )
-            else:
-                q, k = apply_flashinfer_rope_qk_inplace(
-                    q,
-                    k,
-                    rope_cos_sin_cache,
-                    is_neox=False,
-                    positions=rope_positions,
-                )
-        elif freqs_cis is not None:
-            cos, sin = freqs_cis
-            if cos.dim() == 3:
-                batch_size, seq_len = q.shape[:2]
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                ).reshape(batch_size * seq_len, -1)
-                positions = torch.arange(
-                    batch_size * seq_len, device=q.device, dtype=torch.long
-                )
-                if self.qk_norm:
-                    q, k = apply_qk_norm_with_optional_rope(
-                        q=q,
-                        k=k,
-                        q_norm=self.norm_q,
-                        k_norm=self.norm_k,
-                        head_dim=self.head_dim,
-                        cos_sin_cache=cos_sin_cache,
-                        is_neox=False,
-                        positions=positions,
-                        allow_inplace=self.enable_zimage_qk_fusion,
-                    )
-                else:
-                    q, k = apply_flashinfer_rope_qk_inplace(
-                        q, k, cos_sin_cache, is_neox=False, positions=positions
-                    )
-            elif _is_cuda and q.shape == k.shape:
-                cos_sin_cache = torch.cat(
-                    [
-                        cos.to(dtype=torch.float32).contiguous(),
-                        sin.to(dtype=torch.float32).contiguous(),
-                    ],
-                    dim=-1,
-                )
-                if self.qk_norm:
-                    q, k = apply_qk_norm_with_optional_rope(
-                        q=q,
-                        k=k,
-                        q_norm=self.norm_q,
-                        k_norm=self.norm_k,
-                        head_dim=self.head_dim,
-                        cos_sin_cache=cos_sin_cache,
-                        is_neox=False,
-                        allow_inplace=self.enable_zimage_qk_fusion,
-                    )
-                else:
-                    q, k = apply_flashinfer_rope_qk_inplace(
-                        q, k, cos_sin_cache, is_neox=False
-                    )
-            else:
-                if self.qk_norm:
-                    q, k = apply_qk_norm_with_optional_rope(
-                        q=q,
-                        k=k,
-                        q_norm=self.norm_q,
-                        k_norm=self.norm_k,
-                        head_dim=self.head_dim,
-                        allow_inplace=self.enable_zimage_qk_fusion,
-                    )
-                q = _apply_rotary_emb(q, cos, sin, is_neox_style=False)
-                k = _apply_rotary_emb(k, cos, sin, is_neox_style=False)
-        elif self.qk_norm:
+        fused_qk = None
+        if try_native_qk_norm:
+            fused_qk = zimage_native_qk_rmsnorm(
+                q, k, self.norm_q, self.norm_k, self.head_dim
+            )
+
+        # Off CUDA only the batched 3D table (the one with positions) may take the
+        # fused QKNorm+RoPE kernels; a 2D table gets qk-norm, then the class.
+        rope_in_qk_norm = _is_cuda or rope_positions is not None
+        if self.qk_norm and fused_qk is None and rope_in_qk_norm:
             q, k = apply_qk_norm_with_optional_rope(
-                q=q,
-                k=k,
+                q=q.contiguous(),
+                k=k.contiguous(),
                 q_norm=self.norm_q,
                 k_norm=self.norm_k,
                 head_dim=self.head_dim,
-                allow_inplace=self.enable_zimage_qk_fusion,
+                cos_sin_cache=rope_cos_sin_cache,
+                is_neox=False,
+                positions=rope_positions,
+                # CUDA lands here when native qk-norm is refused; keep it unfused.
+                allow_inplace=self.enable_zimage_qk_fusion and not _is_cuda,
+            )
+        else:
+            if fused_qk is not None:
+                q, k = fused_qk
+            elif self.qk_norm:
+                q, k = apply_qk_norm(
+                    q=q,
+                    k=k,
+                    q_norm=self.norm_q,
+                    k_norm=self.norm_k,
+                    head_dim=self.head_dim,
+                    allow_inplace=self.enable_zimage_qk_fusion,
+                )
+            q, k = self.rotary_emb(
+                query=q,
+                key=k,
+                complex_freqs=(
+                    rope_freqs_complex.unsqueeze(-2)
+                    if rope_freqs_complex is not None
+                    else None
+                ),
+                cos_sin_cache=rope_cos_sin_cache,
+                positions=rope_positions,
             )
 
         hidden_states = self.attn(
@@ -604,6 +541,8 @@ class ZImageTransformerBlock(nn.Module):
         num_replicated_prefix: int = 0,
         num_replicated_suffix: int = 0,
         skip_sequence_parallel_override: bool = False,
+        *,
+        rope_freqs_complex: Optional[torch.Tensor] = None,
     ):
         if self.modulation:
             assert adaln_input is not None
@@ -629,6 +568,7 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
+                rope_freqs_complex=rope_freqs_complex,
             )
             x = zimage_rmsnorm_tanh_mul_add(
                 attn_out,
@@ -666,6 +606,7 @@ class ZImageTransformerBlock(nn.Module):
                 num_replicated_prefix=num_replicated_prefix,
                 num_replicated_suffix=num_replicated_suffix,
                 skip_sequence_parallel_override=skip_sequence_parallel_override,
+                rope_freqs_complex=rope_freqs_complex,
             )
             x = x + self.attention_norm2(attn_out)
 
@@ -1251,48 +1192,48 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             pinned.append(value)
         return value
 
+    @staticmethod
+    def _build_rope_cache(
+        freqs_cis: Tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """Return (cos_sin_cache, positions, freqs_complex) for one RoPE group."""
+        cos, sin = freqs_cis
+        cos_f32 = cos.to(dtype=torch.float32).contiguous()
+        sin_f32 = sin.to(dtype=torch.float32).contiguous()
+        if cos.dim() == 3:
+            batch_size, seq_len = cos.shape[:2]
+            cos_sin_cache = torch.cat([cos_f32, sin_f32], dim=-1).reshape(
+                batch_size * seq_len, -1
+            )
+            positions = torch.arange(
+                batch_size * seq_len, device=cos.device, dtype=torch.long
+            )
+            # RotaryEmbedding only accepts a 3D [S, 1, D/2] complex table.
+            freqs_complex = None
+        elif cos.dim() == 2:
+            cos_sin_cache = torch.cat([cos_f32, sin_f32], dim=-1)
+            positions = None
+            # [S, D/2]; the attention adds the head dim before calling the class.
+            freqs_complex = torch.complex(cos_f32, sin_f32)
+        else:
+            return None, None, None
+        return cos_sin_cache, positions, freqs_complex
+
     def _get_rope_cache(
         self,
         stream: str,
         freqs_cis: Optional[Tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if freqs_cis is None or not _is_cuda:
-            return None, None
+    ) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if freqs_cis is None:
+            return None, None, None
 
         cos, sin = freqs_cis
-        if not (cos.is_cuda and sin.is_cuda):
-            return None, None
-
         # matched by the live source tensors: a data_ptr key hit a freed table's address
         cached = self._rope_caches.get(stream)
         if cached is not None and cached[0][0] is cos and cached[0][1] is sin:
             return self._pin_for_active_capture(cached[1])
 
-        if cos.dim() == 3:
-            batch_size, seq_len = cos.shape[:2]
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            ).reshape(batch_size * seq_len, -1)
-            positions = torch.arange(
-                batch_size * seq_len, device=cos.device, dtype=torch.long
-            )
-        elif cos.dim() == 2:
-            cos_sin_cache = torch.cat(
-                [
-                    cos.to(dtype=torch.float32).contiguous(),
-                    sin.to(dtype=torch.float32).contiguous(),
-                ],
-                dim=-1,
-            )
-            positions = None
-        else:
-            return None, None
-
-        rope_cache = (cos_sin_cache, positions)
+        rope_cache = self._build_rope_cache(freqs_cis)
         self._rope_caches[stream] = ((cos, sin), rope_cache)
         return self._pin_for_active_capture(rope_cache)
 
@@ -1572,7 +1513,9 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 device=device,
             )
         x_freqs_cis = freqs_cis[1]
-        x_rope_cos_sin_cache, x_rope_positions = self._get_rope_cache("x", x_freqs_cis)
+        x_rope_cos_sin_cache, x_rope_positions, x_rope_freqs_complex = (
+            self._get_rope_cache("x", x_freqs_cis)
+        )
         x_attn_mask, x_attn_mask_meta = self._get_attn_mask_and_meta(
             "_cached_x_attn_mask_meta", x_attn_lens, x.shape[1], device
         )
@@ -1586,6 +1529,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 rope_positions=x_rope_positions,
                 attn_mask=x_attn_mask,
                 attn_mask_meta=x_attn_mask_meta,
+                rope_freqs_complex=x_rope_freqs_complex,
             )
 
         cap_feats, _ = self.cap_embedder(cap_feats)
@@ -1599,8 +1543,8 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         cap_freqs_cis = freqs_cis[0]
-        cap_rope_cos_sin_cache, cap_rope_positions = self._get_rope_cache(
-            "cap", cap_freqs_cis
+        cap_rope_cos_sin_cache, cap_rope_positions, cap_rope_freqs_complex = (
+            self._get_rope_cache("cap", cap_freqs_cis)
         )
         cap_attn_mask, cap_attn_mask_meta = self._get_attn_mask_and_meta(
             "_cached_cap_attn_mask_meta", cap_attn_lens, cap_feats.shape[1], device
@@ -1614,6 +1558,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 rope_positions=cap_rope_positions,
                 attn_mask=cap_attn_mask,
                 attn_mask_meta=cap_attn_mask_meta,
+                rope_freqs_complex=cap_rope_freqs_complex,
             )
 
         cap_seq_len = cap_feats.shape[1]
@@ -1626,9 +1571,11 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_seq_len,
             device,
         )
-        unified_rope_cos_sin_cache, unified_rope_positions = self._get_rope_cache(
-            "unified", unified_freqs_cis
-        )
+        (
+            unified_rope_cos_sin_cache,
+            unified_rope_positions,
+            unified_rope_freqs_complex,
+        ) = self._get_rope_cache("unified", unified_freqs_cis)
         num_replicated_suffix = cap_seq_len
 
         for layer in self.layers:
@@ -1641,6 +1588,7 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
                 attn_mask=unified_attn_mask,
                 attn_mask_meta=unified_attn_mask_meta,
                 num_replicated_suffix=num_replicated_suffix,
+                rope_freqs_complex=unified_rope_freqs_complex,
             )
 
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
