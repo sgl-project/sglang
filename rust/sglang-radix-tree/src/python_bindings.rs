@@ -1631,6 +1631,11 @@ macro_rules! tree_core_methods {
                 py.detach(|| self.core().total_size())
             }
 
+            /// (device-mirror host tokens, reclaimable host tokens) of the Full tier.
+            fn full_host_occupancy(&self, py: Python<'_>, include_duplicates: bool) -> (usize, usize) {
+                py.detach(|| self.core().full_host_occupancy(include_duplicates))
+            }
+
             /// Whether the node's FULL device value has been evicted.
             fn is_full_device_evicted(&self, py: Python<'_>, node_id: NodeId) -> PyResult<bool> {
                 py.detach(|| self.core().is_full_device_evicted(node_id))
@@ -3099,6 +3104,15 @@ macro_rules! tree_core_binding {
             /// (full_tokens, aux_tokens) summed across the whole tree.
             fn total_size(&self, py: Python<'_>) -> PyResult<(usize, usize)> {
                 catch_native_panic(|| Ok(self.inner.total_size(py)))
+            }
+
+            /// (device-mirror host tokens, reclaimable host tokens) of the Full tier.
+            fn full_host_occupancy(
+                &self,
+                py: Python<'_>,
+                include_duplicates: bool,
+            ) -> PyResult<(usize, usize)> {
+                catch_native_panic(|| Ok(self.inner.full_host_occupancy(py, include_duplicates)))
             }
 
             /// Whether the node's FULL device value has been evicted.

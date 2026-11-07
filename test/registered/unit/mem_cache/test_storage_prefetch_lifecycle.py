@@ -651,6 +651,8 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
         cache.host_memory_mode = "cache"
         cache.buffer_pipeline = None
         cache.cache_controller.prefetch_rate_limited = lambda: True
+        cache.enable_storage_metrics = True
+        cache.storage_metrics_collector = Mock()
         tokens = array("q", range(10))
         cache.prefetch_from_storage(
             req.cache_request_handle,
@@ -660,6 +662,9 @@ class TestStagedPrefetchLifecycle(unittest.TestCase):
             storage_hit_end=10,
         )
         self.assertEqual(cache.ongoing_prefetch, {})
+        # The skipped lookup's candidate span is what the staging cap cost.
+        collector = cache.storage_metrics_collector
+        collector.log_storage_prefetch_rate_limited_tokens.assert_called_once_with(8)
         retries = cache.storage_prefetch_retries
         self.assertEqual(retries.pop_ready([head, req], 2, 8), [])
         self.assertEqual(retries.pop_ready([head, req], 2, 8), [])

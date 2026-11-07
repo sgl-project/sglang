@@ -6281,6 +6281,50 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
     }
 
     /// (full_tokens, aux_tokens) summed across the whole tree.
+    /// Full host-tier occupancy: (host tokens whose node is still on the device,
+    /// host tokens host eviction can reclaim now). Reclaimable counts host-only
+    /// nodes whose whole subtree host eviction can take and, with
+    /// `include_duplicates`, the device-resident nodes' host copies that the
+    /// write-back duplicate reclaim frees. O(nodes); not for scheduling paths.
+    pub fn full_host_occupancy(&self, include_duplicates: bool) -> (usize, usize) {
+        let mut mirror = 0usize;
+        let mut reclaimable = 0usize;
+        let mut reclaimable_subtree: HashSet<NodeIdx_> = HashSet::new();
+        // Pre-order reversed: every child is visited before its parent.
+        for &node_id in self.collect_all_nodes_().iter().rev() {
+            let node = self.arena.node(node_id);
+            if node.is_root() {
+                continue;
+            }
+            if !node.evicted() {
+                if node.has_host_value(FULL) {
+                    let tokens = node.host_value_len(FULL);
+                    mirror += tokens;
+                    if include_duplicates && self.can_reclaim_coexisting_host_value_(node_id, FULL)
+                    {
+                        reclaimable += tokens;
+                    }
+                }
+                continue;
+            }
+            // Host eviction takes a host-only node once it is an evictable
+            // host leaf, so its whole subtree must be reclaimable first.
+            if node.backuped()
+                && !node.is_load_back_pending()
+                && !node.is_host_locked()
+                && !node.is_device_locked()
+                && node
+                    .children
+                    .values()
+                    .all(|child_id| reclaimable_subtree.contains(child_id))
+            {
+                reclaimable += node.host_value_len(FULL);
+                reclaimable_subtree.insert(node_id);
+            }
+        }
+        (mirror, reclaimable)
+    }
+
     pub fn total_size(&self) -> (usize, usize) {
         let mut total_size = 0;
         let mut total_aux_size = 0;
