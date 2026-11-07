@@ -12,10 +12,8 @@ from sglang.multimodal_gen.configs.models.dits.kandinsky6_sr import (
 from sglang.multimodal_gen.configs.models.vaes.kandinsky6_sr import (
     Kandinsky6SRVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @dataclass

@@ -486,6 +486,40 @@ def linear_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{linear_attn_parallel_group()}_size")
 
 
+def linear_attn_tp_rank() -> int:
+    """This rank's index in ``linear_attn_parallel_group()``."""
+    return getattr(get_parallel(), f"{linear_attn_parallel_group()}_rank")
+
+
+def draft_attn_parallel_group() -> str:
+    """The group an attention-owning draft uses, resolved in the target scope.
+
+    With CP and no attention DP, the draft runs on full TP without CP.
+    Otherwise it stays within attention TP, preserving independent DP drafts.
+    """
+    parallel = get_parallel()
+    return (
+        "tp" if parallel.attn_cp_size > 1 and parallel.attn_dp_size == 1 else "attn_tp"
+    )
+
+
+def draft_attn_tp_size() -> int:
+    """The width of ``draft_attn_parallel_group()`` in the target scope."""
+    return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
+
+
+def is_scheduler_io_rank() -> bool:
+    """Whether this scheduler rank receives requests from the tokenizer and
+    sends outputs to the detokenizer: pipeline, attention-TP and attention-CP
+    rank 0, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 
@@ -552,24 +586,13 @@ class MoeFlags(_FlagGroupBase):
     speculative_a2a_backend: Any = None
     deepep_mode: Any = None
     deepep_config: str | None = None
+    moe_ascend_ops_config: Any = None
     tbo_enabled: bool | None = None
     sbo_enabled: bool | None = None
     tbo_token_distribution_threshold: float | None = None
     disable_fp4_allgather: bool | None = None
     quantization: str | None = None
-    # The shared-experts-fusion decision, per runner — the runner_backend /
-    # speculative_runner_backend shape. Both leaves are seeded from the config
-    # intent by ``initialize_moe_config``; each MoE model's gate
-    # (determine_num_fused_shared_experts) refines the ACTIVE leaf, both ways,
-    # before its layers build and read it. ``speculative_moe_backend_context``
-    # brackets a draft's build: on exit the draft's effective decision is
-    # persisted onto the speculative leaf (inspectable afterwards) and the
-    # target's ACTIVE value returns.
-    disable_shared_experts_fusion: bool | None = None
-    speculative_disable_shared_experts_fusion: bool | None = None
-    # Lifecycle marker (the capture.disable_dispose_tensor family): set while
-    # speculative_moe_backend_context is active, so a draft gate's write also
-    # lands on the speculative leaf.
+    # True while draft construction/backend scopes are active.
     in_speculative_scope: bool = False
     # Draft construction/execution uses a separate one-sided A2A workspace from
     # the target model's concurrently live CUDA graphs.
@@ -592,6 +615,9 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
+    # Set during prefill-graph capture by breaks that capture graphs of their own
+    # behind TP-group barriers; every DP rank must then take the same path.
+    prefill_graph_has_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None
@@ -907,7 +933,7 @@ def _install_derived_leaves(tops: dict, server_args: Any) -> None:
     import importlib
 
     from sglang.srt.arg_groups.arg_utils import _NO_DEFAULT, Derived
-    from sglang.srt.arg_groups.overrides import resolved_view
+    from sglang.srt.arg_groups.model_override_base import resolved_view
 
     namespaces = getattr(type(server_args), "_NAMESPACES", None)
     if not namespaces:
@@ -1820,6 +1846,8 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_mlu": "is_mlu",
+    "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
     "is_sm100_or_sm110": "is_sm100_or_sm110_supported",
@@ -1841,7 +1869,7 @@ _PLATFORM_VALUES: Dict[str, str] = {
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
-    Every name maps to a probe in `utils.common`; the probes are
+    Every name maps to a probe in `utils.device`; the probes are
     `lru_cache`-d, so reading through here costs a call and a dict lookup
     (~26 ns) rather than a device query.
     """
@@ -1861,9 +1889,9 @@ class PlatformContext:
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        from sglang.srt.utils import device as _device
 
-        return getattr(_common, probe)()
+        return getattr(_device, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
@@ -1994,7 +2022,7 @@ def max_speculative_num_draft_tokens() -> int | None:
 
 def uses_mla_backend() -> bool:
     """Whether this process's model runs the MLA attention path."""
-    from sglang.srt.arg_groups.overrides import use_mla_backend
+    from sglang.srt.arg_groups.model_override_base import use_mla_backend
 
     return use_mla_backend(get_server_args())
 
@@ -2009,14 +2037,14 @@ def attention_backends() -> tuple:
     stamps its own resolved pair (``ModelRunner.prefill_attention_backend_str``);
     read that when there is a runner in hand.
     """
-    from sglang.srt.arg_groups.overrides import attention_backends_of
+    from sglang.srt.arg_groups.model_override_base import attention_backends_of
 
     return attention_backends_of(get_exec().kernel)
 
 
 def process_model_config():
     """The process's ``ModelConfig`` (built once from the published config)."""
-    from sglang.srt.arg_groups.overrides import model_config_of
+    from sglang.srt.arg_groups.model_override_base import model_config_of
 
     return model_config_of(get_server_args())
 
@@ -2135,7 +2163,8 @@ def describe_kv_events_publisher(server_args: Any) -> Optional[dict]:
     helpers the scheduler binds through — so the advertisement cannot
     drift from the sockets.
     """
-    from sglang.srt.arg_groups.overrides import kv_event_block_size_of, resolving_view
+    from sglang.srt.arg_groups.model_override_base import resolving_view
+    from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
     # Lazy import so loading server_args doesn't pull in
     # disaggregation / msgspec / zmq at module top level.
