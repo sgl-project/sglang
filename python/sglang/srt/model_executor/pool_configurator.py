@@ -22,7 +22,6 @@ from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
-    get_dsa_index_kpool_compress,
     get_minimax_sparse_attention_config,
     get_minimax_sparse_disable_value_layer_ids,
     get_minimax_sparse_layer_ids,
@@ -577,12 +576,8 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = (
-                    ceil_div(
-                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
-                    )
-                    if get_dsa_index_kpool_compress(kvc.model_config.hf_config)
-                    else index_head_dim
+                indexer_size_per_token = ceil_div(
+                    index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
                 )
                 element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
