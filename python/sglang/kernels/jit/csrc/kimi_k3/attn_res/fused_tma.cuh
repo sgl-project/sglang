@@ -650,7 +650,13 @@ using host::distributed::CommunicatorRef;
 
 // Host launcher: constexpr kernel table over nvb.
 
-template <int64_t kDim, uint32_t kMaxBankRows, uint32_t kChunkRows, uint32_t kOccupancy, uint32_t kConsumerRegs>
+template <
+    int64_t kDim,
+    uint32_t kMaxBankRows,
+    uint32_t kChunkRows,
+    uint32_t kOccupancy,
+    uint32_t kConsumerRegs,
+    uint32_t kBankMask>
 struct AttnResFusedTmaKernel {
   using KernelFn = void (*)(const AttnResTMAParams);
   template <uint32_t kNvb>
@@ -660,22 +666,26 @@ struct AttnResFusedTmaKernel {
   // kOccupancy copies of the smem ring must fit one SM (228KB on SM100).
   static_assert(kOccupancy >= 1 && kOccupancy * kSmemBytes <= 233472 - 1024, "occupancy exceeds the smem budget");
 
-  template <std::size_t... I>
+  template <uint32_t kNvb, uint32_t kMode>
+  static constexpr KernelFn get_kernel() {
+    if constexpr (!(kBankMask & (1u << kNvb))) {
+      return nullptr;
+    } else if constexpr (kMode == 0) {
+      return attn_res_fused_tma_kernel<Trait<kNvb>, kOccupancy>;
+    } else if constexpr (kMode == 1) {
+      return attn_res_fused_pull_rs_kernel<Trait<kNvb>, kOccupancy>;
+    } else {
+      return attn_res_fused_direct_ag_kernel<Trait<kNvb>, kOccupancy>;
+    }
+  }
+
+  template <uint32_t kMode, std::size_t... I>
   static constexpr auto make_table(std::index_sequence<I...>) {
-    return std::array<KernelFn, kMaxBankRows + 1>{nullptr, attn_res_fused_tma_kernel<Trait<I + 1>, kOccupancy>...};
+    return std::array<KernelFn, kMaxBankRows + 1>{nullptr, get_kernel<I + 1, kMode>()...};
   }
-  static constexpr auto kTable = make_table(std::make_index_sequence<kMaxBankRows>{});
-  template <std::size_t... I>
-  static constexpr auto make_pull_table(std::index_sequence<I...>) {
-    return std::array<KernelFn, kMaxBankRows + 1>{nullptr, attn_res_fused_pull_rs_kernel<Trait<I + 1>, kOccupancy>...};
-  }
-  static constexpr auto kPullTable = make_pull_table(std::make_index_sequence<kMaxBankRows>{});
-  template <std::size_t... I>
-  static constexpr auto make_ag_table(std::index_sequence<I...>) {
-    return std::array<KernelFn, kMaxBankRows + 1>{
-        nullptr, attn_res_fused_direct_ag_kernel<Trait<I + 1>, kOccupancy>...};
-  }
-  static constexpr auto kAgTable = make_ag_table(std::make_index_sequence<kMaxBankRows>{});
+  static constexpr auto kTable = make_table<0>(std::make_index_sequence<kMaxBankRows>{});
+  static constexpr auto kPullTable = make_table<1>(std::make_index_sequence<kMaxBankRows>{});
+  static constexpr auto kAgTable = make_table<2>(std::make_index_sequence<kMaxBankRows>{});
 
   static void
   run(const tvm::ffi::TensorView prefix_sum,
@@ -718,10 +728,12 @@ struct AttnResFusedTmaKernel {
         " NB=",
         NB);
 
+    RuntimeCheck(kTable[nvb] != nullptr, "attn_res_fused_tma: nvb was not compiled: ", nvb);
     if (num_tokens == 0) return;
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        if (kTable[i] == nullptr) continue;
         RuntimeDeviceCheck(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;
@@ -792,10 +804,12 @@ struct AttnResFusedTmaKernel {
     RuntimeCheck(input_mc_ptr != 0, "fused pull RS requires multicast input");
     RuntimeCheck(pull.mc_semaphore != nullptr, "fused pull RS requires a multicast-capable pull plane");
     RuntimeCheck(max_blocks > 0, "fused pull RS requires max_blocks > 0");
+    RuntimeCheck(kPullTable[nvb] != nullptr, "fused pull RS: nvb was not compiled: ", nvb);
     if (num_tokens == 0) return;
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        if (kPullTable[i] == nullptr) continue;
         RuntimeDeviceCheck(
             cudaFuncSetAttribute(kPullTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
@@ -870,10 +884,12 @@ struct AttnResFusedTmaKernel {
     RuntimeCheck(output_mc_ptr != 0, "fused direct AG requires multicast output");
     RuntimeCheck(pull.mc_semaphore != nullptr, "fused direct AG requires a multicast-capable pull plane");
     RuntimeCheck(max_blocks > 0, "fused direct AG requires max_blocks > 0");
+    RuntimeCheck(kAgTable[nvb] != nullptr, "fused direct AG: nvb was not compiled: ", nvb);
     if (num_tokens == 0) return;
 
     [[maybe_unused]] static const bool attrs_set = [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
+        if (kAgTable[i] == nullptr) continue;
         RuntimeDeviceCheck(cudaFuncSetAttribute(kAgTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
       }
       return true;

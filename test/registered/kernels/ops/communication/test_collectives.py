@@ -309,7 +309,7 @@ def _precompile(num_gpus):
         sp_collective._jit_module(world_size)
     if _GEMM_AG_WORLD_SIZE in num_gpus:
         gemm_ag._jit_module()
-    attn_res._jit_fused_tma_module(4, 1, 200)
+    attn_res._tuned_fused_tma_module(4, 1, 200)
 
 
 if __name__ == "__main__":

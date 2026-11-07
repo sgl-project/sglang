@@ -22,7 +22,7 @@ def _make_name(*args):
 
 @cache_once
 def _jit_fused_tma_module(
-    chunk_rows: int, occupancy: int, consumer_regs: int
+    chunk_rows: int, occupancy: int, consumer_regs: int, bank_mask: int = 0x1FE
 ) -> Module:
     """Compile and cache the warp-specialized TMA aggregation kernel (per-row
     bulk copies into chunk slots; chunk_rows / occupancy / consumer_regs are
@@ -41,6 +41,7 @@ def _jit_fused_tma_module(
         chunk_rows,
         occupancy,
         consumer_regs,
+        bank_mask,
     )
     return load_jit(
         _make_name("fused_tma"),
@@ -92,6 +93,22 @@ def _tuning(nvb: int, num_tokens: int) -> tuple[int, int, int]:
     return best
 
 
+@cache_once
+def _tuned_fused_tma_module(chunk_rows: int, occupancy: int, consumer_regs: int):
+    config = (chunk_rows, occupancy, consumer_regs)
+    # Include both sides of the small-token occupancy fallback. Compiling all
+    # eight nvb specializations for every configuration builds mostly unused
+    # kernels, including three separate collective/standalone dispatch tables.
+    bank_mask = sum(
+        1 << nvb
+        for nvb in range(1, _MAX_BANK_ROWS + 1)
+        if config in (_tuning(nvb, 0), _TMA_BEST_CONFIG[nvb])
+    )
+    if not bank_mask:
+        raise ValueError(f"No attention-residual dispatch uses {config}")
+    return _jit_fused_tma_module(*config, bank_mask)
+
+
 def attn_res_fused_tma(
     prefix_sum: torch.Tensor,
     bank: torch.Tensor,
@@ -127,6 +144,6 @@ def attn_res_fused_tma(
                  (bit-exact copy, fused into the score pass which already
                  has the row in registers); requires NB > nvb
     """
-    _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
+    _tuned_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
         prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
     )

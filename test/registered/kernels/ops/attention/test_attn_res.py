@@ -21,12 +21,19 @@ class TestAttentionResidual(CustomTestCase):
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
     def test_attn_residual_and_prefix_write(self):
+        # Cover every compiled bank mask and both sides of the occupancy switch.
+        for num_tokens in (5, 128):
+            for num_valid_bank_rows in range(1, 9):
+                with self.subTest(tokens=num_tokens, bank_rows=num_valid_bank_rows):
+                    self._check_attn_residual(num_tokens, num_valid_bank_rows)
+
+    def _check_attn_residual(self, num_tokens, num_valid_bank_rows):
         generator = torch.Generator(device="cuda").manual_seed(0)
 
         def randn(*shape):
             return torch.randn(*shape, generator=generator, device="cuda")
 
-        num_tokens, num_bank_rows, num_valid_bank_rows = 5, 8, 5
+        num_bank_rows = num_valid_bank_rows + 1
         prefix = randn(num_tokens, _HIDDEN_SIZE).to(torch.bfloat16)
         bank = randn(num_tokens, num_bank_rows, _HIDDEN_SIZE).to(torch.bfloat16)
         combine_weight = (randn(_HIDDEN_SIZE) * _HIDDEN_SIZE**-0.5).to(torch.bfloat16)
