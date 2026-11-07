@@ -216,7 +216,7 @@ client sent. The router picks the first of these that applies:
 3. The rank with the fewest requests this router has in flight on it, or with
    `--dp-rank-policy round_robin`, the worker's ranks in turn.
 
-In PD mode, decode is ranked by step 3 only. The decode request names the
+In PD mode, decode is ranked by step 3 only. Both PD requests name the
 prefill rank in `disagg_prefill_dp_rank`, and the bootstrap room satisfies
 `room % prefill_dp_size == prefill_rank`.
 

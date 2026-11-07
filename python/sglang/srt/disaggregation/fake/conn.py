@@ -44,6 +44,7 @@ class FakeKVSender(BaseKVSender):
         bootstrap_addr: str,
         bootstrap_room: int,
         req_has_disagg_prefill_dp_rank: bool = False,
+        req_disagg_prefill_dp_rank: Optional[int] = None,
     ):
         self.kv_mgr = mgr
         self.bootstrap_room = bootstrap_room
