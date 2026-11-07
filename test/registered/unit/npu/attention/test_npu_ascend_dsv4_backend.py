@@ -838,12 +838,13 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
                         patch(self._BACKEND + ".is_npu_arch35", return_value=arch35),
                         patch(
                             self._BACKEND
-                            + ".npu_transformer_compat.get_transformer_metadata_size",
-                            side_effect=lambda name: (
-                                indexer_size
-                                if name == "quant_lightning_indexer_metadata"
-                                else attention_size
-                            ),
+                            + ".npu_attention_ops.get_sparse_flash_mla_metadata_size",
+                            return_value=attention_size,
+                        ),
+                        patch(
+                            self._BACKEND
+                            + ".npu_attention_ops.get_mixed_quant_sparse_flash_mla_metadata_size",
+                            return_value=attention_size,
                         ),
                         patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
                         patch(self._BACKEND + ".npu_indexer_ops") as indexer_ops,
@@ -865,6 +866,7 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
                                 (indexer_size,), batch + kv_len, dtype=torch.int32
                             )
 
+                        indexer_ops.get_quant_lightning_indexer_metadata_size.return_value = indexer_size
                         metadata_op = MagicMock(side_effect=make_attention)
                         select_ops.return_value = metadata_op, MagicMock()
                         indexer_ops.quant_lightning_indexer_metadata.side_effect = (
@@ -909,7 +911,7 @@ class TestKernelMetadataGraphBuffers(unittest.TestCase):
         with (
             patch(self._BACKEND + ".is_npu_arch35", return_value=False),
             patch(
-                self._BACKEND + ".npu_transformer_compat.get_transformer_metadata_size",
+                self._BACKEND + ".npu_attention_ops.get_sparse_flash_mla_metadata_size",
                 return_value=2048,
             ),
             patch(self._BACKEND + "._sparse_attn_ops") as select_ops,
