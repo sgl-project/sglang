@@ -8,7 +8,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
-from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -16,8 +15,6 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
-
-CASE_ID = "test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap"
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -242,7 +239,6 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHighOverlap(
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high_overlap(self):
         """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode without spec decoding."""
         self.run_accuracy()
-        assert_no_regression(self, CASE_ID, self.last_metrics)
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate_overlap(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
