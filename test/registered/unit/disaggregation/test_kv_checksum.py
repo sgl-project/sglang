@@ -263,9 +263,12 @@ class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
         self.enable_overlap = False
         self.waiting_queue = []
         self.running_reqs = KeyedReqList(ListKind.DECODING)
-        # A static pool: no unified storage.
+        # A static pool: no unified storage, and ids the transfer uses as they are.
         self.token_to_kv_pool_allocator = SimpleNamespace(
-            page_size=1, get_kvcache=_plain_kv_pool, storage=None
+            page_size=1,
+            get_kvcache=_plain_kv_pool,
+            storage=None,
+            translate_kv_indices_for_transfer=lambda kv_indices: kv_indices,
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
