@@ -43,14 +43,18 @@ class FakeBuilt:
 
 SPEC = MonoSpec(
     name="fake_xpu",
-    devices={"xe2": DeviceLimits(widths=(1, 2, 4, 8), tp_sizes=(2,), resident_blocks=32)},
+    devices={
+        "xe2": DeviceLimits(widths=(1, 2, 4, 8), tp_sizes=(2,), resident_blocks=32)
+    },
     features=frozenset(),
     requires=Requirements(
         dtypes=frozenset({"bfloat16", "float16"}),
         attention_backends=frozenset({"intel_xpu"}),
         server_args={"page_size": frozenset({64, 128})},
     ),
-    numerics=Numerics(kind=NumericsKind.TOLERANCE, bounds={"layer.hidden.cosine": 0.999}),
+    numerics=Numerics(
+        kind=NumericsKind.TOLERANCE, bounds={"layer.hidden.cosine": 0.999}
+    ),
     model_disable_reasons=lambda model, hf, copies: [],
     build=lambda model, hf, ctx: FakeBuilt(),
     api_version=registry.MONOKERNEL_API_VERSION,
@@ -72,7 +76,9 @@ def reasons_for(cfg, isa="xe2", dtype="bfloat16"):
     model_config = SimpleNamespace(
         hf_config=SimpleNamespace(architectures=[ARCH], model_type="fake"), dtype=dtype
     )
-    return monokernel_disable_reasons(cfg=cfg, backend=BACKEND, model_config=model_config, isa=isa)
+    return monokernel_disable_reasons(
+        cfg=cfg, backend=BACKEND, model_config=model_config, isa=isa
+    )
 
 
 def xpu_props(arch, xe_cores=32):
@@ -87,28 +93,40 @@ class TestXpuMonokernel(CustomTestCase):
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
 
     def test_the_flag_selects_the_xpu_backend(self):
-        self.assertEqual(selected_monokernel(server_args()), (BACKEND, "--enable-xpu-monokernel"))
+        self.assertEqual(
+            selected_monokernel(server_args()), (BACKEND, "--enable-xpu-monokernel")
+        )
         self.assertIsNone(selected_monokernel(ServerArgs(model_path="dummy")))
         publish(server_args(), role="test")
         self.addCleanup(reset_context)
         self.assertEqual(binding._backend(), BACKEND)
 
     def test_the_deprecated_backend_choice_maps_to_the_flag(self):
-        args = prepare_server_args(["--model-path", "dummy", "--monokernel-backend", "xpu"])
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--monokernel-backend", "xpu"]
+        )
         self.assertTrue(args.enable_xpu_monokernel)
         self.assertFalse(args.enable_amd_monokernel)
 
     def test_the_isa_of_an_intel_gpu(self):
-        for arch, isa in ((0x500800000, "xe2"), (0x500400400, "xe2"), (0x780000400, "xe3")):
+        for arch, isa in (
+            (0x500800000, "xe2"),
+            (0x500400400, "xe2"),
+            (0x780000400, "xe3"),
+        ):
             with self.subTest(arch=hex(arch)):
                 with (
                     patch.object(binding, "_device_module", return_value=torch.xpu),
                     patch.object(torch.xpu, "current_device", return_value=0),
-                    patch.object(torch.xpu, "get_device_properties", return_value=xpu_props(arch)),
+                    patch.object(
+                        torch.xpu, "get_device_properties", return_value=xpu_props(arch)
+                    ),
                 ):
                     self.assertEqual(binding.device_isa(), isa)
         self.assertEqual(binding._compute_units(xpu_props(0x500800000, 20)), 20)
-        self.assertEqual(binding._compute_units(SimpleNamespace(multi_processor_count=132)), 132)
+        self.assertEqual(
+            binding._compute_units(SimpleNamespace(multi_processor_count=132)), 132
+        )
 
     def test_a_supported_setup_has_no_reasons(self):
         spec, reasons = reasons_for(server_args())
@@ -116,9 +134,16 @@ class TestXpuMonokernel(CustomTestCase):
         self.assertEqual(reasons, [])
 
     def test_every_refusal_reason_is_listed(self):
-        spec, reasons = reasons_for(server_args(tp_size=4, page_size=16, pp_size=2), dtype="float32")
+        spec, reasons = reasons_for(
+            server_args(tp_size=4, page_size=16, pp_size=2), dtype="float32"
+        )
         self.assertIs(spec, SPEC)
-        for want in ("tp_size 4", "page_size 16", "dtype 'float32'", Feature.PIPELINE_PARALLEL.value):
+        for want in (
+            "tp_size 4",
+            "page_size 16",
+            "dtype 'float32'",
+            Feature.PIPELINE_PARALLEL.value,
+        ):
             self.assertTrue(any(want in r for r in reasons), (want, reasons))
         spec, reasons = reasons_for(server_args(), isa="xe3")
         self.assertIsNone(spec)
@@ -126,27 +151,46 @@ class TestXpuMonokernel(CustomTestCase):
 
     def test_capture_sizes_align_to_the_widths(self):
         self.assertEqual(
-            covered_capture_sizes(widths=(1, 2, 4, 8), tokens_per_request=1, sizes=[1, 2, 4, 8, 12, 16, 24]),
+            covered_capture_sizes(
+                widths=(1, 2, 4, 8),
+                tokens_per_request=1,
+                sizes=[1, 2, 4, 8, 12, 16, 24],
+            ),
             [1, 2, 4, 8, 12, 16, 24],
         )
         self.assertEqual(
-            covered_capture_sizes(widths=(1, 2, 4, 8), tokens_per_request=1, sizes=[1, 3, 6, 16]),
+            covered_capture_sizes(
+                widths=(1, 2, 4, 8), tokens_per_request=1, sizes=[1, 3, 6, 16]
+            ),
             [1, 2, 4, 8, 16],
         )
 
     def test_one_full_forward_replacement_at_a_time(self):
         cfg = server_args(enable_amd_monokernel=True)
         with patch.object(binding, "resolving_view", return_value=cfg):
-            with self.assertRaisesRegex(ValueError, "--enable-amd-monokernel is also set"):
+            with self.assertRaisesRegex(
+                ValueError, "--enable-amd-monokernel is also set"
+            ):
                 binding.handle_monokernel(cfg)
         cfg = server_args(enable_nvidia_megakernel=True)
         with (
-            patch("sglang.srt.kernel_plugins.nvidia.binding.resolving_view", return_value=cfg),
+            patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.resolving_view",
+                return_value=cfg,
+            ),
             patch("sglang.srt.kernel_plugins.nvidia.binding.model_config_of"),
-            patch("sglang.srt.kernel_plugins.nvidia.binding.msa_serves", return_value=False),
-            patch("sglang.srt.kernel_plugins.nvidia.binding.plugin_reasons", return_value=["x"]),
+            patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.msa_serves",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.kernel_plugins.nvidia.binding.plugin_reasons",
+                return_value=["x"],
+            ),
         ):
-            with self.assertRaisesRegex(ValueError, "--enable-xpu-monokernel is also set"):
+            with self.assertRaisesRegex(
+                ValueError, "--enable-xpu-monokernel is also set"
+            ):
                 handle_nvidia_megakernel(cfg)
 
 
