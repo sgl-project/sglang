@@ -766,10 +766,6 @@ class Scheduler(
         rank = (
             parallel.dp_rank if parallel.dp_rank is not None else tp_group.rank_in_group
         )
-        # Finish cache initialization on every rank before issuing HCCL work.
-        # Device synchronization can hold the runtime lock that MemFabric's
-        # background threads need to create channels for the remaining ranks.
-        torch.distributed.barrier(group=tp_group.cpu_group)
         logger.info("HCCL DP prewarm start: rank=%s", rank)
         _prewarm_hccl_group(
             device=tp_group.device,
