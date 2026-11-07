@@ -31,7 +31,7 @@ class TestMooncakeEfaAllocator(unittest.TestCase):
             return result
 
     def test_efa_rejects_custom_memory_pools(self):
-        for pool_type in ("true", "NVLINK", "BAREX"):
+        for pool_type in ("true", "NVLINK", "BAREX", "FABRIC"):
             with self.subTest(pool_type=pool_type):
                 with self.assertRaisesRegex(
                     ValueError, "incompatible with MOONCAKE_PROTOCOL=efa"
