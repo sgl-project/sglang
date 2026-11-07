@@ -14,7 +14,7 @@ def _nemotron_labs_diffusion_overrides(server_args: Any, hf_config: Any) -> dict
     cfg = resolving_view(server_args)
     # A supported default keeps dLLM validation from replacing split backends.
     if (
-        cfg.dllm_algorithm == "NemotronFastDiffuser"
+        cfg.dllm_algorithm in ("NemotronFastDiffuser", "NemotronLinearSpec")
         and get_platform().is_sm100
         and cfg.attention_backend is None
     ):

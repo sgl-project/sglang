@@ -12,7 +12,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=360, stage="base-b", runner_config="1-gpu-large")
 
 
 class TestNemotronLabsDiffusion(CustomTestCase):
@@ -25,7 +25,7 @@ class TestNemotronLabsDiffusion(CustomTestCase):
             ("Translate to French: The cat is sleeping.", "chat"),
             ("Explain in one short sentence why ice floats on water.", "less dense"),
         ]
-        for algorithm in (None, "NemotronFastDiffuser"):
+        for algorithm in (None, "NemotronFastDiffuser", "NemotronLinearSpec"):
             args = [
                 "--context-length",
                 "4096",
@@ -107,7 +107,7 @@ class TestNemotronLabsDiffusion(CustomTestCase):
                                 )
                                 self.assertEqual(response.status_code, 400)
                                 self.assertIn(
-                                    "NemotronFastDiffuser supports greedy decoding",
+                                    f"{algorithm} supports greedy decoding",
                                     response.text,
                                 )
                         generate(cases[0])

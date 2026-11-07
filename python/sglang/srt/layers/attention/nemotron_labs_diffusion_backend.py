@@ -6,6 +6,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.srt.dllm.nemotron_linear_spec import (
+    NemotronLinearSpecGraphVariants,
+    is_causal_verify,
+)
+from sglang.srt.runtime_context import get_exec
+
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -19,8 +25,14 @@ from sglang.srt.layers.attention.flashattention_backend import (
 class NemotronLabsDiffusionAttentionBackend(FlashAttentionBackend):
     def __init__(self, model_runner: "ModelRunner") -> None:
         super().__init__(model_runner, fa_impl_ver=4)
+        self.is_linear_spec = get_exec().dllm.dllm_algorithm == "NemotronLinearSpec"
         self.block_size = model_runner.decode_num_tokens_per_req()
-        self.denoise_graph_metadata: dict[int, FlashAttentionMetadata] = {}
+        self.denoise_graph_metadata: dict[tuple[int, bool], FlashAttentionMetadata] = {}
+
+    def get_decode_graph_variants(self, capture_forward_mode, captured_req_width):
+        if self.is_linear_spec and capture_forward_mode.is_dllm_extend():
+            return NemotronLinearSpecGraphVariants()
+        return None
 
     def init_forward_metadata(self, forward_batch: "ForwardBatch") -> None:
         if not forward_batch.forward_mode.is_dllm_extend():
@@ -36,10 +48,11 @@ class NemotronLabsDiffusionAttentionBackend(FlashAttentionBackend):
             return super().init_forward_metadata_out_graph(forward_batch, in_capture)
 
         bs = forward_batch.batch_size
+        key = (bs, self.is_linear_spec and is_causal_verify(forward_batch))
         # Replays update metadata without replacing captured tensor addresses.
         if in_capture:
-            self.denoise_graph_metadata[bs] = self._make_denoise_metadata(bs)
-        self._update_denoise_metadata(forward_batch, self.denoise_graph_metadata[bs])
+            self.denoise_graph_metadata[key] = self._make_denoise_metadata(bs)
+        self._update_denoise_metadata(forward_batch, self.denoise_graph_metadata[key])
 
     def _make_denoise_metadata(self, batch_size: int) -> FlashAttentionMetadata:
         return FlashAttentionMetadata(

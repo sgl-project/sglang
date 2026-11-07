@@ -18,6 +18,7 @@ class DllmConfig:
         capture_input_preparation: bool = False,
         delete_token_id: int | None = None,
         split_token_id: int | None = None,
+        retains_causal_prefix: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -27,6 +28,7 @@ class DllmConfig:
         self.first_done_first_out_mode = first_done_first_out_mode
         self.requires_separate_context_encoding = requires_separate_context_encoding
         self.capture_input_preparation = capture_input_preparation
+        self.retains_causal_prefix = retains_causal_prefix
         self.delete_token_id = delete_token_id
         self.split_token_id = split_token_id
 
@@ -69,7 +71,7 @@ class DllmConfig:
             DLLM_PARAMS[arch] = {
                 "block_size": model_config.hf_config.block_size,
                 "mask_id": model_config.hf_config.mask_token_id,
-                "algorithm": "NemotronFastDiffuser",
+                "algorithms": ("NemotronFastDiffuser", "NemotronLinearSpec"),
             }
         if arch in DLLM_PARAMS:
             params = DLLM_PARAMS[arch]
@@ -93,6 +95,13 @@ class DllmConfig:
             raise ValueError(
                 f"{cfg.dllm_algorithm} does not support model architecture {arch}"
             )
+
+        allowed_algorithms = params.get("algorithms")
+        if (
+            allowed_algorithms is not None
+            and cfg.dllm_algorithm not in allowed_algorithms
+        ):
+            raise ValueError(f"{arch} requires one of {allowed_algorithms}")
 
         delete_token_id = None
         split_token_id = None
@@ -186,6 +195,7 @@ class DllmConfig:
                 algorithm_cls.capture_input_preparation
                 and algorithm_config.get("capture_input_preparation", True)
             ),
+            retains_causal_prefix=algorithm_cls.retains_causal_prefix,
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
         )

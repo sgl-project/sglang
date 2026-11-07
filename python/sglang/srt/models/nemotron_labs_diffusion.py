@@ -4,6 +4,7 @@
 
 import torch
 
+from sglang.srt.dllm.nemotron_linear_spec import is_causal_verify
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.models.llama import (
@@ -45,6 +46,7 @@ class NemotronLabsDiffusionAttention(LlamaAttention):
         attention = (
             self.diffusion_attn
             if forward_batch.forward_mode.is_dllm_extend()
+            and not is_causal_verify(forward_batch)
             else self.attn
         )
         output = attention(q, k, v, forward_batch)

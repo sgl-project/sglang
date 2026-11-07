@@ -84,6 +84,18 @@ def create_flashinfer_backend(runner):
             FlashInferAttnBackend,
         )
 
+        if (
+            "NemotronLabsDiffusionModel" in runner.model_config.hf_config.architectures
+            and get_exec().dllm.dllm_algorithm == "NemotronLinearSpec"
+        ):
+            from sglang.srt.layers.attention.nemotron_linear_spec_backend import (
+                NemotronLinearSpecFlashInferBackend,
+            )
+
+            return NemotronLinearSpecFlashInferBackend(
+                runner, init_new_workspace=runner.init_new_workspace
+            )
+
         # Init streams
         if get_spec().speculative_algorithm == "EAGLE":
             if (

@@ -62,7 +62,7 @@ class NemotronFastDiffuser(DllmAlgorithm):
             or req.return_logprob
             or req.return_sampling_mask
         ):
-            return "NemotronFastDiffuser supports greedy decoding without penalties, grammars, custom processors or logprobs; use temperature=0"
+            return f"{cls.__name__} supports greedy decoding without penalties, grammars, custom processors or logprobs; use temperature=0"
         return None
 
     def __init__(self, config):

@@ -50,7 +50,9 @@ python3 -m sglang.launch_server \
 
 Block diffusion uses FA4 on SM100 GPUs and FlashInfer on other CUDA GPUs, with BF16 weights and the default FDFO scheduler. Use `--attention-backend flashinfer` to select FlashInfer on SM100. Both modes preserve the configured CUDA graph settings. Causal context encoding can use prefill graphs, while denoising uses decode graphs. It encodes committed context causally and fills each new block bidirectionally, starting with a causal next-token prediction. Block size and mask ID come from the checkpoint. The confidence threshold defaults to `0.9`; you can set `threshold` in a YAML file passed with `--dllm-algorithm-config`.
 
-Use greedy sampling for block diffusion:
+For self-speculation, use `--dllm-algorithm NemotronLinearSpec`. The same model drafts bidirectionally and verifies causally. It keeps only the matching prefix, retains its causal KV, and carries the target's next prediction into the following round. Draft and verification passes have separate CUDA graph variants. The draft threshold defaults to `0.0` (one draft pass); `threshold` in the algorithm YAML can enable additional denoising steps.
+
+Use greedy sampling for block diffusion and self-speculation:
 
 ```bash
 curl http://127.0.0.1:30000/v1/chat/completions \
@@ -63,7 +65,7 @@ curl http://127.0.0.1:30000/v1/chat/completions \
   }'
 ```
 
-The block-diffusion implementation requires FDFO and disables prefix caching and chunked prefill. It does not support quantized loading, LoRA, pipeline/context parallelism, attention data parallelism, penalties, constrained decoding or logprob requests. LinearSpec is not implemented.
+The block-diffusion implementation requires FDFO and disables prefix caching and chunked prefill. It does not support quantized loading, LoRA, pipeline/context parallelism, attention data parallelism, penalties, constrained decoding or logprob requests. These restrictions also apply to self-speculation; its optional model-card LoRA drafter is not loaded.
 
 ## Example Configuration File
 
