@@ -784,7 +784,9 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
         if self.dsa_shards_index_k:
-            max_rows = max(model_runner.max_running_requests, 1)
+            max_rows = max(model_runner.max_running_requests, 1) * (
+                self.speculative_num_draft_tokens or 1
+            )
             # The fused merge returns only this rank's slots; top-k capture needs all.
             if (
                 get_exec().features.enable_return_indexer_topk
@@ -1069,13 +1071,19 @@ class DeepseekSparseAttnBackend(
         # TODO: SM90 supports DG-native next_n in {1,2} too — enable once
         # validated; for now DG-native is SM100+ only.
         next_n = self.speculative_num_draft_tokens
-        if (
+        dg_native_verify = (
             forward_mode.is_target_verify()
             and next_n
             and next_n >= 2
             and get_platform().is_sm100
             and not envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.get()
-        ):
+        )
+        if forward_mode.is_target_verify() and self.dsa_shards_index_k:
+            lens = _to_2d_context_lens(seqlens_expanded, batch_size)
+            if dg_native_verify and lens.numel() == batch_size * next_n:
+                lens = lens.view(batch_size, next_n)
+            return self._dcp_local_ctx_lens(lens)
+        if dg_native_verify:
             return cache_seqlens_int32.view(-1, 1).expand(-1, next_n).contiguous()
         if forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2():
             return _to_2d_context_lens(seqlens_expanded, batch_size)
@@ -2066,6 +2074,7 @@ class DeepseekSparseAttnBackend(
                 if (
                     self.speculative_num_draft_tokens >= 2
                     and get_platform().is_sm100
+                    and not self.dsa_shards_index_k
                     and metadata.paged_mqa_ctx_lens_2d is not None
                     and metadata.paged_mqa_ctx_lens_2d.dim() == 2
                     and metadata.paged_mqa_ctx_lens_2d.size(0) == bs
@@ -2437,7 +2446,10 @@ class DeepseekSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         kv_cache = self.kv_layers.read(layer.layer_id).key()
-        if self.dsa_shards_index_k:
+        if (
+            self.dsa_shards_index_k
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
             kv_cache = self.dcp_gather_kv_cache(kv_cache, forward_batch, metadata)
 
         if q_rope is not None:
@@ -2690,6 +2702,8 @@ class DeepseekSparseAttnBackend(
                 metadata=metadata,
                 page_table_1=page_table_1,
                 forward_batch=forward_batch,
+                dcp_partial=self.dsa_shards_index_k
+                and forward_batch.forward_mode.is_target_verify(),
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
