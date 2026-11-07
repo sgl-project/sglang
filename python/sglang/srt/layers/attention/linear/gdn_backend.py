@@ -55,7 +55,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 

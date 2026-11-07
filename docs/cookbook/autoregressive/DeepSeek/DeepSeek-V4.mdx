@@ -241,7 +241,7 @@ The **DGX Spark** row has three recipes, all **Balanced · Multi-Nodes**: **Flas
 
 - **Docker image** — all three cells use `lmsysorg/sglang:dev-v4f-2dgx-v2`, a preview build made **only for DGX Spark** (branch `b12x-vision` @ `452239a74f`): it bakes in the SM12x `b12x` MoE (W4A8) and compressed-MLA attention kernels ([#34878](https://github.com/sgl-project/sglang/pull/34878), [#35899](https://github.com/sgl-project/sglang/pull/35899), [#34018](https://github.com/sgl-project/sglang/pull/34018)), the Flash Vision model support ([#37253](https://github.com/sgl-project/sglang/pull/37253)), the b12x image-prefill fix that lets Flash Vision serve images on SM12x, the NVFP4 MTP-layer dispatch fix, and the CuTeDSL and NCCL pins the GB10 pair needs. Do not use it on other hardware, and use the panel's Docker mode — the bare Python command needs the `b12x` kernel package this image ships.
 - **Run the same command on both Sparks** with `--node-rank 0` / `--node-rank 1` and `--dist-init-addr` pointing at node 0 over the ConnectX-7 link. The `docker run` flags the panel emits (`--network host --ulimit memlock=-1:-1 --cap-add IPC_LOCK --device /dev/infiniband`) are what let NCCL use RDMA; without them NCCL silently falls back to TCP and decode slows by roughly 40%.
-- **Env knobs** in the cells are part of the recipe: `SGLANG_SM120_FLASHMLA_BACKEND=b12x` selects the b12x attention path, `SGLANG_B12X_MAX_TOKENS` must equal `--chunked-prefill-size`, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids unified-memory fragmentation OOMs on GB10.
+- **Env knobs** in the cells are part of the recipe: `SGLANG_B12X_MAX_TOKENS` must equal `--chunked-prefill-size`, and `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` avoids unified-memory fragmentation OOMs on GB10.
 - **NVFP4 (`nvidia/DeepSeek-V4-Flash-0731-NVFP4`)** — only the routed experts are NVFP4; attention, shared experts and the DSpark MTP layer stay in the checkpoint's native formats. On SM12x that means three extra flags: `--moe-runner-backend flashinfer_cutlass` (b12x's MoE is MXFP4-only and trtllm-gen kernels are sm100-only), `--speculative-moe-runner-backend b12x` (the DSpark draft's MTP experts are MXFP4 and run on b12x), and `--disable-shared-experts-fusion` (HashTopK rejects fused shared experts under the cutlass runner). Throughput and DSpark acceptance match the FP4 cell within noise.
 - **Flash Vision** — images are served natively on the b12x recipe with the same flags as Flash Official (send `image_url` content on `/v1/chat/completions`, see [Vision](#3-5-vision-image-inputs)); text-only requests work unchanged. Expect roughly 15–20% lower text throughput than Flash Official on this checkpoint — its bundled DSpark head accepts fewer drafts (~3.2 vs ~3.9) — with text accuracy intact.
 
@@ -812,13 +812,10 @@ Adjustments are not in the commands below. Add them when they apply:
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -853,13 +850,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
@@ -903,14 +897,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=16384 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR=512 \
 AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023 \
@@ -961,7 +951,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
+This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
 
 ### 3.7 PD Disaggregation on MI355X (MORI-IO)
 
@@ -1029,7 +1019,6 @@ The two commands below are that pair at concurrency 256, on one prefill node and
 
 ```bash Command
 GPU_MAX_HW_QUEUES=5 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
 MORI_SHMEM_HEAP_SIZE=8G \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
@@ -1131,7 +1120,7 @@ The rest of the difference is the prefill-only set already described above: `--c
 
 On the prefill env:
 
-- `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
+- On ROCm, `--moe-a2a-backend megamoe` runs Aiter MegaMoEv2.
 - `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is the default, so the command omits this variable. Set it explicitly if you increase the per-rank chunk size.
 - `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.6](#3-6-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
 

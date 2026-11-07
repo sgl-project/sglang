@@ -10,7 +10,10 @@ from sglang.kernels.ops.attention.fla.l2norm import (
     gdn_prefill_qkv_prepare_fwd,
     l2norm_fwd,
 )
-from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    RMSNorm,
+    rms_norm_gated,
+)
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_gdn_prefill_prepare,
@@ -209,6 +212,16 @@ class TestGdnPrefillLayout(CustomTestCase):
                         is_rms_norm=True,
                     )
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+                    norm = RMSNorm(
+                        self.HEAD_DIM,
+                        dtype=dtype,
+                        device="cuda",
+                        norm_before_gate=norm_before_gate,
+                    )
+                    norm.weight.data.copy_(weight)
+                    native = norm.forward_native(x, z)
+                    torch.testing.assert_close(native, actual, rtol=1e-2, atol=1e-2)
 
     def test_fused_prepare_matches_reference(self):
         # Production passes a [T, qkv_dim] transpose of [qkv_dim, T].

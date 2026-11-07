@@ -7,8 +7,7 @@
 #     its own coverage invocation, so diffusion coverage is attributed per
 #     test case instead of per shard.
 #   - Skips pr-gate, recommend
-#   - setup-covstub assembles and publishes the baseline to the shared disk
-#     at /root/.cache/tests/precise-test/coverage
+#   - setup-covstub assembles the baseline and publishes it to OBS
 # pr-test-npu-finish is the final gate in the called workflow. Triggered
 # manually via workflow_dispatch or every 2 days via schedule; this pipeline
 # builds the full coverage baseline on demand.
@@ -16,9 +15,9 @@ name: Coverage Collection (NPU)
 
 on:
   workflow_dispatch:
-  # Every 2 days at 05:00 Asia/Shanghai (21:00 UTC the previous day).
+  # Every 2 days at 04:00 Asia/Shanghai (20:00 UTC the previous day).
   schedule:
-    - cron: "0 21 */2 * *"
+    - cron: "0 20 */2 * *"
 
 concurrency:
   group: npu-coverage-collection-${{ github.ref }}

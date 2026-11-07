@@ -17,7 +17,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
