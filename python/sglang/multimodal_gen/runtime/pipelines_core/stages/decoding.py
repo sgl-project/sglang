@@ -109,6 +109,7 @@ def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
 def rollout_output_without_decode(batch: Req) -> OutputBatch:
     """The rollout trajectory alone, for a request with ``rollout_return_generated_output=False``."""
     return OutputBatch(
+        generated_output_skipped=True,
         trajectory_timesteps=batch.trajectory_timesteps,
         trajectory_latents=batch.trajectory_latents,
         rollout_trajectory_data=batch.rollout_trajectory_data,
