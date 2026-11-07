@@ -5,11 +5,13 @@
    "skip_names": [
     "audio_data",
     "image_data",
+    "images_config.prefix",
     "input_embeds",
     "input_ids",
     "lora_path",
     "sampling_params",
     "text",
+    "video_config._question",
     "video_data"
    ],
    "out_skip_names": [
@@ -381,10 +383,12 @@
    "skip_names": [
     "audio_data",
     "image_data",
+    "images_config.prefix",
     "input_embeds",
     "input_ids",
     "lora_path",
     "text",
+    "video_config._question",
     "video_data"
    ],
    "out_skip_names": [
