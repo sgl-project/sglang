@@ -75,6 +75,7 @@ from sglang.kernels.ops.kvcache.kv_read_table import (
     build_kv_read_table,
     build_kv_read_table_packed,
 )
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind, state_id_space
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import (
@@ -152,6 +153,11 @@ class RunnerIds:
         self._spaces: Dict[str, IdSpace] = {}
         self._call_spaces: Optional[Dict[str, IdSpace]] = None
         if self.is_translating:
+            if is_cp_sharded_padded():
+                # Translated ids skip the sharded projection and rank filter below.
+                raise ValueError(
+                    "A sharded --cp-kv-layout does not support --enable-unified-memory."
+                )
             alloc = token_to_kv_pool_allocator
             self._capture_page_size = alloc.page_size
             self._translate_full = alloc.translate_kv_loc
@@ -162,18 +168,50 @@ class RunnerIds:
             # runner shares the target's sub-pools, and so their keys. A fused
             # draft reads the ones its own pool routes layers to.
             alloc_spaces = alloc.id_spaces(defer_reads=self.defer_read_translate)
+            self._capture_token_capacity = (
+                alloc_spaces[IdSpaceKind.FULL].table.numel() * alloc.page_size
+            )
             # A fused draft's write ids are the owner's virtual ids, whichever
             # sub-pools its layers read.
-            routed = (
-                alloc_spaces
-                if is_unified_target
-                else {IdSpaceKind.FULL}.union(
-                    sp.name for sp in token_to_kv_pool.layer_router.sub_pools()
+            if is_unified_target:
+                self._spaces = alloc_spaces
+            else:
+                self._spaces = {IdSpaceKind.FULL: alloc_spaces[IdSpaceKind.FULL]}
+                for sub_pool in token_to_kv_pool.layer_router.sub_pools():
+                    view = token_to_kv_pool.layer_router.view(sub_pool.name)
+                    self._spaces[sub_pool.name] = alloc_spaces[
+                        token_to_kv_pool.layer_router.storage_name(sub_pool.name)
+                    ]
+            if self.is_fused_draft:
+                from sglang.srt.mem_cache.kv.alloc.id_space import ReplicatedTokenIds
+
+                replicas = max(
+                    token_to_kv_pool.layer_router.view(p.name).token_replicas
+                    for p in token_to_kv_pool.layer_router.sub_pools()
                 )
-            )
-            self._spaces = {
-                name: space for name, space in alloc_spaces.items() if name in routed
-            }
+                if replicas > 1:
+                    # FULL also supplies capture metadata for window-only heads.
+                    owner_ids = ReplicatedTokenIds(
+                        alloc.full_attn_allocator.ids, replicas
+                    )
+                    self._spaces[IdSpaceKind.FULL] = owner_ids.space(
+                        alloc_spaces[IdSpaceKind.FULL].key
+                    )
+                    self.defer_read_translate = False
+                for sub_pool in token_to_kv_pool.layer_router.sub_pools():
+                    name = sub_pool.name
+                    view = token_to_kv_pool.layer_router.view(name)
+                    if view.token_replicas > 1:
+                        band = (
+                            alloc.full_attn_allocator
+                            if name == alloc.roles.owner
+                            else alloc.window_allocators[
+                                token_to_kv_pool.layer_router.storage_name(name)
+                            ]
+                        )
+                        replicated = ReplicatedTokenIds(band.ids, view.token_replicas)
+                        self._spaces[name] = replicated.space(self._spaces[name].key)
+                        self.defer_read_translate = False
             self._full_v2p_table = self._spaces[IdSpaceKind.FULL].table
         else:
             self._capture_page_size = page_size
@@ -193,6 +231,25 @@ class RunnerIds:
                     dcp_rank=parallel.dcp_rank,
                     interleave_size=page_size,
                 )
+                self._call_spaces = self._spaces
+                self._spaces = {
+                    name: _localized(name, space, localize)
+                    for name, space in self._spaces.items()
+                }
+            elif is_cp_sharded_padded():
+                # Keep the plan's global rows; each sub-pool writes only owned pages.
+                strategy = get_cp_strategy()
+                c, p = strategy.cp_size, page_size
+
+                def localize(ids):
+                    shifted = ids.to(torch.int64) + (c - 1) * p
+                    local = (shifted // (c * p)) * p + shifted % p
+                    return torch.where(
+                        (ids > 0) & ((shifted // p) % c == strategy.cp_rank),
+                        local,
+                        0,
+                    )
+
                 self._call_spaces = self._spaces
                 self._spaces = {
                     name: _localized(name, space, localize)
@@ -269,7 +326,7 @@ class RunnerIds:
         DCP widens allocator pages; the runner's page size stays physical.
         """
         if self.is_translating:
-            return self._full_v2p_table.numel() * self._capture_page_size
+            return self._capture_token_capacity
         return max_token_pool_size + self.page_size
 
     # -- the iteration's plan --------------------------------------------------
@@ -331,7 +388,7 @@ class RunnerIds:
             for kind in (IdSpaceKind.FULL, IdSpaceKind.SLIDING_WINDOW):
                 space = self.space(kind)
                 if space is not None and space.read_v2p is not None:
-                    mappings[kind] = space.read_v2p
+                    mappings[kind] = space.read_mapping()
                     translated[kind] = torch.empty(
                         req_pool_indices.numel() * width,
                         dtype=torch.int64,
@@ -454,7 +511,7 @@ class RunnerIds:
                 req_to_token=self.req_to_token,
                 req_pool_indices=plan.req_pool_indices,
                 seq_lens=plan.seq_lens,
-                v2p=space.read_v2p,
+                v2p=space.read_mapping(),
                 page_size=self.page_size,
                 max_pages=width,
                 out=out,
@@ -498,7 +555,7 @@ class RunnerIds:
             row_stride=self.req_to_token.stride(0),
             entry_page_size=1,
             is_translated=True,
-            v2p=self.space(kind).read_v2p,
+            v2p=self.space(kind).read_mapping(),
         )
 
     def read_table(
@@ -588,7 +645,7 @@ class RunnerIds:
                 req_to_token=self.req_to_token,
                 req_pool_indices=req_pool_indices[:bs],
                 seq_lens=seq_lens,
-                v2p=self.space(kind).read_v2p,
+                v2p=self.space(kind).read_mapping(),
                 indptr=indptr,
                 page_size=self.page_size,
                 max_tokens=out.numel(),
@@ -660,6 +717,9 @@ class RunnerIds:
         slice rather than a row prefix, so a plan's row-prefix table cannot
         serve them.
         """
+        space = self.space(IdSpaceKind.FULL)
+        if space is not None and space.prepare_read is not None:
+            space.prepare_read()
         return self._full_v2p_table
 
     def bind_and_verify_backends(self, backends) -> None:

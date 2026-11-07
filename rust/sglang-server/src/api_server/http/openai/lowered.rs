@@ -19,11 +19,12 @@ use sglang_processor::openai::{
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
+use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
 use super::{AppState, ChatFormatter};
-use crate::api_server::core::CoreError;
+use crate::api_server::core::{CoreError, ReceivedAs};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
@@ -176,6 +177,16 @@ pub(super) async fn chat(
         // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
         return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
     }
+    // Below the override header, `X-Data-Parallel-Rank` names the DP rank.
+    match HintRoute::ChatCompletions
+        .header_rank(headers, state.server_args.enable_request_header_overrides)
+    {
+        Ok(Some(rank)) => generate["routed_dp_rank"] = rank.into(),
+        Ok(None) => {}
+        Err(error) => {
+            return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        }
+    }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.
     let (requests, is_batch) = match generate_requests(state, generate) {
@@ -185,9 +196,10 @@ pub(super) async fn chat(
     let timing = RequestTiming::new();
     let request_states: Vec<RequestState> = requests
         .iter()
-        .map(|request| RequestState::new(state, request, timing.clone()))
+        .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
-    let calls: Vec<_> = match state.core.generate_batch(requests).await {
+    let received = ReceivedAs::Typed(state.core.logged_headers(headers));
+    let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };

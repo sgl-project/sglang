@@ -19,6 +19,8 @@ from sglang.srt.layers.quantization.modelslim.schemes import ModelSlimLinearSche
 
 
 class ModelSlimW8A8Int8(ModelSlimLinearScheme):
+    """Static/dynamic INT8, including uncompressed W8A8S via dense kernels."""
+
     def __init__(
         self,
         quant_config: Dict[str, any],
@@ -28,7 +30,11 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         self.is_dynamic = (
             self.quant_config.get(prefix + ".weight", "") == "W8A8_DYNAMIC"
         )
+        self.has_weight_scale = prefix + ".weight_scale" in quant_config
+        self.has_weight_offset = prefix + ".weight_offset" in quant_config
         if self.is_dynamic:
+            if not self.has_weight_scale:
+                raise ValueError(f"W8A8_DYNAMIC requires weight_scale for {prefix}")
             self.kernel = NPUW8A8Int8DynamicLinearMethod()
         else:
             self.kernel = NPUW8A8Int8LinearMethod()
@@ -56,19 +62,21 @@ class ModelSlimW8A8Int8(ModelSlimLinearScheme):
         )
         layer.register_parameter("weight", weight)
 
-        weight_scale = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_scale", weight_scale)
+        if self.has_weight_scale:
+            weight_scale = ChannelQuantScaleParameter(
+                data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_scale", weight_scale)
 
-        weight_offset = ChannelQuantScaleParameter(
-            data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
-            output_dim=0,
-            weight_loader=weight_loader,
-        )
-        layer.register_parameter("weight_offset", weight_offset)
+        if self.has_weight_offset:
+            weight_offset = ChannelQuantScaleParameter(
+                data=torch.empty((output_size_per_partition, 1), dtype=params_dtype),
+                output_dim=0,
+                weight_loader=weight_loader,
+            )
+            layer.register_parameter("weight_offset", weight_offset)
 
         if not self.is_dynamic:
             input_scale = PerTensorScaleParameter(

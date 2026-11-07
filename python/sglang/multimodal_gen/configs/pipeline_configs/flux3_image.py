@@ -12,17 +12,12 @@ from sglang.multimodal_gen.configs.models.dits.flux3 import (
     Flux3DiTConfig,
 )
 from sglang.multimodal_gen.configs.models.vaes.flux3_image import Flux3ImageVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 if TYPE_CHECKING:
