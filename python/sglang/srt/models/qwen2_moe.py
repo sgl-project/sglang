@@ -85,6 +85,7 @@ from sglang.srt.layers.moe.utils import (
     uses_per_rank_fused_shared_slots,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import DenseSiluAndMulQuant
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -219,6 +220,7 @@ class Qwen2MoeMLP(nn.Module):
                 f"Unsupported activation: {hidden_act}. Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
         # Set externally (see qwen3_5.py) when both projections are NVFP4 and
         # the FlashInfer fused SiLU+mul+FP4-quant kernel is available. The
         # fused path replaces act_fn + the down_proj input quantization with a
@@ -237,7 +239,9 @@ class Qwen2MoeMLP(nn.Module):
         if can_run_silu_fp4_quant_fusion(self, gate_up):
             x, _ = self.down_proj(silu_and_mul_fp4_quant(self, gate_up))
             return x
-        x = self.act_fn(gate_up)
+        x = self.activation_quant(
+            x=gate_up, act_fn=self.act_fn, down_proj=self.down_proj
+        )
         x, _ = self.down_proj(x)
         return x
 

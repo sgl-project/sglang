@@ -127,12 +127,9 @@ class LlamaMLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            if forward_batch is not None and forward_batch.forward_mode.is_decode():
-                x = self.activation_quant.forward_decode(
-                    gate_up, self.act_fn, self.down_proj
-                )
-            else:
-                x = self.act_fn(gate_up)
+            x = self.activation_quant(
+                x=gate_up, act_fn=self.act_fn, down_proj=self.down_proj
+            )
 
         x, _ = self.down_proj(x)
         return x

@@ -8,13 +8,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.fused_op import get_fused_op_backend
-from sglang.srt.runtime_context import (
-    get_exec,
-    get_forward,
-    get_lora,
-    get_parallel,
-    get_platform,
-)
+from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_platform
 from sglang.srt.utils import is_cuda
 
 if TYPE_CHECKING:
@@ -29,7 +23,8 @@ class DenseSiluAndMulQuant:
         self.enabled = False
         self.down_proj = down_proj
         self.quant_method = down_proj.quant_method
-        if not (is_cuda() and get_platform().is_sm100 and get_parallel().tp_size == 1):
+        platform = get_platform()
+        if not (is_cuda() and (platform.is_sm90 or platform.is_sm100)):
             return
 
         from sglang.srt.layers import deep_gemm_wrapper
@@ -37,9 +32,13 @@ class DenseSiluAndMulQuant:
         from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
         from sglang.srt.layers.quantization.fp8_utils import (
             _deepgemm_block_fp8_supported,
+            _fp8_block_gemv_enabled,
             deepgemm_w8a8_block_fp8_linear_with_fallback,
         )
 
+        # Match the linear's own activation quant: packed UE8M0 on SM100,
+        # fp32 column-major TMA-aligned on SM90.
+        self.scale_ue8m0 = deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
         method = self.quant_method
         if not (
             type(down_proj) is RowParallelLinear
@@ -47,7 +46,7 @@ class DenseSiluAndMulQuant:
             and method.weight_block_size == [128, 128]
             and method.quant_config.activation_scheme == "dynamic"
             and not (method.use_marlin or method.use_mxfp8 or method.block_fp8_as_mxfp8)
-            and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and (self.scale_ue8m0 or platform.is_sm90)
             and down_proj.input_is_parallel
         ):
             return
@@ -55,7 +54,13 @@ class DenseSiluAndMulQuant:
         if isinstance(backend, partial):
             if backend.args or set(backend.keywords) - {"act_scale_ue8m0"}:
                 return
+            # SM90 quantizes these checkpoints with row-major power-of-two scales.
+            if platform.is_sm90:
+                return
             backend = backend.func
+        # The SM90 GEMV takes row-major scales.
+        if _fp8_block_gemv_enabled():
+            return
         # The supported loader preserves matrix geometry, not tensor identity/device.
         self.weight_shape = (down_proj.output_size, down_proj.input_size_per_partition)
         self.enabled = (
@@ -65,13 +70,12 @@ class DenseSiluAndMulQuant:
             )
         )
 
-    def forward_decode(
+    def __call__(
         self,
         x: torch.Tensor,
         act_fn: SiluAndMul,
         down_proj: RowParallelLinear,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        """Try fusion for decode; callers must bypass this helper in other modes."""
         if not self.enabled or torch.compiler.is_compiling():
             return act_fn(x)
 
@@ -112,7 +116,7 @@ class DenseSiluAndMulQuant:
         return per_token_group_quant(
             x,
             group_size=128,
-            scale_ue8m0=True,
+            scale_ue8m0=self.scale_ue8m0,
             column_major_scales=True,
             fuse_silu_and_mul=True,
             silu_and_mul_mode="dense",
