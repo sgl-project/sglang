@@ -79,3 +79,14 @@ def validate_optional_list_i64_1d_2d(
                 raise ValueError(f"row {i}: {e}") from None
         return v
     raise ValueError(f"elements must be int or list; got {type(v[0]).__name__}")
+
+
+def input_embeds_union_tag(v: Any) -> str:
+    is_batch = (
+        isinstance(v, list)
+        and v
+        and isinstance(v[0], list)
+        and v[0]
+        and isinstance(v[0][0], list)
+    )
+    return "batch" if is_batch else "single"
