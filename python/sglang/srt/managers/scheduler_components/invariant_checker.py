@@ -20,7 +20,6 @@ import torch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
-from sglang.srt.managers.scheduler_components.exit_ledger import LeakDetector
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
@@ -77,15 +76,12 @@ class SchedulerInvariantChecker:
     get_running_batches: Callable = field(default=lambda: ())
     # Under PP, the micro-batches' launched steps.
     get_pp_mbs: Callable = field(default=lambda: ())
-    # Whether the decode offload still holds a request that left every list.
-    is_offloading: Callable[[Req], bool] = field(default=lambda req: False)
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     reporter: FailureReporter = field(default_factory=FailureReporter)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
-    leak_detector: LeakDetector = field(default_factory=LeakDetector)
     checks: Dict[CheckPhase, List[StateCheck]] = field(init=False)
 
     def __post_init__(self) -> None:
@@ -103,11 +99,6 @@ class SchedulerInvariantChecker:
             ),
             StateCheck(
                 phase=CheckPhase.BUSY,
-                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
-                fn=self._check_leaks,
-            ),
-            StateCheck(
-                phase=CheckPhase.BUSY,
                 when=envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get,
                 fn=self._check_busy_pools,
             ),
@@ -115,11 +106,6 @@ class SchedulerInvariantChecker:
                 phase=CheckPhase.BUSY,
                 when=envs.SGLANG_CHECK_KV_PAGE_INVARIANTS.get,
                 fn=self._check_kv_page_invariants,
-            ),
-            StateCheck(
-                phase=CheckPhase.IDLE,
-                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
-                fn=self._check_leaks,
             ),
             StateCheck(
                 phase=CheckPhase.IDLE,
@@ -625,11 +611,6 @@ class SchedulerInvariantChecker:
             {req for req in running - in_running_batch if req.inflight_steps <= 0},
             "Requests in running but in no running batch or step",
         )
-
-    def _check_leaks(self) -> None:
-        """A request that left every list has exited, has a step in flight, or
-        is held by the decode offload."""
-        self.leak_detector.check(self.get_request_lists().values(), self.is_offloading)
 
     def _check_batch_consistency(self, batch: ScheduleBatch) -> None:
         """A step is processed once, with the requests it was launched with."""

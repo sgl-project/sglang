@@ -328,7 +328,6 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            done.exit_via = "release"
             s._on_step_processed(batch)
 
         s.run_batch = run_batch

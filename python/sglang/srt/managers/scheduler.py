@@ -2737,10 +2737,6 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
-            is_offloading=lambda req: (
-                self.decode_offload_manager is not None
-                and self.decode_offload_manager.has_inflight_offload(req)
-            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.

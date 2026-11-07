@@ -38,7 +38,6 @@ from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, StaticPoolSh
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.session.streaming_session import SessionSlot
-from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.tree_slots import tree_slots_of
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -253,7 +252,7 @@ class TestShardedFullPoolInvariant(CustomTestCase):
         )
         locs = torch.cat((prefix_locs, tail_locs))
         checker.req_to_token_pool.req_to_token[0, : len(locs)] = locs
-        req = FakeReq(
+        req = SimpleNamespace(
             kv=SimpleNamespace(
                 holds_kv=True,
                 req_pool_idx=0,
