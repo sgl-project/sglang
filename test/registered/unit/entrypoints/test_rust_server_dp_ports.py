@@ -103,6 +103,8 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
             "default_priority_value",
             5,
         ),
+        ({"api_key": "sk-api"}, "api_key", "sk-api"),
+        ({"admin_api_key": "sk-admin"}, "admin_api_key", "sk-admin"),
         ({}, "limit_mm_data_per_request", []),
         (
             {"limit_mm_data_per_request": {"video": 1, "image": 2}},
@@ -125,6 +127,8 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "grpc-response-timeout",
         "priority-off",
         "priority-on",
+        "api-key",
+        "admin-api-key",
         "mm-limits-unset",
         "mm-limits-keep-order",
         "loaded-tokenizer",
@@ -315,13 +319,15 @@ def test_dp_leaders_reuse_node_local_ports(
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         parallel = get_parallel()
         ports = []
         for dp_rank, tp_rank in enumerate(ranks):
             scheduler = SimpleNamespace(
                 server_args=SimpleNamespace(),
-                model_config=SimpleNamespace(is_multimodal=False),
+                model_config=SimpleNamespace(is_multimodal=False, is_generation=True),
             )
             with parallel.override(
                 tp_rank=tp_rank,
@@ -347,10 +353,12 @@ def test_plain_dp_replicas_bind_their_own_ports():
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         scheduler = SimpleNamespace(
             server_args=SimpleNamespace(),
-            model_config=SimpleNamespace(is_multimodal=False),
+            model_config=SimpleNamespace(is_multimodal=False, is_generation=True),
         )
         ports = []
         for dp_rank in range(2):
@@ -407,6 +415,8 @@ def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
         patch.object(rust_extensions, "load_rust_extension") as extension,
         patch.object(rust_server, "_partition_cores", return_value=(None, None)),
         patch.object(rust_server, "_build_server_args"),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(rust_server.RustServer, "_watch_startup_failure"),
     ):
         parallel = get_parallel()
         reported = []
@@ -426,7 +436,9 @@ def test_node_listeners_name_every_listener_on_the_node(server_args, leaders):
                 rust_server.RustServer.launch(
                     SimpleNamespace(
                         server_args=SimpleNamespace(),
-                        model_config=SimpleNamespace(is_multimodal=False),
+                        model_config=SimpleNamespace(
+                            is_multimodal=False, is_generation=True
+                        ),
                     )
                 )
                 reported.append(_reported_deployment_info())
@@ -616,6 +628,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     server_class.gather_frontend_cpu_share.return_value = (1, 2)
     scheduler = SimpleNamespace(
         _hosts_rust_server=lambda: hosts,
+        _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
         _engine_paused=False,
     )
@@ -635,7 +648,8 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
             scheduler, frontend_cpu_share=(1, 2)
         )
         server.install_sigterm_drain.assert_called_once_with(
-            notify=rust_server.drain_notify_name("dp-ports-test")
+            notify=rust_server.drain_notify_name("dp-ports-test"),
+            hold_drain_end=False,
         )
     assert scheduler.rust_server is (server if hosts else None)
 

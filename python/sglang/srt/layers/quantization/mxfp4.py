@@ -1016,6 +1016,17 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                k31_decode_moe_supported,
+            )
+
+            layer.k31_decode_moe = k31_decode_moe_supported(
+                layer,
+                self.intermediate_size_per_partition,
+                self.hidden_size,
+                self.with_bias,
+                self.flashinfer_mxfp4_moe_precision,
+            )
             return
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:
@@ -1655,6 +1666,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            k31_decode_moe=layer.k31_decode_moe,
         )
         return self.runner.run(dispatch_output, quant_info)
 

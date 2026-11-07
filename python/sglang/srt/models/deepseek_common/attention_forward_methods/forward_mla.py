@@ -183,10 +183,13 @@ class DeepseekMLAForwardMixin:
     dsa_decode_absorb_under_indexer = False
     # set by forward_absorb_prepare when that overlap wrote the layer's KV
     _kv_cache_saved_early = False
+    # Apply W_UV to the DCP decode partials before the reduce (DSA layers only)
+    dcp_v_preproject = False
+    _dcp_v_weights: Optional[torch.Tensor] = None
 
     def _prepare_dcp_v_weights(self, group):
         weights = group.all_gather(self.w_vc.contiguous(), dim=0)
-        cached = getattr(self, "_dcp_v_weights", None)
+        cached = self._dcp_v_weights
         if cached is None:
             self._dcp_v_weights = weights
         else:
@@ -1042,7 +1045,7 @@ class DeepseekMLAForwardMixin:
                     # A head's linear V projection commutes with its LSE-weighted
                     # reduction. Exchange the narrower projected partials.
                     if (
-                        getattr(self, "dcp_v_preproject", False)
+                        self.dcp_v_preproject
                         and self.use_dsa
                         and (
                             attn_output.shape[0] >= 512
@@ -1058,7 +1061,7 @@ class DeepseekMLAForwardMixin:
                         and not _SGLANG_EXPERIMENTAL_LORA_OPTI
                         and not is_kv_b_lora_active(self)
                     ):
-                        weights = getattr(self, "_dcp_v_weights", None)
+                        weights = self._dcp_v_weights
                         if (
                             weights is None
                             and not torch.cuda.is_current_stream_capturing()

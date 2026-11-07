@@ -3883,7 +3883,7 @@ class KimiK3LinearForCausalLM(nn.Module):
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
-            if getattr(self_attn, "_dcp_v_weights", None) is not None:
+            if self_attn._dcp_v_weights is not None:
                 self_attn._prepare_dcp_v_weights(get_parallel().dcp_group)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
             if _is_hip and (

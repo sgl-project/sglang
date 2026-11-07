@@ -118,6 +118,8 @@ logger = logging.getLogger(__name__)
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
 GB = 1024 * 1024 * 1024
+# Arbitrary; no evidence this is the best chunk size for temporal state copies.
+_MAMBA_TEMPORAL_COPY_CHUNK_BYTES = 64 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -1185,6 +1187,30 @@ class MambaPool:
         if temporal.numel() > 0:
             temporal.index_fill_(1, idx64, 0)
 
+    def _copy_temporal_slots(
+        self, *, src_indices: torch.Tensor, dst_indices: torch.Tensor
+    ) -> None:
+        temporal = self.mamba_cache.temporal
+        if temporal.numel() == 0:
+            return
+        num_slots = dst_indices.shape[0]
+        slot_bytes = temporal.element_size() * (temporal.numel() // temporal.shape[1])
+        step = max(1, _MAMBA_TEMPORAL_COPY_CHUNK_BYTES // slot_bytes)
+        if num_slots <= step:
+            temporal[:, dst_indices] = temporal[:, src_indices]
+            return
+        # A batched gather allocates num_slots * slot_bytes at once and can OOM
+        # under admission bursts; chunking requires disjoint src/dst slots.
+        if envs.SGLANG_DEBUG_MEMORY_POOL.get():
+            overlap = set(src_indices.tolist()) & set(dst_indices.tolist())
+            assert not overlap, (
+                "chunked temporal copy requires disjoint src/dst slots; "
+                f"overlap={sorted(overlap)}"
+            )
+        for start in range(0, num_slots, step):
+            chunk = slice(start, start + step)
+            temporal[:, dst_indices[chunk]] = temporal[:, src_indices[chunk]]
+
     def copy_from(self, src_indices: torch.Tensor, dst_indices: torch.Tensor):
         """Clone mamba state (conv + temporal) from src slots into dst slots.
 
@@ -1214,17 +1240,13 @@ class MambaPool:
                     f"overlap={sorted(overlap)}"
                 )
             fused_copy_conv_slots(self._conv_slot_desc, src_indices, dst_indices)
-            temporal = self.mamba_cache.temporal
-            if temporal.numel() > 0:
-                temporal[:, dst_indices] = temporal[:, src_indices]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         else:
             for i in range(len(self.mamba_cache.conv)):
                 self.mamba_cache.conv[i][:, dst_indices] = self.mamba_cache.conv[i][
                     :, src_indices
                 ]
-            self.mamba_cache.temporal[:, dst_indices] = self.mamba_cache.temporal[
-                :, src_indices
-            ]
+            self._copy_temporal_slots(src_indices=src_indices, dst_indices=dst_indices)
         if self.replayssm_write_pos is not None:
             self.replayssm_write_pos[dst_indices] = 0
         for sibling in self._slot_siblings:

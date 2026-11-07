@@ -8,7 +8,9 @@ use std::time::Duration;
 use axum::Router;
 
 use super::generate_hook::GenerateHook;
-use super::{hicache, info, loads, metrics, native_api, openai, pre_generate};
+use super::{
+    auth, hicache, info, loads, metrics, native_api, openai, pre_generate, request_decompression,
+};
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
@@ -35,29 +37,65 @@ pub(super) struct AppState {
     pub(super) openai_chat: Option<openai::OpenAiChat>,
 }
 
-/// Every listener warms its own rank; health stays 503 until it succeeds,
-/// and a failed or timed-out warmup leaves the listener unready.
-async fn startup_warmup(core: CoreHandle, server_args: Arc<ServerArgs>) {
-    if core.is_ready() {
-        return;
-    }
-    let timeout = match environ::env_i64("SGLANG_WARMUP_TIMEOUT", -1) {
-        t if t > 0 => t as u64,
-        _ if server_args.is_disaggregation() => 1800,
-        _ => 600,
-    };
-    match tokio::time::timeout(
-        Duration::from_secs(timeout),
-        core.warm_up(server_args.skip_tokenizer_init),
-    )
-    .await
-    {
-        Ok(Ok(())) => {
-            core.mark_ready();
-            tracing::info!("The server is fired up and ready to roll!");
+/// Every listener warms its own rank, as Python's `_execute_server_warmup`
+/// warms the server, and health stays 503 until the warmup settles. A failed
+/// or timed-out warmup takes the server down as Python's does: the error goes
+/// to `startup_failure`, which `Server.wait_startup_failure` hands to the
+/// launching process. Python's PD exception holds here too: a warmup the
+/// scheduler answers with an error (Python: a non-200 status) leaves the
+/// server up, and the health probe decides whether it serves.
+///
+/// Once warm (or with the warmup skipped, or past the PD exception), the
+/// scheduler ranks freeze their garbage collectors, as after Python's
+/// post-warmup `/freeze_gc`: the objects startup allocated then stay out of
+/// every later full collection.
+async fn startup_warmup(
+    core: CoreHandle,
+    server_args: Arc<ServerArgs>,
+    timeout: Duration,
+    startup_failure: flume::Sender<String>,
+) {
+    if !core.is_ready() {
+        let error = match tokio::time::timeout(
+            timeout,
+            core.warm_up(server_args.skip_tokenizer_init),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                core.mark_ready();
+                tracing::info!("The server is fired up and ready to roll!");
+                None
+            }
+            Ok(Err(e)) if server_args.is_disaggregation() => {
+                tracing::info!(
+                    "Disaggregation warmup failed (mode={:?}), error: {e}",
+                    server_args.disaggregation_mode
+                );
+                core.mark_ready();
+                None
+            }
+            Ok(Err(e)) => Some(e.to_string()),
+            Err(_) => Some(format!("timed out after {timeout:?}")),
+        };
+        if let Some(error) = error {
+            tracing::error!("Initialization failed. warmup error: {error}");
+            let _ = startup_failure.try_send(error);
+            return;
         }
-        Ok(Err(e)) => tracing::error!(error = %e, "startup warmup failed"),
-        Err(_) => tracing::error!(timeout_secs = timeout, "startup warmup timed out"),
+    }
+    if let Err(e) = core.freeze_gc(server_args.gc_threshold.clone()).await {
+        tracing::error!(error = %e, "post-warmup freeze_gc failed");
+    }
+}
+
+/// Python's warmup request timeout: `SGLANG_WARMUP_TIMEOUT` seconds when
+/// positive, else 1800 s in PD mode and 600 s otherwise.
+fn warmup_timeout(configured_secs: f64, is_disaggregation: bool) -> Duration {
+    match configured_secs {
+        secs if secs > 0.0 && secs.is_finite() => Duration::from_secs_f64(secs),
+        _ if is_disaggregation => Duration::from_secs(1800),
+        _ => Duration::from_secs(600),
     }
 }
 
@@ -76,6 +114,8 @@ pub async fn serve(
     // aborted with the api runtime. A graceful drain
     // (`CoreHandle::begin_drain`) instead returns once its requests finished.
     shutdown: flume::Receiver<()>,
+    // Where a failed startup warmup reports (see `startup_warmup`).
+    startup_failure: flume::Sender<String>,
     hicache_manager: Arc<HiCacheManager>,
     tokenizer: Option<Arc<sglang_processor::DynamoTokenizer>>,
 ) {
@@ -98,7 +138,15 @@ pub async fn serve(
         openai_chat,
     });
     // Cancelled with the api runtime on shutdown.
-    tokio::spawn(startup_warmup(state.core.clone(), server_args.clone()));
+    tokio::spawn(startup_warmup(
+        state.core.clone(),
+        server_args.clone(),
+        warmup_timeout(
+            environ::env_f64("SGLANG_WARMUP_TIMEOUT", -1.0),
+            server_args.is_disaggregation(),
+        ),
+        startup_failure,
+    ));
 
     // Each endpoint module registers its own routes and merges here.
     let mut router = Router::new()
@@ -123,10 +171,6 @@ pub async fn serve(
         });
     }
 
-    // TODO(auth): no API-key boundary yet. Python gates every route (except
-    // /health*, /metrics*, OPTIONS) via `add_api_key_middleware`; until ported,
-    // a configured `api_key` does NOT protect these routes.
-    //
     // No body limit, matching the Python server.
     let core = state.core.clone();
     let mut app = router
@@ -136,6 +180,12 @@ pub async fn serve(
     if let Some(http_layer) = http_layer {
         app = pre_generate::apply(app, &http_layer, core);
     }
+    // Outside the embedding package's layers, so they read decompressed bodies.
+    app = request_decompression::apply(app, &server_args);
+    // Outside the extension layer, so its routes are keyed too. The bootstrap
+    // registry below stays open, as Python serves it on its own server. Auth
+    // runs before decompression, so an unauthenticated body is never inflated.
+    app = auth::apply(app, &server_args.api_keys);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
     // router carries its own Arc<Registry> state, so it cannot merge into the
@@ -147,6 +197,7 @@ pub async fn serve(
         app = app.merge(routes);
         tracing::info!("PD KV bootstrap registry mounted on the api listener");
     }
+    app = auth::guard_fallback(app, &server_args.api_keys);
 
     // Apply logging and access log middleware.
     let app = log::apply(app, &server_args);
@@ -199,5 +250,162 @@ pub async fn serve(
         // `dump_requests_before_crash` does on the health-check path, once
         // the Rust server supports `--crash-dump-folder`.
         tracing::error!("{reason}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api_server::handlers::{CoreConfig, CoreMetadata};
+    use crate::message::config::DisaggregationMode;
+    use crate::message::response::{ChunkEvent, ResponseItem};
+    use crate::tokenizer_manager::wiring::TmEvent;
+
+    /// `SGLANG_WARMUP_TIMEOUT` is a float, as Python's `EnvFloat`.
+    #[test]
+    fn warmup_timeout_reads_python_float_seconds() {
+        let configured = environ::parse_f64("3600.0").unwrap();
+        assert_eq!(warmup_timeout(configured, false), Duration::from_secs(3600));
+        assert_eq!(warmup_timeout(0.5, true), Duration::from_millis(500));
+        assert_eq!(warmup_timeout(-1.0, false), Duration::from_secs(600));
+        assert_eq!(warmup_timeout(-1.0, true), Duration::from_secs(1800));
+    }
+
+    /// A warmup the scheduler never answers times out and is reported, as
+    /// Python's request timeout fails its warmup; the server stays unready.
+    #[tokio::test]
+    async fn timed_out_startup_warmup_is_reported() {
+        // Held, so the request is queued but never answered.
+        let (intake_tx, _intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: false,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                peer_endpoints: Vec::new(),
+                generate_validator: None,
+            },
+        );
+        let (failure_tx, failure_rx) = flume::bounded(1);
+        startup_warmup(
+            core.clone(),
+            Arc::new(ServerArgs::default()),
+            Duration::from_millis(10),
+            failure_tx,
+        )
+        .await;
+        assert_eq!(failure_rx.try_recv().unwrap(), "timed out after 10ms");
+        assert!(!core.is_ready());
+    }
+
+    /// The scheduler ranks freeze their garbage collectors with the
+    /// configured thresholds once the warmup generation finishes, or at once
+    /// when the warmup is skipped; a failed warmup freezes nothing and is
+    /// reported, except in PD mode, where the server stays up and freezes.
+    #[tokio::test]
+    async fn startup_warmup_freezes_gc_once_warm() {
+        for (skip_warmup, warmup_succeeds, pd) in [
+            (true, true, false),
+            (false, true, false),
+            (false, false, false),
+            (false, false, true),
+        ] {
+            let case =
+                format!("skip_warmup={skip_warmup} warmup_succeeds={warmup_succeeds} pd={pd}");
+            let server_args = Arc::new(ServerArgs {
+                gc_threshold: Some(vec![700, 10, 1000]),
+                disaggregation_mode: if pd {
+                    DisaggregationMode::Prefill
+                } else {
+                    DisaggregationMode::Null
+                },
+                ..Default::default()
+            });
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: skip_warmup,
+                    is_disaggregation: pd,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    metadata: CoreMetadata::from(server_args.as_ref()),
+                    metrics: None,
+                    request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: None,
+                },
+            );
+            let (failure_tx, failure_rx) = flume::bounded(1);
+            let warmup = tokio::spawn(startup_warmup(
+                core.clone(),
+                server_args.clone(),
+                Duration::from_secs(60),
+                failure_tx,
+            ));
+            if !skip_warmup {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("{case}: the warmup generation must come first");
+                };
+                assert!(admission.try_accept());
+                // Hold the reply and let the warmup task run (the test runtime
+                // is single-threaded): nothing may be frozen yet.
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                assert!(
+                    intake_rx.is_empty(),
+                    "{case}: froze GC before the warmup finished"
+                );
+                if warmup_succeeds {
+                    request
+                        .sink
+                        .try_send(ResponseItem::Done(ChunkEvent::default()))
+                        .unwrap();
+                }
+            }
+            if !warmup_succeeds && !pd {
+                warmup.await.unwrap();
+                assert!(!core.is_ready(), "{case}");
+                assert!(intake_rx.is_empty(), "{case}: a failed warmup froze GC");
+                assert!(
+                    failure_rx.try_recv().is_ok(),
+                    "{case}: failure not reported"
+                );
+                continue;
+            }
+            let TmEvent::OneWay { control, queued } = intake_rx.recv_async().await.unwrap() else {
+                panic!("{case}: expected a one-way control message");
+            };
+            let header = control.encode().unwrap();
+            let header = rmpv::decode::read_value(&mut &header[..]).unwrap();
+            assert_eq!(
+                header,
+                rmpv::Value::Array(vec![
+                    "FreezeGCReq".into(),
+                    control.rid().into(),
+                    rmpv::Value::Nil,
+                    rmpv::Value::Array(vec![700.into(), 10.into(), 1000.into()]),
+                ]),
+                "{case}"
+            );
+            queued.send(Ok(())).unwrap();
+            warmup.await.unwrap();
+            assert!(core.is_ready(), "{case}");
+            assert!(intake_rx.is_empty(), "{case}: froze GC more than once");
+            assert!(failure_rx.is_empty(), "{case}: reported a failure");
+        }
     }
 }

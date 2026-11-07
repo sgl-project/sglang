@@ -741,7 +741,7 @@ class TestFusedDraftDecision(CustomTestCase):
             swa_v_head_dim=64,
         )
         cfg.kv_cache_dtype = host_kv_dtype
-        cfg.dflash_draft_rows_dcp_collapsed = False
+        cfg.dflash_draft_loc_space_scale = 1
         cfg.spec_aux_config = SimpleNamespace(
             eagle_draft_num_layers=1,
             draft_kv_num_layers=1,

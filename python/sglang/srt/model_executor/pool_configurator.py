@@ -136,15 +136,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _dflash_draft_loc_scale(kvc: KVCacheConfigurator) -> int:
-    """Draft KV rows per target row under DCP: a replicated draft spans the
-    widened virtual location space (attn_dcp_size), a DCP-collapsed MLA draft
-    keeps one physical row per target row."""
-    if kvc.dflash_draft_rows_dcp_collapsed:
-        return 1
-    return get_parallel().attn_dcp_size
-
-
 def _has_dflash_draft_kv(kvc: KVCacheConfigurator) -> bool:
     """Whether the target's per-token budget carries a draft KV row. A DFLASH
     draft KV ring is a small fixed pool instead, so it charges nothing here."""
@@ -166,7 +157,7 @@ def _dflash_draft_cell_size(kvc: KVCacheConfigurator) -> int:
     cell_size = kvc.dflash_draft_cell_size_per_token
     if cell_size is None or int(cell_size) <= 0:
         return 0
-    return int(cell_size) * _dflash_draft_loc_scale(kvc)
+    return int(cell_size) * kvc.dflash_draft_loc_space_scale
 
 
 def _get_dsa_cache_layer_ids(kvc: KVCacheConfigurator, num_layers: int) -> list[int]:
@@ -395,7 +386,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_cell_size_per_token=self._cell_size,
                     target_num_layers=int(num_layers),
                     draft_num_layers=int(draft_num_layers)
-                    * _dflash_draft_loc_scale(kvc),
+                    * kvc.dflash_draft_loc_space_scale,
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 

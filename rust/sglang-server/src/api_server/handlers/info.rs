@@ -141,6 +141,8 @@ mod tests {
                     max_context_length: 1_u64 << 32,
                     ..Default::default()
                 },
+                request_log: None,
+                generate_validator: None,
             },
         );
 
@@ -191,6 +193,8 @@ mod tests {
                     ..Default::default()
                 },
                 peer_endpoints: vec![DummyTarget::replying(&[0], move |_| Ok(envelope(2.5)))],
+                request_log: None,
+                generate_validator: None,
             },
         );
 

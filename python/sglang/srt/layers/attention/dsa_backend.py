@@ -958,8 +958,8 @@ class DeepseekSparseAttnBackend(
             )
             # decode merges top-k candidates of every request row; target
             # verify of every draft-token row.
-            max_rows = max(model_runner.max_running_requests, 1) * max(
-                self.speculative_num_draft_tokens or 1, 1
+            max_rows = max(model_runner.max_running_requests, 1) * (
+                self.speculative_num_draft_tokens or 1
             )
             # The fused merge returns only this rank's slots; top-k capture needs all.
             if (

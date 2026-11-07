@@ -9,10 +9,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -55,6 +52,7 @@ use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -327,7 +325,7 @@ async fn chat_completions(
             }),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(&state, &headers, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -359,7 +357,7 @@ async fn chat_completions(
             service_tier,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        sse_response(event_stream)
     } else {
         unary_chat(
             submitted,
@@ -1746,6 +1744,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             let state = Arc::new(super::super::AppState {

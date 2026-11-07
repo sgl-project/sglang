@@ -17,7 +17,9 @@ use super::generate_hook::{
 };
 use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
+use crate::api_server::core::{
+    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
+};
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
@@ -28,17 +30,14 @@ use crate::message::response::{CustomizedInfo, RequestStats};
 use crate::message::wire::{ClientMaxNewTokens, merge_preferred_sampling};
 use crate::utils::{
     environ,
-    response::{error_response, error_value},
+    response::{error_response, error_value, sse_response},
 };
 use axum::{
     Extension, Json, Router,
     extract::State,
     extract::rejection::JsonRejection,
     http::{HeaderMap, HeaderName, HeaderValue, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::{get, post},
 };
 use sglang_api_types::api::v1 as api;
@@ -294,6 +293,7 @@ const SCHEMA_META_INFO_KEYS: &[&str] = &[
     "audio_tokens",
     "video_tokens",
     "cached_tokens_details",
+    "dp_rank",
 ];
 
 /// A repeated key has been logged once.
@@ -591,10 +591,10 @@ async fn generate(
     start: Option<Extension<crate::RequestStart>>,
     held: Option<Extension<HeldGeneration>>,
     headers: HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
+    request: axum::extract::Request,
 ) -> Response {
-    let mut body = match body {
-        Ok(Json(body)) => body,
+    let (mut body, raw_body) = match json_body(&state, request).await {
+        Ok(body) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary -- as Python's does (FastAPI rejects before its
         // handler runs).
@@ -602,17 +602,32 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut body, &headers)
-    {
-        return native_error(StatusCode::BAD_REQUEST, &error, false);
-    }
+    let overrides = if state.server_args.enable_request_header_overrides {
+        match apply_header_overrides(&mut body, &headers) {
+            Ok(applied) => Some(applied),
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error, false),
+        }
+    } else {
+        None
+    };
     // What the client sent as `sampling_params` (an object, or one per batch
     // item), for a package's hook, before anything fills in beneath it.
     let client_sampling_params = state
         .generate_hook
         .as_ref()
         .and_then(|_| body.get("sampling_params").cloned());
+    // The request log and crash dump show the body as the client sent it:
+    // the defaults merged below go into a copy, as Python does.
+    let raw_body = RawBody {
+        bytes: raw_body,
+        overrides,
+    };
+    let snapshot = state
+        .core
+        .snapshot_body(&body, Some(raw_body), &headers)
+        .map(|snapshot| {
+            snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
+        });
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -640,7 +655,7 @@ async fn generate(
             .map(|held| held.claim(&mut payload));
         let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
         let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
-        generate_single(&state, payload, held, stream, request).await
+        generate_single(&state, payload, held, stream, request, snapshot).await
     } else {
         let requests = payloads
             .iter()
@@ -657,7 +672,7 @@ async fn generate(
                 )
             })
             .collect();
-        generate_batch(&state, payloads, stream, requests).await
+        generate_batch(&state, payloads, stream, requests, snapshot).await
     }
 }
 
@@ -671,6 +686,35 @@ fn item_sampling_params(
         serde_json::Value::Array(items) => items.get(item)?.as_object(),
         sent => sent.as_object(),
     }
+}
+
+/// The body exactly as axum's `Json<Value>` extracts it (the same content-type
+/// check, body limit and rejections), with its raw bytes, which a crash dump
+/// keeps as they came rather than serializing the body again.
+async fn json_body<S: Send + Sync>(
+    state: &S,
+    request: axum::extract::Request,
+) -> Result<(serde_json::Value, bytes::Bytes), JsonRejection> {
+    use axum::extract::FromRequest;
+
+    if !json_content_type(request.headers()) {
+        return Err(axum::extract::rejection::MissingJsonContentType::default().into());
+    }
+    let raw = bytes::Bytes::from_request(request, state).await?;
+    let Json(body) = Json::<serde_json::Value>::from_bytes(&raw)?;
+    Ok((body, raw))
+}
+
+/// axum's `Json` content-type rule: `application/json` or `application/*+json`.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|mime| {
+            mime.type_() == "application"
+                && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+        })
 }
 
 /// Decode a `/generate` body under the launch-time defaults into its requests and
@@ -721,12 +765,14 @@ async fn generate_single(
     held: Option<PendingGeneration>,
     stream: bool,
     request: RequestState,
+    snapshot: Option<BodySnapshot>,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // the frame builder just reads them — no tokenizer needed here.
+    let received = ReceivedAs::Body(snapshot);
     let call = match held {
-        Some(held) => state.core.generate_pending(req, held).await,
-        None => state.core.generate(req).await,
+        Some(held) => state.core.generate_pending(req, received, held).await,
+        None => state.core.generate(req, received).await,
     };
     let mut call = match call {
         Ok(call) => call,
@@ -742,7 +788,7 @@ async fn generate_single(
         use futures::StreamExt;
         let s = generation_event_stream(vec![(call, request)], incremental, false)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: fold to the terminal and respond once. `CoreCall` disarms
         // itself on a terminal item; truncation leaves it armed for drop cleanup.
@@ -824,11 +870,16 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
     request_states: Vec<RequestState>,
+    snapshot: Option<BodySnapshot>,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state.core.generate_batch(requests).await {
+    let calls = match state
+        .core
+        .generate_batch(requests, ReceivedAs::Body(snapshot))
+        .await
+    {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return native_core_error(error, stream),
     };
@@ -840,7 +891,7 @@ async fn generate_batch(
         let incremental = state.server_args.incremental_streaming_output;
         let s = generation_event_stream(calls, incremental, true)
             .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         // Unary: poll every item concurrently, as Python's gather does. `join_all`
         // preserves input order for the final JSON array, while each drain observes
@@ -1085,6 +1136,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1132,6 +1185,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1178,6 +1233,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1222,6 +1279,8 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1311,6 +1370,8 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1564,28 +1625,77 @@ mod tests {
         }
     }
 
-    /// A hook's keys reach every native frame of every request — unary,
-    /// cumulative and incremental streams, single and batch — each request's
-    /// hook started from its own sampling params, with the scheduler's decode
-    /// latency for a unary request and this frontend's for a streamed one;
-    /// without a hook the frames are the schema's. A finished request's stats
-    /// reach its terminal frame only, after the schema's keys and before the
-    /// hook's, with the decode throughput when metrics are on; a request whose
-    /// terminal output carries no stats (an older scheduler) reports neither.
-    /// The hook starts from each item's request, the HTTP headers and the
-    /// sampling params the client sent for it (without the launch-time
-    /// preferred ones), and sees each terminal frame once. An HTTP layer's
-    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
-    /// but neither decode latency.
+    /// The launch's generate validator refuses at every ingress before
+    /// anything is submitted, a batch's valid items included: native
+    /// `/generate` with its 400 (a stream's error frame), and the OpenAI
+    /// routes with their 400, unary even for a stream, as Python answers the
+    /// tokenizer manager's `ValueError` before the stream starts.
     #[tokio::test]
-    async fn generate_hook_keys_reach_every_frame() {
-        for (stream, incremental, hook, batch, metrics) in [
-            (false, false, true, true, true),
-            (false, false, false, false, false),
-            (true, false, true, true, false),
-            (true, false, false, false, true),
-            (true, true, true, true, true),
-            (true, true, false, false, true),
+    async fn generate_validator_refuses_every_ingress_before_submission() {
+        let native = serde_json::json!({"code": 400, "message": "top_logprobs_num 2"});
+        let openai = serde_json::json!({
+            "object": "error",
+            "message": "top_logprobs_num 2",
+            "type": "BadRequestError",
+            "param": null,
+            "code": 400,
+        });
+        let generate = |text: serde_json::Value, top_logprobs_num, stream| {
+            serde_json::json!({
+                "text": text,
+                "stream": stream,
+                "return_logprob": true,
+                "top_logprobs_num": top_logprobs_num,
+            })
+        };
+        let completion = |stream| {
+            serde_json::json!({
+                "model": "m",
+                "prompt": [1, 2],
+                "logprobs": 2,
+                "max_tokens": 1,
+                "stream": stream,
+            })
+        };
+        for (uri, body, status, error) in [
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    false,
+                ),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(
+                    serde_json::json!(["x", "y"]),
+                    serde_json::json!([1, 2]),
+                    true,
+                ),
+                StatusCode::OK,
+                &native,
+            ),
+            (
+                "/generate",
+                generate(serde_json::json!("x"), serde_json::json!(2), false),
+                StatusCode::BAD_REQUEST,
+                &native,
+            ),
+            (
+                "/v1/completions",
+                completion(false),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
+            (
+                "/v1/completions",
+                completion(true),
+                StatusCode::BAD_REQUEST,
+                &openai,
+            ),
         ] {
             let (intake_tx, intake_rx) = flume::unbounded();
             let core = crate::api_server::handlers::CoreHandle::new(
@@ -1598,33 +1708,126 @@ mod tests {
                     is_disaggregation: false,
                     mm_limits: Default::default(),
                     multimodal: false,
-                    peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
+                    peer_endpoints: Vec::new(),
+                    generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+                },
+            );
+            let state = Arc::new(AppState {
+                core,
+                server_args: Arc::new(crate::message::config::ServerArgs {
+                    served_model_name: "m".into(),
+                    ..Default::default()
+                }),
+                generation_policy: GenerationPolicy::default(),
+                chat_formatter: None,
+                generate_hook: None,
+                openai_chat: None,
+            });
+            let case = format!("{uri} {body}");
+            let request = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = routes()
+                .merge(super::super::openai::routes())
+                .with_state(state)
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), status, "{case}");
+            let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            let body = std::str::from_utf8(&body).unwrap();
+            let first = body
+                .strip_prefix("data: ")
+                .unwrap_or(body)
+                .lines()
+                .next()
+                .unwrap();
+            assert_eq!(&parse(first)["error"], error, "{case}");
+            assert!(
+                intake_rx.is_empty(),
+                "{case}: an item reached the scheduler"
+            );
+        }
+    }
+
+    /// A hook's keys reach every native frame of every request — unary,
+    /// cumulative and incremental streams, single and batch — each request's
+    /// hook started from its own sampling params, with the scheduler's decode
+    /// latency for a unary request and this frontend's for a streamed one;
+    /// without a hook the frames are the schema's. A finished request's stats
+    /// reach its terminal frame only, after the schema's keys and before the
+    /// hook's, with the decode throughput when metrics are on; a request whose
+    /// terminal output carries no stats (an older scheduler) reports neither.
+    /// The hook starts from each item's request, the HTTP headers and the
+    /// sampling params the client sent for it (without the launch-time
+    /// preferred ones), and sees each terminal frame once. An HTTP layer's
+    /// earlier [`crate::RequestStart`] lengthens every terminal `e2e_latency`
+    /// but neither decode latency. Every frame carries the listener's DP rank
+    /// (null without data parallelism), a status abort's terminal stream frame
+    /// included.
+    #[tokio::test]
+    async fn generate_hook_keys_reach_every_frame() {
+        for (stream, incremental, hook, batch, metrics) in [
+            (false, false, true, true, true),
+            (false, false, false, false, false),
+            (true, false, true, true, false),
+            (true, false, false, false, true),
+            (true, true, true, true, true),
+            (true, true, false, false, true),
+        ] {
+            // A hooked case also runs as DP rank 1; the rest as the only rank.
+            let dp_rank: u32 = if hook { 1 } else { 0 };
+            let server_args = crate::message::config::ServerArgs {
+                incremental_streaming_output: incremental,
+                metrics: metrics.then(|| crate::message::config::MetricsConfig {
+                    multiproc_dir: String::new(),
+                    labels: Default::default(),
+                    priority_label: false,
+                    bucket_time_to_first_token: None,
+                    bucket_inter_token_latency: None,
+                    bucket_e2e_request_latency: None,
+                    bucket_prompt_tokens: None,
+                    bucket_generation_tokens: None,
+                }),
+                preferred_sampling_params: Some(crate::message::config::PreferredSamplingParams(
+                    serde_json::json!({"top_k": 7}),
+                )),
+                deployment_info: crate::message::config::DeploymentInfo {
+                    dp_rank: Some(dp_rank),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let core = crate::api_server::handlers::CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::from(&server_args),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             let top_p_hook = TopPHook::default();
             let state = Arc::new(AppState {
                 core,
-                server_args: Arc::new(crate::message::config::ServerArgs {
-                    incremental_streaming_output: incremental,
-                    metrics: metrics.then(|| crate::message::config::MetricsConfig {
-                        multiproc_dir: String::new(),
-                        labels: Default::default(),
-                        priority_label: false,
-                        bucket_time_to_first_token: None,
-                        bucket_inter_token_latency: None,
-                        bucket_e2e_request_latency: None,
-                        bucket_prompt_tokens: None,
-                        bucket_generation_tokens: None,
-                    }),
-                    preferred_sampling_params: Some(
-                        crate::message::config::PreferredSamplingParams(
-                            serde_json::json!({"top_k": 7}),
-                        ),
-                    ),
-                    ..Default::default()
-                }),
+                server_args: Arc::new(server_args),
                 generation_policy: GenerationPolicy::default(),
                 chat_formatter: None,
                 generate_hook: hook
@@ -1668,6 +1871,17 @@ mod tests {
                         unreachable!()
                     };
                     chunk.rid = rid.clone();
+                    // A streamed batch's second item ends on a status abort,
+                    // still a frame.
+                    if stream && item == 1 {
+                        chunk.finish_reason = serde_json::from_value(serde_json::json!({
+                            "type": "abort",
+                            "message": "Aborted",
+                            "status_code": 500,
+                            "err_type": null
+                        }))
+                        .unwrap();
+                    }
                     let mut stats = serde_json::Map::new();
                     stats.insert("num_retractions".into(), serde_json::json!(1));
                     stats.insert("queue_time".into(), serde_json::json!(0.5));
@@ -1707,6 +1921,12 @@ mod tests {
                 .body(Body::from(body.to_string()))
                 .unwrap();
             let response = routes().with_state(state).oneshot(request).await.unwrap();
+            if stream {
+                assert_eq!(
+                    response.headers()["content-type"],
+                    crate::utils::response::SSE_CONTENT_TYPE
+                );
+            }
             let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
                 .await
                 .unwrap();
@@ -1725,7 +1945,7 @@ mod tests {
             };
 
             let case = format!(
-                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics}"
+                "stream={stream} incremental={incremental} hook={hook} batch={batch} metrics={metrics} dp_rank={dp_rank}"
             );
             // A stream takes each delta before its terminal output arrives.
             assert_eq!(frames.len(), items * if stream { 2 } else { 1 }, "{case}");
@@ -1738,6 +1958,11 @@ mod tests {
                     .map_or(if batch { position } else { 0 }, |i| i as usize);
                 let meta = frame["meta_info"].as_object().unwrap();
                 let terminal = !meta["finish_reason"].is_null();
+                assert_eq!(
+                    meta.get("dp_rank"),
+                    Some(&serde_json::json!(dp_rank)),
+                    "{case}"
+                );
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();
                 let e2e_latency = meta.get("e2e_latency").and_then(serde_json::Value::as_f64);
                 assert_eq!(e2e_latency.is_some(), terminal, "{case}");
@@ -2096,6 +2321,7 @@ mod tests {
             audio_tokens: Some(1),
             video_tokens: Some(1),
             cached_tokens_details: Some(Default::default()),
+            dp_rank: Some(0),
         };
         let keys: Vec<String> = serde_json::to_value(&every)
             .unwrap()
@@ -2693,6 +2919,50 @@ mod tests {
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"
             );
+        }
+    }
+
+    /// `json_body` accepts and rejects exactly what `Json<Value>` does, with
+    /// the same rejection text, and hands back the bytes it was sent.
+    #[tokio::test]
+    async fn json_body_matches_the_json_extractor() {
+        use axum::extract::FromRequest;
+
+        let request = |content_type: Option<&str>, body: &'static str| {
+            let mut builder = http::Request::builder().method("POST").uri("/generate");
+            if let Some(content_type) = content_type {
+                builder = builder.header(http::header::CONTENT_TYPE, content_type);
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
+        };
+        let body = "{ \"text\": \"hi\",  \"rid\": \"r\" }";
+        for (content_type, body) in [
+            (Some("application/json"), body),
+            (Some("application/json; charset=utf-8"), body),
+            (Some("application/vnd.api+json"), body),
+            (Some("text/plain"), body),
+            (None, body),
+            (Some("application/json"), "{\"text\": "),
+            (Some("application/json"), "[1, 2"),
+        ] {
+            let ours = json_body(&(), request(content_type, body)).await;
+            let axums =
+                Json::<serde_json::Value>::from_request(request(content_type, body), &()).await;
+            match (ours, axums) {
+                (Ok((value, raw)), Ok(Json(expected))) => {
+                    assert_eq!(value, expected);
+                    assert_eq!(raw, body.as_bytes(), "the bytes as sent");
+                }
+                (Err(ours), Err(axums)) => {
+                    assert_eq!(ours.status(), axums.status(), "{content_type:?} {body}");
+                    assert_eq!(ours.body_text(), axums.body_text());
+                }
+                (ours, axums) => panic!(
+                    "{content_type:?} {body}: ours ok={}, axum ok={}",
+                    ours.is_ok(),
+                    axums.is_ok()
+                ),
+            }
         }
     }
 }

@@ -323,9 +323,8 @@ def _scatter_candidates_kernel(
     src_row = tl.program_id(0)
     row = src_row % num_rows
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    # a rank holds ceil((len - rank) / WORLD) keys of the row. Prefix-only
-    # gathers leave the padding undefined, including on graph replays with
-    # shorter lengths: never read it or scatter stale positions.
+    # Prefix-only gathers leave the padding undefined, including on graph
+    # replays with shorter lengths. Never read it or scatter stale positions.
     n = (tl.load(global_lens + row) + WORLD - 1 - src_row // num_rows) // WORLD
     mask = offs < tl.minimum(n, TOPK)
     base = gathered + src_row.to(tl.int64) * TOPK * 2

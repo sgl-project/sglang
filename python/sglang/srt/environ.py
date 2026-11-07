@@ -2335,6 +2335,18 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # Gemma 4
+    # ===================================================================
+    # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
+    # quant of the dense layer stack as one NVLS kernel per site, for extend
+    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
+    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
+    # srt/layers/communication/gemma4_ar_fusion.py).
+    SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
+    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
+    SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
@@ -2356,7 +2368,7 @@ class Envs:
     # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).
     # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
     # kernels/ops/attention/dcp_push_combine.py.
-    SGLANG_DCP_PUSH_COMBINE = EnvBool(True)
+    SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
     SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(_k31_gb_best(1536, 1024))
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
@@ -2377,6 +2389,11 @@ class Envs:
     SGLANG_K31_DECODE_GEMM_TACTICS = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
+    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
+    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
+    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
+    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

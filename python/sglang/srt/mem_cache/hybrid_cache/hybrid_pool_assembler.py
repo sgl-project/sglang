@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.mem_cache.device_pool_info import (
     IndexKeyLayout,
     MHABufferInfo,
@@ -1593,8 +1594,8 @@ def _build_sidecar_host_pool(
         buffer_device=root.device,
         dtype=root.store_dtype,
         layer_sharded=root.layer_shard_enabled,
-        dcp_size=root_host_pool.dcp_size,
-        dcp_rank=root_host_pool.dcp_rank,
+        dcp_size=root_host_pool.dcp_size if dsa_shards_index_k() else 1,
+        dcp_rank=root_host_pool.dcp_rank if dsa_shards_index_k() else 0,
         allocator_type=_get_allocator_type(),
     )
     host.start_layer, host.end_layer = root.start_layer, root.end_layer

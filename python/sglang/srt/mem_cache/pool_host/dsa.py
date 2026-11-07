@@ -107,16 +107,14 @@ class DSAIndexerPoolHost(HostKVCache):
         self._is_dummy = is_dummy
         self._destroyed = False
         self.device_pool = None
-        # DCP: transfer_page_size is the physical (per-rank) page; the anchor KV
-        # host's dcp_size/dcp_rank translate logical slots the same way.
-        self.dcp_size = dcp_size
-        self.dcp_rank = dcp_rank
         self.pin_memory = pin_memory
         self.device = device
         self.allocator = get_allocator_from_storage(allocator_type)
         self._layer_sharded = layer_sharded
         self._buffer_device = torch.device(buffer_device)
         self.page_size = transfer_page_size
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
         self.layout = layout
         self.dtype = dtype
         self.indexer_dtype = torch.uint8
