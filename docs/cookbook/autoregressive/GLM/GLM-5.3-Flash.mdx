@@ -185,7 +185,7 @@ The same configuration was also measured at C4. Total throughput increased by 2.
 
 Total throughput includes cached input tokens. TPOT p99 is the 99th percentile of per-request average time per output token.
 
-Tune the cap and memory ratio together: with interval `1` and ratio `0.9`, adding `cap=2` reduced C64 total throughput from 184,053.1 to 166,257.3 tokens/s. The ratio `0.5` result above uses both settings; ratio `0.5` without the cap was not measured in this sweep.
+Tune the cap and memory ratio together: with interval `1` and ratio `0.9`, adding `cap=2` reduced C64 total throughput from 184,053.1 to 166,257.3 tokens/s. A follow-up at ratio `0.5` with an unlimited path-state cap measured 190,658.5 total tokens/s and 1,292.1 output tokens/s, compared with 227,018.8 and 1,642.5 with `cap=2`.
 
 <Accordion title="Measurement details">
 
