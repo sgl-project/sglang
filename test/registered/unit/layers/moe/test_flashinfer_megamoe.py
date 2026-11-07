@@ -239,7 +239,13 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {"version": 2, "entries": [{"knobs": {"native_tactic": 7}}]}
+    fake_tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
+    # No FlashInfer release writes this version, so only its constant matches.
+    fake_tuning.KNOB_CACHE_VERSION = 37
+    payload = {
+        "version": fake_tuning.KNOB_CACHE_VERSION,
+        "entries": [{"knobs": {"native_tactic": 7}}],
+    }
     events = []
     staged = []
     native_paths = []
@@ -287,8 +293,6 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
 
     fake_moe = types.ModuleType("flashinfer.moe_ep")
     fake_moe.MoEEpMegaLayer = Mega
-    fake_tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
-    fake_tuning.KNOB_CACHE_VERSION = 2
     fake_autotuner = types.ModuleType("flashinfer.autotuner")
     records = {}
     tuner = types.SimpleNamespace(
