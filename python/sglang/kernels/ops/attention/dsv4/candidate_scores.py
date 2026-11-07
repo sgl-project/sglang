@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.candidate_table import CANDIDATE_BLOCK_SIZE
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.device import is_cuda
 
 
 @triton.jit
