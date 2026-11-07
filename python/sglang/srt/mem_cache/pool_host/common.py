@@ -365,6 +365,31 @@ def alloc_with_pin_memory(
     return buffer
 
 
+def alloc_with_pin_memory_npu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """
+    Allocate an NPU host tensor using the configured host-memory backend.
+    """
+    from sglang.srt.mem_cache.pool_host.npu_memfabric import (
+        acl_host_memory_enabled,
+        alloc_with_acl,
+        alloc_with_memfabric,
+        memfabric_host_memory_enabled,
+    )
+
+    if memfabric_host_memory_enabled():
+        return alloc_with_memfabric(dims, dtype, device, pin_memory, allocator)
+    if acl_host_memory_enabled():
+        return alloc_with_acl(dims, dtype, device, pin_memory, allocator)
+    return alloc_with_pin_memory(dims, dtype, device, pin_memory, allocator)
+
+
 def alloc_with_pin_memory_xpu(
     dims: tuple,
     dtype: torch.dtype,
@@ -453,7 +478,7 @@ def make_kernel_ptr_table(
 ALLOC_MEMORY_FUNCS = defaultdict(
     lambda: alloc_with_host_register,
     {
-        "npu": alloc_with_pin_memory,
+        "npu": alloc_with_pin_memory_npu,
         "musa": alloc_with_pin_memory,
         "xpu": alloc_with_pin_memory_xpu,
     },

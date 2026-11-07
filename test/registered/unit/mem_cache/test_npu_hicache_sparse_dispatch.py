@@ -48,6 +48,58 @@ class Buffer:
         return result
 
 
+class TestRegisteredNPUHostAllocation(unittest.TestCase):
+    def test_pin_memory_allocator_selects_configured_backend(self):
+        path = ROOT / "python/sglang/srt/mem_cache/pool_host/common.py"
+        tree = ast.parse(path.read_text())
+        functions = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ("alloc_with_pin_memory", "alloc_with_pin_memory_npu")
+        ]
+        module = ast.Module(body=functions, type_ignores=[])
+        native = Mock(return_value="native")
+        memfabric = Mock(return_value="memfabric")
+        acl = Mock(return_value="acl")
+        backend = SimpleNamespace(
+            memfabric_host_memory_enabled=Mock(return_value=False),
+            acl_host_memory_enabled=Mock(return_value=False),
+            alloc_with_memfabric=memfabric,
+            alloc_with_acl=acl,
+        )
+        namespace = {"torch": SimpleNamespace(Tensor=object, dtype=object, empty=native)}
+        with patch.dict(
+            sys.modules,
+            {"sglang.srt.mem_cache.pool_host.npu_memfabric": backend},
+        ):
+            exec(compile(module, str(path), "exec"), namespace)
+            allocate = namespace["alloc_with_pin_memory_npu"]
+            native_allocate = namespace["alloc_with_pin_memory"]
+            kwargs = dict(
+                dims=(2, 3),
+                dtype="uint8",
+                device="cpu",
+                pin_memory=True,
+                allocator=None,
+            )
+
+            self.assertEqual(allocate(**kwargs), "native")
+            native.assert_called_once_with(
+                (2, 3), dtype="uint8", device="cpu", pin_memory=True
+            )
+
+            backend.memfabric_host_memory_enabled.return_value = True
+            self.assertEqual(allocate(**kwargs), "memfabric")
+            memfabric.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
+            self.assertEqual(native_allocate(**kwargs), "native")
+
+            backend.memfabric_host_memory_enabled.return_value = False
+            backend.acl_host_memory_enabled.return_value = True
+            self.assertEqual(allocate(**kwargs), "acl")
+            acl.assert_called_once_with((2, 3), "uint8", "cpu", True, None)
+
+
 class TestNPUSparseDispatch(unittest.TestCase):
     def setUp(self):
         path = ROOT / "python/sglang/srt/mem_cache/pool_host/mla.py"
@@ -93,6 +145,7 @@ class TestNPUSparseDispatch(unittest.TestCase):
                 distributed=SimpleNamespace(is_initialized=lambda: False)
             ),
             memfabric_host_memory_enabled=lambda: False,
+            acl_host_memory_enabled=lambda: False,
         )
         exec(compile(methods, str(path), "exec"), self.namespace)
         host_class = type("Host", (), {name: self.namespace[name] for name in names})
@@ -330,7 +383,6 @@ class TestNPUSparseDispatch(unittest.TestCase):
         empty = Mock(side_effect=lambda shape, **_: Buffer(shape))
         self.namespace.update(
             ALLOC_MEMORY_FUNCS={"npu": allocate},
-            alloc_with_memfabric=allocate,
             ensure_memfabric_capacity=reserve,
             memfabric_host_memory_enabled=lambda: True,
             torch=SimpleNamespace(
