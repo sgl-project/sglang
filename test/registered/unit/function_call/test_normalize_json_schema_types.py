@@ -5,7 +5,10 @@ import unittest
 
 from jsonschema import Draft202012Validator, SchemaError
 
-from sglang.srt.function_call.utils import normalize_json_schema_types
+from sglang.srt.function_call.utils import (
+    _json_schema_type_rewrites,
+    normalize_json_schema_types,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -384,6 +387,34 @@ class TestNormalizeJsonSchemaTypes(CustomTestCase):
         schema["items"] = schema
         with self.assertRaises(RecursionError):
             normalize_json_schema_types(schema)
+
+    def test_repeated_schema_rewrites_each_fresh_object(self):
+        """A schema resent by a later request is rewritten from the cache onto
+        that request's own objects, never sharing them with an earlier request."""
+
+        def make():
+            return {
+                "type": "object",
+                "properties": {
+                    "id": {"type": ["bigint", "null"]},
+                    "name": {"type": "varchar(64)"},
+                },
+            }
+
+        first, second = make(), make()
+        before = _json_schema_type_rewrites.cache_info()
+        normalize_json_schema_types(first)
+        first["properties"]["id"]["type"].append("string")
+        normalize_json_schema_types(second)
+        after = _json_schema_type_rewrites.cache_info()
+
+        self.assertEqual(
+            (after.misses - before.misses, after.hits - before.hits), (1, 1)
+        )
+        self.assertEqual(
+            second["properties"],
+            {"id": {"type": ["integer", "null"]}, "name": {"type": "string"}},
+        )
 
     def test_boolean_subschema_does_not_crash(self):
         """``additionalProperties: True`` and ``items: false`` are valid 2020-12
