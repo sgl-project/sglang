@@ -1332,12 +1332,19 @@ def buffered_multi_thread_safetensors_weights_iterator(
     prefetch: bool = False,
     prefetch_num_threads: int = 4,
     drop_cache_after_load: bool = False,
+    max_inflight_bytes: Optional[int] = None,
 ) -> Generator[Tuple[str, torch.Tensor], None, None]:
     """Multi-threaded safetensor loader with bounded memory via a sliding window.
 
     At most (max_workers + 1) shard files are in-flight at any time:
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
+    ``max_inflight_bytes`` also caps the summed size of the files submitted
+    but not yet handed out (one file is always admitted). The shard being
+    yielded is not counted, so peak RAM is about the cap plus one shard. With
+    ``disable_mmap`` the read bytes stay alive while the tensors are built, so a
+    loading shard briefly needs about twice its size and peak RAM can reach
+    about twice the cap plus one shard.
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1364,9 +1371,24 @@ def buffered_multi_thread_safetensors_weights_iterator(
         file_iter = iter(hf_weights_files)
         pending: collections.deque = collections.deque()
 
-        # Seed the buffer.
-        for st_file in itertools.islice(file_iter, buffer_size):
-            pending.append((st_file, executor.submit(_load_file, st_file)))
+        next_file = next(file_iter, None)
+        inflight_bytes = 0
+
+        def fill_window():
+            nonlocal next_file, inflight_bytes
+            while next_file is not None and len(pending) < buffer_size:
+                size = os.path.getsize(next_file)
+                if (
+                    max_inflight_bytes is not None
+                    and pending
+                    and inflight_bytes + size > max_inflight_bytes
+                ):
+                    break
+                pending.append((next_file, executor.submit(_load_file, next_file)))
+                inflight_bytes += size
+                next_file = next(file_iter, None)
+
+        fill_window()
 
         with tqdm(
             total=len(hf_weights_files),
@@ -1380,10 +1402,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
-                # Replenish: submit the next file to keep the buffer full.
-                next_file = next(file_iter, None)
-                if next_file is not None:
-                    pending.append((next_file, executor.submit(_load_file, next_file)))
+                # Replenish the window.
+                inflight_bytes -= os.path.getsize(st_file)
+                fill_window()
 
                 for name in sorted(state_dict.keys()):
                     yield name, state_dict[name]

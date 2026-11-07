@@ -283,6 +283,66 @@ class TestPrefetchCheckpoints(CustomTestCase):
             )
 
     @patch("torch.distributed.is_initialized", return_value=False)
+    def test_buffered_loader_caps_inflight_bytes(self, _):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            paths = self._create_safetensors_files(tmpdir, num_shards=5)
+            shard_bytes = os.path.getsize(paths[0])
+            reference = dict(safetensors_weights_iterator(paths))
+            # max_workers=3: a window of 4 shards unless the byte cap is lower;
+            # one shard is always admitted.
+            for cap, window in ((None, 4), (2 * shard_bytes, 2), (1, 1)):
+                submitted = []
+
+                class _RecordingExecutor(_InlineExecutor):
+                    def submit(self, fn, path):
+                        submitted.append(path)
+                        return super().submit(fn, path)
+
+                loaded, peak = {}, 0
+                weights = buffered_multi_thread_safetensors_weights_iterator(
+                    paths, max_workers=3, disable_mmap=True, max_inflight_bytes=cap
+                )
+                with patch("concurrent.futures.ThreadPoolExecutor", _RecordingExecutor):
+                    for name, tensor in weights:
+                        shard = int(name.split(".")[0].removeprefix("layer"))
+                        peak = max(peak, len(submitted) - (shard + 1))
+                        loaded[name] = tensor
+                self.assertEqual(peak, window, f"max_inflight_bytes={cap}")
+                self.assertEqual(loaded.keys(), reference.keys())
+                for name, tensor in reference.items():
+                    self.assertTrue(torch.equal(loaded[name], tensor))
+
+    def test_max_inflight_bytes_must_be_a_positive_int(self):
+        from sglang.srt.model_loader.loader import (
+            _validate_default_loader_extra_config,
+        )
+
+        for bad in (0, -1, 1.5, "1", True):
+            with self.assertRaisesRegex(ValueError, "max_inflight_bytes"):
+                _validate_default_loader_extra_config(
+                    extra_config={"max_inflight_bytes": bad},
+                    load_format=LoadFormat.SAFETENSORS,
+                )
+        # Formats that reach the buffered safetensors iterator accept it.
+        for load_format in (
+            LoadFormat.AUTO,
+            LoadFormat.SAFETENSORS,
+            LoadFormat.MISTRAL,
+            LoadFormat.FLASH_RL,
+        ):
+            _validate_default_loader_extra_config(
+                extra_config={"max_inflight_bytes": 1 << 30},
+                load_format=load_format,
+            )
+        # Formats whose loaders ignore the cap reject it.
+        for load_format in (LoadFormat.FASTSAFETENSORS, LoadFormat.PT):
+            with self.assertRaisesRegex(ValueError, "Unexpected extra config keys"):
+                _validate_default_loader_extra_config(
+                    extra_config={"max_inflight_bytes": 1 << 30},
+                    load_format=load_format,
+                )
+
+    @patch("torch.distributed.is_initialized", return_value=False)
     def test_fastsafetensors_drops_only_the_rank_owned_file(self, _):
         events = []
         test_case = self
