@@ -466,6 +466,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_fast_match_prefix(self) -> bool:
         return False
 
+    def get_scheduling_prefix_len(self, req: Req) -> int:
+        """Read reusable prefix length after matching, without admitting the request."""
+        return req.num_matched_prefix_tokens
+
     def touch_prefix(self, key: RadixKey) -> None:
         """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
         never allocates, loads, or queries external tiers."""

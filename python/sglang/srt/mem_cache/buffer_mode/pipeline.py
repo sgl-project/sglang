@@ -1475,6 +1475,23 @@ class BufferModePipeline:
     def has_staged(self, request: CacheRequestHandle) -> bool:
         return request in self.staged_prefetches
 
+    def peek_staged_prefix_len(self, req: Req) -> int:
+        """Read the reusable staged prefix without preparing or consuming it."""
+        f = self.staged_prefetches.get(req.cache_request_handle)
+        if f is None:
+            return 0
+        key = RadixKey(
+            f.key_tokens,
+            extra_key=f.extra_key,
+            is_bigram=self._cache.tree_core.is_eagle,
+            cache_salt=f.cache_salt,
+        )
+        matched_len, _, _ = self._cache.tree_core.match_full_device_prefix(key)
+        # The bounce cannot repair a gap before its original device anchor.
+        if matched_len < f.matched_len:
+            return 0
+        return f.matched_len + f.num_tokens
+
     def prepare_staged_prefetch(self, req: Req) -> bool:
         """Rebuild the admission plan from this pass's joint component match."""
         req.staged_prefetch_plan = None

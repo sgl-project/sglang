@@ -362,6 +362,10 @@ class SchedulePolicy:
             extra_key = r.extra_key
             cache_salt = r.cache_salt
             match_result = match_kv_cache(r, self.tree_cache, prefix_ids)
+            if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
+                r.num_matched_prefix_tokens = self.tree_cache.get_scheduling_prefix_len(
+                    r
+                )
 
             # NOTE(sang): This logic is for in-batch prefix caching;
             # If there are more than 1 request that have small matching prefix from
@@ -370,7 +374,12 @@ class SchedulePolicy:
             # We prefer to set IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD > 0 because too small
             # threshold means we cannot use in-batch prefix caching for short prefixes.
             # It is kind of common when the engine is long running (e.g., imagine the prefix "the").
-            if r.prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
+            matched_prefix_len = (
+                r.num_matched_prefix_tokens
+                if policy == CacheAwarePolicy.SHORTEST_PREFILL_FIRST
+                else r.prefix_len
+            )
+            if matched_prefix_len <= IN_BATCH_PREFIX_CACHING_CHECK_THRESHOLD:
                 match_result = self.waiting_queue_radix_tree.match_prefix(
                     MatchPrefixParams(
                         key=RadixKey(

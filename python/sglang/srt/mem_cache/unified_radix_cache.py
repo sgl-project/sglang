@@ -726,6 +726,16 @@ class UnifiedRadixCache(BasePrefixCache):
     def supports_fast_match_prefix(self) -> bool:
         return self.tree_core.supports_fast_match_prefix()
 
+    def get_scheduling_prefix_len(self, req: Req) -> int:
+        matched_len = super().get_scheduling_prefix_len(req)
+        if self.buffer_pipeline is None:
+            return matched_len
+        staged_len = self.buffer_pipeline.peek_staged_prefix_len(req)
+        max_len = req._compute_max_prefix_len(
+            len(req.origin_input_ids) + len(req.output_ids)
+        )
+        return max(matched_len, min(staged_len, max_len))
+
     def touch_prefix(self, key: RadixKey) -> None:
         # Tree walk only; skips match_prefix's session shortcut, finalizers and linker.
         if self.disable:

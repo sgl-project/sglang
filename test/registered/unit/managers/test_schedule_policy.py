@@ -2,9 +2,19 @@ import unittest
 from array import array
 from unittest.mock import patch
 
+import torch
+
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import CacheAwarePolicy, SchedulePolicy
-from sglang.srt.mem_cache.radix_cache import RadixCache
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.buffer_mode.pipeline import (
+    BufferModePipeline,
+    _StagedPrefetch,
+)
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -151,6 +161,100 @@ class TestShortestPrefillFirst(CustomTestCase):
         with patch.object(self.policy, "_compute_prefix_matches", return_value=set()):
             queue = self.policy.calc_priority(queue)
         self.assertEqual([req.rid for req in queue], ["cached", "short", "long"])
+
+    def buffer_cache(self, req, *, device_tokens=64, staged_end=4096):
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=None,
+                token_to_kv_pool_allocator=None,
+                page_size=1,
+                tree_components=(ComponentType.FULL,),
+                tree_core_backend="python",
+            )
+        )
+        cache.insert(
+            InsertParams(
+                key=RadixKey(req.origin_input_ids[:device_tokens]),
+                value=torch.arange(device_tokens),
+            )
+        )
+        cache.host_memory_mode = "buffer_only"
+        cache.tree_core.set_host_memory_buffer_only()
+        pipeline = BufferModePipeline.__new__(BufferModePipeline)
+        pipeline._cache = cache
+        pipeline.staged_prefetches = {
+            req.cache_request_handle: _StagedPrefetch(
+                request=req.cache_request_handle,
+                key_tokens=req.origin_input_ids[:staged_end],
+                extra_key=req.extra_key,
+                cache_salt=req.cache_salt,
+                matched_len=device_tokens,
+                num_tokens=staged_end - device_tokens,
+                occupied_tokens=staged_end - device_tokens,
+                host_indices=torch.arange(staged_end - device_tokens),
+                aux_xfers=[],
+                hash_values=[],
+                operation_id=1,
+            )
+        }
+        cache.buffer_pipeline = pipeline
+        self.policy.tree_cache = cache
+        return cache
+
+    def test_scheduling_prefix_defaults_to_matched_tokens(self):
+        req = self.make_req("cached", 16, cached=64)
+        self.assertEqual(self.policy.tree_cache.get_scheduling_prefix_len(req), 64)
+
+    def test_unified_scheduling_prefix_without_staging(self):
+        req = self.make_req("cached", 16, cached=64)
+        cache = self.buffer_cache(req, staged_end=64)
+        cache.buffer_pipeline = None
+        self.assertEqual(cache.get_scheduling_prefix_len(req), 64)
+
+    def test_buffer_staged_hit_prioritizes_long_input_without_consuming_it(self):
+        cached = self.make_req("cached", 16, cached=4096)
+        short = self.make_req("short", 128)
+        cache = self.buffer_cache(cached)
+        staged = cache.buffer_pipeline.staged_prefetches[cached.cache_request_handle]
+        queue = [short, cached]
+        queue = self.policy.calc_priority(queue)
+        self.assertEqual(queue, [cached, short])
+        self.assertEqual(self.policy._shortest_prefill_work(cached), 16)
+        self.assertEqual(cached.prefix_len, 64)
+        self.assertEqual(cached.host_hit_length, 0)
+        self.assertIsNone(cached.staged_prefetch_plan)
+        self.assertIs(
+            cache.buffer_pipeline.staged_prefetches[cached.cache_request_handle], staged
+        )
+
+    def test_buffer_staged_hit_rejects_evicted_device_anchor(self):
+        cached = self.make_req("cached", 16, cached=4096)
+        short = self.make_req("short", 128)
+        cache = self.buffer_cache(cached)
+        cache.tree_core.reset()
+        queue = [cached, short]
+        queue = self.policy.calc_priority(queue)
+        self.assertEqual(queue, [short, cached])
+        self.assertEqual(cached.num_matched_prefix_tokens, 0)
+        self.assertTrue(cache.buffer_pipeline.has_staged(cached.cache_request_handle))
+
+    def test_buffer_staged_hit_respects_logprob_limit(self):
+        cached = self.make_req("cached", 16, cached=4096)
+        cached.return_logprob = True
+        cached.logprob_start_len = 32
+        self.buffer_cache(cached)
+        self.policy.calc_priority([cached])
+        self.assertEqual(cached.num_matched_prefix_tokens, 32)
+
+    def test_buffer_staged_hit_is_not_sticky_after_release(self):
+        cached = self.make_req("cached", 16, cached=4096)
+        cache = self.buffer_cache(cached)
+        self.policy.calc_priority([cached])
+        self.assertEqual(cached.num_matched_prefix_tokens, 4096)
+        cache.buffer_pipeline.staged_prefetches.clear()
+        self.policy.calc_priority([cached])
+        self.assertEqual(cached.num_matched_prefix_tokens, 64)
 
     def test_equal_work_uses_arrival_time(self):
         older = self.make_req("z", 32, arrived=1)
