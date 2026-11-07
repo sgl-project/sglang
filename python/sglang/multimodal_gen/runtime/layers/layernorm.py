@@ -53,7 +53,6 @@ _is_npu = current_platform.is_npu()
 _is_musa = current_platform.is_musa()
 _is_cpu = current_platform.is_cpu()
 _is_xpu = current_platform.is_xpu()
-_use_rocm_flydsl = get_bool_env_var("SGLANG_USE_ROCM_FLYDSL")
 _has_attentions = False
 
 if _is_cuda or _is_xpu:
@@ -633,10 +632,15 @@ class _ScaleResidualNormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_default: bool = False,
     ):
         super().__init__()
         self.eps = eps
         self.dtype = dtype
+        self.use_rocm_flydsl = get_bool_env_var(
+            "SGLANG_USE_ROCM_FLYDSL",
+            default="true" if rocm_flydsl_default else "false",
+        )
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -693,7 +697,7 @@ class _ScaleResidualNormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        if not _use_rocm_flydsl:
+        if not self.use_rocm_flydsl:
             return self.forward_native(residual, x, gate, shift, scale)
 
         try:
@@ -896,9 +900,14 @@ class _NormScaleShift(CustomOp):
         elementwise_affine: bool = False,
         dtype: torch.dtype = torch.float32,
         prefix: str = "",
+        rocm_flydsl_default: bool = False,
     ):
         super().__init__()
         self.eps = eps
+        self.use_rocm_flydsl = get_bool_env_var(
+            "SGLANG_USE_ROCM_FLYDSL",
+            default="true" if rocm_flydsl_default else "false",
+        )
         if self.norm_type == "rms":
             self.norm = RMSNorm(hidden_size, eps=eps, dtype=dtype)
         elif self.norm_type == "layer":
@@ -938,7 +947,7 @@ class _NormScaleShift(CustomOp):
         shift: torch.Tensor,
         scale: torch.Tensor,
     ) -> torch.Tensor:
-        if not _use_rocm_flydsl:
+        if not self.use_rocm_flydsl:
             return self.forward_native(x, shift, scale)
 
         try:

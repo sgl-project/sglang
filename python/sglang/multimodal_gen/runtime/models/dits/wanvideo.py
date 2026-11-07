@@ -463,11 +463,14 @@ class WanTransformerBlock(nn.Module):
         super().__init__()
 
         # 1. Self-attention
+        # Prefer the existing FlyDSL fused norms on ROCm for Wan. The
+        # SGLANG_USE_ROCM_FLYDSL=0 environment override keeps eager available.
         self.norm1 = LayerNormScaleShift(
             dim,
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_default=True,
         )
         self.to_q = ColumnParallelLinear(
             dim,
@@ -589,6 +592,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=True,
             dtype=torch.float32,
+            rocm_flydsl_default=True,
         )
 
         # 2. Cross-attention
@@ -622,6 +626,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_default=True,
         )
 
         # 3. Feed-forward
@@ -638,6 +643,7 @@ class WanTransformerBlock(nn.Module):
             eps=eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            rocm_flydsl_default=True,
         )
 
         self.scale_shift_table = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
@@ -1416,6 +1422,12 @@ class WanTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             eps=config.eps,
             elementwise_affine=False,
             dtype=torch.float32,
+            # norm_out is shared with the VSA block, which has not been validated
+            # with FlyDSL; keep its previous default until that path is tested.
+            rocm_flydsl_default=(
+                (get_global_server_args().attention_backend or "").lower()
+                != "video_sparse_attn"
+            ),
         )
         self.proj_out = ColumnParallelLinear(
             inner_dim,
