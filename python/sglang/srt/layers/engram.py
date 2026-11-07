@@ -86,9 +86,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
-from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
 
