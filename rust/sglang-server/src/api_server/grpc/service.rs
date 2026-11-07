@@ -11,8 +11,8 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::HealthStatus;
-use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
+use crate::api_server::core::{HealthStatus, ReceivedAs};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheError, HiCacheManager};
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
@@ -74,8 +74,13 @@ impl GrpcService {
         incremental_streaming_output: bool,
         response_timeout: Duration,
     ) -> Self {
+        // With an admin key, so the HiCache tests reach the scheduler.
+        let args = ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(None, Some("sk-admin".into())),
+            ..Default::default()
+        };
         Self {
-            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &ServerArgs::default())),
+            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
             core,
             config: AdapterConfig {
                 preferred_sampling_params,
@@ -135,7 +140,7 @@ impl SglangService for GrpcService {
         let created_at = Instant::now();
         let calls = self
             .core
-            .generate_batch(payloads)
+            .generate_batch(payloads, ReceivedAs::without_headers())
             .await
             .map_err(native_api::status)?;
         Ok(Response::new(native_api::generate_stream(
@@ -205,7 +210,7 @@ impl SglangService for GrpcService {
             .hicache_manager
             .attach(request.into_inner())
             .await
-            .map_err(native_api::status)?;
+            .map_err(hicache_status)?;
         Ok(Response::new(output))
     }
 
@@ -217,7 +222,7 @@ impl SglangService for GrpcService {
             .hicache_manager
             .detach()
             .await
-            .map_err(native_api::status)?;
+            .map_err(hicache_status)?;
         Ok(Response::new(output))
     }
 
@@ -281,8 +286,22 @@ impl SglangService for GrpcService {
     }
 }
 
+/// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
+/// has the admin key attach and detach require; HTTP's Python message, which
+/// says to restart with one, would point gRPC callers at a refused flag.
+const HICACHE_GRPC_UNAVAILABLE: &str =
+    "HiCache attach/detach is not available over gRPC; use the HTTP endpoint with --admin-api-key.";
+
+fn hicache_status(error: HiCacheError) -> Status {
+    match error {
+        HiCacheError::AdminKeyMissing => Status::failed_precondition(HICACHE_GRPC_UNAVAILABLE),
+        HiCacheError::Core(error) => native_api::status(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use futures::StreamExt;
@@ -292,7 +311,7 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::GrpcService;
-    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata, HiCacheManager};
     use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
     use crate::message::finish_reason::FinishReason;
     use crate::message::ids::Rid;
@@ -347,6 +366,8 @@ mod tests {
                         ..Default::default()
                     }),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             Self {
@@ -726,6 +747,8 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
+                generate_validator: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
@@ -764,6 +787,48 @@ mod tests {
             .expect("empty input_ids must be rejected");
         assert_eq!(error.code(), Code::InvalidArgument);
         assert!(harness.intake_rx.try_recv().is_err());
+    }
+
+    /// The launch's generate validator refuses a batch whole, as on HTTP: no
+    /// item reaches the scheduler, the valid one included.
+    #[tokio::test]
+    async fn generate_validator_refuses_the_whole_batch_before_submission() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let core = CoreHandle::new(
+            intake_tx,
+            flume::unbounded().0,
+            CoreConfig {
+                response_capacity: 2,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                generate_validator: Some(Arc::new(crate::api_server::core::TopLogprobsCap)),
+            },
+        );
+        let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));
+        let request = api::GenerateRequest {
+            text: Some(many_strings(&["a", "b"])),
+            top_logprobs_num: Some(api::Int64OrList {
+                value: Some(api::int64_or_list::Value::Many(api::Int64List {
+                    items: vec![1, 2],
+                })),
+            }),
+            ..Default::default()
+        };
+        let error = service
+            .generate(Request::new(request))
+            .await
+            .err()
+            .expect("the validator must refuse the batch");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert_eq!(error.message(), "top_logprobs_num 2");
+        assert!(intake_rx.is_empty());
     }
 
     /// A list-form request fans out like the HTTP batch: every item is tagged
@@ -923,6 +988,34 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(initial, api::HiCacheStatus::default());
+
+        // Without an admin key, attach and detach are refused before any rank
+        // sees them, as on HTTP.
+        let refusing = GrpcService {
+            core: service.core.clone(),
+            config: service.config.clone(),
+            hicache_manager: Arc::new(HiCacheManager::new(
+                service.core.clone(),
+                &ServerArgs::default(),
+            )),
+        };
+        let attach = refusing
+            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
+                hicache_storage_backend: Some("file".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let detach = refusing
+            .detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {}))
+            .await
+            .unwrap_err();
+        for error in [attach, detach] {
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert_eq!(error.message(), super::HICACHE_GRPC_UNAVAILABLE);
+        }
+        assert!(h.intake_rx.is_empty());
+
         let error = service
             .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
             .await

@@ -672,4 +672,5 @@ def create_scheduler_watchdog(
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        before_crash=scheduler.dump_requests_before_crash,
     )
