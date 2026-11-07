@@ -144,8 +144,8 @@ class Spec(msgspec.Struct):
     speculative_dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=["sgl-kernel", "torch", "flashinfer"],
+            help="DSA indexer top-k backend for speculative draft workers. Options: 'sgl-kernel', 'torch', 'flashinfer', 'flashinfer_gvr2'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=["sgl-kernel", "torch", "flashinfer", "flashinfer_gvr2"],
         ),
     ] = "sgl-kernel"
     speculative_draft_kv_cache_dtype: A[

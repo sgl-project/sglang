@@ -638,6 +638,12 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
+        if self.dsa_index_topk is not None:
+            self.dsa_topk_backend.check_config(
+                self.device,
+                self.dsa_index_topk,
+                deterministic=get_exec().deterministic.enable_deterministic_inference,
+            )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -1079,6 +1085,7 @@ class DeepseekSparseAttnBackend(
     def _get_fused_topk_page_table(self, topk_indices: torch.Tensor) -> torch.Tensor:
         if (
             self.dsa_topk_backend.is_sgl_kernel()
+            or self.dsa_topk_backend.is_gvr2()
             or self.dsa_topk_backend.is_flashinfer()
         ):
             return topk_indices

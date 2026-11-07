@@ -412,8 +412,8 @@ class ExecKernel(msgspec.Struct):
     dsa_topk_backend: A[
         str,
         Arg(
-            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer'. The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
-            choices=["sgl-kernel", "torch", "flashinfer"],
+            help="DSA indexer top-k backend for the target model. Options: 'sgl-kernel', 'torch', 'flashinfer', 'flashinfer_gvr2' (FlashInfer GVR V2 for decode and spec-verify top-k on SM 100/103/107, top-k 512/1024/2048; prefill uses 'sgl-kernel'; not with --enable-deterministic-inference). The 'torch' backend currently requires SGLANG_DSA_FUSE_TOPK=false.",
+            choices=["sgl-kernel", "torch", "flashinfer", "flashinfer_gvr2"],
             resolvable=True,
         ),
     ] = "sgl-kernel"

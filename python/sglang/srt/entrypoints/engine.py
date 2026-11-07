@@ -1989,8 +1989,8 @@ def _set_envs_and_config(server_args: ServerArgs):
     if not get_bool_env_var("SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK"):
         if (
             "flashinfer" in attention_backends_of(resolved_view(cfg))
-            or cfg.dsa_topk_backend == "flashinfer"
-            or cfg.speculative_dsa_topk_backend == "flashinfer"
+            or cfg.dsa_topk_backend in ("flashinfer", "flashinfer_gvr2")
+            or cfg.speculative_dsa_topk_backend in ("flashinfer", "flashinfer_gvr2")
         ):
             assert_pkg_version(
                 "flashinfer_python",
