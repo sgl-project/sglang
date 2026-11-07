@@ -2,7 +2,11 @@
 
 import torch
 
+from sglang.srt.layers.vocab_parallel_embedding import pad_vocab_size
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils import is_cpu
+
+_is_cpu = is_cpu()
 
 
 def update_vit_attn_dummy_heads_config(config):
@@ -21,6 +25,33 @@ def update_vit_attn_dummy_heads_config(config):
 
     setattr(config.vision_config, "head_dim", head_dim)
     setattr(config.vision_config, "num_dummy_heads", num_dummy_heads)
+
+
+def update_vit_mlp_dummy_neurons_config(config):
+    """CPU-only: pad the vision MLP hidden width to a multiple of tp_size.
+
+    Some models (e.g. GLM4V) reuse `vision_config.out_hidden_size` as both the
+    vision block MLP's hidden width and the vision->language projection width;
+    only the former may be padded, so the padded value is stored under a
+    separate `mlp_hidden_size` attribute instead of mutating `out_hidden_size`.
+    The checkpoint's narrower gate_up_proj/down_proj weights are zero-padded
+    automatically at load time by the generic CPU path in
+    `sglang.srt.layers.linear` (gate_proj/up_proj are loaded as separate
+    shards), so no custom weight-loading code is needed here.
+
+    The per-rank shard width (padded size / tp_size) must also be a multiple
+    of 32: it is used as the AMX GEMM's IC (down_proj input) and, doubled, as
+    its OC (gate_up_proj's two concatenated per-rank outputs, so 32 keeps
+    each individual chunk divisible by 16 too). Padding only to a multiple of
+    tp_size (ignoring this) leaves the AMX weight-prepacking check failing
+    silently, falling back to a slow non-AMX GEMM for every vision block.
+    """
+    AMX_TILE_ALIGN = 32
+    mlp_hidden_size = config.vision_config.out_hidden_size
+    if _is_cpu:
+        tp_size = get_parallel().tp_size
+        mlp_hidden_size = pad_vocab_size(mlp_hidden_size, tp_size * AMX_TILE_ALIGN)
+    setattr(config.vision_config, "mlp_hidden_size", mlp_hidden_size)
 
 
 def pad_vit_attn_dummy_heads(config, name: str, loaded_weight: torch.Tensor):

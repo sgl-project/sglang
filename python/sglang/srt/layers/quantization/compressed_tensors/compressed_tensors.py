@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Int8,
     CompressedTensorsW8A8MXFp8,
     CompressedTensorsW8A16Fp8,
+    CompressedTensorsW8A16Fp8MoE,
     CompressedTensorsWNA16,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
@@ -78,12 +79,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
 )
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
 _is_npu = is_npu()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+_is_cpu = is_cpu()
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import (
@@ -414,13 +416,14 @@ class CompressedTensorsConfig(QuantizationConfig):
         return []
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
+        if _is_cpu:
+            return False
         if _is_xpu:
             # TODO: torch.xpu.get_device_capability
             device = torch.xpu.current_device()
             device_capability = torch.ops.sgl_kernel.query_device.default(device)
         else:
             device_capability = torch.cuda.get_device_capability()
-
         capability_tuple = DeviceCapability(*device_capability)
 
         if capability_tuple is not None:
@@ -1070,6 +1073,9 @@ class CompressedTensorsConfig(QuantizationConfig):
             )
             return CompressedTensorsW4A16Nvfp4MoE(has_input_global_scale=True)
         elif self._is_fp8_w8a8(weight_quant, input_quant):
+            if _is_cpu:
+                logger.info_once("Using CompressedTensorsW8A16Fp8MoE (CPU fallback)")
+                return CompressedTensorsW8A16Fp8MoE(weight_quant, input_quant)
             logger.info_once("Using CompressedTensorsW8A8Fp8MoE")
             return CompressedTensorsW8A8Fp8MoE(weight_quant, input_quant)
         elif self._is_dynamic_token_w8a8(weight_quant, input_quant):
@@ -1175,7 +1181,7 @@ class CompressedTensorsConfig(QuantizationConfig):
         # Raise error if device does not support the scheme
         # (e.g. fp8 needs ada lovelace)
         # Note: NPU devices do not support min_capability function
-        if not _is_npu:
+        if not _is_npu and not _is_cpu:
             self._check_scheme_supported(scheme.get_min_capability())
         logger.debug("Using scheme: %s for %s", scheme.__class__.__name__, layer_name)
         return scheme

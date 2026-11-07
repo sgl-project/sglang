@@ -825,6 +825,7 @@ def register_fake_ops(tp_size: int):
         num_fused_shared_experts,
         routed_scaling_factor,
         num_token_non_padded,
+        shared_expert_weight=1.0,
     ):
         num_tokens = hidden_states.shape[0]
         shape = (num_tokens, topk)
