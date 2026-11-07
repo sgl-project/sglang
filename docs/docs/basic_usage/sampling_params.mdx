@@ -192,6 +192,31 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
   </tbody>
 </table>
 
+### Greedy decoding and output precision
+
+On the CUDA argmax path, greedy sampling (`temperature = 0`) selects the token
+with the highest post-processed logit. For finite logits with an exact tie at the
+maximum, it selects the lowest token ID. `sampling_seed` does not break this tie.
+
+Changing LM-head output precision can change that choice even when the input and
+hidden states are identical. BF16 output rounding can turn distinct scores into
+an exact tie, so the greedy token can differ from the higher-precision result.
+Converting already-rounded logits to FP32 does not recover the lost differences.
+
+The [`--enable-fp32-lm-head`](/docs/advanced_features/server_arguments#quantization-and-data-type)
+server flag requests FP32 LM-head outputs. On the standard CUDA dense,
+unquantized path with matching FP16/BF16 hidden-state and weight dtypes, SGLang
+uses an FP32-output GEMM while keeping the operands in their original dtype. It
+does not convert the model's stored weights to FP32. Quantized and model-specific
+LM heads can use different implementations.
+
+FP32 output preserves more score differences, but it does not remove all ties or
+numerical differences introduced upstream. A smaller logprob difference between
+execution paths does not by itself show better agreement with a high-precision
+reference: lower-precision rounding can partially cancel an upstream difference.
+Changing output precision
+does not guarantee the same generated sequence, even for greedy requests.
+
 ### Penalizers
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

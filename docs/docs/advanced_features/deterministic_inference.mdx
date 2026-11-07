@@ -12,6 +12,9 @@ Deterministic inference ensures consistent LLM outputs across runs, which is cri
 
 Even with `temperature=0`, standard LLM inference can produce different outputs due to dynamic batching and varying reduction orders in GPU kernels.
 
+For CUDA greedy tie-breaking and the effect of LM-head output precision, see
+[Greedy decoding and output precision](/docs/basic_usage/sampling_params#greedy-decoding-and-output-precision).
+
 ## The Root Cause of Non-Determinism
 
 The main source is **varying batch sizes**. Different batch sizes cause GPU kernels to split reduction operations differently, leading to different addition orders. Due to floating-point non-associativity (`(a + b) + c ≠ a + (b + c)`), this produces different results even for identical inputs.
