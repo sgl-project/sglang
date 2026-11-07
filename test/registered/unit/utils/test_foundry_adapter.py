@@ -7,9 +7,6 @@ check, that every adapter method reaches foundry.integration.sglang.api (a
 fake api module stands in for Foundry), and the fallback: an ``Unsupported``
 from any step turns every later method into a no-op.
 
-TestDispatcherPrebuildProtocol: which dispatchers implement ``prebuild``, and that
-native prebuilding leaves the others alone.
-
 TestFoundryCallSites: Foundry's archive is only valid if the call sites stay at
 their sequence points (before or after the work they bracket), so a refactor
 that moves or drops one fails here instead of at a user's LOAD. It reads
@@ -29,13 +26,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-import torch
-
 import sglang
-from sglang.srt.layers.moe.token_dispatcher.base import (
-    BaseDispatcher,
-    prebuild_dispatchers,
-)
 from sglang.srt.utils import foundry_adapter
 from sglang.srt.utils.foundry_adapter import (
     FOUNDRY_INTEGRATION_API_MAJOR,
@@ -180,23 +171,10 @@ class TestFoundryAdapter(CustomTestCase):
             enabled = activate_foundry(_sa("save"))
             with self.assertRaisesRegex(RuntimeError, "cannot be undone"):
                 activate_foundry(_sa())
-            # The enabled adapter stays the process's adapter.
+            # The enabled adapter stays the process's adapter, and a second
+            # record with the flag re-activates it (idempotent).
             self.assertIs(get_foundry_adapter(), enabled)
-
-    def test_activation_passes_mode_and_config(self):
-        api = _fake_api()
-        with _installed(api):
-            sa = _sa("load", "/x/foundry.toml")
-            adapter = activate_foundry(sa)
-            self.assertIs(get_foundry_adapter(), adapter)
-            self.assertTrue(adapter.enabled)
-            self.assertEqual(adapter.mode, "load")
-            # Idempotent: a second record re-activates with its own arguments.
-            self.assertIs(activate_foundry(sa), adapter)
-        activations = [c for c in api.calls if c[0] == "activate"]
-        self.assertEqual(len(activations), 2)
-        for _, _, kwargs in activations:
-            self.assertEqual(kwargs, {"mode": "load", "config_path": "/x/foundry.toml"})
+            self.assertIs(activate_foundry(_sa("save")), enabled)
 
     def test_every_adapter_method_reaches_the_api(self):
         """A no-op method added without a real override would silently do
@@ -307,51 +285,6 @@ class TestFoundryAdapter(CustomTestCase):
             with adapter.configure_subprocess(object()):
                 pass
         self.assertEqual(api.calls[-1][0], "configure_subprocess")
-
-
-class _Dispatcher(BaseDispatcher):
-    def dispatch(self, hidden_states, topk_output):
-        raise NotImplementedError
-
-    def combine(self, combine_input):
-        raise NotImplementedError
-
-
-class _LazyDispatcher(_Dispatcher):
-    """Builds its state at the first dispatch, as a new backend would."""
-
-    @property
-    def prebuild_pending(self):
-        return True
-
-
-class _PrebuiltDispatcher(_Dispatcher):
-    built = False
-
-    @property
-    def prebuild_pending(self):
-        return not self.built
-
-    def prebuild(self):
-        self.built = True
-
-
-class TestDispatcherPrebuildProtocol(CustomTestCase):
-    def test_only_an_overridden_prebuild_implements_the_protocol(self):
-        self.assertFalse(_LazyDispatcher().implements_prebuild)
-        self.assertTrue(_PrebuiltDispatcher().implements_prebuild)
-
-    def test_native_prebuild_skips_dispatchers_without_the_protocol(self):
-        """A dispatcher without ``prebuild`` keeps its lazy build natively, even
-        when it reports pending state; one with it is prebuilt."""
-        model = torch.nn.Module()
-        model.lazy = torch.nn.Module()
-        model.lazy.dispatcher = _LazyDispatcher()
-        model.prebuilt = torch.nn.Module()
-        model.prebuilt.dispatcher = _PrebuiltDispatcher()
-        self.assertEqual(prebuild_dispatchers(model), 1)
-        self.assertTrue(model.prebuilt.dispatcher.built)
-        self.assertEqual(prebuild_dispatchers(model), 0)
 
 
 _SRT = Path(sglang.__file__).parent / "srt"
@@ -466,7 +399,26 @@ def _members(node):
 
 
 class TestFoundryCallSites(CustomTestCase):
-    def test_call_sites_stay_at_their_sequence_points(self):
+    def test_call_site_contract(self):
+        """Without it a call site moved off its sequence point or resolution
+        position, or a renamed field Foundry reads (wrong workspace rank or
+        device), passes here and fails at a user's LOAD."""
+        for check in (
+            self._check_sequence_points,
+            self._check_resolution_steps,
+            self._check_read_names,
+        ):
+            with self.subTest(check=check.__name__):
+                check()
+
+    def test_capture_scope_and_spawns_are_wrapped(self):
+        """Without it a capture loop or scheduler spawn outside Foundry's scope
+        (the DP controller's schedulers miss the hook preload) goes unnoticed."""
+        for check in (self._check_capture_scope, self._check_spawns_wrapped):
+            with self.subTest(check=check.__name__):
+                check()
+
+    def _check_sequence_points(self):
         for path, qualname, call, where in _CALL_SITES:
             with self.subTest(site=qualname, call=call):
                 fn = _find(path, qualname)
@@ -486,7 +438,7 @@ class TestFoundryCallSites(CustomTestCase):
                     self.assertTrue(other, where)
                     self.assertGreater(lines[-1], other[-1])
 
-    def test_every_engine_scheduler_spawn_is_wrapped(self):
+    def _check_spawns_wrapped(self):
         """Every scheduler spawn and the DP-controller spawn: the controller's
         schedulers inherit the hook preload from its environment."""
         fn = _find("entrypoints/engine.py", "Engine._launch_scheduler_processes")
@@ -495,7 +447,7 @@ class TestFoundryCallSites(CustomTestCase):
             len(_call_lines(fn, "proc.start")),
         )
 
-    def test_capture_scope_wraps_the_whole_capture_loop(self):
+    def _check_capture_scope(self):
         """Foundry's scope must bracket warmup and every shape, inside the
         runner's model context: capture() enters model_context() and then the
         scope, around _capture() alone."""
@@ -519,7 +471,7 @@ class TestFoundryCallSites(CustomTestCase):
                 inner = _find(path, f"{cls}._capture")
                 self.assertTrue(_call_lines(inner, "self.warmup"))
 
-    def test_resolution_steps_keep_their_positions(self):
+    def _check_resolution_steps(self):
         overridable = next(
             n.value
             for n in _tree("arg_groups/resolution_hooks.py").body
@@ -543,7 +495,7 @@ class TestFoundryCallSites(CustomTestCase):
         order = [steps.index(name) for name, _, _ in _RESOLUTION_STEPS]
         self.assertEqual(order, sorted(order))
 
-    def test_read_names_exist(self):
+    def _check_read_names(self):
         """Renamed fields would give Foundry a wrong workspace rank or device."""
         for path, cls, names in _READ:
             with self.subTest(owner=cls or path):

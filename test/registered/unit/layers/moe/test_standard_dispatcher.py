@@ -10,7 +10,10 @@ from sglang.srt.batch_overlap.two_batch_overlap import MaybeTboDeepEPDispatcher
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
-from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    prebuild_dispatchers,
+)
 from sglang.srt.layers.moe.token_dispatcher.standard import (
     StandardDispatcher,
     StandardDispatchOutput,
@@ -46,6 +49,33 @@ def _ep_dispatcher(*, moe_ep_rank: int, num_shared: int = 0, runner_backend=None
     return dispatcher
 
 
+class _ProtocolDispatcher(BaseDispatcher):
+    def dispatch(self, hidden_states, topk_output):
+        raise NotImplementedError
+
+    def combine(self, combine_input):
+        raise NotImplementedError
+
+
+class _LazyDispatcher(_ProtocolDispatcher):
+    """Builds its state at the first dispatch, as a new backend would."""
+
+    @property
+    def prebuild_pending(self):
+        return True
+
+
+class _PrebuiltDispatcher(_ProtocolDispatcher):
+    built = False
+
+    @property
+    def prebuild_pending(self):
+        return not self.built
+
+    def prebuild(self):
+        self.built = True
+
+
 class TestStandardDispatcherPrebuild(CustomTestCase):
     def setUp(self):
         self.enterContext(
@@ -63,9 +93,11 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
         )
 
     def test_prebuilt_mapping_matches_the_first_dispatch(self):
-        """A mapping built before graph capture must equal the one the first EP
-        dispatch builds, and a later dispatch or prebuild must keep it, so a
-        captured dispatch never records the mapping's fill (EP2 garbage routing)."""
+        """Regression for EP2 garbage routing when the mapping fill was recorded
+        inside a capture: the mapping prebuilt before capture must equal the one
+        the first EP dispatch builds and survive later dispatches and prebuilds.
+        Layouts whose dispatch never builds the mapping must stay unbuilt, since
+        a set mapping changes how dispatch routes."""
         topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
@@ -90,15 +122,12 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
                 local = mapping[topk_ids.long()]
                 self.assertTrue(torch.equal(out.topk_output.topk_ids, local))
 
-    def test_layouts_without_the_mapping_stay_unbuilt(self):
-        """Layouts whose dispatch never builds the mapping must not get one,
-        since a set mapping changes how dispatch routes."""
         cases = {
             "ep1": dict(moe_ep_size=1),
             "global_ids": dict(skip_local_expert_mapping=True),
         }
         for name, fields in cases.items():
-            with self.subTest(case=name):
+            with self.subTest(unbuilt_layout=name):
                 dispatcher = _ep_dispatcher(moe_ep_rank=0)
                 for field, value in fields.items():
                     setattr(dispatcher, field, value)
@@ -125,6 +154,21 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
         self.assertEqual(prebuild_dispatchers(model), 2)
         for dispatcher in [plain, *inners]:
             self.assertIsNotNone(dispatcher.local_expert_mapping)
+        self.assertEqual(prebuild_dispatchers(model), 0)
+
+    def test_prebuild_protocol_is_opt_in(self):
+        """A dispatcher without an overridden ``prebuild`` keeps its lazy build
+        natively, even when it reports pending state; without it a new backend
+        would be prebuilt through a no-op or have its state built under capture."""
+        self.assertFalse(_LazyDispatcher().implements_prebuild)
+        self.assertTrue(_PrebuiltDispatcher().implements_prebuild)
+        model = torch.nn.Module()
+        model.lazy = torch.nn.Module()
+        model.lazy.dispatcher = _LazyDispatcher()
+        model.prebuilt = torch.nn.Module()
+        model.prebuilt.dispatcher = _PrebuiltDispatcher()
+        self.assertEqual(prebuild_dispatchers(model), 1)
+        self.assertTrue(model.prebuilt.dispatcher.built)
         self.assertEqual(prebuild_dispatchers(model), 0)
 
 
