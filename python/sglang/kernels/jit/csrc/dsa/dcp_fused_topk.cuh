@@ -41,12 +41,12 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/mbarrier.cuh>  // ptx::to_shared
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/distributed/ptx.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>  // ptx::to_shared, ptx::bar_sync, ptx::bar_arrive
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -95,14 +95,6 @@ SGL_DEVICE void or_if_ge(uint32_t& mask, float x, float t, uint32_t bit) {
   asm("{\n\t.reg .pred p;\n\tsetp.ge.f32 p, %1, %2;\n\t@p or.b32 %0, %0, %3;\n\t}"
       : "+r"(mask)
       : "f"(x), "f"(t), "r"(bit));
-}
-
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
-}
-
-SGL_DEVICE void bar_arrive(uint32_t id, uint32_t num_threads) {
-  asm volatile("bar.arrive %0, %1;" ::"r"(id), "r"(num_threads) : "memory");
 }
 
 }  // namespace device::ptx
