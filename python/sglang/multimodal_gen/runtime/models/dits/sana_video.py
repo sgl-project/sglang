@@ -439,7 +439,7 @@ class SanaVideoTransformerBlock(nn.Module):
         ).unbind(dim=2)
 
         norm_hidden_states = sana_ln_modulate(
-            self.norm1, hidden_states, scale_msa, shift_msa, prefer_strided=True
+            self.norm1, hidden_states, scale_msa, shift_msa
         )
         hidden_states = sana_residual_gate_add(
             hidden_states,
@@ -451,7 +451,7 @@ class SanaVideoTransformerBlock(nn.Module):
         )
 
         norm_hidden_states = sana_ln_modulate(
-            self.norm2, hidden_states, scale_mlp, shift_mlp, prefer_strided=True
+            self.norm2, hidden_states, scale_mlp, shift_mlp
         )
         norm_hidden_states = norm_hidden_states.unflatten(1, (frames, height, width))
         ff_output = self.ff(norm_hidden_states).flatten(1, 3)

@@ -52,12 +52,9 @@ def _can_use_strided_sana_ln_modulate(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    *,
-    prefer_strided: bool,
 ) -> bool:
     if (
-        not prefer_strided
-        or not x.is_cuda
+        not x.is_cuda
         or x.dtype is not torch.bfloat16
         or x.dim() != 3
         or x.is_contiguous()
@@ -72,7 +69,6 @@ def _can_use_strided_sana_ln_modulate(
         and (batch <= 1 or x.stride(0) == seq_len * hidden)
         and can_use_fused_layernorm_modulate(x.dtype, hidden)
         and is_plain_layer_norm(norm, hidden)
-        and current_arch().is_sm(9, 0)
     ):
         return False
 
@@ -97,8 +93,6 @@ def sana_ln_modulate(
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
-    *,
-    prefer_strided: bool = False,
 ) -> torch.Tensor:
     """Single-kernel ``LN(x) * (1 + scale) + shift``, bit-exact vs eager.
 
@@ -114,10 +108,10 @@ def sana_ln_modulate(
     whole aten chain it replaces (+14% forward wall), so default-stream
     serving keeps the eager chain.
 
-    ``x`` reaches the image path transposed (patch-embed / GLUMBConv permute
-    layout); aten's LayerNorm contiguizes internally, and that fast path
-    issues the same copy explicitly. Sana-Video may opt into direct strided
-    reads for its validated transposed layout.
+    ``x`` may reach the model transposed (patch-embed / GLUMBConv permute
+    layout); aten's LayerNorm contiguizes internally, and the contiguous fast
+    path issues the same copy explicitly. Validated dense-transposed inputs
+    use direct strided reads.
     """
     global _SANA_LN_MOD_DISABLED
 
@@ -128,12 +122,15 @@ def sana_ln_modulate(
     if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
         return _eager_ln_modulate(norm, x, scale, shift)
 
-    strided_eligible = _can_use_strided_sana_ln_modulate(
-        norm, x, scale, shift, prefer_strided=prefer_strided
-    )
+    strided_eligible = _can_use_strided_sana_ln_modulate(norm, x, scale, shift)
     variant = "strided" if strided_eligible else "contiguous"
+    architecture = None
+    if strided_eligible:
+        cuda_arch = current_arch().cuda
+        architecture = cuda_arch.capability if cuda_arch is not None else None
     sig = (
         variant,
+        architecture,
         x.shape,
         x.stride(),
         x.dtype,
