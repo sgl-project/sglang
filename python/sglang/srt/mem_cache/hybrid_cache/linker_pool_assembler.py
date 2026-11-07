@@ -596,6 +596,109 @@ def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]
     return entries
 
 
+def _build_minimax_sparse_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import (
+        MHATokenToKOnlyPool,
+        MHATokenToKVPool,
+        MiniMaxSparseKVPool,
+    )
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
+
+    if isinstance(kvcache, MiniMaxM3Nvfp4KVPool):
+        return _build_minimax_m3_nvfp4_device_pool_group(kvcache, params, page_size)
+    if (
+        type(kvcache) is not MiniMaxSparseKVPool
+        or kvcache._enable_hisparse
+        or kvcache.dense_pool is not None
+        or kvcache.index_kv_pool is not None
+        or params.mtp_draft_device_pools
+        or getattr(params, "mtp_draft_mamba_pools", ())
+        or getattr(params, "sidecar_draft_device_pools", ())
+        or getattr(params, "pp_size", 1) != 1
+        or getattr(params, "attn_cp_size", 1) != 1
+    ):
+        raise ValueError(
+            "The standard MiniMax sparse direct linker requires index-K-only "
+            "pools, without HiSparse, draft KV, PP or CP."
+        )
+    main, index = kvcache.main_pool, kvcache.index_k_pool
+    if type(main) is not MHATokenToKVPool or (
+        index is not None and type(index) is not MHATokenToKOnlyPool
+    ):
+        raise ValueError("Unsupported standard MiniMax sparse device pool types.")
+    if (
+        main.page_size != page_size
+        or kvcache.page_size != page_size
+        or main.size != kvcache.size
+        or main.layer_num != kvcache.layer_num
+        or main.start_layer != kvcache.start_layer
+        or main.end_layer != kvcache.end_layer
+        or kvcache.end_layer != kvcache.start_layer + kvcache.layer_num
+        or (
+            index is not None
+            and (index.page_size != page_size or index.size != main.size)
+        )
+    ):
+        raise ValueError("MiniMax sparse direct-linker pool geometry must match.")
+    if index is None and kvcache.index_k_layer_id_mapping:
+        raise ValueError("MiniMax sparse index-K layer mapping requires an index pool.")
+    index_mapping = {}
+    if index is not None:
+        mapping = kvcache.index_k_layer_id_mapping
+        if (
+            len(mapping) != index.layer_num
+            or sorted(mapping.values()) != list(range(index.layer_num))
+            or tuple(sorted(mapping, key=mapping.get)) != tuple(index.model_layer_ids)
+            or any(
+                not kvcache.start_layer <= layer < kvcache.end_layer
+                for layer in mapping
+            )
+        ):
+            raise ValueError("MiniMax sparse index-K layer mapping is inconsistent.")
+        index_mapping = {
+            layer - kvcache.start_layer: local for layer, local in mapping.items()
+        }
+    if (
+        len(main.k_buffer) != main.layer_num
+        or len(main.v_buffer) != main.layer_num
+        or (index is not None and len(index.k_buffer) != index.layer_num)
+    ):
+        raise ValueError("MiniMax sparse direct-linker buffer layer counts must match.")
+    if any(
+        getattr(main, name, None) is not None
+        for name in ("v_scale_buffer", "native_v_scale_buffer")
+    ):
+        raise ValueError(
+            "The direct external linker does not support scaled KV caches yet."
+        )
+
+    # All geometry is checked before entries expose device pointers. Dense and
+    # sparse layers share the main pool; index K follows the same logical slots.
+    entries = [
+        _mha_device_pool_entry(
+            PoolName.KV,
+            main,
+            {layer: layer for layer in range(main.layer_num)},
+            page_size,
+        )
+    ]
+    if index is not None:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=index,
+                components=[index.k_buffer],
+                layer_mapping=index_mapping,
+                page_size=page_size,
+                rows_are_pages=False,
+            )
+        )
+    return DevicePoolGroup(entries, main.layer_num, page_size)
+
+
 def _build_minimax_m3_nvfp4_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:

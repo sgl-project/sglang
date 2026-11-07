@@ -46,6 +46,12 @@ Full/SWA/Mamba within existing linker layout limits and requires PP=1.
 All attention TP ranks read into private GPU slots; only complete KV confirmed
 successful by every rank joins the radix tree. Failed reads fall back to recomputation.
 
+Standard MiniMax sparse pools support main K/V for every layer plus the
+index-K-only sparse pool. This path requires PP=CP=1 and rejects HiSparse,
+value-bearing index pools, draft KV, and separate KV scale buffers. The packed
+MiniMax NVFP4 pool path is unchanged. Weight quantization and KV pool layout are
+separate: selecting an NVFP4 checkpoint does not select packed NVFP4 KV pools.
+
 Set `prefetch_policy` in the same JSON:
 
 - `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.

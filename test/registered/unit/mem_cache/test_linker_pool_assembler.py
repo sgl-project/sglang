@@ -1,5 +1,6 @@
 """Unit tests for external-linker device pool assembly."""
 
+import ctypes
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -984,6 +985,256 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.main_pool = page_rows(MHATokenToKVPool, 5)
         with self.assertRaisesRegex(ValueError, "M3.1 NVFP4"):
             resolve()
+
+    @staticmethod
+    def _standard_minimax_pool(start_layer=4, layer_num=4, index_layers=(5, 7)):
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKOnlyPool,
+            MHATokenToKVPool,
+            MiniMaxSparseKVPool,
+        )
+
+        def buffers(count, width, dtype, base):
+            return [
+                (torch.arange(10 * width).reshape(10, 1, width) + base + layer * 100)
+                .to(dtype)
+                .contiguous()
+                for layer in range(count)
+            ]
+
+        main = MHATokenToKVPool.__new__(MHATokenToKVPool)
+        main.size, main.page_size = 8, 2
+        main.start_layer, main.layer_num = start_layer, layer_num
+        main.end_layer = start_layer + layer_num
+        main.k_scale_buffer = main.native_k_scale_buffer = None
+        main.v_scale_buffer = main.native_v_scale_buffer = None
+        main.k_buffer = buffers(layer_num, 3, torch.bfloat16, 1)
+        main.v_buffer = buffers(layer_num, 3, torch.bfloat16, 21)
+        index = MHATokenToKOnlyPool.__new__(MHATokenToKOnlyPool)
+        index.size, index.page_size, index.layer_num = 8, 2, len(index_layers)
+        index.model_layer_ids = tuple(index_layers)
+        index.k_buffer = buffers(len(index_layers), 2, torch.float32, 41)
+        pool = MiniMaxSparseKVPool.__new__(MiniMaxSparseKVPool)
+        pool.size, pool.page_size = 8, 2
+        pool.start_layer, pool.end_layer = start_layer, start_layer + layer_num
+        pool.layer_num = layer_num
+        pool._enable_hisparse = False
+        pool.dense_pool = pool.index_kv_pool = None
+        pool.main_pool, pool.index_k_pool = main, index
+        pool.index_k_layer_id_mapping = {
+            layer: local for local, layer in enumerate(index_layers)
+        }
+        return pool
+
+    @staticmethod
+    def _resolve_standard_minimax(pool, **overrides):
+        params = SimpleNamespace(
+            mtp_draft_device_pools=(),
+            mtp_draft_mamba_pools=(),
+            sidecar_draft_device_pools=(),
+            pp_size=1,
+            attn_cp_size=1,
+        )
+        params.__dict__.update(overrides)
+        return resolve_hybrid_device_pool_group(
+            kvcache=pool, page_size=2, params=params, components={ComponentType.FULL}
+        )
+
+    def test_minimax_standard_all_layers_byte_round_trip(self):
+        # Cover the exact M3 layer policy and a nonzero stage offset with holes.
+        for start, layers, index_layers in (
+            (0, 60, tuple(range(3, 60))),
+            (4, 4, (5, 7)),
+        ):
+            with self.subTest(start=start, layers=layers):
+                source = self._standard_minimax_pool(start, layers, index_layers)
+                target = self._standard_minimax_pool(start, layers, index_layers)
+                src_group = self._resolve_standard_minimax(source)
+                dst_group = self._resolve_standard_minimax(target)
+                self.assertEqual(
+                    set(src_group.entry_map), {PoolName.KV, PoolName.INDEXER}
+                )
+                self.assertFalse(src_group.rank_replicated)
+                self.assertEqual(
+                    src_group.entry_map[PoolName.INDEXER].layer_mapping,
+                    {layer - start: local for local, layer in enumerate(index_layers)},
+                )
+                src_indices = torch.tensor([2, 3, 6, 7])
+                dst_indices = torch.tensor([0, 1, 4, 5])
+                transfers = src_group.resolve_transfers(
+                    [
+                        PoolTransfer(
+                            name=PoolName.KV,
+                            keys=["page0", "page1"],
+                            device_indices=src_indices,
+                        )
+                    ]
+                )
+                self.assertEqual(
+                    {t.name for t in transfers}, {PoolName.KV, PoolName.INDEXER}
+                )
+                for name, src_entry in src_group.entry_map.items():
+                    dst_entry = dst_group.entry_map[name]
+                    originals = [b.clone() for b in src_entry.kv_buffer]
+                    for buffer in dst_entry.kv_buffer:
+                        buffer.fill_(-128)
+                    ptrs, sizes = src_entry.get_page_buffer_meta(src_indices)
+                    buffers_per_page = len(src_entry.kv_buffer)
+                    objects = [
+                        b"".join(
+                            ctypes.string_at(ptr, size)
+                            for ptr, size in zip(
+                                ptrs[i : i + buffers_per_page],
+                                sizes[i : i + buffers_per_page],
+                            )
+                        )
+                        for i in range(0, len(ptrs), buffers_per_page)
+                    ]
+                    expected_bytes = (
+                        layers * 2 * 2 * 3 * 2
+                        if name == PoolName.KV
+                        else len(index_layers) * 2 * 2 * 4
+                    )
+                    self.assertEqual(
+                        [len(obj) for obj in objects], [expected_bytes] * 2
+                    )
+                    src_locations = src_entry.prepare_locations(src_indices)
+                    dst_locations = dst_entry.prepare_locations(dst_indices)
+                    for layer in range(layers):
+                        src_meta = src_entry.get_prepared_layer_range_meta(
+                            src_locations, layer
+                        )
+                        dst_meta = dst_entry.get_prepared_layer_range_meta(
+                            dst_locations, layer
+                        )
+                        self.assertEqual(src_meta is None, dst_meta is None)
+                        if dst_meta is None:
+                            self.assertNotIn(layer, src_entry.layer_mapping)
+                            continue
+                        dst_ptrs, dst_sizes, offsets = dst_meta
+                        for obj, row_ptrs, row_sizes, row_offsets in zip(
+                            objects, dst_ptrs, dst_sizes, offsets
+                        ):
+                            for ptr, size, offset in zip(
+                                row_ptrs, row_sizes, row_offsets
+                            ):
+                                self.assertGreaterEqual(offset, 0)
+                                self.assertLessEqual(offset + size, len(obj))
+                                ctypes.memmove(ptr, obj[offset : offset + size], size)
+                    for old, src_buffer, dst_buffer in zip(
+                        originals, src_entry.kv_buffer, dst_entry.kv_buffer
+                    ):
+                        torch.testing.assert_close(src_buffer, old, rtol=0, atol=0)
+                        torch.testing.assert_close(
+                            dst_buffer[dst_indices], old[src_indices], rtol=0, atol=0
+                        )
+                        self.assertTrue(
+                            torch.all(dst_buffer[[2, 3, 6, 7, 8, 9]] == -128)
+                        )
+
+    def test_minimax_standard_rejects_unsupported_before_buffer_access(self):
+        for field, value in (
+            ("_enable_hisparse", True),
+            ("dense_pool", object()),
+            ("index_kv_pool", object()),
+        ):
+            with self.subTest(field=field):
+                pool = self._standard_minimax_pool()
+                setattr(pool, field, value)
+                pool.main_pool = pool.index_k_pool = object()
+                with self.assertRaisesRegex(ValueError, "index-K-only"):
+                    self._resolve_standard_minimax(pool)
+        for options in (
+            dict(mtp_draft_device_pools=(object(),)),
+            dict(mtp_draft_mamba_pools=(object(),)),
+            dict(sidecar_draft_device_pools=(object(),)),
+            dict(pp_size=2),
+            dict(attn_cp_size=2),
+        ):
+            with self.subTest(options=options):
+                pool = self._standard_minimax_pool()
+                pool.main_pool = pool.index_k_pool = object()
+                with self.assertRaisesRegex(ValueError, "index-K-only"):
+                    self._resolve_standard_minimax(pool, **options)
+
+    def test_minimax_standard_rejects_geometry_and_mapping_before_pointers(self):
+        changes = (
+            lambda p: setattr(p.main_pool, "page_size", 4),
+            lambda p: setattr(p.index_k_pool, "page_size", 4),
+            lambda p: setattr(p.index_k_pool, "size", 16),
+            lambda p: setattr(p.main_pool, "size", 16),
+            lambda p: setattr(p.main_pool, "start_layer", 0),
+            lambda p: setattr(p.main_pool, "end_layer", 9),
+            lambda p: setattr(p.main_pool, "layer_num", 3),
+            lambda p: setattr(p, "end_layer", 9),
+            lambda p: setattr(p, "index_k_layer_id_mapping", {5: 0, 7: 0}),
+            lambda p: setattr(p, "index_k_layer_id_mapping", {5: 0, 8: 1}),
+            lambda p: setattr(p.index_k_pool, "model_layer_ids", (7, 5)),
+        )
+        for change in changes:
+            pool = self._standard_minimax_pool()
+            change(pool)
+            with patch(
+                "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.DevicePoolEntry",
+                side_effect=AssertionError("pointer access"),
+            ):
+                with self.assertRaisesRegex(ValueError, "geometry|mapping"):
+                    self._resolve_standard_minimax(pool)
+
+    def test_minimax_standard_rejects_unknown_pool_and_missing_layer_buffers(self):
+        for field in ("main_pool", "index_k_pool"):
+            pool = self._standard_minimax_pool()
+            setattr(pool, field, object())
+            with self.assertRaisesRegex(ValueError, "pool types"):
+                self._resolve_standard_minimax(pool)
+        for name in ("k_buffer", "v_buffer"):
+            pool = self._standard_minimax_pool()
+            setattr(pool.main_pool, name, [])
+            with patch(
+                "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.DevicePoolEntry",
+                side_effect=AssertionError("pointer access"),
+            ):
+                with self.assertRaisesRegex(ValueError, "buffer layer counts"):
+                    self._resolve_standard_minimax(pool)
+        pool = self._standard_minimax_pool()
+        pool.index_k_pool.k_buffer = []
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.DevicePoolEntry",
+            side_effect=AssertionError("pointer access"),
+        ):
+            with self.assertRaisesRegex(ValueError, "buffer layer counts"):
+                self._resolve_standard_minimax(pool)
+
+    def test_minimax_standard_requires_index_pool_for_index_mapping(self):
+        pool = self._standard_minimax_pool()
+        pool.index_k_pool = None
+        with patch(
+            "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.DevicePoolEntry",
+            side_effect=AssertionError("pointer access"),
+        ):
+            with self.assertRaisesRegex(ValueError, "requires an index pool"):
+                self._resolve_standard_minimax(pool)
+        pool.index_k_layer_id_mapping = {}
+        group = self._resolve_standard_minimax(pool)
+        self.assertEqual(set(group.entry_map), {PoolName.KV})
+        self.assertEqual(group.num_layers, 4)
+
+    def test_minimax_standard_never_drops_scale_buffers(self):
+        for name in (
+            "k_scale_buffer",
+            "v_scale_buffer",
+            "native_k_scale_buffer",
+            "native_v_scale_buffer",
+        ):
+            with self.subTest(name=name):
+                pool = self._standard_minimax_pool()
+                setattr(pool.main_pool, name, [torch.ones(1)])
+                with patch(
+                    "sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler.DevicePoolEntry",
+                    side_effect=AssertionError("pointer access"),
+                ):
+                    with self.assertRaisesRegex(ValueError, "scaled KV"):
+                        self._resolve_standard_minimax(pool)
 
     def test_unsupported_strategy_fails_with_context(self):
         from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
