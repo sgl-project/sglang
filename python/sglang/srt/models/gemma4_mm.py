@@ -45,6 +45,7 @@ from sglang.srt.managers.mm_utils import (
     pad_mm_tokens,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -60,7 +61,7 @@ from sglang.srt.models.gemma4_causal import (
 )
 from sglang.srt.models.gemma4_vision import Gemma4VisionEncoder
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_exec, get_mm, get_parallel
 from sglang.srt.utils import cpu_has_amx_support, flatten_nested_list, is_cpu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -185,14 +186,19 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
+        self.enable_multimodal = bool(get_mm().enable_multimodal)
 
         text_config = config.text_config
+
+        if text_config.num_kv_shared_layers > 0:
+            # E2B/E4B reuse KV-cache layer IDs, which prefill graph indexing rejects.
+            get_exec().graph.cuda_graph_config.prefill.backend = Backend.DISABLED
 
         prefix = add_prefix("model", prefix)
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        if self.pp_group.is_first_rank and self.enable_multimodal:
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
                 quant_config=quant_config,
@@ -219,9 +225,14 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             else:
                 self.audio_tower = None
                 self.embed_audio = None
-        else:
+        elif self.enable_multimodal:
             self.vision_tower = PPMissingLayer()
             self.embed_vision = PPMissingLayer()
+            self.audio_tower = None
+            self.embed_audio = None
+        else:
+            self.vision_tower = None
+            self.embed_vision = None
             self.audio_tower = None
             self.embed_audio = None
 
@@ -765,6 +776,15 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return
         return self.language_model.tie_weights()
 
+    # E2B / E4B carry vision + audio; 26B-A4B / 31B carry vision only; 12B is
+    # encoder-free and handled by Gemma4UnifiedForConditionalGeneration.
+    _MULTIMODAL_NAME_FRAGMENTS = (
+        "vision_tower.",
+        "embed_vision.",
+        "audio_tower.",
+        "embed_audio.",
+    )
+
     # Standard stacked-params mapping for fused QKV / GateUp linears
     # in the text decoder.  Also consumed by the tower QKV remap (step 2).
     stacked_params_mapping = [
@@ -889,6 +909,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         return name
 
+    def _should_skip_multimodal_weight(self, name: str) -> bool:
+        """Text-only serving never builds the towers, so drop their weights."""
+        return not self.enable_multimodal and any(
+            fragment in name for fragment in self._MULTIMODAL_NAME_FRAGMENTS
+        )
+
     def _get_k_eq_v_layers(self) -> set:
         """Return set of layer indices where attention_k_eq_v applies (full-attention layers)."""
         text_config = self.config.text_config
@@ -945,6 +971,8 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
         loaded_params: Set[str] = set()
 
         for name, loaded_weight in weights:
+            if self._should_skip_multimodal_weight(name):
+                continue
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
                 continue
             if self.audio_tower is None and (
