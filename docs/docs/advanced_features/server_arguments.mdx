@@ -2465,7 +2465,7 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--ple-offload-backend`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host storage for the offloaded PLE table: `pinned` (CPU pinned memory) or `file` (a sparse file-backed mmap under `--ple-offload-dir`, read directly by the gather kernel). Use `file` on unified-memory devices such as GB10 / DGX Spark, where pinned host memory comes out of the same pool as the weights; it requires a device that reports `cudaDevAttrPageableMemoryAccessUsesHostPageTables`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host storage for the offloaded PLE table: `pinned` (CPU pinned memory) or `file` (a sparse file-backed mmap under `--ple-offload-dir`, read directly by the gather kernel). Use `file` on unified-memory devices such as GB10 / DGX Spark, where pinned host memory comes out of the same pool as the weights; it requires a device that reports `cudaDevAttrPageableMemoryAccess` (GB10, or a discrete GPU with HMM).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`pinned`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>

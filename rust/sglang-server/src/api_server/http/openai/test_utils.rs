@@ -61,6 +61,8 @@ pub(super) fn core_handle() -> CoreHandle {
             peer_endpoints: Vec::new(),
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
             metrics: None,
+            request_log: None,
+            generate_validator: None,
         },
     )
 }
@@ -163,6 +165,8 @@ pub(super) fn frontend_closed() -> CoreHandle {
             peer_endpoints: Vec::new(),
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
             metrics: None,
+            request_log: None,
+            generate_validator: None,
         },
     )
 }
@@ -172,6 +176,20 @@ pub(super) fn frontend_closed() -> CoreHandle {
 fn answering_app_state() -> Arc<super::AppState> {
     let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
     answering_app_state_with(server_args(), formatter.unwrap(), None, "ok")
+}
+
+/// [`answering_app_state`], logging its requests to `request_log`.
+fn answering_app_state_logged(
+    request_log: Arc<crate::api_server::core::RequestLog>,
+) -> Arc<super::AppState> {
+    let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
+    answering_app_state_built(
+        server_args(),
+        formatter.unwrap(),
+        None,
+        |rid| chunk(rid, "ok", true),
+        Some(request_log),
+    )
 }
 
 /// App state whose core intake answers every generation with one finished `text` chunk.
@@ -192,6 +210,16 @@ pub(super) fn answering_app_state_with_item(
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
+    answering_app_state_built(server_args, formatter, tokenizer, answer, None)
+}
+
+fn answering_app_state_built(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    request_log: Option<Arc<crate::api_server::core::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
     tokio::spawn(async move {
@@ -216,6 +244,8 @@ pub(super) fn answering_app_state_with_item(
             peer_endpoints: Vec::new(),
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args.as_ref()),
             metrics: None,
+            request_log,
+            generate_validator: None,
         },
     );
     // The test tokenizers add no specials, so one handle serves both modes.
@@ -433,6 +463,31 @@ async fn openai_handlers_serve_any_model_name() {
     assert_eq!(model_error("org/model:v1", "org/model:v1"), None);
 }
 
+/// Both OpenAI streams declare UTF-8, as Python's `StreamingResponse` does.
+#[tokio::test]
+async fn openai_streams_declare_utf8_event_stream() {
+    let app = routes().with_state(answering_app_state());
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "stream": true}),
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "stream": true}),
+        ),
+    ] {
+        let response = post_json(app.clone(), path, body).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(
+            response.headers()["content-type"],
+            crate::utils::response::SSE_CONTENT_TYPE,
+            "{path}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn basic_openai_router_excludes_responses_api() {
     let app = routes().with_state(app_state(core_handle()));
@@ -453,6 +508,10 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["content-type"],
+        crate::utils::response::SSE_CONTENT_TYPE
+    );
     let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
         .await
         .unwrap();
@@ -468,4 +527,59 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
     assert_eq!(frame["error"]["type"], "InternalServerError");
     assert_eq!(frame["error"]["code"], 503);
     assert!(text.contains("[DONE]"));
+}
+
+/// The OpenAI routes log their requests with the whitelisted headers of the
+/// HTTP request, as Python's tokenizer manager does.
+#[tokio::test]
+async fn openai_request_lines_carry_whitelisted_headers() {
+    let log = crate::api_server::core::RequestLog::for_test(
+        Some(crate::message::config::RequestLogConfig {
+            max_length: 1 << 30,
+            skip_names: vec!["text".into()],
+            out_skip_names: vec!["text".into(), "output_ids".into()],
+            class_name: "GenerateReqInput".into(),
+            fields: vec![("rid".into(), "None".into())],
+            batch_item_fields: Vec::new(),
+            batch_shared_fields: Vec::new(),
+            headers: vec!["x-smg-routing-key".into()],
+            exceeded_ms: -1,
+        }),
+        false,
+    );
+    let app = routes().with_state(answering_app_state_logged(log.clone()));
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        ("/v1/completions", json!({"model": "model", "prompt": "hi"})),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages}),
+        ),
+    ] {
+        let req = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-smg-routing-key", "conv-1")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let response = oneshot(app.clone(), req).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let lines = log.logged_lines();
+        assert_eq!(lines.len(), 2, "{path}: {lines:?}");
+        assert!(
+            lines[0].starts_with("Receive: obj=GenerateReqInput(rid="),
+            "{path}"
+        );
+        assert!(
+            lines[1].starts_with("Finish: obj=GenerateReqInput(rid="),
+            "{path}"
+        );
+        for line in &lines {
+            assert!(
+                line.contains(", headers={'x-smg-routing-key': 'conv-1'}"),
+                "{path}: {line}"
+            );
+        }
+    }
 }
