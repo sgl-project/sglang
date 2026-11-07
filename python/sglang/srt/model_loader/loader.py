@@ -727,6 +727,11 @@ class DefaultModelLoader(BaseModelLoader):
                     max_inflight_bytes=extra_config.get("max_inflight_bytes"),
                 )
             else:
+                if "max_inflight_bytes" in extra_config:
+                    logger.warning(
+                        "max_inflight_bytes applies to the multithreaded loader "
+                        "only; ignored because it is not in use."
+                    )
                 weights_iterator = safetensors_weights_iterator(
                     hf_weights_files,
                     disable_mmap=weight_loader_disable_mmap,

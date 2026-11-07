@@ -1338,11 +1338,10 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     ``max_inflight_bytes`` also caps the summed size of the files submitted
-    but not yet handed out (one file is always admitted). The shard being
-    yielded is not counted, so peak RAM is about the cap plus one shard. With
-    ``disable_mmap`` the read bytes stay alive while the tensors are built, so a
-    loading shard briefly needs about twice its size and peak RAM can reach
-    about twice the cap plus one shard.
+    but not yet handed out (one file is always admitted). Peak RAM is a small
+    multiple of the cap: the shard being yielded is not counted, and with
+    ``disable_mmap`` a shard is held as bytes and then as tensors (measured
+    2-3x the cap with ``disable_mmap``).
     """
     prefetch_handle = None
     if prefetch and not disable_mmap:
@@ -1382,7 +1381,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     and inflight_bytes + size > max_inflight_bytes
                 ):
                     break
-                pending.append((next_file, executor.submit(_load_file, next_file)))
+                pending.append(
+                    (next_file, size, executor.submit(_load_file, next_file))
+                )
                 inflight_bytes += size
                 next_file = next(file_iter, None)
 
@@ -1396,12 +1397,12 @@ def buffered_multi_thread_safetensors_weights_iterator(
             position=tqdm._get_free_pos(),
         ) as pbar:
             while pending:
-                st_file, future = pending.popleft()
+                st_file, size, future = pending.popleft()
                 state_dict = future.result()
                 del future  # let GC reclaim the Future's internal result
 
                 # Replenish the window.
-                inflight_bytes -= os.path.getsize(st_file)
+                inflight_bytes -= size
                 fill_window()
 
                 for name in sorted(state_dict.keys()):

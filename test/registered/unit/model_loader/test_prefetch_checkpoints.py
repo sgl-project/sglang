@@ -555,6 +555,34 @@ class TestPrefetchDispatch(CustomTestCase):
         mock_single.assert_not_called()
         self.assertEqual(self._override_notices(mock_log), [])
 
+    def test_max_inflight_bytes_without_multithread_warns(self):
+        """The cap bounds only the multithreaded loader; with it off, the key
+        is ignored with a warning rather than silently."""
+        cap = {"max_inflight_bytes": 1 << 30}
+        for extra, warns in (
+            ({"enable_multithread_load": False, **cap}, True),
+            ({"enable_multithread_load": False}, False),
+            (cap, False),
+        ):
+            with self.subTest(extra=extra):
+                loader = self._make_loader(extra)
+                p_prep, p_model, p_buffered, p_single, p_log = self._patch_dispatch(
+                    prefetch=False
+                )
+                with (
+                    p_prep,
+                    p_model,
+                    p_buffered,
+                    p_single,
+                    p_log,
+                    patch("sglang.srt.model_loader.loader.logger.warning") as warn,
+                ):
+                    self._run(loader)
+                notices = [
+                    c for c in warn.call_args_list if "max_inflight_bytes" in c.args[0]
+                ]
+                self.assertEqual(len(notices), int(warns))
+
     def test_startup_prefetch_reuses_existing_background_handle(self):
         """Startup commit reuses resolved shards and the active prefetch handle."""
         loader = self._make_loader({})
