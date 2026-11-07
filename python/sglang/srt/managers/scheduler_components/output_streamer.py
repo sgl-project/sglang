@@ -137,12 +137,13 @@ class SchedulerOutputStreamer:
         """Whether Rust egress frames carry each request's cached tokens by
         tier, from which the frontend reports what
         ``get_cached_tokens_details`` would. Only a cache with a host or
-        storage tier, or a PD decode server (which takes the split from
-        prefill), serves hits from anywhere but the device; otherwise the
-        frontend reports every cached token on device."""
+        storage tier, an external cache linker, or a PD decode server (which
+        takes the split from prefill), serves hits from anywhere but the
+        device; otherwise the frontend reports every cached token on device."""
         return self.rust_server is not None and (
             self.server_args.enable_hierarchical_cache
             or self.server_args.enable_lmcache
+            or self.server_args.enable_unified_cache_external_linker
             or self.disaggregation_mode == DisaggregationMode.DECODE
         )
 

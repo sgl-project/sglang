@@ -2650,6 +2650,135 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             num_tokens
         )
 
+    def init_linker_metrics(self) -> None:
+        """Create the external cache linker series; only caches with a linker call this."""
+        from prometheus_client import Counter as _PromCounter
+        from prometheus_client import Gauge as _PromGauge
+        from prometheus_client import Histogram as _PromHistogram
+
+        Counter = self._counter_cls or _PromCounter
+        Gauge = self._gauge_cls or _PromGauge
+        Histogram = self._histogram_cls or _PromHistogram
+        labels = self.labels
+
+        self.linker_lookup_tokens = Counter(
+            name="sglang:linker_lookup_tokens_total",
+            documentation="Device-uncached prefix tokens probed in the external "
+            "store, per lookup. A waiting request is probed again on each "
+            "scheduling pass that matches it.",
+            labelnames=labels.keys(),
+        )
+        self.linker_hit_tokens = Counter(
+            name="sglang:linker_hit_tokens_total",
+            documentation="Probed tokens every rank can restore from the external "
+            "store, per lookup.",
+            labelnames=labels.keys(),
+        )
+        self.linker_load_tokens = Counter(
+            name="sglang:linker_load_tokens_total",
+            documentation="Tokens loaded from the external store into device KV, by "
+            "load mode: layer_wise loads overlap the forward that uses them, "
+            "prefetch loads complete before admission.",
+            labelnames=list(labels.keys()) + ["mode"],
+        )
+        for mode in ("layer_wise", "prefetch"):
+            self.linker_load_tokens.labels(**labels, mode=mode)
+        self.linker_offload_tokens = Counter(
+            name="sglang:linker_offload_tokens_total",
+            documentation="KV tokens queued for writing to the external store.",
+            labelnames=labels.keys(),
+        )
+        self.linker_failures = Counter(
+            name="sglang:linker_failures_total",
+            documentation="External store operations that failed, by stage: lookup "
+            "(a prefetch lookup raised), load (requests aborted because their "
+            "layer-wise load did not land), offload (writes the store rejected).",
+            labelnames=list(labels.keys()) + ["stage"],
+        )
+        for stage in ("lookup", "load", "offload"):
+            self.linker_failures.labels(**labels, stage=stage)
+        self.linker_prefetch_requests = Counter(
+            name="sglang:linker_prefetch_requests_total",
+            documentation="Prefetch-mode reads that ended, by outcome: published "
+            "(joined the cache), stopped (the prefetch stop policy ended the wait), "
+            "rejected (a rank could not submit the read), released (the request "
+            "left the queue or the cache reset), failed (the read did not land).",
+            labelnames=list(labels.keys()) + ["outcome"],
+        )
+        for outcome in ("published", "stopped", "rejected", "released", "failed"):
+            self.linker_prefetch_requests.labels(**labels, outcome=outcome)
+
+        # Same coarse boundaries as the backup histogram: downstream metrics
+        # gateways with a fixed bucket preset drop series with other boundaries.
+        bucket_wait = [0.001, 0.005, 0.01, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0]
+        self.linker_forward_wait_seconds = Histogram(
+            name="sglang:linker_forward_wait_seconds",
+            documentation="Per batch, the time the forward pass blocked on "
+            "layer-wise loads that had not landed yet: the load-back cost the "
+            "forward actually pays.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait,
+        )
+        self.linker_finish_wait_seconds = Histogram(
+            name="sglang:linker_finish_wait_seconds",
+            documentation="Per batch, the time spent after the forward waiting for "
+            "its layer-wise loads to stop writing device memory.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait,
+        )
+        self.linker_offload_duration_seconds = Histogram(
+            name="sglang:linker_offload_duration_seconds",
+            documentation="Time from queuing a write to the external store until "
+            "the cache consumes its completion.",
+            labelnames=labels.keys(),
+            buckets=bucket_wait + [30.0, 60.0],
+        )
+        self.linker_offloads_in_flight = Gauge(
+            name="sglang:linker_offloads_in_flight",
+            documentation="Writes to the external store queued and not yet "
+            "completed; each pins its tree node until it lands.",
+            labelnames=labels.keys(),
+            multiprocess_mode="mostrecent",
+        )
+
+    def increment_linker_lookup_tokens(
+        self, lookup_tokens: int, hit_tokens: int
+    ) -> None:
+        self.linker_lookup_tokens.labels(**self.labels).inc(lookup_tokens)
+        if hit_tokens > 0:
+            self.linker_hit_tokens.labels(**self.labels).inc(hit_tokens)
+
+    def increment_linker_load_tokens(self, num_tokens: int, mode: str) -> None:
+        self.linker_load_tokens.labels(**self.labels, mode=mode).inc(num_tokens)
+
+    def increment_linker_offload_tokens(self, num_tokens: int) -> None:
+        self.linker_offload_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_linker_failures(self, stage: str, count: int = 1) -> None:
+        self.linker_failures.labels(**self.labels, stage=stage).inc(count)
+
+    def increment_linker_prefetch_requests(self, outcome: str) -> None:
+        self.linker_prefetch_requests.labels(**self.labels, outcome=outcome).inc()
+
+    def observe_linker_load_waits(
+        self, forward_wait_seconds: Optional[float], finish_wait_seconds: float
+    ) -> None:
+        if forward_wait_seconds is not None:
+            self.linker_forward_wait_seconds.labels(**self.labels).observe(
+                forward_wait_seconds
+            )
+        self.linker_finish_wait_seconds.labels(**self.labels).observe(
+            finish_wait_seconds
+        )
+
+    def observe_linker_offload_duration(self, duration_seconds: float) -> None:
+        self.linker_offload_duration_seconds.labels(**self.labels).observe(
+            duration_seconds
+        )
+
+    def set_linker_offloads_in_flight(self, count: int) -> None:
+        self.linker_offloads_in_flight.labels(**self.labels).set(count)
+
 
 class EncoderMetricsCollector(_StatLoggerDIMixin):
     """Metrics collector for the EPD encoder server (--encoder-only)."""

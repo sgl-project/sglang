@@ -60,6 +60,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.observability.metrics_collector import RadixCacheMetricsCollector
 from sglang.srt.runtime_context import get_context, get_disagg
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
@@ -79,6 +80,49 @@ from sglang.test.tree_slots import index_slots
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
+
+
+class _RecordedSeries:
+    """In-memory stand-in for a prometheus Counter/Gauge/Histogram."""
+
+    def __init__(self, *args, **kwargs):
+        self.values = defaultdict(float)
+        self.observations = defaultdict(list)
+
+    def labels(self, **labels):
+        return _RecordedChild(self, tuple(sorted(labels.items())))
+
+
+class _RecordedChild:
+    def __init__(self, series, key):
+        self.series, self.key = series, key
+
+    def inc(self, value=1):
+        self.series.values[self.key] += value
+
+    def set(self, value):
+        self.series.values[self.key] = value
+
+    def observe(self, value):
+        self.series.observations[self.key].append(value)
+
+
+class _RecordingRadixCacheMetrics(RadixCacheMetricsCollector):
+    _counter_cls = _RecordedSeries
+    _gauge_cls = _RecordedSeries
+    _histogram_cls = _RecordedSeries
+
+    def __init__(self):
+        super().__init__(labels={"model_name": "test"})
+
+    @staticmethod
+    def value(series, **labels):
+        key = tuple(sorted({"model_name": "test", **labels}.items()))
+        return series.values.get(key, 0.0)
+
+    @staticmethod
+    def observations(series):
+        return series.observations.get((("model_name", "test"),), [])
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -182,6 +226,7 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        "metrics_collector": None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -317,7 +362,7 @@ class TestMooncakePrefetch(CustomTestCase):
 
 
 class TestLinkerDevicePrefetch(CustomTestCase):
-    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
+    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete", metrics=None):
         cfg = CacheConfig(
             page_size=1 if mamba else 2,
             components=(ComponentType.FULL,)
@@ -330,6 +375,7 @@ class TestLinkerDevicePrefetch(CustomTestCase):
         )
         with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
             cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+        cache.metrics_collector = metrics
         backend = _FakeLinker()
         if swa:
             backend.pools[PoolName.SWA] = object()
@@ -400,6 +446,25 @@ class TestLinkerDevicePrefetch(CustomTestCase):
             tree_cache=cache,
         )
         Scheduler._prefetch_kvcache(scheduler, req)
+
+    def test_prefetch_metrics_count_lookup_load_and_outcome(self):
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                metrics = _RecordingRadixCacheMetrics()
+                cache, backend, req, allocator = self._fixture(metrics=metrics)
+                self._enqueue(cache, req)
+                backend.prefetch_futures[-1].set_result(landed)
+                cache.linker.check_prefetch_events()
+
+                value = metrics.value
+                assert value(metrics.linker_lookup_tokens) == 6
+                assert value(metrics.linker_hit_tokens) == 6
+                loaded = value(metrics.linker_load_tokens, mode="prefetch")
+                assert loaded == (6 if landed else 0)
+                outcome = "published" if landed else "failed"
+                assert value(metrics.linker_prefetch_requests, outcome=outcome) == 1
+                assert sum(metrics.linker_prefetch_requests.values.values()) == 1
+                self._assert_balanced(cache, allocator)
 
     def test_timeout_config_overrides_legacy_including_empty_object(self):
         cache, backend, _, _ = self._fixture()
@@ -1008,6 +1073,74 @@ class TestUnifiedCacheLinkerPythonBackend(
         consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
+
+    def test_metrics_follow_offload_lookup_and_layer_wise_load(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 9))
+
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer.metrics_collector = produced = _RecordingRadixCacheMetrics()
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        value = produced.value
+        self.assertEqual(value(produced.linker_offload_tokens), len(tokens))
+        self.assertEqual(value(produced.linker_offloads_in_flight), 1)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        self.assertEqual(value(produced.linker_offloads_in_flight), 0)
+        self.assertEqual(
+            len(produced.observations(produced.linker_offload_duration_seconds)), 1
+        )
+        self.assertEqual(value(produced.linker_failures, stage="offload"), 0)
+
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                consumer, _, consumer_req_pool = build_fixture(cfg)
+                consumer.metrics_collector = consumed = _RecordingRadixCacheMetrics()
+                consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+                consumer_linker.load_landed = landed
+                consumer.init_cache_linker(consumer_linker)
+                req = self._make_req(consumer_req_pool)
+                match = consumer.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+                )
+                self._apply_match_to_req(req, match)
+                consumer.init_load_back(
+                    InitLoadBackParams(
+                        best_match_node=match.best_match_node,
+                        host_hit_length=match.host_hit_length,
+                        req=req,
+                    )
+                )
+                value = consumed.value
+                self.assertEqual(value(consumed.linker_lookup_tokens), len(tokens))
+                self.assertEqual(value(consumed.linker_hit_tokens), len(tokens))
+                self.assertEqual(
+                    value(consumed.linker_load_tokens, mode="layer_wise"), len(tokens)
+                )
+                # Restored tokens are reported as storage hits, not host hits.
+                self.assertTrue(req.host_hit_is_storage)
+
+                self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+                loaded = consumer.linker.private_load_indices[req.rid]
+                self._bind_loaded_request(
+                    consumer, consumer_req_pool, req, tokens, loaded
+                )
+                aborted = consumer.finish_external_linker_loads([req])
+                self.assertEqual(aborted, [] if landed else [req])
+                self.assertEqual(
+                    len(consumed.observations(consumed.linker_finish_wait_seconds)), 1
+                )
+                self.assertEqual(
+                    value(consumed.linker_failures, stage="load"), 0 if landed else 1
+                )
+                if landed:
+                    consumer.checkpoint(req, up_to=req.extend_end)
+                consumer.unlock(req.lock)
+                req.lock = None
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
@@ -1724,6 +1857,24 @@ def test_layer_counter_reports_failure_after_the_forward():
 
     assert ready == [0, 1]  # an MLA dedup source still broadcasts layer 1
     assert counter.finish(index) is False
+
+
+def test_layer_counter_times_only_blocked_waits():
+    counter = LayerWiseLoadCounter(2)
+    index = counter.update_producer()
+    counter.set_consumer(index)
+    counter.complete(index, 0)
+    loader = threading.Timer(0.05, counter.complete, (index, 1))
+    loader.start()
+
+    counter.wait_until(0)  # already landed: not a blocked wait
+    assert counter.blocked_seconds.get(index, 0.0) == 0.0
+    counter.wait_until(1)
+    loader.join()
+
+    assert counter.finish(index) is True
+    assert counter.pop_blocked_seconds(index) >= 0.04
+    assert counter.pop_blocked_seconds(index) == 0.0  # consumed once
 
 
 def test_layer_counter_finish_waits_for_layers_still_loading():
