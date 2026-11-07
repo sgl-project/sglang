@@ -62,6 +62,11 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.server_utils import (
+    launch_dummy_health_check_server,
+    set_prometheus_multiproc_dir,
+    start_follower_grpc_server,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
@@ -101,14 +106,16 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     run_multi_detokenizer_router_process,
     write_data_for_multi_tokenizer,
 )
 from sglang.srt.managers.req_types import ReturnHiddenStatesMode
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    TokenizerManager,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.observability import metrics_collector
 from sglang.srt.observability.metrics_collector import (
@@ -145,13 +152,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_mnnvl_fabric_device,
     kill_process_tree,
-    launch_dummy_health_check_server,
     maybe_reindex_device_id,
     normalize_serialized_named_tensor_payloads,
     numa_utils,
-    set_prometheus_multiproc_dir,
     set_ulimit,
-    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -281,7 +285,7 @@ class Engine(EngineScoreMixin, EngineBase):
     # Backend-specific launch handle: the Ray engine schedules its actors onto a
     # placement group. Not config — a live cluster object.
     _placement_group = None
-    # Set by attach_tokenizer_worker(): this instance only owns a TokenizerWorker,
+    # Set by attach_tokenizer_worker(): this instance only owns a tokenizer worker,
     # the engine subprocesses belong to the parent Engine.
     _attached = False
     tokenizer_router: Optional[MultiTokenizerRouter] = None
@@ -364,7 +368,7 @@ class Engine(EngineScoreMixin, EngineBase):
         self.port_args = port_args
 
         if isinstance(tokenizer_manager, MultiTokenizerRouter):
-            # --tokenizer-worker-num > 1: the router only bridges TokenizerWorkers to
+            # --tokenizer-worker-num > 1: the router only bridges tokenizer workers to
             # the scheduler and has no generate_request. Publish the launch data the
             # workers need (same shared-memory contract as `sglang serve`) and give
             # this process its own worker so Engine.generate() keeps working here;
@@ -572,12 +576,9 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        # Optional per-image hashes the caller has already computed (hex strings,
-        # one per image in `image_data`). When supplied, each MultimodalDataItem's
-        # `hash` is initialised from this list and `set_pad_value` skips the
-        # internal `hash_feature()` recompute. Intended for external KV routers
-        # that compute their own per-image hash for routing decisions and need
-        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        # Optional per-image routing hints (hex strings). These never replace
+        # the server-computed full content/configuration identity and cannot
+        # force cache sharing. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         mm_content_hashes: Optional[
             Union[List[Optional[str]], List[List[Optional[str]]]]
@@ -1423,7 +1424,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def _init_tokenizer_worker(
         server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict[str, Any]
     ) -> Tuple[TokenizerManager, TemplateManager]:
-        # TokenizerWorker.__init__ registers with the router over a zmq.asyncio
+        # TokenizerManager.__init__ registers with the router over a zmq.asyncio
         # socket, which needs the loop the Engine will later run to be current.
         Engine._ensure_event_loop()
         port_args = copy.copy(port_args)
@@ -1458,7 +1459,7 @@ class Engine(EngineScoreMixin, EngineBase):
         process on the same host.
 
         The returned Engine has no subprocesses of its own: it holds a
-        ``TokenizerWorker`` registered with the parent's ``MultiTokenizerRouter``, so
+        tokenizer worker registered with the parent's ``MultiTokenizerRouter``, so
         ``generate``/``async_generate`` run on this process while prefill and decode
         stay on the parent's schedulers. Use it to spread the per-request Python
         work of one engine over several processes (what ``sglang serve`` does with
@@ -1993,7 +1994,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                "0.7.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

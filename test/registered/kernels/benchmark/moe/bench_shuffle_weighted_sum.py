@@ -9,7 +9,7 @@ from sglang.kernels.ops.moe.shuffle_weighted_sum import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=12, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=12, stage="nightly", runner_config="1-gpu-small")
 
 
 @marker.parametrize("tokens,width,topk", [(32, 256, 2), (512, 256, 2), (64, 4096, 8)])
