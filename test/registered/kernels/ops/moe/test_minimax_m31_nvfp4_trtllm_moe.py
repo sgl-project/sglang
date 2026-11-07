@@ -152,6 +152,49 @@ def test_trtllm_routed_matches_dequantized_reference():
     assert rel < 0.13 and abs(fit - 1) < 0.02, (rel, fit)
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 8,
+    reason="Marlin W4A16 needs SM80+",
+)
+def test_marlin_matches_w16_reference():
+    """The path every GPU outside the SM100 family takes (Hopper, SM120)."""
+    from sglang.srt.runtime_context import override_platform
+
+    torch.manual_seed(0)
+    with override_platform(is_sm100=False):
+        scheme = minimax_m3_nvfp4.MiniMaxM3Nvfp4MoE()
+    assert scheme.use_marlin
+    layer, d13, d2 = _build_layer()
+    layer.dispatcher = None  # no expert map: every expert is local
+    # what FusedMoE carries for the Marlin repack
+    layer.quant_config = SimpleNamespace(group_size=16)
+    layer.params_dtype = torch.bfloat16
+    scheme.create_moe_runner(layer, layer.moe_runner_config)
+    scheme.process_weights_after_loading(layer)
+
+    x = torch.randn(T, H, device="cuda", dtype=torch.bfloat16)
+    ids = torch.stack([torch.randperm(E, device="cuda")[:TOPK] for _ in range(T)])
+    weights = torch.rand(T, TOPK, device="cuda").softmax(-1)
+    # W4A16: the activations stay bf16, so the reference quantizes nothing
+    ref = torch.zeros(x.shape, device="cuda", dtype=torch.float32)
+    for k in range(TOPK):
+        h = _swigluoai(torch.einsum("th,tnh->tn", x.float(), d13[ids[:, k]]))
+        ref += weights[:, k : k + 1] * torch.einsum("ti,thi->th", h, d2[ids[:, k]])
+    dispatch = StandardDispatchOutput(
+        hidden_states=x,
+        hidden_states_scale=None,
+        topk_output=StandardTopKOutput(
+            topk_weights=weights,
+            topk_ids=ids.int(),
+            # Marlin checks the token count against the router logits
+            router_logits=torch.zeros(T, E, device="cuda"),
+        ),
+    )
+    out = scheme.apply_weights(layer, dispatch).hidden_states.float()
+    rel = ((out - ref).norm() / ref.norm()).item()
+    assert rel < 0.02, rel
+
+
 def _scheme(runner, a2a):
     with (
         mock.patch.object(

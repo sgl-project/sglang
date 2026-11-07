@@ -90,9 +90,10 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 algorithm == "DSPARK"
                 and cfg.speculative_draft_attention_backend is None
             ):
-                overrides["speculative_draft_attention_backend"] = (
-                    "trtllm_mha" if get_platform().is_blackwell else "fa3"
-                )
+                if get_platform().is_sm100:
+                    overrides["speculative_draft_attention_backend"] = "trtllm_mha"
+                elif get_platform().is_sm90:
+                    overrides["speculative_draft_attention_backend"] = "fa3"
             # Draft tokens come from a cross-rank candidate gather and the greedy
             # accept from gathered target logits, so the ranks agree without
             # rank 0's broadcasts; keep only the RNG-dependent sites.
@@ -100,13 +101,15 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                 envs.SGLANG_SPEC_TP_SYNC.set("rng")
         if cfg.page_size not in (None, 128):
             raise ValueError("M3.1 NVFP4 requires --page-size 128")
-        if not get_platform().is_blackwell:
+        if not get_platform().is_sm100:
             # MegaMoE and the packed NVFP4 KV cache are SM100-only; neither is
-            # selected here, and the KV dtype stays at the model dtype.
+            # selected here, and the KV dtype stays at the model dtype. FA3 is
+            # Hopper's; elsewhere (SM120) the attention backend resolves as for
+            # any model.
             overrides.update(page_size=128)
             if cfg.moe_runner_backend == "auto":
                 overrides["moe_runner_backend"] = "marlin"
-            if is_attention_backend_not_set(cfg):
+            if is_attention_backend_not_set(cfg) and get_platform().is_sm90:
                 overrides["attention_backend"] = "fa3"
             return overrides
         if cfg.moe_runner_backend == "flashinfer_trtllm_routed":
