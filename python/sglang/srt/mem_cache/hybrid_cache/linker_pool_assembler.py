@@ -374,6 +374,21 @@ def _build_deepseek_v4_device_pool_group(
     )
 
 
+def _build_kv_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if not isinstance(kvcache, DSATokenToKVPool):
+        raise ValueError(
+            "The direct external linker supports only DSA among single KV "
+            f"pools, got {type(kvcache).__name__}."
+        )
+    return _build_dsa_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
+
+
 def _build_dsa_device_pool_group(
     kvcache: Any,
     page_size: int,
@@ -556,6 +571,14 @@ def _build_mamba_device_pool_group(
             params.token_to_kv_pool_allocator.state, kvcache.start_layer
         ),
     ]
+    entries.extend(_sidecar_draft_entries(params, page_size))
+    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
+    # Not rank_replicated: the Mamba state is TP-sharded.
+    return DevicePoolGroup(entries, num_layers + 1, page_size)
+
+
+def _sidecar_draft_entries(params: Any, page_size: int) -> list[DevicePoolEntry]:
+    entries = []
     for draft_pool in params.sidecar_draft_device_pools:
         if draft_pool.page_size != page_size:
             raise ValueError("Draft KV page size must match the tree page size.")
@@ -570,9 +593,62 @@ def _build_mamba_device_pool_group(
                 indices_from_pool=PoolName.KV,
             )
         )
-    num_layers = max(layer for entry in entries for layer in entry.layer_mapping)
-    # Not rank_replicated: the Mamba state is TP-sharded.
-    return DevicePoolGroup(entries, num_layers + 1, page_size)
+    return entries
+
+
+def _build_minimax_m3_nvfp4_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import (
+        MiniMaxM3Nvfp4IndexKPool,
+        MiniMaxM3Nvfp4KVPool,
+        MiniMaxM3Nvfp4MainKVPool,
+    )
+
+    # TODO(alphabetc1): support the bf16 MiniMax sparse pools and HiSparse.
+    main_pool, index_pool = kvcache.main_pool, kvcache.index_k_pool
+    if not (
+        isinstance(kvcache, MiniMaxM3Nvfp4KVPool)
+        and type(main_pool) is MiniMaxM3Nvfp4MainKVPool
+        and type(index_pool) is MiniMaxM3Nvfp4IndexKPool
+        and not params.mtp_draft_device_pools
+    ):
+        raise ValueError(
+            "The direct external linker supports MiniMax sparse models only with "
+            "the M3.1 NVFP4 pools, without HiSparse or packed draft KV."
+        )
+    if main_pool.page_size != page_size:
+        raise ValueError(
+            "MiniMax NVFP4 page size must match the tree page size: "
+            f"{main_pool.page_size} != {page_size}."
+        )
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=main_pool,
+            components=[main_pool.rows],
+            layer_mapping={layer: layer for layer in range(main_pool.layer_num)},
+            page_size=page_size,
+            rows_are_pages=True,
+        ),
+        DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=index_pool,
+            components=[index_pool.rows],
+            layer_mapping={
+                layer_id - kvcache.start_layer: index
+                for layer_id, index in kvcache.index_k_layer_id_mapping.items()
+            },
+            page_size=page_size,
+            rows_are_pages=True,
+        ),
+        *_sidecar_draft_entries(params, page_size),
+    ]
+    # Not rank_replicated: the KV heads are TP-sharded.
+    return DevicePoolGroup(entries, main_pool.layer_num, page_size)
 
 
 def resolve_hybrid_device_pool_group(

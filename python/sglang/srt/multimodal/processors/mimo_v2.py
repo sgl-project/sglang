@@ -3,6 +3,7 @@
 import asyncio
 import base64
 import copy
+import logging
 import math
 import os
 import re
@@ -21,12 +22,10 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 )
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
+from sglang.srt.multimodal.media_io import ImageData, VideoData, download_remote_media
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
@@ -38,9 +37,8 @@ from sglang.srt.multimodal.processors.mimo_audio import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import smart_nframes
 from sglang.srt.runtime_context import get_device
-from sglang.srt.utils import ImageData, VideoData
-from sglang.srt.utils.common import download_remote_media
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -493,7 +491,7 @@ class MiMoProcessor:
     def _load_video_for_encoder(self, video_data):
         # Normalise once to bytes-or-path; reused by frame decode, audio
         # detection, and audio preprocessing without re-downloading.
-        from sglang.srt.utils.common import VideoData, _normalize_video_input
+        from sglang.srt.multimodal.media_io import VideoData, _normalize_video_input
         from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
         if isinstance(video_data, VideoData):
@@ -524,7 +522,7 @@ class MiMoProcessor:
     def preprocess_for_encoder(self, mm_data, modality):
         # EPD encoder-side features. video_audio_* fields appear when any
         # video has audio; the D side uses them to rebuild input_ids.
-        from sglang.srt.managers.schedule_batch import Modality
+        from sglang.srt.multimodal.modality import Modality
 
         if not isinstance(mm_data, (list, tuple)):
             mm_data = [mm_data]

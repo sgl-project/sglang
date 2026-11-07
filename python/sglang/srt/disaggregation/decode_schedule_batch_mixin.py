@@ -9,9 +9,9 @@ import torch
 from sglang.srt.disaggregation.utils import pre_alloc_fill_len
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +127,7 @@ class ScheduleBatchDisaggregationDecodeMixin:
                     if req.grammar.current_token is None:
                         req.grammar.accept_token(req.output_ids[-1])
                 except ValueError as e:
-                    from sglang.srt.managers.schedule_batch import FINISH_ABORT
+                    from sglang.srt.managers.req_types import FINISH_ABORT
 
                     # Grammar accept_token can raise ValueError if the token is not in the grammar.
                     # This can happen if the grammar is not set correctly or the token is invalid.

@@ -25,8 +25,8 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 import msgspec
 from typing_extensions import Self
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.metrics_collector import (
     EncoderMetricsCollector,
     SchedulerMetricsCollector,
