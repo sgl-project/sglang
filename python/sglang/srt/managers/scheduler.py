@@ -2935,7 +2935,6 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             leave_prefill_launched=self.prefill_launched_reqs.leave,
             still_in_batch=self.still_in_batch,
-            leave_running_and_prefill_launched=self.leave_running_and_prefill_launched,
         )
 
     def init_internal_state(self) -> None:
@@ -4498,7 +4497,6 @@ class Scheduler(
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
-        resumed_req = self.chunked_req
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4659,6 +4657,9 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
+        self.invariant_checker.check_admitted(
+            req for req in can_run_list if req in self.waiting_queue
+        )
         self.waiting_queue.leave(can_run_set)
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -4670,9 +4671,6 @@ class Scheduler(
             self.chunked_req = adder.new_chunked_req
 
         set_time_batch(can_run_list, "set_forward_entry_time")
-
-        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get() and self.dllm_config is None:
-            self._check_admitted_not_in_flight(can_run_list, resumed_req)
 
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
@@ -4839,21 +4837,6 @@ class Scheduler(
                 if r is not batch.chunked_req and r not in self.running_reqs
             )
 
-    def _check_admitted_not_in_flight(
-        self, admitted: List[Req], resumed_req: Optional[Req]
-    ) -> None:
-        """A request never re-enters the batch while an older step still carries
-        it, which is what lets `still_in_batch` look at the batch lists alone.
-        So no step carries a request admitted to a prefill batch, except the one
-        resuming its chunked prefill, whose earlier chunks may still be in flight.
-        Gated like the request-list check."""
-        for req in admitted:
-            if req is not resumed_req and req.inflight_steps != 0:
-                raise RuntimeError(
-                    f"Request {req.rid} is admitted to a prefill batch while "
-                    f"{req.inflight_steps} older steps still carry it"
-                )
-
     def still_in_batch(self, req: Req) -> bool:
         """Whether `req` is still in the batch: in running, prefill_launched or
         chunked. A step's result commits only on the rows still in the batch; a
@@ -4864,13 +4847,6 @@ class Scheduler(
             or req in self.prefill_launched_reqs
             or req in self.chunked_reqs
         )
-
-    def leave_running_and_prefill_launched(self, reqs: List[Req]) -> None:
-        """A request that finishes in a step's processing leaves the running and
-        prefill_launched lists at once: its in-flight steps then find it no longer
-        in the batch."""
-        self.running_reqs.leave(reqs)
-        self.prefill_launched_reqs.leave(reqs)
 
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
@@ -4898,6 +4874,9 @@ class Scheduler(
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.run(CheckPhase.RESULT, batch)
         batch.drop_inflight_step()
+        # Requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
+        self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""

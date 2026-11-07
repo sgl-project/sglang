@@ -95,7 +95,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
         still_in_batch=lambda req: True,
-        leave_running_and_prefill_launched=lambda reqs: None,
     )
 
 

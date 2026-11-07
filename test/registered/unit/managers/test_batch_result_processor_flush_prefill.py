@@ -107,7 +107,6 @@ def _run(cls, *, hisparse=False):
         ),
         output_streamer=streamer,
         still_in_batch=lambda req: True,
-        leave_running_and_prefill_launched=lambda reqs: None,
     )
     batch = _batch()
     result = GenerationBatchResult(

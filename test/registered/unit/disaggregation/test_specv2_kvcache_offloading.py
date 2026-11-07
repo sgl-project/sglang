@@ -270,10 +270,7 @@ class TestSamplingMaskAbortOffload(CustomTestCase):
                 manager.req_to_token_pool.free.side_effect = lambda req: setattr(
                     req.kv, "req_pool_idx", None
                 )
-                processor = SimpleNamespace(
-                    decode_offload_manager=manager,
-                    leave_running_and_prefill_launched=lambda reqs: None,
-                )
+                processor = SimpleNamespace(decode_offload_manager=manager)
                 if inflight:
                     manager.offload_inflight[req] = 1
                     manager.ongoing_offload[1] = (req, torch.arange(4), [1], 0.0, [])

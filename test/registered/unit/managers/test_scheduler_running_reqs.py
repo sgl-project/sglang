@@ -331,7 +331,6 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            s.leave_running_and_prefill_launched([done])
             s._on_step_processed(batch)
 
         s.run_batch = run_batch

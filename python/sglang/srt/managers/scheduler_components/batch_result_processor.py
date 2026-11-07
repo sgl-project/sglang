@@ -150,10 +150,8 @@ class SchedulerBatchResultProcessor:
     request_retirer: RequestRetirer
     abort_request: Callable
     # Whether a request is still in the batch (running, prefill_launched or
-    # chunked), so a step's frozen row for it may commit. A request that finishes
-    # in processing leaves at once through `leave_running_and_prefill_launched`.
+    # chunked), so a step's frozen row for it may commit.
     still_in_batch: Callable
-    leave_running_and_prefill_launched: Callable
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
     # Hands requests out of the scheduler's prefill_launched_reqs.
     leave_prefill_launched: Callable = lambda reqs: None
@@ -494,7 +492,6 @@ class SchedulerBatchResultProcessor:
                     ):
                         req.kv.commit_decode(1)
                     if req.finished():
-                        self.leave_running_and_prefill_launched([req])
                         if discard_finish_reason is None:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
@@ -600,7 +597,6 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    self.leave_running_and_prefill_launched([req])
                     self.request_retirer.release(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
@@ -619,7 +615,6 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        self.leave_running_and_prefill_launched([req])
                         self.request_retirer.release(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
@@ -970,7 +965,7 @@ class SchedulerBatchResultProcessor:
         # barrier; otherwise advance now. advance_grammar_fsm self-gates on per-req
         # grammar (the queued batch.copy() does not carry has_grammar) and consumes
         # result.grammar_retained_tokens below instead of re-advancing.
-        self.advance_grammar_fsm(result, batch, still_in_batch_rows)
+        self.advance_grammar_fsm(result, batch)
 
         predict_tokens = []
         for i, req in enumerate(batch.reqs):
@@ -1043,10 +1038,7 @@ class SchedulerBatchResultProcessor:
         return retained
 
     def advance_grammar_fsm(
-        self,
-        result: GenerationBatchResult,
-        batch: ScheduleBatch,
-        still_in_batch_rows: Optional[List[bool]] = None,
+        self, result: GenerationBatchResult, batch: ScheduleBatch
     ) -> None:
         """Advance each req's grammar FSM over the tokens THIS batch committed, and
         (for decode) memoize the grammar-truncated run on ``result``.
@@ -1059,17 +1051,15 @@ class SchedulerBatchResultProcessor:
         prefilled token) results, so the barrier can resolve whatever the previous
         batch was — e.g. the extend->decode boundary.
 
-        ``still_in_batch_rows`` marks the rows still in the batch. The grammar barrier runs
-        during ``run_batch``, before the step is processed, so it passes none and
-        the rows are checked here.
+        It checks the rows still in the batch itself: the grammar barrier calls it
+        during ``run_batch``, before the step is processed.
         """
         if result.grammar_advanced or not batch.has_grammar:
             return
-        if still_in_batch_rows is None:
-            still_in_batch_rows = self._rows_still_in_batch(batch)
         is_decode = batch.forward_mode.is_decode()
         if not (is_decode or batch.forward_mode.is_extend()):
             return
+        still_in_batch_rows = self._rows_still_in_batch(batch)
         if result.copy_done is not None:
             result.copy_done.synchronize()
         next_token_ids = result.next_token_ids.tolist()
@@ -1528,7 +1518,6 @@ class SchedulerBatchResultProcessor:
 
     def _handle_sampling_mask_abort(self, req: Req) -> None:
         """Release a request whose sampled token must not be committed."""
-        self.leave_running_and_prefill_launched([req])
         if req.multimodal_inputs is not None and req.session is None:
             req.multimodal_inputs.release_features()
         if get_disagg().disaggregation_decode_enable_offload_kvcache:
@@ -1594,7 +1583,6 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.offload_kv_cache(req)
 
         if req.finished():
-            self.leave_running_and_prefill_launched([req])
             if not self._mamba_can_cache_finished_req(req, result, i):
                 req.skip_radix_cache_insert = True
 
