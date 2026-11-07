@@ -1,4 +1,6 @@
+import gc
 import unittest
+import weakref
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -6,6 +8,10 @@ from unittest.mock import Mock, patch
 import torch
 
 import sglang.srt.model_loader.loader as loader_mod
+from sglang.srt.model_loader.batched_expert_loader import (
+    _ExpertParameterLoader,
+    _restore_parameter_loaders,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -14,6 +20,25 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDefaultModelLoader(CustomTestCase):
+    def test_staging_releases_replaced_parameters(self):
+        """Retaining staging wrappers during packing doubled GPU weight residency."""
+
+        class Layer(torch.nn.Module):
+            def weight_loader(self, *args):
+                pass
+
+        layer = Layer()
+        layer.weight = torch.nn.Parameter(torch.zeros(2, 4, 4), requires_grad=False)
+        layer.weight.weight_loader = layer.weight_loader
+        old_weight = weakref.ref(layer.weight)
+        loaders = [_ExpertParameterLoader(layer, "w2_weight", layer.weight, None)]
+        layer.weight.weight_loader = loaders[0]
+
+        _restore_parameter_loaders(loaders)
+        layer.weight = torch.nn.Parameter(torch.ones(2, 4, 4), requires_grad=False)
+        gc.collect()
+        self.assertIsNone(old_weight())
+
     def test_load_weights_only_precedes_postprocessing(self):
         events = []
         model = Mock()
