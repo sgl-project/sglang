@@ -150,11 +150,11 @@ class FullTopKIndexer:
                 topk_page_transform(
                     d.scores,
                     inputs.indexer.index_topk,
-                    page_table=metadata.page_table[rows],
+                    page_table=metadata.page_table[rows][: d.bs],
                     page_size=metadata.compressed_page_size,
                     end=d.lens.to(torch.int32),
                     sorted_index=False,
-                    output_idx=chunk.out_page_indices,
+                    output_idx=chunk.out_page_indices[: d.bs],
                 )
             else:
                 select_decode(chunk, d, inputs.indexer.index_topk)

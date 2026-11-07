@@ -531,7 +531,7 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     has_candidate_mask: bool
 
 
-def decode_input_chunks(inputs: DecodeInputs):
+def decode_input_chunks(inputs: DecodeInputs) -> Iterator[tuple[slice, DecodeInputs]]:
     """Slice Hopper score rows using only graph-stable shapes."""
     num_rows = inputs.positions.numel()
     budget = envs.SGLANG_DSV41_DECODE_SCORE_BUDGET_MIB.get()
