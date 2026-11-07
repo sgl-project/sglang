@@ -338,78 +338,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     draft_cell_size_per_token=_dflash_draft_cell_size(kvc) or None,
                 )
 
-        self._fixed_overhead_bytes += self._npu_kpool_fixed_bytes(kvc, num_layers)
-
-    @staticmethod
-    def _npu_kpool_fixed_bytes(kvc: KVCacheConfigurator, num_layers: int) -> int:
-        config = kvc.model_config.hf_config
-        if not (
-            _is_npu
-            and mambaish_config(kvc.model_config) is not None
-            and get_dsa_index_kpool(config) > 1
-            and get_dsa_index_kpool_compress(config)
-        ):
-            return 0
-        schedule = get_schedule()
-        requested = schedule.max_running_requests
-        # The default request resolver is capped at 4096. Reserve an upper
-        # bound before token sizing, avoiding a circular request/token solve.
-        slots = max(1, requested // kvc.attn_dp_size) if requested is not None else 4096
-        disagg = get_disagg()
-        if disagg.disaggregation_mode == "decode" or disagg.enable_pd_role_switch:
-            slots += disagg.disaggregation_decode_extra_slots or 0
-        slots += 2  # request-pool sentinel, then tail-buffer sentinel
-        ratio = get_dsa_index_kpool(config)
-        width = get_dsa_index_head_dim(config)
-        active_layers = sum(
-            not dsa_layer_skips_topk(config, layer)
-            for layer in _get_dsa_cache_layer_ids(kvc, num_layers)
-        )
-        draft_layers = 0
-        if not kvc.is_draft_worker and (
-            kvc.spec_algorithm.is_eagle() or kvc.spec_algorithm.is_standalone()
-        ):
-            draft_layers = int(kvc.spec_aux_config.eagle_draft_num_layers or 1)
-        tail_bytes = (
-            (active_layers + draft_layers)
-            * slots
-            * (ratio + (max_speculative_num_draft_tokens() or 0))
-            * width
-            * 2
-            * 2  # separate BF16 K and Gate rings
-        )
-        from sglang.srt.hardware_backend.npu.attention.ascend_kpool import (
-            AscendKPoolWorkspace,
-        )
-
-        # Metadata/state is shared by layers, but not by capture buckets or
-        # speculative backends. Account for the target and draft workers here,
-        # just as for the persistent rings above.
-        graph = get_exec().graph.cuda_graph_config
-        decode = graph.decode if graph is not None else None
-        buckets = []
-        if decode is not None and decode.backend != "disabled":
-            configured = decode.bs or [decode.max_bs or slots]
-            buckets = sorted({min(slots, bs) for bs in configured if bs > 0})
-        draft_tokens = max_speculative_num_draft_tokens() or 1
-        workspace = sum(
-            AscendKPoolWorkspace.estimate_bytes(bs, bs * draft_tokens, ratio, width)
-            for bs in buckets
-        )
-        # One eager forward can coexist with the captured buffers.
-        prefill_tokens = schedule.chunked_prefill_size or schedule.max_prefill_tokens
-        workspace += AscendKPoolWorkspace.estimate_bytes(
-            slots, max(prefill_tokens or 0, slots * draft_tokens), ratio, width
-        )
-        if draft_layers:
-            workspace *= 2 + (get_spec().speculative_num_steps or 1)
-        # One reserved logical KV page and index page per allocated layer.
-        kv_width = kvc.model_config.kv_lora_rank + kvc.model_config.qk_rope_head_dim
-        padding_bytes = (num_layers + draft_layers) * (
-            schedule.page_size * kv_width * 2 + schedule.page_size // ratio * width * 2
-        )
-        return tail_bytes + padding_bytes + workspace
-
     def _compute_cell_size(self, kvc: KVCacheConfigurator, num_layers: int) -> int:
         """Compute per-token KV cache cost in bytes."""
         # args to config cell size
@@ -649,12 +577,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                ratio = (
-                    get_dsa_index_kpool(kvc.model_config.hf_config)
+                indexer_size_per_token = (
+                    ceil_div(
+                        index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
+                    )
                     if get_dsa_index_kpool_compress(kvc.model_config.hf_config)
-                    else 1
+                    else index_head_dim
                 )
-                indexer_size_per_token = ceil_div(index_head_dim, ratio)
                 element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1
@@ -669,12 +598,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
         if (
             allocate_all_layers
-            or (
-                _is_npu
-                and mambaish_config(kvc.model_config) is not None
-                and get_dsa_index_kpool_compress(kvc.model_config.hf_config)
-                and get_dsa_index_kpool(kvc.model_config.hf_config) > 1
-            )
             or kvc.server_args.enable_hisparse
             or not _should_elide_dsa_index_k(is_draft_worker=kvc.is_draft_worker)
         ):

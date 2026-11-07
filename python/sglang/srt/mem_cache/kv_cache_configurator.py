@@ -2486,7 +2486,9 @@ class KVCacheConfigurator:
                     ),
                     skip_topk_layers=(
                         None
-                        if self.is_draft_worker
+                        if not _should_elide_dsa_index_k(
+                            is_draft_worker=self.is_draft_worker
+                        )
                         else [
                             dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                             for layer_id in full_attention_layer_ids

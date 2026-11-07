@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import prod
 from typing import Literal
 
 import torch
@@ -114,20 +113,6 @@ class AscendKPoolWorkspace:
     @property
     def batch_size(self) -> int:
         return self.req_pool_indices.numel()
-
-    @classmethod
-    def estimate_bytes(cls, batch: int, tokens: int, ratio: int, width: int) -> int:
-        """Conservative buffer/adapter bound; CANN workspace is profiled separately."""
-        specs = cls._buffer_specs(
-            batch, tokens, ratio, width, max(ratio, tokens // max(batch, 1)), tokens
-        )
-        buffers = sum(
-            prod(shape) * torch._utils._element_size(dtype)
-            for shape, dtype in specs.values()
-        )
-        temporary = batch * ratio * (width * 8 + 17) + tokens * width * 32
-        temporary += batch * ((tokens + ratio - 1) // ratio) * 96
-        return buffers + temporary
 
     def update_inputs(
         self,
