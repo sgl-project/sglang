@@ -120,6 +120,7 @@ class RequestFuncOutput:
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
+    prompt_len_source: str = "dataset"
 
     @staticmethod
     def init_new(request_func_input: RequestFuncInput):
@@ -271,19 +272,30 @@ def _record_server_prompt_len(data, output):
     summing ``prompt_len`` across outputs counts one number once per round
     rather than adding up each request's own prompt.
 
-    Two consumers divide by that sum: the ``--cache-report`` hit rate, and
-    ``input_lens`` in the JSON output.
+    Text-only single-turn input throughput, the ``--cache-report`` hit rate, and
+    ``input_lens`` in the JSON output use the recorded lengths.
+    Multimodal summaries keep dataset totals and modality estimates together.
 
     The server reports the real figure as ``usage.prompt_tokens`` on the
     OpenAI-compatible routes and ``meta_info.prompt_tokens`` on the native one.
-    It is the same quantity for a single-turn row, so preferring it needs no
-    per-dataset branch, and leaving the seeded value in place when the server
-    reports nothing keeps behaviour unchanged for any backend that does not.
+    It may differ from the dataset estimate after preprocessing or truncation.
+    Leaving the seeded value in place when usage is absent preserves the
+    fallback for backends that do not report prompt counts.
     """
     reported = data.get("usage") or data.get("meta_info") or {}
     prompt_tokens = reported.get("prompt_tokens")
-    if prompt_tokens:
+    if prompt_tokens is not None:
         output.prompt_len = prompt_tokens
+        output.prompt_len_source = "server"
+
+
+def _request_stream_usage(payload: Dict[str, Any]) -> None:
+    """Request streamed usage unless the caller explicitly opts out."""
+    if payload.get("stream"):
+        payload["stream_options"] = {
+            "include_usage": True,
+            **(payload.get("stream_options") or {}),
+        }
 
 
 # set ignore_eos True by default
@@ -321,6 +333,7 @@ async def async_request_openai_completions(
 
         # Merge in extra parameters - these will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        _request_stream_usage(payload)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -359,6 +372,9 @@ async def async_request_openai_completions(
                         else:
                             data = json.loads(chunk)
                             _record_server_prompt_len(data, output)
+                            output_len = (data.get("usage") or {}).get(
+                                "completion_tokens", output_len
+                            )
 
                             if getattr(args, "cache_report", False):
                                 _extract_cache_from_sglext(data, output)
@@ -366,7 +382,7 @@ async def async_request_openai_completions(
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
                             # want to check a token was generated
-                            if data["choices"][0]["text"]:
+                            if data["choices"] and data["choices"][0]["text"]:
                                 timestamp = time.perf_counter()
                                 # First token
                                 if ttft == 0.0:
@@ -382,9 +398,6 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += data["choices"][0]["text"]
-                                output_len = (data.get("usage") or {}).get(
-                                    "completion_tokens", output_len
-                                )
 
                     output.generated_text = generated_text
                     output.success = True
@@ -480,6 +493,7 @@ async def async_request_openai_chat_completions(
         # Merge in extra parameters (tools, temperature, top_p, etc.)
         # These will override defaults if present
         payload.update(request_func_input.extra_request_body)
+        _request_stream_usage(payload)
 
         # hack to accommodate different LoRA conventions between SGLang and vLLM.
         if request_func_input.lora_name:
@@ -759,7 +773,26 @@ async def async_request_sglang_generate(
                         else:
                             data = orjson.loads(sse_data)
 
+                            if "error" in data:
+                                error = data["error"]
+                                if isinstance(error, dict):
+                                    error = error.get("message") or error
+                                output.error = str(error or "Server returned an error")
+                                break
+
                             _meta_info = data.get("meta_info") or {}
+                            finish_reason = _meta_info.get("finish_reason")
+                            if (
+                                isinstance(finish_reason, dict)
+                                and finish_reason.get("type") == "abort"
+                            ):
+                                output.error = str(
+                                    finish_reason.get("message") or "Request aborted"
+                                )
+                                break
+                            completion_tokens = _meta_info.get("completion_tokens")
+                            if completion_tokens is not None:
+                                output_len = completion_tokens
                             if _meta_info.get("spec_accept_length") is not None:
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
@@ -778,20 +811,20 @@ async def async_request_sglang_generate(
                                 )
 
                             if "text" in data and data["text"]:
-                                timestamp = time.perf_counter()
                                 generated_text = data["text"]
-                                output_len = data["meta_info"]["completion_tokens"]
 
-                                # First token
+                            if (
+                                completion_tokens is not None
+                                and output_len > last_output_len
+                            ):
+                                timestamp = time.perf_counter()
+                                num_new_tokens = output_len - last_output_len
                                 if ttft == 0.0:
-                                    ttft = time.perf_counter() - st
+                                    ttft = timestamp - st
                                     output.ttft = ttft
-
-                                # Decoding phase
+                                    # Tokens in the first chunk share its arrival time.
+                                    output.itl.extend([0.0] * (num_new_tokens - 1))
                                 else:
-                                    num_new_tokens = output_len - last_output_len
-                                    if num_new_tokens == 0:
-                                        continue
                                     chunk_gap = timestamp - most_recent_timestamp
                                     adjust_itl = chunk_gap / num_new_tokens
                                     output.itl.extend([adjust_itl] * num_new_tokens)
@@ -800,9 +833,9 @@ async def async_request_sglang_generate(
                                 last_output_len = output_len
 
                     output.generated_text = generated_text
-                    output.success = True
+                    output.success = not output.error
                     output.latency = latency
-                    output.output_len = output_len
+                    output.output_len = output_len if output.success else 0
                 else:
                     output.error = (
                         (response.reason or "") + ": " + (await response.text())
@@ -1087,6 +1120,8 @@ class BenchmarkMetrics:
     concurrency: float
     max_output_tokens_per_s: float = 0.0
     max_concurrent_requests: int = 0
+    input_token_count_source: str = "unavailable"
+    input_token_count_sources: List[Optional[str]] = field(default_factory=list)
 
 
 async def get_request(
@@ -1143,6 +1178,7 @@ def calculate_metrics(
     total_input = 0
     total_input_text = 0
     total_input_vision = 0
+    input_token_count_sources: List[Optional[str]] = [None] * len(outputs)
     completed = 0
     itls: List[float] = []
     tpots: List[float] = []
@@ -1165,8 +1201,16 @@ def calculate_metrics(
             )
             retokenized_output_lens.append(retokenized_output_len)
             if input_requests is not None:
-                total_input += input_requests[i].prompt_len
-                total_input_text += input_requests[i].text_prompt_len
+                if input_requests[i].vision_prompt_len:
+                    # Keep the multimodal total and breakdown on one source:
+                    # aggregate server usage cannot recover the modality split.
+                    total_input += input_requests[i].prompt_len
+                    total_input_text += input_requests[i].text_prompt_len
+                    input_token_count_sources[i] = "dataset"
+                else:
+                    total_input += outputs[i].prompt_len
+                    total_input_text += outputs[i].prompt_len
+                    input_token_count_sources[i] = outputs[i].prompt_len_source
                 total_input_vision += input_requests[i].vision_prompt_len
             if output_len > 1:
                 tpots.append((outputs[i].latency - outputs[i].ttft) / (output_len - 1))
@@ -1262,11 +1306,20 @@ def calculate_metrics(
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
     itls = retokenized_itls if use_retokenized_itl else itls
+    input_sources = {
+        source for source in input_token_count_sources if source is not None
+    }
     metrics = BenchmarkMetrics(
         completed=completed,
         total_input=total_input,
         total_input_text=total_input_text,
         total_input_vision=total_input_vision,
+        input_token_count_source=(
+            "mixed"
+            if len(input_sources) > 1
+            else next(iter(input_sources), "unavailable")
+        ),
+        input_token_count_sources=input_token_count_sources,
         total_output=sum(output_lens),
         total_output_retokenized=sum(retokenized_output_lens),
         request_throughput=completed / dur_s,
@@ -1694,6 +1747,11 @@ async def benchmark(
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
+    print(
+        "{:<40} {:<10}".format(
+            "Input token count source:", metrics.input_token_count_source
+        )
+    )
     print("{:<40} {:<10}".format("Total input text tokens:", metrics.total_input_text))
     if args.dataset_name in ["image", "mmmu"]:
         print(
@@ -1869,6 +1927,7 @@ async def benchmark(
             "duration": benchmark_duration,
             "completed": metrics.completed,
             "total_input_tokens": metrics.total_input,
+            "input_token_count_source": metrics.input_token_count_source,
             "total_input_text_tokens": metrics.total_input_text,
             "total_input_vision_tokens": metrics.total_input_vision,
             "total_output_tokens": metrics.total_output,
@@ -1944,6 +2003,8 @@ async def benchmark(
 
     result_details = {
         "input_lens": [output.prompt_len for output in outputs],
+        "input_len_sources": [output.prompt_len_source for output in outputs],
+        "input_token_count_sources": metrics.input_token_count_sources,
         "output_lens": output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
