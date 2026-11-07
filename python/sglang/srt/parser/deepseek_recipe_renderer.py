@@ -147,11 +147,13 @@ class DeepSeekRecipe:
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
         raises ValueError. `image_urls` receives the images in placeholder order,
-        `parse_start` the stage recipe reports this prompt ends in."""
+        `parse_start` the stage recipe reports for it, None without `thinking` and
+        after a `task`, whose tail this appends past recipe's report."""
         converted = self._convert(body, effort_budget=effort_budget)
         conversation = converted.conversation
         prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
         if parse_start is not None:
+            # recipe reports None without thinking; pin that rather than rely on it.
             parse_start.append(
                 converted.parsing_options.thinking_initial_stage
                 if body["thinking"]

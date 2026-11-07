@@ -622,6 +622,15 @@ class TestHandlerRequestSemantics(CustomTestCase):
             ("Still thinking.", {"separate_reasoning": False}),
             ("Still thinking.", {"input_ids": client_prompt}),
             ("Still thinking.", {"chat_template_kwargs": nonempty}),
+            # recipe reports a reasoning start for a continued empty first turn,
+            # but renders `</think>`, so the prompt has no reasoning to close.
+            (
+                "Still thinking.",
+                {
+                    "messages": [{"role": "assistant", "content": ""}],
+                    "continue_final_message": True,
+                },
+            ),
         ):
             with self.subTest(fields=fields):
                 reasoning, content, _ = self._parse(chat, text, **(thinking | fields))
@@ -645,17 +654,6 @@ class TestHandlerRequestSemantics(CustomTestCase):
         reasoning, content, _ = chatml._encoding_output().parse_responses_output(
             request=request,
             require_reasoning=processed.require_reasoning,
-            output_ids=output_ids,
-            finish_reason={"type": "stop", "matched": eos},
-            separate_reasoning=True,
-            parse_tool_calls=False,
-        )
-        self.assertEqual((reasoning, content), ("Still thinking.", ""))
-        # Nor Responses output whose reasoning the request did not ask for: a
-        # template toggle requires it, and then the prompt already closed it.
-        reasoning, content, _ = chat._encoding_output().parse_responses_output(
-            request=ResponsesRequest(input="hi"),
-            require_reasoning=True,
             output_ids=output_ids,
             finish_reason={"type": "stop", "matched": eos},
             separate_reasoning=True,
@@ -730,6 +728,35 @@ class TestHandlerRequestSemantics(CustomTestCase):
             ):
                 reasoning, content, _ = self._parse(server, '{"a": 1}')
                 self.assertEqual((reasoning or "") + content, '{"a": 1}')
+        # Responses renders with the env default while require_reasoning stays
+        # false, so its prompt opens reasoning the grammar can never close.
+        import asyncio
+
+        from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
+
+        responses = _serving(self, self.tokenizer, responses=True)
+        eos = self._token("<｜end▁of▁sentence｜>")
+        output_ids = self.tokenizer.encode('{"a": 1}', add_special_tokens=False)
+        output_ids.append(eos)
+        with envs.SGLANG_DEFAULT_THINKING.override(True):
+            request = ResponsesRequest(
+                model="dummy",
+                input="json?",
+                text={"format": {"type": "json_object"}},
+            )
+            *_, processed = asyncio.run(
+                responses._make_request(request, None, self.tokenizer)
+            )
+            self.assertFalse(processed.require_reasoning)
+            reasoning, content, _ = responses._encoding_output().parse_responses_output(
+                request=request,
+                require_reasoning=processed.require_reasoning,
+                output_ids=output_ids,
+                finish_reason={"type": "stop", "matched": eos},
+                separate_reasoning=True,
+                parse_tool_calls=False,
+            )
+            self.assertEqual((reasoning or "") + content, '{"a": 1}')
 
     def test_unconstrained_output_under_default_thinking_fails(self):
         """Under SGLANG_DEFAULT_THINKING alone, an output is checked without a grammar,

@@ -46,7 +46,9 @@ if TYPE_CHECKING:
 
 
 class RecipePrompt(msgspec.Struct, frozen=True):
-    """What recipe reports about a prompt it rendered, recorded on the request."""
+    """A prompt recipe rendered, as the output parser needs it: the stage recipe
+    reports parsing begins in, and whether the prompt's own last thinking
+    delimiter left reasoning open."""
 
     parse_start: Any
     reasoning_open: bool
@@ -358,9 +360,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
-        # Only recipe's own prompt reports where parsing begins and whether it
-        # left reasoning open, so only its output is checked; a client's input_ids,
-        # a conversation template and a task keep main's start and go unchecked.
+        # Only the renderer of a prompt reports where its output begins, so only
+        # recipe's own prompts are checked; a client's input_ids, a conversation
+        # template and a task record nothing and keep the request's own start.
         recipe_prompt = request._recipe_prompt
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
@@ -405,7 +407,10 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
-        recipe_prompt = request._recipe_prompt
+        # Responses renders its prompt with `thinking_requested`, which follows
+        # SGLANG_DEFAULT_THINKING, while require_reasoning does not (#45614): the
+        # grammar then applies from the first token, so keep main's start.
+        recipe_prompt = request._recipe_prompt if require_reasoning else None
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=(
@@ -480,7 +485,8 @@ def _recipe_reports_start(request: ChatCompletionRequest) -> bool:
 def _requested_continuation(
     request: ChatCompletionRequest,
 ) -> Optional[dict[str, Any]]:
-    """The turn a prompt not of recipe's continues, from the request's fields."""
+    """The turn SGLang continues, from the request's fields alone, for a prompt
+    recipe did not report on."""
     if not request.continue_final_message:
         return None
     return _trailing_assistant_turn(

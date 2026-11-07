@@ -921,8 +921,8 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
-    # What the prompt's renderer reports: where parsing begins and whether the
-    # prompt leaves reasoning open; None when recipe did not render it.
+    # Where recipe reports parsing begins in the prompt it rendered, with
+    # whether that prompt left reasoning open; None when recipe did not render it.
     _recipe_prompt: Any = PrivateAttr(default=None)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
