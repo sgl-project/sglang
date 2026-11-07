@@ -1,5 +1,9 @@
+import copy
+import importlib.util
+import json
 import logging
 import os
+import pathlib
 import re
 import signal
 import socket
@@ -301,6 +305,68 @@ def set_environment_variables(env_vars):
     return env_vars
 
 
+# Mooncake + TENT + MemFabric KV transfer config. With ``metadata_type``
+# ``p2p`` every node runs its own metadata RPC server and must advertise its
+# own IP, so ``rpc_server_hostname`` is filled per node from ``POD_IP``.
+MEMFABRIC_TENT_CONF_TEMPLATE = {
+    "metadata_type": "p2p",
+    "rpc_server_hostname": "",
+    "rpc_server_port": 0,
+    "log_level": "info",
+    "transports": {
+        "memfabric": {"enable": True},
+        "ascend_direct": {"enable": False},
+        "rdma": {"enable": False},
+        "tcp": {"enable": False},
+        "shm": {"enable": False},
+        "gds": {"enable": False},
+        "hp_tcp": {"enable": False},
+        "fabric": {"enable": False},
+        "mnnvl": {"enable": False},
+        "nvlink": {"enable": False},
+    },
+    "policy": [
+        {
+            "name": "default_memory",
+            "segment_type": "memory",
+            "transports": ["memfabric"],
+        }
+    ],
+}
+
+
+def write_memfabric_tent_conf(path="/tmp/memfabric_tent.json"):
+    """Write the Mooncake TENT/MemFabric config for the current node.
+
+    The IP is taken from ``POD_IP`` so the same test works on every node of a
+    multi-node PD deployment without manually editing the file per node.
+
+    Returns:
+        str: Path of the generated config file.
+    """
+    conf = copy.deepcopy(MEMFABRIC_TENT_CONF_TEMPLATE)
+    conf["rpc_server_hostname"] = get_host_ip()
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(conf, f, indent=2)
+    logger.info(f"Wrote memfabric tent config to {path}: {conf}")
+    return path
+
+
+def get_mooncake_ld_library_path():
+    """Build LD_LIBRARY_PATH for Mooncake/MemFabric shared libraries."""
+    paths = []
+    for module_name, lib_subdir in (("memfabric_hybrid", "lib"), ("mooncake", None)):
+        spec = importlib.util.find_spec(module_name)
+        if spec is None or spec.origin is None:
+            continue
+        pkg_dir = pathlib.Path(spec.origin).parent
+        paths.append(str(pkg_dir / lib_subdir) if lib_subdir else str(pkg_dir))
+    existing = os.environ.get("LD_LIBRARY_PATH")
+    if existing:
+        paths.append(existing)
+    return ":".join(paths)
+
+
 def check_port_availability(host, port, timeout=3):
     """Check if the port is available.
 
@@ -383,11 +449,16 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
     return False
 
 
-def _get_nnodes_from_args(args_list):
+def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
-        if arg == "--nnodes" and i + 1 < len(args_list):
-            return int(args_list[i + 1])
+        if arg == name and i + 1 < len(args_list):
+            return args_list[i + 1]
     return None
+
+
+def _get_nnodes_from_args(args_list):
+    nnodes = _get_arg_value(args_list, "--nnodes")
+    return int(nnodes) if nnodes is not None else None
 
 
 def _get_pod_ip_by_keyword(configmap_data, keyword):
@@ -554,9 +625,27 @@ def launch_pd_separation_node(model_config):
     # Generate prefill/decode run command
     service_args = list()
 
-    mf_addr = f"tcp://{master_prefill_ip}:24666"
-    os.environ["ASCEND_MF_STORE_URL"] = mf_addr
-    logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    # ASCEND_MF_STORE_URL belongs to the Ascend memfabric transfer path. Other
+    # backends (e.g. mooncake with TENT) configure their metadata through their
+    # own config (MC_TENT_CONF), so the legacy store URL must not leak into the
+    # launched process.
+    role_args = (
+        model_config["prefill_args"]
+        if role == "prefill"
+        else model_config["decode_args"]
+    )
+    transfer_backend = _get_arg_value(
+        role_args, "--disaggregation-transfer-backend"
+    )
+    if transfer_backend in (None, "ascend"):
+        mf_addr = f"tcp://{master_prefill_ip}:24666"
+        os.environ["ASCEND_MF_STORE_URL"] = mf_addr
+        logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
+    else:
+        os.environ.pop("ASCEND_MF_STORE_URL", None)
+        logger.info(
+            f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}"
+        )
 
     if role == "prefill":
         # Current node is prefill

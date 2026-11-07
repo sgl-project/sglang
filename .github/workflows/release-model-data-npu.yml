@@ -1,0 +1,145 @@
+# Key-model performance/accuracy data collection for NPU releases.
+#
+# Runs a curated matrix of multi-node PD cases through the same reusable
+# workflow as the nightly, so metrics land in the versioned shared-disk layout
+# (/root/.cache/tests/output/...) consumed by the data dashboard, and are also
+# uploaded as workflow artifacts for direct download.
+#
+# To add a model/case, append an entry to the `collect` matrix below. Each entry
+# is one test case; both `perf` and `accuracy` cases are supported. Prefer one
+# entry per (model, test_type) so the artifact name stays unique.
+name: Release Model Data (NPU)
+
+on:
+  # TEMPORARY: run the pipeline on PRs that touch it, for validation.
+  # Remove this trigger before merging.
+  pull_request:
+    paths:
+      - ".github/workflows/release-model-data-npu.yml"
+      - ".github/workflows/nightly-test-npu-e2e-multi-node.yml"
+      - "scripts/ci/utils/collect_npu_release_data.py"
+      - "test/registered/npu/accuracy/glm5_3/**"
+      - "python/sglang/test/ascend/e2e/**"
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'NPU image used by the prefill/decode pods.'
+        required: false
+        type: string
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B010'
+      install_sglang_from_source:
+        description: 'Install sglang from the checked-out source inside the pods.'
+        required: false
+        type: boolean
+        default: false
+      transformers_version:
+        description: 'Optional transformers version for the test pods (empty keeps the image default).'
+        required: false
+        type: string
+        default: ''
+
+concurrency:
+  group: npu-release-model-data-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  metadata:
+    name: build-run-metadata
+    runs-on: ubuntu-latest
+    outputs:
+      run_start_metadata: ${{ steps.meta.outputs.run_start_metadata }}
+    steps:
+      - name: Build run metadata
+        id: meta
+        run: |
+          BRANCH_LABEL="${{ github.ref_name }}"
+          BRANCH_LABEL="$(echo "${BRANCH_LABEL}" | tr -cd 'a-zA-Z0-9._/:' | tr '/:' '--')"
+          # Same {branch_label, workflow_name, create_time} layout as the nightly
+          # pipeline, so release data shares the dashboard's directory scheme.
+          RUN_START_METADATA="$(python3 -c "import json,sys; print(json.dumps({'branch_label':sys.argv[1],'workflow_name':sys.argv[2],'create_time':sys.argv[3]}))" "$BRANCH_LABEL" "${{ github.workflow }}" "$(date -u -d '+8 hours' +%Y%m%d-%H%M)")"
+          echo "run_start_metadata=${RUN_START_METADATA}" | tee -a $GITHUB_OUTPUT
+
+  collect:
+    name: ${{ matrix.name }}
+    needs: [metadata]
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          # GLM-5.3-w8a8: one prefill instance (2 nodes) + one decode instance
+          # (2 nodes), mooncake + TENT transport, GPQA accuracy.
+          - name: glm_5_3_w8a8_1p1d_32p_mooncake_gpqa
+            test_type: accuracy
+            prefill_decode_deployment: separation
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/glm5_3/test_npu_glm_5_3_w8a8_1p1d_32p_mooncake_gpqa.py
+            # The current image lacks the mooncake + TENT transfer stack; drop
+            # this once docker/npu.Dockerfile ships it.
+            container_patches: mooncake_memfabric_1.3.1
+          # Add performance / more key models here, e.g.:
+          # - name: <model>_w8a8_1p1d_32p_in1k_out1k
+          #   test_type: perf
+          #   prefill_decode_deployment: separation
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/performance/<model>/<case>.py
+    uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
+    with:
+      runner: linux-amd64-cpu-4
+      test_type: ${{ matrix.test_type }}
+      test_config_name: ${{ matrix.name }}
+      prefill_size: ${{ matrix.prefill_size }}
+      decode_size: ${{ matrix.decode_size }}
+      router_size: ${{ matrix.router_size }}
+      test_case: ${{ matrix.test_case }}
+      # PR-triggered runs have no inputs; fall back to the dispatch defaults.
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B010' }}
+      install_sglang_from_source: ${{ inputs.install_sglang_from_source || true }}
+      prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
+      transformers_version: ${{ inputs.transformers_version || '' }}
+      container_patches: ${{ matrix.container_patches }}
+      run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
+    secrets: inherit
+
+  publish:
+    name: publish-release-data
+    needs: [collect]
+    # Publish whatever was collected even if some case failed; skip on cancel.
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download metrics artifacts
+        # No artifacts exist if every collect job failed before running the
+        # test; the consolidation step reports the empty result in that case.
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: npu-metrics-*
+          path: release-data
+
+      - name: Consolidate release data
+        run: |
+          python3 scripts/ci/utils/collect_npu_release_data.py \
+            --input-dir release-data \
+            --output-json release-data.json \
+            --output-markdown release-data.md \
+            --run-id "${{ github.run_id }}" \
+            --commit-sha "${{ github.sha }}" \
+            --branch "${{ github.ref_name }}"
+          cat release-data.md >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload release data
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-release-data-${{ github.run_id }}
+          path: |
+            release-data.json
+            release-data.md
+          retention-days: 90

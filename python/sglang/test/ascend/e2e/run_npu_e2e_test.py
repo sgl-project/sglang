@@ -688,6 +688,7 @@ def run_npu_e2e_test_case(
                 "prefill_size": resource_info["prefill_size"],
                 "decode_size": resource_info["decode_size"],
                 "router_size": resource_info["router_size"],
+                "container_patches": args.container_patches,
                 "sglang_source_relative_path": sglang_source_relative_path,
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
@@ -896,6 +897,14 @@ if __name__ == "__main__":
         required=False,
         default="",
         help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
+    )
+
+    parser.add_argument(
+        "--container-patches",
+        type=str,
+        required=False,
+        default="",
+        help="Comma separated container patch sets applied inside every pod before the test. Empty keeps the image untouched.",
     )
 
     args = parser.parse_args()

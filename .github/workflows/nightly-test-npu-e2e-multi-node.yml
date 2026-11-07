@@ -64,6 +64,11 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      container_patches:
+        required: false
+        type: string
+        default: ""
+        description: "Comma separated container patch sets under python/sglang/test/ascend/e2e/container_patches. Empty keeps the image untouched."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -194,6 +199,12 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
+          container_patches="${{ inputs.container_patches }}"
+          if [ "$container_patches" != "" ]; then
+            echo "Container patches: ${container_patches}"
+            CMD="${CMD} --container-patches ${container_patches}"
+          fi
+
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
               --prefill-size ${{ inputs.prefill_size }} \
@@ -229,6 +240,16 @@ jobs:
 
           echo "Run command: ${CMD}"
           eval "${CMD}"
+
+      - name: Upload metrics artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: npu-metrics-${{ inputs.test_config_name }}
+          # output/<branch>-<create_time>-<run_id>-<run_attempt>/<workflow>/<test_type>/<case>
+          path: /root/.cache/tests/output/*-${{ github.run_id }}-${{ github.run_attempt }}/*/${{ inputs.test_type }}/*
+          if-no-files-found: ignore
+          retention-days: 90
 
       - name: Post process
         if: always()
