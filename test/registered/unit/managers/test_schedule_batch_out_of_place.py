@@ -387,7 +387,8 @@ class TestMixWithRunningOutOfPlace(unittest.TestCase):
         self.assertEqual(extend_batch.prefix_lens, [0, 0, 5])
         self.assertEqual(extend_batch.extend_lens, [3, 3, 1])
         self.assertEqual(extend_batch.extend_num_tokens, 7)
-        self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 0])
+        # The decode tail returns no input logprobs: it starts at its extend length.
+        self.assertEqual(extend_batch.extend_logprob_start_lens, [0, 0, 1])
         self.assertFalse(extend_batch.is_prefill_only)
         self.assertIsNot(extend_batch.prefix_lens, extend_prefix_before)
         self.assertIsNot(extend_batch.extend_lens, extend_lens_before)

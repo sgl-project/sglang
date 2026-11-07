@@ -2821,9 +2821,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.prefix_lens = self.prefix_lens + running_prefix_lens
         self.extend_lens = self.extend_lens + [1] * running_bs
         self.extend_num_tokens = self.extend_num_tokens + running_bs
-        # TODO (lianmin): Revisit this. It should be seq_len - 1
+        # A decode row's input token is the previous output token, whose logprob was
+        # returned with it: start its logprobs at its extend length (none).
         self.extend_logprob_start_lens = (
-            self.extend_logprob_start_lens + [0] * running_bs
+            self.extend_logprob_start_lens + [1] * running_bs
         )
         self.is_prefill_only = False
 
