@@ -42,12 +42,13 @@ use crate::{
     protocols::{
         chat::ChatCompletionRequest,
         classify::ClassifyRequest,
+        common::GenerationRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
         generate::GenerateRequest,
         parser::{ParseFunctionCallRequest, SeparateReasoningRequest},
         rerank::V1RerankReqInput,
-        responses::{ResponsesGetParams, ResponsesRequest},
+        responses::ResponsesGetParams,
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
         validated::ValidatedJson,
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
@@ -60,6 +61,7 @@ use crate::{
             get_worker_states, set_global_rate_limit, trigger_graceful_shutdown, update_app_config,
         },
         parse,
+        responses::ResponsesRequestBody,
         router_manager::RouterManager,
         tokenize, RouterTrait,
     },
@@ -218,11 +220,11 @@ async fn v1_rerank(
 async fn v1_responses(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ResponsesRequest>,
+    ValidatedJson(body): ValidatedJson<ResponsesRequestBody>,
 ) -> Response {
     state
         .router
-        .route_responses(Some(&headers), &body, Some(&body.model))
+        .route_responses_raw(Some(&headers), &body, body.get_model())
         .await
 }
 
