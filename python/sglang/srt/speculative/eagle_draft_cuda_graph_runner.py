@@ -213,7 +213,18 @@ class EAGLEDraftCudaGraphRunner(DecodeCudaGraphRunner):
             topk_index = torch.zeros((self.max_bs, self.topk), dtype=torch.int64)
             draft_probs = (
                 torch.zeros(
-                    (self.max_bs, self.model_runner.model_config.vocab_size),
+                    # q stays in the draft vocabulary until verify, so a reduced
+                    # (hot) draft vocabulary makes it narrower than
+                    # model_config.vocab_size. Replay copies the incoming q into
+                    # this buffer, so the widths must match.
+                    (
+                        self.max_bs,
+                        getattr(
+                            self.eagle_worker,
+                            "draft_probs_vocab_size",
+                            self.model_runner.model_config.vocab_size,
+                        ),
+                    ),
                     dtype=torch.float32,
                 )
                 if get_spec().speculative_use_rejection_sampling
