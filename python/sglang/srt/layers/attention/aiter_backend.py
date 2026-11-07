@@ -1354,10 +1354,19 @@ class AiterAttnBackend(AttentionBackend):
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
         q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
-        o = q_u.new_empty(
-            (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
-            dtype=self.input_dtype,
-        )
+        o_shape = (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim)
+        # Under a breakable prefill graph the graph-owned output buffer is handed in here;
+        # writing it directly saves RadixAttention._eager_attention's copy of the result.
+        o = forward_batch._attn_output
+        if (
+            o is None
+            or o.dtype != self.input_dtype
+            or o.numel() != q_u.shape[0] * layer.tp_q_head_num * layer.v_head_dim
+            or not o.is_contiguous()
+        ):
+            o = q_u.new_empty(o_shape, dtype=self.input_dtype)
+        else:
+            o = o.view(o_shape)
         unified_attention(
             q=q_u,
             k=k_cache.view(-1, self.page_size, layer.tp_k_head_num, layer.qk_head_dim),
