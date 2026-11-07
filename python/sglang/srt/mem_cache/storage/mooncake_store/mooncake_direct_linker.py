@@ -177,12 +177,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 if allocation in seen:
                     continue
                 seen.add(allocation)
-                result = self.storage.store.register_buffer(*allocation)
-                if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
-                    )
+                self.storage.register_memory(*allocation)
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)

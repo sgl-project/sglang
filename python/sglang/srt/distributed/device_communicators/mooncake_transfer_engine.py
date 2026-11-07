@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 from sglang.srt.environ import envs
@@ -107,6 +109,142 @@ def get_ib_devices_for_gpu(ib_device_str: Optional[str], gpu_id: int) -> Optiona
     )
 
 
+@dataclass
+class _Registration:
+    length: int
+    users: int
+    remote_accessible: bool
+
+
+class MooncakeMemoryRegistry:
+    """Memory registrations of one Mooncake engine, shared by all of its users.
+
+    Mooncake rejects a registration that overlaps an existing one, even an
+    identical region. Components sharing one engine (PD transfer, the Mooncake
+    store and linker, the encoder) can need the same memory: the linker
+    registers each whole GPU KV allocation while PD transfer registers the
+    same allocation, or per-layer views inside it. A region within an existing
+    registration therefore shares it; each registration counts its users and
+    is unregistered when its last user releases it.
+    """
+
+    def __init__(self, engine):
+        self._engine = engine
+        self._lock = threading.Lock()
+        self._registrations: Dict[int, _Registration] = {}
+
+    def register(self, ptrs: List[int], lengths: List[int]) -> None:
+        """Register remote-accessible regions, sharing registrations that cover them."""
+        if len(set(ptrs)) != len(ptrs):
+            raise ValueError("Duplicate Mooncake memory regions in one registration")
+        with self._lock:
+            covering: List[int] = []
+            new_regions: Dict[int, int] = {}
+            for ptr, length in zip(ptrs, lengths):
+                base = self._find_registration(ptr, length)
+                if base is not None:
+                    covering.append(base)
+                    continue
+                self._check_no_overlap(ptr, length, new_regions)
+                new_regions[ptr] = length
+
+            if new_regions:
+                self._register_memory(list(new_regions), list(new_regions.values()))
+                for ptr, length in new_regions.items():
+                    self._registrations[ptr] = _Registration(
+                        length=length, users=1, remote_accessible=True
+                    )
+            for base in covering:
+                registration = self._registrations[base]
+                if not registration.remote_accessible:
+                    self._grant_remote_access(base, registration)
+                registration.users += 1
+
+    def deregister(self, ptrs: List[int]) -> None:
+        """Release regions, unregistering a registration once its last user releases it."""
+        if len(set(ptrs)) != len(ptrs):
+            raise ValueError("Duplicate Mooncake memory regions in one deregistration")
+        with self._lock:
+            bases = [self._find_registration(ptr, 1) for ptr in ptrs]
+            unknown = [ptr for ptr, base in zip(ptrs, bases) if base is None]
+            if unknown:
+                raise ValueError(
+                    "Mooncake memory regions are not registered: "
+                    + ", ".join(f"{ptr:#x}" for ptr in unknown)
+                )
+            released = []
+            for base in bases:
+                registration = self._registrations[base]
+                registration.users -= 1
+                if registration.users == 0:
+                    released.append(base)
+            if released:
+                self._unregister_memory(released)
+                for base in released:
+                    del self._registrations[base]
+
+    def adopt_store_registration(self, ptr: int, length: int) -> None:
+        """Track a region the Mooncake store registered on this engine.
+
+        The store must register its buffers through its own client, whose
+        records its zero-copy reads depend on, and that registration grants
+        local access only. The store keeps the region for its lifetime.
+        """
+        with self._lock:
+            self._registrations[ptr] = _Registration(
+                length=length, users=1, remote_accessible=False
+            )
+
+    def _find_registration(self, ptr: int, length: int) -> Optional[int]:
+        """Return the base of the registration covering [ptr, ptr + length)."""
+        for base, registration in self._registrations.items():
+            if base <= ptr and ptr + length <= base + registration.length:
+                return base
+        return None
+
+    def _check_no_overlap(
+        self, ptr: int, length: int, new_regions: Dict[int, int]
+    ) -> None:
+        registered = {p: r.length for p, r in self._registrations.items()}
+        for other_ptr, other_length in {**registered, **new_regions}.items():
+            if other_ptr < ptr + length and ptr < other_ptr + other_length:
+                raise ValueError(
+                    f"Mooncake memory region [{ptr:#x}, +{length}) overlaps "
+                    f"registered region [{other_ptr:#x}, +{other_length})"
+                )
+
+    def _grant_remote_access(self, ptr: int, registration: _Registration) -> None:
+        # Mooncake cannot change the access rights of a registered region, so
+        # replace the local-only registration. The store's own record of the
+        # region is independent of the engine registration and stays valid.
+        self._unregister_memory([ptr])
+        self._register_memory([ptr], [registration.length])
+        registration.remote_accessible = True
+
+    def _register_memory(self, ptrs: List[int], lengths: List[int]) -> None:
+        try:
+            ret_value = self._engine.batch_register_memory(ptrs, lengths)
+        except Exception as exc:
+            if not hasattr(self._engine, "batch_register_memory"):
+                raise RuntimeError(
+                    "Mooncake's batch register requires a newer version of "
+                    "mooncake-transfer-engine. Please upgrade Mooncake."
+                ) from exc
+            raise RuntimeError("Mooncake memory registration failed") from exc
+        if ret_value != 0:
+            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
+
+    def _unregister_memory(self, ptrs: List[int]) -> None:
+        try:
+            ret_value = self._engine.batch_unregister_memory(ptrs)
+        except Exception as exc:
+            raise RuntimeError("Mooncake memory deregistration failed") from exc
+        if ret_value != 0:
+            raise RuntimeError(
+                f"Mooncake memory deregistration failed (ret={ret_value})"
+            )
+
+
 class MooncakeTransferEngine:
     """Shared Mooncake transfer engine for RDMA/transfer operations."""
 
@@ -126,6 +264,7 @@ class MooncakeTransferEngine:
             ) from e
 
         self.engine = TransferEngine()
+        self.memory_registry = MooncakeMemoryRegistry(self.engine)
         self.hostname = hostname
         self.gpu_id = gpu_id if gpu_id is not None else 0
         # MC_FORCE_TCP=1 makes mooncake install TcpTransport instead of RDMA,
@@ -143,54 +282,17 @@ class MooncakeTransferEngine:
             self.hostname, self.engine.get_rpc_port()
         ).to_host_port_str()
 
-    def register(self, ptr, length) -> None:
-        try:
-            ret_value = self.engine.register_memory(ptr, length)
-        except Exception as exc:
-            raise RuntimeError("Mooncake memory registration failed") from exc
+    def register(self, ptr: int, length: int) -> None:
+        self.memory_registry.register([ptr], [length])
 
-        if ret_value != 0:
-            raise RuntimeError(f"Mooncake memory registration failed (ret={ret_value})")
+    def deregister(self, ptr: int) -> None:
+        self.memory_registry.deregister([ptr])
 
-    def deregister(self, ptr) -> None:
-        try:
-            ret_value = self.engine.unregister_memory(ptr)
-        except Exception as exc:
-            raise RuntimeError("Mooncake memory deregistration failed") from exc
+    def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
+        self.memory_registry.register(ptrs, lengths)
 
-        if ret_value != 0:
-            raise RuntimeError(
-                f"Mooncake memory deregistration failed (ret={ret_value})"
-            )
-
-    def batch_register(self, ptrs: List[int], lengths: List[int]) -> int:
-        """Batch register multiple memory regions."""
-        try:
-            ret_value = self.engine.batch_register_memory(ptrs, lengths)
-        except Exception:
-            # Mark batch register as failed
-            ret_value = -1
-            if not hasattr(self.engine, "batch_register_memory"):
-                raise RuntimeError(
-                    "Mooncake's batch register requires a newer version of "
-                    "mooncake-transfer-engine. Please upgrade Mooncake."
-                )
-
-        if ret_value != 0:
-            logger.debug("Mooncake batch memory registration failed.")
-        return ret_value
-
-    def batch_deregister(self, ptrs: List[int]) -> int:
-        """Batch deregister multiple memory regions."""
-        try:
-            ret_value = self.engine.batch_unregister_memory(ptrs)
-        except Exception:
-            # Mark batch deregister as failed
-            ret_value = -1
-
-        if ret_value != 0:
-            logger.debug("Mooncake batch memory deregistration failed.")
-        return ret_value
+    def batch_deregister(self, ptrs: List[int]) -> None:
+        self.memory_registry.deregister(ptrs)
 
     def initialize(
         self,
