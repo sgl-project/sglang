@@ -62,9 +62,29 @@ def fused_linear_gelu_tanh(
     ``weight`` is ``[out, in]`` (nn.Linear / sglang linear layout). Registered
     as a custom op so it is opaque under torch.compile.
     """
+    if _use_gfx1250_backend():
+        return _linear_gelu_tanh_gfx1250(x=x, weight=weight, bias=bias)
     x2d = x.reshape(-1, x.shape[-1])
     out = torch._addmm_activation(bias, x2d, weight.t(), use_gelu=True)
     return out.view(*x.shape[:-1], weight.shape[0])
+
+
+def _use_gfx1250_backend() -> bool:
+    from sglang.multimodal_gen.runtime.platforms.aiter import USE_AITER_GFX1250
+
+    return USE_AITER_GFX1250
+
+
+def _linear_gelu_tanh_gfx1250(
+    *, x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor
+) -> torch.Tensor:
+    # hipBLASLt has no tuned gfx1250 kernels, so keep the runtime's FlyDSL GEMM
+    # and replace aten's GELU, which splits into two ~2.2 TB/s launches past 2**31 bytes.
+    from sglang.kernels.ops.diffusion import gelu_tanh_inplace_
+    from sglang.multimodal_gen.runtime.layers.linear import apply_unquantized_linear
+
+    out = apply_unquantized_linear(x, weight, bias).contiguous()
+    return gelu_tanh_inplace_(out)
 
 
 def _is_unquantized(linear: Any) -> bool:
@@ -131,6 +151,8 @@ _VERDICTS: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 def _input_independent_ok(linear: Any) -> bool:
+    if _use_gfx1250_backend():
+        return can_use_linear_gelu_static(linear)
     if current_arch().is_sm_at_least(12):
         # The cublasLt GELU epilogue selected by current SM120 PyTorch/CUDA
         # builds is slower than GEMM + the native GELU kernel for the FLUX
