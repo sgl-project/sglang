@@ -12,11 +12,13 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from functools import partial
+from functools import cache, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -46,6 +48,71 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# CANN acl_rt.h flags belong to separate creation and recording APIs.
+ACL_EVENT_SYNC = 0x01  # Create an event for cross-stream synchronization.
+ACL_EVENT_RECORD_EXTERNAL = 0x01  # Keep the graph record visible outside the graph.
+
+
+def _call_acl(function, *args):
+    result = function(*args)
+    if result:
+        raise RuntimeError(f"{function.__name__} failed with ACL error {result}")
+    return result
+
+
+@cache
+def _record_event_with_flag_api():
+    # pyACL exposes the other event operations, but not record-with-flag.
+    library = ctypes.CDLL("libascendcl.so")
+    function = library.aclrtRecordEventWithFlag
+    function.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)
+    function.restype = ctypes.c_int
+    return function
+
+
+class NPUSharedReadEvent:
+    """Record a graph node that the scheduler can wait on outside the graph.
+
+    Unlike torch.npu.ExternalEvent, this event uses CreateEventExWithFlag and
+    must not be reset. Only the capture-time record uses the EXTERNAL flag;
+    the scheduler consumes it through the ordinary Stream.wait_event protocol.
+    """
+
+    def __init__(self, device_module):
+        import acl
+
+        self._device_module = device_module
+        self._acl_rt = acl.rt
+        self._record_event = _record_event_with_flag_api()
+        self._event, result = self._acl_rt.create_event_ex_with_flag(ACL_EVENT_SYNC)
+        if result:
+            raise RuntimeError(
+                f"create_event_ex_with_flag failed with ACL error {result}"
+            )
+        self._finalizer = weakref.finalize(
+            self, _call_acl, self._acl_rt.destroy_event, self._event
+        )
+        # The runtime owns process-exit cleanup; it may shut down before Python
+        # finalizers. Normal object disposal still releases the event.
+        self._finalizer.atexit = False
+
+    def record(self, stream=None):
+        if stream is None:
+            stream = self._device_module.current_stream()
+        # Reading npu_stream drains torch_npu's host submission queue, without
+        # waiting for device completion. Do not cache the raw stream handle.
+        _call_acl(
+            self._record_event,
+            self._event,
+            stream.npu_stream,
+            ACL_EVENT_RECORD_EXTERNAL,
+        )
+
+    def wait(self, stream=None):
+        if stream is None:
+            stream = self._device_module.current_stream()
+        _call_acl(self._acl_rt.stream_wait_event, stream.npu_stream, self._event)
 
 
 class NPUCudaGraphBackend(BaseCudaGraphBackend):
@@ -87,12 +154,19 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
 
     @property
     def supports_shared_read_events(self) -> bool:
-        # Preserve the legacy NPUGraphRunner replay behavior.
-        return False
+        # In-graph metadata reads shared pool mappings before recording read-done.
+        return self._use_in_graph_metadata
 
     @property
     def cache_loc_dtype(self):
         return torch.int32
+
+    @property
+    def _use_in_graph_metadata(self):
+        attn_backend = self._decode_runner.attn_backend
+        # Hybrid models delegate dense attention metadata to the full backend.
+        attn_backend = getattr(attn_backend, "full_attn_backend", attn_backend)
+        return getattr(attn_backend, "use_in_graph_metadata", False)
 
     def get_update_attr_name(self):
         """Preserve each runner's existing captured attention update protocol."""
@@ -206,6 +280,10 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
     def prepare_replay(self, forward_batch):
         runner = self._decode_runner
         if runner is None or forward_batch.needs_forward_metadata_init():
+            return False
+        if self._use_in_graph_metadata:
+            # False delegates to the common runner's load_batch: stage device
+            # inputs for in-graph metadata, including pre-planned batches.
             return False
         if not runner.model_runner.spec_algorithm.is_dflash():
             # Preserve the NPU pre-planned path without refreshing metadata
@@ -460,7 +538,8 @@ class NPUCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         runner = self._decode_runner
-        if runner is not None:
+        # In-graph metadata needs no FIA host-length rebinding; replay still runs.
+        if runner is not None and not self._use_in_graph_metadata:
             from sglang.srt.speculative import (
                 multi_layer_eagle_draft_extend_cuda_graph_runner as multi_layer,
             )

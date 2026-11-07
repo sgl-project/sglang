@@ -1,19 +1,32 @@
 """Shared-read-done event utilities for graph and eager runners."""
 
 import logging
-from typing import Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.runtime_context import get_memory
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_npu
+
+if TYPE_CHECKING:
+    from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+        NPUSharedReadEvent,
+    )
 
 logger = logging.getLogger(__name__)
 
 
-def make_external_event(device_module) -> Optional[torch.cuda.Event]:
+def make_external_event(
+    device_module,
+) -> Optional[Union[torch.cuda.Event, "NPUSharedReadEvent"]]:
     """Create a persistent external event, e.g., for CUDA graph capture."""
+    if is_npu():
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_cudagraph_backend import (
+            NPUSharedReadEvent,
+        )
+
+        return NPUSharedReadEvent(device_module)
     if not is_cuda():
         return None
     try:

@@ -406,7 +406,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if dcp_size is None:
             dcp_size = get_parallel().attn_dcp_size
 
-        if kvc.use_mla_backend:
+        if kvc.modelslim_cache_layout is not None:
+            cell_size = (
+                kvc.modelslim_cache_layout.bytes_per_token * effective_num_layers
+            )
+        elif kvc.use_mla_backend:
             if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
                 # NPU sparse KV offload uses an index-only device pool.
                 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
@@ -428,16 +432,13 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 calculate_mla_kv_cache_dim,
             )
 
-            if kvc.modelslim_cache_layout is not None:
-                per_layer_bytes = kvc.modelslim_cache_layout.bytes_per_token
-            else:
-                per_layer_bytes = (
-                    calculate_mla_kv_cache_dim(
-                        model_config=model_config,
-                        kv_cache_dtype=kv_cache_dtype,
-                    )
-                    * kv_size
+            per_layer_bytes = (
+                calculate_mla_kv_cache_dim(
+                    model_config=model_config,
+                    kv_cache_dtype=kv_cache_dtype,
                 )
+                * kv_size
+            )
             cell_size = per_layer_bytes * effective_num_layers
             if is_float4_e2m1fn_x2(kv_cache_dtype):
                 # kv_scale_buffer
