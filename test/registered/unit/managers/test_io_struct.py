@@ -433,6 +433,40 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_background_flag_survives_slicing(self):
+        """Every per-sample sub-request keeps the request-level `background` flag.
+
+        A dropped flag makes a Responses API background job run as foreground, so the
+        caller disconnecting aborts it.
+        """
+        req = copy.deepcopy(self.base_req)
+        req.sampling_params = [{"n": 3}, {"n": 3}]
+        req.background = True
+        req.require_reasoning = True
+        req.use_audio_in_video = True
+        req.routing_key = "test_key"
+        req.normalize_batch_and_arguments()
+
+        self.assertGreater(len(req.text), 2)
+        for i in range(len(req.rid)):
+            self.assertTrue(req[i].background)
+            self.assertTrue(req[i].require_reasoning)
+            self.assertTrue(req[i].use_audio_in_video)
+            self.assertEqual(req[i].routing_key, "test_key")
+
+        first = req[0]
+        self.assertIs(req[0], first)
+        self.assertTrue(first.background)
+
+    def test_background_flag_stays_false_for_foreground_requests(self):
+        req = copy.deepcopy(self.base_req)
+        req.sampling_params = [{"n": 2}, {"n": 2}]
+        req.background = False
+        req.normalize_batch_and_arguments()
+
+        for i in range(len(req.rid)):
+            self.assertFalse(req[i].background)
+
     def test_sampling_logprobs_mode_normalization(self):
         default_req = copy.deepcopy(self.base_req)
         default_req.normalize_batch_and_arguments()
