@@ -66,7 +66,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     async_d2h,
     is_cpu,
     is_gfx1250_supported,
@@ -375,6 +375,18 @@ class LogitsProcessorOutput:
                     sequences[i] = [row for span in spans for row in span.tolist()]
 
 
+def extend_reads_input_logprobs(forward_batch: ForwardBatch) -> bool:
+    """Whether an extend batch returns logprobs for some token before a
+    segment's last, so the LM head reads more than the last rows."""
+    return forward_batch.return_logprob and any(
+        extend_len > start_len
+        for extend_len, start_len in zip(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_logprob_start_lens_cpu,
+        )
+    )
+
+
 @dataclasses.dataclass
 class LogitsMetadata:
     forward_mode: ForwardMode
@@ -444,15 +456,14 @@ class LogitsMetadata:
             extend_token_ids_logprob = any(
                 x is not None for x in forward_batch.token_ids_logprobs
             )
-            extend_return_logprob = False
-            extend_logprob_pruned_lens_cpu = []
-            for extend_len, start_len in zip(
-                forward_batch.extend_seq_lens_cpu,
-                forward_batch.extend_logprob_start_lens_cpu,
-            ):
-                if extend_len - start_len > 0:
-                    extend_return_logprob = True
-                extend_logprob_pruned_lens_cpu.append(extend_len - start_len)
+            extend_return_logprob = extend_reads_input_logprobs(forward_batch)
+            extend_logprob_pruned_lens_cpu = [
+                extend_len - start_len
+                for extend_len, start_len in zip(
+                    forward_batch.extend_seq_lens_cpu,
+                    forward_batch.extend_logprob_start_lens_cpu,
+                )
+            ]
         else:
             extend_return_logprob = extend_return_top_logprob = (
                 extend_token_ids_logprob

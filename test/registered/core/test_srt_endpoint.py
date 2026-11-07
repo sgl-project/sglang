@@ -17,9 +17,9 @@ from typing import Optional
 import numpy as np
 import requests
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -42,6 +42,7 @@ class TestSRTEndpoint(CustomTestCase):
     # against a different server flavor (e.g. SGLANG_RUST_SERVER=1).
     env = {}
     expect_startup_observability = True
+    custom_logit_processor_args = ("--enable-custom-logit-processor",)
 
     @classmethod
     def setUpClass(cls):
@@ -56,7 +57,7 @@ class TestSRTEndpoint(CustomTestCase):
             # rows still cover the non-chunked path).
             env={**cls.env, **SERVER_ENV, "SGLANG_LOGPROB_CHUNK_SIZE": "64"},
             other_args=(
-                "--enable-custom-logit-processor",
+                *cls.custom_logit_processor_args,
                 "--mem-fraction-static",
                 "0.7",
                 "--cuda-graph-max-bs-decode",
@@ -108,6 +109,22 @@ class TestSRTEndpoint(CustomTestCase):
 
         print(json.dumps(response_json, indent=2))
         print("=" * 100)
+
+    def test_stream_declares_utf8(self):
+        # Without a charset, `requests` decodes a text/event-stream as Latin-1.
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": "The capital of France is",
+                "sampling_params": {"temperature": 0, "max_new_tokens": 4},
+                "stream": True,
+            },
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.headers["content-type"], "text/event-stream; charset=utf-8"
+        )
+        self.assertEqual(response.encoding, "utf-8")
 
     def test_logprob(self):
         self.run_decode(
@@ -809,6 +826,8 @@ class TestTokenizeDetokenize(CustomTestCase):
 class TestRustServerEndpoint(TestSRTEndpoint):
     env = {"SGLANG_RUST_SERVER": "1"}
     expect_startup_observability = False
+    # Refused at startup in Rust-server mode; its tests are skipped below.
+    custom_logit_processor_args = ()
 
     _RUST_TODO = "not implemented by the embedded Rust server yet"
 
