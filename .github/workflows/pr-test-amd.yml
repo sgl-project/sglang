@@ -691,7 +691,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 3
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0]
@@ -733,7 +733,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0]
@@ -775,7 +775,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         part: [0, 1, 2, 3]
@@ -925,7 +925,7 @@ jobs:
       )
     strategy:
       fail-fast: false
-      max-parallel: 1
+      max-parallel: 2
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
         # run_suite.py load-balances the suite's parametrized cases and
