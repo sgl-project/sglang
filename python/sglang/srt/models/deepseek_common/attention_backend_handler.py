@@ -182,6 +182,13 @@ def handle_attention_trtllm_mla(attn, forward_batch):
 
 
 def handle_attention_aiter(attn, forward_batch):
+    # Over-capacity extends run eagerly (graph replay rejects them), but the HIP
+    # eager fallback still sits in the PCG context: keep them chunked so the
+    # cached prefix is never materialized in one piece.
+    if forward_batch.forward_mode.is_extend_without_speculative() and not (
+        _support_mha_one_shot(attn, forward_batch, "aiter")
+    ):
+        return AttnForwardMethod.MHA_CHUNKED_KV
     # During PCG/BCG capture on ROCm, aiter fp8 MLA prefill has no capture
     # kernels; route through the MHA path (radix_attention swaps attn_mqa for
     # its attn_mha companion) so capture/replay use valid head/dim metadata.
