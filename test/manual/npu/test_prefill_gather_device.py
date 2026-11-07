@@ -12,7 +12,7 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import create_shm_tensor, free_sh
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager import (
     SparseKVCacheManager,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 # Deliberately noncontiguous, with a physical alias across request rows.
 MAP = [

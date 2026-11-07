@@ -26,7 +26,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     prepare_mtp_rows,
     validate_mtp_chain,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

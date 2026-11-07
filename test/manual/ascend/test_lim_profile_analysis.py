@@ -15,6 +15,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
+
 from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,8 +42,9 @@ class TestLIMProfileAnalysis(CustomTestCase):
         # Intermediate prefill chunks invoke the processor but emit no token.
         # Forcing/capturing those calls shifts the history before decode starts.
         encoded = precision.processor_string()
-        with tempfile.TemporaryDirectory() as directory, patch.object(
-            torch.distributed, "get_rank", return_value=0
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(torch.distributed, "get_rank", return_value=0),
         ):
             params = {
                 "capture_root": directory,

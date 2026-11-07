@@ -23,7 +23,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager im
     SparseKVCacheManager,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 K = 2048
 

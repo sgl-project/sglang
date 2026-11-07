@@ -6,11 +6,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
+from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager import (
     _wait_stream_event,
     normalize_batch_topk_indices,
-    unidex_copy_inplace,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     is_sparse_mtp_batch,

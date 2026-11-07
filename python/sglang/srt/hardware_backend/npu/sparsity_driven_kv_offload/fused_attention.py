@@ -8,7 +8,7 @@ import torch
 import torch_npu
 
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 def forward_sparsity_driven_kv_offload(
