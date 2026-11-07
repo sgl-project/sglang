@@ -96,6 +96,11 @@ class Mm(msgspec.Struct):
         "Maximum size in MiB for one client-supplied remote media download. "
         "The limit is enforced while streaming; set to 0 to disable it.",
     ] = 64
+    audio_transcription_max_file_size_mb: A[
+        int,
+        "Maximum size in MiB for one uploaded transcription file. The limit "
+        "is enforced while reading the upload; set to 0 to disable it.",
+    ] = 25
     mm_preprocess_cache_size_mb: A[
         Optional[int],
         Arg(
