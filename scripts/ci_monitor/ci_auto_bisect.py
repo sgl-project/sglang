@@ -5,8 +5,9 @@ SGLang CI Auto Bisect
 Fetches recent Nvidia scheduled PR Test runs, identifies consistently failing
 tests, and calls Claude to classify each as regression/flaky/hardware/environment.
 
-Self-contained: does its own lightweight GitHub API analysis instead of running
-the full ci_failures_analysis.py, keeping API usage to ~30-40 calls.
+Does its own lightweight GitHub API analysis instead of running the full
+ci_failures_analysis.py, keeping API usage to ~30-40 calls. It reuses only that
+script's log parser.
 
 Usage:
     python ci_auto_bisect.py \
@@ -29,6 +30,7 @@ from typing import Dict, List, Optional, Tuple
 
 import anthropic
 import requests
+from ci_failures_analysis import SGLangFailuresAnalyzer
 
 REPO = "sgl-project/sglang"
 GITHUB_API = "https://api.github.com"
@@ -209,70 +211,6 @@ def fetch_job_logs(job_id: int, token: str, max_chars: int = 2000000) -> str:
     return ""
 
 
-def parse_test_summary(logs: str) -> Optional[Dict]:
-    """Parse the test summary block from job logs.
-
-    Returns dict with passed/total counts and list of failed tests,
-    or None if no summary found.
-    """
-    # Strip ANSI escape codes
-    logs = _ANSI_ESCAPE_RE.sub("", logs)
-
-    summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
-    if not summary_match:
-        # Try to find the last running test (timeout scenario)
-        last_test = _find_last_running_test(logs)
-        if last_test:
-            return {"passed": 0, "total": 0, "failed_tests": [last_test]}
-        return None
-
-    try:
-        passed = int(summary_match.group(1))
-        total = int(summary_match.group(2))
-    except (ValueError, TypeError):
-        return None
-
-    failed_tests = []
-    failed_section_match = re.search(
-        r".?\s*FAILED:\s*\n(.*?)(?:={10,}|$)", logs, re.DOTALL
-    )
-    if failed_section_match:
-        for match in re.finditer(r"(\S+\.py)", failed_section_match.group(1)):
-            full_path = match.group(1)
-            test_file = full_path.split("/")[-1] if "/" in full_path else full_path
-            failed_tests.append({"test_file": test_file, "full_path": full_path})
-
-    return {"passed": passed, "total": total, "failed_tests": failed_tests}
-
-
-def _find_last_running_test(logs: str) -> Optional[Dict]:
-    """Find the last test running before logs cut off (timeout scenarios)."""
-    lines = logs.split("\n")
-    test_patterns = [r"(\S+\.py)::", r"python3?\s+(\S+\.py)"]
-
-    # Find last "server_args:" and look above it for test file
-    server_args_idx = None
-    for i in range(len(lines) - 1, -1, -1):
-        if "server_args:" in lines[i].lower() or "server_args =" in lines[i]:
-            server_args_idx = i
-            break
-
-    if server_args_idx is not None:
-        for j in range(1, 11):
-            line_idx = server_args_idx - j
-            if line_idx >= 0:
-                for pattern in test_patterns:
-                    match = re.search(pattern, lines[line_idx])
-                    if match:
-                        full_path = match.group(1)
-                        test_file = (
-                            full_path.split("/")[-1] if "/" in full_path else full_path
-                        )
-                        if test_file.endswith(".py"):
-                            return {"test_file": test_file, "full_path": full_path}
-    return None
-
-
 def analyze_scheduled_failures(
     token: str, min_streak: int = 1, max_failures: int = 10
 ) -> Tuple[List[FailureTarget], Dict[int, str]]:
@@ -376,6 +314,7 @@ def analyze_scheduled_failures(
     # For broken jobs, fetch logs and parse test-level failures
     # Only fetch logs for the MOST RECENT failure of each broken job
     print("\nFetching logs for broken jobs to identify failing tests...")
+    log_parser = SGLangFailuresAnalyzer(token)
     targets = []
 
     for job_name, data in broken_jobs.items():
@@ -388,7 +327,7 @@ def analyze_scheduled_failures(
             api_calls += 1
             if logs:
                 logs_cache[last_job_id] = logs
-                summary = parse_test_summary(logs)
+                summary = log_parser.parse_test_summary(logs)
                 if summary and summary.get("failed_tests"):
                     test_failures = summary["failed_tests"]
 

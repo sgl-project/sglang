@@ -369,15 +369,78 @@ class SGLangFailuresAnalyzer:
         # Pattern matches: "Test Summary: 7/8 passed"
         summary_match = re.search(r"Test Summary:\s*(\d+)/(\d+)\s*passed", logs)
         if not summary_match:
-            # No summary found - try to find last running test
-            last_test = self.find_last_running_test(logs)
+            pytest_lines = []
+            pytest_failures = {}
+            completed_pytest_failures = {}
+            saw_pytest_session = False
+            in_pytest_tail = False
+            for line in logs.splitlines():
+                # Accept both the logs API and `gh run view --log` prefixes.
+                line = re.sub(r"^(?:.*\t)?\d{4}-\d{2}-\d{2}T\S+Z ?", "", line).strip()
+                # The runner reprints failures from every attempt here, including
+                # attempts that passed on retry. Only use the original output.
+                if re.fullmatch(r"=+\s*Pytest Tail Summary\s*=+", line):
+                    # Later standalone invocations must retain this result.
+                    completed_pytest_failures.update(pytest_failures)
+                    pytest_failures = {}
+                    in_pytest_tail = True
+                if in_pytest_tail:
+                    if re.fullmatch(r"=+", line):
+                        in_pytest_tail = False
+                    continue
+                # pytest_runner.py prints this marker before a retry replaces the
+                # last attempt. Any other new session keeps earlier failures.
+                if "retry failed items" in line:
+                    pytest_failures = {}
+                if re.fullmatch(r"=+\s*test session starts\s*=+", line):
+                    completed_pytest_failures.update(pytest_failures)
+                    pytest_failures = {}
+                    pytest_lines = []
+                    saw_pytest_session = True
+                pytest_lines.append(line)
+                if re.fullmatch(r"=+\s*short test summary info\s*=+", line):
+                    pytest_failures = {}
+                failure = re.match(
+                    r"(?:(?:FAILED|ERROR)\s+|SUBFAILED.*?\s)(\S+?\.py)(?=::|\s|$)", line
+                )
+                if failure:
+                    full_path = failure.group(1)
+                    pytest_failures[full_path] = {
+                        "test_file": full_path.rsplit("/", 1)[-1],
+                        "full_path": full_path,
+                    }
+                elif re.match(
+                    r"^(?:=+\s*)?(?:(?:\d+\s+(?:failed|passed|skipped|errors?|"
+                    r"deselected|xfailed|xpassed|warnings?|rerun|subtests passed)"
+                    r"(?:,\s*|\s+))+|no tests ran\s+)in\s+\d",
+                    line,
+                ):
+                    pytest_lines = []
+                    # A `-q` result inside a session comes from a nested run.
+                    nested = saw_pytest_session and not line.startswith("=")
+                    if nested or not re.search(
+                        r"\b[1-9]\d*\s+(?:failed|errors?)\b", line
+                    ):
+                        pytest_failures = {}
+
+            completed_pytest_failures.update(pytest_failures)
+            # Infer only from output after the last pytest result, retaining
+            # known failures from earlier invocations.
+            last_test = self.find_last_running_test("\n".join(pytest_lines))
             if last_test:
-                return {
+                completed_pytest_failures.setdefault(last_test["full_path"], last_test)
+
+            if completed_pytest_failures:
+                summary = {
+                    # Pytest counts test cases, not the files counted by the
+                    # custom summary. Leave file totals unknown.
                     "passed": 0,
                     "total": 0,
-                    "failed_tests": [last_test],
-                    "incomplete": True,  # Mark that this is incomplete/inferred
+                    "failed_tests": list(completed_pytest_failures.values()),
                 }
+                if last_test:
+                    summary["incomplete"] = True
+                return summary
             return None
 
         try:
@@ -470,7 +533,9 @@ class SGLangFailuresAnalyzer:
                     job_name = run_info.get("job_name", "unknown")
                     run_number = run_info.get("run_number", "unknown")
                     inferred_tests = [
-                        t["test_file"] for t in test_summary.get("failed_tests", [])
+                        t["test_file"]
+                        for t in test_summary.get("failed_tests", [])
+                        if t.get("context") == "last_running"
                     ]
                     print(
                         f"  ⏱️  Inferred timeout test for {job_name} (Run #{run_number}): {inferred_tests}"
