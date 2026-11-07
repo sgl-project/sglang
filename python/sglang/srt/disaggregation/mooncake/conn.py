@@ -1066,11 +1066,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
-            return False, (
-                "CP/TP-sharing DFLASH PD requires the same physical TP size: "
-                f"prefill={self.state_tp_size}, "
-                f"decode={registration_info.dst_attn_tp_size}"
+            # MLA drafts instead register one complete KV row per layer. Allow
+            # those only when both peers publish the same single-entry layout
+            # and token widths; equal widths alone can also occur for MHA.
+            num_draft = self.kv_args.num_draft_entries
+            draft_ids = self.kv_args.kv_layer_ids[-num_draft:]
+            src_lens = self.kv_args.kv_item_lens[-num_draft:]
+            dst_ids = registration_info.dst_kv_layer_ids
+            dst_lens = registration_info.dst_kv_item_lens[-num_draft:]
+            dst_page_scale = (
+                registration_info.dst_dcp_size
+                if registration_info.requires_dcp_relayout
+                else 1
             )
+            replicated_draft = (
+                num_draft > 0
+                and len(draft_ids) == len(set(draft_ids)) == num_draft
+                and dst_ids[-num_draft:] == draft_ids
+                and not set(draft_ids).intersection(dst_ids[:-num_draft])
+                and len(src_lens) == len(dst_lens) == num_draft
+                and all(
+                    src > 0 and dst == src * dst_page_scale
+                    for src, dst in zip(src_lens, dst_lens)
+                )
+            )
+            if not replicated_draft:
+                return False, (
+                    "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                    f"prefill={self.state_tp_size}, "
+                    f"decode={registration_info.dst_attn_tp_size}"
+                )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):
