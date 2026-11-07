@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Callable, Optional
+from typing import TYPE_CHECKING, Callable, List, Optional
 
 if TYPE_CHECKING:
     import torch
@@ -46,6 +46,10 @@ class ForwardContext:
     attn_backend: AttentionBackend
     # Resolve after batch preparation; captured calls retain the static buffer.
     moe_num_token_non_padded: Optional[Callable[[], Optional[torch.Tensor]]] = None
+    # This call runs one micro-batch of a larger batch (a TBO child).
+    is_micro_batch: bool = False
+    # Upper bound of each DP rank's tokens in this call: the split batch's counts.
+    dp_global_num_tokens_bound: Optional[List[int]] = None
 
 
 _current: Optional[ForwardContext] = None

@@ -440,6 +440,10 @@ class NonCudaDecoderMixin:
             state.pop("ffn_post"),
             state.pop("ffn_comb"),
         )
+        # DSpark: this ubatch's share of a captured layer; _forward_layers_tbo merges.
+        dspark_capture = getattr(state.forward_batch, "dspark_capture", None)
+        if dspark_capture is not None and self.layer_id in dspark_capture[0]:
+            dspark_capture[1].append(hidden_states.mean(dim=1))
         output = dict(
             positions=state.positions,
             hidden_states=hidden_states,
