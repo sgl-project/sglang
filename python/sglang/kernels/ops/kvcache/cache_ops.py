@@ -27,6 +27,9 @@ def reshape_and_cache_flash(
     BLOCK_D: tl.constexpr,
     HAS_SWA: tl.constexpr,
     USE_SCALE: tl.constexpr,
+    size_limit=0,
+    SKIP_SLOT_ZERO: tl.constexpr = False,
+    HAS_SIZE_LIMIT: tl.constexpr = False,
 ):
     """
     Triton kernel for reshaping per-token K/V tensors into paged KV cache layout.
@@ -45,6 +48,7 @@ def reshape_and_cache_flash(
     Features:
         - optional SWA slot remapping
         - optional FP8 scale dequantization before cache write
+        - optional slot-0 skip and slot upper bound
 
     Args:
         key_ptr: Pointer to source key tensor.
@@ -70,6 +74,11 @@ def reshape_and_cache_flash(
         BLOCK_D: Vectorized dimension size (power-of-2 padded).
         HAS_SWA: Enable SWA remapping.
         USE_SCALE: Enable scale division before storing.
+        size_limit: Writes to slots >= size_limit are skipped; read only when
+            HAS_SIZE_LIMIT. Checked after the SWA remap, so it does not bound the
+            swa_slot_mapping lookup.
+        SKIP_SLOT_ZERO: Skip writes to slot 0, the reserved padding slot.
+        HAS_SIZE_LIMIT: Enable the size_limit bound.
     """
 
     # ----------------------------------
@@ -88,7 +97,15 @@ def reshape_and_cache_flash(
     if HAS_SWA:
         slot_idx = tl.load(swa_slot_mapping_ptr + slot_idx)
 
-    if slot_idx < 0:
+    # Keep destination offsets in int64: a valid int32 slot can overflow when
+    # multiplied by the cache row stride.
+    slot_idx = slot_idx.to(tl.int64)
+    skip = slot_idx < 0
+    if SKIP_SLOT_ZERO:
+        skip = skip | (slot_idx == 0)
+    if HAS_SIZE_LIMIT:
+        skip = skip | (slot_idx >= size_limit)
+    if skip:
         return
 
     block_idx = slot_idx // block_size
@@ -156,6 +173,8 @@ def launch_reshape_and_cache_flash(
     swa_slot_mapping=None,
     k_scale=None,
     v_scale=None,
+    skip_slot_zero=False,
+    size_limit=None,
 ):
     """
     Launch wrapper for reshape_and_cache_flash Triton kernel.
@@ -172,11 +191,29 @@ def launch_reshape_and_cache_flash(
         swa_slot_mapping: Optional SWA remapping table
         k_scale: Optional key scaling factor
         v_scale: Optional value scaling factor
+        skip_slot_zero: Skip writes to slot 0, the reserved padding slot that
+            store_cache skips. False (default) skips none.
+        size_limit: If set, writes to slots >= size_limit are skipped; must not
+            exceed the caches' slot count. Not supported with swa_slot_mapping,
+            whose lookup it would not bound. None (default) checks no upper bound.
     """
 
     num_tokens = key.shape[0]
     num_heads = key.shape[1]
     head_size = key.shape[2]
+
+    assert slot_mapping.is_contiguous(), "slot_mapping must be contiguous"
+    if size_limit is not None:
+        assert swa_slot_mapping is None, (
+            "size_limit does not bound the swa_slot_mapping lookup"
+        )
+        num_slots = min(
+            key_cache.shape[0] * key_cache.shape[1],
+            value_cache.shape[0] * value_cache.shape[1],
+        )
+        assert 0 <= size_limit <= num_slots, (
+            f"size_limit={size_limit} is outside the caches' {num_slots} slots"
+        )
 
     HEAD_BLOCK = 4
 
@@ -211,4 +248,7 @@ def launch_reshape_and_cache_flash(
         BLOCK_D=BLOCK_D,
         HAS_SWA=(swa_slot_mapping is not None),
         USE_SCALE=(k_scale is not None),
+        size_limit=size_limit if size_limit is not None else 0,
+        SKIP_SLOT_ZERO=skip_slot_zero,
+        HAS_SIZE_LIMIT=(size_limit is not None),
     )
