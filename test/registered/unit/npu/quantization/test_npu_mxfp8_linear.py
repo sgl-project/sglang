@@ -8,18 +8,12 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=1, suite="base-a-test-npu")
 
-# Load the quantization package first so `base_config`, `moe_methods`, and
-# `linear_method_npu` initialize in dependency order. Importing
-# `linear_method_npu` directly from a cold process triggers a circular import:
-# linear_method_npu -> base_config -> quantization/__init__ ->
-# gguf/unquant/gptq_moe -> moe_methods -> linear_method_npu (partially
-# initialized, `_get_float8_e8m0fnu_dtype` not yet defined). Initializing the
-# package first mirrors how the engine loads quantization at model-config time.
+# Initialize the quantization registry as in model-config loading.
 import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
     npu_w8a8_mxfp8_linear,
 )
-from sglang.srt.hardware_backend.npu.quantization.w8a8_mxfp8 import (
+from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
     process_npu_arch35_mxfp8_linear_weights,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config

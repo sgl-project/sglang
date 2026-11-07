@@ -5,7 +5,7 @@ from collections.abc import Sequence
 import torch
 
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
-from sglang.srt.utils.common import rank0_log
+from sglang.srt.utils.log_utils import rank0_log
 
 
 def _load_aiter_flydsl_gdn():

@@ -23,8 +23,16 @@ Consolidated from the two merged DCP implementations:
 from typing import Optional, Tuple
 
 import torch
+import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
+
+from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+    _blockwise_barrier,
+    _local_ld_128,
+    _multimem_st_128,
+    _sync_threads,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -728,3 +736,194 @@ def dcp_lse_combine_triton(
         RETURN_LSE=return_lse,
     )
     return out, (out_lse if return_lse else None)
+
+
+@triton.jit
+def _peer_store_128(ptr, x, y, z, w, mask):
+    return tl.inline_asm_elementwise(
+        """{
+            .reg .pred p;
+            setp.ne.s32 p, $6, 0;
+            @p st.relaxed.sys.global.v4.b32 [$1], {$2, $3, $4, $5};
+        }""",
+        "=r,l,r,r,r,r,r",
+        [ptr, x, y, z, w, mask.to(tl.int32)],
+        dtype=tl.uint32,
+        is_pure=False,
+        pack=1,
+    )
+
+
+@triton.jit
+def _dcp_pack_exchange_kernel(
+    src,
+    lse,
+    peer_ptrs,
+    signals,
+    B: tl.constexpr,
+    SRC_B: tl.constexpr,
+    SRC_H: tl.constexpr,
+    LSE_B: tl.constexpr,
+    LSE_H: tl.constexpr,
+    MAX_B: tl.constexpr,
+    RANK: tl.constexpr,
+    SRC_ALIGNED: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    # Head-sharded BF16 partials; four extra words preserve peer-store alignment.
+    CHUNKS: tl.constexpr = HEAD_DIM // 8
+    WORDS: tl.constexpr = HEAD_DIM // 2
+    PITCH: tl.constexpr = WORDS + 4
+    _blockwise_barrier(signals, RANK, 8, sem="relaxed")
+    _sync_threads()
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    for start in range(0, tl.cdiv(B * 96 * CHUNKS, tl.num_programs(0) * BLOCK)):
+        index = offsets + start * tl.num_programs(0) * BLOCK
+        valid = index < B * 96 * CHUNKS
+        chunk = index % CHUNKS
+        head = index // CHUNKS % 96
+        row = index // (96 * CHUNKS)
+        peer = head // 12
+        head_local = head % 12
+        source = src + row.to(tl.int64) * SRC_B + head * SRC_H + chunk * 4
+        address = tl.load(peer_ptrs + peer).to(tl.pointer_type(tl.int32))
+        base = ((RANK * MAX_B + row.to(tl.int64)) * 12 + head_local) * PITCH
+        if SRC_ALIGNED:
+            x, y, z, w = _local_ld_128(source, valid)
+        else:
+            x = tl.load(source, valid, other=0)
+            y = tl.load(source + 1, valid, other=0)
+            z = tl.load(source + 2, valid, other=0)
+            w = tl.load(source + 3, valid, other=0)
+        _peer_store_128(address + base + chunk * 4, x, y, z, w, valid)
+        copy_lse = valid & (chunk == 0)
+        lse_value = tl.load(lse + row * LSE_B + head * LSE_H, copy_lse, other=0)
+        tl.store(address + base + WORDS, lse_value.to(tl.int32, bitcast=True), copy_lse)
+    _sync_threads()
+    _blockwise_barrier(signals, RANK, 8, sem="acq_rel")
+
+
+class DcpDirectAllToAll:
+    """Persistent receive storage; unsupported shapes use FlashInfer's exchange."""
+
+    _MAX_ROWS = 1024
+
+    def __init__(self, group):
+        self.group = group
+        self.enabled = (
+            group.world_size == 8
+            and torch.cuda.get_device_name(group.device) == "NVIDIA B300 SXM6 AC"
+        )
+        self.buffers = {}
+
+    def __call__(self, output: torch.Tensor, lse: torch.Tensor):
+        if not (
+            self.enabled
+            and output.dtype == torch.bfloat16
+            and output.ndim == 3
+            and output.shape[1] == 96
+            and output.shape[2] in (128, 512)
+            and output.stride(2) == 1
+            and output.stride(0) % 2 == 0
+            and output.stride(1) % 2 == 0
+            and lse.dtype == torch.float32
+            and lse.shape == output.shape[:2]
+            and 0 < output.shape[0] <= self._MAX_ROWS
+        ):
+            return None
+        dim = output.shape[2]
+        storage = self.buffers.get(dim)
+        if storage is None:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            # Build during eager warmup, even at a smaller batch, so the verify
+            # graph can reuse it. Pad each head to keep 16-byte peer stores aligned.
+            symm_mem.set_signal_pad_size(
+                max(symm_mem.get_signal_pad_size(), 128 * 8 * 4)
+            )
+            with torch.inference_mode(False):
+                buffer = symm_mem.empty(
+                    (8, self._MAX_ROWS, 12, dim // 2 + 4),
+                    dtype=torch.int32,
+                    device=output.device,
+                )
+            handle = symm_mem.rendezvous(buffer, self.group.device_group)
+            assert handle.rank == self.group.rank_in_group
+            peers = torch.tensor(
+                handle.buffer_ptrs, dtype=torch.int64, device=output.device
+            )
+            storage = self.buffers[dim] = (buffer, handle, peers)
+        buffer, handle, peers = storage
+        rows = output.shape[0]
+        if rows < 512:
+            return None
+        words = output.view(torch.int32)
+        _dcp_pack_exchange_kernel[(128,)](
+            words,
+            lse,
+            peers,
+            handle.signal_pad_ptrs_dev,
+            rows,
+            words.stride(0),
+            words.stride(1),
+            lse.stride(0),
+            lse.stride(1),
+            self._MAX_ROWS,
+            handle.rank,
+            words.data_ptr() % 16 == 0
+            and words.stride(0) % 4 == 0
+            and words.stride(1) % 4 == 0,
+            dim,
+            1024,
+            num_warps=32,
+        )
+        # Borrowed until the next exchange; the caller immediately combines
+        # the partials into an owned result with the existing LSE kernel.
+        return (
+            buffer.view(torch.bfloat16)[:, :rows, :, :dim],
+            buffer.view(torch.float32)[:, :rows, :, dim // 2],
+        )
+
+
+@triton.jit
+def _gather_candidate_prefix_kernel(
+    src,
+    lengths,
+    multicast_ptr,
+    signal_ptrs,
+    rows,
+    TOPK: tl.constexpr,
+    RANK: tl.constexpr,
+    WORLD: tl.constexpr,
+    BLOCK: tl.constexpr,
+    COMPACT_PREFIX: tl.constexpr = False,
+):
+    _blockwise_barrier(signal_ptrs, RANK, WORLD, sem="relaxed")
+    _sync_threads()
+    lane = tl.arange(0, BLOCK)
+    for row in range(tl.program_id(0), rows, tl.num_programs(0)):
+        length = tl.load(lengths + row)
+        n = tl.minimum(length, TOPK)
+        dst = multicast_ptr.to(tl.int64).to(tl.pointer_type(tl.int32))
+        base = (RANK * tl.cast(rows, tl.int64) + row) * TOPK * 2
+        if COMPACT_PREFIX and length <= TOPK:
+            # Complete prefixes are emitted in local position order.
+            # The receiver reconstructs positions as column * WORLD + RANK.
+            for start in range(0, tl.cdiv(n, 4), BLOCK):
+                quad = start + lane
+                mask = quad * 4 < n
+                offset = (row.to(tl.int64) * TOPK + quad * 4) * 2
+                s0, _, s1, _ = _local_ld_128(src + offset, mask)
+                s2, _, s3, _ = _local_ld_128(src + offset + 4, mask)
+                _multimem_st_128(dst + base + quad * 4, s0, s1, s2, s3, mask)
+        else:
+            # Each store holds two pairs; the consumer masks an odd tail.
+            for start in range(0, tl.cdiv(n, 2), BLOCK):
+                pair = start + lane
+                mask = pair * 2 < n
+                offset = (row.to(tl.int64) * TOPK + pair * 2) * 2
+                v0, v1, v2, v3 = _local_ld_128(src + offset, mask)
+                _multimem_st_128(dst + base + pair * 4, v0, v1, v2, v3, mask)
+    _sync_threads()
+    _blockwise_barrier(signal_ptrs, RANK, WORLD, sem="acq_rel")
