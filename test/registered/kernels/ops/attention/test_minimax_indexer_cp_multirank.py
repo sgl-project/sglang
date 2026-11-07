@@ -20,7 +20,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import publish_build_topology
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=120, stage="extra-b", runner_config="8-gpu-h200")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 0, 1
@@ -46,10 +46,11 @@ def _cp():
     return cp
 
 
-def _inputs(cp, batch, max_len, dtype):
+def _inputs(cp, batch, max_len, dtype, calls):
+    """Per-call queries and slots; calls read disjoint, non-contiguous request rows."""
     gen = torch.Generator(device="cuda").manual_seed(20261107)
-    # Spare rows and shuffled pages, so neither slots nor a rank's blocks are contiguous.
-    rows = 3 * batch
+    rows = (calls + 1) * batch + 1
+    # Shuffled pages, so a rank's strided blocks never land on contiguous memory.
     pages = torch.randperm(rows * max_len // BLOCK, generator=gen, device="cuda")
     table = (
         (pages.to(torch.int32)[:, None] * BLOCK + torch.arange(BLOCK, device="cuda"))
@@ -60,12 +61,14 @@ def _inputs(cp, batch, max_len, dtype):
         (rows * max_len, 1, DIM), generator=gen, device="cuda", dtype=torch.bfloat16
     ).to(dtype)
     q = torch.randn(
-        (batch, HEADS, DIM), generator=gen, device="cuda", dtype=torch.bfloat16
+        (calls, batch, HEADS, DIM), generator=gen, device="cuda", dtype=torch.bfloat16
     )
     head = cp.rank * HEADS // cp.world
-    slots = (batch + 1 + 2 * torch.arange(batch, device="cuda")).flip(0)
+    qs = [q[call, :, head : head + 1].contiguous() for call in range(calls)]
+    stride = (calls + 1) * torch.arange(batch, device="cuda")
+    slot_sets = [(call + 1 + stride).flip(0) for call in range(calls)]
     lengths = max_len - (37 * torch.arange(batch, device="cuda")) % 200
-    return q[:, head : head + 1].contiguous(), cache, table, slots, lengths
+    return qs, cache, table, slot_sets, lengths
 
 
 def _native(q, cache, table, slots, lengths, max_len):
@@ -104,34 +107,48 @@ def test_multimem_gathers_select_native_blocks(dtype, monkeypatch):
     cp = _cp()
     if cp.multimem is None:
         pytest.skip("no NVLink multicast mapping for this group")
-    max_len = 32768
-    q, cache, table, slots, lengths = _inputs(cp, 4, max_len, dtype)
+    batch, max_len = 4, 32768
+    qs, cache, table, slot_sets, lengths = _inputs(cp, batch, max_len, dtype, calls=3)
     calls = _multimem_gathers(monkeypatch)
 
-    def run():
-        return cp(q, cache, table, slots, lengths, max_len, INIT_BLOCKS, LOCAL_BLOCKS)
+    def run_all():
+        # Back-to-back calls reuse both symmetric buffers, as consecutive layers do.
+        return [
+            cp(q, cache, table, slots, lengths, max_len, INIT_BLOCKS, LOCAL_BLOCKS)
+            for q, slots in zip(qs, slot_sets)
+        ]
 
-    assert torch.equal(run(), _native(q, cache, table, slots, lengths, max_len))
-    assert len(calls) == 2
+    def check(outs):
+        for q, slots, out in zip(qs, slot_sets, outs):
+            assert torch.equal(out, _native(q, cache, table, slots, lengths, max_len))
+
+    check(run_all())
+    assert len(calls) == 2 * len(qs)
     with cp.group.graph_capture() as ctx:
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph, stream=ctx.stream):
-            out = run()
-    # Replays read the symmetric buffers the eager calls also wrote.
+            outs = run_all()
     for shrink in (300, 4097):
-        lengths.copy_(max_len - shrink - (37 * torch.arange(4, device="cuda")) % 200)
+        offsets = (37 * torch.arange(batch, device="cuda")) % 200
+        lengths.copy_(max_len - shrink - offsets)
         graph.replay()
         torch.cuda.synchronize()
-        assert torch.equal(out, _native(q, cache, table, slots, lengths, max_len))
+        check(outs)
 
 
 def test_batch_past_multimem_cap_uses_communicator(monkeypatch):
     cp = _cp()
     batch, max_len = indexer_cp.MULTIMEM_MAX_ROWS + 1, 2048
-    q, cache, table, slots, lengths = _inputs(cp, batch, max_len, torch.bfloat16)
+    qs, cache, table, slot_sets, lengths = _inputs(
+        cp, batch, max_len, torch.bfloat16, calls=1
+    )
     calls = _multimem_gathers(monkeypatch)
-    out = cp(q, cache, table, slots, lengths, max_len, INIT_BLOCKS, LOCAL_BLOCKS)
-    assert torch.equal(out, _native(q, cache, table, slots, lengths, max_len))
+    out = cp(
+        qs[0], cache, table, slot_sets[0], lengths, max_len, INIT_BLOCKS, LOCAL_BLOCKS
+    )
+    assert torch.equal(
+        out, _native(qs[0], cache, table, slot_sets[0], lengths, max_len)
+    )
     assert not calls
 
 
