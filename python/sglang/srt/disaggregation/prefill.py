@@ -706,6 +706,11 @@ class SchedulerDisaggregationPrefillMixin:
         last_batch: Optional[ScheduleBatch],
         should_retry_storage_prefetch: bool = True,
     ) -> NextBatchPlan:
+        if (
+            envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+            and get_parallel().pp_size == 1
+        ):
+            self.process_disagg_prefill_transfer_queue()
         self.process_pending_chunked_abort()
         self._process_hicache_events(
             should_retry_storage_prefetch=should_retry_storage_prefetch
@@ -762,6 +767,14 @@ class SchedulerDisaggregationPrefillMixin:
                 batch, chunked_req=self.chunked_req
             )
             self.cur_batch_for_debug = batch
+
+            # Transfers can finish during preparation. Retire them before
+            # another forward delays their response and cache release.
+            if (
+                envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+                and get_parallel().pp_size == 1
+            ):
+                self.process_disagg_prefill_transfer_queue()
 
             # Launch the current batch
             if batch:
@@ -926,6 +939,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self.cur_batch_for_debug = batch
                 # Skip batch creation next round to avoid repeated preparation failures.
                 skip_batch_creation = batch is None
+
+                # Keep the same completion boundary for active and idle ranks.
+                if (
+                    envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+                    and get_parallel().pp_size == 1
+                ):
+                    self.process_disagg_prefill_transfer_queue()
 
                 # Launch the current batch
                 if batch:

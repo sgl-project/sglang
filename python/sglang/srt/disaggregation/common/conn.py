@@ -3316,10 +3316,16 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         bootstrap_room = int(data["bootstrap_room"])
         dp_rank = int(data["dp_rank"])
         async with self.lock:
-            self.room_to_dp_rank[bootstrap_room] = {
-                "dp_rank": dp_rank,
-                "timestamp": time.time(),
-            }
+            # Controller hints can arrive after the worker's authoritative
+            # registration. They must never overwrite or extend that entry.
+            if (
+                not data.get("advisory", False)
+                or bootstrap_room not in self.room_to_dp_rank
+            ):
+                self.room_to_dp_rank[bootstrap_room] = {
+                    "dp_rank": dp_rank,
+                    "timestamp": time.time(),
+                }
         logger.debug(f"Registered dp_rank={dp_rank} for {bootstrap_room=}")
         return web.Response(text="OK", status=200)
 
