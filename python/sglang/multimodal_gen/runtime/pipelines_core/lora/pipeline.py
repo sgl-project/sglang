@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.layers.lora.linear import (
     replace_submodule,
     wrap_with_lora_layer,
 )
+from sglang.multimodal_gen.runtime.layers.lora.lokr import LoKrAdapter
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     is_layerwise_offloaded_module,
@@ -38,6 +39,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import 
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.format_adapter import (
     normalize_lora_state_dict,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.lora.lokr_adapter import (
+    load_lokr_adapter,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.lora.lora_merge_cache import (
     LoraMergeCache,
@@ -165,7 +169,7 @@ class LoRAPipeline(ComposedPipelineBase):
     # Type annotations for instance attributes (initialized in __init__)
     # [lora_nickname][target_LoRA_weight_name_in_SGLang_dit] = weight
     # e.g., [jinx][transformer_blocks.0.attn.to_v.lora_A]
-    lora_adapters: dict[str, dict[str, torch.Tensor]]
+    lora_adapters: dict[str, dict[str, torch.Tensor | LoKrAdapter]]
     loaded_adapter_paths: dict[str, str]  # nickname -> lora_path
     loaded_adapter_files: dict[str, str]  # nickname -> resolved local file
     loaded_adapter_configs: dict[str, dict]  # nickname -> PEFT config at load
@@ -811,6 +815,16 @@ class LoRAPipeline(ComposedPipelineBase):
             for idx, (nickname, path, lora_strength) in enumerate(
                 zip(lora_nicknames, lora_paths, strengths)
             ):
+                lokr = self.lora_adapters[nickname].get(name + ".lokr")
+                if lokr is not None:
+                    if merge_weights or len(lora_nicknames) != 1:
+                        raise ValueError(
+                            "LoKr requires a single adapter in dynamic mode"
+                        )
+                    layer.set_lokr_weights(lokr, path, lora_strength)
+                    adapted_count += 1
+                    applied_count_by_adapter[idx] += 1
+                    continue
                 lora_A_name = name + ".lora_A"
                 lora_B_name = name + ".lora_B"
                 if (
@@ -925,7 +939,7 @@ class LoRAPipeline(ComposedPipelineBase):
         nickname = lora_nicknames[0]
         strength = strengths[0]
         adapter = self.lora_adapters.get(nickname)
-        if adapter is None:
+        if adapter is None or any(name.endswith(".lokr") for name in adapter):
             return None
         path = lora_paths[0] or self.loaded_adapter_paths.get(nickname)
         if path is None:
@@ -993,6 +1007,8 @@ class LoRAPipeline(ComposedPipelineBase):
         rank: int,
         weight_name: str | None = None,
         lora_alpha: int | None = None,
+        *,
+        allow_lokr: bool = True,
     ):
         """
         Load the LoRA, and setup the lora_adapters for later weight replacement
@@ -1021,17 +1037,52 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_fingerprint = (stat.st_size, stat.st_mtime_ns)
         raw_state_dict = load_file(lora_local_path)
         adapter_config = load_peft_config(lora_local_path)
-        lora_state_dict = normalize_lora_state_dict(
-            raw_state_dict,
-            logger=logger,
-            adapter_config=adapter_config,
+        is_lokr = any(".lokr_" in name for name in raw_state_dict)
+        if is_lokr:
+            # A rejected request must not replace a cached adapter or its metadata.
+            if not allow_lokr:
+                raise ValueError(
+                    "LoKr requires one transformer adapter in auto or dynamic mode"
+                )
+            from sglang.multimodal_gen.configs.models.dits.zimage import (
+                ZImageArchConfig,
+            )
+
+            if (
+                not isinstance(
+                    self.server_args.pipeline_config.dit_config.arch_config,
+                    ZImageArchConfig,
+                )
+                or self.server_args.num_gpus != 1
+                or self.server_args.tp_size != 1
+                or self._uses_dtensor_weights(self.lora_layers)
+                or any(
+                    not layer.can_merge_base_weight
+                    for layer in self.lora_layers.values()
+                )
+            ):
+                raise ValueError(
+                    "LoKr currently requires single-GPU, unquantized Z-Image without FSDP"
+                )
+            if adapter_config or lora_alpha is not None:
+                raise ValueError(
+                    "Full-matrix LoKr does not accept PEFT config or a LoRA alpha override"
+                )
+        lora_state_dict = (
+            raw_state_dict
+            if is_lokr
+            else normalize_lora_state_dict(
+                raw_state_dict,
+                logger=logger,
+                adapter_config=adapter_config,
+            )
         )
         adapter_lora_alpha = lora_alpha
         if adapter_lora_alpha is None:
             adapter_lora_alpha = get_peft_lora_alpha(adapter_config)
 
         # Swapped in at the end so a failed load keeps the previous adapter.
-        new_adapter: dict[str, torch.Tensor] = {}
+        new_adapter: dict[str, torch.Tensor | LoKrAdapter] = {}
 
         config = self.server_args.pipeline_config.dit_config.arch_config
 
@@ -1044,8 +1095,13 @@ class LoRAPipeline(ComposedPipelineBase):
             or self.modules["transformer"].lora_param_names_mapping
         )
 
+        if is_lokr:
+            new_adapter = load_lokr_adapter(
+                lora_state_dict, self.lora_layers, param_names_mapping_fn, self.device
+            )
+
         to_merge_params: defaultdict[Hashable, dict[Any, Any]] = defaultdict(dict)
-        for name, weight in lora_state_dict.items():
+        for name, weight in ({} if is_lokr else lora_state_dict).items():
             name = name.replace("diffusion_model.", "")
             name = name.removesuffix(".weight")
             # misc-format -> HF-format
@@ -1084,7 +1140,7 @@ class LoRAPipeline(ComposedPipelineBase):
             self.device,
         )
         transformer = self.modules["transformer"]
-        if isinstance(transformer, BaseDiT):
+        if isinstance(transformer, BaseDiT) and not is_lokr:
             new_adapter = transformer.prepare_lora_adapter(new_adapter)
         self.lora_adapters[lora_nickname] = new_adapter
 
@@ -1152,6 +1208,11 @@ class LoRAPipeline(ComposedPipelineBase):
         adapter_updated = False
         rank = dist.get_rank()
 
+        allow_lokr = (
+            len(lora_nicknames) == 1
+            and targets[0] in ("all", "transformer")
+            and merge_mode != "merge"
+        )
         # load required adapters
         for nickname, path, alpha in zip(lora_nicknames, lora_paths, lora_alphas):
             if nickname not in self.lora_adapters and path is None:
@@ -1167,7 +1228,9 @@ class LoRAPipeline(ComposedPipelineBase):
                     should_load = True
             if should_load:
                 adapter_updated = True
-                self.load_lora_adapter(path, nickname, rank, lora_alpha=alpha)
+                self.load_lora_adapter(
+                    path, nickname, rank, lora_alpha=alpha, allow_lokr=allow_lokr
+                )
             elif (
                 alpha is not None and self.loaded_adapter_alphas.get(nickname) != alpha
             ):
@@ -1178,7 +1241,22 @@ class LoRAPipeline(ComposedPipelineBase):
                     nickname,
                     rank,
                     lora_alpha=alpha,
+                    allow_lokr=allow_lokr,
                 )
+
+        has_lokr = any(
+            name.endswith(".lokr")
+            for nickname in lora_nicknames
+            for name in self.lora_adapters[nickname]
+        )
+        if has_lokr:
+            if len(lora_nicknames) != 1 or targets[0] not in ("all", "transformer"):
+                raise ValueError("LoKr supports one adapter on the transformer only")
+            if merge_mode == "merge":
+                raise ValueError(
+                    "LoKr currently supports dynamic mode only; use auto or dynamic"
+                )
+            merge_mode = "dynamic"
 
         # Group by target to apply separately
         target_to_indices = {}
@@ -1520,6 +1598,15 @@ class LoRAPipeline(ComposedPipelineBase):
             logger.warning("merge_lora_weights: %s", error)
         if not target_modules:
             return
+
+        if any(
+            layer.lokr_adapter is not None
+            for _, layers in target_modules
+            for layer in layers.values()
+        ):
+            raise ValueError(
+                "LoKr currently supports dynamic mode only; use set_lora to change strength"
+            )
 
         with self._weight_update_context(target_modules):
             for module_name, lora_layers_dict in target_modules:
