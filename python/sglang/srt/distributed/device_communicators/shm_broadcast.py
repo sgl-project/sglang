@@ -30,6 +30,31 @@ SGLANG_RINGBUFFER_WARNING_INTERVAL = int(
 logger = logging.getLogger(__name__)
 
 
+def _get_local_subscribe_port_range() -> Optional[tuple[int, int]]:
+    """Return a half-open loopback port range, or use ZMQ's default range."""
+    base = envs.SGLANG_PORT.get()
+    width = envs.SGLANG_SHM_PORTS_PER_RANK.get()
+    if width < 0:
+        raise ValueError("SGLANG_SHM_PORTS_PER_RANK must be nonnegative")
+    if base is None:
+        if width:
+            raise ValueError("SGLANG_SHM_PORTS_PER_RANK requires SGLANG_PORT")
+        return None
+
+    # Use the global rank: multiple local TP groups can each have group rank 0.
+    # Standalone queues constructed before distributed initialization use rank 0.
+    rank = dist.get_rank() if width and dist.is_initialized() else 0
+    first = base + rank * width
+    last = first + (width or 8)
+    if not 1 <= first < last <= 65536:
+        raise ValueError(
+            f"Invalid local SHM port range [{first}, {last}) for rank {rank}; "
+            "choose SGLANG_PORT and SGLANG_SHM_PORTS_PER_RANK so all writer "
+            "ranges fit in ports 1 through 65535"
+        )
+    return first, last
+
+
 class ShmRingBuffer:
     def __init__(
         self,
@@ -194,6 +219,10 @@ class MessageQueue:
                 get_local_ip_auto("0.0.0.0") if n_remote_reader > 0 else "127.0.0.1"
             )
 
+        # Validate before allocating shared memory or creating sockets.
+        local_port_range = (
+            _get_local_subscribe_port_range() if n_local_reader > 0 else None
+        )
         context = Context()
 
         if n_local_reader > 0:
@@ -210,12 +239,11 @@ class MessageQueue:
             # message. otherwise, we will only receive the first subscription
             # see http://api.zeromq.org/3-3:zmq-setsockopt for more details
             self.local_socket.setsockopt(XPUB_VERBOSE, True)
-            # Bind atomically to avoid get_open_port()'s check-then-bind race;
-            # search from SGLANG_PORT to keep the existing port range.
-            sglang_port = envs.SGLANG_PORT.get()
-            if sglang_port is not None:
+            # Bind atomically within the shared or per-rank loopback window.
+            if local_port_range is not None:
+                first, last = local_port_range
                 local_subscribe_port = self.local_socket.bind_to_random_port(
-                    "tcp://127.0.0.1", min_port=sglang_port, max_port=sglang_port + 8
+                    "tcp://127.0.0.1", min_port=first, max_port=last
                 )
             else:
                 local_subscribe_port = self.local_socket.bind_to_random_port(

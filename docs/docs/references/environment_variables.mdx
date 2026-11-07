@@ -35,8 +35,13 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_PORT`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Port for the server</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Base port hint for ephemeral sockets, including the SHM broadcaster. Configure the HTTP listening port with <code>--port</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>auto-detected</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SHM_PORTS_PER_RANK</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Candidate loopback XPUB ports per global distributed rank. A positive width requires <code>SGLANG_PORT</code> and selects from <code>[base + rank * width, base + (rank + 1) * width)</code>. Standalone queues use rank 0 before distributed initialization. All writer ranges must fit in ports 1–65535. For example, base 43000 and width 128 separate local writer groups. Ports are selected when binding, not reserved in advance. Zero retains the shared 8-port window.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`SGLANG_LOGGING_CONFIG_PATH`</td>
