@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU coverage for SANA's automatic strided LayerNorm dispatch."""
+"""CPU coverage for SANA LayerNorm dispatch validation."""
 
 import unittest
 from contextlib import ExitStack
@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class _FakeCudaTensor:
+class _FakeTensor:
     def __init__(self, shape, stride, *, dtype=torch.bfloat16):
         self.shape = tuple(shape)
         self._stride = tuple(stride)
@@ -40,49 +40,26 @@ class _FakeCudaTensor:
 
     def contiguous(self):
         _, seq, hidden = self.shape
-        return _FakeCudaTensor(
-            self.shape, (seq * hidden, hidden, 1), dtype=self.dtype
-        )
-
-
-class _FakeModulation:
-    def __init__(self, batch, hidden, *, stride=None):
-        self.shape = (batch, 1, hidden)
-        self._stride = stride or (hidden, hidden, 1)
-        self.dtype = torch.bfloat16
-        self.device = torch.device("cuda")
-
-    def dim(self):
-        return 3
-
-    def stride(self, dim=None):
-        return self._stride if dim is None else self._stride[dim]
+        return _FakeTensor(self.shape, (seq * hidden, hidden, 1), dtype=self.dtype)
 
     def __getitem__(self, _index):
         return self
 
 
-class TestSanaStridedLayerNormDispatch(CustomTestCase):
+class TestSanaLayerNormDispatch(CustomTestCase):
     def _patch_runtime(self, stack, *, capability=(9, 0), capturing=False):
-        current_stream = object()
-        default_stream = object()
         stack.enter_context(
             patch.object(torch.compiler, "is_compiling", return_value=False)
         )
         stack.enter_context(
-            patch.object(
+            patch.multiple(
                 torch.cuda,
-                "is_current_stream_capturing",
-                return_value=capturing,
+                is_current_stream_capturing=lambda: capturing,
+                current_stream=lambda: "side",
+                default_stream=lambda: "default",
             )
         )
-        stack.enter_context(
-            patch.object(torch.cuda, "current_stream", return_value=current_stream)
-        )
-        stack.enter_context(
-            patch.object(torch.cuda, "default_stream", return_value=default_stream)
-        )
-        arch_patch = stack.enter_context(
+        arch = stack.enter_context(
             patch.object(
                 sana,
                 "current_arch",
@@ -94,151 +71,143 @@ class TestSanaStridedLayerNormDispatch(CustomTestCase):
         stack.enter_context(
             patch.object(sana, "can_use_fused_layernorm_modulate", return_value=True)
         )
-        return arch_patch
+        return arch
 
     def _patch_gate(self, stack):
         gate = BitExactFusionGate("SANA dispatch test", per_signature=True)
-        stack.enter_context(patch.object(sana, "_SANA_LN_MOD", gate))
-        stack.enter_context(patch.object(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs))
-        stack.enter_context(patch.object(sana, "_SANA_LN_MOD_DISABLED", False))
+        stack.enter_context(
+            patch.multiple(
+                sana,
+                _SANA_LN_MOD=gate,
+                _SANA_LN_MOD_SIGS=gate.verified_sigs,
+                _SANA_LN_MOD_DISABLED=False,
+            )
+        )
         return gate
 
     @staticmethod
-    def _inputs(x_stride=(136, 1, 17), scale_stride=None):
-        batch, seq, hidden = 2, 17, 8
+    def _inputs(x_stride=(136, 1, 17), scale_stride=(8, 8, 1)):
         return (
-            _FakeCudaTensor((batch, seq, hidden), x_stride),
-            _FakeModulation(batch, hidden, stride=scale_stride),
-            _FakeModulation(batch, hidden),
-            nn.LayerNorm(hidden, elementwise_affine=False),
+            _FakeTensor((2, 17, 8), x_stride),
+            _FakeTensor((2, 1, 8), scale_stride),
+            _FakeTensor((2, 1, 8), (8, 8, 1)),
         )
 
-    def test_eligible_layout_dispatches_automatically_and_verifies_per_arch(self):
-        x, scale, shift, norm = self._inputs()
-        expected = torch.tensor([1.0])
-        with ExitStack() as stack:
-            arch_patch = self._patch_runtime(stack)
-            gate = self._patch_gate(stack)
-            stack.enter_context(
-                patch.object(sana, "_eager_ln_modulate", return_value=expected)
+    @staticmethod
+    def _patch_outputs(stack, result):
+        eager = stack.enter_context(
+            patch.object(sana, "_eager_ln_modulate", return_value=result)
+        )
+        strided = stack.enter_context(
+            patch.object(
+                sana, "fused_layernorm_modulate_strided_raw", return_value=result
             )
-            strided = stack.enter_context(
-                patch.object(
-                    sana,
-                    "fused_layernorm_modulate_strided_raw",
-                    return_value=expected,
-                )
-            )
-            contiguous = stack.enter_context(
-                patch.object(
-                    sana, "fused_layernorm_modulate_raw", return_value=expected
-                )
-            )
+        )
+        contiguous = stack.enter_context(
+            patch.object(sana, "fused_layernorm_modulate_raw", return_value=result)
+        )
+        return eager, strided, contiguous
 
-            actual = sana.sana_ln_modulate(norm, x, scale, shift)
-            self.assertTrue(torch.equal(actual, expected))
-            arch_patch.return_value = SimpleNamespace(
+    def test_automatic_dispatch_and_arch_scoped_signatures(self):
+        x, scale, shift = self._inputs()
+        contiguous_x, _, _ = self._inputs(x_stride=(136, 8, 1))
+        norm = nn.LayerNorm(8, elementwise_affine=False)
+        expected = torch.tensor([1.0])
+
+        with ExitStack() as stack:
+            arch = self._patch_runtime(stack)
+            gate = self._patch_gate(stack)
+            _, strided, contiguous = self._patch_outputs(stack, expected)
+
+            sana.sana_ln_modulate(norm, x, scale, shift)
+            arch.return_value = SimpleNamespace(
                 cuda=SimpleNamespace(capability=(10, 0))
             )
-            actual = sana.sana_ln_modulate(norm, x, scale, shift)
-            self.assertTrue(torch.equal(actual, expected))
+            sana.sana_ln_modulate(norm, x, scale, shift)
+            sana.sana_ln_modulate(norm, contiguous_x, scale, shift)
+            arch.return_value = SimpleNamespace(
+                cuda=SimpleNamespace(capability=(12, 0))
+            )
+            sana.sana_ln_modulate(norm, contiguous_x, scale, shift)
 
             self.assertEqual(strided.call_count, 2)
-            contiguous.assert_not_called()
+            self.assertEqual(contiguous.call_count, 2)
             self.assertEqual(
-                {sig[1] for sig in gate.verified_sigs}, {(9, 0), (10, 0)}
+                {(sig[0], sig[1]) for sig in gate.verified_sigs},
+                {
+                    ("strided", (9, 0)),
+                    ("strided", (10, 0)),
+                    ("contiguous", (10, 0)),
+                    ("contiguous", (12, 0)),
+                },
             )
 
-    def test_unsupported_stride_uses_the_contiguous_path(self):
-        x, scale, shift, norm = self._inputs(x_stride=(135, 1, 17))
-        expected = torch.tensor([1.0])
+    def test_cached_signature_cannot_bypass_plain_layernorm_requirement(self):
+        x, scale, shift = self._inputs(x_stride=(136, 8, 1))
+        plain_norm = nn.LayerNorm(8, eps=1e-6, elementwise_affine=False)
+        affine_norm = nn.LayerNorm(8, eps=1e-6, elementwise_affine=True)
+        plain_result, affine_result = torch.tensor([1.0]), torch.tensor([2.0])
+
         with ExitStack() as stack:
             self._patch_runtime(stack)
             self._patch_gate(stack)
-            stack.enter_context(
-                patch.object(sana, "_eager_ln_modulate", return_value=expected)
-            )
-            strided = stack.enter_context(
-                patch.object(sana, "fused_layernorm_modulate_strided_raw")
+            eager = stack.enter_context(
+                patch.object(
+                    sana,
+                    "_eager_ln_modulate",
+                    side_effect=[plain_result, affine_result],
+                )
             )
             contiguous = stack.enter_context(
                 patch.object(
-                    sana, "fused_layernorm_modulate_raw", return_value=expected
+                    sana, "fused_layernorm_modulate_raw", return_value=plain_result
                 )
             )
 
-            sana.sana_ln_modulate(norm, x, scale, shift)
+            sana.sana_ln_modulate(plain_norm, x, scale, shift)
+            actual = sana.sana_ln_modulate(affine_norm, x, scale, shift)
 
-            strided.assert_not_called()
+            self.assertTrue(torch.equal(actual, affine_result))
             contiguous.assert_called_once()
+            self.assertEqual(eager.call_count, 2)
 
-    def test_incompatible_modulation_falls_back_to_eager(self):
-        x, scale, shift, norm = self._inputs(scale_stride=(8, 8, 2))
+    def test_unsupported_layouts_fall_back_appropriately(self):
         expected = torch.tensor([1.0])
-        with ExitStack() as stack:
-            self._patch_runtime(stack)
-            gate = self._patch_gate(stack)
-            stack.enter_context(
-                patch.object(sana, "_eager_ln_modulate", return_value=expected)
-            )
-            strided = stack.enter_context(
-                patch.object(sana, "fused_layernorm_modulate_strided_raw")
-            )
-            contiguous = stack.enter_context(
-                patch.object(
-                    sana,
-                    "fused_layernorm_modulate_raw",
-                    side_effect=RuntimeError("incompatible modulation strides"),
-                )
-            )
+        cases = (
+            ((135, 1, 17), (8, 8, 1), True),
+            ((136, 1, 17), (8, 8, 2), False),
+        )
+        for x_stride, scale_stride, uses_contiguous in cases:
+            with self.subTest(x_stride=x_stride, scale_stride=scale_stride):
+                x, scale, shift = self._inputs(x_stride, scale_stride)
+                with ExitStack() as stack:
+                    self._patch_runtime(stack)
+                    gate = self._patch_gate(stack)
+                    _, strided, contiguous = self._patch_outputs(stack, expected)
 
-            actual = sana.sana_ln_modulate(norm, x, scale, shift)
+                    actual = sana.sana_ln_modulate(
+                        nn.LayerNorm(8, elementwise_affine=False), x, scale, shift
+                    )
 
-            self.assertTrue(torch.equal(actual, expected))
-            strided.assert_not_called()
-            contiguous.assert_called_once()
-            self.assertTrue(gate.disabled)
+                    self.assertTrue(torch.equal(actual, expected))
+                    strided.assert_not_called()
+                    if uses_contiguous:
+                        contiguous.assert_called_once()
+                    else:
+                        contiguous.assert_not_called()
+                        self.assertFalse(gate.verified_sigs)
 
-    def test_numerical_mismatch_disables_candidate_and_returns_eager(self):
-        x, scale, shift, norm = self._inputs()
-        expected = torch.tensor([1.0])
-        with ExitStack() as stack:
-            self._patch_runtime(stack)
-            gate = self._patch_gate(stack)
-            stack.enter_context(
-                patch.object(sana, "_eager_ln_modulate", return_value=expected)
-            )
-            stack.enter_context(
-                patch.object(
-                    sana,
-                    "fused_layernorm_modulate_strided_raw",
-                    return_value=torch.tensor([0.0]),
-                )
-            )
-
-            actual = sana.sana_ln_modulate(norm, x, scale, shift)
-
-            self.assertTrue(torch.equal(actual, expected))
-            self.assertTrue(gate.disabled)
-            self.assertFalse(gate.verified_sigs)
-
-    def test_unverified_signature_falls_back_during_capture(self):
-        x, scale, shift, norm = self._inputs()
+    def test_unverified_signature_uses_eager_during_capture(self):
+        x, scale, shift = self._inputs()
         expected = torch.tensor([1.0])
         with ExitStack() as stack:
             self._patch_runtime(stack, capturing=True)
             gate = self._patch_gate(stack)
-            stack.enter_context(
-                patch.object(sana, "_eager_ln_modulate", return_value=expected)
-            )
-            strided = stack.enter_context(
-                patch.object(sana, "fused_layernorm_modulate_strided_raw")
-            )
-            contiguous = stack.enter_context(
-                patch.object(sana, "fused_layernorm_modulate_raw")
-            )
+            _, strided, contiguous = self._patch_outputs(stack, expected)
 
-            sana.sana_ln_modulate(norm, x, scale, shift)
+            sana.sana_ln_modulate(
+                nn.LayerNorm(8, elementwise_affine=False), x, scale, shift
+            )
 
             strided.assert_not_called()
             contiguous.assert_not_called()

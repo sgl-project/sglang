@@ -47,35 +47,26 @@ def _eager_ln_modulate(
     return norm(x) * (1 + scale) + shift
 
 
-def _can_use_strided_sana_ln_modulate(
+def _can_use_sana_ln_modulate(
     norm: nn.LayerNorm,
     x: torch.Tensor,
     scale: torch.Tensor,
     shift: torch.Tensor,
 ) -> bool:
-    if (
-        not x.is_cuda
-        or x.dtype is not torch.bfloat16
-        or x.dim() != 3
-        or x.is_contiguous()
-    ):
-        return False
-
-    batch, seq_len, hidden = x.shape
-    if not (
-        x.numel() > 0
-        and x.stride(1) == 1
-        and x.stride(2) == seq_len
-        and (batch <= 1 or x.stride(0) == seq_len * hidden)
-        and can_use_fused_layernorm_modulate(x.dtype, hidden)
-        and is_plain_layer_norm(norm, hidden)
-    ):
+    if not x.is_cuda or x.dtype is not torch.bfloat16 or x.dim() != 3 or x.numel() == 0:
         return False
 
     if not (
-        scale.shape == (batch, 1, hidden)
-        and shift.shape == scale.shape
-        and scale.dtype is torch.bfloat16
+        can_use_fused_layernorm_modulate(x.dtype, x.shape[-1])
+        and is_plain_layer_norm(norm, x.shape[-1])
+    ):
+        return False
+
+    batch, _, hidden = x.shape
+    if scale.shape != (batch, 1, hidden) or shift.shape != scale.shape:
+        return False
+    if not (
+        scale.dtype is torch.bfloat16
         and shift.dtype is torch.bfloat16
         and scale.device == x.device
         and shift.device == x.device
@@ -86,6 +77,16 @@ def _can_use_strided_sana_ln_modulate(
         return False
 
     return True
+
+
+def _has_strided_sana_ln_layout(x: torch.Tensor) -> bool:
+    batch, seq_len, hidden = x.shape
+    return (
+        not x.is_contiguous()
+        and x.stride(1) == 1
+        and x.stride(2) == seq_len
+        and (batch <= 1 or x.stride(0) == seq_len * hidden)
+    )
 
 
 def sana_ln_modulate(
@@ -122,12 +123,13 @@ def sana_ln_modulate(
     if not capturing and torch.cuda.current_stream() == torch.cuda.default_stream():
         return _eager_ln_modulate(norm, x, scale, shift)
 
-    strided_eligible = _can_use_strided_sana_ln_modulate(norm, x, scale, shift)
+    if not _can_use_sana_ln_modulate(norm, x, scale, shift):
+        return _eager_ln_modulate(norm, x, scale, shift)
+
+    strided_eligible = _has_strided_sana_ln_layout(x)
     variant = "strided" if strided_eligible else "contiguous"
-    architecture = None
-    if strided_eligible:
-        cuda_arch = current_arch().cuda
-        architecture = cuda_arch.capability if cuda_arch is not None else None
+    cuda_arch = current_arch().cuda
+    architecture = cuda_arch.capability if cuda_arch is not None else None
     sig = (
         variant,
         architecture,
@@ -151,36 +153,26 @@ def sana_ln_modulate(
         # unverified signature during capture: cannot sync-verify here
         return _eager_ln_modulate(norm, x, scale, shift)
 
-    if (
-        x.dtype is torch.bfloat16
-        and x.dim() == 3
-        and scale.dim() == 3
-        and scale.shape[1] == 1
-        and shift.shape == scale.shape
-        and is_plain_layer_norm(norm, x.shape[-1])
-    ):
-        if strided_eligible:
-            fused_fn = fused_layernorm_modulate_strided_raw
-            fused_x = x
-        else:
-            fused_x = x.contiguous()
-            if not can_use_fused_layernorm_modulate(fused_x.dtype, fused_x.shape[-1]):
-                return _eager_ln_modulate(norm, x, scale, shift)
-            fused_fn = fused_layernorm_modulate_raw
-        try:
-            out = fused_fn(fused_x, scale[:, 0], shift[:, 0], norm.eps)
-        except Exception as exc:
-            _SANA_LN_MOD.on_exception(exc, logger=logger)
-            _SANA_LN_MOD_DISABLED = True
-        else:
-            result = _SANA_LN_MOD.accept_or_fallback(
-                out,
-                _eager_ln_modulate(norm, x, scale, shift),
-                sig=sig,
-                logger=logger,
-            )
-            _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
-            return result
+    if strided_eligible:
+        fused_fn = fused_layernorm_modulate_strided_raw
+        fused_x = x
+    else:
+        fused_fn = fused_layernorm_modulate_raw
+        fused_x = x.contiguous()
+    try:
+        out = fused_fn(fused_x, scale[:, 0], shift[:, 0], norm.eps)
+    except Exception as exc:
+        _SANA_LN_MOD.on_exception(exc, logger=logger)
+        _SANA_LN_MOD_DISABLED = True
+    else:
+        result = _SANA_LN_MOD.accept_or_fallback(
+            out,
+            _eager_ln_modulate(norm, x, scale, shift),
+            sig=sig,
+            logger=logger,
+        )
+        _SANA_LN_MOD_DISABLED = _SANA_LN_MOD.disabled
+        return result
 
     return _eager_ln_modulate(norm, x, scale, shift)
 
