@@ -75,6 +75,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_BLOCK, TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.mem_cache.pool_host.base import uses_shared_host_layout
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -4303,6 +4304,44 @@ class UnifiedRadixCache(BasePrefixCache):
     def full_evictable_size(self) -> int:
         return self.tree_core.full_evictable_size()
 
+    def full_unreclaimable_size(self) -> int:
+        """Evictable FULL tokens a write-back eviction cannot free with the host
+        room it has now; prefill admission must not count them."""
+        cc = self.cache_controller
+        if not self.is_write_back or cc is None:
+            return 0
+        full_evictable = self.full_evictable_size()
+        anchor = cc.mem_pool_host.anchor_entry.host_pool
+        domain = anchor.shared_allocation_domain
+        if domain is None:
+            host_free = cc.mem_pool_host.available_size()
+            if host_free >= full_evictable:
+                return 0
+        else:
+            # A backup takes bytes from every pool of the shared domain, while
+            # host eviction is only credited with the KV bytes it frees.
+            backup_bytes_per_token = sum(
+                entry.host_pool.size_per_token
+                for entry in cc.mem_pool_host.entries
+                if uses_shared_host_layout(entry.host_pool)
+                and entry.host_pool.shared_allocation_domain is domain
+            )
+            free_bytes = domain.free_bytes()
+            if free_bytes >= full_evictable * backup_bytes_per_token:
+                return 0
+        stuck, needs_host, droppable, host_evictable = (
+            self.tree_core.full_write_back_reclaim_classes()
+        )
+        # Droppable victims may back up first and take the room.
+        if domain is None:
+            fits = host_free + host_evictable >= droppable + needs_host
+        else:
+            fits = (
+                free_bytes + host_evictable * anchor.size_per_token
+                >= (droppable + needs_host) * backup_bytes_per_token
+            )
+        return 0 if needs_host == 0 or fits else stuck
+
     def full_protected_size(self) -> int:
         return self.tree_core.full_protected_size() + (
             self.linker.prefetch_size(PoolName.KV) if self.linker is not None else 0
@@ -4349,6 +4388,11 @@ class UnifiedRadixCache(BasePrefixCache):
             f"Available full tokens: {full_available_size + full_evictable} "
             f"(full_available_size={full_available_size} + full_evictable_size_={full_evictable})"
         ]
+        if self.is_write_back:
+            # Admission already excluded these; a failure despite that is an accounting gap.
+            lines.append(
+                f"Write-back unreclaimable full tokens now: {self.full_unreclaimable_size()}"
+            )
         for ct in self.tree_components:
             if ct == BASE_COMPONENT_TYPE:
                 continue

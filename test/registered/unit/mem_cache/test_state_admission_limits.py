@@ -74,6 +74,7 @@ def _cache():
     return SimpleNamespace(
         sliding_window_size=16,
         full_evictable_size=lambda: 0,
+        full_unreclaimable_size=lambda: 0,
         swa_evictable_size=lambda: 0,
         auxiliary_swa_evictable_size=lambda: 0,
         mamba_evictable_size=lambda: 0,

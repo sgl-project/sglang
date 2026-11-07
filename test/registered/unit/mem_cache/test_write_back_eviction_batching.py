@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -632,6 +633,90 @@ class _WriteBackBatchingSuite:
                     cache.tree_core.commit_load_back(
                         node, device_indices, kv_xfer, comp_xfers
                     )
+
+    def _admission_promise(self, cache, allocator):
+        """The Full tokens one admission round counts on eviction for, and what
+        evicting that many actually frees."""
+        budget = PrefillBudget(allocator, cache)
+        promised = budget.remaining_total - allocator.available_size()
+        if promised <= 0:
+            return promised, 0
+        return promised, cache.evict(
+            EvictParams(num_tokens=promised)
+        ).num_tokens_evicted
+
+    def test_admission_never_promises_what_write_back_cannot_free(self):
+        """With the host pool full and a pinned host-only child under an
+        unbacked device parent, the parent can be neither backed up nor dropped,
+        and its backed grandparent never becomes a leaf; admission counted both
+        as evictable, so the prefill allocation that relied on them failed."""
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            host_tokens=BATCH_TOKENS,
+        )
+        grandparent = [1000 + t for t in range(PAGE)]
+        parent = grandparent + [2000 + t for t in range(2 * PAGE)]
+        child = parent + [3000 + t for t in range(PAGE)]
+        for seq in (grandparent, parent, child):
+            insert_seq(cache, allocator, seq)
+        self.assertTrue(
+            cache.backup_node_for_write_back(
+                match_seq(cache, grandparent).last_device_node
+            )
+        )
+        child_node = match_seq(cache, child).last_device_node
+        cache.evict(EvictParams(num_tokens=PAGE))
+        self.assertEqual(match_seq(cache, child).host_hit_length, PAGE)
+        pin = cache.inc_host_lock_ref(child_node).to_dec_params()
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+
+        self.assertEqual(cache.full_evictable_size(), len(parent))
+        self.assertEqual(cache.full_unreclaimable_size(), len(parent))
+        self.assertEqual(self._admission_promise(cache, allocator), (0, 0))
+
+        # Unpinned, the parent drops and the backed grandparent demotes.
+        cache.dec_host_lock_ref(child_node, pin)
+        self.assertEqual(cache.full_unreclaimable_size(), 0)
+        promised, freed = self._admission_promise(cache, allocator)
+        self.assertEqual(promised, len(parent))
+        self.assertGreaterEqual(freed, promised)
+        cache.sanity_check()
+
+    def test_admission_credits_host_room_only_when_it_covers_the_backup(self):
+        """An unbacked parent whose host-only child is pinned is freeable only
+        through a backup. Host eviction can hand it the room of an unpinned
+        host-only sibling: admission counts the parent when that room covers the
+        whole backup, and not when it covers only part of it."""
+        for sibling_pages, freeable in ((2, True), (1, False)):
+            with self.subTest(sibling_pages=sibling_pages):
+                cache, allocator, host_pool = write_back_cache(
+                    self.tree_core_backend,
+                    device_tokens=4 * BATCH_TOKENS,
+                    host_tokens=BATCH_TOKENS,
+                )
+                sibling = [5000 + t for t in range(sibling_pages * PAGE)]
+                parent = [1000 + t for t in range(2 * PAGE)]
+                child = parent + [3000 + t for t in range(PAGE)]
+                for seq in (sibling, parent, child):
+                    insert_seq(cache, allocator, seq)
+                child_node = match_seq(cache, child).last_device_node
+                cache.evict(EvictParams(num_tokens=len(sibling) + PAGE))
+                self.assertEqual(
+                    match_seq(cache, sibling).host_hit_length, len(sibling)
+                )
+                self.assertEqual(match_seq(cache, child).device_prefix_len, len(parent))
+                pin = cache.inc_host_lock_ref(child_node).to_dec_params()
+                self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+
+                self.assertEqual(
+                    cache.full_unreclaimable_size(), 0 if freeable else len(parent)
+                )
+                promised, freed = self._admission_promise(cache, allocator)
+                self.assertEqual(promised, len(parent) if freeable else 0)
+                self.assertGreaterEqual(freed, promised)
+                cache.dec_host_lock_ref(child_node, pin)
+                cache.sanity_check()
 
 
 class TestWriteBackBatchingRustCore(_WriteBackBatchingSuite, CustomTestCase):

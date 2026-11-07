@@ -604,6 +604,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def full_evictable_size(self):
         return 0
 
+    def full_unreclaimable_size(self) -> int:
+        """Evictable FULL tokens that eviction cannot free right now."""
+        return 0
+
     def swa_evictable_size(self):
         return 0
 

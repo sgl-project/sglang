@@ -2076,6 +2076,51 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         finally:
             result.unbacked_tokens = self._finish_tracking_unbacked_tokens()
 
+    @staticmethod
+    def _blocks_subtree_drop(node: UnifiedTreeNode) -> bool:
+        """Whether ``node`` keeps ``drop_subtree_no_host`` from dropping a subtree that holds it."""
+        return (
+            node.write_through_pending_id is not None
+            or node.load_back_pending_id is not None
+            or any(
+                cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
+            )
+        )
+
+    def full_write_back_reclaim_classes(self) -> tuple[int, int, int, int]:
+        full = self.components_by_type[BASE_COMPONENT_TYPE]
+        pinned: set[int] = set()
+        stuck: set[int] = set()
+        host_evictable_tokens = droppable_tokens = needs_host_tokens = stuck_tokens = 0
+        # Pre-order reversed: every child is classified before its parent.
+        for node in reversed(self._collect_all_nodes()):
+            children = node.children.values()
+            if self._blocks_subtree_drop(node) or any(c.id in pinned for c in children):
+                pinned.add(node.id)
+            if node is self.root_node:
+                continue
+            if node.evicted:
+                if node.backuped and node.id not in pinned:
+                    host_evictable_tokens += len(
+                        node.component_data[BASE_COMPONENT_TYPE].host_value
+                    )
+                continue
+            if node.component_data[BASE_COMPONENT_TYPE].lock_ref > 0:
+                continue
+            tokens = full.reclaimable_value_len(node)
+            # An in-flight write already holds its host slots.
+            unbacked = not node.backuped and node.write_through_pending_id is None
+            if unbacked and node.id in pinned:
+                stuck.add(node.id)
+                needs_host_tokens += tokens
+                stuck_tokens += tokens
+            elif any(c.id in stuck for c in children):
+                stuck.add(node.id)
+                stuck_tokens += tokens
+            elif unbacked:
+                droppable_tokens += tokens
+        return stuck_tokens, needs_host_tokens, droppable_tokens, host_evictable_tokens
+
     def drop_subtree_no_host(self, node_id: NodeId) -> DropSubtreeNoHostResult:
         """Write-back fallback when a D-leaf's D->H backup fails under host
         memory pressure: drop the subtree rooted at the unbacked leaf so
@@ -2087,21 +2132,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # A failed backup never issues the D->H copy, so the subtree root has
         # no host state and no in-flight DMA reading its device slots.
         assert not node.backuped and node.write_through_pending_id is None
-        if node.load_back_pending_id is not None or any(
-            cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in node.component_data
-        ):
+        if self._blocks_subtree_drop(node):
             return result
         descendants: list[UnifiedTreeNode] = []
         stack = list(node.children.values())
         while stack:
             cur = stack.pop()
-            if (
-                cur.write_through_pending_id is not None
-                or cur.load_back_pending_id is not None
-                or any(
-                    cd.lock_ref > 0 or cd.host_lock_ref > 0 for cd in cur.component_data
-                )
-            ):
+            if self._blocks_subtree_drop(cur):
                 return result
             descendants.append(cur)
             stack.extend(cur.children.values())

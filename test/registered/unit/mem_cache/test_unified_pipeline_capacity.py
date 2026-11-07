@@ -171,6 +171,7 @@ def _admission(allocator, input_tokens, max_requests):
     tree = NS(
         supports_mamba=lambda: True,
         full_evictable_size=lambda: 0,
+        full_unreclaimable_size=lambda: 0,
         mamba_evictable_size=lambda: 0,
     )
     budget = allocator.create_prefill_budget(tree)

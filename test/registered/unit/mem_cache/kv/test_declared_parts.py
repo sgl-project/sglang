@@ -2193,6 +2193,7 @@ class TestDeclaredParts(CustomTestCase):
             sliding_window_size=16,
             window_retain_size=lambda component: 32,
             full_evictable_size=lambda: 0,
+            full_unreclaimable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
             auxiliary_swa_evictable_size=lambda: 0,
             supports_mamba=lambda: False,

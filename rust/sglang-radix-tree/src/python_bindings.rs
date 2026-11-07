@@ -1609,6 +1609,14 @@ macro_rules! tree_core_methods {
                 self.core_attached(py).full_evictable_size()
             }
 
+            /// (stuck, needs_host, droppable, host_evictable) FULL tokens under write-back.
+            fn full_write_back_reclaim_classes(
+                &self,
+                py: Python<'_>,
+            ) -> (usize, usize, usize, usize) {
+                self.core_attached(py).full_write_back_reclaim_classes()
+            }
+
             /// FULL component protected token count.
             fn full_protected_size(&self, py: Python<'_>) -> usize {
                 self.core_attached(py).full_protected_size()
@@ -3079,6 +3087,14 @@ macro_rules! tree_core_binding {
             /// FULL component evictable token count.
             fn full_evictable_size(&self, py: Python<'_>) -> PyResult<usize> {
                 catch_native_panic(|| Ok(self.inner.full_evictable_size(py)))
+            }
+
+            /// (stuck, needs_host, droppable, host_evictable) FULL tokens under write-back.
+            fn full_write_back_reclaim_classes(
+                &self,
+                py: Python<'_>,
+            ) -> PyResult<(usize, usize, usize, usize)> {
+                catch_native_panic(|| Ok(self.inner.full_write_back_reclaim_classes(py)))
             }
 
             /// FULL component protected token count.

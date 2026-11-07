@@ -89,6 +89,9 @@ class PrefillBudget:
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0
+        # Snapshotted once per round: admission only locks prefixes, which moves
+        # tokens out of the evictable count, so the snapshot never undercounts.
+        self.full_unreclaimable = tree_cache.full_unreclaimable_size()
 
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
@@ -110,11 +113,15 @@ class PrefillBudget:
     def load_back_scope(self, **kwargs):
         return nullcontext()
 
+    def _full_evictable(self) -> int:
+        """FULL evictable tokens eviction can actually free this round."""
+        return max(0, self.tree_cache.full_evictable_size() - self.full_unreclaimable)
+
     def _available_and_evictable(self):
         evictable = (
-            self.tree_cache.full_evictable_size()
+            self._full_evictable()
             if self.tree_cache.supports_mamba()
-            else self.tree_cache.evictable_size()
+            else max(0, self.tree_cache.evictable_size() - self.full_unreclaimable)
         )
         global_available_size = self.allocator.available_size()
         if is_cp_sharded_padded():
@@ -241,7 +248,7 @@ class SWAPrefillBudget(PrefillBudget):
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
-        return global_full_available_size + self.tree_cache.full_evictable_size()
+        return global_full_available_size + self._full_evictable()
 
     @property
     def remaining_swa(self):
@@ -520,7 +527,7 @@ class ChainPrefillBudget(SWAPrefillBudget):
             full_tokens + self.total_offset,
             swa_tokens + self.swa_offset,
             state_slots + self.pending_state_slots,
-            full_evictable_tokens=self.tree_cache.full_evictable_size(),
+            full_evictable_tokens=self._full_evictable(),
             swa_evictable_tokens=(
                 self.tree_cache.swa_evictable_size()
                 if self.rules.window != "none"
@@ -681,9 +688,7 @@ class ChainPrefillBudget(SWAPrefillBudget):
         return self.allocator.can_reserve(
             full_tokens + (0 if empty_pool else self.total_offset),
             swa_tokens + (0 if empty_pool else self.swa_offset),
-            full_evictable_tokens=0
-            if empty_pool
-            else self.tree_cache.full_evictable_size(),
+            full_evictable_tokens=0 if empty_pool else self._full_evictable(),
             swa_evictable_tokens=0
             if empty_pool
             else self.tree_cache.swa_evictable_size(),

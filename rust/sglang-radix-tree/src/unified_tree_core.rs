@@ -2976,6 +2976,70 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok((None, result))
     }
 
+    /// Whether `node` keeps `drop_subtree_no_host` from dropping a subtree that holds it.
+    fn blocks_subtree_drop_(node: &Node<K>) -> bool {
+        node.is_device_locked()
+            || node.is_host_locked()
+            || node.write_through_pending_id.is_some()
+            || node.is_load_back_pending()
+    }
+
+    /// Classify the evictable Full device tokens by what write-back eviction needs
+    /// to free them, as (stuck, needs_host, droppable, host_evictable) token counts.
+    /// needs_host: unbacked nodes whose drop is blocked, freed only by a backup into
+    /// host room. droppable: unbacked nodes the drop fallback can free. stuck:
+    /// needs_host plus the evictable device ancestors that become leaves only after
+    /// them. host_evictable: host-only tokens host eviction can free for backups.
+    pub fn full_write_back_reclaim_classes(&self) -> (usize, usize, usize, usize) {
+        // Pre-order reversed: every child is classified before its parent.
+        let nodes = self.collect_all_nodes_();
+        let mut pinned: HashSet<NodeIdx_> = HashSet::new();
+        let mut stuck: HashSet<NodeIdx_> = HashSet::new();
+        let mut host_evictable_tokens = 0usize;
+        let mut droppable_tokens = 0usize;
+        let mut needs_host_tokens = 0usize;
+        let mut stuck_tokens = 0usize;
+        for &node_id in nodes.iter().rev() {
+            let node = self.arena.node(node_id);
+            let child_pinned = node.children.values().any(|c| pinned.contains(c));
+            let child_stuck = node.children.values().any(|c| stuck.contains(c));
+            if child_pinned || Self::blocks_subtree_drop_(node) {
+                pinned.insert(node_id);
+            }
+            if node.is_root() {
+                continue;
+            }
+            if node.evicted() {
+                if node.backuped() && !pinned.contains(&node_id) {
+                    host_evictable_tokens += node.host_value_len(FULL);
+                }
+                continue;
+            }
+            if node.device_lock_ref(FULL) > 0 {
+                continue;
+            }
+            let tokens = self.component_reclaimable_value_len_(node_id, FULL);
+            // An in-flight write already holds its host slots.
+            let unbacked = !node.backuped() && node.write_through_pending_id.is_none();
+            if unbacked && pinned.contains(&node_id) {
+                stuck.insert(node_id);
+                needs_host_tokens += tokens;
+                stuck_tokens += tokens;
+            } else if child_stuck {
+                stuck.insert(node_id);
+                stuck_tokens += tokens;
+            } else if unbacked {
+                droppable_tokens += tokens;
+            }
+        }
+        (
+            stuck_tokens,
+            needs_host_tokens,
+            droppable_tokens,
+            host_evictable_tokens,
+        )
+    }
+
     /// Write-back fallback when a D-leaf's D->H backup fails under host
     /// memory pressure: drop the subtree rooted at the unbacked leaf so
     /// device eviction keeps making progress instead of leaving its KV
@@ -2995,7 +3059,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             // A failed backup never issues the D->H copy, so the subtree root has
             // no host state and no in-flight DMA reading its device slots.
             assert!(!node.backuped() && node.write_through_pending_id.is_none());
-            if node.is_host_locked() || node.is_load_back_pending() {
+            if Self::blocks_subtree_drop_(node) {
                 return Ok((false, result));
             }
         }
@@ -3009,11 +3073,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
             .collect();
         while let Some(cur_id) = stack.pop() {
             let cur = self.arena.node(cur_id);
-            if cur.is_device_locked()
-                || cur.is_host_locked()
-                || cur.write_through_pending_id.is_some()
-                || cur.is_load_back_pending()
-            {
+            if Self::blocks_subtree_drop_(cur) {
                 return Ok((false, result));
             }
             descendants.push(cur_id);

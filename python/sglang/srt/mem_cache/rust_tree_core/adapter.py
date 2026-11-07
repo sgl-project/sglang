@@ -754,6 +754,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()
 
+    def full_write_back_reclaim_classes(self) -> tuple[int, int, int, int]:
+        return self._binding.full_write_back_reclaim_classes()
+
     def full_protected_size(self) -> int:
         return self._binding.full_protected_size()
 

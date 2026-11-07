@@ -163,6 +163,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         cache = SimpleNamespace(
             full_evictable_size=lambda: 0,
+            full_unreclaimable_size=lambda: 0,
             swa_evictable_size=lambda: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)

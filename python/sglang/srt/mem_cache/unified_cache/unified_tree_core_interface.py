@@ -510,6 +510,15 @@ class UnifiedTreeCoreInterface(ABC):
     def full_evictable_size(self) -> int: ...
 
     @abstractmethod
+    def full_write_back_reclaim_classes(self) -> tuple[int, int, int, int]:
+        """Evictable FULL device tokens by what write-back eviction needs to free
+        them: (stuck, needs_host, droppable, host_evictable). needs_host are freed
+        only by a backup into host room, droppable by the drop fallback; stuck adds
+        the device ancestors that wait on needs_host; host_evictable is the host-only
+        room host eviction can hand to backups."""
+        ...
+
+    @abstractmethod
     def full_protected_size(self) -> int: ...
 
     @abstractmethod
