@@ -467,13 +467,13 @@ class HostBuilder:
 
     def __init__(self, directory, workers, backends):
         self.directory = Path(directory)
-        self.workers, self.backends = workers, backends
+        self.backends = backends
         self._ordinals = self._shared_order = None
         self._index = None
         self._metadata_mapping = self._metadata_capacity = None
         self._prepared_capacity = None
         self._prepared_view = memoryview(b"")
-        self._pool = None
+        self.pool = HostPayloadPool(workers)
         stat = Path("/proc/self/stat").read_text()
         self.identity = {
             "pid": os.getpid(),
@@ -557,12 +557,6 @@ class HostBuilder:
             state = orjson.loads((self.directory / "state.json").read_bytes())
             if state == ready_state:
                 _write_record(self.directory, "state", state | {"state": "REUSABLE"})
-
-    @property
-    def payload_pool(self):
-        if self._pool is None:
-            self._pool = HostPayloadPool(self.workers)
-        return self._pool
 
     def _attach_prepared(self, allocation):
         if self._prepared_capacity != allocation:
@@ -733,7 +727,7 @@ class HostBuilder:
             backing,
             file_spans,
             (entries[ordinal] for ordinal in self._shared_order),
-            self.payload_pool,
+            self.pool,
             metrics,
             index["publication"]["codec"],
         )
@@ -796,7 +790,7 @@ class HostBuilder:
             backing,
             file_spans,
             definitions,
-            self.payload_pool,
+            self.pool,
             metrics,
             expected["skip_payload_hash"],
         )
@@ -819,9 +813,7 @@ class HostBuilder:
         return {"index": index, "metrics": metrics}
 
     def close(self):
-        if self._pool is not None:
-            self._pool.close()
-            self._pool = None
+        self.pool.close()
         self._prepared_view.release()
         self._prepared_view = memoryview(b"")
         self._metadata_mapping = None

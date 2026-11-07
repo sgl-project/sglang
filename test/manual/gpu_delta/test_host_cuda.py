@@ -147,12 +147,7 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
                 )
                 # Match the scheduler's persistent preparation worker: CUDA
                 # allocations on this foreground thread do not bind its context.
-                prepared = prepare_executor.submit(
-                    backend.prepare,
-                    descriptor["manifest_path"],
-                    descriptor["manifest_sha256"],
-                    metadata,
-                ).result()
+                prepared = prepare_executor.submit(backend.prepare, metadata).result()
                 assert not prepared.hardware
                 assert (
                     not prepared.decode_plan.decoded_slots
@@ -408,7 +403,10 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
             )
             barrier.wait(timeout=90)
             metrics = {}
-            publication = arena.prepare_publication(path, digest, metadata, metrics)
+            publication = arena.prepare_publication(
+                metadata | dict(manifest_path=str(path), manifest_sha256=digest),
+                metrics,
+            )
             codec = publication.header["codec"]
             if version == 1:
                 ordinals = {

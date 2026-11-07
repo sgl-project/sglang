@@ -10,9 +10,10 @@ for the end-to-end design and performance motivation.
 
 Implementation ownership is explicit: `layout.py` admits immutable canonical
 bindings and consumer identities; `receiver.py` prepares publications and runs
-the fixed decode/apply pipeline. `host.py` owns publication control and rank-local
-CUDA mappings; `host_worker.py` builds the shared encoded, prepared and metadata
-images in one persistent CPU-only process per engine-host. `tokenizer.py`
+the fixed decode/apply pipeline. `host.py` owns the CPU-child client, shared-map
+attachment and rank-local CUDA mappings; `host_worker.py` owns publication
+transactions and the shared encoded, prepared and metadata images in one persistent
+CPU-only process per engine-host. `tokenizer.py`
 coordinates the public update and
 correlates internal replies; `session.py` owns scheduler integration and each
 rank's state. HTTP routes and IPC schemas stay in `http.py` and `io.py`.
@@ -44,7 +45,7 @@ images each receive it. The admitted FlashInfer matrix is:
 | FP8, 128×128 blocks, UE8M0 scales | Yes | No | No |
 | MXFP8 | Yes | No | Yes |
 | MXFP4 with MXFP8 activation | Yes | No | Yes |
-| NVFP4 | W4A4 | W4A4 or W4A16 | W4A4 |
+| NVFP4 | W4A4 | W4A4 or W4A16 | W4A4 or W4A16 |
 
 These are byte-layout contracts for existing inference paths, not new inference
 kernels. Load-time weight quantization and conversion fallbacks are rejected.
@@ -210,8 +211,9 @@ granularity. Growth reserves twice the required extent; fitting
 updates reuse storage and CUDA registrations. Shared prepared capacity is counted
 once per engine-host, while DE rank-private capacity is counted per rank.
 
-Successful all-rank resume authorizes encoded and prepared-cache reuse. The session
-queues release and view cleanup ahead of its next prepare on the same FIFO executor.
+Successful all-rank apply precedes resume. The owner queues exact-state release
+after its resume, and ordered release/view cleanup on the same FIFO executor
+completes before the next preparation can reuse the arena.
 BUILDING precedes overwrite; failed/aborted publications remain nonreusable, and
 late old releases cannot release newer bytes. Explicit clear removes retained
 encoded and prepared files only after the rank-close barrier.
@@ -293,7 +295,7 @@ Profiling the CPU child requires the optional NVIDIA `nvtx` Python package:
 Payload verification is selected per update by `validate_payload_hash=True` on
 `update_weights_from_gpu_delta`. Miles passes its configured policy explicitly;
 SGLang does not read a hash-policy environment variable. Every rank sharing a
-publication must agree. After successful all-rank apply/resume releases the cache,
+publication must agree. After ordered cleanup releases the completed publication,
 the next publication may choose another policy; unchecked bytes cannot satisfy a
 checked publication. A receiver requiring hashes rejects
 `payload_checksum_format="none"`; a skipping receiver may accept hashed
@@ -314,11 +316,12 @@ device bandwidth from host durations.
 | `host_prepare_s` | Full background preparation |
 | `host_manifest_read_parse_s`, `host_plan_validate_s`, `host_tensor_prepare_s` | Manifest, canonical-plan qualification, local tensor planning |
 | `host_plan_cache_reused`, `host_batch_plan_reused` | Admitted digest / current active-geometry cache reused; no old frames retained |
-| `host_rank_prepare_s` | Encoded admission, global metadata release, local allocation/fill and final encoded-view release |
+| `host_rank_prepare_s`, `host_rank_prepare_body_s` | Publication access and child work or follower wait, rank-local canonical admission, mapping and local input preparation; these two fields currently report the same span |
 | `host_rank_metadata_release_s` | CPU child drops the parsed manifest and encoded view after shared preparation |
 | `host_cpu_worker_spawn_s`, `host_cpu_worker_wait_s` | Owner's process-launch call / complete preparation IPC wait; wait includes child work and is not additive with its phases |
 | `host_cpu_worker_pid`, `host_cpu_worker_start_ticks` | Shared child identity, repeated on the engine's ranks; followers do not own another child |
-| `host_rank_prepare_body_s`, `host_rank_prepare_call_s` | Through local snapshot return / local fill and job cleanup; caller-minus-body includes view release/bookkeeping |
+| `host_rank_prepare_call_s` | DE-local copy loop or CUDA tensor-view binding after layout/allocation; nested inside the rank preparation span |
+| `host_encoded_cache_access_s` | Publication access through shared numeric-metadata attachment; includes child work or follower wait |
 | `host_rank_layout_s`, `host_rank_allocation_s` | Local ordering/offset planning / arena growth |
 | `host_raw_pack_s`, `raw_bytes`, `raw_h2d_bytes` | CPU raw packing, direct bytes, aligned arena upload bytes |
 | `host_metadata_prepare_s`, `host_metadata_wait_s` | Small GPU input/status setup including its own stream waits / those waits alone |

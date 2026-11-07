@@ -132,10 +132,7 @@ class DeltaSession:
             # failure before reusing buffers or replacing its completion future.
             if self._cleanup_future is not None:
                 self._cleanup_future.result()
-            req = session.request
-            prepared = self.backend.prepare(
-                req["manifest_path"], req["manifest_sha256"], req, session.cancelled
-            )
+            prepared = self.backend.prepare(session.request, session.cancelled)
             with self._lock:
                 if session.state != "ABORTED":
                     session.prepared = prepared

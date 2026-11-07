@@ -169,8 +169,12 @@ def prepare_snapshot(
     arena, path, digest, entries, pool, timings, metadata, cancelled=None
 ):
     if arena._worker is not None:
-        arena._worker.builder._pool = pool
-    publication = arena.prepare_publication(path, digest, metadata, timings, cancelled)
+        arena._worker.builder.pool = pool
+    publication = arena.prepare_publication(
+        metadata | dict(manifest_path=str(path), manifest_sha256=digest),
+        timings,
+        cancelled,
+    )
     return arena.prepare_local(
         publication, [TENSOR_IDS[e["name"]] for e in entries], timings
     )
@@ -212,15 +216,15 @@ class InlineCpuWorker:
     """Use the real CPU builder for deterministic unit fault injection."""
 
     def __init__(self, directory, device, pool):
-        self.builder = worker.HostBuilder(
-            directory,
-            pool.workers,
-            {
-                name: host.decoder_backend(device, name)
-                for name in ("snappy", "lz4", "bitcomp")
-            },
-        )
-        self.builder._pool = pool
+        with patch.object(worker, "HostPayloadPool", return_value=pool):
+            self.builder = worker.HostBuilder(
+                directory,
+                pool.workers,
+                {
+                    name: host.decoder_backend(device, name)
+                    for name in ("snappy", "lz4", "bitcomp")
+                },
+            )
 
     def prepare(self, expected, namespace, metrics, cancelled):
         result = self.builder.prepare(expected, namespace)
@@ -279,7 +283,9 @@ def _shared_child(rank, publications, barrier, output):
                 metrics = {}
                 reads.clear()
                 publication = arena.prepare_publication(
-                    path, digest, metadata(version), metrics
+                    metadata(version)
+                    | dict(manifest_path=str(path), manifest_sha256=digest),
+                    metrics,
                 )
                 assert all(
                     not array.flags.writeable
@@ -311,7 +317,7 @@ def _shared_child(rank, publications, barrier, output):
                         frames=publication.frames.copy(),
                         gaps=publication.gaps.copy(),
                         offsets=snapshot.offsets.copy(),
-                        pool_id=id(arena._worker.builder._pool)
+                        pool_id=id(arena._worker.builder.pool)
                         if arena._worker
                         else None,
                         set_device_calls=set_device.call_count,
@@ -565,7 +571,9 @@ class TestHostSnapshot(unittest.TestCase):
             ValueError, "immutable delta manifest SHA256 mismatch"
         ):
             self.arena("bad-manifest").prepare_publication(
-                path, "0" * 64, metadata(engine="bad-manifest"), {}
+                metadata(engine="bad-manifest")
+                | dict(manifest_path=str(path), manifest_sha256="0" * 64),
+                {},
             )
         manifest["files"][0]["sha256"] = "0" * 64
         path, digest = write_manifest(path, manifest)
@@ -778,7 +786,8 @@ class TestHostSnapshot(unittest.TestCase):
         request = metadata() | dict(participants=participants)
         prior_metrics = {}
         prior_publication = owner.prepare_publication(
-            path, digest, request, prior_metrics
+            request | dict(manifest_path=str(path), manifest_sha256=digest),
+            prior_metrics,
         )
         prior = owner.prepare_local(
             prior_publication, [TENSOR_IDS["dense"]], prior_metrics, False
@@ -793,7 +802,9 @@ class TestHostSnapshot(unittest.TestCase):
             worker, "_prepare_arena", side_effect=RuntimeError("decode failed")
         ):
             with self.assertRaisesRegex(RuntimeError, "decode failed"):
-                owner.prepare_publication(path, digest, request, {})
+                owner.prepare_publication(
+                    request | dict(manifest_path=str(path), manifest_sha256=digest), {}
+                )
         state = json.loads((owner.directory / "state.json").read_text())
         self.assertEqual(state["state"], "BUILDING")
         prior.mark_reusable()
@@ -804,14 +815,19 @@ class TestHostSnapshot(unittest.TestCase):
         owner.close()
         self.assertTrue(prepared_path.exists())
         with self.assertRaisesRegex(ValueError, "failed or already released"):
-            peer.prepare_publication(path, digest, request, {})
+            peer.prepare_publication(
+                request | dict(manifest_path=str(path), manifest_sha256=digest), {}
+            )
         self.assertIsNone(peer.allocation)
         self.assertIsNone(peer._worker)
         with self.assertRaisesRegex(ValueError, "engine APPLIED release"):
             owner.prepare_publication(
-                path,
-                digest,
-                metadata(3) | dict(participants=participants),
+                metadata(3)
+                | dict(
+                    participants=participants,
+                    manifest_path=str(path),
+                    manifest_sha256=digest,
+                ),
                 {},
             )
 
@@ -979,7 +995,7 @@ class TestHostSnapshot(unittest.TestCase):
                 )
                 self.assertFalse(release.is_set())
                 self.assertFalse(follower_finished.is_set())
-                self.assertNotEqual(first.directory, third.directory)
+                self.assertNotEqual(first.directory, other.directory)
                 third.close()
             finally:
                 release.set()
@@ -1023,7 +1039,9 @@ class TestHostSnapshot(unittest.TestCase):
         with patch.object(
             Path, "read_bytes", autospec=True, side_effect=Path.read_bytes
         ) as read:
-            reused = arena.prepare_publication(path, digest, metadata(), {})
+            reused = arena.prepare_publication(
+                metadata() | dict(manifest_path=str(path), manifest_sha256=digest), {}
+            )
         self.assertEqual(reused.header["target_version"], 1)
         self.assertEqual(
             [call.args[0] for call in read.call_args_list],
@@ -1522,7 +1540,11 @@ with (directory / '.lock').open('a+b') as lock:
 
     def build():
         try:
-            arena.prepare_publication(path, digest, metadata(), {}, cancelled)
+            arena.prepare_publication(
+                metadata() | dict(manifest_path=str(path), manifest_sha256=digest),
+                {},
+                cancelled,
+            )
         except RuntimeError as error:
             errors.append(error)
         finally:

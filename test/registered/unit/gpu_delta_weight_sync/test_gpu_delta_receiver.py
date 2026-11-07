@@ -435,7 +435,7 @@ class TestReceiverPreparation(unittest.TestCase):
             prepare_publication=lambda *args: publication, prepare_local=prepare_local
         )
         with self.assertRaisesRegex(RuntimeError, "local preparation boundary"):
-            receiver.PreparedDelta(backend, "manifest.json", "digest", {})
+            receiver.PreparedDelta(backend, {})
 
     def test_layer_batch_cache_tracks_active_names_and_grouping(self):
         names = [
@@ -526,7 +526,7 @@ class TestReceiverPreparation(unittest.TestCase):
             )
             with patch.object(torch.cuda, "device", return_value=nullcontext()):
                 with self.assertRaisesRegex(ValueError, "bad manifest"):
-                    backend.prepare("manifest.json", "digest", {})
+                    backend.prepare({})
             backend.host_arena.close.assert_called_once()
 
         drains = []

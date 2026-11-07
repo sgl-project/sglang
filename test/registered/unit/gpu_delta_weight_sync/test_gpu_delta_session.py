@@ -64,12 +64,12 @@ class Backend:
     def close(self):
         self.closed = True
 
-    def prepare(self, *args):
+    def prepare(self, request, cancelled):
         self.started.set()
         assert self.ready.wait(5)
         if self.error:
             raise self.error
-        self.payload.target_version = args[2]["target_version"]
+        self.payload.target_version = request["target_version"]
         return self.payload
 
 
@@ -229,9 +229,9 @@ def test_abort_unblocks_rank_waiting_for_shared_preparation_owner(
     arena = host.HostArena("a", 0, participants[1])
 
     class WaitingBackend(Backend):
-        def prepare(self, path, digest, metadata, cancelled):
+        def prepare(self, request, cancelled):
             self.started.set()
-            return arena.prepare_publication(path, digest, metadata, {}, cancelled)
+            return arena.prepare_publication(request, {}, cancelled)
 
     backend = WaitingBackend()
     backend.host_arena = arena

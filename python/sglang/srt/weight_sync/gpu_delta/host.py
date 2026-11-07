@@ -40,7 +40,6 @@ from sglang.srt.weight_sync.gpu_delta import profiling
 from sglang.srt.weight_sync.gpu_delta.codec import decoder_backend
 from sglang.srt.weight_sync.gpu_delta.host_worker import (
     _CAPACITY_ALIGNMENT,
-    _PREPARE_METRICS,
     _identity,
     _metadata_views,
     configured_cpu_workers,
@@ -343,15 +342,13 @@ class HostArena:
             self._metadata_capacity = allocation
 
     @profiling.annotate("gpu_delta.host.prepare_encoded")
-    def prepare_publication(
-        self, manifest_path, manifest_sha256, metadata, timings, cancelled=None
-    ):
+    def prepare_publication(self, request, timings, cancelled=None):
         """The original owner authenticates and prepares one shared publication."""
         started = time.perf_counter()
         participants = sorted(
-            metadata["participants"], key=lambda value: value["rank_id"]
+            request["participants"], key=lambda value: value["rank_id"]
         )
-        namespace = {"stream_id": metadata["stream_id"], "participants": participants}
+        namespace = {"stream_id": request["stream_id"], "participants": participants}
         if self._namespace is None:
             self._namespace = namespace
             key = hashlib.sha256(
@@ -371,12 +368,12 @@ class HostArena:
             self.owner = self.identity == owner
         elif namespace != self._namespace:
             raise ValueError("host cache original cohort or stream changed")
-        publication = Path(manifest_path).resolve(strict=True)
+        publication = Path(request["manifest_path"]).resolve(strict=True)
         expected = {
             "manifest_path": str(publication),
-            "manifest_sha256": manifest_sha256,
+            "manifest_sha256": request["manifest_sha256"],
             **{
-                key: metadata[key]
+                key: request[key]
                 for key in (
                     "session_id",
                     "base_version",
@@ -384,15 +381,15 @@ class HostArena:
                     "plan_digest",
                 )
             },
-            "skip_payload_hash": not metadata["validate_payload_hash"],
+            "skip_payload_hash": not request["validate_payload_hash"],
         }
-        token = publication_token(expected)
         metrics = new_metrics()
         if self.owner:
             if self._worker is None:
                 self._worker = CpuWorker(self.directory, self.device)
             index = self._worker.prepare(expected, namespace, metrics, cancelled)
         else:
+            token = publication_token(expected)
             waiting = time.perf_counter()
             with (self.directory / ".lock").open("a+b") as lock:
                 while True:
@@ -461,19 +458,7 @@ class HostArena:
         if publication.header["backend"] != ("hardware" if hardware else "cuda"):
             raise ValueError("engine-host decoder backends differ")
         index, tensors = publication.index, publication.tensors
-        metrics = {
-            name: timings[name]
-            for name in (
-                "host_rank_allocation_s",
-                "host_rank_allocation_calls",
-                "host_rank_allocation_bytes",
-                "host_rank_mapping_reused",
-                "host_rank_outer_zstd_decode_s",
-                "host_rank_encoded_copy_s",
-                *_PREPARE_METRICS,
-            )
-        }
-        self._attach_shared_arena(index["prepared"], metrics, hardware)
+        self._attach_shared_arena(index["prepared"], timings, hardware)
         layout_started = time.perf_counter()
         selected = np.asarray(tensor_ids, dtype=np.int64)
         sizes = tensors["prepared_nbytes"][selected]
@@ -488,9 +473,9 @@ class HostArena:
             offsets = np.zeros(len(tensors), dtype=np.int64)
             offsets[selected] = positions
             size = int(np.max((positions + sizes)[sizes != 0], initial=0))
-        metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
+        timings["host_rank_layout_s"] = time.perf_counter() - layout_started
         if hardware:
-            self._reserve_rank_arena(size, metrics)
+            self._reserve_rank_arena(size, timings)
             prepare_started = time.perf_counter()
             for tensor_id in selected:
                 count = int(tensors["prepared_nbytes"][tensor_id])
@@ -521,19 +506,17 @@ class HostArena:
                 )
                 self.hardware, self.capacity = False, index["prepared"]
             staging_s = 0.0
-        metrics["host_rank_prepare_call_s"] = time.perf_counter() - prepare_started
-        metrics.update(
+        timings["host_rank_prepare_call_s"] = time.perf_counter() - prepare_started
+        timings.update(
             host_rank_arena_bytes=size,
             host_rank_capacity_bytes=self.capacity["capacity"],
             host_rank_capacity_generation=self.capacity["generation"],
-            host_rank_cpu_workers=timings["host_rank_cpu_workers"],
             host_rank_private_capacity_bytes=self.capacity["capacity"]
             if hardware
             else 0,
             host_rank_staging_copy_s=staging_s,
             host_rank_staging_copy_bytes=staging_bytes,
         )
-        timings.update(metrics)
         return HostPreparedSnapshot(self, publication, offsets)
 
     def _close_private(self):
@@ -586,7 +569,6 @@ class HostPreparedSnapshot:
 
     def __init__(self, arena, publication, offsets):
         self.arena, self.publication, self.offsets = arena, publication, offsets
-        self.directory = arena.directory
         self.worker = arena._worker if arena.owner else None
         index = publication.index
         self.ready_state = {

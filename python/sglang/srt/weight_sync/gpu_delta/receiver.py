@@ -60,16 +60,14 @@ class GpuDeltaBackend:
         self.layout.check_identity()
         return self.layout.description
 
-    def prepare(self, manifest_path, manifest_sha256, metadata, cancelled=None):
+    def prepare(self, request, cancelled=None):
         # Called by the background worker. Small scalar calibration may be read
         # to prepare derived values; no live writes, collectives, loader hooks
         # or generation-stream synchronization occur here.
         with torch.cuda.device(self.device):
             prepared = PreparedDelta.__new__(PreparedDelta)
             try:
-                prepared.__init__(
-                    self, manifest_path, manifest_sha256, metadata, cancelled
-                )
+                prepared.__init__(self, request, cancelled)
                 return prepared
             except BaseException:
                 self.discard(prepared)
@@ -243,9 +241,7 @@ def _qualify_canonical_plan(backend, publication):
 
 class PreparedDelta:
     @profiling.annotate("gpu_delta.prepare.layout")
-    def __init__(
-        self, backend, manifest_path, manifest_sha256, metadata, cancelled=None
-    ):
+    def __init__(self, backend, request, cancelled=None):
         from sglang.srt.weight_sync.gpu_delta.host import copy_bytes
 
         self.stream = None
@@ -262,7 +258,7 @@ class PreparedDelta:
         layers_per_batch = backend.layers_per_batch
         payload_started = time.perf_counter()
         publication = backend.host_arena.prepare_publication(
-            manifest_path, manifest_sha256, metadata, self.timings, cancelled
+            request, self.timings, cancelled
         )
         self.codec = publication.header["codec"]
         from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
