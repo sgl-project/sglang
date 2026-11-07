@@ -615,6 +615,138 @@ def test_listen_generate_request_propagates_disconnect_without_error_write():
     assert sent_messages == []
 
 
+@pytest.mark.parametrize(
+    ("error", "reason"),
+    [
+        (NotImplementedError(), "NotImplementedError"),
+        (RuntimeError("\n\nscheduler failed\ndetails"), "scheduler failed"),
+    ],
+)
+def test_generate_loop_reports_errors_without_a_leading_message_line(error, reason):
+    """a failure with an empty or blank first line must still reach the client"""
+    sent_messages = []
+
+    class _Adapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def create_state(self):
+            return None
+
+        async def wait_for_next_chunk(self, session):
+            raise error
+
+    class _Ws:
+        async def send_bytes(self, message):
+            sent_messages.append(msgspec.msgpack.decode(message))
+
+    session = GenerateSession()
+    session.set_adapter(_Adapter())
+
+    asyncio.run(realtime_video_api._generate_loop(_Ws(), session))
+
+    assert sent_messages == [
+        {"type": "error", "content": f"error during generate loop: {reason}"}
+    ]
+
+
+class _RejectingAdapter(realtime_adapter.BaseRealtimeModelAdapter):
+    def __init__(self, error):
+        super().__init__()
+        self.error = error
+
+    def create_state(self):
+        return None
+
+    def ingest_event(self, session, event):
+        raise self.error
+
+    async def on_init(self, session, request):
+        raise self.error
+
+
+@pytest.mark.parametrize(
+    ("message", "error", "content"),
+    [
+        ([], None, "invalid event: realtime event must be a map"),
+        ({"type": "event"}, None, "invalid event: kind: Field required"),
+        (
+            {"type": "event", "kind": "move"},
+            ValueError("unsupported event kind: move"),
+            "invalid event: unsupported event kind: move",
+        ),
+        ({"type": "event", "kind": "move"}, OSError("/srv/private"), "invalid event"),
+    ],
+)
+def test_invalid_event_tells_the_client_why(message, error, content):
+    """a rejected event names its input problem but never a server failure"""
+    sent_messages = []
+
+    class _Ws:
+        async def iter_bytes(self):
+            yield msgspec.msgpack.encode(message)
+
+        async def send_bytes(self, sent):
+            sent_messages.append(msgspec.msgpack.decode(sent))
+
+    session = GenerateSession()
+    session.set_adapter(_RejectingAdapter(error))
+
+    asyncio.run(realtime_video_api._listen_events(_Ws(), session))
+
+    assert sent_messages == [{"type": "error", "content": content}]
+
+
+@pytest.mark.parametrize(
+    ("message", "error", "content"),
+    [
+        (
+            {"type": "other", "max_chunks": 0},
+            None,
+            "invalid generate request: prompt: Field required; "
+            "type: Input should be 'init'; "
+            "max_chunks: Input should be greater than or equal to 1",
+        ),
+        (
+            {"type": "init", "prompt": "A quiet village"},
+            ValueError("SANA-WM realtime requires first_frame"),
+            "invalid generate request: SANA-WM realtime requires first_frame",
+        ),
+        (
+            {"type": "init", "prompt": "A quiet village"},
+            Exception("Failed to download image from URL http://10.0.0.1/: refused"),
+            "invalid generate request",
+        ),
+    ],
+)
+def test_invalid_generate_request_tells_the_client_why(
+    monkeypatch, message, error, content
+):
+    """a rejected init names its input problem but never a server failure"""
+    sent_messages = []
+    incoming = [msgspec.msgpack.encode(message)]
+
+    class _Ws:
+        async def receive_bytes(self):
+            if incoming:
+                return incoming.pop()
+            raise realtime_video_api.WebSocketDisconnect(1000, "client close")
+
+        async def send_bytes(self, sent):
+            sent_messages.append(msgspec.msgpack.decode(sent))
+
+    monkeypatch.setattr(realtime_video_api, "get_global_server_args", lambda: None)
+    monkeypatch.setattr(
+        realtime_video_api,
+        "get_realtime_model_adapter",
+        lambda _: _RejectingAdapter(error),
+    )
+
+    with pytest.raises(realtime_video_api.WebSocketDisconnect):
+        asyncio.run(
+            realtime_video_api._listen_generate_request(_Ws(), GenerateSession())
+        )
+
+    assert sent_messages == [{"type": "error", "content": content}]
+
+
 def test_invalid_event_does_not_split_frame_header_and_payload():
     """an invalid event under send backpressure must not corrupt frame transport"""
 
@@ -747,7 +879,7 @@ def test_uninitialized_connections_do_not_reserve_realtime_slot(
             idle.send_bytes(msgspec.msgpack.encode([]))
             assert (
                 msgspec.msgpack.decode(idle.receive_bytes())["content"]
-                == "invalid generate request"
+                == "invalid generate request: generate request must be a map"
             )
         with client.websocket_connect(endpoint) as active:
             active.send_bytes(init)
