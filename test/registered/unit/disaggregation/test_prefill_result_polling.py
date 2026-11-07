@@ -1356,6 +1356,9 @@ class _EarlySendScheduler(SchedulerDisaggregationPrefillMixin):
     _on_step_launch = Scheduler._on_step_launch
     _join_prefill_launched = Scheduler._join_prefill_launched
 
+    def _collect_inflight_batches(self):
+        return ()
+
     def __init__(self):
         self.scheduler_stage_metrics = None
         self.metrics_reporter = SimpleNamespace(record_scheduler_active=Mock())
@@ -1397,6 +1400,7 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                 start_send_idx=0,
                 pending_bootstrap=False,
                 early_send_prefix_end=None,
+                inflight_steps=1,
             )
             batch = SimpleNamespace(
                 reqs=[req],

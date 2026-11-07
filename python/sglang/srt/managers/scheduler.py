@@ -2858,8 +2858,6 @@ class Scheduler(
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
-            enable_overlap=self.enable_overlap,
-            enable_overlap_mlx=self.enable_overlap_mlx,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -2880,6 +2878,8 @@ class Scheduler(
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
             leave_prefill_launched=self.prefill_launched_reqs.leave,
+            is_live=self.is_live,
+            leave_running_and_prefill_launched=self.leave_running_and_prefill_launched,
         )
 
     def init_internal_state(self) -> None:
@@ -4028,8 +4028,9 @@ class Scheduler(
         the result lands a step later; its batch still names the request as its
         ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` via its chunked branch (the finished req
-        is excluded from streaming and its logprob offset is still accounted).
+        ``process_batch_result_prefill`` as a dead row (the aborted req left the
+        chunked slot, so it commits and streams nothing, and its logprob offset is
+        still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
         req = self._pending_chunked_abort_req
@@ -4433,6 +4434,7 @@ class Scheduler(
             kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
+        resumed_req = self.chunked_req
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
@@ -4605,6 +4607,9 @@ class Scheduler(
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
+        if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get() and self.dllm_config is None:
+            self._check_admitted_not_in_flight(can_run_list, resumed_req)
+
         # Create a new batch
         new_batch = ScheduleBatch.init_new(
             can_run_list,
@@ -4770,6 +4775,38 @@ class Scheduler(
                 if r is not batch.chunked_req and r not in self.running_reqs
             )
 
+    def _check_admitted_not_in_flight(
+        self, admitted: List[Req], resumed_req: Optional[Req]
+    ) -> None:
+        """A request never re-enters the step-carrying lists while an older step
+        still carries it, which is what lets `is_live` look at those lists alone.
+        So no step carries a request admitted to a prefill batch, except the one
+        resuming its chunked prefill, whose earlier chunks may still be in flight.
+        Gated like the request-list check."""
+        for req in admitted:
+            if req is not resumed_req and req.inflight_steps != 0:
+                raise RuntimeError(
+                    f"Request {req.rid} is admitted to a prefill batch while "
+                    f"{req.inflight_steps} older steps still carry it"
+                )
+
+    def is_live(self, req: Req) -> bool:
+        """Whether `req` is in a step-carrying list: running, prefill_launched or
+        chunked. A step's result commits only on the rows of live requests; a request
+        that left them (finished, retracted, aborted) since the step launched is dead
+        to it."""
+        return (
+            req in self.running_reqs
+            or req in self.prefill_launched_reqs
+            or req in self.chunked_reqs
+        )
+
+    def leave_running_and_prefill_launched(self, reqs: List[Req]) -> None:
+        """A request that finishes in a step's processing leaves the running and
+        prefill_launched lists at once: its in-flight steps then find it dead."""
+        self.running_reqs.leave(reqs)
+        self.prefill_launched_reqs.leave(reqs)
+
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
@@ -4796,9 +4833,6 @@ class Scheduler(
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.run(CheckPhase.RESULT, batch)
         batch.drop_inflight_step()
-        # Requests finish only in a step's processing.
-        self.running_reqs.leave_finished()
-        self.prefill_launched_reqs.leave_finished()
 
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
         """Requests whose step in flight commits their last output by length."""

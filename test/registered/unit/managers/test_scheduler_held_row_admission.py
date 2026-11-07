@@ -29,6 +29,7 @@ class _Req:
     def __init__(self, holds_row):
         self.kv = SimpleNamespace(holds_kv=holds_row)
         self.beam_group = None
+        self.inflight_steps = 0
         self.token_indices_to_pool = None
 
     def init_next_round_input(self, tree_cache=None):

@@ -323,7 +323,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     speculative_output_stride=8,
                 )
 
-                def settle_grammar(result, batch):
+                def settle_grammar(result, batch, live):
                     # Mutating request state must not affect the earlier snapshot.
                     for req in batch.reqs:
                         req.seqlen += 20
@@ -334,7 +334,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
+                    processor, result, batch, [True, False, False]
                 )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
