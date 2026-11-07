@@ -1,8 +1,9 @@
 """Native host-arena and complete receiver checks.
 
 Manual-only: Linux, CUDA, nvCOMP 6, Torch, Snappy, LZ4 and Zstandard are required.
-Bitcomp uses one GPU and the Miles producer. The two-engine DE test requires two
-Blackwell GPUs; its barriers coordinate the oracle, not production preparation.
+Bitcomp uses one GPU and the Miles producer, without requiring DE. The two-engine
+DE test requires two SM100/SM103 GPUs; its barriers coordinate the oracle, not
+production preparation.
 """
 
 import hashlib
