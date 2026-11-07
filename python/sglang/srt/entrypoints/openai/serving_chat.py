@@ -665,6 +665,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 tool_call_parser=self.tool_call_parser,
                 chat_hooks=chat_encoding_adapters.ChatOutputHooks(
                     thinking_requested=self._thinking_requested,
+                    reasoning_required=self._get_reasoning_from_request,
                     tool_call_parsing_active=self._tool_call_parsing_active,
                     history_tool_calls_count=self._get_history_tool_calls_cnt,
                     tool_call_id=self._process_tool_call_id,
@@ -673,6 +674,8 @@ class OpenAIServingChat(OpenAIServingBase):
                 model_path=self.tokenizer_manager.model_path,
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
+                preferred_sampling_params=get_serving().preferred_sampling_params,
+                allow_auto_truncate=get_serving().allow_auto_truncate,
             )
         )
 

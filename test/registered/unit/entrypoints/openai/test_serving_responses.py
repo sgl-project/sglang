@@ -1683,6 +1683,7 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
 
         return chat_encoding_adapters.ChatOutputHooks(
             thinking_requested=Mock(),
+            reasoning_required=Mock(),
             tool_call_parsing_active=Mock(),
             history_tool_calls_count=Mock(),
             tool_call_id=Mock(),

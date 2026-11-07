@@ -48,6 +48,10 @@ class RecipeToolCall(msgspec.Struct, frozen=True):
     arguments: str
 
 
+class UnclosedReasoningError(ValueError):
+    """A ValueError, so chat answers it with a 400 or a stream error."""
+
+
 def whole_tool_calls(delta: RecipeOutputDelta) -> list[RecipeToolCall]:
     calls: dict[int, list[str]] = {}
     for piece in delta.tool_calls:
@@ -76,7 +80,10 @@ class DeepSeekRecipeOutputParser:
         parse_json_output: bool = False,
         separate_reasoning: bool = True,
         stream_reasoning: bool = True,
+        reasoning_must_close: bool = True,
         stop: Sequence[str] = (),
+        stop_regex: Sequence[str] = (),
+        stop_token_ids: Sequence[int] = (),
     ):
         recipe = load_deepseek_recipe()
         options = recipe.ParsingOptions(
@@ -105,6 +112,17 @@ class DeepSeekRecipeOutputParser:
         self._stop_hold_chars = max(map(len, stop), default=1) - 1
         self._pending_ids: list[int] = []
         self.num_consumed_tokens = 0
+        # A finish reports a client stop by its string, regex or id, and EOS by its id.
+        self._client_stops = (*stop, *stop_regex, *stop_token_ids)
+        self._think_end_id = self._hf_tokenizer.token_to_id(THINK_END_TOKEN)
+        # Reasoning ends at </think> or at the first call recipe parses.
+        # Reasoning sent as content is not tracked: its text is the answer.
+        self._reasoning_open = (
+            reasoning_must_close
+            and separate_reasoning
+            and thinking_stage is not None
+            and thinking_stage.starts_in_reasoning()
+        )
 
     def feed(self, token_ids: Sequence[int]) -> RecipeOutputDelta:
         self.num_consumed_tokens += len(token_ids)
@@ -114,9 +132,12 @@ class DeepSeekRecipeOutputParser:
         ready = self._release_pending_ids()
         if not ready:
             return RecipeOutputDelta()
-        return self._deltas(
-            self._processor.push(self._recipe.InferenceChunk.tokens(ready))
-        )
+        return self._deltas(self._push(ready))
+
+    def _push(self, token_ids: list[int]) -> list[Any]:
+        if self._think_end_id in token_ids:
+            self._reasoning_open = False
+        return self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
 
     def _release_pending_ids(self) -> list[int]:
         held = len(self._pending_ids)
@@ -154,11 +175,7 @@ class DeepSeekRecipeOutputParser:
             and token_ids[-1] == matched
         ):
             token_ids = token_ids[:-1]
-        chunks = (
-            self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
-            if token_ids
-            else []
-        )
+        chunks = self._push(token_ids) if token_ids else []
         if not self._processor.finished:
             reason = {
                 "stop": self._recipe.InferenceFinishReason.Stop,
@@ -202,6 +219,22 @@ class DeepSeekRecipeOutputParser:
             + self._hf_tokenizer.encode(text[:cut], add_special_tokens=False).ids
         )
 
+    def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
+        """After `finish`: raise if the output stopped on its own inside its
+        reasoning. Length, abort and client stops cut it on purpose."""
+        matched = finish_reason.get("matched")
+        if (
+            self._reasoning_open
+            and finish_reason["type"] == "stop"
+            and matched not in self._client_stops
+        ):
+            # A string names a stop that is not the model's, like the NaN sentinel.
+            cause = f" ({matched})" if isinstance(matched, str) else ""
+            raise UnclosedReasoningError(
+                "The output stopped inside its reasoning, "
+                f"before any answer or tool call{cause}."
+            )
+
     def _deltas(self, chunks: list[Any]) -> RecipeOutputDelta:
         delta = RecipeOutputDelta()
         for chunk in chunks:
@@ -219,6 +252,8 @@ class DeepSeekRecipeOutputParser:
                 )
                 for call in piece.get("tool_calls") or ()
             )
+            if tool_calls:
+                self._reasoning_open = False
             if self._reasoning_as_content:
                 content, reasoning = reasoning + content, ""
             if self._hold_reasoning:

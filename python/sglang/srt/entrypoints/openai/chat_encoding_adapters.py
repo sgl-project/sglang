@@ -23,6 +23,9 @@ class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
     thinking_requested: Callable[[ChatCompletionRequest], bool]
+    # The handler's require_reasoning: whether a grammar waits for </think>.
+    # Unlike `thinking_requested`, it does not follow SGLANG_DEFAULT_THINKING (#45614).
+    reasoning_required: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]
@@ -228,6 +231,10 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
       model_path, revision: checkpoint files.
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
         (deepseek-recipe validates the default effort at startup).
+      preferred_sampling_params: the workers' --preferred-sampling-params
+        (DeepSeek-V4 / V4.1 output parsing exempts a grammar there).
+      allow_auto_truncate: the workers' --allow-auto-truncate
+        (DeepSeek-V4 / V4.1 output parsing cannot trust a prompt's tail then).
       backend: selects the builder; every spec has a "builtin" one.
     """
 
@@ -240,6 +247,8 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     model_path: str
     revision: Optional[str]
     default_chat_template_kwargs: Optional[dict[str, Any]] = None
+    preferred_sampling_params: Optional[dict[str, Any]] = None
+    allow_auto_truncate: bool = False
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -279,6 +288,8 @@ def _build_deepseek_recipe(
         tool_call_parser=ctx.tool_call_parser,
         chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
+        preferred_sampling_params=ctx.preferred_sampling_params,
+        allow_auto_truncate=ctx.allow_auto_truncate,
     )
 
 
