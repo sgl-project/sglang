@@ -424,12 +424,14 @@ class MixedAttention(torch.autograd.Function):
         moba_kv,
         moba_cu_seqlen_q,
         moba_cu_seqlen_kv,
-        max_seqlen,
+        moba_max_seqlen_q,
         moba_chunk_size,
         moba_q_sh_indices,
         softmax_scale,
     ):
-        ctx.max_seqlen = max_seqlen
+        # Self branch segments are single chunks, so moba_chunk_size bounds
+        # both sides; flash-attn sizes its grid from these maxima.
+        ctx.moba_max_seqlen_q = moba_max_seqlen_q
         ctx.moba_chunk_size = moba_chunk_size
         ctx.softmax_scale = softmax_scale
 
@@ -441,8 +443,8 @@ class MixedAttention(torch.autograd.Function):
             v=v,
             cu_seqlens_q=self_attn_cu_seqlen,
             cu_seqlens_k=self_attn_cu_seqlen,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_q=moba_chunk_size,
+            max_seqlen_k=moba_chunk_size,
             softmax_scale=softmax_scale,
             causal=False,
             dropout_p=0.0,
@@ -454,7 +456,7 @@ class MixedAttention(torch.autograd.Function):
             v=moba_kv[:, 1],
             cu_seqlens_q=moba_cu_seqlen_q,
             cu_seqlens_k=moba_cu_seqlen_kv,
-            max_seqlen_q=max_seqlen,
+            max_seqlen_q=moba_max_seqlen_q,
             max_seqlen_k=moba_chunk_size,
             softmax_scale=softmax_scale,
             causal=False,
@@ -524,7 +526,7 @@ class MixedAttention(torch.autograd.Function):
     @staticmethod
     def backward(ctx, d_output):
 
-        max_seqlen = ctx.max_seqlen
+        moba_max_seqlen_q = ctx.moba_max_seqlen_q
         moba_chunk_size = ctx.moba_chunk_size
         softmax_scale = ctx.softmax_scale
 
@@ -559,8 +561,8 @@ class MixedAttention(torch.autograd.Function):
             dv=dv,
             cu_seqlens_q=self_attn_cu_seqlen,
             cu_seqlens_k=self_attn_cu_seqlen,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
+            max_seqlen_q=moba_chunk_size,
+            max_seqlen_k=moba_chunk_size,
             softmax_scale=softmax_scale,
             causal=False,
             dropout_p=0.0,
@@ -597,7 +599,7 @@ class MixedAttention(torch.autograd.Function):
             dv=dmkv[:, 1],
             cu_seqlens_q=moba_cu_seqlen_q,
             cu_seqlens_k=moba_cu_seqlen_kv,
-            max_seqlen_q=max_seqlen,
+            max_seqlen_q=moba_max_seqlen_q,
             max_seqlen_k=moba_chunk_size,
             softmax_scale=softmax_scale,
             causal=False,
@@ -836,6 +838,7 @@ def moba_attn_varlen(
         ),
         dim=0,
     ).to(torch.int32)
+    moba_max_seqlen_q = int(moba_seqlen_q.max().item())
 
     # Rearrange gathered KV for the MOBA branch.
     experts_tensor = rearrange(gathered, "nc cl two h d -> (nc h) cl two d")
@@ -877,7 +880,7 @@ def moba_attn_varlen(
         moba_kv,
         moba_cu_seqlen_q,
         moba_cu_seqlen_kv,
-        max_seqlen,
+        moba_max_seqlen_q,
         moba_chunk_size,
         moba_q_sh_indices,
         softmax_scale,

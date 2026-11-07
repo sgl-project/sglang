@@ -5,6 +5,8 @@ The CPU tests check which (chunk, head, query) entries get selected with the
 flash-attn kernels replaced; the CUDA tests run flash-attn 2 itself.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -283,3 +285,155 @@ def test_gpu_self_chunk_only_fallback_matches_flash_attention():
     )
 
     assert torch.allclose(actual, expected, atol=5e-3, rtol=5e-3)
+
+
+def test_flash_attn_grid_uses_actual_segment_lengths(monkeypatch):
+    torch.manual_seed(0)
+    chunk, heads = 32, 2
+    q, k, v = (torch.randn(256, heads, 16) for _ in range(3))
+    cu = torch.tensor([0, 128, 256], dtype=torch.int32)
+    calls = []
+
+    def fake_forward(q, k, v, cu_seqlens_q, cu_seqlens_k, **kwargs):
+        calls.append((cu_seqlens_q, cu_seqlens_k, kwargs))
+        lse = torch.zeros(q.shape[1], q.shape[0])
+        return torch.zeros_like(q), lse, None, None
+
+    monkeypatch.setattr(vmoba, "_flash_attn_varlen_forward", fake_forward)
+    vmoba.moba_attn_varlen(
+        q, k, v, cu, 128, chunk, 2, select_mode="topk", threshold_type="query_head"
+    )
+    (self_cu, _, self_kw), (moba_cu_q, moba_cu_k, moba_kw) = calls
+    assert self_kw["max_seqlen_q"] == self_kw["max_seqlen_k"] == chunk
+    assert int(self_cu.diff().max()) <= chunk
+    # the MoBA branch grid follows the busiest chunk, not the full sequence
+    assert moba_kw["max_seqlen_q"] == int(moba_cu_q.diff().max())
+    assert moba_kw["max_seqlen_q"] < 128
+    assert moba_kw["max_seqlen_k"] == chunk
+    assert int(moba_cu_k.diff().max()) <= chunk
+
+
+MOBA_CONFIG = {
+    "temporal_chunk_size": 2,
+    "temporal_topk": 3,
+    "spatial_chunk_size": [3, 4],
+    "spatial_topk": 20,
+    "st_chunk_size": [4, 6, 4],
+    "st_topk": 15,
+    "moba_select_mode": "threshold",
+    "moba_threshold": 0.25,
+    "moba_threshold_type": "query_head",
+    "first_full_layer": 2,
+    "first_full_step": 12,
+    "temporal_layer": 1,
+    "spatial_layer": 1,
+    "st_layer": 1,
+}
+
+
+@pytest.fixture
+def vmoba_backend(monkeypatch):
+    from sglang.multimodal_gen.runtime.layers.attention.backends import vmoba as backend
+
+    calls = []
+
+    def fake_moba(q, k, v, **kwargs):
+        calls.append(("moba", kwargs))
+        return torch.zeros_like(q)
+
+    def fake_full(*args, **kwargs):
+        calls.append(("full", kwargs))
+        return _fake_varlen_attn(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "moba_attn_varlen", fake_moba)
+    monkeypatch.setattr(backend, "flash_attn_varlen_func", fake_full)
+    return backend, calls
+
+
+@pytest.mark.parametrize(
+    "layer, step, expected",
+    [
+        (0, 20, "full"),
+        (1, 20, "full"),
+        (3, 0, "full"),
+        (3, 11, "full"),
+        (3, 12, "moba"),
+    ],
+)
+def test_backend_full_attention_for_leading_layers_and_steps(
+    vmoba_backend, layer, step, expected
+):
+    backend, calls = vmoba_backend
+    impl = backend.VMOBAAttentionImpl(
+        num_heads=2, head_size=16, softmax_scale=0.2, prefix=f"blocks.{layer}.attn1"
+    )
+    metadata = backend.VideoMobaAttentionMetadataBuilder().build(
+        current_timestep=step,
+        raw_latent_shape=(4, 12, 16),
+        patch_size=(1, 2, 2),
+        **MOBA_CONFIG,
+    )
+    seq = 4 * 6 * 8
+    q, k, v = (torch.randn(1, seq, 2, 16) for _ in range(3))
+    out = impl.forward(q, k, v, metadata)
+
+    assert [c[0] for c in calls] == [expected]
+    assert calls[0][1]["softmax_scale"] == 0.2
+    assert out.shape == q.shape
+    if expected == "full":
+        scores = torch.einsum("bqhd,bkhd->bhqk", q, k) * 0.2
+        ref = torch.einsum("bhqk,bkhd->bqhd", scores.softmax(-1), v)
+        assert torch.allclose(out, ref, atol=1e-5)
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_denoising_stage_builds_vmoba_metadata(nested):
+    import addict
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
+        VideoMobaAttentionMetadata,
+        VMOBAAttentionBackend,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingStage,
+    )
+
+    config = {"moba_config": MOBA_CONFIG} if nested else MOBA_CONFIG
+    stage = SimpleNamespace(attn_backend=VMOBAAttentionBackend)
+    server_args = SimpleNamespace(
+        attention_backend_config=addict.Dict(config),
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(patch_size=(1, 2, 2))
+        ),
+    )
+    batch = SimpleNamespace(raw_latent_shape=torch.Size([1, 16, 21, 60, 104]))
+
+    metadata = DenoisingStage._build_attn_metadata(stage, 5, batch, server_args)
+
+    assert isinstance(metadata, VideoMobaAttentionMetadata)
+    assert metadata.current_timestep == 5
+    assert metadata.patch_resolution == [21, 30, 52]
+    assert metadata.first_full_layer == 2
+    assert metadata.spatial_chunk_size == [3, 4]
+
+
+def test_denoising_stage_requires_vmoba_config():
+    import addict
+
+    from sglang.multimodal_gen.runtime.layers.attention.backends.vmoba import (
+        VMOBAAttentionBackend,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+        DenoisingStage,
+    )
+
+    stage = SimpleNamespace(attn_backend=VMOBAAttentionBackend)
+    server_args = SimpleNamespace(
+        attention_backend_config=addict.Dict(),
+        pipeline_config=SimpleNamespace(
+            dit_config=SimpleNamespace(patch_size=(1, 2, 2))
+        ),
+    )
+    batch = SimpleNamespace(raw_latent_shape=torch.Size([1, 16, 21, 60, 104]))
+    with pytest.raises(ValueError, match="--attention-backend-config"):
+        DenoisingStage._build_attn_metadata(stage, 0, batch, server_args)

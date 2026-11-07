@@ -2430,15 +2430,31 @@ class DenoisingStage(PipelineStage):
                 calculate_density=False,  # only need density when doing head load balancing
             )
         elif self.attn_backend.get_enum() == AttentionBackendEnum.VMOBA_ATTN:
-            moba_params = server_args.attention_backend_config.moba_config.copy()
+            # Accept the VMoBA config flat (e.g. configs/backend/vmoba/*.json)
+            # or nested under a "moba_config" key.
+            backend_config = server_args.attention_backend_config or {}
+            moba_params = dict(backend_config.get("moba_config") or backend_config)
+            if "temporal_chunk_size" not in moba_params:
+                raise ValueError(
+                    "vmoba_attn needs a VMoBA config, e.g. --attention-backend-config "
+                    "python/sglang/multimodal_gen/configs/backend/vmoba/"
+                    "wan_1.3B_77_480_832.json"
+                )
+            patch_size = server_args.pipeline_config.dit_config.patch_size
+            if isinstance(patch_size, int):
+                patch_size_t = getattr(
+                    server_args.pipeline_config.dit_config, "patch_size_t", None
+                )
+                patch_size = (patch_size_t or 1, patch_size, patch_size)
             moba_params.update(
                 {
                     "current_timestep": i,
-                    "raw_latent_shape": batch.raw_latent_shape[2:5],
-                    "patch_size": server_args.pipeline_config.dit_config.patch_size,
+                    "raw_latent_shape": tuple(batch.raw_latent_shape[2:5]),
+                    "patch_size": tuple(patch_size),
                     "device": get_local_torch_device(),
                 }
             )
+            attn_metadata = self.attn_metadata_builder.build(**moba_params)
         elif self.attn_backend.get_enum() == AttentionBackendEnum.FA:
             attn_metadata = self.attn_metadata_builder.build(
                 raw_latent_shape=batch.raw_latent_shape
