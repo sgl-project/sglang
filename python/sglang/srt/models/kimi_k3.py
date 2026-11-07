@@ -241,6 +241,12 @@ def _k3_bf16_gemm(
     return torch.mm(x, weight.t(), out=out)
 
 
+# Row window of the TP-sharded MoE front; below 18 rows the gather costs more
+# than the replicated read saves (measured on GB300 TP8).
+_SHARDED_FRONT_MIN_TOKENS = 18
+_SHARDED_FRONT_MAX_TOKENS = 256
+
+
 # Fully fused KDA decode step (kernels/ops/attention/kda_fused_decode). The
 # model hands the output-norm gate to the KDA backend via an attempt-and-verify
 # stash on the attention layer; unconsumed stashes fall back to the unfused
@@ -276,6 +282,23 @@ def _merge_weights_as_views(
         m.weight.data = merged[off : off + n]
         off += n
     return merged, sizes
+
+
+def _lead_with_rows_copy(
+    mods: list, merged: torch.Tensor, first_row: int, rows: int
+) -> torch.Tensor:
+    """A ``[rows + len(merged), H]`` buffer led by a copy of
+    ``merged[first_row : first_row + rows]``, whose ``[rows:]`` view is
+    ``merged``; the module weights are re-pointed into it."""
+    buf = merged.new_empty((rows + merged.shape[0], merged.shape[1]))
+    buf[:rows].copy_(merged[first_row : first_row + rows])
+    buf[rows:].copy_(merged)
+    off = rows
+    for m in mods:
+        n = m.weight.shape[0]
+        m.weight.data = buf[off : off + n]
+        off += n
+    return buf
 
 
 def _dense_mlp_parallel_group() -> str:
@@ -483,6 +506,11 @@ class KimiK3MoE(nn.Module):
         # loading by _merge_front_weights().
         self._front_w: Optional[torch.Tensor] = None
         self._front_sizes: Optional[List[int]] = None
+        # [this rank's router + latent rows (a copy) | shared gate_up], the
+        # leading view of _front_w's buffer.
+        self._front_block_w: Optional[torch.Tensor] = None
+        # Read by the online weight updater; set while _front_block_w holds a copy.
+        self._derived_weight_cache_error: Optional[str] = None
         # True when _front_w merges only [gate, routed_expert_down_proj] (the EP
         # a2a pair) rather than the three-way fused-front weight.
         self._front_is_ep_pair = False
@@ -704,10 +732,9 @@ class KimiK3MoE(nn.Module):
             and self.moe_hidden_size == k3_ar_fusion.NORM_DIM
             and hidden_size == 2 * k3_ar_fusion.NORM_DIM
         )
-        # Static eligibility for the column-parallel up_proj tail (gemm_ag):
-        # 1/8-column GEMV + multicast all-gather + spin-add3 replaces the
-        # replicated [3584, 7168] GEMM (~1.5-2x at decode). Dims fixed to
-        # fuse_ar_norm's over TP8; per-batch checks in k3_ar_fusion.
+        # Static eligibility for the column-parallel up_proj tail (gemm_ag).
+        # Dims fixed to fuse_ar_norm's over TP8; per-batch checks in
+        # k3_ar_fusion.gemm_ag_up_fits.
         self._gemm_ag_up_eligible = (
             self.fuse_ar_norm
             and self.tp_size == 8
@@ -763,10 +790,25 @@ class KimiK3MoE(nn.Module):
         for prop in (
             "_eligible_for_fused_front",
             "_front_fp32",
+            "_front_shard",
             "_routing_contract_ok",
             "_ep_front_eligible",
         ):
             self.__dict__.pop(prop, None)
+        self._front_block_w = None
+        self._derived_weight_cache_error = None
+        if (shard := self._front_shard) is not None:
+            first_row, rows = shard
+            buf = _lead_with_rows_copy(mods, self._front_w, first_row, rows)
+            self._front_w = buf[rows:]
+            self._front_block_w = buf[: rows + self._front_sizes[0]]
+            self._derived_weight_cache_error = (
+                "Online weight updates are not supported while the TP-sharded "
+                "Kimi-K3 MoE front is active: each MoE layer keeps a copy of its "
+                "router and routed_expert_down_proj rows that in-place weight "
+                "writes do not refresh. Restart with SGLANG_K3_SHARDED_MOE=0 "
+                "to allow online updates."
+            )
 
     @cached_property
     def _routed_needs_reduce(self):
@@ -800,6 +842,37 @@ class KimiK3MoE(nn.Module):
             not _is_hip
             and self._eligible_for_fused_front
             and self._front_w.dtype == torch.bfloat16
+        )
+
+    @cached_property
+    def _front_shard(self) -> Optional[Tuple[int, int]]:
+        """``(first row, rows)`` of this rank's contiguous block of the merged
+        [router | latent] rows, or None (replicated front only). The rank-major
+        fp32 all-gather of the blocks is exactly the replicated front's
+        [router | latent] columns."""
+        if not (
+            envs.SGLANG_K3_SHARDED_MOE.get()
+            and self._front_fp32
+            and self.tp_size > 1
+            and k3_ar_fusion.enabled()
+        ):
+            return None
+        assert self._front_sizes is not None
+        gate_up_rows, num_experts, latent_rows = self._front_sizes
+        group = get_parallel().tp_group
+        rows, rem = divmod(num_experts + latent_rows, group.world_size)
+        if rem or rows % 4:  # whole 16B fp32 vectors per rank
+            return None
+        return gate_up_rows + group.rank_in_group * rows, rows
+
+    def _sharded_front_covers(self, num_tokens: int) -> bool:
+        # static per M, so each captured CUDA graph bakes in one front
+        shard = self._front_shard
+        return (
+            shard is not None
+            and self._front_block_w is not None
+            and _SHARDED_FRONT_MIN_TOKENS <= num_tokens <= _SHARDED_FRONT_MAX_TOKENS
+            and k3_ar_fusion.moe_front_all_gather_fits(num_tokens, shard[1])
         )
 
     def _mega_moe_buffer(self):
@@ -1425,16 +1498,47 @@ class KimiK3MoE(nn.Module):
             routed_input = routed_input.to(hidden_states.dtype).contiguous()
         return gate_up, router_logits, routed_input
 
+    def _sharded_front_gemm(
+        self, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """``(gate_up, block)`` in fp32 from one GEMM over the [block | gate_up]
+        rows."""
+        if TYPE_CHECKING:
+            assert self._front_block_w is not None and self._front_shard is not None
+        rows = self._front_shard[1]
+        front = k3_ar_fusion.slice_gemm(
+            hidden_states, self._front_block_w, torch.float32
+        )
+        block, gate_up = torch.split(front, [rows, front.shape[1] - rows], dim=-1)
+        return gate_up, block
+
+    def _sharded_front_gather(
+        self, block: torch.Tensor, hidden_states: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """_fused_front's router logits and routed input, from the all-gather
+        of every rank's block."""
+        if TYPE_CHECKING:
+            assert self._front_sizes is not None
+        gathered = k3_ar_fusion.moe_front_all_gather(block)
+        num_experts = self._front_sizes[1]
+        router_logits, routed_input = torch.split(
+            gathered, [num_experts, gathered.shape[1] - num_experts], dim=-1
+        )
+        if self._moe_front_needs_dense_bf16:
+            routed_input = routed_input.to(hidden_states.dtype).contiguous()
+        return router_logits, routed_input
+
     def _forward_fused(
         self, hidden_states: torch.Tensor, *, prefix_sum: Optional[torch.Tensor]
     ) -> torch.Tensor:
         """Fused-front pipeline: read hidden_states once through the merged
-        [H, gate_up + E + latent] weight, then land both TP-partial sums in
-        one flat symmetric [latent | shared] buffer with zero copies — the
-        shared down GEMM writes its slice via out=, the MoE runner writes
-        its top-k sum via the zero-copy context — and all-reduce the pair
-        in a single collective (the symmetric mempool keeps the one-shot
-        allreduce path; same trick as RowParallelLinear)."""
+        [H, gate_up + E + latent] weight (or its TP-sharded form, see
+        _front_shard), then land both TP-partial sums in one flat symmetric
+        [latent | shared] buffer with zero copies — the shared down GEMM writes
+        its slice via out=, the MoE runner writes its top-k sum via the
+        zero-copy context — and all-reduce the pair in a single collective (the
+        symmetric mempool keeps the one-shot allreduce path; same trick as
+        RowParallelLinear)."""
         if TYPE_CHECKING:  # NOTE: precondition for this case
             assert (
                 self._front_w is not None
@@ -1446,7 +1550,11 @@ class KimiK3MoE(nn.Module):
             )
 
         num_tokens, hidden_size = hidden_states.shape
-        gate_up, router_logits, routed_input = self._fused_front(hidden_states)
+        sharded = self._sharded_front_covers(num_tokens)
+        if sharded:
+            gate_up, front_block = self._sharded_front_gemm(hidden_states)
+        else:
+            gate_up, router_logits, routed_input = self._fused_front(hidden_states)
         latent_numel = num_tokens * self.moe_hidden_size
         if k3_ar_fusion.enabled():
             # the shared-expert AR is pull-only, so its input must be a
@@ -1474,17 +1582,31 @@ class KimiK3MoE(nn.Module):
             )
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
+            if sharded:
+                # queue the shared experts and their AR before gemm1 fills every
+                # SM; the AR waits for the gather to stay off its NVLink traffic
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                router_logits, routed_input = self._sharded_front_gather(
+                    front_block, hidden_states
+                )
+                self.alt_stream.wait_stream(current_stream)
+                with torch.cuda.stream(self.alt_stream):
+                    k3_ar_fusion.all_reduce_low_sm(shared_output)
             if defer_finalize:
                 deferred = self._forward_routed_deferred(
                     hidden_states, router_logits, routed_input
                 )
             else:
                 self._forward_routed(hidden_states, router_logits, routed_input, latent)
-            with torch.cuda.stream(self.alt_stream):
-                self._forward_shared(gate_up, shared_output)
-                # low-SM pull so the side-stream AR leaves the SMs to the
-                # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
-                k3_ar_fusion.all_reduce_low_sm(shared_output, num_blocks=4, unroll=8)
+            if not sharded:
+                with torch.cuda.stream(self.alt_stream):
+                    self._forward_shared(gate_up, shared_output)
+                    # low-SM pull so the side-stream AR leaves the SMs to the
+                    # routed GEMMs it overlaps (K3 dims are fixed; tuned here)
+                    k3_ar_fusion.all_reduce_low_sm(
+                        shared_output, num_blocks=4, unroll=8
+                    )
             current_stream.wait_stream(self.alt_stream)
             # The latent AR must stay serialized after the shared AR (both
             # reuse the v2 pull semaphores); the join above does it.
