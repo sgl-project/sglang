@@ -192,10 +192,19 @@ class Apertus2509Detector(BaseFormatDetector):
                     ):
                         out_normal += self._buffer[:-partial_bot]
                         self._buffer = self._buffer[-partial_bot:]
-                    else:
-                        out_normal += self._buffer
-                        self._buffer = ""
-                return StreamingParseResult(normal_text=out_normal, calls=out_calls)
+                        # A partial marker prefix cannot become a complete
+                        # block in this call; keep it buffered for the next
+                        # chunk instead of looping on it.
+                        return StreamingParseResult(
+                            normal_text=out_normal, calls=out_calls
+                        )
+                    out_normal += self._buffer
+                    self._buffer = ""
+                # Do not return yet: the buffer may hold another complete
+                # tools block, or trailing text, that arrived in the same
+                # chunk. Keep looping so streaming yields the same calls and
+                # text as detect_and_parse.
+                continue
 
             continue
 
