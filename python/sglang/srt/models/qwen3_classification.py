@@ -134,6 +134,9 @@ class Qwen3ForSequenceClassification(Qwen3ForPooledOutput):
     ) -> None:
         super().__init__(config, quant_config, prefix)
         self.score = nn.Linear(config.hidden_size, config.num_labels)
+        # Standard Qwen3 checkpoints have no score.bias. Keep it neutral unless
+        # an explicit bias is supplied by the checkpoint.
+        nn.init.zeros_(self.score.bias)
         # Use normalize=True for qwen3 embedding based on official implementation
         # Reference: https://github.com/QwenLM/Qwen3-Embedding/blob/main/examples/qwen3_embedding_transformers.py#L55
         # Official code: output = F.normalize(output, p=2, dim=1)
