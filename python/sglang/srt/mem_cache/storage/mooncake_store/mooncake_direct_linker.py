@@ -358,6 +358,49 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
+    def _get_layer_ranges(self, keys, ptrs, sizes, offsets):
+        store = self.storage.store
+        result = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+        if result is None or isinstance(result, int):
+            return result
+        result = list(result)
+        if len(result) != len(keys):
+            return result
+        expected = [sum(item) for item in sizes]
+        # A long load can outlive its read leases (-707): renew and retry once. A key
+        # read repeatedly in one call reports -707 once and -600 for its repeats.
+        lapsed = {key for key, value in zip(keys, result) if value == -707}
+        expired = [
+            i
+            for i, value in enumerate(result)
+            if value == -707 or (value == -600 and keys[i] in lapsed)
+        ]
+        if not expired or len(expired) != sum(
+            value != want for value, want in zip(result, expected)
+        ):
+            return result
+        renewed = list(store.batch_get_session_start(list(lapsed)))
+        if renewed != [0] * len(lapsed):
+            raise RuntimeError(
+                f"Mooncake get session renewal failed: keys={len(lapsed)}, "
+                f"result_sample={renewed[:8]}"
+            )
+        retried = store.batch_get_into_multi_buffer_ranges(
+            [keys[i] for i in expired],
+            [ptrs[i] for i in expired],
+            [sizes[i] for i in expired],
+            [offsets[i] for i in expired],
+        )
+        if retried is None or isinstance(retried, int):
+            return retried
+        retried = list(retried)
+        if len(retried) != len(expired):
+            raise RuntimeError("Mooncake renewed range get returned wrong result count")
+        for index, value in zip(expired, retried):
+            result[index] = value
+        logger.debug("Refreshed Mooncake read leases for %d objects", len(expired))
+        return result
+
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
@@ -393,12 +436,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
+                    result = self._get_layer_ranges(keys, ptrs, sizes, offsets)
                     expected = [sum(item) for item in sizes]
                     if (
                         result is None
