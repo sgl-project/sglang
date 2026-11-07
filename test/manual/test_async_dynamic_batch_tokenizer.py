@@ -291,6 +291,95 @@ class TestAsyncDynamicbatchTokenizer:
         tokenizer._batcher_task.cancel.assert_called_once()
         tokenizer._executor.shutdown.assert_called_once_with(wait=False)
 
+    @pytest.mark.asyncio
+    async def test_batch_fault_isolation_same_kwargs(self):
+        """A single bad prompt in a batch should not fail sibling requests."""
+
+        def selective_tokenizer(texts, **kwargs):
+            is_single = isinstance(texts, str)
+            items = [texts] if is_single else list(texts)
+            for item in items:
+                if item == "BAD_PROMPT":
+                    raise ValueError("Invalid prompt input")
+            input_ids = [list(range(len(t.split()))) for t in items]
+            return {"input_ids": input_ids[0] if is_single else input_ids}
+
+        async_tokenizer = AsyncDynamicbatchTokenizer(
+            tokenizer=selective_tokenizer, max_batch_size=4, batch_wait_timeout_s=0.01
+        )
+
+        results = await asyncio.gather(
+            async_tokenizer.encode("hello world"),
+            async_tokenizer.encode("BAD_PROMPT"),
+            async_tokenizer.encode("good morning everyone"),
+            return_exceptions=True,
+        )
+
+        assert results[0] == {"input_ids": [0, 1]}
+        assert isinstance(results[1], ValueError)
+        assert results[2] == {"input_ids": [0, 1, 2]}
+
+    @pytest.mark.asyncio
+    async def test_batch_fault_isolation_different_kwargs(self):
+        """A failing request in the unbatched fallback path should not fail sibling requests."""
+
+        def selective_kw_tokenizer(text, **kwargs):
+            if kwargs.get("invalid_opt"):
+                raise ValueError("Unsupported option")
+            return {"input_ids": list(range(len(text.split())))}
+
+        async_tokenizer = AsyncDynamicbatchTokenizer(
+            tokenizer=selective_kw_tokenizer,
+            max_batch_size=4,
+            batch_wait_timeout_s=0.01,
+        )
+
+        results = await asyncio.gather(
+            async_tokenizer.encode("hello world"),
+            async_tokenizer.encode("bad request", invalid_opt=True),
+            async_tokenizer.encode("three token prompt", return_token_type_ids=False),
+            return_exceptions=True,
+        )
+
+        assert results[0] == {"input_ids": [0, 1]}
+        assert isinstance(results[1], ValueError)
+        assert results[2] == {"input_ids": [0, 1, 2]}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_future_skipped_in_batch(self):
+        """Cancelled futures should be filtered out before tokenization."""
+        calls = []
+
+        def tracking_tokenizer(texts, **kwargs):
+            calls.append((texts, kwargs))
+            is_single = isinstance(texts, str)
+            items = [texts] if is_single else list(texts)
+            input_ids = [list(range(len(t.split()))) for t in items]
+            return {"input_ids": input_ids[0] if is_single else input_ids}
+
+        async_tokenizer = AsyncDynamicbatchTokenizer(
+            tokenizer=tracking_tokenizer, max_batch_size=4, batch_wait_timeout_s=0.01
+        )
+        async_tokenizer._ensure_initialized()
+
+        loop = asyncio.get_running_loop()
+        cancelled_fut = loop.create_future()
+        cancelled_fut.cancel()
+        valid_fut1 = loop.create_future()
+        valid_fut2 = loop.create_future()
+
+        await async_tokenizer._process_dynamic_batch(
+            ["cancelled prompt", "hello world", "foo bar baz"],
+            [{"differing_kw": True}, {}, {}],
+            [cancelled_fut, valid_fut1, valid_fut2],
+        )
+
+        assert (await valid_fut1) == {"input_ids": [0, 1]}
+        assert (await valid_fut2) == {"input_ids": [0, 1, 2]}
+        # Remaining valid requests had identical kwargs and should be batched together
+        assert len(calls) == 1
+        assert calls[0][0] == ["hello world", "foo bar baz"]
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))
