@@ -223,6 +223,7 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
         args = dict(
             device="cuda",
             dllm_fdfo=False,
+            enable_multimodal=None,
             cuda_graph_config=CudaGraphConfig(
                 decode=PhaseConfig(backend=Backend.FULL),
                 prefill=PhaseConfig(backend=Backend.FULL),
@@ -241,6 +242,18 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
         resolved = resolving_view(server_args).cuda_graph_config
         self.assertEqual(resolved.decode.backend, Backend.DISABLED)
         self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+
+    def test_multimodal_is_off_unless_explicitly_requested(self):
+        """The checkpoint carries a vision sub-config, so it would otherwise be
+        served as multimodal, which needs an image processor and image support
+        on the dLLM path that do not exist yet."""
+        server_args = self._server_args()
+        HierarchyBlock.configure_server_args(server_args)
+        self.assertFalse(resolving_view(server_args).enable_multimodal)
+        with self.assertRaises(ValueError):
+            HierarchyBlock.configure_server_args(
+                self._server_args(enable_multimodal=True)
+            )
 
     def test_rejects_fdfo_and_non_cuda_devices(self):
         with self.assertRaises(ValueError):

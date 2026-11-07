@@ -44,12 +44,21 @@ class HierarchyBlock(DllmAlgorithm):
             raise ValueError("HierarchyBlock supports CUDA GPU execution only")
         if cfg.dllm_fdfo:
             raise ValueError("HierarchyBlock does not support --dllm-fdfo")
+        # The checkpoint's vision sub-config would make it multimodal, but the
+        # dLLM path does not handle image inputs yet.
+        if cfg.enable_multimodal:
+            raise ValueError("HierarchyBlock does not support multimodal inputs yet")
         # Denoise and the final KV write use different block masks; a graph
         # captured with one mask cannot replay the other.
         graph_config = cfg.cuda_graph_config
         for phase in Phase.ALL:
             graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
-        declare_resolution(server_args, cls.__name__, cuda_graph_config=graph_config)
+        declare_resolution(
+            server_args,
+            cls.__name__,
+            cuda_graph_config=graph_config,
+            enable_multimodal=False,
+        )
 
     def __init__(self, config: DllmConfig):
         super().__init__(config)
