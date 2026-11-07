@@ -86,7 +86,16 @@ class Schedule(msgspec.Struct):
     schedule_policy: A[
         str,
         Arg(
-            help="The scheduling policy of the requests.",
+            help=(
+                "The scheduling policy of the requests. 'sj-mlfq' is a skip-join "
+                "multi-level feedback queue: a request starts at the queue level its "
+                "predicted prefill time fits, drops a level each time it uses up a "
+                "quantum, and a new prefill starts only when the queue head is at "
+                "least as urgent as the most urgent running request. It requires "
+                "--enable-priority-scheduling and stores the level in the request "
+                "priority; run it with --retraction-policy priority and "
+                "--disable-priority-preemption."
+            ),
             choices=[
                 "lpm",
                 "random",
@@ -97,9 +106,28 @@ class Schedule(msgspec.Struct):
                 "routing-key",
                 "hrrn",
                 "shortest-prefill-first",
+                "sj-mlfq",
             ],
         ),
     ] = "fcfs"
+    sj_mlfq_cost: A[
+        str,
+        Arg(
+            help=(
+                "How sj-mlfq predicts a request's first-iteration time to pick its "
+                "starting queue level. 'cache-aware' prices the uncached suffix "
+                "prefilled on top of the cached prefix; 'prompt' prices the whole "
+                "prompt from scratch (FastServe's rule)."
+            ),
+            choices=["cache-aware", "prompt"],
+        ),
+    ] = "cache-aware"
+    sj_mlfq_base_quantum_ms: A[
+        float,
+        "Quantum of sj-mlfq's top queue level in milliseconds; each level below "
+        "doubles it. FastServe used 10 ms; it should be about one decode step on "
+        "the hardware.",
+    ] = 10.0
     enable_priority_scheduling: A[
         bool,
         "Enable priority scheduling. Requests with higher priority integer values will be scheduled first by default.",
