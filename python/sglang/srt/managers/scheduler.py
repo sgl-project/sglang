@@ -2266,7 +2266,8 @@ class Scheduler(
         continue each pass; all ranks retain the same suffix.
 
         The one place a new per-iteration input source belongs; the return
-        value exists for the pipeline stages that relay requests onward.
+        value, held requests included, exists for the pipeline stages that
+        relay requests onward.
         """
         if self.uocr_runtime is not None:
             # Document windows released while their predecessor's KV was freed.
@@ -2282,9 +2283,8 @@ class Scheduler(
         ):
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
-        self._deferred_input_requests.extend(
-            self.request_receiver.recv_requests(local_reqs=local_reqs)
-        )
+        received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        self._deferred_input_requests.extend(received_reqs)
 
         num_requests_to_process = len(self._deferred_input_requests)
         if stop_at_pause:
@@ -2299,7 +2299,7 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
-        return recv_reqs
+        return received_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -3389,6 +3389,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self._release_rejected_session(req)
             self.send_abort_output(abort_req, req)
             return
 
@@ -3790,7 +3791,14 @@ class Scheduler(
         logger.error(f"{error_msg}, {req.rid=}")
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self._release_rejected_session(req)
         self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _release_rejected_session(self, req: Req) -> None:
+        """`create_req` marked the streaming session in flight; release it for a
+        request rejected before it was queued."""
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -6149,6 +6157,12 @@ class Scheduler(
                 self._pause_started_at = time.monotonic()
             return
 
+        if get_parallel().pp_size > 1:
+            # The PP loops hold this pause until no micro-batch is in flight.
+            self._pp_retract_microbatches()
+            self._publish_paused_state()
+            return
+
         if self.enable_overlap and self.last_batch:
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
@@ -6160,6 +6174,10 @@ class Scheduler(
             self.process_batch_result(tmp_batch, tmp_result)
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
+        self._retract_running_batch()
+        self._publish_paused_state()
+
+    def _retract_running_batch(self):
         # A first retract starts the pause once the in-flight result has drained.
         if self._pause_started_at is None:
             self._pause_started_at = time.monotonic()
@@ -6233,6 +6251,7 @@ class Scheduler(
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
 
+    def _publish_paused_state(self):
         # Surface the paused state to dashboards immediately. The scheduler
         # event loop short-circuits before reaching ``on_idle`` while paused,
         # so without this hop ``gen_throughput`` retains its last non-zero
