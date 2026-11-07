@@ -564,6 +564,11 @@ class InklingShortConvAttnBackend(ShortConvAttnBackend):
             )
             slot_ids = self._cache_indices_buf[:bs]
         else:
+            # FIXME: off the recordable path this reads the request pool's Mamba
+            # indices and the state map after the forward's declared shared-read
+            # end, while the schedule stream may already have reused the row or
+            # slot of a finished request. Gather them during metadata
+            # preparation, or declare a later read end.
             slot_ids = self._translate_mamba_indices(
                 pool.get_mamba_indices(req_pool_indices)
             )

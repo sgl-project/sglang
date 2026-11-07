@@ -25,6 +25,10 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.forward_steps import (
+    ForwardLaunch,
+    forward_steps_of,
+)
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -126,6 +130,10 @@ class BuilderAdapter:
         )
         self.gate_open = True
         self.events: List[FakeEvent] = []
+        # A lazy chain's forward steps: each forward is a launched step whose
+        # frees pend until `fire` processes it.
+        self.steps = forward_steps_of(self.allocator)
+        self.launches: List[ForwardLaunch] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
         if config.lazy:
             pin_every_band(self.allocator, lambda: not self.gate_open)
@@ -243,6 +251,10 @@ class BuilderAdapter:
     def forward(self, ids: List[int]) -> None:
         event = FakeEvent()
         self.events.append(event)
+        if self.steps is not None:
+            # Back to back: no managed free or allocation between them.
+            self.launches.append(self.steps.forward_launched())
+            self.steps.forward_recorded(event)
         self.allocator.set_latest_forward_done_event(event)
         self.allocator.set_inflight_forward(
             event, torch.tensor(ids, dtype=torch.int64, device=self.device)
@@ -252,6 +264,10 @@ class BuilderAdapter:
         for event in self.events:
             event.fired = True
         self.events.clear()
+        if self.steps is not None:
+            for launch in self.launches:  # oldest first
+                self.steps.forward_processed(launch)
+        self.launches.clear()
 
     def reserve(self, member: str, n: int) -> Optional[List[int]]:
         out = self._member(member).alloc_physical(n)

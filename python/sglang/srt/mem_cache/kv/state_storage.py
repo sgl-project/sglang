@@ -119,6 +119,10 @@ class StateStorage:
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
         did not hold before: their speculative ReplaySSM cursors restart."""
+        # FIXME: these cursor resets run on the schedule stream when a row is
+        # reused, while the forward of the row's previous request may still be
+        # running and advancing the same cursors (the write-after-read barrier
+        # orders only shared reads). Order the reset after that forward.
         spec_write_pos = self.pool.replayssm_spec_write_pos
         if spec_write_pos is not None and reset_request_parts:
             fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
