@@ -470,6 +470,12 @@ def handle_linear_attn_backend(server_args: Any):
                 "EAGLE tree verify. Got "
                 f"--speculative-eagle-topk={cfg.speculative_eagle_topk!r}."
             )
+        if verify == "aiter":
+            raise ValueError(
+                "--enable-linear-replayssm-spec verifies through its own "
+                "ReplaySSM kernels and cannot use "
+                "--linear-attn-verify-backend aiter."
+            )
         if decode not in ("triton", "flashinfer"):
             raise ValueError(
                 "--enable-linear-replayssm-spec requires the triton or "

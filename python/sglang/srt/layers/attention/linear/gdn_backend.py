@@ -381,9 +381,29 @@ class GDNKernelDispatcher:
         # supports MTP verify) only applies when no explicit choice was made.
         # SM90 FlashInfer verify requires a fp32 SSM state, so e.g.
         # --mamba-ssm-dtype bfloat16 setups must be able to force Triton here.
+        self.verify_kernel_is_aiter = False
+        self.verify_conv_update = causal_conv1d_update
         if verify_backend is not None and verify_backend.is_triton():
             self.verify_kernel = triton_kernel
             self.verify_kernel_is_flashinfer = False
+        elif verify_backend is not None and verify_backend.is_aiter():
+            if not (is_hip() and envs.SGLANG_USE_AITER.get()):
+                raise ValueError(
+                    "--linear-attn-verify-backend aiter requires ROCm with "
+                    "SGLANG_USE_AITER=1"
+                )
+            from aiter.ops.flydsl.causal_conv1d_update_kernels import (
+                causal_conv1d_update_sglang_flydsl,
+            )
+
+            from sglang.srt.layers.attention.linear.kernels.gdn_aiter import (
+                AiterGDNKernel,
+            )
+
+            self.verify_kernel = AiterGDNKernel()
+            self.verify_kernel_is_flashinfer = False
+            self.verify_kernel_is_aiter = True
+            self.verify_conv_update = causal_conv1d_update_sglang_flydsl
         elif (
             decode_backend.is_flashinfer() or prefill_backend.is_flashinfer()
         ) and flashinfer_kernel.supports_target_verify:
@@ -1313,7 +1333,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             mixed_qkv_reshaped = mixed_qkv.view(
                 batch_size, draft_token_num, -1
             ).transpose(1, 2)
-            mixed_qkv_processed = causal_conv1d_update(
+            mixed_qkv_processed = self.kernel_dispatcher.verify_conv_update(
                 mixed_qkv_reshaped,
                 conv_states,
                 layer.conv_weights,
