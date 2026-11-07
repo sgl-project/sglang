@@ -59,6 +59,13 @@ if TYPE_CHECKING:
 
 _ENABLE_METRICS_DP_ATTENTION = envs.SGLANG_ENABLE_METRICS_DP_ATTENTION.get()
 
+# The MLP-sync gather carries each attention-DP group's listener drain state
+# (see DPDrainColumn).
+MLP_SYNC_CARRIES_DRAIN_STATE = True
+# The drain-state value of a gathered row with no listener behind it: an
+# inactive slot, or a rank that hosts no listener.
+DRAIN_STATE_NO_LISTENER = 8
+
 
 def exchange_sync_rows(
     global_flat: torch.Tensor,
@@ -167,6 +174,8 @@ class MLPSyncBatchInfo:
     attention_pairs: int = 0
     # This rank honored a ShutdownReq and leaves the event loop after this step.
     is_shutting_down: bool = False
+    # This rank's listener drain state (see DPDrainColumn).
+    drain_state: int = 0
     # Upper bound of the longest sequence in this rank's decode step (0 without one).
     decode_graph_max_seq_len: int = 0
 
@@ -198,6 +207,7 @@ class MLPSyncBatchInfo:
                 int(self.is_health_check),
                 self.attention_pairs,
                 int(self.is_shutting_down),
+                self.drain_state,
                 self.decode_graph_max_seq_len,
             ],
             device=device,
@@ -219,6 +229,7 @@ class MLPSyncBatchInfo:
                 0,  # is_health_check
                 0,  # attention_pairs
                 0,  # is_shutting_down
+                DRAIN_STATE_NO_LISTENER,  # drain_state
                 0,  # decode_graph_max_seq_len
             ],
             device=device,
@@ -311,7 +322,7 @@ class MLPSyncBatchInfo:
         self.any_health_check = bool(tp0_info_cpu[:, 9].max())
         self.global_attention_pairs = tp0_info_cpu[:, 10].tolist()
         self.any_shutting_down = bool(tp0_info_cpu[:, 11].max())
-        self.global_decode_graph_max_seq_len = int(tp0_info_cpu[:, 12].max())
+        self.global_decode_graph_max_seq_len = int(tp0_info_cpu[:, 13].max())
         self.sync_wait_seconds = time.perf_counter() - sync_start
         if _ENABLE_METRICS_DP_ATTENTION:
             self.dp_cooperation_info = DPCooperationInfo.create(
@@ -579,6 +590,24 @@ class DPShutdownVote:
         self.any = local
 
 
+class DPDrainColumn:
+    """Carries each attention-DP group's listener drain state through the
+    MLP-sync gather.
+
+    With the Rust server, every DP group's leading rank hosts a listener that
+    drains on its own. ``local`` is this rank's ``Server.drain_state()`` bits
+    (``DRAIN_STATE_NO_LISTENER`` on a rank without a listener, 0 in Python
+    mode), and ``rows`` receives one value per DP group, from the group's
+    leading rank, whenever the gather produced metadata.
+    """
+
+    __slots__ = ("local", "rows")
+
+    def __init__(self, local: int) -> None:
+        self.local = local
+        self.rows: Optional[list[int]] = None
+
+
 class DPShutdownVoteSent:
     """Whether a gather has carried this rank's own shutdown vote (the adapter is frozen)."""
 
@@ -600,6 +629,7 @@ def prepare_mlp_sync_batch_raw(
     dwdp: bool = False,
     sync_wait_carry: Optional[DPSyncWaitCarry] = None,
     shutdown_vote: Optional[DPShutdownVote] = None,
+    drain_column: Optional[DPDrainColumn] = None,
 ):
     parallel = get_parallel()
     num_dp_ranks = parallel.num_dp_ranks
@@ -716,6 +746,7 @@ def prepare_mlp_sync_batch_raw(
         # metrics flag cannot make ranks disagree on what the tensor holds.
         attention_pairs=_local_attention_pairs(local_batch),
         is_shutting_down=shutdown_vote is not None and shutdown_vote.local,
+        drain_state=drain_column.local if drain_column is not None else 0,
         decode_graph_max_seq_len=_local_decode_graph_max_seq_len(
             local_batch, model_runner.spec_algorithm
         ),
@@ -733,6 +764,8 @@ def prepare_mlp_sync_batch_raw(
     metadata_ready = mlp_sync_info.tp0_info_cpu is not None
     if shutdown_vote is not None and metadata_ready:
         shutdown_vote.any = mlp_sync_info.any_shutting_down
+    if drain_column is not None and metadata_ready:
+        drain_column.rows = mlp_sync_info.tp0_info_cpu[:, 12].tolist()
     if metadata_ready:
         mlp_sync_info.tbo_split_seq_index, mlp_sync_info.global_forward_mode = (
             tbo_preparer.compute_output(
@@ -813,6 +846,11 @@ class SchedulerDPAttnAdapter:
     # rank did (see DPShutdownVote).
     get_shutting_down: Callable[[], bool] = lambda: False
     on_peer_shutdown: Optional[Callable[[], None]] = None
+    # This rank's listener drain state, and what to do with every DP group's
+    # after each gather that produced metadata, which can be twice an
+    # iteration (see DPDrainColumn).
+    get_drain_state: Callable[[], int] = lambda: 0
+    on_drain_rows: Optional[Callable[[list[int]], None]] = None
     # Set once a gather carried this rank's own shutdown vote.
     shutdown_vote_sent: DPShutdownVoteSent = field(
         default_factory=DPShutdownVoteSent, init=False
@@ -848,6 +886,7 @@ class SchedulerDPAttnAdapter:
             )
 
         shutdown_vote = DPShutdownVote(self.get_shutting_down())
+        drain_column = DPDrainColumn(self.get_drain_state())
         batch = prepare_mlp_sync_batch_raw(
             local_batch,
             model_runner=self.model_runner,
@@ -860,7 +899,10 @@ class SchedulerDPAttnAdapter:
             dwdp=get_parallel().dwdp_size > 1,
             sync_wait_carry=self.sync_wait_carry,
             shutdown_vote=shutdown_vote,
+            drain_column=drain_column,
         )
+        if drain_column.rows is not None and self.on_drain_rows is not None:
+            self.on_drain_rows(drain_column.rows)
         if shutdown_vote.local:
             self.shutdown_vote_sent.value = True
         if (

@@ -1808,6 +1808,16 @@ def release_req(
     return resumable
 
 
+def free_beam_member_rows(
+    req: Req, req_to_token_pool, token_to_kv_pool_allocator
+) -> None:
+    """Free a beam leader's member rows. Call before releasing the leader:
+    the member rows are found through its lockstep allocated length."""
+    free_member_rows(
+        req.beam_group, kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator)
+    )
+
+
 def retract_all(
     *,
     reqs: List[Req],
@@ -1815,18 +1825,46 @@ def retract_all(
     request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
-    """Returns the requests that cannot be resumed."""
-    unresumable = []
-    for idx in range(len(reqs)):
+    """Returns the requests to abort, each with its abort reason recorded: those
+    that cannot be resumed, and beam leaders, since beam groups cannot be
+    requeued."""
+    reqs_to_abort = []
+    for idx, req in enumerate(reqs):
+        if req.beam_group is not None:
+            req.request_finish(
+                FINISH_ABORT(
+                    "Beam search group aborted: beam groups cannot be retracted, "
+                    "so they are aborted instead of being requeued.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            free_beam_member_rows(
+                req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            )
+            release_req(
+                req=req,
+                remaing_req_count=len(reqs) - idx,
+                tree_cache=tree_cache,
+                request_retirer=request_retirer,
+                offload_kv=False,
+            )
+            reqs_to_abort.append(req)
+            continue
         if not release_req(
-            req=reqs[idx],
+            req=req,
             remaing_req_count=len(reqs) - idx,
             tree_cache=tree_cache,
             request_retirer=request_retirer,
             offload_kv=offload_kv,
         ):
-            unresumable.append(reqs[idx])
-    return unresumable
+            req.request_finish(
+                FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            reqs_to_abort.append(req)
+    return reqs_to_abort
 
 
 def compute_extend_logprob_start_len(
@@ -2897,8 +2935,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             if req.beam_group is not None:
-                # Free member rows before release_req: they need the leader's kv
-                # info, which still carries the lockstep allocated length.
                 req.request_finish(
                     FINISH_ABORT(
                         "Beam search group aborted: KV cache pool is full. Beam "
@@ -2908,11 +2944,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
                 reqs_to_abort.append(req)
-                free_member_rows(
-                    req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
                 # Aborting, so a host backup to resume from would be wasted.
                 self.release_req(
@@ -2960,11 +2993,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
-                free_member_rows(
-                    last_req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
             self.release_req(last_idx, 0, request_retirer, offload_kv=False)
             logger.warning(
