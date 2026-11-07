@@ -97,9 +97,9 @@ def create_indexer_capturer(
 ) -> Optional[IndexerTopkCapturer]:
 
     enable = get_exec().features.enable_return_indexer_topk
-    # Producer wiring is CUDA/NPU-only; other backends
+    # Producer wiring is CUDA/NPU/XPU-only; other backends
     # would create a capturer but never feed it.
-    if enable and device != "cuda" and device != "npu":
+    if enable and device not in ("cuda", "npu", "xpu"):
         logger.warning(
             "indexer-topk capture is not wired for %s backend. Disabling capturer.",
             device,
