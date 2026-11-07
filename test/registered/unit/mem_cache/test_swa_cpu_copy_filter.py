@@ -118,7 +118,9 @@ class TestUnifiedSWATransfers(CustomTestCase):
 
         self.assertTrue(torch.equal(full_buffer[full_pages], expected_full))
         self.assertTrue(torch.equal(swa_buffer[swa_pages], expected_swa))
-        self.assertEqual(saved["swa_mask"].tolist(), [False] * 4 + [True] * 8)
+        # Only the window rows still mapped are saved: the tombstoned four are not.
+        window = saved.bands[allocator.swa_attn_allocator.sub_pool_name]
+        self.assertEqual(window.positions.tolist(), list(range(4, 12)))
 
 
 if __name__ == "__main__":

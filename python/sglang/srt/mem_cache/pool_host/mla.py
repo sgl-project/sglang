@@ -1185,18 +1185,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def _storage_page_index(self, index: int) -> int:
-        if self.dcp_size == 1:
-            return index
-        index = int(index)
-        if index < 0 or index % self.logical_page_size != 0:
-            raise ValueError(
-                "DCP L3 page start must be a nonnegative logical page boundary."
-            )
-        if index + self.logical_page_size > self.logical_size:
-            raise IndexError("DCP L3 page is outside the host pool.")
-        return index // self.dcp_size
-
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
         index = self._storage_page_index(index)
         if self.layout == "page_unified":

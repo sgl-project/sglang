@@ -26,10 +26,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    quality_allows,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.cache.conditioning import _inference_cache
 from sglang.multimodal_gen.runtime.distributed import (
     get_local_torch_device,
@@ -98,7 +96,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     preprocess_image,
 )
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_compiler_backend
+from sglang.srt.utils.device import get_compiler_backend
 
 logger = init_logger(__name__)
 

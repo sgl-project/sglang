@@ -26,7 +26,8 @@ from typing import TYPE_CHECKING, Callable, Optional
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -38,7 +39,6 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import empty_context, log_info_on_rank0
-from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -149,7 +149,14 @@ def should_run_flashinfer_autotune(
     else:
         fp8_gemm_needs_autotune = _serves_block_fp8_as_mxfp8_on_flashinfer(mr)
 
-    if not (moe_needs_autotune or fp4_gemm_needs_autotune or fp8_gemm_needs_autotune):
+    from sglang.srt.layers.quantization.unquant import bf16_gemm_needs_autotune
+
+    if not (
+        moe_needs_autotune
+        or fp4_gemm_needs_autotune
+        or fp8_gemm_needs_autotune
+        or bf16_gemm_needs_autotune()
+    ):
         return False
 
     if torch.cuda.get_device_capability()[0] < 9:

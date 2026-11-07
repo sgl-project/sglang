@@ -15,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
@@ -133,7 +134,7 @@ def build_rust_frame_metadata_fixture() -> dict:
     collector records for each request of the cache-tier batches.
     Regenerate the fixture with ``json.dump(build_rust_frame_metadata_fixture(),
     f, indent=2)`` after changing either side."""
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
     from sglang.srt.managers.io_struct import AbortReq
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
@@ -656,6 +657,8 @@ def launch_context(server_cls, cores=(None, None)):
             ),
         ),
         patch.object(server_cls, "_partition_cores", return_value=cores),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(server_cls, "_watch_startup_failure"),
         patch.object(
             server_module,
             "get_mm",
@@ -669,6 +672,11 @@ def launch_context(server_cls, cores=(None, None)):
         patch.object(
             server_module, "_build_server_args", return_value=sentinel.args
         ) as build_args,
+        patch.object(
+            server_module,
+            "build_processor_fingerprint",
+            return_value="sha256:" + "12" * 32,
+        ),
     ):
         yield build_args
 
@@ -695,7 +703,14 @@ class TestRustServerExtension(CustomTestCase):
                 self.server.start_mm_workers(sentinel.spec, 8)
 
         scheduler = SimpleNamespace(
-            model_config=SimpleNamespace(is_multimodal=True),
+            processor=sentinel.processor,
+            model_config=SimpleNamespace(
+                is_multimodal=True,
+                is_generation=True,
+                hf_config=sentinel.config,
+                model_path="test/model",
+            ),
+            server_args=sentinel.server_args,
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -705,7 +720,11 @@ class TestRustServerExtension(CustomTestCase):
             extension=extension,
             health_generate_headers={},
             default_max_new_tokens=128,
+            request_class=GenerateReqInput,
+            server_added_custom_params=(),
         )
+        # What a crash dump carries.
+        self.assertIs(instance.server_args, sentinel.server_args)
         extension.Server.assert_called_once_with(
             sentinel.args,
             cores=None,
@@ -716,6 +735,26 @@ class TestRustServerExtension(CustomTestCase):
         self.assertIsInstance(instance, ModelServer)
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
+
+    def test_failed_startup_warmup_signals_the_parent(self):
+        """A failed startup warmup takes the server down as a crashed
+        scheduler does: SIGQUIT to the parent, which kills the process tree;
+        a server that shuts down normally signals nothing."""
+        for failure in ["warmup timed out after 600 s", None]:
+            with self.subTest(failure=failure):
+                server = Mock()
+                server.wait_startup_failure.return_value = failure
+                with patch.object(server_module.psutil, "Process") as process:
+                    RustServer(server, http_port=30000)._watch_startup_failure().join(
+                        timeout=10
+                    )
+                parent = process.return_value.parent.return_value
+                if failure is None:
+                    parent.send_signal.assert_not_called()
+                else:
+                    parent.send_signal.assert_called_once_with(
+                        server_module.signal.SIGQUIT
+                    )
 
     def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
         """Every rank joins the collective; only listener ranks contribute an
@@ -728,7 +767,7 @@ class TestRustServerExtension(CustomTestCase):
             return [
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
                 None,
-                obj,
+                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
                 None,
             ]
 
@@ -737,7 +776,7 @@ class TestRustServerExtension(CustomTestCase):
                 server_module,
                 "get_exec",
                 return_value=SimpleNamespace(
-                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                    moe=SimpleNamespace(is_ep_joiner=False, is_ep_scale_joiner=False)
                 ),
             ),
             patch.object(
@@ -772,9 +811,7 @@ class TestRustServerExtension(CustomTestCase):
             gathered[0], {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}
         )
         self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
-        self.assertEqual(
-            others_only, [{"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"}]
-        )
+        self.assertEqual(others_only, table)
         self.assertEqual(
             table,
             [
@@ -782,6 +819,217 @@ class TestRustServerExtension(CustomTestCase):
                 {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
             ],
         )
+
+    def test_gather_server_endpoints_requires_every_attention_dp_rank_once(self):
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_size=2,
+            world_group=SimpleNamespace(all_gather_object=Mock()),
+        )
+        with (
+            patch.object(server_module, "get_parallel", return_value=parallel),
+            patch.object(
+                server_module,
+                "get_exec",
+                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
+            ),
+            patch.object(
+                server_module,
+                "get_serving",
+                return_value=SimpleNamespace(host="10.0.0.1", port=30000),
+            ),
+        ):
+            for ranks in ([], [0], [0, 0], [0, 2], [0, 1, 2]):
+                parallel.world_group.all_gather_object.return_value = [
+                    {"dp_rank": rank, "endpoint": f"http://10.0.0.{i + 1}:30000"}
+                    for i, rank in enumerate(ranks)
+                ]
+                with (
+                    self.subTest(ranks=ranks),
+                    self.assertRaisesRegex(
+                        ValueError,
+                        "expected one Rust listener for each of 2 attention-DP ranks",
+                    ),
+                ):
+                    RustServer.gather_server_endpoints(hosts_listener=False)
+
+    def test_gather_server_endpoints_publishes_an_address_the_bind_serves(self):
+        """An IPv4 wildcard listener publishes 127.0.0.1 for SGLANG_HOST_IP=::1
+        (the same machine) and refuses any other IPv6 SGLANG_HOST_IP, which it
+        does not serve, on every rank, listener or not."""
+        parallel = SimpleNamespace(
+            nnodes=1,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=Mock()),
+        )
+        serving = SimpleNamespace(host="0.0.0.0", port=30000)
+        for bind, host_ip, published in (
+            ("0.0.0.0", "10.0.0.1", "10.0.0.1"),
+            ("::", "2001:db8::1", "2001:db8::1"),
+            ("::", "::1", "::1"),
+            ("0.0.0.0", "::1", "127.0.0.1"),
+            ("0.0.0.0", "2001:db8::1", None),
+        ):
+            serving.host = bind
+            gathered = []
+
+            def gather(entry):
+                if entry is not None:
+                    gathered[:] = [entry]
+                return [*gathered, None]
+
+            parallel.world_group.all_gather_object.side_effect = gather
+            with (
+                patch.dict(os.environ, {"SGLANG_HOST_IP": host_ip}),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
+                patch.object(server_module, "get_serving", return_value=serving),
+                patch.object(RustServer, "_port_offset", return_value=0),
+            ):
+                for hosts_listener in (True, False):
+                    with self.subTest(
+                        bind=bind, host_ip=host_ip, listener=hosts_listener
+                    ):
+                        if published is None:
+                            with self.assertRaisesRegex(
+                                ValueError, "DP rank 0.*IPv4.*2001:db8::1"
+                            ):
+                                RustServer.gather_server_endpoints(hosts_listener)
+                        else:
+                            self.assertEqual(
+                                RustServer.gather_server_endpoints(hosts_listener),
+                                [
+                                    {
+                                        "dp_rank": 0,
+                                        "endpoint": server_module.NetworkAddress(
+                                            published, 30000
+                                        ).to_url(),
+                                    }
+                                ],
+                            )
+
+    def test_gather_server_endpoints_skips_the_collective_on_an_ep_joiner(self):
+        """The serving ranks gathered at their own startup and never enter
+        this collective again, so an elastic-EP joiner (scale or recover)
+        returns an empty table without entering it and fans nothing out. A
+        serving rank under elastic EP gathers as any rank does."""
+        gathered = []
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [
+                obj or {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+            ]
+
+        parallel = SimpleNamespace(
+            nnodes=1,
+            pp_size=1,
+            tp_size=2,
+            tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            attn_dp_size=2,
+            attn_dp_rank=0,
+            dp_size=2,
+            attn_dp_enabled=True,
+            dp_rank=0,
+            world_group=SimpleNamespace(all_gather_object=all_gather_object),
+        )
+        for is_ep_joiner, is_ep_scale_joiner in (
+            (True, True),
+            (True, False),
+            (False, False),
+        ):
+            with (
+                self.subTest(joiner=is_ep_joiner, scale=is_ep_scale_joiner),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(
+                            elastic_ep_backend="mooncake",
+                            is_ep_joiner=is_ep_joiner,
+                            is_ep_scale_joiner=is_ep_scale_joiner,
+                        )
+                    ),
+                ),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_serving",
+                    return_value=SimpleNamespace(host="10.0.0.1", port=30000),
+                ),
+            ):
+                gathered.clear()
+                tables = [
+                    RustServer.gather_server_endpoints(hosts_listener=hosts_listener)
+                    for hosts_listener in (True, False)
+                ]
+                if is_ep_joiner:
+                    self.assertEqual(tables, [[], []])
+                    self.assertEqual(gathered, [], "a joiner never enters the gather")
+                else:
+                    self.assertEqual(
+                        gathered,
+                        [{"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"}, None],
+                    )
+                    expected = [
+                        {"dp_rank": 0, "endpoint": "http://10.0.0.1:30000"},
+                        {"dp_rank": 1, "endpoint": "http://10.0.0.2:30000"},
+                    ]
+                    self.assertEqual(tables, [expected, expected])
+
+    def test_gather_frontend_cpu_share_counts_only_listeners_on_this_mask(self):
+        """Every serving rank joins the collective, a non-listener contributes
+        no key, this rank's position is taken at its own index of the gathered
+        list, and an elastic-EP joiner stays out of it."""
+        gathered = []
+        other_mask = ("node", tuple(range(64, 128)))
+
+        def all_gather_object(obj):
+            gathered.append(obj)
+            return [obj, None, other_mask, obj]
+
+        world_group = SimpleNamespace(
+            all_gather_object=all_gather_object, rank_in_group=3
+        )
+
+        def moe(is_ep_joiner):
+            return SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=is_ep_joiner))
+
+        with (
+            patch.object(
+                server_module,
+                "get_parallel",
+                return_value=SimpleNamespace(world_group=world_group),
+            ),
+            patch.object(server_module, "get_exec", return_value=moe(False)),
+            patch.object(
+                server_module,
+                "_frontend_cpu_key",
+                return_value=("node", tuple(range(64))),
+            ),
+        ):
+            share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+            RustServer.gather_frontend_cpu_share(hosts_listener=False)
+            with patch.object(server_module, "get_exec", return_value=moe(True)):
+                joiner_share = RustServer.gather_frontend_cpu_share(hosts_listener=True)
+
+        self.assertEqual(share, (1, 2))
+        self.assertIsNone(gathered[1], "a non-listener rank contributes nothing")
+        # An elastic-EP joiner never enters the collective the serving ranks
+        # left behind at startup (the same rule as gather_server_endpoints).
+        self.assertEqual(joiner_share, (0, 1))
+        self.assertEqual(len(gathered), 2, "a joiner entered the gather")
 
     def test_gather_server_endpoints_warns_on_an_unreachable_loopback_host(self):
         """A multi-node launch whose listener is loopback warns, naming the
@@ -796,10 +1044,18 @@ class TestRustServerExtension(CustomTestCase):
         ):
             parallel = SimpleNamespace(
                 nnodes=2,
+                attn_dp_size=1,
                 dist_init_addr=dist_init_addr,
                 world_group=SimpleNamespace(all_gather_object=all_gather_object),
             )
             with (
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
                 patch.object(server_module, "get_parallel", return_value=parallel),
                 patch.object(
                     server_module,
@@ -851,6 +1107,28 @@ class TestRustServerExtension(CustomTestCase):
             abort, req
         )
         scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
+
+    def test_freeze_gc_skips_the_detokenizer_socket_in_rust_mode(self):
+        """The scheduler freezes its own GC either way; only without the Rust
+        server, whose detokenizer shares the process, does it forward the
+        request to a detokenizer process."""
+        from sglang.srt.managers.io_struct import FreezeGCReq
+        from sglang.srt.managers.scheduler import Scheduler
+
+        req = FreezeGCReq(rid="r#1", gc_threshold=[700, 10, 1000])
+        scheduler = SimpleNamespace(
+            rust_server=RustServer(Mock(), http_port=30000), ipc_channels=Mock()
+        )
+        with patch("sglang.srt.managers.scheduler.freeze_gc") as freeze_gc:
+            Scheduler.handle_freeze_gc(scheduler, req)
+            freeze_gc.assert_called_once_with("Scheduler", [700, 10, 1000])
+            scheduler.ipc_channels.send_to_detokenizer.send_output.assert_not_called()
+
+            scheduler.rust_server = None
+            Scheduler.handle_freeze_gc(scheduler, req)
+        scheduler.ipc_channels.send_to_detokenizer.send_output.assert_called_once_with(
+            req, req
+        )
 
     def test_mixed_logprob_batch_frame(self):
         """In a batch where only some rows carry each logprob family, every row
@@ -986,7 +1264,9 @@ class TestRustServerExtension(CustomTestCase):
             processor=sentinel.processor,
             model_config=SimpleNamespace(
                 is_multimodal=True,
+                is_generation=False,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
+                model_path="test/model",
             ),
         )
         with (
@@ -996,6 +1276,10 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer, "_build_mm_spec", return_value=sentinel.worker_spec
             ),
         ):
+            with self.assertRaisesRegex(RuntimeError, "serves generation models only"):
+                BuiltinServer.launch(scheduler)
+
+            scheduler.model_config.is_generation = True
             mm_processor.return_value.resolve_spec.return_value = None
             with self.assertRaisesRegex(
                 RuntimeError, "no Rust MM pipeline for model_type='unsupported_vlm'"
@@ -1003,14 +1287,16 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer.launch(scheduler)
             extension.Server.assert_not_called()
 
-            mm_processor.return_value.resolve_spec.return_value = sentinel.spec
+            spec = Mock()
+            spec.rust_json.return_value = "{}"
+            mm_processor.return_value.resolve_spec.return_value = spec
             instance = BuiltinServer.launch(scheduler)
 
         extension.Server.assert_called_once()
         instance.server.start_mm_workers.assert_called_once_with(
             sentinel.worker_spec, 8
         )
-        self.assertIs(instance.mm_spec, sentinel.spec)
+        self.assertIs(instance.mm_spec, spec)
         self.assertTrue(instance._multimodal_enabled)
 
     @unittest.skipUnless(
@@ -1043,7 +1329,14 @@ class TestRustServerExtension(CustomTestCase):
             # Affinity is per thread: launch on a thread of its own, as the
             # scheduler's launch thread, so the test runner keeps its mask.
             scheduler = SimpleNamespace(
-                model_config=SimpleNamespace(is_multimodal=True)
+                processor=sentinel.processor,
+                model_config=SimpleNamespace(
+                    is_multimodal=True,
+                    is_generation=True,
+                    hf_config=sentinel.config,
+                    model_path="test/model",
+                ),
+                server_args=sentinel.server_args,
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)

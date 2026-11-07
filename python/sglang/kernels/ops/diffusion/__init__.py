@@ -46,6 +46,12 @@ _CUDA_SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 
 # ---------------------------------------------------------------------------
 _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
     (
+        "diffusion.depthwise_conv3x3_bias_glu",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.sana_depthwise_glu_triton:fused_depthwise_conv3x3_bias_glu",
+        _CUDA,
+    ),
+    (
         "diffusion.fused_packed_swiglu_fp8_rowwise",
         KernelBackend.TRITON,
         "quantization.swiglu_fp8_rowwise_triton:fused_packed_swiglu_fp8_rowwise",
@@ -418,6 +424,12 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         _CUDA,
     ),
     (
+        "diffusion.silu_temporal_pad",
+        KernelBackend.KDA,
+        "sglang.kernels.kda_kernels.silu_temporal_pad:fused_silu_temporal_pad",
+        _CUDA,
+    ),
+    (
         "diffusion.situ_softcap_mul",
         KernelBackend.TRITON,
         "activation.situ_softcap_mul_bitexact:fused_situ_softcap_mul_bitexact",
@@ -523,18 +535,6 @@ _SPECS: tuple[tuple[str, KernelBackend, str, frozenset], ...] = (
         "diffusion.vdn_linear_epilogue",
         KernelBackend.TRITON,
         "attention.vdn_linear_branch_triton:vdn_linear_epilogue",
-        _CUDA,
-    ),
-    (
-        "diffusion.mxfp8_quantize_swizzled",
-        KernelBackend.TRITON,
-        "sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
-        _CUDA,
-    ),
-    (
-        "diffusion.silu_mul_mxfp8",
-        KernelBackend.TRITON,
-        "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:silu_mul_mxfp8",
         _CUDA,
     ),
     (
@@ -660,6 +660,7 @@ for _op, _backend, _target, _caps in _SPECS:
 # then symbol; a new public kernel belongs here and nowhere else.
 # ---------------------------------------------------------------------------
 _EXPORTS: dict[str, str] = {
+    "can_use_fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "fused_packed_swiglu_fp8_rowwise": "quantization.swiglu_fp8_rowwise_triton",
     "apply_matrix_rope": "rope.matrix_rope",
     "residual_gate_fp32": "modulate.residual_gate_fp32",
@@ -753,7 +754,6 @@ _EXPORTS: dict[str, str] = {
     "indexed_gate_fp32_": "modulate.indexed_modulation_triton",
     "indexed_scale_shift_fp32_": "modulate.indexed_modulation_triton",
     "ltx2_ada_values9": "modulate.ltx2_ada_values_triton",
-    "can_use_head_gate_mul": "modulate.head_gate_triton",
     "head_gate_mul": "modulate.head_gate_triton",
     "can_use_modulate_scale_shift_cuda": "modulate.modulate_scale_shift_jit",
     "modulate_scale_shift": "modulate.modulate_scale_shift_jit",
@@ -805,8 +805,10 @@ _EXPORTS: dict[str, str] = {
     # Activation-function fusions
     "fused_bias_glu": "activation.sana_conv_post_triton",
     "fused_bias_silu": "activation.sana_conv_post_triton",
+    "fused_depthwise_conv3x3_bias_glu": "sglang.kernels.kda_kernels.sana_depthwise_glu_triton",
     "fused_packed_silu_mul_bitexact": "activation.silu_mul_bitexact",
     "fused_silu_mul_bitexact": "activation.silu_mul_bitexact",
+    "fused_silu_temporal_pad": "sglang.kernels.kda_kernels.silu_temporal_pad",
     "can_use_fused_situ_softcap_mul": "activation.situ_softcap_mul_bitexact",
     "fused_situ_softcap_mul_bitexact": "activation.situ_softcap_mul_bitexact",
     # Diffusion attention kernels
@@ -852,17 +854,12 @@ _EXPORTS: dict[str, str] = {
     "vdn_frame_stats_prep": "attention.vdn_linear_branch_triton",
     "vdn_gather_linear_state": "attention.vdn_linear_branch_triton",
     "vdn_linear_epilogue": "attention.vdn_linear_branch_triton",
-    "can_use_mxfp8_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
-    "can_use_silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
     "indexed_scale_shift_mxfp8_": "modulate.indexed_scale_shift_mxfp8_triton",
-    "mxfp8_quantize_swizzled": "sglang.kernels.ops.quantization.mxfp8_swizzled_triton",
-    "silu_mul_mxfp8": "sglang.kernels.ops.activation.swiglu_mxfp8_swizzled",
     "can_use_usp_merge_heads": "layout.usp_relayout_jit",
     "usp_merge_heads": "layout.usp_relayout_jit",
     "can_use_minimax_h3_vae_denorm_clamp": "layout.minimax_h3_vae_output_jit",
     "can_use_minimax_h3_vae_temporal_blend_write": "layout.minimax_h3_vae_output_jit",
     "minimax_h3_vae_denorm_clamp": "layout.minimax_h3_vae_output_jit",
-    "minimax_h3_vae_output_device_supported": "layout.minimax_h3_vae_output_jit",
     "minimax_h3_vae_temporal_blend_write": "layout.minimax_h3_vae_output_jit",
     "build_inv_indices": "layout.varlen_pack_pad_triton",
     "fused_pack_qkv": "layout.varlen_pack_pad_triton",
