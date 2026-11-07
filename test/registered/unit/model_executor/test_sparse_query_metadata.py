@@ -5,11 +5,12 @@ import torch
 
 from sglang.srt.model_executor.sparse_query import SparseQueryMetadata
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
-class TestSparseQueryMetadata(unittest.TestCase):
+class TestSparseQueryMetadata(CustomTestCase):
     def test_original_positions_and_request_boundaries(self):
         metadata = SparseQueryMetadata((2, 1), torch.tensor([0, 3, 1]))
         self.assertEqual(

@@ -1,13 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Original query positions for selective prefill over a complete KV cache."""
 
-from dataclasses import dataclass
-
+import msgspec
 import torch
 
 
-@dataclass(frozen=True)
-class SparseQueryMetadata:
+class SparseQueryMetadata(msgspec.Struct, frozen=True):
     """Describe request-major queries without changing the KV sequence lengths.
 
     Args:
@@ -16,6 +14,10 @@ class SparseQueryMetadata:
             Positions within each request must be sorted, nonnegative, and less
             than that request's KV length. They also determine RoPE positions
             and the caller's selected output-cache locations.
+
+    Callers compact model inputs and bind the selected write columns with
+    ``IterationIds.bind`` before planning attention. KV lengths remain full;
+    this metadata does not change the model inputs or the KV write plan.
     """
 
     query_lens: tuple[int, ...]
