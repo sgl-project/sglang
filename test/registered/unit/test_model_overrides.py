@@ -1927,6 +1927,35 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     SimpleNamespace(architectures=["GptOssForCausalLM"]),
                 )
 
+    def test_gpt_oss_xpu_auto_keeps_native_moe_backend(self):
+        """On XPU, an installed triton_kernels must not move auto MoE selection
+        off the native sgl-kernel-xpu path, for bf16 or mxfp4 checkpoints."""
+        from sglang.srt.arg_groups.model_overrides import gpt_oss as gpt_oss_module
+
+        server_args = SimpleNamespace(
+            dtype="auto",
+            attention_backend="intel_xpu",
+            prefill_attention_backend=None,
+            decode_attention_backend=None,
+            moe_runner_backend="auto",
+            ep_size=1,
+            quantization=None,
+        )
+        for quantization_config in (None, {"quant_method": "mxfp4"}):
+            hf_config = SimpleNamespace(
+                architectures=["GptOssForCausalLM"],
+                quantization_config=quantization_config,
+            )
+            with (
+                self.subTest(quantization_config=quantization_config),
+                override_platform(is_xpu=True),
+                patch.object(
+                    gpt_oss_module, "is_triton_kernels_available", return_value=True
+                ),
+            ):
+                overrides = gpt_oss_module._gpt_oss_overrides(server_args, hf_config)
+                self.assertEqual(overrides.get("moe_runner_backend"), "intel_xpu")
+
     def test_sampling_backend_default_pass(self):
         from sglang.srt.utils.device import is_flashinfer_available
 
