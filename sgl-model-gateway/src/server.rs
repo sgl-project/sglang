@@ -13,6 +13,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use axum_server::{accept::NoDelayAcceptor, tls_rustls::RustlsAcceptor};
 use rustls::crypto::ring;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -1077,13 +1078,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
             .await
             .map_err(|e| format!("Failed to create TLS config: {}", e))?;
 
-        axum_server::bind_rustls(addr, tls_config)
+        axum_server::bind(addr)
+            .acceptor(RustlsAcceptor::new(tls_config).acceptor(NoDelayAcceptor::new()))
             .handle(handle)
             .serve(app.into_make_service())
             .await
             .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)?;
     } else {
         axum_server::bind(addr)
+            .acceptor(NoDelayAcceptor::new())
             .handle(handle)
             .serve(app.into_make_service())
             .await
