@@ -96,6 +96,10 @@ class SchedulerDllmMixin:
             self.dllm_config.requires_separate_context_encoding
             and not batch.forward_mode.is_dllm_extend()
         ):
+            # A causal context pass can seed the following denoising block.
+            if result.dllm_algo_state is not None:
+                for req, state in zip(batch.reqs, result.dllm_algo_state):
+                    req.dllm_algo_state = state
             self.metrics_reporter.report_prefill_stats(
                 batch=batch,
                 prefill_stats=batch.prefill_stats,
@@ -143,6 +147,23 @@ class SchedulerDllmMixin:
                     req.dllm_algo_state = (
                         algo_states[idx] if algo_states is not None else None
                     )
+                    continue
+
+                if self.dllm_config.retains_causal_prefix:
+                    accepted = result.accept_length_per_req_cpu[idx]
+                    assert 1 <= accepted <= block_size
+                    next_token_ids = next_token_ids[:accepted]
+                    start = req.extend_end - block_size
+                    req.full_untruncated_fill_ids[start : req.extend_end] = array(
+                        "q", next_token_ids
+                    )
+                    req.extend_end = start + accepted
+                    req.dllm_incomplete_ids = array("q")
+                    req.dllm_algo_state = algo_states[idx]
+                    self.metrics_reporter.num_generated_tokens += accepted
+                    req.output_ids.extend(next_token_ids)
+                    req.update_finish_state(new_accepted_len=accepted)
+                    self._finish_dllm_request_if_needed(req)
                     continue
 
                 req.dllm_incomplete_ids = array("q")
@@ -196,9 +217,11 @@ class SchedulerDllmMixin:
             req.time_stats.set_completion_time()
 
     def _stash_dllm_context(self: Scheduler, req: Req) -> None:
-        context_len = req.dllm_block_offset
-        block_size = self.dllm_config.block_size
-        assert req.extend_end == context_len + block_size
+        if self.dllm_config.retains_causal_prefix:
+            context_len = req.extend_end
+        else:
+            context_len = req.dllm_block_offset
+            assert req.extend_end == context_len + self.dllm_config.block_size
         assert req.kv is not None and req.kv.req_pool_idx is not None
 
         allocated_len = req.kv.kv_allocated_len

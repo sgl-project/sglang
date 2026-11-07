@@ -401,6 +401,23 @@ class _IsolatedRegistry(CustomTestCase):
         super().tearDown()
 
 
+class TestNemotronLabsDiffusionDefaults(CustomTestCase):
+    def test_fa4_default_does_not_change_ar_or_other_gpus(self):
+        for is_sm100, algorithm in ((False, "NemotronFastDiffuser"), (True, None)):
+            with self.subTest(sm100=is_sm100, algorithm=algorithm):
+                args = SimpleNamespace(
+                    dllm_algorithm=algorithm,
+                    attention_backend=None,
+                    prefill_attention_backend=None,
+                    decode_attention_backend=None,
+                )
+                with override_platform(is_sm100=is_sm100):
+                    declarations = collect_model_override_declarations(
+                        "NemotronLabsDiffusionModel", args, None
+                    )
+                self.assertEqual(declarations, [])
+
+
 class TestModelOverrideRegistry(_IsolatedRegistry):
     def test_const_then_callables_in_registration_order(self):
         base_module.MODEL_OVERRIDES["FakeForCausalLM"] = {"a": 1}
@@ -2222,6 +2239,41 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(
             (self._publish(sa), self._leaf("attention_backend"))[1], "flashinfer"
         )
+
+    def test_nemotron_diffusion_preserves_split_attention_backends(self):
+        """Resolving a missing global backend must keep requested phase backends."""
+        for global_backend, prefill, decode, expected_global in (
+            (None, "fa4", None, "fa4"),
+            (None, None, "fa4", "fa4"),
+            (None, "flashinfer", "fa4", "fa4"),
+            (None, "fa4", "flashinfer", "fa4"),
+            (None, "flashinfer", "flashinfer", "flashinfer"),
+            ("flashinfer", "fa4", None, "flashinfer"),
+        ):
+            with (
+                self.subTest(
+                    global_backend=global_backend, prefill=prefill, decode=decode
+                ),
+                override_platform(is_cuda=True, is_sm100=True),
+            ):
+                args = self._construct(
+                    "NemotronLabsDiffusionModel",
+                    "nemotron_labs_diffusion",
+                    config_extra={"head_dim": 16},
+                    dllm_algorithm="NemotronFastDiffuser",
+                    attention_backend=global_backend,
+                    prefill_attention_backend=prefill,
+                    decode_attention_backend=decode,
+                )
+                self.assertEqual(
+                    self._resolved(args, "attention_backend"), expected_global
+                )
+                self.assertEqual(
+                    self._resolved(args, "prefill_attention_backend"), prefill
+                )
+                self.assertEqual(
+                    self._resolved(args, "decode_attention_backend"), decode
+                )
 
     def test_attention_backend_leaf_materializes_end_state(self):
         # The default-fill pass declares the platform-selected backend; the

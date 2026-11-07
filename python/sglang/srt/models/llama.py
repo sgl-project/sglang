@@ -302,6 +302,8 @@ class LlamaAttention(nn.Module):
 
 
 class LlamaDecoderLayer(nn.Module):
+    attention_cls = LlamaAttention
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -336,7 +338,7 @@ class LlamaDecoderLayer(nn.Module):
         attention_bias = getattr(config, "attention_bias", False) or getattr(
             config, "bias", False
         )
-        self.self_attn = LlamaAttention(
+        self.self_attn = self.attention_cls(
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -413,6 +415,8 @@ class LlamaDecoderLayer(nn.Module):
 
 
 class LlamaModel(nn.Module):
+    decoder_layer_cls = LlamaDecoderLayer
+
     def __init__(
         self,
         config: LlamaConfig,
@@ -442,7 +446,7 @@ class LlamaModel(nn.Module):
         )
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            lambda idx, prefix: LlamaDecoderLayer(
+            lambda idx, prefix: self.decoder_layer_cls(
                 config=config,
                 quant_config=quant_config,
                 layer_id=idx,
@@ -450,7 +454,7 @@ class LlamaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix="model.layers",
-            stage_facts=lambda idx: LlamaDecoderLayer.stage_facts(config, idx),
+            stage_facts=lambda idx: self.decoder_layer_cls.stage_facts(config, idx),
         )
 
         if self.pp_group.is_last_rank:

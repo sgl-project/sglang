@@ -17,6 +17,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -352,6 +353,41 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
                 release.assert_called_once_with(
                     req, scheduler.tree_cache, checkpoint=False
                 )
+
+
+class TestCausalPrefixAcceptance(CustomTestCase):
+    def test_accepted_prefix_is_emitted_and_only_rejected_kv_pages_are_freed(self):
+        for accepted in (1, 2, 3, 4):
+            with self.subTest(accepted=accepted):
+                req = _Req(context_len=10, block_size=4)
+                scheduler = _Scheduler(fdfo=True)
+                scheduler.dllm_config.retains_causal_prefix = True
+                scheduler.stash_chunked_request = Mock()
+                table = torch.arange(64).view(4, 16)
+                scheduler.req_to_token_pool = SimpleNamespace(req_to_token=table)
+                scheduler.token_to_kv_pool_allocator.page_size = 4
+                scheduler.token_to_kv_pool_allocator.free_segment = Mock()
+                state = {"seed": 7, "started": False, "steps": 0}
+                scheduler.process_batch_result_dllm(
+                    _Batch([req]),
+                    _result(
+                        [[1, 2, 3, 4]], accept_lengths=[accepted], algo_states=[state]
+                    ),
+                )
+                self.assertEqual(list(req.output_ids), [1, 2, 3, 4][:accepted])
+                self.assertEqual(len(req.full_untruncated_fill_ids), 10 + accepted)
+                self.assertEqual(req.extend_end, 10 + accepted)
+                self.assertIs(req.dllm_algo_state, state)
+                scheduler.finish_dllm_forward(req)
+                self.assertEqual(req.kv.kv_committed_len, 10 + accepted)
+                self.assertEqual(req.kv.req_pool_idx, 1)
+                free = scheduler.token_to_kv_pool_allocator.free_segment
+                if accepted in (1, 2):
+                    free.assert_called_once()
+                    torch.testing.assert_close(free.call_args.args[0], table[1, 12:14])
+                    self.assertEqual(free.call_args.kwargs["start_pos"], 12)
+                else:
+                    free.assert_not_called()
 
 
 class TestGemma4RequestValidation(unittest.TestCase):

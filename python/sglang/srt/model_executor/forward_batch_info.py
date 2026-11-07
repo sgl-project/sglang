@@ -584,6 +584,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # === Forward-derived (built in init_new on the forward stream; FB-owned) ===
     # Position information
     positions: torch.Tensor = None
+    dllm_is_causal: bool = False
     # dLLM committed positions are immutable, including literal mask-token IDs.
     # None when no request in the batch has a literal mask ID.
     dllm_prompt_mask: Optional[torch.Tensor] = None

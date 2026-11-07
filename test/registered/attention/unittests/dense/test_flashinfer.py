@@ -1,12 +1,18 @@
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    MockModelRunner,
+    TinyModelConfig,
     make_dense_cases,
     run_dense_attention_case,
 )
@@ -280,6 +286,125 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(4, 7),
         ),
     )
+
+    @staticmethod
+    def _flashinfer_fixture(architecture, *, is_dllm=True, decode_graphs=True):
+        case = DenseAttentionCase(
+            name="diffusion_graph_replan",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=1,
+            prefix_lens=(0, 0, 0, 0),
+            extend_lens=(32, 32, 32, 32),
+        )
+        config = TinyModelConfig(
+            num_heads=4,
+            num_kv_heads=2,
+            head_dim=128,
+            hidden_size=256,
+            context_len=128,
+        )
+        config.hf_config.architectures = [architecture]
+        runner = MockModelRunner(
+            case=case,
+            model_config=config,
+            dtype=torch.bfloat16,
+            device="cuda",
+            max_context_len=128,
+            head_dim=128,
+            disable_cuda_graph=not decode_graphs,
+        )
+        dllm_config = SimpleNamespace(block_size=32) if is_dllm else None
+        with patch.object(DllmConfig, "from_server_args", return_value=dllm_config):
+            backend = FlashInferAttnBackend(runner)
+        return SimpleNamespace(runner=runner, backend=backend)
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+        "Blackwell ragged prefill backend selection",
+    )
+    def test_cutlass_selection_is_unchanged_outside_nemotron_full_graphs(self):
+        for architecture, is_dllm, decode_graphs in (
+            ("SDARForCausalLM", True, True),
+            ("NemotronLabsDiffusionModel", False, True),
+            ("NemotronLabsDiffusionModel", True, False),
+        ):
+            with self.subTest(
+                architecture=architecture, is_dllm=is_dllm, decode_graphs=decode_graphs
+            ):
+                fixture = self._flashinfer_fixture(
+                    architecture, is_dllm=is_dllm, decode_graphs=decode_graphs
+                )
+                self.assertEqual(
+                    fixture.backend.prefill_wrapper_ragged._backend, "cutlass"
+                )
+
+    @unittest.skipUnless(
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+        "Blackwell ragged prefill backend selection",
+    )
+    def test_nemotron_ragged_graphs_survive_replanning_batch_sizes(self):
+        fixture = self._flashinfer_fixture("NemotronLabsDiffusionModel")
+        wrapper = fixture.backend.prefill_wrapper_ragged
+        torch.manual_seed(2026)
+        pointers = torch.arange(5, device="cuda", dtype=torch.int32) * 32
+        q = torch.randn(128, 4, 128, device="cuda", dtype=torch.bfloat16)
+        k = torch.randn(128, 2, 128, device="cuda", dtype=torch.bfloat16)
+        v = torch.randn_like(k)
+        reference = []
+        for start in range(0, 128, 32):
+            queries = q[start : start + 32].transpose(0, 1).float()
+            keys = (
+                k[start : start + 32]
+                .transpose(0, 1)
+                .float()
+                .repeat_interleave(2, dim=0)
+            )
+            values = (
+                v[start : start + 32]
+                .transpose(0, 1)
+                .float()
+                .repeat_interleave(2, dim=0)
+            )
+            scores = queries @ keys.transpose(-1, -2) / 128**0.5
+            reference.append((scores.softmax(-1) @ values).transpose(0, 1))
+        reference = torch.cat(reference)
+        graphs, outputs = {}, {}
+
+        def plan(batch_size):
+            wrapper.plan(
+                pointers[: batch_size + 1],
+                pointers[: batch_size + 1],
+                4,
+                2,
+                128,
+                q_data_type=torch.bfloat16,
+                causal=False,
+            )
+
+        for batch_size in (4, 2, 1):
+            plan(batch_size)
+            tokens = batch_size * 32
+            for _ in range(3):
+                wrapper.run(q[:tokens], k[:tokens], v[:tokens])
+            torch.cuda.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph):
+                outputs[batch_size] = wrapper.run(q[:tokens], k[:tokens], v[:tokens])
+            graphs[batch_size] = graph
+        for batch_size in (4, 1, 2, 4):
+            with self.subTest(batch_size=batch_size):
+                plan(batch_size)
+                graphs[batch_size].replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    outputs[batch_size].float(),
+                    reference[: batch_size * 32],
+                    atol=0.02,
+                    rtol=0.02,
+                )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
