@@ -64,7 +64,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
@@ -691,6 +690,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # This DP rank's first row in the parent's gathered layout; non-EP DP TBO only.
+    tbo_parent_dp_offset: Optional[int] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -2261,10 +2262,7 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     return (
-        _is_hip
-        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
-        and get_parallel().attn_dp_size > 1
-        and get_moe_a2a_backend().is_none()
+        _is_hip and get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
     )
 
 

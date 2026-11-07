@@ -74,6 +74,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
+    handle_eplb_and_dispatch,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -530,6 +531,28 @@ class TestPrepareServerArgs(CustomTestCase):
         # This validation runs before model construction and should allow the
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
+
+    def test_eplb_recorder_mode_compatibility(self):
+        def make_args(mode):
+            return ServerArgs(
+                model_path="dummy",
+                tp_size=2,
+                ep_size=2,
+                enable_eplb=True,
+                expert_distribution_recorder_mode=mode,
+            )
+
+        for mode in ("per_pass", "per_token"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    ValueError, "needs --expert-distribution-recorder-mode stat"
+                ),
+            ):
+                handle_eplb_and_dispatch(make_args(mode))
+        for mode in (None, "stat", "stat_approx"):
+            with self.subTest(mode=mode):
+                handle_eplb_and_dispatch(make_args(mode))
 
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
@@ -1243,10 +1266,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
-        with self.assertLogs(serving_hook.logger, level="INFO") as logs:
-            handle_multimodal_feature_transport(server_args)
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
 
-        self.assertEqual(resolution_result(server_args, "mm_feature_transport"), "cpu")
+            self.assertEqual(
+                resolution_result(server_args, "mm_feature_transport"), "cpu"
+            )
+
         self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
 
     @patch("sglang.srt.arg_groups.serving_hook.os.path.exists", return_value=False)
@@ -5046,6 +5074,72 @@ class TestLaunchCommand(CustomTestCase):
         )
 
 
+class TestAccessKeyRedaction(CustomTestCase):
+    """The access keys and the TLS key password reach nothing that reports the
+    configuration: not the launch command, `/server_info`, the startup log or
+    the record's repr. Anyone holding the API key can read those, and the
+    admin key must stay out of their reach."""
+
+    # Spellings argparse accepts: an abbreviation with `=`, a value with a
+    # space, a value that spells another key flag, and a repeated flag.
+    ARGV = [
+        "--model-path",
+        "/tmp/x",
+        "--api-key",
+        "alpha beta",
+        "--admin-api-ke=alpha-admin",
+        "--api-key=--admin-api-key=x",
+        "--admin-api-key",
+        "second-admin",
+        "--ssl-keyfile-password",
+        "tls-secret",
+    ]
+    SECRETS = (
+        "alpha beta",
+        "alpha-admin",
+        "--admin-api-key=x",
+        "second-admin",
+        "tls-secret",
+    )
+
+    def _assert_no_secret(self, text: str):
+        for secret in self.SECRETS:
+            self.assertNotIn(secret, text)
+
+    def test_launch_command_redacts_every_spelling(self):
+        server_args = prepare_server_args(self.ARGV)
+        self.assertEqual(
+            server_args.launch_command,
+            "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
+            "--api-key=<redacted> --admin-api-key <redacted> "
+            "--ssl-keyfile-password <redacted>",
+        )
+        # Redaction is for display only: the server still authenticates with
+        # the values the operator gave, the last of each repeated flag.
+        self.assertEqual(server_args.api_key, "--admin-api-key=x")
+        self.assertEqual(server_args.admin_api_key, "second-admin")
+
+    def test_server_info_reports_whether_a_key_is_set_not_its_value(self):
+        from sglang.srt.entrypoints.server_utils import build_server_info
+
+        info = build_server_info(prepare_server_args(self.ARGV), {})
+        self.assertEqual(info["api_key"], "<redacted>")
+        self.assertEqual(info["admin_api_key"], "<redacted>")
+        self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self._assert_no_secret(json.dumps(info, default=str))
+        unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
+        self.assertIsNone(unset["api_key"])
+        self.assertIsNone(unset["admin_api_key"])
+        self.assertIsNone(unset["ssl_keyfile_password"])
+
+    def test_startup_log_and_repr(self):
+        from sglang.srt.entrypoints.engine import _server_args_for_logging
+
+        server_args = prepare_server_args(self.ARGV)
+        self._assert_no_secret(str(_server_args_for_logging(server_args)))
+        self._assert_no_secret(repr(server_args))
+
+
 class TestNoneMeansUnset(CustomTestCase):
     """A valued field the resolution rewrites carries `None` for "not set".
 
@@ -5316,7 +5410,10 @@ class TestDcpCommBackendDefault(CustomTestCase):
 
     @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
     def test_npu_supports_dcp(self):
-        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
@@ -5421,6 +5518,132 @@ class TestLazyReexports(CustomTestCase):
     def test_an_unknown_attribute_still_raises(self):
         with self.assertRaises(AttributeError):
             server_args_module.NotAThing
+
+
+class TestRustServerUnsupportedArgs(CustomTestCase):
+    # A non-default CLI setting for every refused argument.
+    REFUSED = {
+        "ssl_keyfile": ["--ssl-keyfile", "key.pem"],
+        "ssl_certfile": ["--ssl-certfile", "cert.pem"],
+        "ssl_ca_certs": ["--ssl-ca-certs", "ca.pem"],
+        "ssl_keyfile_password": ["--ssl-keyfile-password", "pw"],
+        "enable_ssl_refresh": ["--enable-ssl-refresh"],
+        "allowed_media_domains": ["--allowed-media-domains", "example.com"],
+        "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "enable_cache_report": ["--enable-cache-report"],
+        "enable_trace": ["--enable-trace"],
+        "warmups": ["--warmups", "voice_chat"],
+        "completion_template": ["--completion-template", "deepseek_coder"],
+        "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
+        "enable_return_routed_experts": ["--enable-return-routed-experts"],
+        "enable_lora": ["--enable-lora"],
+        "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
+        "tokenizer_mode": ["--tokenizer-mode", "slow"],
+        "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
+        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
+        "tokenizer_metrics_allowed_custom_labels": [
+            "--tokenizer-metrics-allowed-custom-labels",
+            "tenant",
+        ],
+        "enable_http2": ["--enable-http2"],
+        "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
+        "language_only": ["--language-only"],
+        "checkpoint_engine_wait_weights_before_ready": [
+            "--checkpoint-engine-wait-weights-before-ready"
+        ],
+        "delete_ckpt_after_loading": ["--delete-ckpt-after-loading"],
+        "return_input_ids": ["--return-input-ids"],
+        "return_output_ids": ["--return-output-ids"],
+    }
+
+    @staticmethod
+    def _resolve(cli_args, rust_server=True):
+        args = prepare_server_args(["--model-path", "dummy", *cli_args])
+        # `override` leaves the variable set when its body raises.
+        with patch.dict(os.environ), envs.SGLANG_RUST_SERVER.override(rust_server):
+            args.resolve_once()
+
+    def test_every_unsupported_arg_is_refused_by_name(self):
+        self.assertEqual(
+            set(self.REFUSED), set(validation_hook.RUST_SERVER_UNSUPPORTED_ARGS)
+        )
+        for name, cli_args in self.REFUSED.items():
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(
+                    ValueError, f"does not support {cli_args[0]}:"
+                ):
+                    self._resolve(cli_args)
+                # The Python frontend honors them.
+                self._resolve(cli_args, rust_server=False)
+
+    def test_error_names_every_offending_flag(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._resolve([arg for args in self.REFUSED.values() for arg in args])
+        message = str(ctx.exception)
+        for cli_args in self.REFUSED.values():
+            self.assertIn(cli_args[0], message)
+
+    def test_tool_strict_level_is_refused(self):
+        with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):
+            with self.assertRaisesRegex(
+                ValueError, "does not support SGLANG_TOOL_STRICT_LEVEL:"
+            ):
+                self._resolve([])
+            self._resolve([], rust_server=False)
+
+    def test_args_a_model_package_honors_are_not_refused(self):
+        args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--mm-preprocess-cache-size-mb",
+                "512",
+                "--enable-http2",
+            ]
+        )
+        self.assertEqual(
+            validation_hook.rust_server_unsupported_args(
+                args, honored={"mm_preprocess_cache_size_mb"}
+            ),
+            ["--enable-http2"],
+        )
+
+    def test_supported_and_default_valued_args_pass(self):
+        self._resolve(
+            [
+                # Accepted in Rust-server mode.
+                "--log-requests",
+                "--log-requests-level",
+                "1",
+                "--crash-dump-folder",
+                "/tmp/dumps",
+                "--trust-remote-code",
+                "--enable-request-time-stats-logging",
+                "--skip-server-warmup",
+                # Honored by the Rust server.
+                "--default-chat-template-kwargs",
+                '{"enable_thinking": false}',
+                "--enable-strict-thinking",
+                "--api-key",
+                "sk-test",
+                "--admin-api-key",
+                "sk-admin",
+                # Refused arguments at their default values.
+                "--media-url-max-file-size-mb",
+                "64",
+                "--tokenizer-mode",
+                "auto",
+                "--tokenizer-backend",
+                "huggingface",
+                # Python disables the GC warning when this is not positive.
+                "--gc-warning-threshold-secs",
+                "-1",
+                # The preprocessing cache off, as in the Rust pipelines.
+                "--mm-preprocess-cache-size-mb",
+                "0",
+            ]
+        )
 
 
 class TestPrefillWeightVersionCompatibility(CustomTestCase):

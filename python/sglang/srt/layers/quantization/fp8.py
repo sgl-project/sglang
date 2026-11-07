@@ -155,9 +155,6 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
-# gfx1250 grouped MoE runs the a8w4 (fp8 activation) FlyDSL kernel when
-# AITER_FORCE_A8W4 is set; that kernel consumes (16,16)-preshuffled weights.
-_use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
 
 
 def _require_fp4_dtype():
@@ -1228,7 +1225,8 @@ class Fp8LinearMethod(LinearMethodBase):
     def process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
-            if layer.deepgemm_mxfp8_input:
+            # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
+            if getattr(layer, "deepgemm_mxfp8_input", False):
                 layer.deepgemm_mxfp8_input = self.prepare_deepgemm_mxfp8_input(layer)
         else:
             layer.weight = Parameter(layer.weight.data, requires_grad=False)
@@ -1385,7 +1383,7 @@ class Fp8LinearMethod(LinearMethodBase):
 
         if self.use_marlin:
             if self.block_quant:
-                layer.weight_block_size = self.quant_config.weight_block_size
+                layer.weight_block_size = self.weight_block_size
             prepare_fp8_layer_for_marlin(layer, not self.block_quant)
             # Activations not quantized for marlin.
             del layer.input_scale
@@ -2020,10 +2018,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
-            if (
-                get_moe_a2a_backend().is_megamoe()
-                and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()
-            ):
+            if get_moe_a2a_backend().is_megamoe():
                 if self.dequant_fp4_to_fp8:
                     raise ValueError(
                         "SGLANG_DSV4_FP4_DEQUANT strips the packed FP4 layout that "
@@ -2157,17 +2152,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                         gate_up=False,
                     )
                 else:
-                    is_shuffled = _is_shuffle_moe_mxfp4 or _use_aiter_a8w4
+                    is_shuffled = _is_shuffle_moe_mxfp4
                     if is_shuffled:
-                        shuffle_gu_intv = gu_intv and not _use_aiter_a8w4
                         layer.w13_weight.data = shuffle_weight(
                             layer.w13_weight,
-                            is_guinterleave=shuffle_gu_intv,
+                            is_guinterleave=gu_intv,
                             gate_up=True,
                         )
                         layer.w2_weight.data = shuffle_weight(
                             layer.w2_weight,
-                            is_guinterleave=shuffle_gu_intv,
+                            is_guinterleave=gu_intv,
                             gate_up=False,
                         )
                 layer.w13_weight.is_shuffled = is_shuffled

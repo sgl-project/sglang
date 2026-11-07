@@ -452,7 +452,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
@@ -463,6 +462,10 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
+        )
+    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+        raise ValueError(
+            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0
