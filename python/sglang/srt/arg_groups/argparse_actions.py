@@ -142,14 +142,18 @@ class DeprecatedChoiceToFlagAction(argparse.Action):
     left unset, so it never reaches the config.
     """
 
-    def __init__(self, option_strings, dest, flags, **kwargs):
+    def __init__(
+        self, option_strings, dest, flags, default=argparse.SUPPRESS, **kwargs
+    ):
+        # Wrappers that re-register server args (e.g. under a prefix) pass a default too.
+        assert default is argparse.SUPPRESS, "the old dest must never reach the config"
         self.flags = flags
         super().__init__(
             option_strings,
             dest,
             nargs=None,
             choices=list(flags),
-            default=argparse.SUPPRESS,
+            default=default,
             **kwargs,
         )
 
