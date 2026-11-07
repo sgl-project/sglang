@@ -47,6 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.gemma3_causal import Gemma3ForCausalLM
 from sglang.srt.models.siglip import SiglipVisionModel
+from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.utils import flatten_nested_list, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,13 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
             "up_proj",
         ],
     }
+
+    # load_weights loads the vision tower's out_proj into VisionAttention's proj.
+    # Apply the same rename to the quantization config's module lists, so that
+    # an ignore entry such as "...self_attn.out_proj" matches the module.
+    hf_to_sglang_mapper = WeightsMapper(
+        orig_to_new_suffix={".self_attn.out_proj": ".self_attn.proj"},
+    )
 
     # LoRA specific attributes
     supported_lora_modules = [
