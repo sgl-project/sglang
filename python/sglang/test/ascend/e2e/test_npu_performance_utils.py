@@ -168,6 +168,10 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
+GLM_5_3_FLASH_W8A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-Flash-w8a8"
+)
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -957,6 +961,8 @@ def assert_metrics(self, metrics):
     """
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
+
+    self.last_metrics = metrics
 
     tc_name = self.__class__.__name__
     # The perf knobs below are declared on the perf test bases; callers from

@@ -278,6 +278,8 @@ def assert_metrics(self, metrics):
     if not metrics:
         raise Exception("No metrics obtained from benchmark")
 
+    self.last_metrics = metrics
+
     if self.accuracy is not None:
         threshold = get_accuracy_threshold(self.datasets, self.accuracy)
         dump_metric(
