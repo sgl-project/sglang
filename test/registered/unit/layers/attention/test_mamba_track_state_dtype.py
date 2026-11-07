@@ -189,6 +189,8 @@ class TestTrackMambaStateDtype(CustomTestCase):
             head_q_dim=2,
             head_k_dim=2,
             head_v_dim=2,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -232,8 +234,15 @@ class TestTrackMambaStateDtype(CustomTestCase):
 
                     def extend(q, k, v, g, beta, **kwargs):
                         self.assertEqual(kwargs["layer_id"], layer.layer_id)
+                        self.assertIs(kwargs["A_log"], layer.A_log)
+                        self.assertIs(kwargs["dt_bias"], layer.dt_bias)
+                        self.assertTrue(kwargs["needs_track_state"])
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
+                        )
+                        torch.testing.assert_close(
+                            kwargs["has_initial_state"],
+                            batch.extend_prefix_lens > 0,
                         )
                         torch.testing.assert_close(
                             kwargs["cache_indices"], expected_indices
