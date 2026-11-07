@@ -462,8 +462,8 @@ The HTTP router exposes the full OpenAI-compatible surface area (`/generate`, `/
 - Provides the same `/v1/*` APIs as the HTTP router while streaming tokenized requests/responses directly to SRT gRPC workers.
 - Built-in reasoning parsers for DeepSeek, Qwen, Llama, Mistral, GPT-OSS, Step-3, GLM4, GLM4.7, Kimi K2, and other structured-thought models.
 - Tool-call parsers for JSON, Pythonic, XML, and custom schemas with streaming and non-streaming execution loops.
-- Tokenizer factory supporting HuggingFace models, local tokenizer.json files, and chat template overrides (see `src/tokenizer`).
-- Explore the code paths in `src/reasoning_parser`, `src/tool_parser`, and `src/tokenizer` for the end-to-end Rust implementations that power gRPC mode.
+- Tokenizer factory supporting HuggingFace models, local tokenizer.json files, and chat template overrides (the `llm-tokenizer` crate).
+- The end-to-end Rust implementations that power gRPC mode come from the `reasoning-parser`, `tool-parser`, and `llm-tokenizer` crates (see `Cargo.toml`).
 
 ### OpenAI Router
 - Proxies OpenAI-compatible chat completions and responses APIs, preserving headers and SSE streams end-to-end.
