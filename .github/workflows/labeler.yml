@@ -2,9 +2,9 @@ name: Auto Label PRs and Issues
 
 on:
   pull_request_target:
-    types: [opened, edited, synchronize, reopened]
+    types: [opened, synchronize, reopened]
   issues:
-    types: [opened, edited, reopened]
+    types: [opened, reopened]
 
 permissions:
   contents: read
@@ -13,18 +13,15 @@ permissions:
 
 jobs:
   label:
-    # Body-only edits cannot change any label.
-    if: github.event.action != 'edited' || github.event.changes.title
     runs-on: ubuntu-latest
     steps:
       # Read metadata only; never check out or execute code from the PR.
+      # Skip pushes so they do not re-add a title label that a maintainer removed.
       - name: Label Beam titles
+        if: github.event.action != 'synchronize'
         uses: actions/github-script@v8
         with:
           script: |
-            // Check titles only when they are new or edited, so pushes do not
-            // re-add a title label that a maintainer removed.
-            if (context.payload.action === 'synchronize') return;
             const { number, title } = context.payload.pull_request ?? context.payload.issue;
             // Bare "beam" also names beam search, so require a Beam model identifier.
             const modelName = new RegExp([
@@ -50,7 +47,7 @@ jobs:
             }
 
       - name: Auto-label by file changes
-        if: github.event_name == 'pull_request_target' && github.event.action != 'edited'
+        if: github.event_name == 'pull_request_target'
         uses: actions/labeler@v5
         with:
           repo-token: "${{ secrets.GITHUB_TOKEN }}"
