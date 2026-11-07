@@ -117,7 +117,12 @@ class BaseFormatDetector(ABC):
         For some format, the bot_token is not a token in model's vocabulary, such as
         `[TOOL_CALLS] [` in Mistral.
         """
-        for i in range(1, min(len(buffer) + 1, len(bot_token))):
+        # Scan longest suffix first: when a bot_token repeats its own prefix
+        # (e.g. `<|action_start|> <|plugin|>`, `<|start|>assistant<|channel|>...`),
+        # a shorter suffix of the buffer can also be a prefix of the bot_token, so
+        # returning the first (shortest) match would hold back too few characters
+        # and leak part of the partial token into the normal text stream.
+        for i in range(min(len(buffer), len(bot_token) - 1), 0, -1):
             if bot_token.startswith(buffer[-i:]):
                 return i
         return 0
