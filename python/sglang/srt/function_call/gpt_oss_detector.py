@@ -27,6 +27,7 @@ class GptOssDetector(BaseFormatDetector):
     def __init__(self):
         super().__init__()
         self.harmony_parser = HarmonyParser()
+        self._after_tool_call = False
         self.bot_token = "<|start|>assistant<|channel|>commentary"
         self.eot_token = "<|call|>"
 
@@ -86,6 +87,12 @@ class GptOssDetector(BaseFormatDetector):
         # markers, treat it as plain text and pass it through. This fixes a bug where
         # normal content was held in the buffer when tools were provided but not used.
         if not events:
+            if self._after_tool_call:
+                # HarmonyParser may be holding a possible commentary filler until
+                # it sees more text or the next structural token.
+                self._buffer = ""
+                return StreamingParseResult(normal_text="", calls=[])
+
             has_harmony_markers = any(
                 marker in self._buffer
                 for marker in (
@@ -119,6 +126,8 @@ class GptOssDetector(BaseFormatDetector):
                 normal_text = "".join(
                     [e.content for e in events if e.event_type == "normal"]
                 )
+                if any(event.event_type == "normal" for event in events):
+                    self._after_tool_call = False
                 if normal_text:
                     self._buffer = ""
                     return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -127,6 +136,8 @@ class GptOssDetector(BaseFormatDetector):
             normal_text = "".join(
                 [e.content for e in events if e.event_type == "normal"]
             )
+            if any(event.event_type == "normal" for event in events):
+                self._after_tool_call = False
             if normal_text or events:
                 self._buffer = ""
                 return StreamingParseResult(normal_text=normal_text, calls=[])
@@ -147,6 +158,7 @@ class GptOssDetector(BaseFormatDetector):
 
         for event in events:
             if event.event_type == "tool_call":
+                self._after_tool_call = True
                 # We got a complete tool call from HarmonyParser
                 tool_call_info = self._extract_tool_call_from_event(
                     event.raw_text if event.raw_text else event.content,
@@ -187,12 +199,24 @@ class GptOssDetector(BaseFormatDetector):
                     self.current_tool_name_sent = False
 
             elif event.event_type == "normal":
+                if self._after_tool_call:
+                    self._after_tool_call = False
                 normal_text += event.content
 
         # Clear buffer since HarmonyParser handles buffering
         self._buffer = ""
 
         return StreamingParseResult(normal_text=normal_text, calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Flush normal text held while checking for a post-call filler."""
+        events = self.harmony_parser.finish()
+        normal_text = "".join(
+            event.content for event in events if event.event_type == "normal"
+        )
+        self._buffer = ""
+        self._after_tool_call = False
+        return StreamingParseResult(normal_text=normal_text, calls=[])
 
     def _extract_tool_call_from_event(
         self, content: str, tool_indices: dict, tool_index: int
