@@ -747,6 +747,7 @@ class ModelRunner:
         self.maybe_init_elastic_ep()
         self.init_token_oracle()
         self.sampler = create_sampler()
+        self.preflight_model_backends()
         self.load_model()
         if self.model_config.is_layer_types_hybrid_swa:
             check_layer_types_hybrid_swa_split(
@@ -780,6 +781,17 @@ class ModelRunner:
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
+
+    def preflight_model_backends(self) -> None:
+        """Delegate model-specific kernel checks before loading weights."""
+
+        from sglang.srt.layers.attention.qsa.preflight import (
+            preflight_qsa_sparse_decode_backend,
+        )
+
+        preflight_qsa_sparse_decode_backend(
+            model_config=self.model_config, tp_rank=get_parallel().tp_rank
+        )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
