@@ -415,6 +415,17 @@ class OpenAIServingResponses(OpenAIServingChat):
                 param="tools",
             )
 
+        # `input` is optional; require at least one of input/instructions
+        # (previous_response_id alone is allowed: it continues a stored conversation).
+        if (
+            request.input is None
+            and not request.instructions
+            and request.previous_response_id is None
+        ):
+            return self.create_error_response(
+                "Either `input` or `instructions` must be provided.", param="input"
+            )
+
         # Handle the previous response ID
         prev_response_id = request.previous_response_id
         if prev_response_id is not None:
@@ -1724,6 +1735,8 @@ class OpenAIServingResponses(OpenAIServingChat):
             if request.previous_response_id is not None
             else []
         )
+        if request.input is None:
+            return history
         if isinstance(request.input, str):
             history.append({"role": "user", "content": request.input})
         else:
@@ -1822,22 +1835,23 @@ class OpenAIServingResponses(OpenAIServingChat):
             messages.extend(self.msg_store[prev_response.id])
         # Append the new input.
         # Responses API supports simple text inputs without chat format.
-        if isinstance(request.input, str):
-            messages.append(get_user_message(request.input))
-        else:
-            if prev_response is not None:
-                prev_outputs = list(prev_response.output)
+        if request.input is not None:
+            if isinstance(request.input, str):
+                messages.append(get_user_message(request.input))
             else:
-                prev_outputs = []
-            for response_msg in request.input:
-                messages.append(parse_response_input(response_msg, prev_outputs))
-                item_type = (
-                    response_msg.get("type")
-                    if isinstance(response_msg, dict)
-                    else response_msg.type
-                )
-                if item_type in ("function_call", "custom_tool_call"):
-                    prev_outputs.append(response_msg)
+                if prev_response is not None:
+                    prev_outputs = list(prev_response.output)
+                else:
+                    prev_outputs = []
+                for response_msg in request.input:
+                    messages.append(parse_response_input(response_msg, prev_outputs))
+                    item_type = (
+                        response_msg.get("type")
+                        if isinstance(response_msg, dict)
+                        else response_msg.type
+                    )
+                    if item_type in ("function_call", "custom_tool_call"):
+                        prev_outputs.append(response_msg)
         return messages
 
     async def _run_background_request(
