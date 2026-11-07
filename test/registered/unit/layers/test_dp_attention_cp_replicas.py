@@ -170,6 +170,10 @@ class TestDpGatherCpReplicas(CustomTestCase):
                     ("world_dp_gather_enabled", lambda: False),
                     ("_note_dp_gather_in_prefill_graph", lambda: None),
                     ("memcpy_func", dp_attention.memcpy_cpu),
+                    (
+                        "memcpy_with_zero_fill_func",
+                        dp_attention.memcpy_cpu_with_zero_fill,
+                    ),
                     ("tensor_model_parallel_all_reduce", all_reduce),
                 ]:
                     stack.enter_context(patch.object(dp_attention, name, value))
