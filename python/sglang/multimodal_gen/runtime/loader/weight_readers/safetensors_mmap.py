@@ -8,9 +8,12 @@ the kernel drop them under memory pressure even on a host with no swap.
 Where host copies are redundant (the device shares the host pool) the mapping
 is made read-only instead: safetensors maps writable, and a device copy from a
 writable private mapping there turns every page it touches into anonymous
-memory at a fraction of the bandwidth (see readonly_safetensors).
+memory at a fraction of the bandwidth (see readonly_safetensors). Integrated
+GPUs with a dedicated VRAM carve-out (e.g. ROCm gfx1151) hit the same copy-on-write
+on a writable mapping, so they take the read-only path too.
 """
 
+import functools
 from typing import Callable, ClassVar, Iterator
 
 import torch
@@ -25,6 +28,21 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
 )
 
 _BAR_FORMAT = "{desc}: {percentage:.0f}%|{bar}| {n_fmt}/{total_fmt}"
+
+
+@functools.lru_cache(maxsize=1)
+def _device_is_integrated() -> bool:
+    # An APU with a VRAM carve-out (e.g. gfx1151) does not share the host pool,
+    # but its driver still pins pageable sources with write intent, so a copy
+    # from safetensors' writable mapping turns every page anonymous.
+    if not torch.cuda.is_available():
+        return False
+    try:
+        return bool(
+            torch.cuda.get_device_properties(torch.cuda.current_device()).is_integrated
+        )
+    except (RuntimeError, AssertionError):
+        return False
 
 
 class SafetensorsMmapReader:
@@ -52,7 +70,9 @@ class SafetensorsMmapReader:
             disable=not show_progress,
             bar_format=_BAR_FORMAT,
         ):
-            if device == "cpu" and host_copies_are_redundant():
+            if device == "cpu" and (
+                host_copies_are_redundant() or _device_is_integrated()
+            ):
                 for name, tensor in iter_safetensors_readonly(path):
                     if key_filter is not None and not key_filter(name):
                         continue
