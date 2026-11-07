@@ -1,4 +1,5 @@
 import json
+import time
 
 import pytest
 
@@ -273,6 +274,28 @@ def test_malformed_xml_with_unescaped_ampersand_falls_back_to_regex():
     result = detector.detect_and_parse(text, tools)
     assert len(result.calls) == 1
     assert json.loads(result.calls[0].parameters)["city"] == "A & B"
+
+
+def test_unclosed_tags_parse_in_linear_time():
+    """Unclosed <function> / <param> tags must not stall the parser (it runs
+    on the event loop); a complete call before them still parses."""
+    detector = MiniCPM5Detector()
+    tools = make_tools_weather()
+    complete = (
+        '<function name="get_weather"><param name="city">Paris</param></function>'
+    )
+    unclosed_params = (
+        '<function name="get_weather">' + '<param name="city">' * 6000 + "</function>"
+    )
+
+    start = time.perf_counter()
+    result = detector.detect_and_parse(complete + "<function " * 10000, tools)
+    detector.detect_and_parse(unclosed_params, tools)
+    elapsed = time.perf_counter() - start
+
+    assert elapsed < 1.0
+    assert len(result.calls) == 1
+    assert json.loads(result.calls[0].parameters) == {"city": "Paris"}
 
 
 if __name__ == "__main__":
