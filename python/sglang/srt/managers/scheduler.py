@@ -2257,8 +2257,13 @@ class Scheduler(
         until the caller reaches a scheduling boundary. Receiving and broadcasting
         continue each pass; all ranks retain the same suffix.
 
-        The one place a new per-iteration input source belongs; the return
-        value exists for the pipeline stages that relay requests onward.
+        The one place a new per-iteration input source belongs. The return
+        value is every request received this pass, held ones included, for the
+        pipeline stages that relay requests onward: each stage then holds the
+        same suffix. Under PP this returns the held inputs too, so rank 0 relays
+        a held pause to every stage; the PD prefill loop's `received_inputs`
+        therefore counts them as well (its launch gate still checks
+        `_deferred_input_requests`).
         """
         if self.uocr_runtime is not None:
             # Document windows released while their predecessor's KV was freed.
@@ -2274,9 +2279,8 @@ class Scheduler(
         ):
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
-        self._deferred_input_requests.extend(
-            self.request_receiver.recv_requests(local_reqs=local_reqs)
-        )
+        received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        self._deferred_input_requests.extend(received_reqs)
 
         num_requests_to_process = len(self._deferred_input_requests)
         if stop_at_pause:
@@ -2291,7 +2295,7 @@ class Scheduler(
             # Count successful receive/broadcast time as active; empty polls stay idle.
             self.metrics_reporter.record_scheduler_active(recv_start_ns)
         self.process_input_requests(recv_reqs)
-        return recv_reqs
+        return received_reqs
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_REQUESTS)
     def process_input_requests(self, recv_reqs: List):
@@ -3334,6 +3338,7 @@ class Scheduler(
                 },
             )
             req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
+            self._release_rejected_session(req)
             self.send_abort_output(abort_req, req)
             return
 
@@ -3735,7 +3740,17 @@ class Scheduler(
         logger.error(f"{error_msg}, {req.rid=}")
         req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self._release_rejected_session(req)
         self.output_streamer.stream_output([req], req.return_logprob)
+
+    def _release_rejected_session(self, req: Req) -> None:
+        """Unmark a streaming session whose request was rejected before queuing.
+
+        `create_req` marked the session in flight; no queue or retirer will
+        clear it for a request that never enters one.
+        """
+        if req.session is not None and req.session.streaming:
+            req.session.abort_req()
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -6093,18 +6108,39 @@ class Scheduler(
                 self._pause_started_at = time.monotonic()
             return
 
-        if self.enable_overlap and self.last_batch:
-            if (
-                self.disaggregation_mode == DisaggregationMode.PREFILL
-                and (req := self.chunked_req) is not None
-            ):
-                # Retract skips the chunk step that sets this result's KV send boundary.
-                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-        elif self.enable_overlap_mlx:
-            self._drain_mlx_pending_jobs()
-        # A first retract starts the pause once the in-flight result has drained.
+        if get_parallel().pp_size > 1:
+            # The PP loops hold this pause until no micro-batch is in flight.
+            self._pp_retract_microbatches()
+        else:
+            # Nothing in flight: drain the overlapped result before retracting.
+            if self.enable_overlap and self.last_batch:
+                if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and (req := self.chunked_req) is not None
+                ):
+                    # Retract skips the chunk step that sets this result's KV send boundary.
+                    req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
+                tmp_batch, tmp_result = self.result_queue.popleft()
+                self.process_batch_result(tmp_batch, tmp_result)
+            elif self.enable_overlap_mlx:
+                self._drain_mlx_pending_jobs()
+            self._retract_running_batch()
+
+        # Surface the paused state to dashboards immediately. The scheduler
+        # event loop short-circuits before reaching ``on_idle`` while paused,
+        # so without this hop ``gen_throughput`` retains its last non-zero
+        # value and KV events are not flushed for the entire pause window
+        # (e.g. across a weight update). Zero the gauge, force a one-shot
+        # idle log by resetting the rate-limit timestamp, and flush pending
+        # KV events.
+        self.metrics_reporter.last_gen_throughput = 0.0
+        if self.metrics_reporter.current_scheduler_metrics_enabled:
+            self.metrics_reporter.metrics_collector.last_log_time = 0.0
+            self.metrics_reporter._maybe_log_idle_metrics()
+        self.kv_events_publisher.publish_kv_events()
+
+    def _retract_running_batch(self):
+        # A first retract starts the pause.
         if self._pause_started_at is None:
             self._pause_started_at = time.monotonic()
 
@@ -6155,7 +6191,7 @@ class Scheduler(
             )
         # Empties the batch through filter_batch so a beam tail goes with the reqs.
         self.running_batch.filter_batch(keep_indices=[])
-        # Under PP the other micro-batches keep running.
+        # Under PP the lists span micro-batches; leave only this batch's reqs.
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
@@ -6176,19 +6212,6 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
-
-        # Surface the paused state to dashboards immediately. The scheduler
-        # event loop short-circuits before reaching ``on_idle`` while paused,
-        # so without this hop ``gen_throughput`` retains its last non-zero
-        # value and KV events are not flushed for the entire pause window
-        # (e.g. across a weight update). Zero the gauge, force a one-shot
-        # idle log by resetting the rate-limit timestamp, and flush pending
-        # KV events.
-        self.metrics_reporter.last_gen_throughput = 0.0
-        if self.metrics_reporter.current_scheduler_metrics_enabled:
-            self.metrics_reporter.metrics_collector.last_log_time = 0.0
-            self.metrics_reporter._maybe_log_idle_metrics()
-        self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
