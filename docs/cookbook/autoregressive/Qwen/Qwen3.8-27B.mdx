@@ -57,8 +57,8 @@ import { Qwen38MambaRatioCalculator } from "/src/snippets/_qwen38_mamba_ratio_ca
 <Deployment config={config} />
 
 <Note>
-  Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across all five
-  checkpoints and every Speculative Decoding / Serving Strategy / SSM dtype
+  Every cell above — RTX 5090, RTX PRO 6000 and DGX Spark, across every
+  checkpoint and every Speculative Decoding / Serving Strategy / SSM dtype
   combination — is measured on **v0.5.19**. That is 202 cells, each one served
   and scored on the full 1319-question GSM8K (93.18-95.15%). The serving
   envelope behind the pins is ISL 8192 / OSL 1024 at concurrency 1; throughput
@@ -165,39 +165,31 @@ context from earlier messages.
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4 (FP4 head)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVFP4 W4A4 + FP8 projections, `lm_head` packed to FP4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4">RadixArk/Qwen3.8-27B-NVFP4</a></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4">nvidia/Qwen3.8-27B-NVFP4</a></td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.05)"}}>Qwen3.8-27B-NVFP4 (BF16 head)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Same body, `lm_head` left dense in BF16</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><a href="https://huggingface.co/RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead">RadixArk/Qwen3.8-27B-NVFP4-BF16-LMHead</a></td>
     </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen3.8-27B-NVFP4 (NVIDIA)</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NVIDIA's ModelOpt export of the same W4A4 body, `lm_head` packed to FP4</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><a href="https://huggingface.co/nvidia/Qwen3.8-27B-NVFP4">nvidia/Qwen3.8-27B-NVFP4</a></td>
-    </tr>
   </tbody>
 </table>
 
-The two RadixArk NVFP4 exports differ only in the `lm_head`: one packs it to
+The two NVFP4 exports differ only in the `lm_head`: one packs it to
 FP4, the other leaves it dense in BF16. The dense head is ~1.7 GB larger on disk
 and ~3.2 GB larger at runtime, so it is the harder of the two to fit — every
 recipe on this page was measured against it, and the FP4-head cells reuse
 those pins unchanged.
 
-NVIDIA's own export is that same W4A4 body with that same FP4 head: identical
-quantized-layer map (FP8 attention and GDN projections, NVFP4 MLPs), identical
-tensor set, identical 21.9 GB on disk. On GB300, RTX PRO 6000 and DGX Spark its
-cells reuse the FP4-head pins unchanged, and both SM12x grids have been
-re-measured against this export on v0.5.19: all 16 overlay combinations per
-card serve and score 94.01-95.00% (RTX PRO 6000) and 94.16-95.07% (DGX Spark)
-on the full 1319-question GSM8K.
+The FP4-head export is NVIDIA's ModelOpt build of that same W4A4 body: FP8
+attention and GDN projections, NVFP4 MLPs, 21.9 GB on disk. Both SM12x grids
+have been measured against this export on v0.5.19: all 16 overlay combinations
+per card serve and score 94.01-95.00% (RTX PRO 6000) and 94.16-95.07% (DGX
+Spark) on the full 1319-question GSM8K.
 
 The RTX 5090 is measured too — all 15 overlay combinations it offers serve and
-score 93.93-94.92% — and every winning launch command there is identical to the
-FP4-head export's, which is the strongest form of the claim above. What the
-32GB card does need is the draft-model rows pinning their own pools: those
+score 93.93-94.92%. What the 32GB card does need is the draft-model rows
+pinning their own pools: those
 recipes pin `--max-running-requests 1`, but nothing caps the pools to match, so
 the KV pool sizes itself for 127,332 tokens against the 9,216 one
 8192-in/1024-out request needs, and the engine's default split then leaves the
@@ -208,11 +200,11 @@ and MTP on the dense-lm_head export at float32 state. Those pins override the
 calculator's live value for the selections that carry them. The no-speculation
 row needs none of it and runs at the pins shown.
 
-The two RadixArk checkpoints declare `kv_cache_quant_algo: FP8`, so SGLang's
-default `--kv-cache-dtype auto` already puts their KV pool in `fp8_e4m3`. The
+The RadixArk checkpoint declares `kv_cache_quant_algo: FP8`, so SGLang's
+default `--kv-cache-dtype auto` already puts its KV pool in `fp8_e4m3`. The
 NVIDIA export ships no `kv_cache_scheme`, so `auto` would leave its pool in
 BF16 instead. Every recipe on this page pins `--kv-cache-dtype fp8_e4m3`
-explicitly, so all three run the same `fp8_e4m3` pool regardless; the
+explicitly, so both run the same `fp8_e4m3` pool regardless; the
 difference only shows up if you switch the Playground's **KV Cache Precision**
 row back to Auto.
 
@@ -222,8 +214,8 @@ row back to Auto.
   flashinfer`; `trtllm_mha` is SM100-only. MTP with the FlashInfer backend
   requires a FlashInfer build whose prefill `plan` accepts `uniform_q_len`
   (newer than 0.6.15.post1); otherwise run spec with `--attention-backend triton`.
-  On DGX Spark the 128GB is unified memory shared with the host CPU, so all
-  three checkpoints fit, and its cells reuse the RTX PRO 6000 recipe at
+  On DGX Spark the 128GB is unified memory shared with the host CPU, so every
+  checkpoint fits, and its cells reuse the RTX PRO 6000 recipe at
   `--mem-fraction-static 0.80` rather than a separate operating point. The one
   lower pin is the unified pool pricing the host's memory too: 0.85 of 128GB
   leaves ~8GB for the OS — exactly DGX OS earlyoom's SIGTERM threshold — and
@@ -231,7 +223,7 @@ row back to Auto.
   scheduler killed with `exit code -15` and no traceback (`journalctl -u
   earlyoom` shows the kill). At 0.85, 15 of the 48 cells were killed that way,
   and which cells is margin noise; at 0.80 every cell served on every attempt.
-  **Validated on SM121 / aarch64**: all 80 configurations (5 checkpoints x
+  **Validated on SM121 / aarch64**: every configuration (checkpoint x
   Speculative Decoding x Serving Strategy x Mamba SSM Dtype, DFLASH2 included)
   served on GB10 on `v0.5.19` at ISL 8192 / OSL 1024, concurrency 1, and each
   scored the full 1319-question GSM8K (93.18-95.15%); the float32 and bfloat16
@@ -246,7 +238,7 @@ row back to Auto.
   calling a boot hung.
 - **H200 (SM90)**: BF16 and FP8 only — the card has no FP4 tensor cores, so an
   NVFP4 checkpoint's MLP would fall back to the Marlin W4A16 weight-only path,
-  and all three NVFP4 cells are greyed out. The H200 recipes use 32768-token
+  and both NVFP4 cells are greyed out. The H200 recipes use 32768-token
   prefill chunks (SM90 prefill is fast enough that a big chunk barely stalls
   decode, unlike the SM120 guidance below), and the FlashInfer GDN prefill
   backend engages by default under them. `--attention-backend fa3` is a valid
@@ -295,7 +287,7 @@ row back to Auto.
   `max_new_tokens=2048`, 128 examples, and concurrency levels 1, 2, 4, 8
   and 16 — a different protocol from this page's own sweep below.
   Validation: every SM12x cell on this page is measured end to end on
-  v0.5.19 — 202 cells over the five checkpoints, four speculative options, two
+  v0.5.19 — 202 cells over the page's checkpoints, four speculative options, two
   serving tiers and two GDN state dtypes, full 1319-question GSM8K on each,
   93.18-95.15%. The RTX PRO 6000 and DGX Spark recipes need no changes. On the
   32GB RTX 5090 the panel applies the measured pins automatically: DFlash2 at
@@ -408,7 +400,7 @@ Then declare the provider in `opencode.json`:
         "baseURL": "http://localhost:30000/v1"
       },
       "models": {
-        "RadixArk/Qwen3.8-27B-NVFP4": {
+        "nvidia/Qwen3.8-27B-NVFP4": {
           "name": "Qwen3.8-27B NVFP4"
         }
       }
@@ -439,7 +431,7 @@ pi.registerProvider("sglang", {
   apiKey: "$SGLANG_API_KEY",
   models: [
     {
-      id: "RadixArk/Qwen3.8-27B-NVFP4",
+      id: "nvidia/Qwen3.8-27B-NVFP4",
       name: "Qwen3.8-27B",
       reasoning: true,
       input: ["text", "image"],
@@ -521,7 +513,7 @@ Equivalently, in `~/.hermes/config.yaml`:
 
 ```yaml Config
 model:
-  default: RadixArk/Qwen3.8-27B-NVFP4
+  default: nvidia/Qwen3.8-27B-NVFP4
   provider: custom
   base_url: http://localhost:30000/v1
   api_key: ""

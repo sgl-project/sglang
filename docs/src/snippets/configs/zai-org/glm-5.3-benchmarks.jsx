@@ -107,7 +107,7 @@ export const benchmarks = [
       "Speed measured under SGLANG_SIMULATE_ACC_LEN=2 with the EAGLE 1/1/2 draft (measured accept length 2.000 exactly at both concurrencies, saturating the 2-token draft). The pinned accept length makes these throughput-mechanism numbers only, never correctness evidence; the accuracy runs carry no such env.",
   },
 
-  // NVIDIA NVFP4, single node (RadixArk/GLM-5.3-NVFP4).
+  // NVIDIA NVFP4, single node (nvidia/GLM-5.3-NVFP4).
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "low-latency",     nodes: "single" } },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "balanced",        nodes: "single" } },
   { match: { hw: "b200",  variant: "default", quant: "nvfp4", strategy: "high-throughput", nodes: "single" } },

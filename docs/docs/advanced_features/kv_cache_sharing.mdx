@@ -53,8 +53,8 @@ Create `kv-shard.env` on both nodes. Replace the example IP addresses and RDMA N
 
 ```bash Environment variables
 cat > kv-shard.env <<'EOF'
-export MODEL_PATH=RadixArk/GLM-5.3-NVFP4
-export MODEL_REVISION=6e389189d564d9d3e4ea7fa284fe91f136d8ae2a
+export MODEL_PATH=nvidia/GLM-5.3-NVFP4
+export MODEL_REVISION=e3b8f9f2fad29727dfa95e766c5cac18ea1414bf
 export PREFILL_HOST=192.0.2.10
 export DECODE_HOST=192.0.2.20
 export PREFILL_IB_DEVICES=mlx5_0,mlx5_1,mlx5_2,mlx5_3
