@@ -77,8 +77,11 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 output_ids=[],
                 time_stats=Mock(),
                 update_finish_state=Mock(),
+                finished_reason=None,
                 finished=lambda: True,
-                kv=SimpleNamespace(holds_kv=True, holds_mamba=False),
+                kv=SimpleNamespace(
+                    holds_kv=True, holds_mamba=False, retraction_backup=None
+                ),
             )
             for encoding_format, discard_reason in (
                 ("tensor", reason),
@@ -239,6 +242,7 @@ class _PrefillReq:
         self.customized_info = None
         self.beam_group = None
         self.discard_output_reason = None
+        self.finished_reason = None
 
     def finished(self):
         return False
@@ -255,13 +259,16 @@ class _DecodeReq:
         self.hidden_states = []
         self.output_ids = []
         self.finished_len = None
+        self.finished_reason = None
         self.is_retracted = False
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
         self.beam_group = None
         self.time_stats = Mock()
-        self.kv = SimpleNamespace(holds_kv=True, holds_mamba=False)
+        self.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
 
     def finished(self):
         return self.finished_len is not None
@@ -392,7 +399,10 @@ class TestMixedBatchKvRelease(CustomTestCase):
         for req in (prefill_req, decode_req):
             req.finished = lambda req=req: bool(req.output_ids)
             req.kv = SimpleNamespace(
-                kv_committed_len=0, holds_kv=True, holds_mamba=False
+                kv_committed_len=0,
+                holds_kv=True,
+                holds_mamba=False,
+                retraction_backup=None,
             )
         batch = SimpleNamespace(
             reqs=[prefill_req, decode_req],

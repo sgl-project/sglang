@@ -451,13 +451,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:
-            self.release_aborted_request(handle)
+            self._abandon_attempt(handle)
 
     @abstractmethod
     def reset(self):
