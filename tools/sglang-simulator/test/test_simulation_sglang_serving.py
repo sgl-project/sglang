@@ -24,7 +24,13 @@ SIM_CONFIGS = {
 
 
 class SGLangServingRunner:
-    def __init__(self, config_path: Path, tmp_path: Path, mode: str = "offline"):
+    def __init__(
+        self,
+        config_path: Path,
+        tmp_path: Path,
+        mode: str = "offline",
+        extra_args: list[str] | None = None,
+    ):
         self.mode = mode
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -57,7 +63,8 @@ class SGLangServingRunner:
             "8",
             "--disable-overlap-schedule",
         ]
-        self.server_proc = subprocess.Popen(cmd, env=env, preexec_fn=os.setsid)
+        cmd.extend(extra_args or [])
+        self.server_proc = subprocess.Popen(cmd, env=env, start_new_session=True)
         for _ in range(120):
             if self.server_proc.poll() is not None:
                 raise RuntimeError("SGLang Simulator server exited during startup")

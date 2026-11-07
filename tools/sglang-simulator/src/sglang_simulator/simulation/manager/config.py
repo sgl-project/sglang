@@ -1,6 +1,5 @@
 import json
 from pathlib import Path
-from typing import Optional
 
 from sglang_simulator.simulation.manager.env import Envs
 from sglang_simulator.simulation.types import PlatformConfig, SchedulerConfig
@@ -9,10 +8,7 @@ from sglang_simulator.simulation.utils import (
     calc_kv_cache_per_layer_elems,
 )
 from sglang_simulator.spec import AcceleratorInfo, DataType, ModelInfo
-from sglang_simulator.time_predictor import (
-    AISimulateTimePredictor,
-    InferTimePredictor,
-)
+from sglang_simulator.time_predictor import InferTimePredictor
 from sglang_simulator.utils import get_logger
 
 logger = get_logger()
@@ -21,10 +17,10 @@ logger = get_logger()
 class ConfigManager:
     """Centralized configuration manager with caching."""
 
-    _model_info: Optional[ModelInfo] = None
-    _platform_config: Optional[PlatformConfig] = None
-    _scheduler_config: Optional[SchedulerConfig] = None
-    _raw_config: Optional[dict] = None
+    _model_info: ModelInfo | None = None
+    _platform_config: PlatformConfig | None = None
+    _scheduler_config: SchedulerConfig | None = None
+    _raw_config: dict | None = None
 
     @classmethod
     def _get_raw_config(cls) -> dict:
@@ -194,6 +190,8 @@ class ConfigManager:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
         if predictor_config.get("name") == "aisimulate":
+            from sglang_simulator.time_predictor import AISimulateTimePredictor
+
             database_mode = predictor_config.get("database_mode", "SILICON")
             prefill_scale_factor = predictor_config.get("prefill_scale_factor", 1)
             decode_scale_factor = predictor_config.get("decode_scale_factor", 1)
