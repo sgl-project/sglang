@@ -191,11 +191,10 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         if (
             cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH")
             or cfg.disaggregation_mode != "null"
-            or cfg.enable_hierarchical_cache
         ):
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
-                "decoding, and not PD disaggregation or HiCache yet."
+                "decoding, and not PD disaggregation yet."
             )
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (

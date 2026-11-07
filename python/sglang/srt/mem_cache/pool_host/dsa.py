@@ -74,6 +74,8 @@ class DSAIndexerPoolHost(HostKVCache):
         buffer_device: str,
         dtype: torch.dtype,
         layer_sharded: bool = False,
+        dcp_size: int = 1,
+        dcp_rank: int = 0,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
@@ -111,6 +113,8 @@ class DSAIndexerPoolHost(HostKVCache):
         self._layer_sharded = layer_sharded
         self._buffer_device = torch.device(buffer_device)
         self.page_size = transfer_page_size
+        self.dcp_size = dcp_size
+        self.dcp_rank = dcp_rank
         self.layout = layout
         self.dtype = dtype
         self.indexer_dtype = torch.uint8
@@ -285,16 +289,13 @@ class DSAIndexerPoolHost(HostKVCache):
     def _get_indexer_page_indices(self, host_indices, device_indices):
         if host_indices.numel() == 0:
             return host_indices, device_indices
-        if host_indices.numel() % self.page_size != 0:
+        page_size = self.logical_page_size
+        if host_indices.numel() % page_size != 0:
             raise ValueError(
                 "Index buffer transfer expects page-aligned indices for DSA."
             )
-        host_page_indices = (
-            host_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
-        device_page_indices = (
-            device_indices.reshape(-1, self.page_size)[:, 0] // self.page_size
-        )
+        host_page_indices = host_indices.reshape(-1, page_size)[:, 0] // page_size
+        device_page_indices = device_indices.reshape(-1, page_size)[:, 0] // page_size
         return host_page_indices, device_page_indices
 
     if _is_xpu:
@@ -510,8 +511,13 @@ class DSAIndexerPoolHost(HostKVCache):
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
+    def _storage_page_number(self, index: int) -> int:
+        # L3 indices are logical slots; the indexer buffer holds one physical
+        # page per logical page on each DCP rank.
+        return self._storage_page_index(index) // self.page_size
+
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        page_idx = int(index) // self.page_size
+        page_idx = self._storage_page_number(index)
         if self.layout == "layer_first":
             data_page = self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :]
         elif self.layout in ["page_first", "page_first_direct"]:
@@ -531,7 +537,7 @@ class DSAIndexerPoolHost(HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
-        page_idx = int(index) // self.page_size
+        page_idx = self._storage_page_number(index)
         if self.layout == "layer_first":
             self.index_k_with_scale_buffer[:, page_idx : page_idx + 1, :] = (
                 data_page.reshape(
@@ -554,7 +560,7 @@ class DSAIndexerPoolHost(HostKVCache):
 
     def get_page_buffer_meta(self, indices):
         """Meta data for zero-copy storage I/O."""
-        assert len(indices) % self.page_size == 0
+        assert len(indices) % self.logical_page_size == 0
         if self.layout not in ["page_first", "page_first_direct"]:
             raise ValueError(f"Unsupported layout: {self.layout}")
         ptr_list = []
@@ -563,8 +569,8 @@ class DSAIndexerPoolHost(HostKVCache):
             self.layer_num * self.indexer_page_stride_size * self.indexer_dtype.itemsize
         )
         base_ptr = self.index_k_with_scale_buffer.data_ptr()
-        for i in range(0, len(indices), self.page_size):
-            page_index = int(indices[i]) // self.page_size
+        for i in range(0, len(indices), self.logical_page_size):
+            page_index = self._storage_page_number(indices[i])
             ptr_list.append(base_ptr + page_index * page_stride_bytes)
         return ptr_list, [page_stride_bytes] * len(ptr_list)
 
