@@ -63,7 +63,16 @@ max_post_edit_steps: 16
 # 2-gram repetition penalty (default 0).
 # An empirical value of 3 is often sufficient to mitigate most repetitions.
 penalty_lambda: 0
+# CUDA and Ascend NPU use batched tensor operations for all batch sizes by
+# default. Set this to false only for compatibility or debugging.
+vectorized_decoding: true
 ```
+
+`JointThreshold` vectorization applies to the native mask-based dLLM
+architectures `LLaDA2MoeModelLM`, `SDARForCausalLM`, and
+`SDARMoeForCausalLM`. `LowConfidence` is already vectorized for these
+architectures. DiffusionGemma uses the separate `Gemma4Renoise` sampler, so
+this setting does not affect it.
 
 ## Example Client Code Snippet
 
