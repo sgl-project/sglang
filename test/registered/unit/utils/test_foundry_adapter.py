@@ -3,8 +3,12 @@
 TestFoundryAdapter: the no-op adapter without the flag, the process contract (a
 record without the flag in a persistence-enabled process is an error), the
 install error when the flag is set without Foundry, the integration-API version
-check, and that every adapter method reaches foundry.integration.sglang.api (a
-fake api module stands in for Foundry).
+check, that every adapter method reaches foundry.integration.sglang.api (a
+fake api module stands in for Foundry), and the fallback: an ``Unsupported``
+from any step turns every later method into a no-op.
+
+TestDispatcherPrebuildProtocol: which dispatchers implement ``prebuild``, and that
+native prebuilding leaves the others alone.
 
 TestFoundryCallSites: Foundry's archive is only valid if the call sites stay at
 their sequence points (before or after the work they bracket), so a refactor
@@ -25,7 +29,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import torch
+
 import sglang
+from sglang.srt.layers.moe.token_dispatcher.base import (
+    BaseDispatcher,
+    prebuild_dispatchers,
+)
 from sglang.srt.utils import foundry_adapter
 from sglang.srt.utils.foundry_adapter import (
     FOUNDRY_INTEGRATION_API_MAJOR,
@@ -42,26 +52,41 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _API_MODULE = "foundry.integration.sglang.api"
 
 
+class _Unsupported(Exception):
+    def __init__(self, step, reason, *, inherited=False):
+        super().__init__(f"unsupported at {step}: {reason}")
+        self.step = step
+        self.reason = reason
+        self.inherited = inherited
+
+
 def _fake_api(
     version=(FOUNDRY_INTEGRATION_API_MAJOR, FOUNDRY_INTEGRATION_API_MIN_MINOR),
+    unsupported_at=None,
 ):
+    """``unsupported_at``: the api function that raises ``Unsupported``."""
     api = types.ModuleType(_API_MODULE)
     api.INTEGRATION_API_VERSION = version
+    api.Unsupported = _Unsupported
     api.calls = []
 
     def record(name, result=None):
         def fn(*args, **kwargs):
             api.calls.append((name, args, kwargs))
+            if name == unsupported_at:
+                raise _Unsupported(name, "fake reason")
             return result
 
         return fn
 
     for name in (
         "activate",
+        "deactivate",
         "pin_server_args",
         "validate_resolved_server_args",
         "before_parallel_init",
         "record_memory_pool_config",
+        "log_init_summary",
     ):
         setattr(api, name, record(name))
     api.capture_one = record("capture_one", ("graph", "out"))
@@ -72,6 +97,8 @@ def _fake_api(
     @contextmanager
     def scope(name, *args):
         api.calls.append((name, args, {}))
+        if name == unsupported_at:
+            raise _Unsupported(name, "fake reason")
         yield
 
     api.configure_subprocess = lambda server_args=None: scope(
@@ -190,6 +217,7 @@ class TestFoundryAdapter(CustomTestCase):
             adapter.capture_one(
                 shape_key="key", forward_fn=None, pool="pool", stream="stream"
             )
+            adapter.log_init_summary()
         called = {name for name, _, _ in api.calls}
         methods = {
             name
@@ -197,6 +225,132 @@ class TestFoundryAdapter(CustomTestCase):
             if callable(value) and not name.startswith("_")
         }
         self.assertEqual(called, methods)
+
+    def _run_init(self, adapter, body):
+        """The scheduler-side calls in process order; ``body`` runs inside the
+        capture scope. Returns what the pool-config replay and capture_one gave."""
+        adapter.before_parallel_init("cuda")
+        replayed = adapter.replay_saved_memory_pool_config()
+        adapter.record_memory_pool_config(object())
+        with adapter.capture_scope(phase="decode", model=object()):
+            body()
+            captured = adapter.capture_one(
+                shape_key="key", forward_fn=None, pool="pool", stream="stream"
+            )
+        adapter.log_init_summary()
+        return replayed, captured
+
+    def test_unsupported_at_any_step_falls_back_natively(self):
+        """After ``Unsupported`` at any step every later call is a no-op: the
+        pool config resolves natively (None), the capture loop runs exactly once
+        and each shape is captured natively (None); Foundry is told once."""
+        steps = (
+            "activate",
+            "pin_server_args",
+            "validate_resolved_server_args",
+            "before_parallel_init",
+            "replay_saved_memory_pool_config",
+            "capture_scope",
+            "capture_one",
+        )
+        for step in steps:
+            with self.subTest(step=step):
+                api = _fake_api(unsupported_at=step)
+                with _installed(api):
+                    adapter = activate_foundry(_sa("save"))
+                    sa = object()
+                    adapter.pin_server_args(sa)
+                    adapter.validate_resolved_server_args(sa)
+                    loops = []
+                    replayed, captured = self._run_init(
+                        adapter, lambda: loops.append(1)
+                    )
+                    self.assertFalse(adapter.enabled)
+                    self.assertIs(activate_foundry(_sa("save")), adapter)
+                self.assertEqual(loops, [1])
+                self.assertIsNone(captured)
+                in_scope = step in ("capture_scope", "capture_one")
+                self.assertEqual(replayed, "cfg" if in_scope else None)
+                names = [name for name, _, _ in api.calls]
+                self.assertEqual(
+                    [kw for name, _, kw in api.calls if name == "deactivate"],
+                    [{"step": step, "reason": "fake reason"}],
+                )
+                after = names[names.index("deactivate") + 1 :]
+                self.assertNotIn("capture_one", after)
+                self.assertNotIn("record_memory_pool_config", after)
+                self.assertNotIn("log_init_summary", after)
+
+    def test_other_foundry_errors_propagate(self):
+        """Only ``Unsupported`` falls back; a Foundry bug must stay an error."""
+        api = _fake_api()
+
+        def broken(**kwargs):
+            raise RuntimeError("restore failed")
+
+        api.capture_one = broken
+        with _installed(api):
+            adapter = activate_foundry(_sa("load"))
+            with self.assertRaisesRegex(RuntimeError, "restore failed"):
+                adapter.capture_one(
+                    shape_key="key", forward_fn=None, pool="pool", stream="stream"
+                )
+            self.assertTrue(adapter.enabled)
+
+    def test_spawn_after_a_fallback_still_reaches_foundry(self):
+        """The children learn about the fallback from Foundry's spawn wrapper."""
+        api = _fake_api(unsupported_at="validate_resolved_server_args")
+        with _installed(api):
+            adapter = activate_foundry(_sa("save"))
+            adapter.validate_resolved_server_args(object())
+            with adapter.configure_subprocess(object()):
+                pass
+        self.assertEqual(api.calls[-1][0], "configure_subprocess")
+
+
+class _Dispatcher(BaseDispatcher):
+    def dispatch(self, hidden_states, topk_output):
+        raise NotImplementedError
+
+    def combine(self, combine_input):
+        raise NotImplementedError
+
+
+class _LazyDispatcher(_Dispatcher):
+    """Builds its state at the first dispatch, as a new backend would."""
+
+    @property
+    def prebuild_pending(self):
+        return True
+
+
+class _PrebuiltDispatcher(_Dispatcher):
+    built = False
+
+    @property
+    def prebuild_pending(self):
+        return not self.built
+
+    def prebuild(self):
+        self.built = True
+
+
+class TestDispatcherPrebuildProtocol(CustomTestCase):
+    def test_only_an_overridden_prebuild_implements_the_protocol(self):
+        self.assertFalse(_LazyDispatcher().implements_prebuild)
+        self.assertTrue(_PrebuiltDispatcher().implements_prebuild)
+
+    def test_native_prebuild_skips_dispatchers_without_the_protocol(self):
+        """A dispatcher without ``prebuild`` keeps its lazy build natively, even
+        when it reports pending state; one with it is prebuilt."""
+        model = torch.nn.Module()
+        model.lazy = torch.nn.Module()
+        model.lazy.dispatcher = _LazyDispatcher()
+        model.prebuilt = torch.nn.Module()
+        model.prebuilt.dispatcher = _PrebuiltDispatcher()
+        self.assertEqual(prebuild_dispatchers(model), 1)
+        self.assertTrue(model.prebuilt.dispatcher.built)
+        self.assertEqual(prebuild_dispatchers(model), 0)
 
 
 _SRT = Path(sglang.__file__).parent / "srt"
@@ -226,6 +380,8 @@ _CALL_SITES = [
      "before:self._cuda_graph_runner"),
     ("managers/scheduler.py", "run_scheduler_process", "activate_foundry",
      "before:publish"),
+    ("managers/scheduler.py", "run_scheduler_process",
+     "get_foundry_adapter().log_init_summary", "before:pipe_writer.send"),
     ("entrypoints/engine.py", "Engine._launch_scheduler_processes",
      "activate_foundry", "before:proc.start"),
     ("entrypoints/engine.py", "Engine._launch_scheduler_processes",

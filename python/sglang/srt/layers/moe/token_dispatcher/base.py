@@ -443,6 +443,13 @@ class BaseDispatcher(ABC):
         """Create the lazily built dispatch state (communication buffers, expert
         maps) now, outside any graph capture. Idempotent; a no-op by default."""
 
+    @property
+    def implements_prebuild(self) -> bool:
+        """Whether this class overrides ``prebuild``. One that does not builds its
+        state lazily at the first dispatch (the default, fine natively); CUDA
+        graph persistence then falls back to native capture."""
+        return type(self).prebuild is not BaseDispatcher.prebuild
+
 
 def iter_dispatchers(model: torch.nn.Module) -> Iterator[BaseDispatcher]:
     """Each distinct dispatcher that a module of ``model`` holds as an attribute;
@@ -459,7 +466,7 @@ def prebuild_dispatchers(model: torch.nn.Module) -> int:
     """Prebuild every dispatcher of ``model``; returns how many had state pending."""
     num_prebuilt = 0
     for dispatcher in iter_dispatchers(model):
-        if dispatcher.prebuild_pending:
+        if dispatcher.implements_prebuild and dispatcher.prebuild_pending:
             dispatcher.prebuild()
             num_prebuilt += 1
     return num_prebuilt
