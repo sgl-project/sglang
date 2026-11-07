@@ -337,7 +337,7 @@ def validate_decode_radix_cache(
     # DeepSeek-V4 qualifies only on the unified KV layout (bf16 or fp8 rows): its
     # SWA ring and c128 state are request-scoped and always transferred whole, so
     # the tree shares only the compressed full-attention pages.
-    if getattr(model_config, "is_deepseek_v4_arch", False) and not getattr(
+    if getattr(model_config, "is_compressed_kv_arch", False) and not getattr(
         token_to_kv_pool, "_unified_kv", False
     ):
         raise ValueError(

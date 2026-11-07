@@ -64,12 +64,12 @@ from sglang.srt.managers.req_types import (
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.mm_utils import has_valid_data
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -2245,7 +2245,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool
+    message: str
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
@@ -2276,6 +2277,47 @@ class EndWeightUpdateReqInput(BaseReq, kw_only=True):
 class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+
+
+class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Receive weights through a platform transport and load them, as
+    UpdateWeightsFromDistributedReqInput does over a torch.distributed group."""
+
+    # a key of SRTPlatform.get_weight_update_handlers()
+    handler: str
+    # what the transport needs to receive this bucket, e.g. names, dtypes, shapes, sources
+    payload: Dict[str, Any] = {}
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    # how many tensors each TP rank received, in rank order; load_weights skips names the
+    # model does not know, so this is not a count of parameters written
+    received_tensor_counts: List[int] = []
+
+    @classmethod
+    def merged(cls, replies: List[PluginWeightUpdateReqOutput]):
+        """One reply per attention-DP leader; all must succeed.
+
+        Every leader gathered the same TP-wide counts, so the first reply's stand.
+        """
+        success = all(reply.success for reply in replies)
+        return cls(
+            success=success,
+            message=" | ".join(reply.message for reply in replies),
+            received_tensor_counts=replies[0].received_tensor_counts if success else [],
+        )
 
 
 class CheckWeightsReqInput(BaseReq, kw_only=True):
