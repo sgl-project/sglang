@@ -642,6 +642,118 @@ class TestTritonAttention(CustomTestCase):
                 19, 12331, 64, 8, 128, window_size
             )
 
+    def _test_extend_attention_bidirectional_mask_once(
+        self, D, is_causal, sliding_window_size
+    ):
+        # Causal mask plus bidirectional blocks over spans that cross several
+        # BLOCK_M query tiles, as Gemma 3/4 build for image tokens. The custom
+        # mask grants keys after the query's own tile, so the kernel must not
+        # stop stage 2 at the causal tile boundary even with is_causal=True.
+        dtype = torch.bfloat16
+        device = get_device()
+        H_Q, H_KV = 8, 2
+        prefix_lens = [0, 37]
+        extend_lens = [300, 211]
+        spans = [[(5, 270)], [(10, 90), (120, 200)]]  # extend coords, end exclusive
+        B = len(prefix_lens)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+
+        k_buffer = torch.empty((sum(seq_lens), H_KV, D), dtype=dtype, device=device)
+        v_buffer = torch.empty_like(k_buffer)
+        k_buffer.normal_(mean=0.1, std=0.2)
+        v_buffer.normal_(mean=0.1, std=0.2)
+        q_extend = torch.empty(
+            (sum(extend_lens), H_Q, D), dtype=dtype, device=device
+        ).normal_(mean=0.1, std=0.2)
+
+        def i32(values):
+            return torch.tensor(values, dtype=torch.int32, device=device)
+
+        seq_starts = [sum(seq_lens[:i]) for i in range(B)]
+        qo_indptr = i32([0] + list(itertools.accumulate(extend_lens)))
+        kv_indptr = i32([0] + list(itertools.accumulate(prefix_lens)))
+        kv_indices = torch.cat(
+            [
+                torch.arange(s, s + p, dtype=torch.int64, device=device)
+                for s, p in zip(seq_starts, prefix_lens)
+            ]
+        )
+        extend_rows = torch.cat(
+            [
+                torch.arange(s + p, s + n, device=device)
+                for s, p, n in zip(seq_starts, prefix_lens, seq_lens)
+            ]
+        )
+        k_extend = k_buffer[extend_rows].contiguous()
+        v_extend = v_buffer[extend_rows].contiguous()
+
+        masks = []
+        o_ref = torch.empty((sum(extend_lens), H_Q, D), dtype=dtype, device=device)
+        for i in range(B):
+            p, e = prefix_lens[i], extend_lens[i]
+            q_pos = p + torch.arange(e, device=device)[:, None]
+            k_pos = torch.arange(p + e, device=device)[None, :]
+            mask = k_pos <= q_pos
+            for begin, end in spans[i]:
+                mask[begin:end, p + begin : p + end] = True
+            masks.append(mask.flatten())
+
+            allowed = mask
+            if sliding_window_size > 0:
+                allowed = allowed & (q_pos <= k_pos + sliding_window_size)
+            k_full = k_buffer[seq_starts[i] : seq_starts[i] + p + e].float()
+            v_full = v_buffer[seq_starts[i] : seq_starts[i] + p + e].float()
+            k_full = k_full.repeat_interleave(H_Q // H_KV, dim=1)
+            v_full = v_full.repeat_interleave(H_Q // H_KV, dim=1)
+            q = q_extend[qo_indptr[i] : qo_indptr[i + 1]].float()
+            scores = torch.einsum("qhd,khd->hqk", q, k_full) / D**0.5
+            scores = scores.masked_fill(~allowed, float("-inf"))
+            o_ref[qo_indptr[i] : qo_indptr[i + 1]] = torch.einsum(
+                "hqk,khd->qhd", scores.softmax(dim=-1), v_full
+            ).to(dtype)
+        custom_mask = torch.cat(masks)
+        mask_indptr = torch.tensor(
+            [0] + list(itertools.accumulate(m.numel() for m in masks)),
+            dtype=torch.int64,
+            device=device,
+        )
+
+        o_triton = torch.empty_like(o_ref)
+        extend_attention_fwd(
+            q_extend,
+            k_extend,
+            v_extend,
+            o_triton,
+            k_buffer,
+            v_buffer,
+            qo_indptr,
+            kv_indptr,
+            kv_indices,
+            custom_mask,
+            is_causal,
+            mask_indptr,
+            max(extend_lens),
+            1.0,
+            1.0,
+            sliding_window_size=sliding_window_size,
+            window_kv_offsets=torch.zeros(B, dtype=torch.int32, device=device),
+        )
+        torch.testing.assert_close(o_triton, o_ref, rtol=1e-2, atol=1e-2)
+
+    def test_extend_attention_bidirectional_custom_mask(self):
+        # 128 and 256 select different BLOCK_M; the spans cross several tiles
+        # for both. A one-sided sliding window keeps is_causal=True semantics.
+        for D, is_causal, window in [
+            (128, True, -1),
+            (128, False, -1),
+            (256, True, -1),
+            (256, True, 150),
+        ]:
+            with self.subTest(D=D, is_causal=is_causal, window=window):
+                self._test_extend_attention_bidirectional_mask_once(
+                    D, is_causal, window
+                )
+
     def _test_context_attention_once(self, head_dim, is_causal):
         # Set up a simple test case
         device = get_device()
