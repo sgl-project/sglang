@@ -66,7 +66,7 @@ class FakeInterval(_TimingInterval):
         self.timestamp = start + milliseconds
         self.ready = ready
 
-    def end(self, metadata):
+    def end(self, device_module, metadata):
         self.metadata = metadata
 
     def query(self):
@@ -74,6 +74,14 @@ class FakeInterval(_TimingInterval):
 
     def elapsed_time(self):
         return self.start_event.elapsed_time(self)
+
+
+def patch_timing_device(test_case):
+    """Give DeviceTimer a timing-capable device, so GPU-less runners exercise wrap()."""
+    enter_scope(
+        test_case,
+        patch("sglang.srt.utils.device_timer.get_device_module", return_value=Mock()),
+    )
 
 
 def capture_timing(timer, *intervals):
@@ -88,17 +96,17 @@ def capture_timing(timer, *intervals):
 
 
 class TestDeviceTimerCapture(unittest.TestCase):
+    def setUp(self):
+        patch_timing_device(self)
+
     def test_intervals_use_selected_device(self):
         for track_stream in (False, True):
-            with (
-                self.subTest(track_stream=track_stream),
-                patch(
-                    "sglang.srt.utils.device_timer.torch.get_device_module"
-                ) as module,
-            ):
-                device = module.return_value
-                interval = _TimingInterval.create(track_stream=track_stream)
-                interval.end({})
+            with self.subTest(track_stream=track_stream):
+                device = Mock()
+                interval = _TimingInterval.create(
+                    device_module=device, track_stream=track_stream
+                )
+                interval.end(device_module=device, metadata={})
             self.assertEqual(device.Event.call_count, 2)
             device.Event.assert_called_with(enable_timing=True)
             self.assertEqual(device.Event.return_value.record.call_count, 2)
@@ -469,6 +477,7 @@ def _make_reporter(test, scheduler) -> SchedulerMetricsReporter:
 
 class TestForwardPassMetrics(unittest.TestCase):
     def setUp(self):
+        patch_timing_device(self)
         self.scheduler = types.SimpleNamespace()
         self.scheduler._fpm_worker_id = "worker-7"
         self.scheduler._fpm_dp_rank = 0
@@ -689,6 +698,42 @@ class TestForwardPassMetrics(unittest.TestCase):
             _DummyPublisherThread,
         ):
             reporter = _make_reporter(self, scheduler)
+
+        self.assertFalse(scheduler.enable_fpm)
+        self.assertIs(scheduler.run_batch, original_forward)
+
+    def test_init_fpm_disabled_without_device_timing(self):
+        """A device without timing events left FPM on but never publishing."""
+        scheduler = types.SimpleNamespace()
+        original_forward = scheduler.run_batch = lambda: types.SimpleNamespace()
+        scheduler.server_args = _publish_server_args(
+            self,
+            enable_metrics=False,
+            enable_metrics_for_all_schedulers=False,
+            extra_metric_labels=None,
+            enable_forward_pass_metrics=True,
+            forward_pass_metrics_worker_id="endpoint-42",
+            forward_pass_metrics_ipc_name=None,
+            kv_events_config=None,
+        )
+        enter_scope(self, get_parallel().override(pp_rank=0, pp_size=1))
+        scheduler.enable_kv_cache_events = False
+
+        with (
+            patch(
+                "sglang.srt.utils.device_timer.get_device_module",
+                return_value=torch.cpu,
+            ),
+            patch(
+                "sglang.srt.observability.forward_pass_metrics._FpmPublisherThread",
+                _DummyPublisherThread,
+            ),
+            self.assertLogs(
+                "sglang.srt.managers.scheduler_components.metrics_reporter",
+                level="WARNING",
+            ),
+        ):
+            _make_reporter(self, scheduler)
 
         self.assertFalse(scheduler.enable_fpm)
         self.assertIs(scheduler.run_batch, original_forward)

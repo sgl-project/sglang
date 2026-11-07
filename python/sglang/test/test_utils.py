@@ -39,6 +39,7 @@ from sglang.benchmark.serving import run_benchmark
 from sglang.lang.global_config import global_config
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    cpu_has_amx_support,
     get_bool_env_var,
     get_device,
     is_blackwell,
@@ -2682,6 +2683,20 @@ def write_results_to_json(model, metrics, mode="a"):
 
     with open("results.json", "w") as f:
         json.dump(existing_results, f, indent=2)
+
+
+def requires_intel_amx():
+    # Evaluated at decoration time, so keep this a factory rather than a
+    # module-level constant: every test_utils importer would otherwise probe
+    # the device on import.
+    if is_in_ci():
+        # Only the Intel CPU lanes pick these suites up, and AMX hardware plus
+        # kernels are a precondition there: losing either must be red, not skipped.
+        return lambda test_target: test_target
+    return unittest.skipUnless(
+        auto_config_device() == "cpu" and cpu_has_amx_support(),
+        "Requires a CPU run with AMX kernels.",
+    )
 
 
 def _parse_cpu_list(spec):

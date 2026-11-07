@@ -51,6 +51,7 @@ from sglang.test.test_utils import (
     intel_amx_benchmark,
     is_in_ci,
     popen_launch_server,
+    requires_intel_amx,
 )
 
 register_cpu_ci(est_time=315, suite="stage-a-tp-test-cpu-intel")
@@ -1125,6 +1126,7 @@ class TestCPUGraph(CustomTestCase):
         self.assertTrue(torch.all(conv_tensor == 0))
         self.assertTrue(torch.all(temporal_tensor == 0))
 
+    @requires_intel_amx()
     @intel_amx_benchmark(
         extra_args=[
             "--batch-size",
@@ -1146,6 +1148,7 @@ class TestCPUGraph(CustomTestCase):
     def test_latency_torch_compile_cpu(self):
         return DEFAULT_SMALL_MODEL_NAME_FOR_TEST
 
+    @requires_intel_amx()
     def test_mmlu_torch_compile_cpu(self):
         model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         base_url = DEFAULT_URL_FOR_TEST

@@ -383,6 +383,15 @@ class SchedulerMetricsReporter:
                 _FpmPublisherThread,
             )
 
+            if self.forward_pass_device_timer is None:
+                self.forward_pass_device_timer = DeviceTimer()
+            if not self.forward_pass_device_timer.timing_supported:
+                logger.warning(
+                    "FPM disabled: the device has no timing events to measure "
+                    "forward passes."
+                )
+                return
+
             self.scheduler._fpm_dp_rank = (
                 get_parallel().dp_rank if get_parallel().dp_rank is not None else 0
             )
@@ -403,8 +412,6 @@ class SchedulerMetricsReporter:
                 worker_id=self.scheduler._fpm_worker_id,
                 dp_rank=self.scheduler._fpm_dp_rank,
             )
-            if self.forward_pass_device_timer is None:
-                self.forward_pass_device_timer = DeviceTimer()
             self.scheduler.enable_fpm = True
             self.scheduler.run_batch = wrap_forward_with_fpm(
                 self.scheduler.run_batch, self.forward_pass_device_timer
@@ -794,7 +801,10 @@ class SchedulerMetricsReporter:
                 tflops_per_s = flops / gap_latency / 1e12
                 msg += f", est. prefill TFLOPS/s (per GPU): {tflops_per_s:.2f}"
 
-        if ENABLE_METRICS_DEVICE_TIMER:
+        if (
+            ENABLE_METRICS_DEVICE_TIMER
+            and self.forward_pass_device_timer.timing_supported
+        ):
             # Poll completed forward events before formatting, without synchronizing.
             self.forward_pass_device_timer._report()
             msg += ", " + self.forward_occupancy_log_string()
@@ -1050,7 +1060,10 @@ class SchedulerMetricsReporter:
             self._mfu_log_read_bytes = 0.0
             self._mfu_log_write_bytes = 0.0
 
-        if ENABLE_METRICS_DEVICE_TIMER:
+        if (
+            ENABLE_METRICS_DEVICE_TIMER
+            and self.forward_pass_device_timer.timing_supported
+        ):
             # Poll completed forward events before formatting, without synchronizing.
             self.forward_pass_device_timer._report()
             msg += ", " + self.forward_occupancy_log_string()
@@ -1304,6 +1317,10 @@ class SchedulerMetricsReporter:
         if self.forward_pass_device_timer is not None:
             self.forward_pass_device_timer._report()
         if not ENABLE_METRICS_DEVICE_TIMER:
+            return
+        # A device without timing events contributes no GPU time, and 0/cpu_time
+        # would publish a permanently idle occupancy instead of no sample at all.
+        if not self.forward_pass_device_timer.timing_supported:
             return
         now = time.perf_counter()
         if self._device_timer_window_batch_count == 0:
