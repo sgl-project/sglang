@@ -21,6 +21,9 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
+        # FP4 keys: ``buffer`` holds the e2m1 pages and ``scale_buffer`` their exponents,
+        # each dense as AITER's FP4 logits address them
+        self.fp4 = pool.index_k_fp4
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
@@ -36,12 +39,32 @@ class IndexKeyCache:
                     )
                     for i in range(pool.layer_num)
                 ]
+                self.scale_buffer = [
+                    torch.zeros(
+                        (
+                            self._layer_num_pages(i, num_pages),
+                            pool.page_size
+                            // pool.index_kpool
+                            * pool.index_head_dim
+                            // 32,
+                        ),
+                        dtype=pool.index_k_with_scale_buffer_dtype,
+                        device=pool.device,
+                    )
+                    for i in range(pool.layer_num if self.fp4 else 0)
+                ]
+
+    def _key_bytes_per_token(self) -> int:
+        # AMD FP4 keeps the exponents in scale_buffer
+        if self.fp4:
+            return self.pool.index_head_dim // 2
+        return self.pool.index_bytes_per_token
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
         return (
             num_pages,
-            pool.page_size // pool.index_kpool * pool.index_bytes_per_token,
+            pool.page_size // pool.index_kpool * self._key_bytes_per_token(),
         )
 
     def _kernel_view(self, buffer: torch.Tensor) -> torch.Tensor:
@@ -58,10 +81,12 @@ class IndexKeyCache:
 
     def clear(self) -> None:
         del self.buffer
+        del self.scale_buffer
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+        assert not self.fp4, "Moving FP4 index keys is not supported"
         assert self.pool.index_kpool == 1, (
             "Moving pooled index keys requires regrouping tokens"
         )
@@ -101,6 +126,15 @@ class IndexKeyCache:
 
     def get_buffer(self, layer_id: int) -> torch.Tensor:
         return self.get_local_buffer(layer_id)
+
+    def get_fp4_buffers(self, layer_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """[pages, 4096] e2m1 bytes and [pages, 256] exponents of the layer's FP4 keys."""
+        assert self.fp4
+        payload = self.get_local_buffer(layer_id)
+        scale = self.scale_buffer[layer_id - self.pool.start_layer]
+        return payload, scale.view(
+            -1, self.pool.index_page_size * self.pool.index_head_dim // 32
+        )
 
     def get_k_and_scale(
         self,
@@ -143,15 +177,13 @@ class IndexKeyCache:
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
+        for buffer in self._page_buffers():
             index_k_cpu.append([])
-            if self.buffer[layer_id].shape[0] == 0:
+            if buffer.shape[0] == 0:
                 continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = self.buffer[layer_id][chunk_page_indices].to(
-                    "cpu", non_blocking=True
-                )
+                idx_cpu = buffer[chunk_page_indices].to("cpu", non_blocking=True)
                 index_k_cpu[-1].append(idx_cpu)
         torch.cuda.synchronize()
         return index_k_cpu
@@ -161,16 +193,20 @@ class IndexKeyCache:
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
         page_chunk_size = max(1, chunk_size // self.pool.page_size)
-        for layer_id in range(self.pool.layer_num):
-            if self.buffer[layer_id].shape[0] == 0:
+        for buffer_id, buffer in enumerate(self._page_buffers()):
+            if buffer.shape[0] == 0:
                 continue
             for i in range(0, len(page_indices), page_chunk_size):
                 chunk_page_indices = page_indices[i : i + page_chunk_size]
-                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                idx_cpu = index_k_cpu[buffer_id][i // page_chunk_size]
                 assert idx_cpu.shape[0] == len(chunk_page_indices)
-                idx_chunk = idx_cpu.to(self.buffer[layer_id].device, non_blocking=True)
-                self.buffer[layer_id][chunk_page_indices] = idx_chunk
+                buffer[chunk_page_indices] = idx_cpu.to(
+                    buffer.device, non_blocking=True
+                )
         torch.cuda.synchronize()
+
+    def _page_buffers(self) -> list[torch.Tensor]:
+        return [*self.buffer, *self.scale_buffer]
 
     def _item_len(self, layer_idx: int) -> int:
         # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
@@ -178,6 +214,7 @@ class IndexKeyCache:
         return 0 if buf.shape[0] == 0 else buf[0].nbytes
 
     def state_buf_infos(self):
+        assert not self.fp4, "PD transfer of FP4 index keys is not supported"
         layer_num = self.pool.layer_num
         data_ptrs = [self.buffer[i].data_ptr() for i in range(layer_num)]
         data_lens = [self.buffer[i].nbytes for i in range(layer_num)]

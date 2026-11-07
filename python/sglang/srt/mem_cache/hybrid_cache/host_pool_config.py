@@ -153,7 +153,7 @@ def _prepare_sidecar(
     packed = msgspec.structs.replace(buffers, buffers=tuple(packed_buffers))
     # The DSA indexer host copies kernel_page_bytes / page_size bytes per token.
     if (
-        packed.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+        packed.key_layout is not IndexKeyLayout.KEY_ROWS
         and packed.kernel_page_bytes % packed.page_size
     ):
         raise ValueError(

@@ -487,6 +487,12 @@ class ExecKernel(msgspec.Struct):
         bool,
         "Use FP4 queries and index-K cache in the DSA lightning indexer of DeepSeek-V3.2-style sparse attention, ERNIE 5.5 Flash's MLA layers included; requires SM100. DeepSeek V4's C4 indexer has its own switch, --enable-deepseek-v4-fp4-indexer. Default keeps the FP8 indexer.",
     ] = False
+    enable_dsa_fp4_indexer: A[
+        bool,
+        "Store the DSA indexer keys in MXFP4 and score them with AITER's FP4 MQA-logits kernels "
+        "(Kimi-K3.1 on gfx950 with DCP): the row-group kernel in decode and target verify, the "
+        "prefill kernel over the DCP-gathered keys in prefill.",
+    ] = False
     enable_dsa_fused_indexer: A[
         Optional[bool],
         Arg(

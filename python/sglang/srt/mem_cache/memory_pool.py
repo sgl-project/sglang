@@ -86,7 +86,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
@@ -4733,6 +4733,13 @@ class HybridLinearKVPool(KVCache):
         layer_id = self._transfer_full_attention_id(layer_id)
         return self.full_kv_pool.get_index_k_with_scale_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        self._wait_for_layer(layer_id)
+        layer_id = self._transfer_full_attention_id(layer_id)
+        return self.full_kv_pool.get_index_k_fp4_buffers(layer_id)
+
     def get_broadcastable_index_k_with_scale_buffer(
         self, layer_id: int
     ) -> torch.Tensor:
@@ -5558,6 +5565,19 @@ class DSATokenToKVPool(MLATokenToKVPool):
         assert len(self.skip_topk_layers) == layer_num
 
         physical_page_size = self.index_page_size
+        self.index_k_fp4 = get_exec().kernel.enable_dsa_fp4_indexer
+        if self.index_k_fp4 and not (
+            _is_hip
+            and aiter_can_use_preshuffle_paged_mqa()
+            and dsa_shards_index_k()
+            and not dcp_replicated
+            and index_kpool == 1
+            and physical_page_size == 64
+        ):
+            raise ValueError(
+                "--enable-dsa-fp4-indexer needs AITER's FP4 logits (ROCm gfx950) and index-K "
+                "sharded by DCP on 64-key pages, as Kimi-K3.1 runs it"
+            )
         if _is_hip:
             if aiter_can_use_preshuffle_paged_mqa():
                 assert physical_page_size % 16 == 0, (
@@ -5618,27 +5638,45 @@ class DSATokenToKVPool(MLATokenToKVPool):
         )
         if not index_buffer_layer_ids or not self.index_key_cache.buffer:
             return kv_infos
-        index_info = DevicePoolInfo(
-            pool_name=PoolName.INDEXER,
-            indices_from_pool=PoolName.KV,
-            layer_ids=tuple(
-                self.model_layer_ids[layer] for layer in index_buffer_layer_ids
-            ),
-            buffer_info=IndexKeyBufferInfo(
-                page_size=self.page_size,
-                compress_ratio=self.index_kpool,
-                kernel_page_size=self.index_page_size,
-                buffers=tuple(
-                    self.index_key_cache.buffer[i] for i in index_buffer_layer_ids
+        layer_ids = tuple(
+            self.model_layer_ids[layer] for layer in index_buffer_layer_ids
+        )
+
+        def info(pool_name, buffers, key_layout):
+            return DevicePoolInfo(
+                pool_name=pool_name,
+                indices_from_pool=PoolName.KV,
+                layer_ids=layer_ids,
+                buffer_info=IndexKeyBufferInfo(
+                    page_size=self.page_size,
+                    compress_ratio=self.index_kpool,
+                    kernel_page_size=self.index_page_size,
+                    buffers=tuple(buffers[i] for i in index_buffer_layer_ids),
+                    key_layout=key_layout,
                 ),
-                key_layout=(
+            )
+
+        cache = self.index_key_cache
+        if not self.index_k_fp4:
+            return (
+                *kv_infos,
+                info(
+                    PoolName.INDEXER,
+                    cache.buffer,
                     IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES
                     if self.use_fp4_indexer
-                    else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES
+                    else IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES,
                 ),
+            )
+        return (
+            *kv_infos,
+            info(PoolName.INDEXER, cache.buffer, IndexKeyLayout.PAGED_FP4_KEYS),
+            info(
+                PoolName.INDEXER_SCALE,
+                cache.scale_buffer,
+                IndexKeyLayout.PAGED_FP4_SCALES,
             ),
         )
-        return (*kv_infos, index_info)
 
     @property
     def index_k_with_scale_buffer(self):
@@ -5798,6 +5836,11 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
 
+    def get_index_k_fp4_buffers(
+        self, layer_id: int
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        return self.index_key_cache.get_fp4_buffers(layer_id)
+
     def get_index_k_scale_buffer(
         self,
         layer_id: int,
@@ -5906,7 +5949,8 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_kv_size_bytes(self):
         kv_size_bytes = super().get_kv_size_bytes()
-        for index_k_cache in self.index_k_with_scale_buffer:
+        cache = self.index_key_cache
+        for index_k_cache in (*cache.buffer, *cache.scale_buffer):
             kv_size_bytes += get_tensor_size_bytes(index_k_cache)
         return kv_size_bytes
 

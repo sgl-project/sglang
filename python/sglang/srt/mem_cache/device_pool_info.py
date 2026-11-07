@@ -69,6 +69,10 @@ class IndexKeyLayout(Enum):
     PAGED_FP8_KEYS_WITH_SCALES = "paged_fp8_keys_with_scales"
     # Each buffer row is one page, [P x 64 packed e2m1 keys][P x 4 ue8m0 scales].
     PAGED_FP4_KEYS_WITH_SCALES = "paged_fp4_keys_with_scales"
+    # Each buffer row is one page of 128-dim e2m1 keys in AITER's FP4 MQA-logits order;
+    # their ue8m0 exponents are the PAGED_FP4_SCALES rows of the same page.
+    PAGED_FP4_KEYS = "paged_fp4_keys"
+    PAGED_FP4_SCALES = "paged_fp4_scales"
     # Each buffer row is one key, [num_keys, head_num, head_dim] in the buffer dtype.
     KEY_ROWS = "key_rows"
 
@@ -80,6 +84,10 @@ class IndexKeyLayout(Enum):
             return key_data_bytes + scale_bytes
         if self is IndexKeyLayout.PAGED_FP4_KEYS_WITH_SCALES:
             return key_count * (64 + 4)
+        if self is IndexKeyLayout.PAGED_FP4_KEYS:
+            return key_count * 64
+        if self is IndexKeyLayout.PAGED_FP4_SCALES:
+            return key_count * 4
         raise ValueError(f"unsupported index key layout {self}")
 
 
@@ -166,7 +174,7 @@ class IndexKeyBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
                 )
 
     def page_views(self) -> tuple[torch.Tensor, ...]:
-        if self.key_layout is IndexKeyLayout.PAGED_FP8_KEYS_WITH_SCALES:
+        if self.key_layout is not IndexKeyLayout.KEY_ROWS:
             return self.buffers
         return tuple(
             buffer.view(torch.uint8).reshape(-1, self.page_bytes)

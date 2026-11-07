@@ -5,6 +5,7 @@
 - Target verify: the shared-index-K logits equal the per-row aiter call on every
   row's keys, layer after layer and forward after forward.
 - NoPE prologue: quantized queries, head weights and stored keys match the generic path.
+- FP4 index-K: AITER's row-group logits read the keys and queries our kernels write.
 """
 
 import contextlib
@@ -19,6 +20,14 @@ import sglang.srt.layers.attention.dsa.dsa_indexer as dsa_indexer
 import sglang.srt.layers.attention.dsa.dsa_indexer_hip as dsa_indexer_hip
 import sglang.srt.layers.attention.dsa.indexer_prologue_hip as prologue_hip
 from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits
+from sglang.kernels.ops.attention.dsa.fp4_index_hip import (
+    fp4_paged_mqa_logits,
+    fp4_ragged_mqa_logits,
+    gather_fp4_index_k_rows,
+    indexer_q_fp4_head_gate,
+    stage_fp4_index_k_rows,
+    store_fp4_index_k,
+)
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.dcp import layout as dcp_layout
@@ -55,6 +64,7 @@ def _make_pool() -> DSATokenToKVPool:
 class _IndexerStub:
     _store_index_k_cache = Indexer._store_index_k_cache
     block_size, scale_fmt = 128, "ue8m0"
+    fp4_index_k = False
 
 
 def _store(pool, loc, key) -> torch.Tensor:
@@ -340,6 +350,122 @@ class TestNoPEPrologueHip(CustomTestCase):
         prologue_k = prologue_pool.get_index_k_with_scale_buffer(0)
         self.assertTrue(generic_k.any(), "no index-K row was stored")
         self.assertTrue(torch.equal(prologue_k, generic_k), "stored index-K differs")
+
+
+_E2M1 = [0, 0.5, 1, 1.5, 2, 3, 4, 6, -0.0, -0.5, -1, -1.5, -2, -3, -4, -6]
+
+
+def _fp4_values(codes: torch.Tensor, exps: torch.Tensor) -> torch.Tensor:
+    """Packed e2m1 bytes [..., 64] and ue8m0 exponents [..., 4] -> [..., 128] fp32."""
+    lut = torch.tensor(_E2M1, device=codes.device)
+    nibbles = torch.stack([codes.long() & 15, codes.long() >> 4], -1).flatten(-2)
+    return lut[nibbles] * torch.exp2(exps.float() - 127).repeat_interleave(32, -1)
+
+
+@unittest.skipUnless(
+    dsa_indexer._use_aiter and dsa_indexer._is_gfx95_supported,
+    "needs SGLANG_USE_AITER=1 on gfx950",
+)
+class TestFp4IndexKHip(CustomTestCase):
+    def test_decode_and_prefill_logits_read_the_stored_fp4_values(self):
+        """AITER's decode (row-group) and prefill logits over keys and queries our FP4
+        kernels wrote, the prefill keys gathered and staged back into pages, equal torch
+        scores of the same FP4 values: a layout drift on either side breaks them."""
+        gen = torch.Generator(device="cuda").manual_seed(0)
+        lens = torch.tensor([300, 2500, 1, 1730], dtype=torch.int32)
+        batch, next_n = lens.numel(), 5
+        pages = (lens + PAGE - 1) // PAGE
+        perm = torch.randperm(
+            int(pages.sum()) + 3, generator=torch.Generator().manual_seed(0)
+        )
+        table = torch.zeros(batch, int(pages.max()), dtype=torch.int32)
+        for b, first in enumerate(torch.cumsum(pages, 0) - pages):
+            table[b, : pages[b]] = perm[first : first + pages[b]].int()
+        table, lens_d = table.cuda(), lens.cuda()
+        payload = torch.zeros(perm.numel(), PAGE * 64, dtype=torch.uint8, device="cuda")
+        scale = torch.zeros(perm.numel(), PAGE * 4, dtype=torch.uint8, device="cuda")
+
+        channel = torch.exp(0.5 * torch.randn(HEAD_DIM, device="cuda", generator=gen))
+        keys, locs = [], []
+        for b in range(batch):
+            rows = torch.arange(int(lens[b]), device="cuda")
+            keys.append(
+                (
+                    torch.randn(rows.numel(), HEAD_DIM, device="cuda", generator=gen)
+                    * channel
+                ).bfloat16()
+            )
+            locs.append(table[b, rows // PAGE].long() * PAGE + rows % PAGE)
+        key, loc = torch.cat(keys), torch.cat(locs)
+        # other DCP ranks' tokens (-1) between this rank's write nothing
+        store_fp4_index_k(
+            torch.stack([key, torch.randn_like(key)], 1).flatten(0, 1),
+            payload,
+            scale,
+            torch.stack([loc, torch.full_like(loc, -1)], 1).flatten(),
+        )
+        rows = gather_fp4_index_k_rows(
+            payload, scale, table, lens_d, int(lens.sum()), int(lens.max())
+        )
+        key_fp4 = _fp4_values(rows[:, :64], rows[:, 64:])
+        group_err = (key_fp4 - key.float()).view(-1, 4, 32).abs().amax(-1)
+        group_amax = key.float().view(-1, 4, 32).abs().amax(-1)
+        self.assertTrue(
+            bool((group_err <= group_amax / 4 + 1e-6).all()), "keys not FP4-rounded"
+        )
+
+        query = torch.randn(
+            batch * next_n, HEADS, HEAD_DIM, device="cuda", generator=gen
+        ).bfloat16()
+        gate = torch.randn(
+            batch * next_n, HEADS, device="cuda", generator=gen
+        ).bfloat16()
+        q, weights = indexer_q_fp4_head_gate(query, gate, HEAD_DIM**-0.5)
+        heads = torch.arange(HEADS, device="cuda")
+        q_exps = q.scale.view(-1, 4, 16, 4)[:, :, heads % 16, heads // 16].transpose(
+            1, 2
+        )
+        query_fp4 = _fp4_values(q.payload, q_exps)
+        ends = (
+            (lens[:, None] - next_n + 1 + torch.arange(next_n))
+            .clamp_min(1)
+            .flatten()
+            .cuda()
+            .int()
+        )
+        starts = torch.arange(
+            0, batch * next_n + 1, next_n, dtype=torch.int32, device="cuda"
+        )
+        logits = fp4_paged_mqa_logits(
+            q,
+            weights.squeeze(-1),
+            payload,
+            scale,
+            table,
+            starts,
+            ends,
+            table.shape[1] * PAGE,
+        )
+        # prefill reads a bf16 gate and takes the softmax scale as its weight scale
+        first = (torch.cumsum(lens, 0) - lens).cuda().int()
+        ks = first.repeat_interleave(next_n)
+        q_prefill, gate_bf16 = indexer_q_fp4_head_gate(query, gate, 1.0, torch.bfloat16)
+        prefill = fp4_ragged_mqa_logits(
+            q_prefill,
+            gate_bf16.squeeze(-1),
+            HEAD_DIM**-0.5,
+            stage_fp4_index_k_rows(rows),
+            ks,
+            ks + ends,
+        )
+        for r in range(batch * next_n):
+            start, end = int(ks[r]), int(ends[r])
+            ref = (
+                torch.relu(query_fp4[r] @ key_fp4[start : start + end].T) * weights[r]
+            ).sum(0)
+            tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
+            torch.testing.assert_close(logits[r, :end], ref, **tol)
+            torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
 
 
 if __name__ == "__main__":

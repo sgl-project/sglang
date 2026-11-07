@@ -39,6 +39,9 @@ _dcp_local_lens = _PerForwardMemo()
 # Target verify on the shared-index-K path: each request's full length and page-table row.
 _verify_request_lens = _PerForwardMemo()
 _verify_request_block_tables = _PerForwardMemo()
+# FP4 index-K logits: each request's page-table row and its first query row
+_fp4_request_block_tables = _PerForwardMemo()
+_fp4_query_starts = _PerForwardMemo()
 
 
 def _localize_store_loc(
@@ -314,3 +317,24 @@ def index_k_norm_store_into(indexer, pool, layer_id, key, out_cache_loc) -> None
         pool.get_index_k_with_scale_buffer(layer_id=layer_id).view(fp8_dtype),
         out_cache_loc.contiguous(),
     )
+
+
+def fp4_request_rows(
+    forward_batch, layer_id: int, block_tables: torch.Tensor, q_offset: int, next_n: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Each request's page-table row (dense, as AITER's row-group logits index it) and
+    the start of its ``next_n`` query rows."""
+    key = (id(forward_batch), q_offset, next_n)
+    tables = _fp4_request_block_tables.get(
+        key=key,
+        layer_id=layer_id,
+        compute=lambda: block_tables[:q_offset:next_n].contiguous(),
+    )
+    starts = _fp4_query_starts.get(
+        key=key,
+        layer_id=layer_id,
+        compute=lambda: torch.arange(
+            0, q_offset + 1, next_n, dtype=torch.int32, device=block_tables.device
+        ),
+    )
+    return tables, starts

@@ -7,6 +7,7 @@ from typing import Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.attention.dsa.fp4_index_hip import indexer_q_fp4_head_gate
 from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
 from sglang.srt.layers.cp.utils import is_cp_active
 
@@ -85,6 +86,12 @@ class RocmNoPEPrologue:
             act_quant=act_quant,
             prenorm=fuse_k_norm,
         )
+        if indexer.fp4_index_k:
+            return indexer_q_fp4_head_gate(
+                query.view(-1, indexer.n_heads, indexer.head_dim),
+                gate,
+                indexer.softmax_scale,
+            )
         return indexer_q_quant_head_gate(
             query.view(-1, indexer.n_heads, indexer.head_dim),
             gate,

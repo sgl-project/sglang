@@ -247,6 +247,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_precise_embedding_interpolation",
     "enable_fused_moe_sum_all_reduce",
     "enable_deepseek_v4_fp4_indexer",
+    "enable_dsa_fp4_indexer",
     "disable_custom_all_reduce",
     "enable_mscclpp",
     "enable_torch_symm_mem",
