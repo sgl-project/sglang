@@ -967,5 +967,6 @@ class TestApplyFp8LinearBmmFlashinferBias(CustomTestCase):
                     out.float(), ref.float() + bias.float(), rtol=1.6e-2, atol=0.5
                 )
 
+
 if __name__ == "__main__":
     unittest.main()
