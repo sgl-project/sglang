@@ -10,8 +10,10 @@ name: Nightly Benchmark (AMD)
 # signal, and the workload can be tuned without touching the gate.
 #
 # Every point runs on a whole MI35x node of a partition kept for performance
-# runs, so no other job shares the node while it is measured. The runner sits on
-# the cluster's login node and submits one job per point through
+# runs, so no other job shares the node while it is measured: --gpus 8, even
+# though a tp2 point uses only two of them, because the launcher packs smaller
+# jobs onto shared nodes. The runner sits on the cluster's login node and
+# submits one job per point through
 # scripts/ci/slurm/launch_amd_ci_mi35x.sh, the same flow as
 # test-amd-mi35x-spur.yml; cluster settings come from the runner's environment
 # (see the launcher's header).
@@ -126,6 +128,7 @@ jobs:
           bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
             --suite nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp \
             --rocm-version "${{ matrix.rocm_version }}" \
+            --gpus 8 \
             --env SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
             --env AGENTIC_TP=${{ matrix.point.tp }} \
             --env AGENTIC_CONCURRENCY=${{ matrix.point.concurrency }} \
