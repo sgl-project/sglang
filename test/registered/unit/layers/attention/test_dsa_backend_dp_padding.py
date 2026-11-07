@@ -214,6 +214,25 @@ class TestDSABackendDPPadding(CustomTestCase):
         ):
             _plan_live_rows(2, 3, SimpleNamespace())
 
+    def test_accepts_metadata_padding_inside_breakable_graph(self):
+        # The replay view lacks global_num_tokens_cpu; the bridge narrowed q.
+        with (
+            patch(
+                "sglang.srt.layers.attention.dsa_backend."
+                "dsa_cache_seqlens_may_be_padded",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.model_executor.runner_backend_utils."
+                "breakable_cuda_graph.context._in_breakable_cuda_graph",
+                True,
+            ),
+        ):
+            plan = _plan_live_rows(34, 48, SimpleNamespace())
+        self.assertEqual(
+            (plan.live_rows, plan.q_pad_rows, plan.meta_pad_rows), (34, 0, 14)
+        )
+
     def test_trtllm_decode_runs_real_rows_then_restores_physical_batch(self):
         self._check_trtllm_padding(is_prefill=False)
 
