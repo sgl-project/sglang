@@ -1634,6 +1634,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
 
+        # Plain-text MRoPE has identical coordinates on all three axes. Reuse
+        # the positions already built on the forward device instead of rebuilding
+        # them on the CPU and issuing a pageable host-to-device copy. Speculative
+        # metadata without its own positions can take this path as well.
+        if (
+            rl_on_policy_target is None
+            and getattr(batch, "dllm_config", None) is None
+            and getattr(self.spec_info, "positions", None) is None
+            and all(mm is None for mm in mm_inputs)
+        ):
+            self.mrope_positions = (
+                self.positions.to(dtype=torch.int64).unsqueeze(0).repeat(3, 1)
+            )
+            return
+
         # Optimize text-only branch with torch.arange
         mrope_positions_list = [None] * batch_size
         for batch_idx in range(batch_size):
