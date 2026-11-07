@@ -189,6 +189,7 @@ def _qem_symmetric_determinant_mask(a: np.ndarray) -> np.ndarray:
         + np.abs(a01) * (np.abs(p2) + np.abs(p3))
         + np.abs(a02) * (np.abs(p4) + np.abs(p5))
     )
+    # Conservative cancellation margin; defer near-threshold cases to NumPy.
     margin = 128 * np.finfo(np.float64).eps * scale
     uncertain = (~np.isfinite(det)) | (np.abs(np.abs(det) - 1e-12) <= margin)
     solvable = np.abs(det) > 1e-12
