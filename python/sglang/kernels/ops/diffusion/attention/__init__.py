@@ -1,1 +1,2 @@
-"""Diffusion attention kernels: sparse linear attention and gated delta-net."""
+"""Diffusion attention kernels: sparse linear attention, gated delta-net and
+SageAttention (Triton)."""

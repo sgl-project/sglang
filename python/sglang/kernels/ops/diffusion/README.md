@@ -38,7 +38,7 @@ modulate/    adaLN modulate, gating, timestep conditioning
 rope/        rotary embeddings and the QK-norm chains fused into them
 activation/  SiLU / GLU / GELU fusions
 quantization/ FP8 rowwise producers fused into the GEMM input path
-attention/   sparse linear attention, gated delta-net
+attention/   sparse linear attention, gated delta-net, SageAttention
 routing/     diffusion-model MoE routing and expert selection
 layout/      pure data movement: USP/Ulysses relayout, varlen pack, causal pad
 common/      platform predicates, non-Triton fallbacks, cached Triton launches (numerics: kernels/numerics.py)
