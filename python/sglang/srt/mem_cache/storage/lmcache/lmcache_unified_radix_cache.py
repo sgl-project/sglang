@@ -298,6 +298,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 self._finalize_retired_flow(flow)
             else:
                 self._finish_successful_load(flow)
+            self._finish_session_if_idle(flow.lookup.request_id)
 
         ready_stores = self.lmcache_connector.ready_prefix_count(
             [pending.operation for pending in self._pending_stores]
@@ -315,7 +316,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                     self._pending_store_counts[rid] = remaining
                 else:
                     self._pending_store_counts.pop(rid)
-                self._finish_session_if_store_idle(rid)
+                self._finish_session_if_idle(rid)
 
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
@@ -964,15 +965,19 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         )
 
     def _request_session_finish(self, rid: str) -> None:
-        """End the LMCache session after this request's stores have completed."""
+        """End the session after this request's loads and stores have completed."""
         self._session_finish_requested.add(rid)
-        self._finish_session_if_store_idle(rid)
+        self._finish_session_if_idle(rid)
 
-    def _finish_session_if_store_idle(self, rid: str) -> None:
+    def _finish_session_if_idle(self, rid: str) -> None:
         if (
             rid not in self._session_finish_requested
             or self._pending_store_counts.get(rid, 0) > 0
         ):
+            return
+        flow = self._external_flows.get(rid)
+        if flow is not None and flow.load is not None and not flow.load_completed:
+            # Retrieve completion owns the server-side read-lock release.
             return
         self._session_finish_requested.remove(rid)
         self.lmcache_connector.finish_request(rid)
