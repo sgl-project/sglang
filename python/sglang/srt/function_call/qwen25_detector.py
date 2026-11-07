@@ -55,6 +55,13 @@ class Qwen25Detector(BaseFormatDetector):
         idx = text.find(self.bot_token)
         normal_text = text[:idx].strip() if idx != -1 else text
         if self.bot_token not in text:
+            # A bare opener at the end of the output means the tool call
+            # was cut off (e.g. by max_tokens) before the "\n" of the
+            # full bot_token arrived. It is markup, not content — the
+            # streaming path drops it, so drop it here too.
+            opener = self.bot_token.rstrip("\n")
+            if normal_text.endswith(opener):
+                normal_text = normal_text[: -len(opener)].strip()
             return StreamingParseResult(normal_text=normal_text, calls=[])
 
         # Find all <tool_call>\n...\n</tool_call> blocks
