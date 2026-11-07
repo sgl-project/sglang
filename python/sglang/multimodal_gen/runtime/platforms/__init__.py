@@ -129,7 +129,15 @@ def rocm_platform_plugin() -> str | None:
         finally:
             amdsmi.amdsmi_shut_down()
     except Exception as e:
-        logger.debug("ROCm platform is unavailable: %s", e)
+        logger.debug("ROCm platform is unavailable via amdsmi: %s", e)
+        # amdsmi's Python bindings are optional (the rocm/pytorch images ship
+        # without them); without this, a ROCm GPU silently falls back to CPU.
+        try:
+            import torch
+
+            is_rocm = torch.version.hip is not None and torch.cuda.is_available()
+        except Exception as e:
+            logger.debug("ROCm detection via torch failed: %s", e)
 
     return _BUILTIN_PLATFORM_QUALNAMES["rocm"] if is_rocm else None
 
