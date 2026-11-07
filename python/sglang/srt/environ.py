@@ -1617,6 +1617,8 @@ class Envs:
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # ROCm CustomAllReduceV2 workspace sharing: auto, fabric or posix_fd
+    SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
