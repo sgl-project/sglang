@@ -12,13 +12,14 @@
 //! [`crate::multi_modality::payload::resolve_media_work`] swaps back in.
 
 use std::sync::{Arc, LazyLock};
+use std::time::Instant;
 
 use bytes::Bytes;
 use sglang_mm::common::fetch::{ByteBudget, fetch_bytes_budgeted, fetch_local_file_budgeted};
 use sglang_mm::driver::MAX_REQUEST_BYTES;
 use tokio::sync::Semaphore;
 
-use crate::message::request::{GenerateRequest, MmData};
+use crate::message::request::{GenerateRequest, MmData, ProcessorFetch};
 use crate::multi_modality::encoded::MmModality;
 use crate::multi_modality::payload::io_sources;
 use crate::multi_modality::worker::{MediaError, MmProcessor};
@@ -90,16 +91,30 @@ pub async fn prefetch_all(
         .iter()
         .map(|r| plan(&r.mm))
         .collect::<Result<Vec<_>, MediaError>>()?;
-    let fetches = plans
-        .into_iter()
-        .map(|sources| fetch_ordered(sources, MAX_REQUEST_BYTES, processor.cloned()));
+    let fetches = plans.into_iter().map(|sources| async {
+        let started = Instant::now();
+        let fetched = fetch_ordered(sources, MAX_REQUEST_BYTES, processor.cloned()).await?;
+        Ok::<_, MediaError>((fetched, started.elapsed()))
+    });
     let fetched = futures::future::try_join_all(fetches).await?;
-    for (req, bytes) in requests.iter_mut().zip(fetched) {
-        if !bytes.is_empty() {
-            req.mm.as_mut().expect("sources came from mm").prefetched = bytes;
-        }
+    for (req, (fetched, elapsed)) in requests.iter_mut().zip(fetched) {
+        let Some(mm) = req.mm.as_mut() else {
+            continue;
+        };
+        mm.admission.prefetch = elapsed;
+        mm.admission.processor_fetches = fetched
+            .iter()
+            .filter_map(|source| source.by_processor)
+            .collect();
+        mm.prefetched = fetched.into_iter().map(|source| source.bytes).collect();
     }
     Ok(())
+}
+
+/// One resolved source, and its timing when the processor fetched it.
+struct Fetched {
+    bytes: Bytes,
+    by_processor: Option<ProcessorFetch>,
 }
 
 /// The modality's name as `--limit-mm-data-per-request` keys it.
@@ -120,7 +135,7 @@ async fn fetch_ordered(
     sources: Vec<(String, MmModality)>,
     total_bytes: u64,
     processor: Option<Arc<dyn MmProcessor>>,
-) -> Result<Vec<Bytes>, MediaError> {
+) -> Result<Vec<Fetched>, MediaError> {
     let budget = Arc::new(ByteBudget::new(total_bytes));
     futures::future::try_join_all(sources.into_iter().map(|(src, modality)| {
         let budget = Arc::clone(&budget);
@@ -131,10 +146,19 @@ async fn fetch_ordered(
             // core set (see `on_thread_start` in `runtime::start`) — off the
             // CPU-bound stages, and mostly I/O-parked, so sharing is fine.
             run_blocking_bounded(Arc::clone(&PERMITS), move || {
-                if let Some(processor) = processor
-                    && let Some(bytes) = processor.fetch_media(&src, modality, &budget)?
-                {
-                    return Ok(bytes);
+                if let Some(processor) = processor {
+                    let started = Instant::now();
+                    if let Some(bytes) = processor.fetch_media(&src, modality, &budget)? {
+                        let by_processor = ProcessorFetch {
+                            started,
+                            elapsed: started.elapsed(),
+                            bytes: bytes.len(),
+                        };
+                        return Ok(Fetched {
+                            bytes,
+                            by_processor: Some(by_processor),
+                        });
+                    }
                 }
                 let fetched = if src.starts_with('/') || src.starts_with("file://") {
                     fetch_local_file_budgeted(&src, &budget)
@@ -143,7 +167,11 @@ async fn fetch_ordered(
                 } else {
                     Err(format!("media fetch: unsupported URI: {src}"))
                 };
-                fetched.map(Bytes::from).map_err(MediaError::Client)
+                let bytes = fetched.map(Bytes::from).map_err(MediaError::Client)?;
+                Ok(Fetched {
+                    bytes,
+                    by_processor: None,
+                })
             })
             .await
             .map_err(MediaError::Server)?
@@ -188,7 +216,8 @@ mod tests {
             .into_iter()
             .map(|source| (source, MmModality::Image))
             .collect();
-        fetch_ordered(sources, total_bytes, None).await
+        let fetched = fetch_ordered(sources, total_bytes, None).await?;
+        Ok(fetched.into_iter().map(|source| source.bytes).collect())
     }
 
     fn serve(bodies: Vec<Vec<u8>>) -> std::net::SocketAddr {
@@ -293,8 +322,9 @@ mod tests {
         );
     }
 
-    /// Serves `custom://` sources (or fails them, by name), rejects audio
-    /// before any fetch, and leaves every other source to the built-in fetcher.
+    /// Serves `custom://` sources, each in [`CUSTOM_FETCH_TIME`] (or fails
+    /// them, by name), rejects audio before any fetch, and leaves every other
+    /// source to the built-in fetcher.
     struct CustomScheme;
 
     impl MmProcessor for CustomScheme {
@@ -325,6 +355,7 @@ mod tests {
                 Some("server") => Err(MediaError::Server("backend down".into())),
                 Some("panic") => panic!("fetch panicked"),
                 Some(name) => {
+                    std::thread::sleep(CUSTOM_FETCH_TIME);
                     let bytes = Bytes::from(format!("{modality:?}:{name}"));
                     budget
                         .charge_existing(bytes.len(), source)
@@ -334,6 +365,9 @@ mod tests {
             }
         }
     }
+
+    /// How long [`CustomScheme`] takes to fetch one of its URIs.
+    const CUSTOM_FETCH_TIME: std::time::Duration = std::time::Duration::from_millis(10);
 
     /// A processor's URIs resolve in request order beside built-in sources;
     /// its failures keep their class, a scheme nobody serves is a client error
@@ -361,11 +395,25 @@ mod tests {
             .await
             .unwrap();
         std::fs::remove_file(&path).ok();
-        let fetched = &requests[0].mm.as_ref().unwrap().prefetched;
+        let mm = requests[0].mm.as_ref().unwrap();
         assert_eq!(
-            fetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
+            mm.prefetched.iter().map(Bytes::as_ref).collect::<Vec<_>>(),
             vec![b"Image:a".as_ref(), b"zzz".as_ref(), b"Video:b".as_ref()]
         );
+        // Only the processor's own fetches are timed, in source order; the
+        // request's prefetch covers them all.
+        let fetches = &mm.admission.processor_fetches;
+        assert_eq!(
+            fetches.iter().map(|fetch| fetch.bytes).collect::<Vec<_>>(),
+            [7, 7]
+        );
+        assert!(
+            fetches
+                .iter()
+                .all(|fetch| fetch.elapsed >= CUSTOM_FETCH_TIME)
+        );
+        assert!(mm.admission.prefetch >= CUSTOM_FETCH_TIME);
+        assert!(mm.admission.queued_at.is_none());
 
         let unsupported =
             |source: &str| MediaError::Client(format!("media fetch: unsupported URI: {source}"));
