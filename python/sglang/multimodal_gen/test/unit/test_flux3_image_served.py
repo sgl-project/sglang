@@ -238,11 +238,11 @@ class TestFlux3ServedOutput(unittest.TestCase):
             OutputBatch,
         )
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.flux3_image import (
-            Flux3ImageDecodeStage,
+            Flux3ImagePostprocessStage,
         )
 
         image = torch.tensor([[[-1.0]], [[0.0]], [[1.0]]])
-        displayed = Flux3ImageDecodeStage._to_display(image)
+        displayed = Flux3ImagePostprocessStage._to_display(image)
         req = SimpleNamespace(
             enable_frame_interpolation=False,
             enable_upscaling=False,

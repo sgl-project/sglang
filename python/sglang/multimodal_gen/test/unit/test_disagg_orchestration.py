@@ -135,7 +135,15 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
         reference.write_bytes(b"head-local image upload")
         for iteration in range(3 if split else 2):
             request_id = str(iteration)
-            image_path = [str(reference)] if iteration else None
+            image_path = (
+                [
+                    str(reference),
+                    "data:image/png;base64," + "A" * 1024,
+                    "https://example.com/reference.png",
+                ]
+                if iteration
+                else None
+            )
             client.send_pyobj(
                 [Req(request_id=request_id, prompt="test", image_path=image_path)]
             )
@@ -151,6 +159,7 @@ def test_pipeline_transfer_and_slot_reuse(tmp_path, split, preallocated, fault):
                     base64.b64decode(req.image_path[0].split(",", 1)[1])
                     == reference.read_bytes()
                 )
+                assert req.image_path[1:] == image_path[1:]
             fail_image = split and iteration == 2
             fail_role = fault == "role_error" and iteration == 0
             active_roles = [

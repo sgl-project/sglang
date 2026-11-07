@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import copy
 from dataclasses import fields
 from typing import ClassVar
 
@@ -22,6 +23,27 @@ class DisaggServerArgsMixin:
         RoleType.PROMPT_ENCODER: 4,
         RoleType.IMAGE_ENCODER: 5,
     }
+
+    def for_stage_role(self, role: str, **overrides):
+        """resolve each worker independently, without copying auto-tuned parent defaults"""
+        values = vars(self)
+        if "model_path" in overrides:
+            # a different checkpoint owns its config; inherit only transport settings
+            kwargs = {k: v for k, v in values.items() if k.startswith("disagg_")}
+        else:
+            kwargs = {k: values[k] for k in self._explicit_arg_names if k in values}
+            kwargs.update(
+                model_path=self.model_path, pipeline_config=self.pipeline_config
+            )
+        kwargs.update(overrides)
+        kwargs = copy.deepcopy(kwargs)
+        kwargs.update(
+            stage_deployment=self.stage_deployment,
+            stage_role=role,
+            stage_node=None,
+            warmup_mode="off",
+        )
+        return type(self).from_kwargs(**kwargs)
 
     def get_role_parallelism(self, role_type: RoleType) -> dict[str, int | None]:
         _none = {
@@ -99,6 +121,30 @@ class DisaggServerArgsMixin:
 
     @classmethod
     def add_disagg_cli_args(cls, parser: FlexibleArgumentParser) -> None:
+        parser.add_argument(
+            "--stage-node",
+            type=str,
+            default=None,
+            help="Launch every stage worker assigned to this node in --stage-deployment.",
+        )
+        parser.add_argument(
+            "--stage-deployment",
+            type=str,
+            default=None,
+            help="JSON stage contracts and role placement; omit --stage-role to launch the coordinator.",
+        )
+        parser.add_argument(
+            "--stage-role",
+            type=str,
+            default=None,
+            help="Named stage group to execute from --stage-deployment.",
+        )
+        parser.add_argument(
+            "--stage-endpoint",
+            type=str,
+            default=None,
+            help="This stage worker's private TCP endpoint, as listed in the deployment.",
+        )
         role_default = (
             cls.disagg_role.value
             if isinstance(cls.disagg_role, RoleType)
