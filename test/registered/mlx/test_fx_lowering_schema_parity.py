@@ -66,6 +66,41 @@ def _indices(count: int, high: int) -> torch.Tensor:
 # be "values" (default) or "shape" for ops with unspecified contents.
 _RECIPES: dict[str, dict] = {
     "alias": dict(args=lambda: (_t(4, 6),)),
+    "add_scalar": dict(args=lambda: (_t(4, 4), 2.0), pools={"alpha": [2, 0.5]}),
+    "subtract_scalar": dict(args=lambda: (_t(4, 4), 2.0), pools={"alpha": [2, 0.5]}),
+    "multiply_scalar": dict(args=lambda: (_t(4, 4), 2.0)),
+    "divide": dict(args=lambda: (_t(4, 4), _positive(4, 4))),
+    "divide_scalar": dict(args=lambda: (_t(4, 4), 2.0)),
+    "addmm": dict(
+        args=lambda: (_t(3, 5), _t(3, 4), _t(4, 5)),
+        pools={"alpha": [2.0], "beta": [0.0, 0.5]},
+    ),
+    "bmm": dict(args=lambda: (_t(2, 3, 4), _t(2, 4, 5))),
+    "cos": dict(args=lambda: (_t(4, 4),)),
+    "sin": dict(args=lambda: (_t(4, 4),)),
+    "sqrt": dict(args=lambda: (_positive(4, 4),)),
+    "negative": dict(args=lambda: (_t(4, 4),)),
+    "expand": dict(
+        args=lambda: (_t(1, 4), [3, -1]),
+        extra=[lambda: ((_t(1, 4), [2, 3, -1]), {})],
+    ),
+    "index": dict(args=lambda: (_t(5, 6), [None, _indices(3, 6)])),
+    "select": dict(args=lambda: (_t(5, 6), -1, -2)),
+    "permute": dict(args=lambda: (_t(2, 3, 4), [2, 0, 1])),
+    "squeeze": dict(
+        args=lambda: (_t(3, 1, 4), 1),
+        extra=[lambda: ((_t(3, 1, 4), 0), {})],
+    ),
+    "transpose": dict(args=lambda: (_t(2, 3, 4), 0, -1)),
+    "to_copy": dict(
+        args=lambda: (_t(4, 4),),
+        pools={"dtype": [torch.float16, torch.int32]},
+        exclude={"non_blocking"},
+    ),
+    "native_layer_norm": dict(
+        args=lambda: (_t(4, 8), [8], _t(8), _t(8), 1e-5),
+        extra=[lambda: ((_t(2, 4, 8), [4, 8], _t(4, 8), _t(4, 8), 1e-5), {})],
+    ),
     "add": dict(
         args=lambda: (_t(4, 4), _t(4, 4)),
         pools={"alpha": [2, 0.5]},
@@ -116,11 +151,12 @@ _RECIPES: dict[str, dict] = {
     "layer_norm": dict(
         args=lambda: (_t(4, 8), [8]),
         pools={"weight": [_t(8)], "bias": [_t(8)], "eps": [1e-3]},
-        rejects=[lambda: ((_t(4, 8), [4, 8]), {})],  # not last-axis only
+        extra=[lambda: ((_t(4, 8), [4, 8]), {})],
     ),
     "rms_norm": dict(
         args=lambda: (_t(4, 8), [8], _t(8)),
         pools={"eps": [1e-3]},
+        extra=[lambda: ((_t(4, 8), [8], None, 1e-5), {})],
         rejects=[lambda: ((_t(4, 8), [4, 8], _t(4, 8)), {})],  # not last-axis only
     ),
     "linear": dict(args=lambda: (_t(3, 8), _t(5, 8)), pools={"bias": [_t(5)]}),

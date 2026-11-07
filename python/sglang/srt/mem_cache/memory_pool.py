@@ -2646,9 +2646,11 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     # k_cache and v_cache, and when they alias one allocation
                     # AOTAutograd functionalizes it through a synthetic base that
                     # clones the layer's whole KV allocation on every decode step.
+                    # MPS export also needs independent K/V backing allocations.
                     if (
                         k_shape == v_shape
                         and not _is_hip
+                        and torch.device(self.device).type != "mps"
                         and not get_flags().capture.enable_torch_compile
                     ):
                         # Store K and V as block-aligned halves of one allocation
