@@ -192,7 +192,7 @@ def fast_sample(
             # Unit column stride is enough: the multi-layer EAGLE single-graph
             # draft passes a [bs, step] view of a [max_bs, steps, vocab] buffer.
             and probs.stride(-1) == 1
-            # Size gate measured on RTX PRO 6000 and GB300; re-tune for other GPUs.
+            # Size gate measured on RTX PRO 6000, H100 and GB300; re-tune for others.
             and probs.numel() >= 1 << 23
             and can_argmax(q)
         ):
