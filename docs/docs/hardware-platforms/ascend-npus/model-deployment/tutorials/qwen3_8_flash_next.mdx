@@ -1,0 +1,356 @@
+---
+title: "Qwen3.8-Flash-Next"
+description: "Deploy Qwen3.8-Flash-Next W8A8 with QSA on eight Ascend A2 NPUs."
+---
+
+## Deployment overview
+
+This tutorial deploys `Eco-Tech/Qwen3.8-Flash-Next-w8a8-mtp` for text generation
+on a single node with eight Ascend 910B1 NPUs. It uses ModelSlim W8A8 quantization,
+tensor parallelism (TP8), Qwen Sparse Attention (QSA), chunked prefill, prefix
+caching, and NPU decode graphs. Multi-token prediction (MTP) is disabled.
+
+The serving implementation comes from
+[SGLang PR #43102](https://github.com/sgl-project/sglang/pull/43102).
+The commands below pin its implementation to
+`7a9883216db73ac0c2031e8ea4ab4ba9a0c18b1a` and install the QSA kernels from
+[sgl-kernel-npu PR #807](https://github.com/sgl-project/sgl-kernel-npu/pull/807).
+Use these revisions to reproduce the tested deployment.
+
+## Prerequisites
+
+Prepare an aarch64 Linux host with eight Ascend 910B1 devices and the following
+software stack. Run the installation and serving commands inside an environment
+with access to all eight devices and the host driver.
+
+| Component | Configuration |
+|---|---|
+| Hardware | 8×Ascend 910B1, 64 GiB HBM/device, aarch64; driver 25.5.1 |
+| Runtime | CANN 9.2.0; NNAL/ATB 9.2.0; Python 3.11.15; torch 2.10.0; torch-npu 2.10.0.post7 |
+| Model libraries | transformers 5.19.0; tokenizers 0.23.3 |
+| Kernel packages | triton-ascend 3.6.0; sgl-kernel-npu source 2026.9.0.post11 (package metadata 2026.9.0); custom-ops 1.0 |
+| Checkpoint | Eco-Tech/Qwen3.8-Flash-Next-w8a8-mtp; ModelSlim W8A8; text-only; MTP disabled |
+
+
+The base image used for the build is
+`quay.io/ascend/triton:3.6.0-cann9.2.0-torch_npu2.10.0.post7-910b-ubuntu24.04-py3.11`.
+Install NNAL/ATB 9.2.0 separately and make its environment script available at
+`/usr/local/Ascend/nnal/atb/set_env.sh`. See
+[Ascend installation](/docs/hardware-platforms/ascend-npus/getting-started/installation)
+for device and driver setup.
+
+## Install SGLang
+
+Check out the tested implementation and create a Python environment that inherits
+the base image's Torch, torch-npu, and Triton-Ascend packages:
+
+```bash
+git clone https://github.com/sgl-project/sglang.git
+cd sglang
+git fetch origin refs/pull/43102/head
+git checkout --detach 7a9883216db73ac0c2031e8ea4ab4ba9a0c18b1a
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+source /usr/local/Ascend/cann-9.2.0/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+```
+
+Install the native build prerequisites:
+
+```bash
+apt-get update
+apt-get install -y \
+  build-essential pkg-config git patch unzip \
+  libnuma-dev libibverbs-dev librdmacm-dev rdma-core \
+  libcurl4-openssl-dev libssl-dev liburing-dev zlib1g-dev
+```
+
+From the SGLang checkout root, install the runtime and build dependencies:
+
+```bash
+python3 - <<'PYTHON'
+import tomllib
+from pathlib import Path
+project = tomllib.loads(Path("python/pyproject_npu.toml").read_text())
+requirements = sorted(set(
+    project["project"]["dependencies"] + project["build-system"]["requires"]
+    + ["build", "packaging", "pybind11", "ninja", "cmake", "pyyaml", "decorator", "attrs"]
+))
+Path("npu-requirements.txt").write_text("\n".join(requirements) + "\n")
+Path("npu-constraints.txt").write_text(
+    "torch==2.10.0\ntorch-npu==2.10.0.post7\ntriton-ascend==3.6.0\nwheel==0.45.1\n"
+)
+PYTHON
+
+python3 -m pip install --prefer-binary \
+  -r npu-requirements.txt -c npu-constraints.txt
+export PIP_CONSTRAINT="$PWD/npu-constraints.txt"
+
+# Install the checked-out serving implementation.
+python3 -m pip install --no-deps --no-build-isolation -e ./python
+```
+
+## Build the native dependencies
+
+Build the native packages against CANN 9.2.0 using
+[sgl-kernel-npu 2026.9.0.post11](https://github.com/sgl-project/sgl-kernel-npu/releases/tag/2026.9.0.post11).
+That release's prebuilt packages target CANN 9.0/9.1. The following CANN 9.2
+procedure follows its
+[release workflow](https://github.com/sgl-project/sgl-kernel-npu/blob/2026.9.0.post11/.github/workflows/build_and_release.yml)
+with the Torch-header and opbase-header adjustments used for this deployment.
+
+### Prepare the sources
+
+Set `BUILD_ROOT` to an absolute build directory and `CUSTOM_OPP_ROOT` to the
+custom operator installation directory. Keep the serving Python environment
+activated throughout the build.
+
+```bash
+export BUILD_ROOT=/path/to/build-root
+export CUSTOM_OPP_ROOT=/path/to/custom-opp
+mkdir -p "$BUILD_ROOT/build/third-party/pkg" "$CUSTOM_OPP_ROOT"
+
+git clone --recursive --branch 2026.9.0.post11 \
+  https://github.com/sgl-project/sgl-kernel-npu.git \
+  "$BUILD_ROOT/build/sgl-kernel-npu"
+git clone https://gitcode.com/cann/cann-recipes-infer.git \
+  "$BUILD_ROOT/build/cann-recipes-infer"
+git -C "$BUILD_ROOT/build/cann-recipes-infer" checkout 35a476c
+git clone https://gitcode.com/cann/ops-transformer.git \
+  "$BUILD_ROOT/build/ops-transformer"
+git -C "$BUILD_ROOT/build/ops-transformer" checkout bcc6304
+git clone https://gitcode.com/cann/opbase.git "$BUILD_ROOT/ops-base"
+git -C "$BUILD_ROOT/ops-base" checkout ee5334d157016d2afa736d4a23381855dbf1fe37
+git clone https://gitcode.com/cann/ops-tensor.git "$BUILD_ROOT/build/ops-tensor"
+git -C "$BUILD_ROOT/build/ops-tensor" checkout f2e975775ca754c04084dece850dd6cc76bfbc5b
+git clone --branch master-016 https://gitcode.com/cann/cmake.git \
+  "$BUILD_ROOT/build/third-party/cann-cmake"
+```
+
+Download these archives into the indicated paths, relative to
+`$BUILD_ROOT/build/third-party/`:
+
+| Archive | Destination |
+|---|---|
+| [JSON](https://cann-3rd.obs.cn-north-4.myhuaweicloud.com/json/json-3.11.3.tar.gz) | `json-3.11.3.tar.gz` |
+| [Eigen](https://gitcode.com/cann-src-third-party/eigen/releases/download/5.0.0-h0.trunk/eigen-5.0.0.tar.gz) | `eigen-5.0.0.tar.gz` |
+| [makeself](https://gitcode.com/cann-src-third-party/makeself/releases/download/release-2.5.0-patch1.0/makeself-release-2.5.0-patch1.tar.gz) | `makeself-release-2.5.0-patch1.tar.gz` |
+| [Abseil](https://gitcode.com/cann-src-third-party/abseil-cpp/releases/download/20230802.1/abseil-cpp-20230802.1.tar.gz) | `pkg/abseil-cpp-20230802.1.tar.gz` |
+| [Protobuf](https://gitcode.com/cann-src-third-party/protobuf/releases/download/v25.1/protobuf-25.1.tar.gz) | `pkg/protobuf-25.1.tar.gz` |
+
+### Adjust header discovery
+
+Resolve `torch` and `torch_npu` independently in the attention extension's
+CMake configuration so the build finds packages inherited from the base image:
+
+```bash
+python3 - <<'PY'
+import os
+from pathlib import Path
+p = Path(os.environ["BUILD_ROOT"]) / "build/sgl-kernel-npu/csrc/attentions/csrc/CMakeLists.txt"
+s = p.read_text()
+for variable, package in (("PYTORCH_INSTALL_PATH", "torch"), ("PYTORCH_NPU_INSTALL_PATH", "torch_npu")):
+    old = f"set({variable} ${{python_site_packages_path}}/{package})"
+    new = (
+        'execute_process(\n  COMMAND python3 -c "import importlib.util, pathlib; '
+        f"print(pathlib.Path(importlib.util.find_spec('{package}').origin).parent)"
+        f'"\n  OUTPUT_VARIABLE {variable}\n'
+        '  OUTPUT_STRIP_TRAILING_WHITESPACE\n  COMMAND_ERROR_IS_FATAL ANY\n)'
+    )
+    if old in s:
+        s = s.replace(old, new, 1)
+    elif new not in s:
+        raise RuntimeError(f"Unexpected package lookup: {package}")
+p.write_text(s)
+PY
+```
+
+Prepend the following block to
+`$BUILD_ROOT/build/ops-transformer/cmake/obj_func.cmake` before configuring the
+build. This makes the pinned opbase headers take precedence over the CANN 9.2
+installation's headers.
+
+```cmake
+if(NOT EXISTS "${OPBASE_SOURCE_PATH}/pkg_inc/op_common/atvoss/elewise/elewise_tiling.h")
+  message(FATAL_ERROR "Pinned opbase headers are missing")
+endif()
+include_directories(BEFORE
+  "${OPBASE_SOURCE_PATH}/pkg_inc"
+  "${OPBASE_SOURCE_PATH}/include"
+  "${OPBASE_SOURCE_PATH}/pkg_inc/op_common"
+  "${OPBASE_SOURCE_PATH}/include/op_common"
+  "${OPBASE_SOURCE_PATH}/include/op_common/op_host"
+)
+```
+
+### Build and install
+
+Run the builds in order in the activated serving environment:
+
+```bash
+export VERSION=2026.9.0.post11
+cd "$BUILD_ROOT/build/sgl-kernel-npu"
+bash build.sh -a kernels Ascend910B2
+bash build.sh -a deepep2 Ascend910B1
+bash build.sh -a attentions
+bash build.sh -a memory-saver
+python3 -m pip install --no-deps --force-reinstall output/*.whl
+
+cd "$BUILD_ROOT/build/cann-recipes-infer"
+git apply "$BUILD_ROOT/build/sgl-kernel-npu/contrib/patch/Adapt-custom-ops-A2.patch"
+cd ops/ascendc/torch_ops_extension
+bash build_and_install.sh
+python3 -m pip install --no-deps --force-reinstall dist/custom_ops-*.whl
+cd ..
+bash build.sh -c ascend910b
+for installer in output/CANN-custom_ops-*.run; do
+  bash "$installer" --install-path="$CUSTOM_OPP_ROOT"
+done
+
+cd "$BUILD_ROOT/build/ops-transformer"
+bash build.sh --pkg --experimental --soc=ascend910b \
+  --cann_3rd_lib_path="$BUILD_ROOT/build/third-party" \
+  --ops=sparse_attn_sharedkv,sparse_attn_sharedkv_metadata,quant_lightning_indexer,quant_lightning_indexer_metadata,compressor
+for installer in build_out/*.run; do
+  bash "$installer" --install-path="$CUSTOM_OPP_ROOT"
+done
+```
+
+### Install the QSA kernels
+
+Copy the QSA Python package from the pinned #807 revision into the installed
+`sgl_kernel_npu` package:
+
+```bash
+git -C "$BUILD_ROOT/build/sgl-kernel-npu" fetch origin refs/pull/807/head
+export QSA_SOURCE="$BUILD_ROOT/build/sgl-kernel-npu-qsa"
+git -C "$BUILD_ROOT/build/sgl-kernel-npu" worktree add --detach \
+  "$QSA_SOURCE" 36467f5176c3e1d0a36c8ba4be12a277fe0f8815
+
+python3 - <<'PY'
+import importlib.util
+import os
+import shutil
+from pathlib import Path
+
+source = (
+    Path(os.environ["QSA_SOURCE"])
+    / "python/sgl_kernel_npu/sgl_kernel_npu/qwen3_8_flash_next"
+)
+spec = importlib.util.find_spec("sgl_kernel_npu")
+destination = Path(next(iter(spec.submodule_search_locations))) / source.name
+shutil.copytree(source, destination, dirs_exist_ok=True)
+print(f"Installed QSA kernels in {destination}")
+PY
+```
+
+## Prepare the model
+
+Download the ModelSlim checkpoint into a local directory:
+
+```bash
+export MODEL_PATH=/path/to/Qwen3.8-Flash-Next-w8a8-mtp
+hf download Eco-Tech/Qwen3.8-Flash-Next-w8a8-mtp --local-dir "$MODEL_PATH"
+```
+
+Use the same `MODEL_PATH` when starting the server. The checkpoint includes MTP
+weights; the launch command below runs text inference with MTP disabled.
+
+## Start the TP8 server
+
+Activate the serving environment, load both custom operator environments, and
+start the server. The configuration allows eight concurrent requests with a
+33,024-token context window.
+
+```bash
+source /usr/local/Ascend/cann-9.2.0/set_env.sh
+export CUSTOM_OPP_ROOT=/path/to/custom-opp
+source "$CUSTOM_OPP_ROOT/vendors/customize/bin/set_env.bash"
+source "$CUSTOM_OPP_ROOT/vendors/custom_transformer/bin/set_env.bash"
+source /usr/local/Ascend/nnal/atb/set_env.sh
+export MODEL_PATH=/path/to/Qwen3.8-Flash-Next-w8a8-mtp
+export ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export SGLANG_NPU_ALLOW_INTERNAL_FORMAT=0
+export SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK=0
+export SGLANG_MAMBA_SSM_DTYPE=bfloat16
+export SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=0
+export HCCL_DETERMINISTIC=strict
+
+sglang serve \
+  --model-path "$MODEL_PATH" \
+  --served-model-name Qwen3.8-Flash-Next \
+  --quantization modelslim --dtype bfloat16 \
+  --tp-size 8 --ep-size 1 --moe-a2a-backend none \
+  --attention-backend ascend \
+  --json-model-override-args '{"language_model_only":true}' \
+  --context-length 33024 --max-total-tokens 270336 \
+  --page-size 64 --chunked-prefill-size 4096 --max-prefill-tokens 4096 \
+  --max-running-requests 8 --max-mamba-cache-size 64 \
+  --mamba-radix-cache-strategy extra_buffer --mem-fraction-static 0.97 \
+  --cuda-graph-backend-decode full --cuda-graph-backend-prefill disabled \
+  --cuda-graph-bs-decode 1 2 3 4 5 6 7 8 \
+  --host 127.0.0.1 --port 30010 --log-level info
+```
+
+The QSA path is selected by
+`SGLANG_ENABLE_QWEN4_NPU_DENSE_FALLBACK=0`. Keep it set to `0` for this
+context window. `SGLANG_NPU_ALLOW_INTERNAL_FORMAT=0` selects the tensor format
+used in the validated graph configuration. The graph batch sizes cover every
+concurrency from one to eight; prefill runs eagerly in chunks of 4,096 tokens.
+
+## Send a request
+
+In another terminal, check that the server is ready:
+
+```bash
+curl --fail http://127.0.0.1:30010/health
+```
+
+Send a text request through the OpenAI-compatible API:
+
+```bash
+curl --fail http://127.0.0.1:30010/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3.8-Flash-Next",
+    "messages": [{"role": "user", "content": "What is the capital of France?"}],
+    "temperature": 0,
+    "max_tokens": 128,
+    "chat_template_kwargs": {"enable_thinking": false}
+  }'
+```
+
+Read the generated text from `choices[0].message.content`. The server binds to
+`127.0.0.1`, so these requests run on the serving host.
+
+## Validation results
+
+The measurements below come from the deployment reported in
+[PR #43102](https://github.com/sgl-project/sglang/pull/43102).
+They cover text inference at TP8 with the software versions and configuration
+above.
+
+- **32K retrieval and cache reuse:** Eight requests ran concurrently after a
+  cache flush, then ran again in reversed submission order. All 16 responses
+  matched the expected record values. Prompts contained 32,768–32,831 tokens;
+  generation used greedy decoding with a limit of 96 output tokens.
+- **GSM8K:** The first 128 test questions yielded 125/128 correct answers
+  (97.65625%), two output-length-limited responses, and zero transport errors.
+  The run used sgl-eval 0.1.3, dataset revision `3101c7d507`, zero-shot prompting,
+  temperature 0, top_p 1, seed 42, thinking disabled, client concurrency 2,
+  and an output limit of 1,800 tokens. These sequences stayed below the
+  checkpoint's 2,048-token QSA selection budget.
+- **Performance:** Each concurrency setting used 12 warmup requests, a prefix-cache
+  flush, and 48 measured requests with 4,096 input and 128 output tokens.
+  Inputs repeated and truncated tokenized GSM8K question text. Generation used
+  temperature 0 and `ignore_eos=true`; measured prefix-cache reuse was 0%.
+
+| Client concurrency | Output throughput (tokens/s) | Mean TTFT (s) | Mean TPOT (ms) | Mean end-to-end latency (s) |
+|---|---:|---:|---:|---:|
+| 1 | 21.330 | 0.819 | 40.791 | 6.000 |
+| 8 | 75.024 | 4.347 | 73.161 | 13.638 |
+
+Peak sampled device HBM usage was 39,671 MB, including preparation, warmup, and
+measurement. The validated context window is 33,024 tokens. Deployment testing
+for longer contexts, multimodal inputs, MTP, and prefill/decode disaggregation
+remains future work.
