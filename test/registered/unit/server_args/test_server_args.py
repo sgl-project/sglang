@@ -5530,7 +5530,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
-        "enable_cache_report": ["--enable-cache-report"],
         "enable_trace": ["--enable-trace"],
         "warmups": ["--warmups", "voice_chat"],
         "completion_template": ["--completion-template", "deepseek_coder"],
@@ -5622,6 +5621,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "--enable-request-time-stats-logging",
                 "--skip-server-warmup",
                 # Honored by the Rust server.
+                "--enable-cache-report",
                 "--default-chat-template-kwargs",
                 '{"enable_thinking": false}',
                 "--enable-strict-thinking",
