@@ -3691,6 +3691,71 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
 
+    def test_m31_nvfp4_picks_sm100_kernels_on_sm100_only(self):
+        """SM120 is Blackwell but has none of MegaMoE's, TRT-LLM-gen's or FA4
+        FP8's kernels: M3.1 NVFP4 takes the Marlin path there, as on Hopper."""
+        from sglang.srt.arg_groups.kv_cache_hook import (
+            handle_mxfp8_kv_cache_compatibility,
+        )
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+        from sglang.srt.layers.quantization.minimax_m3_nvfp4 import (
+            MiniMaxM3Nvfp4MoE,
+        )
+
+        hf = SimpleNamespace(
+            architectures=["MiniMaxM3SparseForConditionalGeneration"],
+            quantization_config={
+                "quant_method": "mxfp8",
+                "moe_quant_algo": "NVFP4",
+                "moe_quant_format": "nvfp4-pack-quantized",
+            },
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                quantization=None,
+                _quantization_explicitly_unset=False,
+                speculative_algorithm=None,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                page_size=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                kv_cache_dtype="auto",
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        sm120 = dict(is_hip=False, is_blackwell=True, is_sm100=False, is_sm90=False)
+        with override_platform(**sm120):
+            ov = _minimax_m3_overrides(_args(), hf)
+            self.assertEqual(ov["quantization"], "minimax_m3_nvfp4")
+            self.assertEqual(ov["moe_runner_backend"], "marlin")
+            self.assertEqual(ov["page_size"], 128)
+            for field in ("moe_a2a_backend", "kv_cache_dtype", "attention_backend"):
+                self.assertNotIn(field, ov)
+            # a bf16 KV cache is no error off SM100
+            ov = _minimax_m3_overrides(_args(kv_cache_dtype="bf16"), hf)
+            self.assertNotIn("kv_cache_dtype", ov)
+            self.assertTrue(MiniMaxM3Nvfp4MoE().use_marlin)
+            with self.assertRaisesRegex(ValueError, "SM100-family"):
+                handle_mxfp8_kv_cache_compatibility(_args(kv_cache_dtype="mxfp8"))
+        sm90 = dict(is_hip=False, is_blackwell=False, is_sm100=False, is_sm90=True)
+        with override_platform(**sm90):
+            ov = _minimax_m3_overrides(_args(), hf)
+            self.assertEqual(ov["attention_backend"], "fa3")
+            self.assertEqual(ov["moe_runner_backend"], "marlin")
+        sm100 = dict(is_hip=False, is_blackwell=True, is_sm100=True, is_sm90=False)
+        with override_platform(**sm100):
+            ov = _minimax_m3_overrides(_args(), hf)
+            self.assertEqual(ov["moe_a2a_backend"], "megamoe")
+            self.assertEqual(ov["kv_cache_dtype"], "fp8_e4m3")
+            self.assertEqual(ov["attention_backend"], "trtllm_mha")
+            handle_mxfp8_kv_cache_compatibility(_args(kv_cache_dtype="mxfp8"))
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
