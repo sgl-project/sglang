@@ -2246,6 +2246,19 @@ macro_rules! tree_core_methods {
                     .transpose()
             }
 
+            /// Build transfers for a node's state components alone.
+            fn build_external_linker_state_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Vec<Py<PyAny>>> {
+                py.detach(|| self.core().build_external_linker_state_offload_transfers(node_id))
+                    .map_err(node_access_error)?
+                    .into_iter()
+                    .map(|transfer| transfer_to_py(py, transfer))
+                    .collect()
+            }
+
             /// Mark an externally restored path, excluding its existing anchor.
             fn mark_external_cache_stored_path(
                 &self,
@@ -3538,6 +3551,18 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| {
                     self.inner
                         .build_external_linker_offload_transfers(py, node_id)
+                })
+            }
+
+            /// Build transfers for a node's state components alone.
+            fn build_external_linker_state_offload_transfers(
+                &self,
+                py: Python<'_>,
+                node_id: NodeId,
+            ) -> PyResult<Vec<Py<PyAny>>> {
+                catch_native_panic(|| {
+                    self.inner
+                        .build_external_linker_state_offload_transfers(py, node_id)
                 })
             }
 

@@ -1240,6 +1240,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             return None
         return [_transfer_from_binding(transfer) for transfer in transfers]
 
+    def build_external_linker_state_offload_transfers(
+        self, node_id: NodeId
+    ) -> list[PoolTransfer]:
+        return [
+            _transfer_from_binding(transfer)
+            for transfer in self._binding.build_external_linker_state_offload_transfers(
+                node_id
+            )
+        ]
+
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId
     ) -> None:

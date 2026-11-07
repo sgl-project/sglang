@@ -762,6 +762,14 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def build_external_linker_state_offload_transfers(
+        self, node_id: NodeId
+    ) -> list[PoolTransfer]:
+        """Build transfers for the node's state components, which can arrive
+        after its KV was stored or queued."""
+        ...
+
+    @abstractmethod
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId
     ) -> None:

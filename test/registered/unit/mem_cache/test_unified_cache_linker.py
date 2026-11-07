@@ -156,6 +156,9 @@ class _FakeExternalTreeCore:
             return None
         return list(self.offload_transfers)
 
+    def build_external_linker_state_offload_transfers(self, node_id):
+        return []
+
     def mark_external_linker_offload_pending(self, node_id):
         node = self.nodes[node_id]
         assert (
@@ -1426,6 +1429,54 @@ class TestUnifiedCacheLinkerPythonBackend(
             consumer_linker.complete_next_offload(True)
         consumer.check_hicache_events()
         consumer.sanity_check()
+
+    def test_branch_checkpoint_on_stored_node_reaches_the_store(self):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.MAMBA),
+            kv_size=64,
+            max_context_len=64,
+        )
+        stored_keys = defaultdict(set)
+        tokens = list(range(1, 7))
+
+        producer, allocator, req_pool = build_fixture(self.cfg)
+        linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(linker)
+        self._insert(producer, allocator, req_pool, tokens)
+        for _ in linker.offload_calls:
+            linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        offloads_before = len(linker.offload_calls)
+
+        branch = self._insert(producer, allocator, req_pool, tokens[:4])
+        (state_offload,) = linker.offload_calls[offloads_before:]
+        self.assertEqual([t.name for t in state_offload], [PoolName.MAMBA])
+        self.assertTrue(
+            torch.equal(
+                state_offload[0].device_indices,
+                node_device_value(
+                    producer, branch.last_device_node, ComponentType.MAMBA
+                ),
+            )
+        )
+        self.assertTrue(
+            producer.tree_core.is_external_cache_stored(branch.last_device_node)
+        )
+        linker.complete_next_offload(True)
+        producer.check_hicache_events()
+        producer.sanity_check()
+
+        consumer, _, consumer_req_pool = build_fixture(self.cfg)
+        consumer.init_cache_linker(_InMemoryUnifiedCacheLinker(stored_keys))
+        match = consumer.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens[:4] + [50, 51])),
+                req=self._make_req(consumer_req_pool),
+            )
+        )
+        self.assertEqual(match.host_hit_length, 4)
+        self.assertEqual(match.mamba_host_hit_length, 1)
 
     def test_mamba_load_supersedes_a_shorter_device_cow(self):
         tokens = list(range(1, 7))
