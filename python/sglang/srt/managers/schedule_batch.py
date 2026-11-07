@@ -1506,6 +1506,8 @@ class Req(ReqDllmMixin):
         self.swa_branching_seqlen = None
         self.extend_end = None
         self.dllm_initialized = False
+        if self.is_dllm():
+            self.init_diffusion_llm(self.dllm_config)
         self.is_retracted = True
         self.retracted_stain = True
         self.input_token_logprobs = None

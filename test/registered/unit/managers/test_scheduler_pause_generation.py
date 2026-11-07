@@ -19,6 +19,9 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.io_struct import (
     AbortReq,
@@ -301,6 +304,66 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         with patch("sglang.srt.managers.scheduler.time.monotonic", return_value=now):
             scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
         return seen
+
+    def test_retract_requeues_parked_dllm_requests_once_and_rebuilds_context(self):
+        """Retracted dLLM requests must be requeued once with fresh context state."""
+        for separate_context in (False, True):
+            with self.subTest(separate_context=separate_context):
+                scheduler = self._new_scheduler()
+                scheduler.dllm_config = DllmConfig(
+                    algorithm="Gemma4Renoise" if separate_context else "LowConfidence",
+                    algorithm_config={},
+                    block_size=4,
+                    mask_id=-1,
+                    max_running_requests=4,
+                    requires_separate_context_encoding=separate_context,
+                )
+                scheduler.dllm_manager = DllmManager(
+                    scheduler.dllm_config, abort=scheduler._abort_dllm_req
+                )
+                staged, parked = [self._make_req(rid) for rid in ("staged", "parked")]
+                for req in (staged, parked):
+                    req.origin_input_ids = array("q", req.origin_input_ids)
+                    req.init_diffusion_llm(scheduler.dllm_config)
+                    req.output_ids.extend([7, 8])
+                    req.dllm_initialized = True
+                    req.dllm_phase = DllmReqPhase.STAGING_DECODE
+                    req.dllm_algo_state = {"seed": 9}
+                    req.dllm_incomplete_ids = array("q", [9, -1, -1, -1])
+                finished = self._make_req("finished", finished=True)
+                finished.init_diffusion_llm(scheduler.dllm_config)
+                scheduler.dllm_manager.add_waiting_reqs([staged, parked, finished])
+                scheduler.dllm_manager.add_staging_reqs([staged])
+                scheduler.last_batch = self._make_batch(
+                    scheduler, [staged], forward_mode=ForwardMode.EXTEND
+                )
+                requeued = self._spy_requeue(scheduler)
+
+                scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
+                self.assertEqual(
+                    list(scheduler.dllm_manager.waiting_queue),
+                    [staged, parked, finished],
+                )
+                self.assertEqual(scheduler.dllm_manager.staging_queue, [staged])
+                self.assertEqual(requeued, [])
+                scheduler.continue_generation(
+                    ContinueGenerationReqInput(torch_empty_cache=False)
+                )
+                scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+                self.assertEqual([entry["req"] for entry in requeued], [staged, parked])
+                self.assertEqual(list(scheduler.dllm_manager.waiting_queue), [])
+                self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+                for req in (staged, parked):
+                    self.assertEqual(req.retraction_count, 1)
+                    self.assertIsNone(req.dllm_algo_state)
+                    self.assertEqual(list(req.dllm_incomplete_ids), [])
+                    req.init_next_round_input()
+                    self.assertEqual(req.dllm_phase, DllmReqPhase.STAGING_PREFILL)
+                    self.assertEqual(list(req.output_ids), [7, 8])
+                    self.assertEqual(
+                        list(req.full_untruncated_fill_ids[:5]), [1, 2, 3, 7, 8]
+                    )
 
     def test_first_retract_starts_the_pause_after_draining(self):
         scheduler = self._new_scheduler()

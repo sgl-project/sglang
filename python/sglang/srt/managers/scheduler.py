@@ -6143,6 +6143,14 @@ class Scheduler(
         ):
             retract_reqs.append(self.chunked_req)
 
+        if self.dllm_config is not None:
+            # dLLM owns parked requests outside the running batch.
+            for req in self.dllm_manager.waiting_queue:
+                if not req.finished() and req not in retract_reqs:
+                    retract_reqs.append(req)
+            self.dllm_manager.waiting_queue.clear()
+            self.dllm_manager.staging_queue.clear()
+
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
