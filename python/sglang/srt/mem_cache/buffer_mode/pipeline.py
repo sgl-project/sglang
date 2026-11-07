@@ -118,6 +118,8 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     intent); ``aux_xfers`` the staged transfers and riding sidecars; all are
     freed at the storage-write ack (host memory is never a cache tier).
     ``keys_by_pool`` are the keys the write stores, learned at the ack.
+    ``written_pages`` leading pages of each pool's keys were acked as
+    written by an earlier attempt; ``attempts`` tail re-enqueues are spent.
     """
 
     intent: _UnifiedBackupIntent
@@ -126,6 +128,8 @@ class _UnifiedBufferBackupEntry(msgspec.Struct):
     lock_params: DecLockRefParams
     occupied_units: int
     keys_by_pool: dict[PoolName, list[str]]
+    written_pages: int = 0
+    attempts: int = 0
 
 
 class _StagedPrefetch(msgspec.Struct):
@@ -1208,18 +1212,36 @@ class BufferModePipeline:
             )
         return list(merged.values())
 
-    def finish_storage_write_ack(self, operation_id: int) -> None:
-        """Storage ack (rank-synced drain): free the staging and feed each
-        written pool's beliefs unconditionally, keeping admission
-        TP-deterministic under per-rank backend failures."""
+    def finish_storage_write_ack(
+        self,
+        operation_id: int,
+        written_pages: Optional[int] = None,
+        retry_operation_id: Optional[int] = None,
+    ) -> None:
+        """Storage ack (rank-synced drain). ``written_pages`` is the agreed
+        written prefix of the operation's KV chain (None: a write with no KV
+        evidence, every key counts); only those pages feed each carried
+        pool's beliefs, which keeps admission TP-deterministic under per-rank
+        backend failures. With ``retry_operation_id`` the unwritten tail is in
+        flight again under that id, so the staging and the in-flight marks
+        stay; otherwise the staging is freed and the marks dropped, and an
+        un-backed tail reads as absent until a later insert writes it."""
         entry = self.ongoing_backup.pop(operation_id, None)
         if entry is None:
             return
         beliefs = self._cache.storage_existence_cache
+        start = entry.written_pages
+        end = None if written_pages is None else start + written_pages
         for pool, keys in entry.keys_by_pool.items():
             pool_beliefs = beliefs.pool(pool)
-            pool_beliefs.add(keys)
-            pool_beliefs.untrack_inflight(keys)
+            pool_beliefs.add(keys[start:end])
+            if retry_operation_id is None:
+                pool_beliefs.untrack_inflight(keys)
+        if retry_operation_id is not None:
+            self.ongoing_backup[retry_operation_id] = msgspec.structs.replace(
+                entry, written_pages=end, attempts=entry.attempts + 1
+            )
+            return
         self._free_staging_now(entry.host_indices, entry.aux_xfers)
         self.write_staged_tokens_ -= entry.occupied_units
         self._finish_inflight(entry.intent.snapshot.node_id, entry.intent.pool)

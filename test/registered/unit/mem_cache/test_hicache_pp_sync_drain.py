@@ -27,6 +27,7 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
         cache.storage_metrics_collector = None
         cache.buffer_pipeline = None
         cache.linker = None
+        cache._host_capacity_backup_retries = {}
         cache._drain_async_work = MagicMock()
         cache._all_reduce = MagicMock()
         cache.writing_check = MagicMock()
