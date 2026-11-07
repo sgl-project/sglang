@@ -10,6 +10,11 @@ from sglang.srt.utils import is_hip
 _is_hip = is_hip()
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
+# AMD launch config for the fused decode conv kernel: 4 warps is one element per
+# wave64 lane at a 256-wide block.
+_HIP_CONV_BLOCK_SIZE = 256
+_HIP_CONV_NUM_WARPS = 4
+
 # =============================================================================
 # Fused kernel — reads INTERLEAVED input format
 # Used by Qwen3-Next whose checkpoint stores fused in_proj_qkvz weights
@@ -506,6 +511,130 @@ def _fused_qkvzba_causal_conv1d_update_contiguous_kernel(
     tl.store(a + batch_idx * NUM_V_HEADS + dim_idx, a_value, mask=gate_mask)
 
 
+@triton.jit
+def _fused_qkvzba_causal_conv1d_update_contiguous_kernel_amd(
+    mixed_qkv,
+    z,
+    b,
+    a,
+    mixed_qkvz,
+    mixed_ba,
+    conv_state,
+    conv_weight,
+    conv_bias,
+    conv_state_indices,
+    stride_qkvz_batch: tl.constexpr,
+    stride_qkvz_dim: tl.constexpr,
+    stride_ba_batch: tl.constexpr,
+    stride_ba_dim: tl.constexpr,
+    stride_state_batch: tl.constexpr,
+    stride_state_dim: tl.constexpr,
+    stride_state_pos: tl.constexpr,
+    stride_weight_dim: tl.constexpr,
+    stride_weight_width: tl.constexpr,
+    stride_state_indices: tl.constexpr,
+    QKV_DIM: tl.constexpr,
+    V_DIM: tl.constexpr,
+    NUM_V_HEADS: tl.constexpr,
+    NUM_STATE_SLOTS: tl.constexpr,
+    STATE_LEN: tl.constexpr,
+    KERNEL_WIDTH: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    SILU_ACTIVATION: tl.constexpr,
+    PAD_SLOT_ID: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    # Same math and accumulation order as the generic kernel above (bit-exact);
+    # each conv-state tap is loaded once and reused for the shifted write-back.
+    batch_idx = tl.program_id(0)
+    dim_idx = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    qkv_mask = dim_idx < QKV_DIM
+
+    x = tl.load(
+        mixed_qkvz + batch_idx * stride_qkvz_batch + dim_idx * stride_qkvz_dim,
+        mask=qkv_mask,
+        other=0.0,
+    )
+
+    state_slot = tl.load(conv_state_indices + batch_idx * stride_state_indices).to(
+        tl.int64
+    )
+    valid_slot = (
+        (state_slot != PAD_SLOT_ID) & (state_slot >= 0) & (state_slot < NUM_STATE_SLOTS)
+    )
+    state_base = (
+        conv_state + state_slot * stride_state_batch + dim_idx * stride_state_dim
+    )
+    state_mask = qkv_mask & valid_slot
+    weight_base = conv_weight + dim_idx * stride_weight_dim
+
+    acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+    if HAS_BIAS:
+        acc += tl.load(conv_bias + dim_idx, mask=qkv_mask, other=0.0).to(tl.float32)
+
+    s0 = tl.load(state_base, mask=state_mask, other=0.0)
+    w0 = tl.load(weight_base, mask=qkv_mask, other=0.0)
+    acc += s0 * w0
+    if KERNEL_WIDTH >= 3:
+        s1 = tl.load(state_base + stride_state_pos, mask=state_mask, other=0.0)
+        w1 = tl.load(weight_base + stride_weight_width, mask=qkv_mask, other=0.0)
+        acc += s1 * w1
+    if KERNEL_WIDTH >= 4:
+        s2 = tl.load(state_base + 2 * stride_state_pos, mask=state_mask, other=0.0)
+        w2 = tl.load(weight_base + 2 * stride_weight_width, mask=qkv_mask, other=0.0)
+        acc += s2 * w2
+
+    last_weight = tl.load(
+        weight_base + (KERNEL_WIDTH - 1) * stride_weight_width,
+        mask=qkv_mask,
+        other=0.0,
+    )
+    acc += x * last_weight
+    if SILU_ACTIVATION:
+        conv_out = acc / (1.0 + tl.exp(-acc))
+    else:
+        conv_out = acc
+
+    conv_out = tl.where(valid_slot, conv_out, x)
+    tl.store(
+        mixed_qkv + batch_idx * QKV_DIM + dim_idx,
+        conv_out,
+        mask=qkv_mask,
+    )
+
+    if KERNEL_WIDTH >= 3:
+        tl.store(state_base, s1, mask=state_mask)
+    if KERNEL_WIDTH >= 4:
+        tl.store(state_base + stride_state_pos, s2, mask=state_mask)
+    tl.store(state_base + (KERNEL_WIDTH - 2) * stride_state_pos, x, mask=state_mask)
+
+    z_mask = dim_idx < V_DIM
+    z_value = tl.load(
+        mixed_qkvz
+        + batch_idx * stride_qkvz_batch
+        + (QKV_DIM + dim_idx) * stride_qkvz_dim,
+        mask=z_mask,
+        other=0.0,
+    )
+    tl.store(z + batch_idx * V_DIM + dim_idx, z_value, mask=z_mask)
+
+    gate_mask = dim_idx < NUM_V_HEADS
+    b_value = tl.load(
+        mixed_ba + batch_idx * stride_ba_batch + dim_idx * stride_ba_dim,
+        mask=gate_mask,
+        other=0.0,
+    )
+    a_value = tl.load(
+        mixed_ba
+        + batch_idx * stride_ba_batch
+        + (NUM_V_HEADS + dim_idx) * stride_ba_dim,
+        mask=gate_mask,
+        other=0.0,
+    )
+    tl.store(b + batch_idx * NUM_V_HEADS + dim_idx, b_value, mask=gate_mask)
+    tl.store(a + batch_idx * NUM_V_HEADS + dim_idx, a_value, mask=gate_mask)
+
+
 def can_use_fused_qkvzba_causal_conv1d_update_contiguous(
     mixed_qkvz: torch.Tensor,
     mixed_ba: torch.Tensor,
@@ -598,9 +727,17 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
     )
     a = torch.empty_like(b)
 
-    block_size = 256
+    # AMD uses its own kernel and launch config.
+    if _is_hip:
+        block_size = _HIP_CONV_BLOCK_SIZE
+        num_warps = _HIP_CONV_NUM_WARPS
+        kernel = _fused_qkvzba_causal_conv1d_update_contiguous_kernel_amd
+    else:
+        block_size = 256
+        num_warps = 8
+        kernel = _fused_qkvzba_causal_conv1d_update_contiguous_kernel
     grid = (batch, triton.cdiv(qkv_dim, block_size))
-    _fused_qkvzba_causal_conv1d_update_contiguous_kernel[grid](
+    kernel[grid](
         mixed_qkv,
         z,
         b,
@@ -631,7 +768,7 @@ def fused_qkvzba_causal_conv1d_update_contiguous(
         SILU_ACTIVATION=activation in ("silu", "swish"),
         PAD_SLOT_ID=pad_slot_id,
         BLOCK_SIZE=block_size,
-        num_warps=8,
+        num_warps=num_warps,
         num_stages=2,
     )
     return mixed_qkv, z, b, a
