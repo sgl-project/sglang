@@ -2532,8 +2532,8 @@ def init_distributed_environment(
             pg_options=pg_options,
         )
 
-        # Create a global TCPStore for coordination (used by NIXL)
-        if moe_a2a_backend == "nixl":
+        # Create a global TCPStore for NIXL and Mooncake EP peer metadata.
+        if moe_a2a_backend in ("nixl", "mooncake"):
             _create_global_tcp_store(
                 rank,
                 world_size,

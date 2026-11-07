@@ -8,6 +8,7 @@ from typing import NamedTuple, Optional
 import torch
 import torch.distributed as dist
 
+from sglang.srt.distributed.utils import get_global_tcp_store
 from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers.dp_attention import get_is_extend_in_batch
@@ -20,7 +21,7 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import DeepEPMode
-from sglang.srt.runtime_context import get_resources
+from sglang.srt.runtime_context import get_parallel, get_resources
 from sglang.srt.utils import get_int_env_var
 
 logger = logging.getLogger(__name__)
@@ -73,6 +74,10 @@ class EPBuffer:
                 hidden_size=None,
                 num_max_dispatch_tokens_per_rank=None,
                 num_experts=None,
+                num_local_experts=None,
+                connected_ep_size=None,
+                scale_to=None,
+                dispatch_ep_size=None,
             )
             buffers["mooncake_ep_state"] = state
         return state
@@ -81,6 +86,43 @@ class EPBuffer:
     def get_existing_buffer(cls):
         """The already-created buffer (elastic-EP membership refresh)."""
         return cls._state().buffer
+
+    @staticmethod
+    def is_elastic_ep_enabled() -> bool:
+        # Change this to False to use the legacy Buffer implementation for debugging.
+        return True
+
+    @classmethod
+    def on_scale(cls, from_ep_size: int, to_ep_size: int) -> None:
+        """Record the scale target; connections are opened lazily on use."""
+        state = cls._state()
+        state.scale_to = to_ep_size
+        state.dispatch_ep_size = to_ep_size
+        logger.debug(
+            "[Elastic EP][mooncake] scheduling rank connections: "
+            "old_ep_size=%d new_ep_size=%d",
+            from_ep_size,
+            to_ep_size,
+        )
+
+    @classmethod
+    def _connect_new_ranks(cls, state, target_ep_size: int) -> None:
+        if state.buffer is None:
+            return
+        connected_ep_size = state.connected_ep_size or 0
+        if target_ep_size > connected_ep_size:
+            current_store = get_global_tcp_store()
+            if current_store is not None:
+                state.buffer.set_tcp_store_group(current_store)
+            state.buffer.connect_ranks(list(range(connected_ep_size, target_ep_size)))
+            state.connected_ep_size = target_ep_size
+
+    @classmethod
+    def get_dispatch_ep_size(cls) -> int:
+        state = cls._state()
+        if state.dispatch_ep_size is not None:
+            return state.dispatch_ep_size
+        return ElasticEPStateManager.get_data_plane_ep_size()
 
     @classmethod
     def get_ep_buffer(
@@ -91,9 +133,13 @@ class EPBuffer:
         deepep_mode: DeepEPMode,
         num_max_dispatch_tokens_per_rank: int = -1,
         num_experts: int = -1,
+        num_local_experts: int = -1,
     ):
         state = cls._state()
+        elastic_ep = cls.is_elastic_ep_enabled()
         if state.buffer is not None:
+            if elastic_ep and state.scale_to is not None:
+                cls._connect_new_ranks(state, state.scale_to)
             return state.buffer
 
         # Lazy import Buffer to avoid creating CUDA context at module import time
@@ -102,15 +148,65 @@ class EPBuffer:
         state.hidden_size = hidden_size
         state.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
         state.num_experts = num_experts
+        state.num_local_experts = num_local_experts
 
-        num_ep_buffer_bytes = 0
         if deepep_mode.enable_normal():
             raise NotImplementedError(
                 "Normal mode is not supported for Mooncake EP yet."
             )
         if deepep_mode.enable_low_latency():
             assert num_max_dispatch_tokens_per_rank != -1
-            assert num_experts != -1 and num_experts % group.size() == 0
+            assert num_experts != -1
+            if not elastic_ep:
+                assert num_experts % group.size() == 0
+
+        if elastic_ep:
+            if not deepep_mode.enable_low_latency():
+                raise NotImplementedError(
+                    "Elastic Mooncake EP requires low-latency dispatch."
+                )
+            assert num_local_experts > 0
+            rank = dist.get_rank(group)
+            world_size = dist.get_world_size(group)
+            rank_offset = ElasticEPStateManager.get_ep_join_rank_offset()
+            global_rank = rank + rank_offset
+            capacity = get_parallel().max_ep_size or world_size
+            initial_ep_size = rank_offset + world_size
+            if global_rank >= capacity or initial_ep_size > capacity:
+                raise ValueError(
+                    "Elastic Mooncake EP rank range exceeds --max-ep-size."
+                )
+            num_rdma_bytes = Buffer.get_rdma_size_hint(
+                num_max_dispatch_tokens_per_rank,
+                hidden_size,
+                capacity,
+                capacity * num_local_experts,
+            )
+            tcp_store = get_global_tcp_store()
+            if tcp_store is None:
+                raise RuntimeError(
+                    "Mooncake EP requires the global TCPStore initialized during "
+                    "distributed setup."
+                )
+
+            state.buffer = Buffer.create_elastic(
+                rank=global_rank,
+                tcp_store_group=tcp_store,
+            )
+            state.buffer.update_memory_buffers(
+                num_ranks=capacity,
+                num_experts_per_rank=num_local_experts,
+                num_rdma_bytes=num_rdma_bytes,
+            )
+            target_ep_size = max(initial_ep_size, state.scale_to or 0)
+            state.scale_to = target_ep_size
+            state.dispatch_ep_size = target_ep_size
+            state.connected_ep_size = 0
+            cls._connect_new_ranks(state, target_ep_size)
+            return state.buffer
+
+        num_ep_buffer_bytes = 0
+        if deepep_mode.enable_low_latency():
             num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
                 num_max_dispatch_tokens_per_rank,
                 hidden_size,
@@ -143,6 +239,15 @@ class _MooncakeEPDispatcherImpl:
                 "https://github.com/kvcache-ai/Mooncake/blob/main/doc/en/build.md "
                 "with EP support to run SGLang with Mooncake EP."
             )
+        self._elastic_ep = EPBuffer.is_elastic_ep_enabled()
+        self._elastic_state = (
+            ElasticEPStateManager.instance() if self._elastic_ep else None
+        )
+        self._mask_buffer = (
+            torch.empty_like(self._elastic_state.active_ranks)
+            if self._elastic_state is not None
+            else None
+        )
         self.group = group
         self.router_topk = router_topk
         self.permute_fusion = permute_fusion
@@ -174,10 +279,18 @@ class _MooncakeEPDispatcherImpl:
         topk_ids, topk_weights = topk_output.topk_ids, topk_output.topk_weights
         buffer = self._get_buffer()
         topk_ids = topk_ids.to(torch.int64)
-        expected_m = (
-            hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
-            + self.num_experts
-        ) // self.num_experts
+        if self._elastic_ep:
+            rank_bound = EPBuffer.get_dispatch_ep_size()
+            dispatch_num_experts = rank_bound * self.num_local_experts
+            expected_m = (
+                hidden_states.shape[0] * rank_bound * topk_ids.shape[1]
+                + dispatch_num_experts
+            ) // dispatch_num_experts
+        else:
+            expected_m = (
+                hidden_states.shape[0] * buffer.group_size * topk_ids.shape[1]
+                + self.num_experts
+            ) // self.num_experts
         hidden_states, masked_m, event, hook = self._dispatch_core(
             hidden_states,
             topk_ids,
@@ -230,9 +343,22 @@ class _MooncakeEPDispatcherImpl:
         use_fp8: bool = False,
     ):
         buffer = self._get_buffer()
-        active_ranks = self._get_active_ranks()
-        packed_recv_hidden, packed_recv_count, self.handle, event, hook = (
-            buffer.dispatch(
+        if self._elastic_ep:
+            dispatch_num_experts = (
+                EPBuffer.get_dispatch_ep_size() * self.num_local_experts
+            )
+            result = buffer.dispatch(
+                hidden_states,
+                topk_ids,
+                num_max_dispatch_tokens_per_rank=self.num_max_dispatch_tokens_per_rank,
+                num_experts=dispatch_num_experts,
+                use_fp8=use_fp8,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
+        else:
+            active_ranks = self._get_active_ranks()
+            result = buffer.dispatch(
                 hidden_states,
                 topk_ids,
                 active_ranks,
@@ -243,7 +369,7 @@ class _MooncakeEPDispatcherImpl:
                 async_finish=not self.return_recv_hook,
                 return_recv_hook=self.return_recv_hook,
             )
-        )
+        packed_recv_hidden, packed_recv_count, self.handle, event, hook = result
         return packed_recv_hidden, packed_recv_count, event, hook
 
     def combine_a(
@@ -270,17 +396,33 @@ class _MooncakeEPDispatcherImpl:
         topk_weights: torch.Tensor,
     ):
         buffer = self._get_buffer()
-        active_ranks = self._get_active_ranks()
-        combined_hidden_states, event, hook = buffer.combine(
-            hidden_states,
-            topk_ids,
-            topk_weights,
-            active_ranks,
-            -1 if self.first_execution else self.timeout_us,
-            self.handle,
-            async_finish=not self.return_recv_hook,
-            return_recv_hook=self.return_recv_hook,
-        )
+        if self._elastic_ep:
+            combined_hidden_states, event, hook = buffer.combine(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
+            if self._elastic_state is not None:
+                buffer.query_mask_buffer(self._mask_buffer)
+                rank_bound = EPBuffer.get_dispatch_ep_size()
+                self._elastic_state.active_ranks[:rank_bound].copy_(
+                    1 - self._mask_buffer[:rank_bound]
+                )
+        else:
+            active_ranks = self._get_active_ranks()
+            combined_hidden_states, event, hook = buffer.combine(
+                hidden_states,
+                topk_ids,
+                topk_weights,
+                active_ranks,
+                -1 if self.first_execution else self.timeout_us,
+                self.handle,
+                async_finish=not self.return_recv_hook,
+                return_recv_hook=self.return_recv_hook,
+            )
         self.first_execution = False
         self.handle = None
         return combined_hidden_states, event, hook
@@ -299,6 +441,7 @@ class _MooncakeEPDispatcherImpl:
             self.deepep_mode,
             self.num_max_dispatch_tokens_per_rank,
             self.num_experts,
+            self.num_local_experts,
         )
 
 

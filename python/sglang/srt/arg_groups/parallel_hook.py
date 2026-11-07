@@ -755,8 +755,8 @@ def handle_elastic_ep(server_args: Any):
             f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); "
             "physical EP membership must coincide with the launch-time TP span."
         )
-        assert resolved.moe_a2a_backend == "nixl", (
-            "Elastic EP scale-up requires --moe-a2a-backend nixl "
+        assert resolved.moe_a2a_backend in ("nixl", "mooncake"), (
+            "Elastic EP scale-up requires --moe-a2a-backend nixl or mooncake "
             f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
         )
 
