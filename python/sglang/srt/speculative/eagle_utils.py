@@ -62,9 +62,11 @@ if TYPE_CHECKING:
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_xpu = is_xpu()
 _is_cpu = is_cpu()
 _COMPACT_VERIFY_SAMPLING = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.get()
+_COMPACT_VERIFY_SAMPLING_SET = envs.SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING.is_set()
 _PACKED_VERIFY_BCAST = envs.SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST.get()
 
 # The binding defaults probe this explicit capability once instead of relying on
@@ -580,6 +582,47 @@ def _can_use_sparse_uno_tree_target_sampling(
     )
 
 
+def _sparse_rejection_target_probs(
+    next_token_logits: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    rows_per_request: int,
+    max_top_k: int,
+) -> torch.Tensor:
+    """The dense rejection target probs (softmax, then the joint top-p and top-k
+    renorm of _apply_joint_top_k_top_p) built on each row's top-k support, ties
+    kept, without a vocabulary-wide sort."""
+    from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
+
+    rows, vocab_size = next_token_logits.shape
+
+    def per_row(x):
+        return x.repeat_interleave(rows_per_request, dim=0).view(rows, 1)
+
+    # ties with the k-th logit stay in, as in top_k_renorm_prob
+    width = min(vocab_size, max_top_k + 32)
+    logits, token_ids = torch.topk(next_token_logits, width, dim=-1)
+    temperatures = per_row(sampling_info.temperatures)
+    logits = logits.float() / temperatures
+    top_ks = per_row(sampling_info.top_ks).long()
+    pivots = logits.gather(1, (top_ks - 1).clamp_(0, width - 1))
+    logits.masked_fill_(logits < pivots, float("-inf"))
+    probs = torch.softmax(logits, dim=-1)
+    if sampling_info.need_top_p_sampling:
+        # The nucleus is cut on the full distribution, so the top-k mass it must
+        # reach is top_p scaled by the top-k share of the vocabulary's mass.
+        top_ps = _adjust_top_p_for_top_k(
+            logits, next_token_logits, per_row(sampling_info.top_ps), temperatures
+        )
+        ascending = probs.flip(-1)
+        cutoff = torch.searchsorted(ascending.cumsum(-1), 1.0 - top_ps).clamp_(
+            max=width - 1
+        )
+        probs = probs.masked_fill(probs < ascending.gather(1, cutoff), 0.0)
+        probs.div_(probs.sum(-1, keepdim=True))
+    target_probs = torch.zeros_like(next_token_logits, dtype=torch.float32)
+    return target_probs.scatter_(1, token_ids, probs)
+
+
 def _apply_joint_top_k_top_p(
     probs: torch.Tensor,
     sampling_info: SamplingBatchInfo,
@@ -604,10 +647,15 @@ def _apply_joint_top_k_top_p(
 
 
 def compact_verify_max_top_k(batch: ScheduleBatch) -> Optional[int]:
-    """The support for eagle_sample's compact top-k branch under
-    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING, or None for the dense branch: every
-    request must sample with a finite top-k within the compact limit."""
-    if not _COMPACT_VERIFY_SAMPLING or batch.forward_mode.is_idle():
+    """The top-k support for eagle_sample's top-k branches, or None for dense. On when
+    SGLANG_OPT_SPEC_COMPACT_VERIFY_SAMPLING is set, or unset with rejection sampling
+    on the AITER path. Every request needs a finite top-k within the compact limit."""
+    enabled = _COMPACT_VERIFY_SAMPLING or (
+        _use_aiter
+        and not _COMPACT_VERIFY_SAMPLING_SET
+        and get_spec().speculative_use_rejection_sampling
+    )
+    if not enabled or batch.forward_mode.is_idle():
         return None
     from sglang.srt.speculative.uno_utils import _SPARSE_TOP_K_LIMIT
 
@@ -1064,19 +1112,27 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        target_probs = sampling_softmax(
-            next_token_logits,
-            temperatures=sampling_info.temperatures,
-            rows_per_request=verify_input.draft_token_num,
-        )  # (bs * num_draft_tokens, vocab_size)
-        maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
-        target_probs = _apply_joint_top_k_top_p(
-            target_probs,
-            sampling_info,
-            verify_input.draft_token_num,
-            top_k_renorm_prob,
-            top_p_renorm_prob,
-        )
+        if use_rejection_sampling and uno_target_max_top_k is not None:
+            target_probs = _sparse_rejection_target_probs(
+                next_token_logits,
+                sampling_info,
+                verify_input.draft_token_num,
+                uno_target_max_top_k,
+            )  # (bs * num_draft_tokens, vocab_size)
+        else:
+            target_probs = sampling_softmax(
+                next_token_logits,
+                temperatures=sampling_info.temperatures,
+                rows_per_request=verify_input.draft_token_num,
+            )  # (bs * num_draft_tokens, vocab_size)
+            maybe_detect_nan(target_probs, "v2 verify: target_probs after softmax")
+            target_probs = _apply_joint_top_k_top_p(
+                target_probs,
+                sampling_info,
+                verify_input.draft_token_num,
+                top_k_renorm_prob,
+                top_p_renorm_prob,
+            )
         target_probs = target_probs.reshape(bs, verify_input.draft_token_num, -1)
         draft_probs = (
             verify_input.draft_probs
