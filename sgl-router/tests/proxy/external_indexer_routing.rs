@@ -85,6 +85,7 @@ async fn external_indexer_routes_to_the_cached_worker() {
             }],
             worker_address: cached.url.clone(),
             cache_spec: None,
+            ..Default::default()
         })
         .await
         .unwrap();
