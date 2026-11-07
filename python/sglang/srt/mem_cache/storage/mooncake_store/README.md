@@ -46,6 +46,15 @@ Full/SWA/Mamba within existing linker layout limits and requires PP=1.
 All attention TP ranks read into private GPU slots; only complete KV confirmed
 successful by every rank joins the radix tree. Failed reads fall back to recomputation.
 
+Ordinary unquantized MHA/GQA pools support complete NHD K/V buffers in FP16,
+BF16 or FP32. This path requires PP=CP=DCP=1 and rejects draft KV, Mamba state,
+scale/workspace buffers, virtual indices, unified memory, post-capture backing,
+specialized MHA pool subclasses and other physical layouts. It adds no head
+relayout for asymmetric TP; use matching TP and separate `extra_backend_tag`
+namespaces for different model, topology, dtype or layout settings. Direct
+linker traffic still uses the Mooncake store rather than another worker's
+retained HBM.
+
 Set `prefetch_policy` in the same JSON:
 
 - `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.

@@ -378,8 +378,15 @@ def _build_kv_device_pool_group(
     kvcache: Any,
     page_size: int,
     mtp_draft_device_pools: tuple[Any, ...] = (),
+    *,
+    params: Any = None,
 ) -> DevicePoolGroup:
-    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MHATokenToKVPool
+
+    if type(kvcache) is MHATokenToKVPool:
+        return _build_mha_device_pool_group(
+            kvcache, page_size, params, mtp_draft_device_pools
+        )
 
     if not isinstance(kvcache, DSATokenToKVPool):
         raise ValueError(
@@ -387,6 +394,82 @@ def _build_kv_device_pool_group(
             f"pools, got {type(kvcache).__name__}."
         )
     return _build_dsa_device_pool_group(kvcache, page_size, mtp_draft_device_pools)
+
+
+def _build_mha_device_pool_group(
+    pool: Any,
+    page_size: int,
+    params: Any,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
+    """View ordinary unquantized NHD MHA without dropping auxiliary state."""
+    if (
+        params is None
+        or params.pp_size != 1
+        or params.attn_cp_size != 1
+        or get_parallel().attn_dcp_size != 1
+        or mtp_draft_device_pools
+        or params.mtp_draft_device_pools
+        or params.mtp_draft_mamba_pools
+        or params.sidecar_draft_device_pools
+        or params.is_eagle
+        or params.token_to_kv_pool_allocator.state is not None
+        or params.token_to_kv_pool_allocator.hands_out_virtual_ids
+        or get_memory().enable_unified_memory
+    ):
+        raise ValueError(
+            "The MHA direct external linker requires PP=CP=DCP=1, without "
+            "draft KV, Mamba state, virtual indices or unified memory."
+        )
+    if (
+        page_size <= 0
+        or pool.page_size != page_size
+        or pool.kv_cache_layout != "nhd"
+        or pool.post_capture_active
+        or pool.is_quantized_kv_cache
+        or any(
+            getattr(pool, name) is not None
+            for name in (
+                "k_scale_buffer",
+                "v_scale_buffer",
+                "native_k_scale_buffer",
+                "native_v_scale_buffer",
+                "dq_k_buffer",
+                "dq_v_buffer",
+            )
+        )
+    ):
+        raise ValueError(
+            "The MHA direct external linker requires matching pages and "
+            "unquantized NHD buffers with stable backing and no scale state."
+        )
+    if (
+        pool.start_layer != 0
+        or pool.layer_num <= 0
+        or len(pool.k_buffer) != pool.layer_num
+        or len(pool.v_buffer) != pool.layer_num
+        or pool.dtype not in (torch.float16, torch.bfloat16, torch.float32)
+        or pool.store_dtype != pool.dtype
+        or min(pool.head_num, pool.head_dim, pool.v_head_dim) <= 0
+        or any(
+            tuple(buffer.shape) != (pool.size + page_size, pool.head_num, head_dim)
+            or not buffer.is_contiguous()
+            or buffer.dtype != pool.dtype
+            for buffers, head_dim in (
+                (pool.k_buffer, pool.head_dim),
+                (pool.v_buffer, pool.v_head_dim),
+            )
+            for buffer in buffers
+        )
+    ):
+        raise ValueError("The MHA direct external linker requires complete NHD layers.")
+    entry = _mha_device_pool_entry(
+        PoolName.KV,
+        pool,
+        {layer: layer for layer in range(pool.layer_num)},
+        page_size,
+    )
+    return DevicePoolGroup([entry], pool.layer_num, page_size)
 
 
 def _build_dsa_device_pool_group(

@@ -2376,7 +2376,7 @@ class _KvStrategy(StackStrategy):
         )
 
         return _build_kv_device_pool_group(
-            kvcache, page_size, params.mtp_draft_device_pools
+            kvcache, page_size, params.mtp_draft_device_pools, params=params
         )
 
     def build(
