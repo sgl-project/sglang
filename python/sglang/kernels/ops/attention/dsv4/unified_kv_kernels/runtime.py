@@ -695,11 +695,14 @@ def _prefill_lengths_kernel(
     positions_ptr,  # [T] int
     chunk_start_ptr,  # [T] int
     page_idx_ptr,  # [T, Wc] int (front-packed, -1 padded)
+    topk_len_ptr,  # [T] int, compressed slot count when the tail is filled later
     prefix_len_ptr,  # [T] int32 out
     extend_len_ptr,  # [T] int32 out
+    prefix_swa_len_ptr,  # [T] int32 out, written with HAS_TOPK_LEN
     win: tl.constexpr,
     Wc: tl.constexpr,
     HAS_COMPRESS: tl.constexpr,
+    HAS_TOPK_LEN: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     """Per token: write extend/prefix segment lengths"""
@@ -711,7 +714,11 @@ def _prefill_lengths_kernel(
     extend_count = tl.minimum(tpic + 1, win)
     prefix_swa_count = tl.minimum(tl.maximum(cstart - swa_low, 0), win)
     tl.store(extend_len_ptr + t, extend_count)
-    if HAS_COMPRESS:
+    if HAS_TOPK_LEN:
+        nc = tl.load(topk_len_ptr + t).to(tl.int32)
+        tl.store(prefix_swa_len_ptr + t, prefix_swa_count)
+        tl.store(prefix_len_ptr + t, prefix_swa_count + nc)
+    elif HAS_COMPRESS:
         nc = 0
         for off in tl.range(0, Wc, BLOCK):
             j = off + tl.arange(0, BLOCK)
@@ -796,42 +803,64 @@ def build_prefill_indices(
     ring_stride: int,  # SWA ring per-slot stride / modulo (win_with_spec)
     swa_pages: int,
     c128_page_indices: Optional[torch.Tensor],
-    c4_sparse_page_indices: Optional[torch.Tensor],
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr)."""
+    c4_sparse_page_indices: Optional[torch.Tensor] = None,
+    c4_topk_lengths: Optional[torch.Tensor] = None,  # [T] int32 top-k slots per token
+    c4_topk_width: int = 0,
+) -> Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]
+]:
+    """Build ragged prefill indices: prefix (SWA ring + swa_pages + compressed) into unified_kv + extend into current-chunk kv; returns (prefix_indices, prefix_indptr, extend_indices, extend_indptr, prefix_swa_len).
+
+    Ratio 4 with c4_topk_lengths sizes each prefix segment by it and leaves its
+    compressed tail unwritten: the top-k slots differ per layer and go in at
+    prefix_swa_len with fill_compress_tail. Otherwise prefix_swa_len is None."""
     device = state_slot.device
     T = state_slot.shape[0]
     assert positions.is_contiguous() and chunk_start.is_contiguous()
     assert cu_q.is_contiguous() and state_slot.is_contiguous()
 
+    page_idx = None
+    topk_len = None
     if compress_ratio == 0:
-        page_idx = None
+        Wc = 0
     elif compress_ratio == 128:
         assert c128_page_indices is not None
         page_idx = c128_page_indices[:T]
+        assert page_idx.is_contiguous()
+        Wc = page_idx.shape[1]
+    elif compress_ratio == 4 and c4_topk_lengths is not None:
+        assert c4_topk_width > 0
+        topk_len = c4_topk_lengths[:T]
+        assert topk_len.is_contiguous()
+        Wc = c4_topk_width
     elif compress_ratio == 4:
         assert c4_sparse_page_indices is not None
         page_idx = c4_sparse_page_indices[:T]
+        assert page_idx.is_contiguous()
+        Wc = page_idx.shape[1]
     else:
         raise ValueError(f"bad compress_ratio {compress_ratio}")
 
     has_compress = page_idx is not None
-    if has_compress:
-        assert page_idx.is_contiguous()
-    Wc = page_idx.shape[1] if has_compress else 0
-
+    has_topk_len = topk_len is not None
     block = min(1024, triton.next_power_of_2(max(win, Wc, 1)))
     prefix_len = torch.empty(T, dtype=torch.int32, device=device)
     extend_len = torch.empty(T, dtype=torch.int32, device=device)
+    prefix_swa_len = (
+        torch.empty(T, dtype=torch.int32, device=device) if has_topk_len else None
+    )
     _prefill_lengths_kernel[(T,)](
         positions,
         chunk_start,
-        page_idx if has_compress else positions,  # dummy ptr when no compress
+        page_idx if has_compress else positions,  # dummy ptrs when unused
+        topk_len if has_topk_len else positions,
         prefix_len,
         extend_len,
+        prefix_swa_len if has_topk_len else prefix_len,
         win=win,
         Wc=Wc if has_compress else 1,
         HAS_COMPRESS=has_compress,
+        HAS_TOPK_LEN=has_topk_len,
         BLOCK=block,
         num_warps=4,
     )
@@ -859,7 +888,13 @@ def build_prefill_indices(
         BLOCK=block,
         num_warps=4,
     )
-    return kv_indices_prefix, kv_indptr_prefix, kv_indices_extend, kv_indptr_extend
+    return (
+        kv_indices_prefix,
+        kv_indptr_prefix,
+        kv_indices_extend,
+        kv_indptr_extend,
+        prefix_swa_len,
+    )
 
 
 def prefill_fp8_2buff(
