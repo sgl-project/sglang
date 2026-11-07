@@ -1028,7 +1028,7 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        # The view of t[token_indices]; rows past the extend are padding.
+        # Same rows as t[token_indices]; t may carry MLP-sync padding past the extend.
         return t[contiguous_start : contiguous_start + token_indices.shape[0]]
     return t[token_indices]
 
@@ -1143,8 +1143,8 @@ class DSV4Metadata:
     # Captured with the late layers on a tail block (decoder SWA bounded replay
     # inside the prefill CUDA graph); replay rebuilds the tail metadata iff set.
     prefill_graph_tail: bool = False
-    # Set when MLP sync padded this eager extend to a multiple of attention TP:
-    # the metadata covers only the leading real rows, as attention computes them.
+    # Set when MLP sync padded this eager extend to a multiple of attention TP;
+    # the metadata then covers only the leading real rows.
     real_num_tokens: Optional[int] = None
 
     @property
@@ -2954,8 +2954,7 @@ class DeepseekV4AttnBackend(
             self.online_c128_mtp.clear()
             return
 
-        # MLP sync pads an extend to a multiple of attention TP; its metadata covers
-        # only the real rows. Prefill CP lays out its own padding.
+        # Prefill CP lays out its own padding (cp_metadata).
         real_num_tokens = (
             padded_extend_real_tokens(forward_batch.positions.shape[0], forward_batch)
             if _get_logical_forward_mode(forward_batch).is_prefill()
@@ -3066,7 +3065,8 @@ class DeepseekV4AttnBackend(
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
         if metadata.real_num_tokens is not None:
-            # Attention queries only the rows the metadata covers.
+            # The runner passes the padded row count; attention queries only the
+            # rows the metadata covers.
             num_qo_tokens = metadata.real_num_tokens
         if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
