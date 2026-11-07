@@ -25,6 +25,7 @@ from .scoring import (
     prefill_requests,
     score_tiles,
     select_decode,
+    select_prefill_chunk,
     topk_ragged,
     write_decode,
     write_prefill,
@@ -203,7 +204,7 @@ class DenseBlocksBackend:
                         ),
                     )
                 )
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                idx = select_prefill_chunk(chunk, request.k)
                 write_prefill(inputs, request, chunk, idx)
         width = max((ids.shape[1] for _, ids in picked), default=0)
         blocks = torch.full(

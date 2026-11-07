@@ -23,6 +23,7 @@ from .scoring import (
     get_deep_gemm_prefill_data,
     prefill_requests,
     select_decode,
+    select_prefill_chunk,
     sharded_dense_prefill_topk,
     write_prefill,
 )
@@ -86,7 +87,7 @@ class FullTopKIndexer:
         )
         for request, chunks in requests:
             for chunk in chunks:
-                idx = chunk.scores.topk(request.k, dim=-1, sorted=False).indices
+                idx = select_prefill_chunk(chunk, request.k)
                 write_prefill(inputs, request, chunk, idx)
 
     def _deep_gemm_decode(self, inputs: DecodeInputs) -> None:

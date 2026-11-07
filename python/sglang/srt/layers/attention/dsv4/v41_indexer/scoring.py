@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -395,6 +396,7 @@ class ChunkScores(msgspec.Struct, frozen=True):
     # invalid positions or candidate columns are -inf.
     scores: torch.Tensor
     candidate_only: bool = False
+    use_ragged_topk: bool = False
 
 
 class DecodeScores(msgspec.Struct, frozen=True):
@@ -413,6 +415,20 @@ def prefill_requests(
     candidate_block_size: int = CANDIDATE_BLOCK_SIZE,
 ) -> Iterator[tuple[RequestScores, Iterator[ChunkScores]]]:
     """Requests with nothing visible yet are skipped."""
+    if (
+        envs.SGLANG_OPT_DSV41_SM90_DEEPGEMM_PREFILL.get()
+        and inputs.x.is_cuda
+        and get_platform().is_sm90
+        and inputs.x.dtype == torch.bfloat16
+        and inputs.indexer.index_head_dim == 128
+        and inputs.indexer.n_local_heads in (32, 64)
+        and inputs.rows_per_request is not None
+        and inputs.seq_lens_cpu is not None
+    ):
+        from .sm90_prefill import prefill_requests_fp8
+
+        yield from prefill_requests_fp8(inputs, token_to_kv_pool)
+        return
     pool = token_to_kv_pool
     ratio = inputs.compress_ratio
     indexer = inputs.indexer
@@ -513,6 +529,18 @@ def _score_chunks(
         yield ChunkScores(
             rows=rows, tok=tok_c, lens=lens_c, scores=s, candidate_only=candidate_only
         )
+
+
+def select_prefill_chunk(chunk: ChunkScores, k: int) -> torch.Tensor:
+    if not chunk.use_ragged_topk:
+        return chunk.scores.topk(k, dim=-1, sorted=False).indices
+    selected = torch.empty(
+        (chunk.scores.shape[0], k), dtype=torch.int32, device=chunk.scores.device
+    )
+    topk_ragged(
+        chunk.scores, chunk.lens, out=selected, offsets=torch.zeros_like(chunk.lens)
+    )
+    return selected.masked_fill_(selected < 0, chunk.scores.shape[1])
 
 
 def write_prefill(
