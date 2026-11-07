@@ -40,6 +40,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
             qk_rope_head_dim=8,
             index_head_dim=32,
         )
+        configurator.server_args = SimpleNamespace(indexer_kv_cache_dtype="int8")
         pool = object()
 
         with (
@@ -84,6 +85,57 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         self.assertEqual(pool_class.call_args.args, (64,))
         self.assertEqual(pool_class.call_args.kwargs["index_size"], 128)
         self.assertEqual(pool_class.call_args.kwargs["indexer_layer_ids"], (10, 12))
+        self.assertEqual(
+            pool_class.call_args.kwargs["indexer_quant_mode"], QUANT_MODE_TOKEN_INT8
+        )
+
+
+class TestNPUIndexerMemorySizing(CustomTestCase):
+    def test_npu_indexer_cell_size_matches_storage(self):
+        from sglang.srt.model_executor import pool_configurator as pc
+
+        configurator = pc.DefaultPoolConfigurator.__new__(pc.DefaultPoolConfigurator)
+        cases = [
+            (None, torch.bfloat16, 256),
+            ("int8", torch.bfloat16, 130),
+            (None, torch.float8_e4m3fn, 132),
+        ]
+        for indexer_dtype, kv_dtype, expected in cases:
+            with self.subTest(indexer_dtype=indexer_dtype, kv_dtype=kv_dtype):
+                kvc = SimpleNamespace(
+                    model_config=SimpleNamespace(
+                        hf_config=SimpleNamespace(
+                            architectures=["DeepseekV32ForCausalLM"],
+                            index_topk=2048,
+                            index_head_dim=128,
+                        )
+                    ),
+                    kv_cache_dtype=kv_dtype,
+                    server_args=SimpleNamespace(
+                        indexer_kv_cache_dtype=indexer_dtype,
+                        enable_hisparse=True,
+                    ),
+                    is_draft_worker=False,
+                )
+                with (
+                    patch.object(pc, "_is_npu", True),
+                    patch.object(
+                        pc,
+                        "get_exec",
+                        return_value=SimpleNamespace(
+                            kernel=SimpleNamespace(enable_fp4_indexer=False)
+                        ),
+                    ),
+                    patch.object(
+                        pc,
+                        "get_memory",
+                        return_value=SimpleNamespace(enable_hisparse=False),
+                    ),
+                ):
+                    actual = configurator._compute_dsa_indexer_cell_size(
+                        kvc=kvc, num_layers=1
+                    )
+                self.assertEqual(actual, expected)
 
 
 class TestNPUIndexerInt8Cache(CustomTestCase):

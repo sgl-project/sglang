@@ -643,11 +643,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.mem_cache.kv_cache_dtype import (
+                QUANT_MODE_TOKEN_INT8,
+                resolve_indexer_quant_mode,
+            )
+
             dtype = kvc.kv_cache_dtype
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_size_per_token = index_head_dim
-                element_size = torch._utils._element_size(dtype)
+                indexer_quant_mode = resolve_indexer_quant_mode(
+                    kvc.server_args.indexer_kv_cache_dtype, dtype
+                )
+                if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                    indexer_size_per_token = (
+                        index_head_dim + torch._utils._element_size(torch.float16)
+                    )
+                    element_size = 1
+                else:
+                    indexer_size_per_token = index_head_dim
+                    element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

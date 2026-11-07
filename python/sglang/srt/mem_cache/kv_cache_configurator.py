@@ -2183,6 +2183,9 @@ class KVCacheConfigurator:
                 else None
             ),
             is_draft_worker=self.is_draft_worker,
+            indexer_quant_mode=resolve_indexer_quant_mode(
+                self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
+            ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
