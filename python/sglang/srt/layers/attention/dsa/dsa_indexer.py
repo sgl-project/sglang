@@ -21,6 +21,7 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa import sm120_fused_indexer
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
     dcp_split_rows,
@@ -30,7 +31,10 @@ from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_global_topk,
     dcp_select_all_slots,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
+    BaseIndexerMetadata,
+    DSAIndexerMetadata,
+)
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
 from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     GRAPH_WEIGHTS_PROJ_LORA_ERROR,
@@ -38,6 +42,7 @@ from sglang.srt.layers.attention.dsa.dsa_prefill_cuda_graph import (
     bcg_dsa_indexer_prefill_split,
     pcg_dsa_indexer_prefill_split,
 )
+from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
 )
@@ -574,6 +579,18 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     max_cols=max_ctx,
                     fp8_dtype=fp8_dtype,
                 )
+
+        self.use_sm120_fused_indexer = (
+            not self.use_gfx950_fused_indexer
+            and sm120_fused_indexer.model_shape_supported(
+                n_heads=self.n_heads,
+                head_dim=self.head_dim,
+                index_topk=self.index_topk,
+                num_init_tokens=self.num_init_tokens,
+                num_local_tokens=self.num_local_tokens,
+            )
+            and sm120_fused_indexer.runtime_ok()
+        )
 
         # After the gfx950 fused indexer's gate, which may turn the writer off.
         global _FUSED_FP8_WRITER_LOGGED
@@ -1352,6 +1369,58 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             logits.scatter_(dim=1, index=local_idxs, value=float("inf"))
         return logits
 
+    def _sm120_fused_paged_ok(
+        self,
+        forward_batch: ForwardBatch,
+        metadata: BaseIndexerMetadata,
+        block_tables: torch.Tensor,
+        batch_size: int,
+        num_rows: int,
+    ) -> bool:
+        # One query row per request; spec verify and draft extend keep DeepGEMM.
+        return (
+            self.use_sm120_fused_indexer
+            and not dsa_shards_index_k()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and num_rows == batch_size == block_tables.shape[0]
+        )
+
+    def _sm120_fused_ragged_ok(
+        self, forward_batch: ForwardBatch, metadata: BaseIndexerMetadata
+    ) -> bool:
+        # RAGGED output, context parallelism and KV-shard scratch tables keep
+        # DeepGEMM.
+        return (
+            self.use_sm120_fused_indexer
+            and not self.dsa_enable_prefill_cp
+            and not dsa_shards_index_k()
+            and forward_batch.attn_cp_metadata is None
+            and isinstance(metadata, DSAIndexerMetadata)
+            and metadata.topk_transform_method == TopkTransformMethod.PAGED
+            and metadata.attn_metadata.indexer_logical_page_table is None
+        )
+
+    def _sm120_fused_to_topk_transform_output_(
+        self,
+        positions: torch.Tensor,
+        metadata: DSAIndexerMetadata,
+        page_table: torch.Tensor,
+        table_rows: Optional[torch.Tensor],
+    ) -> None:
+        """Rewrites ``positions`` in place to what ``metadata.topk_transform``
+        returns: physical KV slots when the transform is fused, else unchanged."""
+        if not envs.SGLANG_DSA_FUSE_TOPK.get() or metadata.force_unfused_topk:
+            return
+        sm120_fused_indexer.to_kv_slots(
+            positions,
+            page_table,
+            get_token_to_kv_pool().index_page_size,
+            table_rows,
+            out=positions,
+        )
+
     def _get_topk_paged(
         self,
         forward_batch: ForwardBatch,
@@ -1458,6 +1527,24 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 seqlens_32_2d = seqlens_32.reshape(-1).contiguous().view(-1, 1)
         else:
             seqlens_32_2d = seqlens_32.contiguous().view(-1, 1)
+        if self._sm120_fused_paged_ok(
+            forward_batch, metadata, block_tables, B, q_offset
+        ):
+            positions = sm120_fused_indexer.topk_paged(
+                q_fp8=q_fp8,
+                weights=weights.squeeze(2),
+                # [pages, page_size, 1, 132]: page_size FP8 keys, then their fp32 scales.
+                kv_cache=kv_cache_fp8.view(kv_cache_fp8.shape[0], page_size, 1, 132),
+                context_lens=seqlens_32,
+                block_table=block_tables,
+                topk=self.index_topk,
+                num_rows=q_offset,
+            )
+            self._sm120_fused_to_topk_transform_output_(
+                positions, metadata, block_tables, None
+            )
+            return positions
+
         if _is_cuda:
             if schedule_metadata is None:
                 schedule_metadata = resolve_paged_mqa_logits_metadata_fn()(
@@ -1723,6 +1810,28 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         seq_lens_expanded = metadata.get_seqlens_expanded()
         token_to_batch_idx = metadata.get_token_to_batch_idx()
         q_offset = ks.shape[0]
+
+        if self._sm120_fused_ragged_ok(forward_batch, metadata):
+            indexer_seq_lens = metadata.get_indexer_seq_len()
+            cu_seqlens_k = torch.nn.functional.pad(
+                torch.cumsum(indexer_seq_lens, 0, dtype=torch.int32), (1, 0)
+            )
+            sm120_fused_indexer.topk_ragged(
+                q_fp8=q_fp8[:q_offset],
+                weights=weights[:q_offset],
+                k_fp8=k_fp8,
+                k_scale=k_scale,
+                cu_seqlens_q=metadata.attn_metadata.cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                max_seqlen_k=max_seq_len,
+                topk=self.index_topk,
+                out=topk_result,
+            )
+            # Prefill graph split ops read topk_result, not the return value.
+            self._sm120_fused_to_topk_transform_output_(
+                topk_result[:q_offset], metadata, block_tables, token_to_batch_idx
+            )
+            return topk_result
         k_offset = k_fp8.shape[0]
         # Every DCP rank holds the whole index K: score 1/W of the rows each, then
         # all-gather the top-k.
