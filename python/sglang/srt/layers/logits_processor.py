@@ -1387,7 +1387,7 @@ class LogitsProcessor(nn.Module):
             ):
                 out = None
             use_mm_out_dtype = (
-                hidden_states.is_cuda
+                (hidden_states.is_cuda or hidden_states.is_xpu)
                 and hidden_states.dtype == lm_head.weight.dtype
                 and hidden_states.dtype in (torch.float16, torch.bfloat16)
             )
