@@ -441,6 +441,9 @@ class ServerArgs(DisaggServerArgsMixin):
     quantization: str | None = None
     # Layer name patterns to skip during online quantization
     quantization_ignored_layers: list[str] | None = None
+    # Ordered "<layer-pattern>=<format>" rules routing named layers to a format
+    # other than --quantization. See runtime/layers/quantization/mixed_precision.
+    quantization_overrides: list[str] | None = None
 
     # can restrict layers to adapt, e.g. ["q_proj"]
     # Will adapt only q, k, v, o by default.
@@ -2221,6 +2224,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"{', '.join(sorted(missing_quantization))}"
             )
         self.component_quantization_ignored_layers = normalized_ignored_layers
+        self._normalize_quantization_overrides()
 
         # Convert string disagg_role to enum (from CLI/config)
         if isinstance(self.disagg_role, str):
@@ -3047,6 +3051,25 @@ class ServerArgs(DisaggServerArgsMixin):
                 "Example: --quantization-ignored-layers img_mod txt_mod to_out"
             ),
         )
+        parser.add_argument(
+            "--quantization-overrides",
+            type=str,
+            nargs="+",
+            default=ServerArgs.quantization_overrides,
+            help=(
+                "Run named layers in a different online format than "
+                "--quantization selects, as '<layer-pattern>=<format>' entries. "
+                "A pattern without a glob character matches on dotted path "
+                "boundaries, like --quantization-ignored-layers; one holding "
+                "'*', '?' or '[' is matched as a glob against the whole layer "
+                "prefix. Entries are tried in order and the first match wins, "
+                "so a specific rule placed before a broader one overrides it. "
+                "Both sides must be online formats "
+                "(fp8/mxfp4/convrot_int8), since a pre-quantized checkpoint "
+                "fixes each tensor's format on disk. "
+                "Example: --quantization-overrides blocks.0=fp8 '*.ffn.fc_out=fp8'"
+            ),
+        )
 
         # Nunchaku SVDQuant quantization parameters
         NunchakuSVDQuantArgs.add_cli_args(parser)
@@ -3603,6 +3626,32 @@ class ServerArgs(DisaggServerArgsMixin):
             alias_suffix=None,
             expand_values=False,
         )
+
+    def _normalize_quantization_overrides(self) -> None:
+        from sglang.multimodal_gen.runtime.layers.quantization import (
+            ONLINE_QUANTIZATION_METHODS,
+        )
+
+        if not self.quantization_overrides:
+            self.quantization_overrides = None
+            return
+        entries = [entry.strip() for entry in self.quantization_overrides]
+        if not all(entries):
+            raise ValueError("--quantization-overrides entries cannot be empty")
+        if self.quantization is None:
+            raise ValueError(
+                "--quantization-overrides routes layers away from the format "
+                "--quantization selects, so --quantization must name an online "
+                "format: " + ", ".join(sorted(ONLINE_QUANTIZATION_METHODS))
+            )
+        if self.quantization not in ONLINE_QUANTIZATION_METHODS:
+            raise ValueError(
+                f"--quantization {self.quantization} reads a format fixed in the "
+                "checkpoint, so its layers cannot be routed by "
+                "--quantization-overrides; online formats are "
+                + ", ".join(sorted(ONLINE_QUANTIZATION_METHODS))
+            )
+        self.quantization_overrides = entries
 
     @staticmethod
     def _extract_component_quantization_ignored_layers(
