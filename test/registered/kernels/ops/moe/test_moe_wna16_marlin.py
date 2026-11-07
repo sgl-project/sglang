@@ -21,6 +21,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.srt.utils.device import is_sm80_supported, is_sm90_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_marlin_utils import (
@@ -30,6 +31,8 @@ from sglang.test.test_marlin_utils import (
 )
 
 register_cuda_ci(est_time=720, stage="extra-a", runner_config="1-gpu-large")
+
+set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
 
 
 def stack_and_dev(tensors: list[torch.Tensor]):

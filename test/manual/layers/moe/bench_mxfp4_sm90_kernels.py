@@ -57,6 +57,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
 )
 from sglang.srt.layers.quantization.marlin_utils_fp4 import mxfp4_marlin_process_scales
+from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 
 GROUP_SIZE = 32
 
@@ -427,6 +428,8 @@ def main():
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required.")
+    # fused_marlin_moe reads the published config (deterministic inference).
+    set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
     cap = torch.cuda.get_device_capability()
     if cap[0] != 9:
         print(f"WARNING: device cap {cap} is not SM90; SM90-specific kernel may fail.")
