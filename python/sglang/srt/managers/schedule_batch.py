@@ -1873,7 +1873,12 @@ def compute_extend_logprob_start_len(
     prefix_len: int,
     extend_len: int,
     full_untruncated_fill_len: int,
+    input_logprobs_finalized: bool,
 ) -> int:
+    # A retracted request re-prefills prompt + output; its input logprobs were
+    # finalized on the first prefill, so it asks for none again.
+    if input_logprobs_finalized:
+        return extend_len
     # Key variables:
     # - logprob_start_len: Absolute position in full sequence where logprob computation begins
     # - extend_logprob_start_len: Relative position within current extend batch where logprob computation begins
@@ -2325,6 +2330,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 prefix_len=prefix_lens[i],
                 extend_len=extend_lens[i],
                 full_untruncated_fill_len=len(r.full_untruncated_fill_ids),
+                input_logprobs_finalized=r.logprob.input_token_logprobs_val is not None,
             )
             for i, r in enumerate(reqs)
         ]
@@ -2489,6 +2495,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
                 logprob_token_ids = req.origin_input_ids[
                     global_start_idx + 1 : global_end_idx + 1
+                ]
+                # one target id per requested row (none for a retracted re-prefill)
+                logprob_token_ids = logprob_token_ids[
+                    : req.extend_len - extend_logprob_start_lens[i]
                 ]
                 extend_input_logprob_token_ids.extend(logprob_token_ids)
 
