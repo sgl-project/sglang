@@ -24,8 +24,9 @@ from sglang.test.scripted_runtime.context.radix import (
 from sglang.test.scripted_runtime.tree_core_inspection import (
     install_tree_core_inspectors,
 )
+from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _cache(backend, enable_session=False):
@@ -40,7 +41,7 @@ def _cache(backend, enable_session=False):
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=None,
                 page_size=1,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 enable_session_radix_cache=enable_session,
             )
         )

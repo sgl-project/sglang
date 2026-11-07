@@ -92,32 +92,24 @@ def chunk_kda_fwd_kernel_intra_token_parallel(
     m_h = (i_hg * BH + o_h) < H
     m_k = o_k < K
 
-    p_q = tl.make_block_ptr(
-        q + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
-    )
-    p_k = tl.make_block_ptr(
-        k + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
-    )
-    p_g = tl.make_block_ptr(
-        g + i_t * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
-    )
-    p_beta = tl.make_block_ptr(beta + i_t * H, (H,), (1,), (i_hg * BH,), (BH,), (0,))
+    o_hv = i_hg * BH + o_h
+    m_hk = m_h[:, None] & m_k[None, :]
+    p_q = q + i_t * H * K + o_hv[:, None] * K + o_k[None, :]
+    p_k = k + i_t * H * K + o_hv[:, None] * K + o_k[None, :]
+    p_g = g + i_t * H * K + o_hv[:, None] * K + o_k[None, :]
+    p_beta = beta + i_t * H + o_hv
     # [BH, BK]
-    b_q = tl.load(p_q, boundary_check=(0, 1)).to(tl.float32)
-    b_k = tl.load(p_k, boundary_check=(0, 1)).to(tl.float32)
-    b_g = tl.load(p_g, boundary_check=(0, 1)).to(tl.float32)
-    b_k = b_k * tl.load(p_beta, boundary_check=(0,)).to(tl.float32)[:, None]
+    b_q = tl.load(p_q, mask=m_hk, other=0.0).to(tl.float32)
+    b_k = tl.load(p_k, mask=m_hk, other=0.0).to(tl.float32)
+    b_g = tl.load(p_g, mask=m_hk, other=0.0).to(tl.float32)
+    b_k = b_k * tl.load(p_beta, mask=m_h, other=0.0).to(tl.float32)[:, None]
 
     for j in range(i_ts, min(i_t + 1, min(T, i_ts + BC))):
-        p_kj = tl.make_block_ptr(
-            k + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
-        )
-        p_gj = tl.make_block_ptr(
-            g + j * H * K, (H, K), (K, 1), (i_hg * BH, 0), (BH, BK), (1, 0)
-        )
+        p_kj = k + j * H * K + o_hv[:, None] * K + o_k[None, :]
+        p_gj = g + j * H * K + o_hv[:, None] * K + o_k[None, :]
         # [BH, BK]
-        b_kj = tl.load(p_kj, boundary_check=(0, 1)).to(tl.float32)
-        b_gj = tl.load(p_gj, boundary_check=(0, 1)).to(tl.float32)
+        b_kj = tl.load(p_kj, mask=m_hk, other=0.0).to(tl.float32)
+        b_gj = tl.load(p_gj, mask=m_hk, other=0.0).to(tl.float32)
 
         b_kgj = b_kj * exp2(b_g - b_gj)
 

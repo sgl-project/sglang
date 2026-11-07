@@ -117,6 +117,7 @@ def _install_sglang_dependency_stubs():
     parallel_state.get_ring_parallel_world_size = lambda: 1
     parallel_state.get_tp_world_size = lambda: 1
     parallel_state.get_ulysses_parallel_world_size = lambda: 1
+    parallel_state.get_classifier_free_guidance_world_size = lambda: 1
     parallel_state.get_dit_group = lambda: None
 
     class _FakeLogger:
@@ -396,6 +397,7 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
             ("ErnieImageTransformer2DModel", "layers"),
             ("MingImageTransformer2DModel", "layers"),
             ("AnimaTransformer3DModel", "transformer_blocks"),
+            ("Flux3ImageDiT", "single_blocks"),
         ):
             with self.subTest(class_name=class_name):
                 transformer = type(class_name, (), {blocks_attr: blocks})()
@@ -455,6 +457,28 @@ class TestBuildCustomBlockAdapter(unittest.TestCase):
         self.assertEqual(adapter.blocks, blocks)
         self.assertEqual(adapter.forward_pattern, "Pattern_3")
         self.assertFalse(adapter.has_separate_cfg)
+
+    def test_joint_cfg_decision_syncs_cfg_parallel_ranks(self):
+        """A CFG pair batched into one forward decides once on one device; under
+        CFG parallelism its ranks must vote together, while separate-CFG models
+        keep their peers independent."""
+        module = _import_module_with_stub()
+        config = module.CacheDitConfig(enabled=True, num_inference_steps=6)
+        dit_group = object()
+        module.get_dit_group = lambda: dit_group
+        module.get_classifier_free_guidance_world_size = lambda: 2
+        for joint, expected in ((True, dit_group), (False, None)):
+            with self.subTest(joint=joint):
+                transformer = _make_transformer("Flux3ImageDiT")
+                transformer.single_blocks = ["block_0"]
+                transformer._context_manager = types.SimpleNamespace()
+                module.enable_cache_on_transformer(
+                    transformer, config, joint_cfg_decision=joint
+                )
+                self.assertIs(
+                    getattr(transformer._context_manager, "_sglang_tp_sp_group", None),
+                    expected,
+                )
 
     def test_native_qwen21_adapter_overrides_generic_family_match(self):
         module = _import_module_with_stub()

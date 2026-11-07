@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.quantization.quark.utils import should_ignore_layer
 from sglang.srt.models.glm4_moe import (
     GlmMoeDsaForCausalLMNextN,
     enable_glm_nextn_moe_ptpc,
@@ -24,7 +25,7 @@ from sglang.srt.models.glm4_moe import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 LAYER = 78
 PREFIX = f"model.layers.{LAYER}"
@@ -117,6 +118,20 @@ class TestResolveNextnQuantConfigPtpcOn(CustomTestCase):
         self.assertEqual(scheme["input_tensors"]["dtype"], "fp8_e4m3")
         self.assertEqual(scheme["input_tensors"]["qscheme"], "per_channel")
         self.assertTrue(scheme["input_tensors"]["is_dynamic"])
+
+    def test_flag_on_fused_experts_not_ignored_by_quark(self):
+        self.assertTrue(
+            should_ignore_layer(
+                "model.decoder.mlp.experts",
+                ignore=self._resolve(_quark_cfg(), flag=False).exclude_layers,
+            )
+        )
+        self.assertFalse(
+            should_ignore_layer(
+                "model.decoder.mlp.experts",
+                ignore=self._resolve(_quark_cfg(), flag=True).exclude_layers,
+            )
+        )
 
     def test_flag_on_does_not_mutate_caller_config(self):
         src = _quark_cfg()

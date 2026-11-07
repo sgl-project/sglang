@@ -23,6 +23,9 @@ class RequestState(enum.Enum):
     ENCODER_WAITING = "encoder_waiting"
     ENCODER_RUNNING = "encoder_running"
     ENCODER_DONE = "encoder_done"
+    IMAGE_ENCODER_WAITING = "image_encoder_waiting"
+    IMAGE_ENCODER_RUNNING = "image_encoder_running"
+    IMAGE_ENCODER_DONE = "image_encoder_done"
     DENOISING_WAITING = "denoising_waiting"
     DENOISING_RUNNING = "denoising_running"
     DENOISING_DONE = "denoising_done"
@@ -43,9 +46,13 @@ _VALID_TRANSITIONS: dict[RequestState, set[RequestState]] = {
     RequestState.ENCODER_WAITING: {RequestState.ENCODER_RUNNING},
     RequestState.ENCODER_RUNNING: {RequestState.ENCODER_DONE},
     RequestState.ENCODER_DONE: {
+        RequestState.IMAGE_ENCODER_WAITING,
         RequestState.DENOISING_WAITING,
         RequestState.DENOISING_RUNNING,
     },
+    RequestState.IMAGE_ENCODER_WAITING: {RequestState.IMAGE_ENCODER_RUNNING},
+    RequestState.IMAGE_ENCODER_RUNNING: {RequestState.IMAGE_ENCODER_DONE},
+    RequestState.IMAGE_ENCODER_DONE: {RequestState.DENOISING_WAITING},
     RequestState.DENOISING_WAITING: {RequestState.DENOISING_RUNNING},
     RequestState.DENOISING_RUNNING: {
         RequestState.DENOISING_WAITING,

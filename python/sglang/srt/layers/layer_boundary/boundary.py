@@ -174,6 +174,13 @@ class _TransformedRead:
     gathering_reads = ()
 
     @property
+    def bind(self):
+        return self._bind if self.inner.bind is not None else None
+
+    def _bind(self, forward_batch, context):
+        return _TransformedRead(self.inner.bind(forward_batch, context), self.transform)
+
+    @property
     def reads_before_dp_gather(self):
         return self.inner.reads_before_dp_gather
 
@@ -341,6 +348,14 @@ def _bind_entry_path(
             step=entry.step,
             is_plain_add=is_plain_add,
             carried_fusions=carried_fusions if plain else (),
+            carried_read_fusions=tuple(
+                f
+                for f in edge.need.read.completing_fusions
+                if f.carried
+                and not f.scatters
+                and (is_plain_add or f.accepts_update is not None)
+            ),
+            read=edge.need.read,
             expected_sum=declared_sum,
             completed_step=completed_step,
             written_step=written_step,
@@ -367,8 +382,8 @@ def bind_exit(
 
     Args:
         edge: Output contract and destination/residual rows. Deferred updates
-            must outlive the producer; pipeline handoffs require a plain add
-            or a residual already written by the producer.
+            must outlive the producer. Pipeline handoff eligibility is checked
+            when the stage is constructed.
         cp_moves: Context-parallel return operations, when the edge needs them.
         attn_tp_gather: The stage's implementation of a gather over attention
             TP, tried before the default one.
@@ -383,10 +398,6 @@ def bind_exit(
             raise NotImplementedError(
                 "a deferred update must guarantee its lifetime across layers"
             )
-        if not update.is_plain_add and get_parallel().pp_size > 1:
-            raise NotImplementedError(
-                "pipeline boundaries require a plain add or a producer-written residual"
-            )
     if edge.need.layout != edge.residual_to:
         raise NotImplementedError(f"{edge=}")
     return _select_exit_move(
@@ -398,17 +409,20 @@ def bind_exit(
     )
 
 
-def _read_fusions(read, owes, is_plain_add, *, scatters):
-    """The kernels a read supplies that complete ``owes`` on the rows this
-    entry completes it on. They take the residual add themselves, so only a
-    plain one."""
-    if not is_plain_add:
-        return ()
-    return tuple(
-        f
-        for f in read.completing_fusions
-        if f.completes is owes and f.scatters == scatters
+def _read_fusion_args(read, owes, is_plain_add, *, scatters):
+    """Select callback slots for this group and row placement once. Stateful
+    readers resolve those slots on the invocation, stateless readers directly
+    retain their kernels. Non-plain updates require explicit acceptance."""
+    indices = tuple(
+        i
+        for i, f in enumerate(read.completing_fusions)
+        if (is_plain_add or f.accepts_update is not None)
+        and f.completes is owes
+        and f.scatters == scatters
     )
+    if read.bind is not None:
+        return {"read_fusion_indices": indices}
+    return {"read_fusions": tuple(read.completing_fusions[i] for i in indices)}
 
 
 def _select_entry_step(
@@ -484,7 +498,7 @@ def _select_entry_step(
             enters_stack=enters_stack,
         )
         return inner._replace(
-            step=partial(_move_before_read, move=move, read=inner.step)
+            step=partial(_move_before_read, move=move, read_step=inner.step)
         )
     if sliced:
         # Each attention-TP rank takes its own slice: the reduce-scatter
@@ -501,7 +515,7 @@ def _select_entry_step(
         if owes is SumGroup.ATTN_TP:
             step = partial(
                 _attn_tp_reduce_scatter_update_read,
-                read_fusions=_read_fusions(read, owes, is_plain_add, scatters=True),
+                **_read_fusion_args(read, owes, is_plain_add, scatters=True),
             )
         else:
             step = _attn_tp_slice_update_read
@@ -581,7 +595,14 @@ def _select_entry_step(
                 enters_stack=enters_stack,
                 read=read,
                 read_gathers=(
-                    read.gathering_reads if is_plain_add or arrives_written else ()
+                    read.gathering_reads
+                    if read.bind is None and (is_plain_add or arrives_written)
+                    else ()
+                ),
+                read_gather_indices=(
+                    tuple(range(len(read.gathering_reads)))
+                    if read.bind is not None and (is_plain_add or arrives_written)
+                    else ()
                 ),
             ),
             input_move=(
@@ -639,13 +660,13 @@ def _select_entry_step(
         ):
             raise NotImplementedError(f"{produced=} {need=}")
         fused = tuple(f for f in fusions if f.completes is owes)
-        read_fused = _read_fusions(read, owes, is_plain_add, scatters=False)
+        read_fused = _read_fusion_args(read, owes, is_plain_add, scatters=False)
         return EntryStep(
             partial(
                 _reduce_update_read,
                 gathers_residual=gathers_residual,
                 fusions=tuple(f.run for f in fused),
-                read_fusions=read_fused,
+                **read_fused,
                 group=owes,
                 read=read,
             ),

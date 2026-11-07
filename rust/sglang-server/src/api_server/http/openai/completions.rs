@@ -7,32 +7,32 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
-};
-use dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 use futures::StreamExt;
 use serde::Deserialize;
+use sglang_processor::dynamo_protocols::types::{
+    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
+    CreateCompletionResponse, Logprobs, Prompt, Stop,
+};
 
+use super::super::dp_relay::HintRoute;
 use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreCall, CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
 use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
@@ -42,6 +42,9 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 struct CompletionRequest {
     #[serde(flatten)]
     request: CreateCompletionRequest,
+    /// Python's `skip_special_tokens` request extension; absent keeps the
+    /// sampling default (drop them).
+    skip_special_tokens: Option<bool>,
     #[serde(flatten)]
     routing: PDRoutingFields,
 }
@@ -68,9 +71,14 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
-    let CompletionRequest { request, routing } = match body {
+    let CompletionRequest {
+        request,
+        skip_special_tokens,
+        routing,
+    } = match body {
         Ok(Json(request)) => request,
         Err(rejection) => {
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
@@ -126,6 +134,9 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, &message, false);
         }
     };
+    if let Some(skip_special_tokens) = skip_special_tokens {
+        sampling.skip_special_tokens = skip_special_tokens;
+    }
     if let Err(error) = sampling.normalize(
         state.server_args.skip_tokenizer_init,
         state.server_args.model_config.vocab_size,
@@ -145,10 +156,17 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::Completions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
@@ -198,7 +216,7 @@ async fn completions(
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
             };
-            let call = match submit_generation(&state, native, stream).await {
+            let call = match submit_generation(&state, &headers, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
             };
@@ -233,7 +251,7 @@ async fn completions(
             continuous_usage,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         unary_completion(
             submitted,
@@ -252,7 +270,11 @@ async fn completions(
 /// detok stage answers it with a single `Data` payload (the raw UTF-8 text),
 /// or an `Error` (e.g. out-of-range ids → `Validation` → 400).
 async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<String, Response> {
-    match state.core.detokenize(token_ids).await {
+    match state
+        .core
+        .detokenize(token_ids, true /* skip_special_tokens */)
+        .await
+    {
         Ok(text) => Ok(text),
         // Same rule as `submit_generation`: build the refusal in the OpenAI
         // error shape rather than forwarding the native-shaped response.
@@ -716,10 +738,10 @@ mod tests {
     };
     use crate::message::response::ChunkExtras;
     use axum::http::StatusCode;
-    use dynamo_protocols::types::{
+    use futures::StreamExt;
+    use sglang_processor::dynamo_protocols::types::{
         Choice, CreateCompletionRequest, CreateCompletionResponse, Prompt,
     };
-    use futures::StreamExt;
 
     #[test]
     fn dynamo_completion_request_deserializes_directly() {

@@ -26,7 +26,6 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.models.dits import sana_wm_parity as parity_probe
 from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     compute_chunk_plucker,
 )
@@ -254,11 +253,6 @@ class SanaWMRealtimeLatentPrepStage(SanaWMRealtimeStage):
                 )
                 buf[:, :, :1] = first_latent
                 noise.noise_buffer = buf
-                parity_probe.dump_tensor(  # parity harness (no-op in prod)
-                    parity_probe.probe_dir(parity_probe.ENV_RT_DUMP),
-                    "noise_buffer",
-                    buf,
-                )
 
         # Chunk plan: enough stage-1 chunks for >=1 refiner block.
         stage1_cur = cache.chunk_indices[-1]
