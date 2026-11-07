@@ -2974,9 +2974,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         tbo_subbatch_index: Optional[int] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
         state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
         if get_moe_a2a_backend().is_mori():
             state.num_tokens = hidden_states.shape[0]
@@ -3313,6 +3316,8 @@ class DeepseekV2Model(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 zero_allocator=zero_allocator,
+                captured_last_layer_outputs=aux_hidden_states,
+                capture_layer_ids=self.layers_to_capture,
             )
 
         if not self.pp_group.is_last_rank:

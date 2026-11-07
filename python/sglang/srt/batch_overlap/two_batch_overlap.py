@@ -14,6 +14,10 @@ from sglang.srt.batch_overlap.operations import (
 )
 from sglang.srt.batch_overlap.operations_strategy import OperationsStrategy
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.aux_hidden_states import (
+    AuxHiddenStateAccumulator,
+    AuxHiddenStateList,
+)
 from sglang.srt.layers.layer_boundary import (
     Layout,
     tbo_split_moves,
@@ -752,6 +756,13 @@ class TboForwardBatchPreparer:
             )
             output_dict[key] = old_value[start_seq_index:end_seq_index]
 
+        # Token buffers above are child-local; their per-sequence offsets must
+        # use the same origin. Two-chunk splits recompute these offsets below.
+        if output_dict.get("extend_start_loc") is not None:
+            output_dict["extend_start_loc"] = (
+                output_dict["extend_start_loc"] - start_token_index
+            )
+
         spec_info = getattr(batch, "spec_info")
         output_spec_info = split_spec_info(
             spec_info=spec_info,
@@ -954,6 +965,8 @@ def model_forward_stages(
     forward_batch: ForwardBatch,
     hidden_states: torch.Tensor,
     zero_allocator: Optional[BumpAllocator] = None,
+    captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
+    capture_layer_ids: Sequence[int] = (),
 ):
     """Run stage operations with an independent residual stream per microbatch."""
     strategy = OperationsStrategy.init_new_tbo(
@@ -966,6 +979,10 @@ def model_forward_stages(
         zero_allocator=zero_allocator,
     )
     if not enable_tbo:
+        if captured_last_layer_outputs is not None:
+            strategy = strategy.with_aux_hidden_states(
+                layers, capture_layer_ids, captured_last_layer_outputs
+            )
         return execute_operations(inputs, strategy.operations)["hidden_states"]
 
     stream = residual_batch.stream_of(forward_batch)
@@ -989,6 +1006,18 @@ def model_forward_stages(
     forward_batch.residual_stream = None
     del inputs, pending, stream, hidden_states, residual
 
+    # Captures are owned per child: interleaving the layer ops must not
+    # interleave entries in the parent's layer-ordered collector.
+    child_captures = [AuxHiddenStateList(), AuxHiddenStateList()]
+    operations_arr = [strategy.operations] * 2
+    if captured_last_layer_outputs is not None and capture_layer_ids:
+        operations_arr = [
+            strategy.with_aux_hidden_states(
+                layers, capture_layer_ids, collector
+            ).operations
+            for collector in child_captures
+        ]
+
     context = (
         empty_context()
         if _is_hip
@@ -997,8 +1026,17 @@ def model_forward_stages(
     with context:
         outputs = execute_overlapped_operations(
             inputs_arr=parts,
-            operations_arr=[strategy.operations] * 2,
+            operations_arr=operations_arr,
             delta_stages=[0, strategy.tbo_delta_stages],
+        )
+    for capture_a, capture_b in zip(*child_captures, strict=True):
+        captured_last_layer_outputs.append(
+            _model_forward_tbo_merge_key(
+                dict(aux=capture_a, forward_batch=outputs[0]["forward_batch"]),
+                dict(aux=capture_b, forward_batch=outputs[1]["forward_batch"]),
+                "aux",
+                original_len,
+            )
         )
     for output in outputs:
         output["residual"] = residual_batch.stream_of(output["forward_batch"])

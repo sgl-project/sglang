@@ -1,5 +1,6 @@
-from dataclasses import dataclass
-from typing import List, Optional
+from dataclasses import dataclass, replace
+from functools import partial, update_wrapper
+from typing import List, Optional, Sequence
 
 import torch
 
@@ -17,6 +18,19 @@ class OperationsStrategy:
     operations: List[Operation]
     deep_gemm_num_sms: Optional[int] = None
     tbo_delta_stages: Optional[int] = None
+
+    def with_aux_hidden_states(self, layers, layer_ids: Sequence[int], collector):
+        """Retain the ordinary attention-input capture point in the op path."""
+        prepares = {}
+        for layer in layers:
+            if layer.layer_id in layer_ids:
+                prepare = layer.op_comm_prepare_attn
+                prepares[prepare] = update_wrapper(
+                    partial(prepare, captured_last_layer_outputs=collector), prepare
+                )
+        return replace(
+            self, operations=[prepares.get(op, op) for op in self.operations]
+        )
 
     @classmethod
     def concat(cls, items: List["OperationsStrategy"]) -> "OperationsStrategy":

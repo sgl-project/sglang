@@ -1215,6 +1215,8 @@ class Qwen2MoeModel(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
+                captured_last_layer_outputs=aux_hidden_states,
+                capture_layer_ids=self.layers_to_capture,
             )
         else:
             for i in range(self.start_layer, self.end_layer):

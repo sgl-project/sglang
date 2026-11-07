@@ -1038,9 +1038,12 @@ class MiMoV2DecoderLayer(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
         tbo_subbatch_index: Optional[int] = None,
+        captured_last_layer_outputs: Optional[AuxHiddenStateAccumulator] = None,
     ):
         state.hidden_states_after_comm_pre_attn = self.attn_boundary.prepare(
-            hidden_states, forward_batch
+            hidden_states,
+            forward_batch,
+            capture_gathered=captured_last_layer_outputs,
         )
         state.update(
             dict(
@@ -1168,14 +1171,21 @@ class MiMoV2Model(nn.Module):
             )
 
         aux_hidden_states = AuxHiddenStatePacker(len(self.layers_to_capture))
-        if forward_batch.can_run_tbo and not self.layers_to_capture:
+        if forward_batch.can_run_tbo:
             tbo_start_layer = self.start_layer
             tbo_end_layer = self.end_layer
 
             # skip first layer for TBO when starting from layer 0
             if self.start_layer == 0:
                 layer = self.layers[0]
-                hidden_states = layer(positions, hidden_states, forward_batch)
+                hidden_states = layer(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    captured_last_layer_outputs=aux_hidden_states
+                    if self.start_layer in self.layers_to_capture
+                    else None,
+                )
                 tbo_start_layer = tbo_start_layer + 1
 
             hidden_states = model_forward_stages(
@@ -1184,6 +1194,8 @@ class MiMoV2Model(nn.Module):
                 positions=positions,
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
+                captured_last_layer_outputs=aux_hidden_states,
+                capture_layer_ids=self.layers_to_capture,
             )
         else:
             for i in range(self.start_layer, self.end_layer):
