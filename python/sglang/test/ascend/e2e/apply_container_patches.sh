@@ -11,16 +11,16 @@ set -euo pipefail
 # Notes:
 #   * The set name comes from a workflow input, so only names matching
 #     ^[a-z0-9_]+$ that resolve to a file in the patch directory are executed.
-#   * Patch resources are cached on the shared disk and installed offline-first,
-#     mirroring the KUBERNETES_PKG_PATH_SOURCE pattern in run_npu_testcase.sh,
-#     so the pods of one run reuse the first download.
+#   * Patch resources are cached in the pod-local filesystem (PATCH_CACHE_DIR,
+#     /tmp by default) instead of the shared disk, so the four pods never race
+#     on the same file. Each pod downloads once and reuses it for re-runs.
 #   * A per-set marker keyed by the file checksum makes re-runs idempotent.
 #   * Any failure aborts the caller: a half patched cluster produces results
 #     that cannot be trusted.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCH_DIR="${SCRIPT_DIR}/container_patches"
-PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/root/.cache/.cache/npu_patches}"
+PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache}"
 PATCH_STATE_FILE="${PATCH_STATE_FILE:-/tmp/sglang_npu_patches_applied.json}"
 REQUESTED="${1:-${SGLANG_NPU_CONTAINER_PATCHES:-}}"
 

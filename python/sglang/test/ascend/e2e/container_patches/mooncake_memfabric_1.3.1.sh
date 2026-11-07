@@ -16,7 +16,7 @@
 
 set -euo pipefail
 
-PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/root/.cache/.cache/npu_patches/mooncake_memfabric_1.3.1}"
+PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache/mooncake_memfabric_1.3.1}"
 mkdir -p "${PATCH_CACHE_DIR}"
 
 MEMFABRIC_WHEEL_NAME="memfabric_hybrid-1.3.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
@@ -32,8 +32,8 @@ fetch_wheel() {
         return
     fi
     echo "Download wheel: ${url}"
-    # Every pod of a run downloads into the shared cache at the same time, so
-    # the temporary file must be unique per pod to avoid interleaved writes.
+    # Unique per pod, so an override that points PATCH_CACHE_DIR at shared
+    # storage still cannot interleave writes between pods.
     local tmp="${dest}.part.${HOSTNAME:-$$}"
     rm -f "${tmp}"
     if command -v wget >/dev/null 2>&1; then
