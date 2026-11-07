@@ -12,9 +12,11 @@ from sglang.srt.layers.attention.deepseek_v4_backend import LateLayerTail
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner import eager_runner
-from sglang.srt.models import deepseek_v4
+from sglang.srt.models import deepseek_v4, deepseek_v4_nextn
 from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -54,7 +56,7 @@ def make_tail(*, cp=True, graph=False):
     )
 
 
-class TestCpBoundedReplayOutput(unittest.TestCase):
+class TestCpBoundedReplayOutput(CustomTestCase):
     def test_compact_global_rows_reach_logits_and_dspark(self):
         model, batch, tail = make_model(), make_batch(), make_tail()
         original_metadata = batch.attn_cp_metadata
@@ -205,7 +207,98 @@ class TestCpBoundedReplayOutput(unittest.TestCase):
         self.assertEqual(metadata.extend_logprob_start_lens_cpu, [0, 2])
 
 
-class TestEagerCpOutputHook(unittest.TestCase):
+class TestEagerCpOutputHook(CustomTestCase):
+    def test_eagle_nextn_cp_prefill_with_and_without_bounded_replay(self):
+        """EAGLE draft prefill must keep full rows through the inherited CP hook."""
+        hidden, pre = (torch.arange(512 * n).view(512, n) for n in (3, 6))
+        local = hidden[::4], pre[::4]
+
+        @contextlib.contextmanager
+        def shard(*_args):
+            yield None, None, None
+
+        def logits(input_ids, states, head, batch, aux, **kwargs):
+            self.assertIsNone(aux)
+            return SimpleNamespace(
+                input_ids=input_ids,
+                hidden_states=states,
+                pre_hc_head=kwargs["hidden_states_before_norm"],
+                forward_batch=batch,
+            )
+
+        for bounded in (False, True):
+            with (
+                self.subTest(bounded=bounded),
+                get_context().override_server_args(
+                    tp_size=4,
+                    attn_cp_size=4,
+                    enable_prefill_cp=True,
+                    speculative_algorithm="EAGLE",
+                    enable_decoder_swa_bounded_replay=bounded,
+                ),
+                get_parallel().override(pp_group=SimpleNamespace(is_last_rank=True)),
+                mock.patch.object(
+                    deepseek_v4_nextn,
+                    "DeepseekV4ModelNextN",
+                    return_value=mock.Mock(spec=[], return_value=local),
+                ),
+                mock.patch.object(deepseek_v4_nextn, "ParallelLMHead"),
+                mock.patch.object(
+                    deepseek_v4_nextn, "LogitsProcessor", return_value=logits
+                ),
+            ):
+                model = deepseek_v4_nextn.DeepseekV4ForCausalLMNextN(
+                    SimpleNamespace(vocab_size=16, hidden_size=3)
+                )
+                runner = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+                batch = make_batch()
+                batch.positions = torch.arange(512)
+                metadata = batch.attn_cp_metadata
+
+                def gather(value, fb, stream, metadata=metadata):
+                    self.assertIs(fb.attn_cp_metadata, metadata)
+                    self.assertEqual(tuple(x.shape[0] for x in value), (128, 128))
+                    return hidden, pre
+
+                with (
+                    mock.patch.object(eager_runner, "cp_shard_model_inputs", shard),
+                    mock.patch.object(
+                        deepseek_v4, "cp_gather_after_forward", side_effect=gather
+                    ),
+                    mock.patch.object(torch.cuda, "current_stream", return_value=None),
+                ):
+                    output = eager_runner.EagerRunner._execute_extend_cp(
+                        runner, batch, {"input_embeds": torch.zeros(512, 3)}
+                    )
+
+                torch.testing.assert_close(output.input_ids, torch.arange(512))
+                torch.testing.assert_close(output.hidden_states, hidden)
+                torch.testing.assert_close(output.pre_hc_head, pre)
+                self.assertIs(output.forward_batch, batch)
+                self.assertIs(batch.attn_cp_metadata, metadata)
+
+    def test_middle_pp_stage_preserves_proxy_with_aux_capture(self):
+        """An intermediate PP stage returns its proxy without output processing."""
+        proxy = object()
+        model = SimpleNamespace(
+            prepare_cp_inputs=lambda *_args, **_kwargs: (None, None, {}),
+            model=mock.Mock(spec=[], return_value=proxy),
+            pp_group=SimpleNamespace(is_last_rank=False),
+            capture_aux_hidden_states=True,
+            postprocess_cp_output=mock.Mock(side_effect=AssertionError("PP hook")),
+        )
+        runner = SimpleNamespace(model_runner=SimpleNamespace(model=model))
+
+        @contextlib.contextmanager
+        def shard(*_args):
+            yield None, None, None
+
+        with mock.patch.object(eager_runner, "cp_shard_model_inputs", shard):
+            output = eager_runner.EagerRunner._execute_extend_cp(
+                runner, make_batch(), {}
+            )
+        self.assertIs(output, proxy)
+
     def test_model_hook_receives_raw_output_before_generic_gather(self):
         raw, result = object(), object()
         model = SimpleNamespace(
@@ -231,7 +324,7 @@ class TestEagerCpOutputHook(unittest.TestCase):
         generic.assert_not_called()
 
 
-class TestCpBoundedReplayConfiguration(unittest.TestCase):
+class TestCpBoundedReplayConfiguration(CustomTestCase):
     def test_eager_cp_opt_in_and_graph_rejection(self):
         for backend in (Backend.DISABLED, Backend.BREAKABLE):
             cfg = SimpleNamespace(
