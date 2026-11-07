@@ -1,4 +1,4 @@
-"""Bounded session affinity using observed decode token footprints."""
+"""Bounded decode session affinity with capacity-aware spill."""
 
 import time
 from collections import OrderedDict
@@ -15,14 +15,21 @@ class _Session:
 
 class DecodeSessionPlacement:
     def __init__(
-        self, num_ranks: int, max_sessions: int = 4096, idle_seconds: int = 1800
+        self,
+        num_ranks: int,
+        max_sessions: int = 4096,
+        idle_seconds: int = 1800,
+        reserved_decode_tokens: int = 0,
     ):
         if min(num_ranks, max_sessions, idle_seconds) <= 0:
             raise ValueError("Session placement limits must be positive")
+        if reserved_decode_tokens < 0:
+            raise ValueError("Reserved decode tokens must be nonnegative")
         self.sessions: OrderedDict[tuple[str, str | None], _Session] = OrderedDict()
         self.retained = [0] * num_ranks
         self.max_sessions = max_sessions
         self.idle_seconds = idle_seconds
+        self.reserved_decode_tokens = reserved_decode_tokens
 
     def _remove(self, key):
         previous = self.sessions.pop(key)
@@ -59,6 +66,32 @@ class DecodeSessionPlacement:
         rank = forced_rank
         if rank is None and previous and previous.rank in active:
             rank = previous.rank
+            # Price the full incoming prompt without assuming prefix reuse.
+            # Snapshots guide routing; native KV admission remains authoritative.
+            if all(capacity[r] > 0 for r in active):
+
+                def projected(worker):
+                    # Include queued prompts and per-request decode reserves.
+                    # Retained history is a cache preference, not live KV use.
+                    return (
+                        live_tokens[worker]
+                        + input_tokens
+                        + self.reserved_decode_tokens * (live_requests[worker] + 1)
+                    )
+
+                if projected(rank) > capacity[rank]:
+                    fitting = [
+                        r for r in active if r != rank and projected(r) <= capacity[r]
+                    ]
+                    if fitting:
+                        rank = min(
+                            fitting,
+                            key=lambda r: (
+                                projected(r) / capacity[r],
+                                live_requests[r],
+                                r,
+                            ),
+                        )
         if rank is None:
             normalize = all(capacity[r] > 0 for r in active)
 

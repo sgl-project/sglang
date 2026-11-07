@@ -229,7 +229,10 @@ class DataParallelController:
 
         self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
         self.decode_sessions = (
-            DecodeSessionPlacement(get_parallel().num_dp_ranks)
+            DecodeSessionPlacement(
+                get_parallel().num_dp_ranks,
+                reserved_decode_tokens=get_disagg().num_reserved_decode_tokens,
+            )
             if self.load_balance_method == LoadBalanceMethod.DECODE_SESSION_TOKENS
             else None
         )
