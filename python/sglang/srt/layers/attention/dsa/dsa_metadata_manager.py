@@ -41,9 +41,7 @@ class DSAMetadataManagementMixin:
         supported = kpool_metadata_fusion_supported(
             self.dsa_index_kpool, self.physical_page_size, self.dsa_index_topk
         )
-        self.experimental_kpool_metadata_fusion = (
-            supported and is_cuda() and not is_hip()
-        )
+        self.experimental_kpool_metadata_fusion = supported and (is_cuda() or _is_hip)
         self._fused_decode_metadata = fused_dsa_decode_metadata
         self._fused_verify_metadata = fused_dsa_target_verify_metadata
         self._fused_draft_extend_metadata = fused_dsa_draft_extend_metadata
@@ -80,7 +78,7 @@ class DSAMetadataManagementMixin:
         fused_kernel_succeeded = False
 
         # Use fused CUDA kernel for all copy operations
-        if not _is_hip:
+        if is_cuda() or _is_hip:
             try:
                 from sglang.kernels.ops.attention.dsa.fused_metadata_copy import (
                     fused_metadata_copy_cuda,
@@ -238,12 +236,11 @@ class DSAMetadataManagementMixin:
         metadata = self.decode_cuda_graph_metadata.get(bs)
         src_metadata = src_backend.decode_cuda_graph_metadata.get(bs)
         if (
-            # The derived-copy body below is CUDA-only; any other platform
-            # must take the full recompute, not a partial copy that would
-            # leave the DeepGEMM schedule / top-k plan / kpool metadata
-            # stale.
-            not is_cuda()
-            or _is_hip
+            # The derived-copy body below covers CUDA and HIP (HIP has no
+            # DeepGEMM schedule / top-k plan); any other platform must take
+            # the full recompute, not a partial copy that would leave its
+            # derived metadata stale.
+            not (is_cuda() or _is_hip)
             or not forward_mode.is_decode_or_idle()
             or metadata is None
             or src_metadata is None
@@ -285,7 +282,7 @@ class DSAMetadataManagementMixin:
         self, metadata: DSAMetadata, src_metadata: DSAMetadata
     ) -> None:
         """Copy KPool metadata derived from identical inputs from a sibling."""
-        if self.dsa_index_kpool <= 1 or not is_cuda():
+        if self.dsa_index_kpool <= 1 or not (is_cuda() or _is_hip):
             return
 
         if metadata.pooled_cache_seqlens_int32 is not None:

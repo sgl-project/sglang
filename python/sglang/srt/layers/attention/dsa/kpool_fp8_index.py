@@ -1947,7 +1947,9 @@ def kpool_write_tail_and_maybe_compress(
     assert write_loc.stride(1) == 1, write_loc.stride()
 
     key = key.contiguous()
-    score = score.contiguous()
+    # The kernel steps rows by score.stride(0): a column slice of a wider GEMM output is fine.
+    if score.stride(-1) != 1:
+        score = score.contiguous()
     ape = ape.contiguous()
     req_pool_indices = req_pool_indices.contiguous()
     write_start = write_start.contiguous()

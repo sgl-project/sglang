@@ -112,7 +112,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
                 softmax_scale=128**-0.5,
             )
             expected = _eager(IndexerKPool._get_logits_head_gate)(indexer, x, q_scale)
-            projected = _eager(IndexerKPool._project_and_scale_head_gates)(indexer, x)
+            projected = _eager(IndexerKPool._project_head_gates)(indexer, x)
             actual = _eager(IndexerKPool._apply_q_scale_and_softmax_scale)(
                 indexer, projected, q_scale
             )
@@ -156,7 +156,7 @@ class TestKPoolStreamScheduling(unittest.TestCase):
             indexer.wk = project_k
             indexer.k_norm = lambda value: value
             indexer.rotary_emb = rope
-            indexer._project_and_scale_head_gates = head_gate
+            indexer._project_head_gates = head_gate
             with (
                 patch.object(
                     torch.cuda, "current_stream", side_effect=lambda: streams.current
