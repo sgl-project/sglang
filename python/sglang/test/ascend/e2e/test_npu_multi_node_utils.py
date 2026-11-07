@@ -453,6 +453,9 @@ def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
         if arg == name and i + 1 < len(args_list):
             return args_list[i + 1]
+        # Also accept the --key=value form.
+        if arg.startswith(f"{name}="):
+            return arg[len(name) + 1 :]
     return None
 
 
@@ -634,18 +637,14 @@ def launch_pd_separation_node(model_config):
         if role == "prefill"
         else model_config["decode_args"]
     )
-    transfer_backend = _get_arg_value(
-        role_args, "--disaggregation-transfer-backend"
-    )
+    transfer_backend = _get_arg_value(role_args, "--disaggregation-transfer-backend")
     if transfer_backend in (None, "ascend"):
         mf_addr = f"tcp://{master_prefill_ip}:24666"
         os.environ["ASCEND_MF_STORE_URL"] = mf_addr
         logger.info(f"Setting ENV_VAR ASCEND_MF_STORE_URL={mf_addr}")
     else:
         os.environ.pop("ASCEND_MF_STORE_URL", None)
-        logger.info(
-            f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}"
-        )
+        logger.info(f"Skip ASCEND_MF_STORE_URL for transfer backend {transfer_backend}")
 
     if role == "prefill":
         # Current node is prefill

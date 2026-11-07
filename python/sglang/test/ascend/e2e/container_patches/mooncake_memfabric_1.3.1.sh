@@ -32,7 +32,9 @@ fetch_wheel() {
         return
     fi
     echo "Download wheel: ${url}"
-    local tmp="${dest}.part"
+    # Every pod of a run downloads into the shared cache at the same time, so
+    # the temporary file must be unique per pod to avoid interleaved writes.
+    local tmp="${dest}.part.${HOSTNAME:-$$}"
     rm -f "${tmp}"
     if command -v wget >/dev/null 2>&1; then
         wget -q -O "${tmp}" "${url}"
@@ -42,9 +44,13 @@ fetch_wheel() {
     mv "${tmp}" "${dest}"
 }
 
-echo "Install libibverbs-dev"
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y libibverbs-dev
+if dpkg -s libibverbs-dev >/dev/null 2>&1; then
+    echo "libibverbs-dev already installed, skip apt."
+else
+    echo "Install libibverbs-dev"
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y libibverbs-dev
+fi
 
 fetch_wheel "${MEMFABRIC_WHEEL_URL}" "${PATCH_CACHE_DIR}/${MEMFABRIC_WHEEL_NAME}"
 fetch_wheel "${MOONCAKE_WHEEL_URL}" "${PATCH_CACHE_DIR}/${MOONCAKE_WHEEL_NAME}"
