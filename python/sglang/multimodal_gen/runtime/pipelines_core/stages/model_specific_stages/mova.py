@@ -646,6 +646,7 @@ class MOVADenoisingStage(PipelineStage):
                         **extra_step_kwargs,
                     )
 
+                    self.check_cancelled(batch)
                     if progress_bar is not None:
                         progress_bar.update()
                     if not is_warmup and hasattr(self, "step_profile"):

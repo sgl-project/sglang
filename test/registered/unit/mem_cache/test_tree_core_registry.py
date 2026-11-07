@@ -24,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.rust_extensions.torch_build import _MAX_SUPPORTED_TORCH
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface import (
     UnifiedTreeCoreInspectionInterface,
@@ -118,6 +119,12 @@ class TreeCoreRegistryTest(CustomTestCase):
         self.assertIsInstance(core, UnifiedTreeCore)
         self.assertNotIsInstance(core, UnifiedTreeCoreInspectionInterface)
         self.assertIs(component.tree_core, core)
+
+    def test_registry_resolves_the_rust_backend_lazily(self):
+        core = create_tree_core(name="rust", params=_cache_init_params(), components={})
+        assert type(core).__name__ == "RustUnifiedTreeCore"
+        assert not isinstance(core, UnifiedTreeCoreInspectionInterface)
+        assert not any(name.startswith("inspect_") for name in dir(core._binding))
 
     def test_unknown_backend_raises_naming_the_known_backends(self):
         with self.assertRaisesRegex(ValueError, "not registered") as cm:
@@ -508,7 +515,8 @@ class TreeCoreDefaultCompatibilityTest(CustomTestCase):
                 self.assertEqual(
                     select_tree_core_backend(_cache_init_params()), "python"
                 )
-        for version in ("2.10.0", "2.15.0", "unknown"):
+        too_new = f"{_MAX_SUPPORTED_TORCH[0]}.{_MAX_SUPPORTED_TORCH[1] + 1}.0"
+        for version in ("2.10.0", too_new, "unknown"):
             with (
                 self.subTest(version=version),
                 mock.patch.object(tree_core_registry.torch, "__version__", version),

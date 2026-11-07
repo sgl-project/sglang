@@ -86,7 +86,10 @@ class SWAKVPool(BaseSWAKVPool):
         self.swa_layer_nums = len(swa_attention_layer_ids)
         self.full_layer_nums = len(full_attention_layer_ids)
         self.layer_num = self.full_layer_nums + self.swa_layer_nums
-        self.start_layer = 0
+        # Layer ids are global under pipeline parallelism; start at this stage's first.
+        self.start_layer = min(
+            [*swa_attention_layer_ids, *full_attention_layer_ids], default=0
+        )
         self.page_size = page_size
         self.layer_transfer_counter = None
 
@@ -144,10 +147,12 @@ class SWAKVPool(BaseSWAKVPool):
             if isinstance(pool, MHATokenToKVPool):
                 pool.model_layer_ids = tuple(layer_ids)
         self.dsa_kv_cache_store_fp8 = False
+        self.kv_scale_ue8m0 = False
         self.kv_cache_dim = None
         self.index_head_dim = None
         if isinstance(self.full_kv_pool, MLATokenToKVPool):
             self.dsa_kv_cache_store_fp8 = self.full_kv_pool.dsa_kv_cache_store_fp8
+            self.kv_scale_ue8m0 = self.full_kv_pool.kv_scale_ue8m0
             self.kv_cache_dim = self.full_kv_pool.kv_cache_dim
         if isinstance(self.full_kv_pool, DSATokenToKVPool):
             self.index_head_dim = self.full_kv_pool.index_head_dim
