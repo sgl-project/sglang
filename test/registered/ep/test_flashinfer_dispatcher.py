@@ -1,3 +1,11 @@
+"""FlashinferDispatcher over FlashInfer's NVLink one-sided all-to-all on 4 GPUs.
+
+Run with ``python test_flashinfer_dispatcher.py``; it relaunches itself under
+torchrun on 4 GPUs. ``torchrun --nproc_per_node=4 test_flashinfer_dispatcher.py``
+also works. The NVFP4 and MXFP8 dispatch paths need Blackwell (SM100+).
+"""
+
+import os
 import unittest
 
 import torch
@@ -18,9 +26,16 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import initialize_moe_config
 from sglang.srt.runtime_context import get_context, publish
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
+register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-b200")
 
+IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
+
+
+@unittest.skipUnless(IS_BLACKWELL, "Requires Blackwell (SM100+) GPUs")
 class TestFlashinferDispatcher(CustomTestCase):
     """Runs FlashinferDispatcher over FlashInfer's NVLink one-sided all-to-all.
 
@@ -283,8 +298,9 @@ class TestFlashinferDispatcher(CustomTestCase):
 
 
 if __name__ == "__main__":
-    """
-    Usage
-    torchrun --nproc_per_node=4 test_flashinfer_dispatcher.py
-    """
-    unittest.main()
+    # Inside a torchrun worker (relaunched below, or started by hand), run the
+    # tests on this rank; otherwise relaunch this file under torchrun.
+    if "LOCAL_RANK" in os.environ:
+        unittest.main()
+    else:
+        multigpu_pytest_main(__name__, __file__, num_gpus=(4,))
