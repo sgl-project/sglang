@@ -287,6 +287,29 @@ def mark_end(name):
         time_infos[name].pretty_print()
 
 
+def derive_attn_dp_random_seed(
+    seed: int, *, attn_dp_rank: int, attn_dp_size: int
+) -> int:
+    """Return the random seed a worker seeds its libraries with.
+
+    ``seed`` is the server's seed (``--random-seed``, or the one world rank 0
+    drew and broadcast). It stays the user-visible value; this only derives
+    what each worker passes to ``set_random_seed``.
+
+    Every attention-DP group samples its own requests, so each needs its own
+    random stream: with one shared seed the groups draw the same numbers in
+    lockstep, and the same prompt sent to several groups comes back with the
+    same "independent" sample. The offset is the attention-DP rank, so group 0
+    keeps ``seed`` and the mapping is deterministic. The attention-TP ranks of
+    one group get the same value: speculative decoding and TP sampling rely on
+    the ranks of a group drawing identical numbers. Without attention DP the
+    seed is returned unchanged.
+    """
+    if attn_dp_size <= 1:
+        return seed
+    return seed + attn_dp_rank
+
+
 def set_random_seed(seed: int) -> None:
     """Set the random seed for all libraries."""
     random.seed(seed)
