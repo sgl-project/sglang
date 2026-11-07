@@ -4,6 +4,7 @@ from .gptq_cpu import GPTQIntelAMXLinearScheme, GPTQIntelAMXMoEScheme
 from .gptq_linear import (
     GPTQAscendLinearScheme,
     GPTQLinearScheme,
+    GPTQTritonLinearScheme,
     GPTQXPULinearScheme,
 )
 from .gptq_marlin import GPTQMarlinLinearScheme
@@ -16,6 +17,7 @@ __all__ = [
     "GPTQLinearScheme",
     "GPTQAscendLinearScheme",
     "GPTQXPULinearScheme",
+    "GPTQTritonLinearScheme",
     "GPTQIntelAMXLinearScheme",
     "GPTQMarlinLinearScheme",
     "GPTQMoEAscendScheme",
