@@ -203,9 +203,9 @@ def _layernorm_modulate_kernel(
     row_mask = row_offs < n_rows
     row_base = row_offs * D
     if STRIDED_X:
-        x_row_base = (
-            (row_offs // seq_len) * X_STRIDE_B + (row_offs % seq_len) * X_STRIDE_S
-        )
+        x_row_base = (row_offs // seq_len) * X_STRIDE_B + (
+            row_offs % seq_len
+        ) * X_STRIDE_S
     else:
         x_row_base = row_base
 
@@ -220,9 +220,7 @@ def _layernorm_modulate_kernel(
         cols = i * 512 + lanes[:, None] * 4 + tl.arange(0, 4)[None, :]
         if (i + 1) * 512 <= D:
             x4 = tl.load(
-                x_ptr
-                + x_row_base[:, None, None]
-                + cols[None, :, :] * X_STRIDE_D,
+                x_ptr + x_row_base[:, None, None] + cols[None, :, :] * X_STRIDE_D,
                 mask=row_mask[:, None, None],
                 other=0.0,
             ).to(tl.float32)
@@ -235,9 +233,7 @@ def _layernorm_modulate_kernel(
             # Welford state untouched.
             vec_valid = (i * 128 + lanes < D // 4)[None, :]
             x4 = tl.load(
-                x_ptr
-                + x_row_base[:, None, None]
-                + cols[None, :, :] * X_STRIDE_D,
+                x_ptr + x_row_base[:, None, None] + cols[None, :, :] * X_STRIDE_D,
                 mask=row_mask[:, None, None] & vec_valid[:, :, None],
                 other=0.0,
             ).to(tl.float32)
@@ -483,7 +479,9 @@ def _validate_strided_layernorm_modulate(
 
     stride = _mod_row_stride(scale, batch, hidden)
     if not (
-        stride is not None and scale.dtype is torch.bfloat16 and scale.device == x.device
+        stride is not None
+        and scale.dtype is torch.bfloat16
+        and scale.device == x.device
     ):
         raise RuntimeError("scale must have packed BF16 [B, D] rows on x's device")
     if shift is not None and not (
