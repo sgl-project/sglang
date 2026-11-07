@@ -73,7 +73,7 @@ def test_strided_modulation_preserves_bits_and_returns_contiguous(batch, seq, hi
     expected = norm(x) * (1 + scale[:, None]) + shift[:, None]
 
     assert actual.is_contiguous()
-    assert torch.equal(actual, expected)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
 @pytest.mark.parametrize("has_shift", [False, True])
