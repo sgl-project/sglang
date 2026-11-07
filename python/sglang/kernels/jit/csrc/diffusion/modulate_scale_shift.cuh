@@ -29,6 +29,12 @@ constexpr uintptr_t kAlignment = 16;
 
 template <typename T>
 SGL_DEVICE T modulate_value(T x, T scale, T shift) {
+  // The rounding boundary between the multiply and the add is part of the
+  // contract above. hipcc contracts the pair into an FMA across it by default,
+  // which drops the intermediate rounding and changes the result.
+#if defined(__HIP_PLATFORM_AMD__)
+#pragma clang fp contract(off)
+#endif
   const T one_plus_scale = device::cast<T>(1.0f + device::cast<fp32_t>(scale));
   const T product = device::cast<T>(device::cast<fp32_t>(x) * device::cast<fp32_t>(one_plus_scale));
   return device::cast<T>(device::cast<fp32_t>(product) + device::cast<fp32_t>(shift));

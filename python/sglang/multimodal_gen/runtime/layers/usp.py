@@ -558,10 +558,29 @@ def _can_use_packed_qkv_a2a_4d(
     )
 
 
+_PACKED_QKV_RECV_TURN = 0
+
+
+def _packed_qkv_recv_role(views_escape: bool) -> str:
+    """Staging role for the packed-QKV receive buffer.
+
+    Returning views into this buffer keeps it live past the collective, so
+    that path alternates between two buffers: the next block's exchange
+    writes the other one while attention still reads this one.
+    """
+    if not views_escape:
+        return "usp_packed_qkv_recv"
+    global _PACKED_QKV_RECV_TURN
+    _PACKED_QKV_RECV_TURN ^= 1
+    return f"usp_packed_qkv_recv_{_PACKED_QKV_RECV_TURN}"
+
+
 def _usp_input_all_to_all_qkv(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    *,
+    allow_strided_qkv: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Ulysses input exchange for Q/K/V with heads at dim=2.
 
@@ -571,6 +590,10 @@ def _usp_input_all_to_all_qkv(
     bit-identical to the unpacked path, which stays as the fallback for
     ineligible inputs (CPU, GQA-mismatched shapes, layouts whose row view
     would copy).
+
+    ``allow_strided_qkv`` returns the three interleaved views as they land,
+    for consumers that read Q/K/V through explicit strides
+    (``AttentionImpl.accepts_strided_qkv``); the default copies them apart.
     Adapted from the NVlabs Sana sol-engine branch (Apache-2.0).
     """
     world_size = get_ulysses_parallel_world_size()
@@ -595,7 +618,9 @@ def _usp_input_all_to_all_qkv(
             "usp_packed_qkv_src", (world_size, rows, h_local, 3 * d), q.dtype, q.device
         ),
     )
-    packed = _usp_all_to_all_single(packed, role="usp_packed_qkv_recv")
+    packed = _usp_all_to_all_single(
+        packed, role=_packed_qkv_recv_role(allow_strided_qkv)
+    )
     if b == 1:
         # Received chunks are already sequence-major: rank j's rows arrive at
         # offset j * s_local, so flattening the leading dims is a free view.
@@ -608,6 +633,8 @@ def _usp_input_all_to_all_qkv(
             .view(b, world_size * s_local, h_local, 3 * d)
         )
     q, k, v = packed.split(d, dim=-1)
+    if allow_strided_qkv:
+        return q, k, v
     # Copy out before the staging buffer is recycled by the next collective.
     return q.contiguous(), k.contiguous(), v.contiguous()
 

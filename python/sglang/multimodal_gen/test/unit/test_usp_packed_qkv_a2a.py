@@ -215,6 +215,77 @@ class TestPackedQKVInputA2A(CustomTestCase):
                     )
                     self.assertTrue(packed[r][i].is_contiguous())
 
+    def test_strided_qkv_matches_the_copied_path_bitwise(self):
+        """``allow_strided_qkv`` must only skip copies, never change values.
+
+        The views it returns alias the interleaved ``[.., 3 * d]`` receive
+        buffer, so a wrong stride would read a neighbouring projection's rows
+        instead of failing loudly.
+        """
+        world, b, s_global, h_global, d = 4, 1, 128, 8, 64
+        s_local, h_local = s_global // world, h_global // world
+        torch.manual_seed(1234)
+        full = [
+            torch.randn(
+                b, s_global, h_global, d, dtype=torch.bfloat16, device=get_device()
+            )
+            for _ in range(3)
+        ]
+        shards = [
+            tuple(t[:, r * s_local : (r + 1) * s_local].contiguous() for t in full)
+            for r in range(world)
+        ]
+        strided = self._run_all_ranks(
+            lambda r: usp_mod._usp_input_all_to_all_qkv(
+                *shards[r], allow_strided_qkv=True
+            ),
+            world,
+        )
+        for r in range(world):
+            for i in range(3):
+                spec = full[i][:, :, r * h_local : (r + 1) * h_local].contiguous()
+                self.assertTrue(torch.equal(strided[r][i], spec), f"rank{r} qkv[{i}]")
+                self.assertFalse(strided[r][i].is_contiguous())
+
+    def test_strided_qkv_alternates_receive_buffers(self):
+        """Successive exchanges must not land in the buffer still being read.
+
+        The returned views stay alive until attention has consumed them, so
+        two calls in a row have to name different staging roles.
+        """
+        world, b, s_global, h_global, d = 4, 1, 128, 8, 64
+        shard = tuple(
+            torch.randn(
+                b,
+                s_global // world,
+                h_global,
+                d,
+                dtype=torch.bfloat16,
+                device=get_device(),
+            )
+            for _ in range(3)
+        )
+        roles = []
+
+        def recording_a2a(x, role=None):
+            roles.append(role)
+            return torch.empty_like(x)
+
+        with (
+            torch.no_grad(),
+            patch(f"{_USP}._usp_all_to_all_single", recording_a2a),
+            patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=world),
+        ):
+            for _ in range(4):
+                usp_mod._usp_input_all_to_all_qkv(*shard, allow_strided_qkv=True)
+            usp_mod._usp_input_all_to_all_qkv(*shard)
+
+        self.assertEqual(len(set(roles[:4])), 2, roles)
+        self.assertNotEqual(roles[0], roles[1])
+        self.assertEqual(roles[0], roles[2])
+        # The copying default keeps its single buffer.
+        self.assertEqual(roles[4], "usp_packed_qkv_recv")
+
     def test_packed_path_issues_one_collective(self):
         """The unpacked fallback is also bit-exact, so the equivalence test above
         passes either way; only the collective count proves the packed path ran.

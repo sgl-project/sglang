@@ -1592,7 +1592,17 @@ class USPAttention(nn.Module):
                 k = k.contiguous()
                 v = v.contiguous()
             else:
-                q, k, v = _usp_input_all_to_all_qkv(q, k, v)
+                # The ring path reshapes and chunks Q/K/V, so only the plain
+                # Ulysses handoff into the backend can take them interleaved.
+                q, k, v = _usp_input_all_to_all_qkv(
+                    q,
+                    k,
+                    v,
+                    allow_strided_qkv=(
+                        get_ring_parallel_world_size() <= 1
+                        and self.attn_impl.accepts_strided_qkv
+                    ),
+                )
 
         # Ring Attention within subgroups or local attention
         if get_ring_parallel_world_size() > 1:

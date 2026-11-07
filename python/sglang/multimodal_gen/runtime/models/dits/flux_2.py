@@ -29,6 +29,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_flux2_gated_resnorm,
     can_use_flux2_strided_qknorm_rope,
     can_use_fused_layernorm_modulate,
+    can_use_modulate_scale_shift_cuda,
     can_use_xpu_layernorm_modulate,
     flux2_gated_resnorm_raw,
     flux2_strided_qknorm_rope,
@@ -36,6 +37,7 @@ from sglang.kernels.ops.diffusion import (
     fused_layernorm_modulate_raw,
     fused_packed_silu_mul_bitexact,
     is_plain_layer_norm,
+    modulate_scale_shift_cuda,
     residual_gate_add,
     tensors_equal,
     try_flux2_token_cat_fp8,
@@ -396,6 +398,26 @@ def _flux2_norm_maybe_fp8(
     return norm_hidden_states, hidden_states
 
 
+def _flux2_norm_then_modulate(
+    norm: nn.Module,
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor,
+    scale_row: torch.Tensor,
+    shift_row: torch.Tensor,
+) -> torch.Tensor:
+    """``LN(x) * (1 + scale) + shift`` with the modulate chain in one kernel.
+
+    The fused modulate reproduces the eager rounding boundaries exactly, so it
+    needs no quality gate; it is used wherever the single-kernel LN+modulate
+    is unavailable.
+    """
+    normed = norm(x)
+    if can_use_modulate_scale_shift_cuda(normed, scale_row, shift_row):
+        return modulate_scale_shift_cuda(normed, scale_row, shift_row)
+    return normed * (1 + scale) + shift
+
+
 def _flux2_norm_modulate(
     norm: nn.Module,
     x: torch.Tensor,
@@ -417,7 +439,7 @@ def _flux2_norm_modulate(
         or not is_plain_layer_norm(norm, x.shape[-1])
         or not (use_xpu or use_cuda)
     ):
-        return norm(x) * (1 + scale) + shift
+        return _flux2_norm_then_modulate(norm, x, scale, shift, scale_row, shift_row)
 
     # The bit-exact contract is set by dtype/reduction width/affine-row
     # layout, not by the number of independent rows.  Excluding sequence
@@ -441,7 +463,7 @@ def _flux2_norm_modulate(
         out = kernel(x, scale_row, shift_row, norm.eps)
     except Exception as exc:
         _FLUX2_LN_MOD.on_exception(exc, logger=logger)
-        return norm(x) * (1 + scale) + shift
+        return _flux2_norm_then_modulate(norm, x, scale, shift, scale_row, shift_row)
     if verified:
         return out
     ref = norm(x) * (1 + scale) + shift
