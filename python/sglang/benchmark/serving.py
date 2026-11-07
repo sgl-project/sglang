@@ -117,6 +117,7 @@ class RequestFuncOutput:
     cached_tokens: int = 0
     cached_tokens_details: Optional[Dict[str, Any]] = None
     spec_accept_length: float = 0.0
+    spec_verify_ct: int = 0
     spec_cap_length: float = 0.0
     spec_block_accept_length: float = 0.0
     spec_cap_lens_histogram: List[int] = field(default_factory=list)
@@ -284,6 +285,30 @@ def _record_server_prompt_len(data, output):
     prompt_tokens = reported.get("prompt_tokens")
     if prompt_tokens:
         output.prompt_len = prompt_tokens
+
+
+def calculate_run_accept_length(
+    outputs: List[RequestFuncOutput],
+) -> Optional[float]:
+    """Total accepted tokens / total verify steps over this run's requests,
+    the server's avg_spec_accept_length definition without warmup or earlier runs."""
+    total_tokens = 0.0
+    total_verify_ct = 0.0
+    for output in outputs:
+        if not output.success or output.spec_accept_length <= 0:
+            continue
+        if output.spec_verify_ct > 0:
+            verify_ct = output.spec_verify_ct
+        elif output.output_len > 0:
+            # Older servers send no spec_verify_ct; recover it from the length.
+            verify_ct = output.output_len / output.spec_accept_length
+        else:
+            continue
+        total_tokens += output.spec_accept_length * verify_ct
+        total_verify_ct += verify_ct
+    if total_verify_ct <= 0:
+        return None
+    return total_tokens / total_verify_ct
 
 
 # set ignore_eos True by default
@@ -521,6 +546,7 @@ async def async_request_openai_chat_completions(
                         output.spec_accept_length = (
                             _meta_info.get("spec_accept_length", 0.0) or 0.0
                         )
+                        output.spec_verify_ct = _meta_info.get("spec_verify_ct", 0) or 0
                         output.spec_cap_length = (
                             _meta_info.get("spec_cap_length", 0.0) or 0.0
                         )
@@ -764,6 +790,9 @@ async def async_request_sglang_generate(
                                 output.spec_accept_length = _meta_info[
                                     "spec_accept_length"
                                 ]
+                                output.spec_verify_ct = (
+                                    _meta_info.get("spec_verify_ct", 0) or 0
+                                )
 
                             # NOTE: Some completion API might have a last
                             # usage summary response without a token so we
@@ -1639,6 +1668,11 @@ async def benchmark(
     if pbar is not None:
         pbar.close()
 
+    # The server's avg_spec_accept_length is accumulated since it started (or
+    # since the last /flush_cache), so it also counts warmup requests and any
+    # earlier run. Prefer the per-request values of this run; fall back to the
+    # server's number only when the responses carry no speculative metadata.
+    server_accept_length = None
     if "sglang" in backend:
         server_info = requests.get(
             base_url + "/server_info", headers=get_auth_headers()
@@ -1651,15 +1685,14 @@ async def benchmark(
                 "internal_states" in server_info_json
                 and server_info_json["internal_states"]
             ):
-                accept_length = server_info_json["internal_states"][0].get(
+                server_accept_length = server_info_json["internal_states"][0].get(
                     "avg_spec_accept_length", None
                 )
-            else:
-                accept_length = None
-        else:
-            accept_length = None
-    else:
-        accept_length = None
+    accept_length = calculate_run_accept_length(outputs)
+    accept_length_source = "per_request" if accept_length is not None else None
+    if accept_length is None and server_accept_length:
+        accept_length = server_accept_length
+        accept_length_source = "server_cumulative"
 
     # Compute metrics and print results
     benchmark_duration = time.perf_counter() - benchmark_start_time
@@ -1746,6 +1779,13 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+        # A separate line: CI log parsers read the value from "Accept length:".
+        source = (
+            "this run (per request)"
+            if accept_length_source == "per_request"
+            else "server lifetime (/server_info)"
+        )
+        print("{:<40} {:<10}".format("Speculative stats source:", source))
     if goodput:
         print_goodput(goodput)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
@@ -1903,6 +1943,8 @@ async def benchmark(
             "p99_itl_ms": metrics.p99_itl_ms,
             "concurrency": metrics.concurrency,
             "accept_length": accept_length,
+            "accept_length_source": accept_length_source,
+            "server_avg_spec_accept_length": server_accept_length,
             "max_output_tokens_per_s": metrics.max_output_tokens_per_s,
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
