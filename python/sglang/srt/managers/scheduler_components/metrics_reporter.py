@@ -1214,6 +1214,12 @@ class SchedulerMetricsReporter:
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
         self.stats.hicache_host_total_tokens = host_total
+        if isinstance(self.scheduler.tree_cache, UnifiedRadixCache):
+            (
+                self.stats.hicache_host_prefetch_staging_tokens,
+                self.stats.hicache_host_prefetch_staging_limit_tokens,
+                self.stats.hicache_host_storage_backup_inflight_tokens,
+            ) = self.scheduler.tree_cache.host_storage_occupancy()
 
         mamba_host_pool = None
         if (

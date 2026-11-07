@@ -168,6 +168,12 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
+    # Host tokens held by L3->L2 prefetches that have not joined the tree yet,
+    # and the cap new prefetches stop at; both stay 0 without a storage backend.
+    hicache_host_prefetch_staging_tokens: int = 0
+    hicache_host_prefetch_staging_limit_tokens: int = 0
+    # Host tokens pinned until their L2->L3 write is acknowledged.
+    hicache_host_storage_backup_inflight_tokens: int = 0
     # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
     hicache_host_mamba_used_states: int = 0
     hicache_host_mamba_total_states: int = 0
@@ -781,6 +787,33 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self.hicache_host_total_tokens = Gauge(
                 name="sglang:hicache_host_total_tokens",
                 documentation="Total capacity of the host KV cache in tokens.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_prefetch_staging_tokens = Gauge(
+                name="sglang:hicache_host_prefetch_staging_tokens",
+                documentation="Host KV tokens held by L3->L2 prefetches that "
+                "have not joined the cache tree yet. They cannot be evicted, so "
+                "with hicache_host_used_tokens they show how much of the host "
+                "tier is free to absorb device evictions.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_prefetch_staging_limit_tokens = Gauge(
+                name="sglang:hicache_host_prefetch_staging_limit_tokens",
+                documentation="Prefetch staging level at which new L3->L2 "
+                "prefetches are declined; see "
+                "sglang:storage_prefetch_rate_limited_tokens_total.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
+            self.hicache_host_storage_backup_inflight_tokens = Gauge(
+                name="sglang:hicache_host_storage_backup_inflight_tokens",
+                documentation="Host KV tokens whose L2->L3 write is in flight. "
+                "They stay pinned in the host tier until the storage backend "
+                "acknowledges the write; a rising value means L3 writes lag "
+                "behind host-tier churn. Cache host-memory mode only; "
+                "buffer_only mode stages its writes elsewhere and reports 0.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1742,6 +1775,20 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
+            # Without a storage backend these stay 0; skip the series.
+            if stats.hicache_host_prefetch_staging_limit_tokens > 0:
+                self._log_gauge(
+                    self.hicache_host_prefetch_staging_tokens,
+                    stats.hicache_host_prefetch_staging_tokens,
+                )
+                self._log_gauge(
+                    self.hicache_host_prefetch_staging_limit_tokens,
+                    stats.hicache_host_prefetch_staging_limit_tokens,
+                )
+                self._log_gauge(
+                    self.hicache_host_storage_backup_inflight_tokens,
+                    stats.hicache_host_storage_backup_inflight_tokens,
+                )
             # Non-hybrid models have no host Mamba pool; skip the series rather
             # than exporting a permanent 0/0.
             if stats.hicache_host_mamba_total_states > 0:
@@ -2280,6 +2327,15 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
                 **self.labels, reason=reason
             )
 
+        self.storage_prefetch_rate_limited_tokens_total = Counter(
+            name="sglang:storage_prefetch_rate_limited_tokens_total",
+            documentation="Prefetch-candidate tokens whose L3 lookup was "
+            "skipped because L3->L2 prefetch staging reached "
+            "sglang:hicache_host_prefetch_staging_limit_tokens. Attempt-level: "
+            "a request that retries after staging drains counts again.",
+            labelnames=labels.keys(),
+        )
+
         self.backup_dropped_tokens_total = Counter(
             name="sglang:hicache_backup_dropped_tokens_total",
             documentation="Buffer-mode backup tokens that never reached L3 "
@@ -2348,6 +2404,12 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
             buckets=bucket_bandwidth,
         )
+
+    def log_storage_prefetch_rate_limited_tokens(self, num_tokens: int):
+        if num_tokens > 0:
+            self.storage_prefetch_rate_limited_tokens_total.labels(**self.labels).inc(
+                num_tokens
+            )
 
     def log_prefetched_tokens(self, prefetched_tokens: int):
         if prefetched_tokens > 0:
@@ -2621,6 +2683,17 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=list(labels.keys()) + ["reason", "pool"],
         )
 
+        self.write_back_backup_blocked_tokens = Counter(
+            name="sglang:hicache_write_back_backup_blocked_tokens_total",
+            documentation="Device KV tokens a write-back eviction could "
+            "neither back up (the host tier had no free or evictable room) "
+            "nor drop (a node in the subtree was pinned), so they stayed on "
+            "the device. Counted once per eviction attempt. Admission still "
+            "counts these tokens as evictable, so a sustained rate precedes "
+            "prefill allocation failures.",
+            labelnames=labels.keys(),
+        )
+
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
 
@@ -2644,6 +2717,9 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def observe_backup_duration(self, duration_seconds: float) -> None:
         self.backup_duration_seconds.labels(**self.labels).observe(duration_seconds)
+
+    def increment_write_back_backup_blocked_tokens(self, num_tokens: int) -> None:
+        self.write_back_backup_blocked_tokens.labels(**self.labels).inc(num_tokens)
 
     def increment_dropped_tokens(self, num_tokens: int, reason: str, pool: str) -> None:
         self.hicache_dropped_tokens.labels(**self.labels, reason=reason, pool=pool).inc(

@@ -181,6 +181,14 @@ class _OngoingWriteThrough(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
+class _OngoingStorageBackup(NamedTuple):
+    """Tracks an in-flight H→L3 backup; the node stays host-pinned until it acks."""
+
+    node_id: NodeId
+    lock_params: DecLockRefParams
+    num_tokens: int
+
+
 class _OngoingLoadBack(NamedTuple):
     """Tracks an in-flight H→D load-back operation."""
 
@@ -510,7 +518,7 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
-        self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        self.ongoing_backup: dict[int, _OngoingStorageBackup] = {}
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -1233,6 +1241,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 node_id,
                             )
                         else:
+                            self._record_write_back_backup_blocked(backup_kv)
                             logger.warning(
                                 "write_back: backup failed under host memory "
                                 "pressure but subtree drop declined (node "
@@ -1322,6 +1331,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 node_id,
             )
         else:
+            self._record_write_back_backup_blocked(backup_kv)
             logger.warning(
                 "write_back: backup failed under host memory pressure but "
                 "subtree drop declined (node locked); root node %d stays "
@@ -1335,6 +1345,19 @@ class UnifiedRadixCache(BasePrefixCache):
             and self.cache_controller is not None
             and self.cache_controller.write_policy == "write_through"
         )
+
+    def _record_write_back_backup_blocked(self, backup_kv: BackupKV) -> None:
+        """Count device tokens a write-back eviction could neither back up nor drop."""
+        if self.metrics_collector is None:
+            return
+        blocked_tokens = sum(
+            self.tree_core.build_backup_spec(node_id)[0].numel()
+            for node_id in backup_kv.node_ids
+        )
+        if blocked_tokens > 0:
+            self.metrics_collector.increment_write_back_backup_blocked_tokens(
+                blocked_tokens
+            )
 
     def _record_dropped_tokens(self, dropped_tokens: int, reason: str) -> None:
         """Record logical KV tokens irreversibly dropped without a host backup."""
@@ -2383,9 +2406,10 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_backup[operation_id] = (
+        self.ongoing_backup[operation_id] = _OngoingStorageBackup(
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
+            len(spec.host_value),
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -2525,6 +2549,13 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         if not buffer_mode and self.cache_controller.prefetch_rate_limited():
             stats["declined_rate_limited"] += 1
+            if (
+                self.enable_storage_metrics
+                and self.storage_metrics_collector is not None
+            ):
+                self.storage_metrics_collector.log_storage_prefetch_rate_limited_tokens(
+                    prefetch_length
+                )
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
@@ -3264,6 +3295,17 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l1l2_miss_tokens"] += requested
         stats["l3_miss_tokens"] += miss
 
+    def host_storage_occupancy(self) -> tuple[int, int, int]:
+        """Host tokens held by L3 traffic: (prefetch staging, the staging cap,
+        backups awaiting the L3 ack); all 0 without a storage backend."""
+        cc = self.cache_controller
+        if not self.enable_storage or cc is None:
+            return 0, 0, 0
+        backup_inflight = sum(
+            entry.num_tokens for entry in self.ongoing_backup.values()
+        )
+        return cc.prefetch_tokens_occupied, cc.prefetch_capacity_limit, backup_inflight
+
     def prefetch_outcome_stats_snapshot(self) -> dict:
         return self._prefetch_outcome_stats.copy()
 
@@ -3626,8 +3668,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 else:
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:
-                        node_id, lock_params = entry
-                        self.dec_host_lock_ref(node_id, lock_params)
+                        self.dec_host_lock_ref(entry.node_id, entry.lock_params)
                 if (
                     log_metrics
                     and self.enable_storage_metrics
