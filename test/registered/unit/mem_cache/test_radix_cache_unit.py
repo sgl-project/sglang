@@ -487,6 +487,8 @@ class TestRadixCache(CustomTestCase):
             last_node=cache.root_node,
             lock=None,
         )
+        # No dLLM block in flight, so every checkpoint length is cacheable.
+        req.cacheable_checkpoint_len = lambda up_to: up_to
         req.full_untruncated_fill_ids = token_ids
         req.origin_input_ids = token_ids
         req.output_ids = array("q")
@@ -539,6 +541,8 @@ class TestRadixCache(CustomTestCase):
             last_node=cache.root_node,
             lock=None,
         )
+        # No dLLM block in flight, so every checkpoint length is cacheable.
+        req.cacheable_checkpoint_len = lambda up_to: up_to
 
         up_to = len(prompt_ids) + len(output_ids)
         cache.checkpoint(req, up_to=up_to)
