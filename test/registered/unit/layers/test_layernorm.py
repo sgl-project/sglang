@@ -72,12 +72,14 @@ class TestRMSNormHipWithoutVllm(CustomTestCase):
             ),
             "weight_dtype_mismatch": dict(norm_kwargs=dict(weight_dtype=torch.float32)),
             "post_residual_addition": dict(post_residual_addition=True),
+            "residual_dtype_mismatch": dict(residual_dtype=torch.float32),
             "batch_invariant_mode": dict(batch_invariant=True),
         }
         for name, case in cases.items():
             with self.subTest(mode=name):
                 norm = _make_norm(**case.get("norm_kwargs", {}))
                 x, residual = _make_inputs()
+                residual = residual.to(case.get("residual_dtype", residual.dtype))
                 post = (
                     torch.randn_like(residual)
                     if case.get("post_residual_addition")

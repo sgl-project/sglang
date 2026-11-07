@@ -907,7 +907,9 @@ class RMSNorm(BaseFusedOp):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if not _has_vllm_rms_norm:
             if self._can_use_torch_rms_norm(
-                x=x, post_residual_addition=post_residual_addition
+                x=x,
+                residual=residual,
+                post_residual_addition=post_residual_addition,
             ):
                 return self._forward_torch_rms_norm(x=x, residual=residual)
             return self.forward_native(x, residual, post_residual_addition)
@@ -948,7 +950,10 @@ class RMSNorm(BaseFusedOp):
         return out
 
     def _can_use_torch_rms_norm(
-        self, x: torch.Tensor, post_residual_addition: Optional[torch.Tensor]
+        self,
+        x: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        post_residual_addition: Optional[torch.Tensor],
     ) -> bool:
         # Checked per call: some models flip cast_x_before_out_mul after construction.
         return (
@@ -958,6 +963,8 @@ class RMSNorm(BaseFusedOp):
             and not self.fp32_residual
             and self.override_orig_dtype is None
             and x.dtype == self.weight.dtype
+            # forward_native returns the residual in x's dtype
+            and (residual is None or residual.dtype == x.dtype)
             and not is_batch_invariant_mode_enabled()
         )
 
