@@ -442,7 +442,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref())
                 .with_server_info_state_keys(cfg.server_info_state_keys.clone()),
             metrics,
-            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args),
+            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args)?,
             generate_validator: cfg.generate_validator.clone(),
         },
     );

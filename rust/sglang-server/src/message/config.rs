@@ -695,12 +695,12 @@ impl MetricsConfig {
     }
 }
 
-/// Python's `RequestLogger` settings for `--log-requests` (text format to
-/// stdout; Rust mode refuses the other formats and targets at startup). Every
-/// value comes from Python so the two servers render the same lines: the
-/// level's metadata (`RequestLogger._compute_metadata`), the request class
-/// with its fields in order and each default as Python renders it, the header
-/// whitelist and `SGLANG_LOG_REQUEST_EXCEEDED_MS`.
+/// Python's `RequestLogger` settings for `--log-requests`. Every value comes
+/// from Python so the two servers render the same lines: the level's metadata
+/// (`RequestLogger._compute_metadata`), the format, the request class with its
+/// fields in order and each default as Python renders it, the OpenAI request
+/// models' fields, the header whitelist, `SGLANG_LOG_REQUEST_EXCEEDED_MS` and
+/// the targets (`--log-requests-target`).
 #[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
 #[derive(Clone, Debug)]
 pub struct RequestLogConfig {
@@ -709,8 +709,12 @@ pub struct RequestLogConfig {
     /// Request fields and output keys left out of the lines at this level.
     pub skip_names: Vec<String>,
     pub out_skip_names: Vec<String>,
+    /// `--log-requests-format json`: each line is the JSON object Python's
+    /// `log_json` writes; otherwise the text line.
+    pub json: bool,
     /// The request class name and its `(field, rendered default)` pairs, in
-    /// declaration order.
+    /// declaration order; the default as the format renders a value (its
+    /// `repr`-style text, or its JSON).
     pub class_name: String,
     pub fields: Vec<(String, String)>,
     /// The fields a batch item's object (Python `obj[i]`) takes from the
@@ -722,6 +726,19 @@ pub struct RequestLogConfig {
     pub headers: Vec<String>,
     /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
     pub exceeded_ms: i64,
+    /// Log each OpenAI request as received, before it is adapted (Python's
+    /// `log_openai_received_request`, from level 2).
+    pub openai_requests: bool,
+    /// `ChatCompletionRequest`'s and `CompletionRequest`'s fields in
+    /// declaration order, each with its default as JSON (`None` when it has
+    /// none or it is `None`), for the OpenAI line's `model_dump`.
+    pub chat_completion_fields: Vec<(String, Option<String>)>,
+    pub completion_fields: Vec<(String, Option<String>)>,
+    /// Write to stdout; and to each of `files`, an hourly-rotated
+    /// `{hostname}_{rank}.log` in a target directory (Python creates the
+    /// directory).
+    pub stdout: bool,
+    pub files: Vec<String>,
 }
 
 #[pyo3::pymethods]
@@ -731,35 +748,53 @@ impl RequestLogConfig {
         max_length,
         skip_names,
         out_skip_names,
+        json = false,
         class_name,
         fields,
         batch_item_fields,
         batch_shared_fields,
         headers,
         exceeded_ms,
+        openai_requests = false,
+        chat_completion_fields = Vec::new(),
+        completion_fields = Vec::new(),
+        stdout = true,
+        files = Vec::new(),
     ))]
     #[allow(clippy::too_many_arguments)]
     fn py_new(
         max_length: usize,
         skip_names: Vec<String>,
         out_skip_names: Vec<String>,
+        json: bool,
         class_name: String,
         fields: Vec<(String, String)>,
         batch_item_fields: Vec<String>,
         batch_shared_fields: Vec<String>,
         headers: Vec<String>,
         exceeded_ms: i64,
+        openai_requests: bool,
+        chat_completion_fields: Vec<(String, Option<String>)>,
+        completion_fields: Vec<(String, Option<String>)>,
+        stdout: bool,
+        files: Vec<String>,
     ) -> Self {
         Self {
             max_length,
             skip_names,
             out_skip_names,
+            json,
             class_name,
             fields,
             batch_item_fields,
             batch_shared_fields,
             headers,
             exceeded_ms,
+            openai_requests,
+            chat_completion_fields,
+            completion_fields,
+            stdout,
+            files,
         }
     }
 }
