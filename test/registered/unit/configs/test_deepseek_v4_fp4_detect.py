@@ -31,9 +31,7 @@ def _make_checkpoint(tmp_path, dtype: str) -> str:
     return str(tmp_path)
 
 
-@pytest.mark.parametrize(
-    "dtype", ["BF16", "F16", "F32"], ids=["bf16", "f16", "f32"]
-)
+@pytest.mark.parametrize("dtype", ["BF16", "F16", "F32"], ids=["bf16", "f16", "f32"])
 def test_unquantized_expert_dtype_detects_not_fp4(tmp_path, dtype):
     """Unquantized checkpoints must route to the unquantized expert path."""
     assert try_detect_fp4_experts(_make_checkpoint(tmp_path, dtype)) is False
