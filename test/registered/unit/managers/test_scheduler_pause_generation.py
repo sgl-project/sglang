@@ -146,6 +146,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.invariant_checker = MagicMock()
         scheduler.kv_events_publisher = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.send_abort_output = MagicMock()

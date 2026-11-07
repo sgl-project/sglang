@@ -109,7 +109,7 @@ struct K3FrontAllGather {
     auto M = SymbolicSize{"num_tokens"};
     auto S = SymbolicSize{"local_stride"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
     TensorMatcher({M, kNLocal})
         .with_strides({S, 1})
         .with_dtype<float>()

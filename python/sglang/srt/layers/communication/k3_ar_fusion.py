@@ -368,8 +368,9 @@ def slice_gemm(
             return torch.nn.functional.linear(x, weight)
         return torch.mm(x, weight.t(), out_dtype=out_dtype)
     out = x.new_empty((m, n), dtype=out_dtype)
-    # warp split-K compiles per M: only captured batches (a fixed set of M) take it
-    if m <= _SLICE_WARP_SPLITK_MAX_TOKENS and get_is_capture_mode():
+    # warp split-K compiles per M: only captured batches (a fixed set of M) take it,
+    # and its 16- or 32-column output tiles must divide N (not the TP16 front's 1048)
+    if m <= _SLICE_WARP_SPLITK_MAX_TOKENS and n % 16 == 0 and get_is_capture_mode():
         from sglang.kernels.ops.gemm.dense_bf16_gemm_warp_splitk import (
             default_tactic,
             run_warp_splitk_dense,
