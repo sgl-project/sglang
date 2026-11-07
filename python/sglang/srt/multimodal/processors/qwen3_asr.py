@@ -7,6 +7,7 @@ from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.qwen3_asr import Qwen3ASRForConditionalGeneration
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
+    ZERO_MROPE_POSITION_DELTA,
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
@@ -55,7 +56,7 @@ class Qwen3ASRMultimodalProcessor(BaseMultimodalProcessor):
             seq_len = input_ids.shape[-1] if input_ids.dim() > 1 else input_ids.shape[0]
         positions = torch.arange(seq_len, dtype=torch.long)
         mrope_positions = positions.unsqueeze(0).expand(3, -1).clone()
-        return mrope_positions, torch.tensor([0], dtype=torch.long)
+        return mrope_positions, ZERO_MROPE_POSITION_DELTA.clone()
 
     async def process_mm_data_async(
         self,
