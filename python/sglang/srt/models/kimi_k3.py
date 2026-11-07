@@ -20,6 +20,7 @@ from torch import nn
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.srt.configs.kimi_k3 import KimiK3Config
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.configs.mamba_utils import mamba2_state_dtype
 from sglang.srt.distributed import (
     divide,
     tensor_model_parallel_all_reduce,
@@ -2053,13 +2054,17 @@ class KimiK3DeltaAttention(nn.Module):
             float(self.o_norm.eps),
         )
         mamba = get_exec().mamba
+        if mamba.mamba_ssm_dtype is not None:
+            ssm_is_fp32 = mamba.mamba_ssm_dtype == "float32"
+        else:
+            ssm_is_fp32 = mamba2_state_dtype(None).temporal == torch.float32
         # The FP32 fused consumer is only reachable on the admitted SM100/103
         # Kimi route. Repeat that gate here so a direct caller does not import
         # FlashInfer or pack the per-layer FP32 weights for a BF16 pool; the
         # actual pool dtype still remains authoritative at run time.
         if (
             mamba.linear_attn_decode_backend == "flashinfer"
-            and mamba.mamba_ssm_dtype != "bfloat16"
+            and ssm_is_fp32
             and SpeculativeAlgorithm.from_string(
                 get_spec().speculative_algorithm
             ).is_none()

@@ -141,6 +141,7 @@ def _prepare(model, kernel, *, backend="flashinfer", speculative=False):
             from_string=lambda value: SimpleNamespace(is_none=lambda: value is None)
         ),
         "get_platform": lambda: SimpleNamespace(is_cuda=True),
+        "mamba2_state_dtype": lambda _: SimpleNamespace(temporal=torch.float32),
         "rank0_log": Mock(),
     }
     prepare = _source_function(

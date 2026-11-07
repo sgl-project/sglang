@@ -350,6 +350,7 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                         ),
                         SpeculativeAlgorithm=self.algorithm,
                         get_platform=lambda: SimpleNamespace(is_cuda=True),
+                        mamba2_state_dtype=self.params["mamba2_state_dtype"],
                     ),
                 )
                 with (

@@ -392,9 +392,11 @@ def handle_linear_attn_backend(server_args: Any):
     ):
         raise ValueError(
             "--linear-attn-decode-backend flashinfer on SM100+ requires a "
-            "BF16 Mamba state by default. Pass --mamba-ssm-dtype bfloat16, "
-            "or use the explicit FP32 Kimi route with "
-            f"--mamba-ssm-dtype float32. Effective dtype: {ssm_dtype}."
+            "BF16 Mamba state by default. Pass "
+            "--linear-attn-decode-backend flashinfer --mamba-ssm-dtype "
+            "bfloat16, or use the explicit FP32 Kimi route with both "
+            "--linear-attn-decode-backend flashinfer and "
+            f"--mamba-ssm-dtype float32. CLI/env-resolved dtype: {ssm_dtype}."
         )
 
     verify = cfg.linear_attn_verify_backend
@@ -437,7 +439,7 @@ def handle_linear_attn_backend(server_args: Any):
         raise ValueError(
             "--linear-attn-verify-backend flashinfer on SM100+ requires a "
             "BF16 Mamba state; "
-            f"effective dtype: {ssm_dtype}."
+            f"CLI/env-resolved dtype: {ssm_dtype}."
         )
 
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)
