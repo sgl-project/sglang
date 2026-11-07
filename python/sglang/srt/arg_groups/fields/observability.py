@@ -79,6 +79,10 @@ class Observability(msgspec.Struct):
         bool,
         "Enable estimated MFU-related prometheus metrics.",
     ] = False
+    enable_prefix_cache_hit_rate_window: A[
+        bool,
+        "Add a token-weighted prefix cache hit rate over the most recent 1000 admitted requests (vLLM CachingMetrics semantics) to the prefill and decode log lines. Log-only: it does not affect the sglang:cache_hit_rate gauge, which keeps its per-report semantics either way.",
+    ] = False
     enable_metrics_for_all_schedulers: A[
         bool,
         "Enable --enable-metrics-for-all-schedulers when you want schedulers on all TP ranks (not just TP 0) to record request metrics separately. This is especially useful when dp_attention is enabled, as otherwise all metrics appear to come from TP 0.",
