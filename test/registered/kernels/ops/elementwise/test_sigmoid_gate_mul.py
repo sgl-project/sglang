@@ -77,5 +77,19 @@ def test_sigmoid_gate_mul_contiguous_output():
     assert out.is_contiguous()
 
 
+def test_sigmoid_gate_mul_strided_gate_round_sigmoid_is_bit_exact():
+    num_tokens = 300
+    # The gate is the tail columns of a merged [q_up | gate] GEMM output.
+    from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, 8192, dtype=torch.bfloat16, device=DEVICE)
+    merged = torch.randn(num_tokens, 4096 + 8192, dtype=torch.bfloat16, device=DEVICE)
+    gate = merged[:, 4096:]
+    ref = x * torch.sigmoid(gate)
+    assert torch.equal(fused_sigmoid_mul(x, gate, round_sigmoid=True), ref)
+    assert torch.equal(fused_sigmoid_mul(x, gate.contiguous(), round_sigmoid=True), ref)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))

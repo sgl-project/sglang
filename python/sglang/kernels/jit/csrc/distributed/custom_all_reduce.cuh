@@ -39,6 +39,13 @@
 #include <cstring>
 #include <string>
 
+// Kept out of sgl_kernel/utils.cuh: every JIT build's cache key covers that
+// header's contents, so an edit there rebuilds every CUDA kernel.
+#ifdef USE_ROCM
+#define cudaMemcpyDeviceToDevice hipMemcpyDeviceToDevice
+#define cudaGetDevice hipGetDevice
+#endif
+
 namespace sglang {
 
 using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
@@ -378,6 +385,11 @@ ALL_REDUCE_KERNEL void all_reduce_2shot_pull_kernel(const __grid_constant__ AllR
   }
 
   PDLTriggerSecondary<kUsePDL>();
+#ifdef USE_ROCM
+  // s_barrier does not drain a wave's outstanding stores and the signalling
+  // thread's release covers only its own wave, so each wave publishes its own.
+  ptx::fence_release_sys();
+#endif
   __syncthreads();
   barrier.arrive_rel_acq(/*n=*/1);
 }
@@ -455,6 +467,11 @@ struct AllReduceKernel {
                                    : all_reduce_1shot_push_kernel<T, kWorldSize, kUsePDL>;
       // the grid is bound to the counter array and must stay constant
       auto block_size = choose_block_size(num_vecs);
+#ifdef USE_ROCM
+      // MI350X: from 128 KB a full block per CU beats the narrower pick for
+      // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
+      if (!two_shot && num_vecs >= 8192) block_size = 1024u;
+#endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
         block_size = std::max(block_size, 32u * div_ceil(kWorldSize - 1, push.num_blocks));

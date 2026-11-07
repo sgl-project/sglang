@@ -23,7 +23,7 @@ from sglang.srt.models.locate_anything import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context, get_parallel
-from sglang.srt.utils.common import is_cpu
+from sglang.srt.utils.device import is_cpu
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -352,7 +352,7 @@ def _tiny_vision_param_names():
         get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1, attn_tp_rank=0),
         get_context().override_server_args(),
         patch.dict(os.environ, {"SGLANG_USE_CPU_ENGINE": "1"}),
-        patch("sglang.srt.utils.common.is_cpu", is_cpu.__wrapped__),
+        patch("sglang.srt.utils.device.is_cpu", is_cpu.__wrapped__),
     ):
         tower = MoonVitPretrainedModel(vision_config)
     return {f"vision_tower.{name}" for name, _ in tower.named_parameters()}
