@@ -114,8 +114,6 @@ def _ensure_dsv41_static_verify_mode() -> None:
 @functools.cache
 def _ds41_ops():
     """Resolve seven migrated DSL functions and the existing AscendC compressor."""
-    from types import SimpleNamespace
-
     import cann_ops_transformer.ops.ds41  # noqa: F401 - registers torch.ops ds41
     from sgl_kernel_npu.operators.attention import (
         mixed_quant_sparse_flash_mla,
@@ -2159,10 +2157,12 @@ class LowRatioCompressAscendBackendMixin:
         metadata.kernel_metadata[f"c{candidate_ratio}a_qli_candidate_metadata"] = buf
 
         if self._dsv41_has_candidate_consumers():
-            # Only the record count matters for the probe; replay rewrites it.
-            visible_blocks = torch.ones((t, 1), dtype=torch.int32, device=device)
+            # One candidate length per query row, including every verify token.
+            probe_candidate_lengths = torch.ones(
+                (t, 1), dtype=torch.int32, device=device
+            )
             probe = ds41.quant_sparse_lightning_indexer_metadata(
-                candidate_block_length=visible_blocks,
+                candidate_block_length=probe_candidate_lengths,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_q=None,
                 seqused_k=local_cmp_lens,

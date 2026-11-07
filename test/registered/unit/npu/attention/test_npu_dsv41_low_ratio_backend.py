@@ -95,8 +95,8 @@ class _Ds41Stub(ModuleType):
 
 
 DS41 = _Ds41Stub()
-# _ds41_ops resolves the module global at call time; replacing it is enough.
-_resolve_ds41_ops = dsv4_backend._ds41_ops
+# Keep the real resolver for routing tests; other tests use CPU metadata stubs.
+_real_ds41_ops = dsv4_backend._ds41_ops
 dsv4_backend._ds41_ops = lambda: DS41
 
 
@@ -2326,11 +2326,11 @@ class TestVerifyGraphRefresh(unittest.TestCase):
         self.assertEqual(metadata.seqused.tolist(), [0, 0])
 
 
-class TestDs41DirectAbi(unittest.TestCase):
+class TestDs41OperatorResolver(unittest.TestCase):
     """The seven kernel routes retain the AscendC compressor and caching."""
 
     def test_resolver_uses_public_kernel_apis(self):
-        groups = {
+        operator_groups = {
             "sgl_kernel_npu.operators.attention": (
                 "mixed_quant_sparse_flash_mla",
                 "mixed_quant_sparse_flash_mla_metadata",
@@ -2343,36 +2343,37 @@ class TestDs41DirectAbi(unittest.TestCase):
                 "quant_sparse_lightning_indexer_metadata",
             ),
         }
-        modules, expected = {}, {}
-        for module_name, names in groups.items():
+        stub_modules = {}
+        expected_entries = {}
+        for module_name, names in operator_groups.items():
             module = ModuleType(module_name)
             for name in names:
-                expected[name] = object()
-                setattr(module, name, expected[name])
-            modules[module_name] = module
+                expected_entries[name] = object()
+                setattr(module, name, expected_entries[name])
+            stub_modules[module_name] = module
         for name in (
             "cann_ops_transformer",
             "cann_ops_transformer.ops",
             "cann_ops_transformer.ops.ds41",
         ):
-            modules[name] = ModuleType(name)
-        expected["compressor"] = object()
-        ops = SimpleNamespace(
+            stub_modules[name] = ModuleType(name)
+        expected_entries["compressor"] = object()
+        stub_torch_ops = SimpleNamespace(
             cann_ops_transformer=SimpleNamespace(
-                ds41=SimpleNamespace(compressor=expected["compressor"])
+                ds41=SimpleNamespace(compressor=expected_entries["compressor"])
             )
         )
         with (
-            patch.dict(sys.modules, modules),
-            patch.object(dsv4_backend.torch, "ops", ops),
+            patch.dict(sys.modules, stub_modules),
+            patch.object(dsv4_backend.torch, "ops", stub_torch_ops),
         ):
-            _resolve_ds41_ops.cache_clear()
+            _real_ds41_ops.cache_clear()
             try:
-                resolved = _resolve_ds41_ops()
-                self.assertIs(_resolve_ds41_ops(), resolved)
-                self.assertEqual(vars(resolved), expected)
+                resolved_entries = _real_ds41_ops()
+                self.assertIs(_real_ds41_ops(), resolved_entries)
+                self.assertEqual(vars(resolved_entries), expected_entries)
             finally:
-                _resolve_ds41_ops.cache_clear()
+                _real_ds41_ops.cache_clear()
 
 
 if __name__ == "__main__":
