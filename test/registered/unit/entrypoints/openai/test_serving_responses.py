@@ -16,7 +16,12 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
+from openai_harmony import (
+    Conversation,
+    Message,
+    Role,
+    ToolNamespaceConfig,
+)
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -1802,6 +1807,137 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
         hooks = build.call_args.args[0].chat_hooks
         self.assertIs(hooks.tool_call_id.__self__, serving)
         self.assertIsNotNone(serving._encoding_adapter)
+
+
+class HarmonyHeaderRecoveryTestCase(CustomTestCase):
+    def _response_from_tokens(self, token_ids, declared_tool="echo"):
+        serving = make_serving(model_type="gpt_oss")
+
+        async def generate(*args, **kwargs):
+            chunk = engine_chunk("", len(token_ids), finish=True)
+            chunk["output_ids"] = token_ids
+            yield chunk
+
+        serving.tokenizer_manager.generate_request = generate
+        tools = (
+            [
+                {
+                    "type": "function",
+                    "name": declared_tool,
+                    "description": "Return the supplied text.",
+                    "parameters": {"type": "object"},
+                }
+            ]
+            if declared_tool is not None
+            else []
+        )
+        request = ResponsesRequest(model="x", input="hi", tools=tools, store=False)
+        return asyncio.run(serving.create_responses(request))
+
+    def test_malformed_headers_recover_function_call_response(self):
+        """Recover each malformed header without losing earlier output or body text."""
+        encoding = get_encoding()
+        arguments = '{"text":"literal <|call|> and café"}'
+        prefix = "<|channel|>analysis<|message|>plan<|end|><|start|>assistant"
+        for header in (
+            "<|channel|>commentary to=functions.echo "
+            "<|constrain|>commentary to=assistant "
+            "<|constrain|>analysis to=functions.echo json<|message|>",
+            "<|channel|>analysis to=functions.echo",
+            "<|channel|>analysis to=functions.echo<|constrain|>",
+        ):
+            with self.subTest(header=header):
+                tokens = (
+                    encoding.encode(prefix + header, allowed_special="all")
+                    + encoding.encode(arguments, disallowed_special=())
+                    + encoding.encode("<|call|>", allowed_special="all")
+                )
+                response = self._response_from_tokens(tokens)
+                self.assertIsInstance(
+                    response, ResponsesResponse, getattr(response, "body", None)
+                )
+                self.assertEqual(
+                    [item.type for item in response.output],
+                    ["reasoning", "function_call"],
+                )
+                self.assertEqual(response.output[0].content[0].text, "plan")
+                call = response.output[1]
+                self.assertEqual((call.name, call.arguments), ("echo", arguments))
+                self.assertEqual(response.usage.completion_tokens, len(tokens))
+
+    def test_recovery_rejects_unrecognized_headers(self):
+        """Recovery must not invent calls or discard authored header text."""
+        encoding = get_encoding()
+        header = "<|channel|>commentary to="
+        cases = (
+            (
+                "undeclared",
+                header + "functions.other",
+                '{"x":1}',
+                "<|call|>",
+                "echo",
+                False,
+            ),
+            ("no_tools", header + "functions.echo", '{"x":1}', "<|call|>", None, False),
+            ("builtin", header + "python", '{"x":1}', "<|call|>", "python", False),
+            (
+                "truncated",
+                header + "functions.echo",
+                '{"x":',
+                "<|call|>",
+                "echo",
+                False,
+            ),
+            (
+                "no_handoff",
+                header + "functions.echo",
+                '{"x":1}',
+                "<|end|>",
+                "echo",
+                False,
+            ),
+            (
+                "authored_metadata",
+                header
+                + "functions.echo <|constrain|>analysis authored code<|message|>",
+                "{}",
+                "<|call|>",
+                "echo",
+                True,
+            ),
+        )
+        for name, prefix, body, ending, declared_tool, expect_error in cases:
+            with self.subTest(name=name):
+                tokens = (
+                    encoding.encode(prefix, allowed_special="all")
+                    + encoding.encode(body, disallowed_special=())
+                    + encoding.encode(ending, allowed_special="all")
+                )
+                response = self._response_from_tokens(tokens, declared_tool)
+                if expect_error:
+                    self.assertIsInstance(response, ORJSONResponse)
+                    self.assertEqual(response.status_code, 400)
+                else:
+                    self.assertIsInstance(
+                        response, ResponsesResponse, getattr(response, "body", None)
+                    )
+                    self.assertEqual(response.output, [])
+
+    def test_terminal_partial_content_is_not_finalized(self):
+        """Generation end must leave a valid unfinished function body available."""
+        arguments = '{"text":"unfinished'
+        tokens = get_encoding().encode(
+            "<|channel|>analysis to=functions.echo<|message|>" + arguments,
+            allowed_special="all",
+        )
+        context = HarmonyContext([], {}, function_names={"echo"})
+        chunk = engine_chunk("", len(tokens), finish=True)
+        chunk["output_ids"] = tokens
+        chunk["meta_info"]["finish_reason"] = {"type": "length"}
+        context.append_output(chunk)
+        self.assertEqual(context.messages, [])
+        self.assertEqual(context.parser.current_content, arguments)
+        self.assertEqual(context.parser.current_recipient, "functions.echo")
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
