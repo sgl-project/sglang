@@ -354,15 +354,9 @@ impl RequestLog {
     /// Python's single-request normalization of the fields the request
     /// carries.
     fn normalize(&self, item: &mut Map<String, Value>, request: &GenerateRequest) {
-        // The deprecated `data_parallel_rank` moves to `routed_dp_rank` (the
-        // Rust server itself reads only `routed_dp_rank`).
-        if let Some(rank) = item
-            .remove("data_parallel_rank")
-            .filter(|rank| !rank.is_null())
-            && item.get("routed_dp_rank").is_none_or(Value::is_null)
-        {
-            item.insert("routed_dp_rank".into(), rank);
-        }
+        // The deprecated `data_parallel_rank` moves to `routed_dp_rank`, as
+        // `/generate` decodes it.
+        crate::message::request::move_deprecated_dp_rank(item);
         if item.get("sampling_params").is_none_or(Value::is_null) {
             item.insert("sampling_params".into(), Value::Object(Map::new()));
         }
