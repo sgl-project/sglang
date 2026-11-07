@@ -173,7 +173,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=140, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # backend-specific: preserve ROCm eager fallback coverage for CUDA-only fusions.
-register_amd_ci(est_time=8, suite="nightly-amd-kernel-1-gpu", nightly=True)
+register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
