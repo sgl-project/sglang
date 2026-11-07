@@ -1706,6 +1706,8 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 # Request-scoped state ships as C128_STATE, not with the SWA ring.
                 if pool is None or pool.request_scoped:
                     continue
+                if self._unified_kv and pool.ratio == 4:
+                    continue
                 t = pool.kv_score_buffer.kv_score
                 assert t.ndim == 2, f"expected 2D buffer, got {t.ndim}D"
                 data_ptrs.append(t.data_ptr())
@@ -1713,6 +1715,29 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 item_lens.append(t[0].nbytes * pool.ring_size)
 
         return data_ptrs, data_lens, item_lens
+
+    def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """Unified C4 attention/indexer state, one physical row per item."""
+        data_ptrs, data_lens, item_lens = [], [], []
+        if self._unified_kv:
+            for pools in (self.compress_state_pools, self.indexer_compress_state_pools):
+                for pool in pools:
+                    if pool is None or pool.ratio != 4:
+                        continue
+                    state = pool.kv_score_buffer.kv_score
+                    data_ptrs.append(state.data_ptr())
+                    data_lens.append(state.nbytes)
+                    item_lens.append(state[0].nbytes)
+        return data_ptrs, data_lens, item_lens
+
+    def get_c4_state_transfer_indices(self, req_pool_idx: int, seq_len: int):
+        from sglang.srt.mem_cache.deepseek_v4_compress_state import (
+            c4_state_transfer_indices,
+        )
+
+        return c4_state_transfer_indices(
+            req_pool_idx, seq_len, ring_size=self.get_ring_size(4)
+        )
 
     def get_request_state_buf_infos(
         self,

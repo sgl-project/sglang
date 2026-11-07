@@ -1718,6 +1718,7 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "dsv4_c4_state",
                 "c128_state",
                 "minimax_index_k",
                 "minimax_dense_kv",
@@ -1920,6 +1921,7 @@ class MoriKVManager(CommonKVManager):
                 "qsa_pending",
                 "qsa_compressed",
                 "swa_ring",
+                "dsv4_c4_state",
                 "c128_state",
                 "minimax_dense_kv",
             ):
@@ -1954,6 +1956,14 @@ class MoriKVManager(CommonKVManager):
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]
             state_item_len = src_state_item_lens[i]
+            if (
+                state_type == "dsv4_c4_state"
+                and state_item_len != dst_state_item_lens[j]
+            ):
+                raise RuntimeError(
+                    "C4 state row size mismatch: "
+                    f"src={state_item_len}, dst={dst_state_item_lens[j]}"
+                )
             if is_elided_entry(state_item_len, dst_state_item_lens, j):
                 # DSA index-K elision gives every shared-topk layer a 0-row
                 # buffer; either peer eliding it means nothing moves, and the
