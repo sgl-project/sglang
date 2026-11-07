@@ -1222,6 +1222,7 @@ fn abort_while_in_tokenizer_pool_drops_on_return() {
 #[test]
 fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
     let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+    let queued_after = std::time::Instant::now();
     intake.drive(mm_pretokenized_req("mm-1"));
 
     // The whole request is in the pool, in `Encoding`; nothing on the channel yet.
@@ -1245,6 +1246,8 @@ fn mm_request_goes_to_pool_then_encoded_pushes_to_channel() {
         mm.image_data.first().and_then(|item| item.source()),
         Some("data:image/jpeg;base64,xxxx")
     );
+    // The processor learns when the request queued for a worker.
+    assert!(mm.admission.queued_at.is_some_and(|at| at >= queued_after));
     assert!(consumer.drain(16).is_empty(), "in the pool, not queued");
 
     // The worker returns the final expanded ids -> pushed to the channel.
