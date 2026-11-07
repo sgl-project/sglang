@@ -771,6 +771,32 @@ class WeightsUpdater:
                 )
                 updated += len(layer_sections)
 
+            # The synced adapter replaces whatever set_lora applied, so layers
+            # omitted from the payload must not keep a stale merged delta.
+            if updated:
+                synced = {id(layer) for _, _, layer in plain_pairs} | {
+                    id(layer) for layer in fused_sections
+                }
+                for layer in {id(v): v for v in layer_dict.values()}.values():
+                    if id(layer) in synced:
+                        continue
+                    if getattr(layer, "merged", False):
+                        layer.unmerge_lora_weights()
+                    if hasattr(layer, "disable_lora"):
+                        layer.disable_lora = True
+
+        if updated:
+            lora_pipeline.is_lora_merged[target_module] = any(
+                getattr(layer, "merged", False) for layer in layer_dict.values()
+            )
+            for state in (
+                lora_pipeline.cur_adapter_name,
+                lora_pipeline.cur_adapter_path,
+                lora_pipeline.cur_adapter_strength,
+                lora_pipeline.cur_adapter_config,
+            ):
+                state.pop(target_module, None)
+
         gc.collect()
         torch.cuda.empty_cache()
 
