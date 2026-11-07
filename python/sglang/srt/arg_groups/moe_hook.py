@@ -105,9 +105,10 @@ def handle_moe_kernel_config(server_args: Any):
         assert view.moe_a2a_backend in [
             "none",
             "deepep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
         ], (
-            f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+            "flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or "
+            "'flashinfer_nvlink_one_sided', "
             f"got '{view.moe_a2a_backend}'."
         )
         if view.moe_a2a_backend == "deepep" and (
@@ -116,7 +117,7 @@ def handle_moe_kernel_config(server_args: Any):
         ):
             raise ValueError(
                 "flashinfer_cutedsl per-token NVFP4 activation requires "
-                "moe_a2a_backend='none' or 'flashinfer'."
+                "moe_a2a_backend='none' or 'flashinfer_nvlink_one_sided'."
             )
 
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
@@ -356,12 +357,12 @@ def handle_a2a_moe(server_args: Any):
         )
         logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
-    if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
-        None,
-        "auto",
+    if a2a_backend != "flashinfer_nvlink_one_sided" and (
+        cfg.flashinfer_a2a_dispatch_type not in (None, "auto")
     ):
         raise ValueError(
-            "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
+            "--flashinfer-a2a-dispatch-type requires "
+            "--moe-a2a-backend flashinfer_nvlink_one_sided."
         )
 
     if a2a_backend == "flashinfer_megamoe":
@@ -513,7 +514,7 @@ def handle_a2a_moe(server_args: Any):
     # moved this already (waterfill forces `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
 
-    if a2a_now == "flashinfer":
+    if a2a_now == "flashinfer_nvlink_one_sided":
         view = resolved_view(server_args)
         architectures = model_config_of(server_args).hf_config.architectures
         architecture = architectures[0] if architectures else None
@@ -812,7 +813,7 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
     largest forward; at runtime the dispatcher asserts on the first such batch."""
     view = resolved_view(server_args)
-    if view.moe_a2a_backend != "flashinfer":
+    if view.moe_a2a_backend != "flashinfer_nvlink_one_sided":
         return
     if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
         raise ValueError(
