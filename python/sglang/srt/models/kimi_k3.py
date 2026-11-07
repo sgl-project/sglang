@@ -145,7 +145,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
-from sglang.srt.utils.log_utils import rank0_log
+from sglang.srt.utils.log_utils import print_warning_once, rank0_log
 
 logger = logging.getLogger(__name__)
 
@@ -1943,6 +1943,27 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
 
+    def _fused_decode_f_b_weight(self) -> Optional[torch.Tensor]:
+        """Dense BF16 f_b for the HIP fused KDA decode, which takes no weight scale."""
+        from sglang.srt.models.kimi_k3_rocm_quant import k3_fused_decode_f_b_weight
+
+        # _merge_bfa_weights() leaves the BF16 f_b here, dequantized for block-FP8.
+        merged = self._bfa_f_b_w if self.use_full_rank_gate else None
+        if (
+            merged is not None
+            and merged.dtype == torch.bfloat16
+            and merged.shape == (12 * 128, 128)
+        ):
+            return merged
+        f_b_weight = k3_fused_decode_f_b_weight(self.f_b_proj)
+        if f_b_weight is not None and f_b_weight.dtype != torch.bfloat16:
+            print_warning_once(
+                "Kimi-K3 fused KDA decode not armed: no BF16 f_b for the kernel "
+                f"(f_b_proj holds {f_b_weight.dtype}); decode runs the unfused chain"
+            )
+            return None
+        return f_b_weight
+
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
         (kernels/ops/attention/kda_fused_decode): per-segment transposed fp32 conv
@@ -1958,21 +1979,28 @@ class KimiK3DeltaAttention(nn.Module):
             )
 
             layer = self.attn
+            # A re-run that fails to arm must not leave the previous f_b serving decode.
+            self._kda_hip_fused_decode_ready = False
+            layer._k3_hip_fused_decode_args = None
+            layer._k3_hip_fused_decode_backend = ""
+            layer._k3_hip_fused_decode_ops = None
             w = layer.conv_weights
-            f_b_weight = self.f_b_proj.weight
-            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
+            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
             }.get(backend)
+            state_dtype = self.config.mamba2_cache_params.dtype.temporal
             backend_available = fused_ops is not None and fused_ops.available(
-                f_b_weight.device
+                device=self.f_b_proj.weight.device, state_dtype=state_dtype
             )
+            f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
             if (
                 backend_available
                 and w is not None
                 and tuple(w.shape) == (3 * 12 * 128, 4)
                 and w.dtype == torch.float32
+                and f_b_weight is not None
                 and f_b_weight.shape == (12 * 128, 128)
                 and f_b_weight.dtype == torch.bfloat16
                 and layer.A_log is not None
@@ -2000,6 +2028,7 @@ class KimiK3DeltaAttention(nn.Module):
                     lower_bound=float(layer.lower_bound),
                     norm_weight=norm_weight,
                     norm_eps=float(self.o_norm.eps),
+                    state_dtype=state_dtype,
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops

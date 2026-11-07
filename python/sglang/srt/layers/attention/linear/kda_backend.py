@@ -807,12 +807,17 @@ class KDAAttnBackend(MambaAttnBackendBase):
         replayssm_g = layer_cache.replayssm_g
 
         deferred_f_b = bool(getattr(layer, "_k3_deferred_f_b", False))
-        if replayssm_d is None and deferred_f_b and is_gfx95_supported():
+        if deferred_f_b and is_gfx95_supported():
             fused_static = getattr(layer, "_k3_hip_fused_decode_args", None)
             fused_backend = getattr(layer, "_k3_hip_fused_decode_backend", "")
             fused_ops = getattr(layer, "_k3_hip_fused_decode_ops", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
-            if fused_static is not None and onorm_gate is not None:
+            # The ReplaySSM ring path has no fused kernel, but still needs f_b applied.
+            if (
+                replayssm_d is None
+                and fused_static is not None
+                and onorm_gate is not None
+            ):
                 f_b_weight, norm_weight, norm_eps, a_log = fused_static
                 conv_state_view = conv_states.transpose(-1, -2)
                 output_gate = onorm_gate.view(
