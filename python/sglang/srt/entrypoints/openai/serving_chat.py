@@ -675,6 +675,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
                 preferred_sampling_params=get_serving().preferred_sampling_params,
+                allow_auto_truncate=get_serving().allow_auto_truncate,
             )
         )
 

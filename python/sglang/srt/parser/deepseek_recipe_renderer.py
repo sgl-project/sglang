@@ -147,8 +147,8 @@ class DeepSeekRecipe:
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
         raises ValueError. `image_urls` receives the images in placeholder order,
-        `parse_start` the stage recipe reports for it, None without `thinking` and
-        after a `task`, whose tail this appends past recipe's report."""
+        `parse_start` the stage recipe reports, None without `thinking`;
+        a `task` changes the tail that stage describes."""
         converted = self._convert(body, effort_budget=effort_budget)
         conversation = converted.conversation
         prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
@@ -170,8 +170,8 @@ class DeepSeekRecipe:
 
     def reasoning_open(self, prompt_ids: list[int]) -> bool:
         """Whether the prompt's last thinking delimiter leaves reasoning open.
-        recipe reports a continued empty first turn as a reasoning start even
-        though it renders `</think>`, so the prompt is what the output follows."""
+        V4.1 renders `</think>` for a continued empty first turn,
+        which recipe reports as a reasoning start."""
         think_start = self.hf_tokenizer.token_to_id(THINK_START_TOKEN)
         think_end = self.hf_tokenizer.token_to_id(THINK_END_TOKEN)
         for token_id in reversed(prompt_ids):

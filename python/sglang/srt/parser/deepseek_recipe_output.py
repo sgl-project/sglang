@@ -222,14 +222,17 @@ class DeepSeekRecipeOutputParser:
     def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
         """After `finish`: raise if the output stopped on its own inside its
         reasoning. Length, abort and client stops cut it on purpose."""
+        matched = finish_reason.get("matched")
         if (
             self._reasoning_open
             and finish_reason["type"] == "stop"
-            and finish_reason.get("matched") not in self._client_stops
+            and matched not in self._client_stops
         ):
+            # A string names a stop that is not the model's, like the NaN sentinel.
+            cause = f" ({matched})" if isinstance(matched, str) else ""
             raise UnclosedReasoningError(
-                "The model stopped inside its reasoning, "
-                "before any answer or tool call."
+                "The output stopped inside its reasoning, "
+                f"before any answer or tool call{cause}."
             )
 
     def _deltas(self, chunks: list[Any]) -> RecipeOutputDelta:

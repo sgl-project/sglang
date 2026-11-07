@@ -76,6 +76,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         chat_hooks: ChatOutputHooks,
         default_chat_template_kwargs: Optional[dict[str, Any]],
         preferred_sampling_params: Optional[dict[str, Any]],
+        allow_auto_truncate: bool,
     ):
         self._spec = chat_encoding_spec
         self.deepseek_recipe = DeepSeekRecipe.from_hf_tokenizer(
@@ -112,6 +113,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         self._preferred_grammar = bool(
             preferred.get("json_schema") or preferred.get("structural_tag")
         )
+        self._allow_auto_truncate = allow_auto_truncate
 
     @property
     def output(self) -> Optional[DeepSeekRecipeChatEncodingAdapter]:
@@ -172,7 +174,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         image_data.extend(ImageData(url=url) for url in image_urls)
         if task_prefix:
             prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
-        if _recipe_reports_start(request):
+        # The engine may cut the prompt's tail, which neither signal would follow.
+        if _recipe_reports_start(request) and not self._allow_auto_truncate:
             request._recipe_prompt = RecipePrompt(
                 parse_start=parse_start[0],
                 reasoning_open=self.deepseek_recipe.reasoning_open(prompt_ids),
@@ -362,7 +365,8 @@ class DeepSeekRecipeChatEncodingAdapter:
         response_format = request.response_format
         # Only the renderer of a prompt reports where its output begins, so only
         # recipe's own prompts are checked; a client's input_ids, a conversation
-        # template and a task record nothing and keep the request's own start.
+        # template, a task and a prompt the engine may cut record nothing,
+        # and keep the request's own start.
         recipe_prompt = request._recipe_prompt
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
@@ -409,7 +413,8 @@ class DeepSeekRecipeChatEncodingAdapter:
     ) -> DeepSeekRecipeOutputParser:
         # Responses renders its prompt with `thinking_requested`, which follows
         # SGLANG_DEFAULT_THINKING, while require_reasoning does not (#45614): the
-        # grammar then applies from the first token, so keep main's start.
+        # grammar then applies from the first token, so the start follows
+        # require_reasoning alone.
         recipe_prompt = request._recipe_prompt if require_reasoning else None
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
@@ -477,8 +482,8 @@ def _trailing_assistant_turn(
 
 
 def _recipe_reports_start(request: ChatCompletionRequest) -> bool:
-    """Whether recipe's report describes where the rendered prompt ends:
-    a task appends its own tail after it."""
+    """Whether recipe's report describes where the rendered prompt ends: a task
+    changes that tail, as `action` follows it and the other tasks replace it."""
     return request.task is None
 
 

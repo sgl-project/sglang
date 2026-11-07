@@ -233,6 +233,8 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
         (deepseek-recipe validates the default effort at startup).
       preferred_sampling_params: the workers' --preferred-sampling-params
         (DeepSeek-V4 / V4.1 output parsing exempts a grammar there).
+      allow_auto_truncate: the workers' --allow-auto-truncate
+        (DeepSeek-V4 / V4.1 output parsing cannot trust a prompt's tail then).
       backend: selects the builder; every spec has a "builtin" one.
     """
 
@@ -246,6 +248,7 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     revision: Optional[str]
     default_chat_template_kwargs: Optional[dict[str, Any]] = None
     preferred_sampling_params: Optional[dict[str, Any]] = None
+    allow_auto_truncate: bool = False
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -286,6 +289,7 @@ def _build_deepseek_recipe(
         chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
         preferred_sampling_params=ctx.preferred_sampling_params,
+        allow_auto_truncate=ctx.allow_auto_truncate,
     )
 
 
