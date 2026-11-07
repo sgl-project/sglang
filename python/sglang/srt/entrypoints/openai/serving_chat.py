@@ -114,7 +114,7 @@ from sglang.srt.function_call.utils import (
 )
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
-from sglang.srt.parser.conversation import generate_chat_conv
+from sglang.srt.parser.conversation import chat_templates, generate_chat_conv
 from sglang.srt.parser.hunyuan_reasoning import (
     normalize_hunyuan_reasoning_effort,
     uses_hunyuan_reasoning_effort,
@@ -2017,6 +2017,8 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
+            template_stops = self._get_chat_template_stop(request)
+            merged_stop = self._merge_stops(template_stops, request.stop)
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
@@ -2024,7 +2026,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 audio_data=None,
                 video_data=None,
                 modalities=[],
-                stop=request.stop or [],
+                stop=merged_stop,
             )
         elif self.template_manager.chat_template_name is None:
             result = self._apply_jinja_template(request, tools, is_multimodal)
@@ -2470,13 +2472,13 @@ class OpenAIServingChat(OpenAIServingBase):
         video_data = conv.video_data if conv.video_data else None
         audio_data = conv.audio_data if conv.audio_data else None
         modalities = conv.modalities if conv.modalities else []
-        stop = copy.copy(conv.stop_str or [] if not request.ignore_eos else [])
-
-        if request.stop:
-            if isinstance(request.stop, str):
-                stop.append(request.stop)
-            else:
-                stop.extend(request.stop)
+        template_stops = []
+        if not request.ignore_eos and conv.stop_str is not None:
+            if isinstance(conv.stop_str, str):
+                template_stops = [conv.stop_str]
+            elif isinstance(conv.stop_str, (list, tuple, set)):
+                template_stops = list(conv.stop_str)
+        stop = self._merge_stops(template_stops, request.stop)
 
         if not is_multimodal:
             prompt_ids = self.tokenizer_manager.tokenizer.encode(prompt)
@@ -2490,6 +2492,40 @@ class OpenAIServingChat(OpenAIServingBase):
             modalities=modalities,
             stop=stop,
         )
+
+    def _get_chat_template_stop(self, request: ChatCompletionRequest) -> list[str]:
+        """Extract stop strings from the configured conversation template."""
+        if (
+            request.ignore_eos
+            or self.template_manager is None
+            or self.template_manager.chat_template_name is None
+        ):
+            return []
+        template = chat_templates.get(self.template_manager.chat_template_name)
+        if template is None or not template.stop_str:
+            return []
+        if isinstance(template.stop_str, str):
+            return [template.stop_str]
+        if isinstance(template.stop_str, (list, tuple, set)):
+            return list(template.stop_str)
+        return []
+
+    def _merge_stops(
+        self,
+        template_stops: list[str],
+        request_stops: str | list[str] | None,
+    ) -> list[str]:
+        """Merge chat template stop strings with user-provided request stop strings."""
+        stops: list[str] = list(template_stops)
+        if request_stops:
+            if isinstance(request_stops, str):
+                if request_stops not in stops:
+                    stops.append(request_stops)
+            else:
+                for s in request_stops:
+                    if s not in stops:
+                        stops.append(s)
+        return stops
 
     async def _handle_streaming_request(
         self,
