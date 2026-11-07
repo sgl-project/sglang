@@ -1957,6 +1957,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # Metrics
     dp_cooperation_info: Optional[DPCooperationInfo] = None
     dp_balance_stats: Optional[DPBalanceStats] = None
+    prefill_admission_scan_id: Optional[int] = None
     prefill_stats: Optional[PrefillStats] = None
     forward_iter: Optional[int] = None
     launch_ts: Optional[float] = None
