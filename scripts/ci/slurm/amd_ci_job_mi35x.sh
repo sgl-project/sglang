@@ -37,6 +37,9 @@ remove_job() {  # remove_job CONTAINER WORKSPACE
 
 finish() {
     local rc=$?
+    # The suite's step summary lands in the checkout; the launcher appends it
+    # to the workflow's.
+    [[ -n "${CI_SUMMARY_FILE:-}" ]] && cp "$WS/github_summary.md" "$CI_SUMMARY_FILE" 2>/dev/null || true
     remove_job "$CI_CONTAINER_NAME" "$WS"
     echo "$rc" > "$CI_EXIT_FILE"
     echo "[amd-ci-job] exit $rc"
@@ -105,6 +108,7 @@ check_gpus_free() {  # check_gpus_free DEVICE...
 mkdir -p "$WS" "$CI_NODE_SCRATCH/sglang-data"
 cp -a "$CI_SRC/." "$WS/"
 cd "$WS"
+touch github_summary.md
 
 # The scripts read these instead of an ARC pod hostname and /home/runner.
 export GITHUB_WORKSPACE="$WS"
@@ -128,8 +132,9 @@ else
 fi
 bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "$CI_ROCM_VERSION"
 bash scripts/ci/amd/amd_ci_install_dependency.sh
-# --env pairs from the launcher, one KEY=VAL per line.
-EXEC_ENV_ARGS=()
+# --env pairs from the launcher, one KEY=VAL per line. amd_ci_exec.sh keeps the
+# last value given for a key, so they can override the summary path too.
+EXEC_ENV_ARGS=(-e GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary.md)
 while IFS= read -r kv; do
     [[ -n "$kv" ]] && EXEC_ENV_ARGS+=(-e "$kv")
 done <<< "${CI_EXEC_ENV:-}"

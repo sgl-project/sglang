@@ -1,0 +1,151 @@
+name: Nightly Benchmark (AMD)
+
+# Serving benchmarks that report numbers rather than gate anything.
+#
+# They are deliberately not jobs in nightly-test-amd-rocm720.yml: a benchmark
+# holds a node for up to an hour, its result is a throughput number rather than
+# a pass/fail, and inside the nightly test workflow a slow or failed replay
+# would either turn the whole nightly red or have to be pinned behind
+# continue-on-error, which hides real breakage. Here the job's own status is the
+# signal, and the workload can be tuned without touching the gate.
+#
+# Every point runs on a whole MI35x node of a partition kept for performance
+# runs, so no other job shares the node while it is measured: --gpus 8, even
+# though a tp2 point uses only two of them, because the launcher packs smaller
+# jobs onto shared nodes. The runner sits on the cluster's login node and
+# submits one job per point through
+# scripts/ci/slurm/launch_amd_ci_mi35x.sh, the same flow as
+# test-amd-mi35x-spur.yml; cluster settings come from the runner's environment
+# (see the launcher's header).
+on:
+  schedule:
+    - cron: '0 13 * * *'  # with PR Test (AMD)'s 13:00 UTC rocm10 run, first after the 09:00 UTC rocm10 image
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Git ref (branch, tag, or SHA) to benchmark. Defaults to the default branch.'
+        required: false
+        type: string
+        default: ''
+      rocm_version:
+        description: 'ROCm image version ("all" runs rocm10, rocm724, and rocm720)'
+        required: false
+        type: choice
+        default: 'rocm10'
+        options:
+          - rocm10
+          - rocm724
+          - rocm720
+          - 'all'
+      benchmark_select:
+        description: 'Select a benchmark to run from dropdown (choose "all" to run all benchmarks)'
+        required: false
+        type: choice
+        default: 'all'
+        options:
+          - 'all'
+          - qwen35-mxfp4-agentic-mtp-mi35x
+      workload_env:
+        description: 'Optional workload overrides, space separated (e.g. "AGENTIC_NUM_CONVERSATIONS=128 AGENTIC_MAX_TURNS=20")'
+        required: false
+        type: string
+        default: ''
+      continue_on_error:
+        description: 'Keep running the remaining benchmarks after one fails'
+        required: false
+        type: boolean
+        default: true
+
+# sbatch exports the launcher's environment to the cluster job, where
+# amd_ci_start_container.sh logs in to Docker Hub (the cluster's anonymous
+# pulls hit the rate limit). HF_TOKEN comes from the runner's .env; do not set
+# it here, since even an empty value overrides the runner's.
+env:
+  DOCKERHUB_AMD_USERNAME: ${{ secrets.DOCKERHUB_AMD_USERNAME }}
+  DOCKERHUB_AMD_TOKEN: ${{ secrets.DOCKERHUB_AMD_TOKEN }}
+
+concurrency:
+  # One benchmark run at a time, and never cancel one in flight: a cancelled
+  # replay leaves no number behind, which is the only thing this workflow
+  # produces.
+  group: nightly-benchmark-amd-${{ github.event_name == 'workflow_dispatch' && format('manual-{0}', github.run_id) || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ==============================================================================
+  # Qwen3.5-397B-A17B MXFP4 + EAGLE MTP, AgentX coding-agent replay and eval
+  # ==============================================================================
+  qwen35-mxfp4-agentic-mtp-mi35x:
+    name: ${{ format('qwen35-mxfp4-agentic-mtp-mi35x {0} ({1})', matrix.point.name, matrix.rocm_version) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # One image per run by default -- the schedule measures the current
+        # ROCm lane, and sweeping three of them would hold the nodes for hours
+        # to produce three sets of numbers nobody compares.
+        rocm_version: ${{ fromJson(inputs.rocm_version == 'all' && '["rocm10", "rocm724", "rocm720"]' || format('["{0}"]', inputs.rocm_version || 'rocm10')) }}
+        # The recipe's own tp2 sweep, plus its eval pass. Each point holds a
+        # whole 8-GPU node, so the recipe's tp4 points can be added here
+        # without a different runner.
+        point:
+          - { name: tp2-gpu-kv-c1, tp: 2, concurrency: 1, kv_offloading: none, mode: replay }
+          - { name: tp2-gpu-kv-c4, tp: 2, concurrency: 4, kv_offloading: none, mode: replay }
+          - { name: tp2-gpu-kv-c8, tp: 2, concurrency: 8, kv_offloading: none, mode: replay }
+          - { name: tp2-gpu-kv-c12, tp: 2, concurrency: 12, kv_offloading: none, mode: replay }
+          - { name: tp2-gpu-kv-c16, tp: 2, concurrency: 16, kv_offloading: none, mode: replay }
+          - { name: tp2-gpu-kv-c20, tp: 2, concurrency: 20, kv_offloading: none, mode: replay }
+          - { name: tp2-hicache-c20, tp: 2, concurrency: 20, kv_offloading: hicache, mode: replay }
+          - { name: tp2-hicache-c24, tp: 2, concurrency: 24, kv_offloading: hicache, mode: replay }
+          - { name: tp2-hicache-c28, tp: 2, concurrency: 28, kv_offloading: hicache, mode: replay }
+          - { name: tp2-hicache-c32, tp: 2, concurrency: 32, kv_offloading: hicache, mode: replay }
+          # AgentX scores one configuration rather than the whole sweep: the top
+          # of the HiCache row, which is c32 at tp2.
+          - { name: tp2-eval-gsm8k, tp: 2, concurrency: 32, kv_offloading: hicache, mode: eval }
+    if: github.repository == 'sgl-project/sglang' && (!inputs.benchmark_select || inputs.benchmark_select == 'all' || inputs.benchmark_select == 'qwen35-mxfp4-agentic-mtp-mi35x')
+    runs-on: linux-sglang-mi35x-perf-bench
+    timeout-minutes: 300
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref || github.sha }}
+          persist-credentials: false
+
+      # A replay point converts the published AgentX corpus on first use and
+      # caches it under the node's persistent /sgl-data alongside the weights,
+      # so only the first run on each node pays for the download.
+      - name: Qwen3.5-MXFP4 agentic MTP (${{ matrix.point.name }})
+        timeout-minutes: 290
+        env:
+          WORKLOAD_ENV: ${{ inputs.workload_env }}
+          # Cluster time limit for one point, under the step timeout.
+          TIME_LIMIT: '04:30:00'
+        run: |
+          ENV_ARGS=()
+          for override in $WORKLOAD_ENV; do
+            ENV_ARGS+=(--env "$override")
+          done
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite nightly-perf-mi35x-qwen35-mxfp4-agentic-mtp \
+            --rocm-version "${{ matrix.rocm_version }}" \
+            --gpus 8 \
+            --env SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D=1 \
+            --env AGENTIC_TP=${{ matrix.point.tp }} \
+            --env AGENTIC_CONCURRENCY=${{ matrix.point.concurrency }} \
+            --env AGENTIC_KV_OFFLOADING=${{ matrix.point.kv_offloading }} \
+            --env AGENTIC_MODE=${{ matrix.point.mode }} \
+            "${ENV_ARGS[@]}" \
+            -- --nightly --timeout-per-file 12600 ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: failure() || cancelled()
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
