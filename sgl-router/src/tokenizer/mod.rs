@@ -4,6 +4,7 @@
 pub mod adapter;
 pub mod chat_formatter;
 mod kimi;
+pub mod prompt;
 pub mod stats;
 
 use anyhow::Result;
@@ -634,12 +635,9 @@ mod tests {
             "tools": [{"type": "function", "function": {"name": "hello"}}],
             "chat_template_kwargs": {"greeting": "world"}
         });
-        let tokens = crate::policies::request_tokens_for(
-            &reg,
-            &crate::discovery::ModelId("tiny".into()),
-            &request,
-        )
-        .expect("request tokenizes");
+        let tokens =
+            prompt::request_tokens_for(&reg, &crate::discovery::ModelId("tiny".into()), &request)
+                .expect("request tokenizes");
         assert_eq!(tokens.ids, adapter::encode(&tok, "hello world").unwrap());
     }
 
