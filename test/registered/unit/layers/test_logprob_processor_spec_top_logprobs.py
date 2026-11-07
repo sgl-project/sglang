@@ -48,10 +48,11 @@ def _host_rows(nums, greedy, logits, predict, **layout):
     )
     compute_spec_logprobs(_batch(nums, greedy), out, predict.clone(), **layout)
     batched = torch.is_tensor(out.next_token_top_logprobs_val)
-    out.next_token_top_logprobs_val = _rows_d2h(out.next_token_top_logprobs_val)
-    out.next_token_top_logprobs_idx = _rows_d2h(out.next_token_top_logprobs_idx)
-    _top_logprobs_to_lists(out)
-    return batched, out.next_token_top_logprobs_val, out.next_token_top_logprobs_idx
+    val, idx = _top_logprobs_to_lists(
+        _rows_d2h(out.next_token_top_logprobs_val),
+        _rows_d2h(out.next_token_top_logprobs_idx),
+    )
+    return batched, val, idx
 
 
 class TestSpecTopLogprobsBatched(CustomTestCase):

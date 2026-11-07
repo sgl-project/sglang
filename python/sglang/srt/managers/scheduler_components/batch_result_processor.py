@@ -90,17 +90,14 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _top_logprobs_to_lists(logits_output: LogitsProcessorOutput) -> None:
-    """Convert the top logprobs, a per-row tensor list or one [rows, k] tensor,
-    to host lists of rows."""
-    val = logits_output.next_token_top_logprobs_val
-    idx = logits_output.next_token_top_logprobs_idx
+def _top_logprobs_to_lists(val, idx):
+    # Top logprobs arrive as a per-row tensor list, or as one [rows, k] tensor
+    # when every row asks for the same k.
     if torch.is_tensor(val):
-        logits_output.next_token_top_logprobs_val = val.tolist()
-        logits_output.next_token_top_logprobs_idx = idx.tolist()
-    elif val:
-        logits_output.next_token_top_logprobs_val = [v.tolist() for v in val]
-        logits_output.next_token_top_logprobs_idx = [x.tolist() for x in idx]
+        return val.tolist(), idx.tolist()
+    if val:
+        return [v.tolist() for v in val], [x.tolist() for x in idx]
+    return val, idx
 
 
 def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
@@ -650,7 +647,13 @@ class SchedulerBatchResultProcessor:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
-            _top_logprobs_to_lists(logits_output)
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = _top_logprobs_to_lists(
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            )
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
@@ -1238,7 +1241,13 @@ class SchedulerBatchResultProcessor:
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
-            _top_logprobs_to_lists(logits_output)
+            (
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            ) = _top_logprobs_to_lists(
+                logits_output.next_token_top_logprobs_val,
+                logits_output.next_token_top_logprobs_idx,
+            )
 
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [

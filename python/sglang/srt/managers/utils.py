@@ -53,8 +53,6 @@ logger = logging.getLogger(__name__)
 def _rows_d2h(
     rows: Optional[Union[torch.Tensor, List]],
 ) -> Optional[Union[torch.Tensor, List]]:
-    """Copy per-row logprob outputs to the host: one copy for a [rows, k]
-    tensor, one copy per tensor row for a list."""
     if rows is None:
         return None
     if torch.is_tensor(rows):
