@@ -90,6 +90,106 @@ def _mxfp8_linear_kernel(
     )
 
 
+@triton.jit
+def _mxfp8_linear_split_k_kernel(
+    x_ptr,
+    xs_ptr,
+    w_ptr,
+    ws_ptr,
+    out_ptr,
+    M,
+    N,
+    K,
+    stride_xm,
+    stride_xk,
+    stride_xsm,
+    stride_xsk,
+    stride_wn,
+    stride_wk,
+    stride_wsn,
+    stride_wsk,
+    stride_op,
+    stride_om,
+    stride_on,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr,
+):
+    # k-tiles pid_k, pid_k + SPLIT_K, ... accumulate into out[pid_k] of the fp32 [SPLIT_K, M, N] partials
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+    pid_k = tl.program_id(2)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+    offs_sk = pid_k * (BLOCK_K // 32) + tl.arange(0, BLOCK_K // 32)
+    m_mask = offs_m < M
+    n_mask = offs_n < N
+
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + offs_k[None, :] * stride_xk
+    xs_ptrs = xs_ptr + offs_m[:, None] * stride_xsm + offs_sk[None, :] * stride_xsk
+    w_ptrs = w_ptr + offs_n[:, None] * stride_wn + offs_k[None, :] * stride_wk
+    ws_ptrs = ws_ptr + offs_n[:, None] * stride_wsn + offs_sk[None, :] * stride_wsk
+
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(pid_k, tl.cdiv(K, BLOCK_K), SPLIT_K):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs, mask=n_mask[:, None], other=0.0)
+        xs = tl.load(xs_ptrs, mask=m_mask[:, None], other=0)
+        ws = tl.load(ws_ptrs, mask=n_mask[:, None], other=0)
+        acc += tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3")
+        x_ptrs += SPLIT_K * BLOCK_K * stride_xk
+        w_ptrs += SPLIT_K * BLOCK_K * stride_wk
+        xs_ptrs += SPLIT_K * (BLOCK_K // 32) * stride_xsk
+        ws_ptrs += SPLIT_K * (BLOCK_K // 32) * stride_wsk
+
+    o_ptrs = (
+        out_ptr
+        + pid_k * stride_op
+        + offs_m[:, None] * stride_om
+        + offs_n[None, :] * stride_on
+    )
+    tl.store(o_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
+
+
+@cache_once
+def _mxfp8_linear_num_cu(device: torch.device) -> int:
+    return torch.cuda.get_device_properties(device).multi_processor_count
+
+
+def _pow2_floor(value: int) -> int:
+    return 1 << (max(1, value).bit_length() - 1)
+
+
+# K < 4096 (32 k-tiles at BLOCK_K = 128) was not measured; it keeps the single-pass kernel.
+_SPLIT_K_MIN_K_TILES = 32
+_SPLIT_K_MAX = 32
+
+
+def _mxfp8_linear_split_k(
+    M: int,
+    N: int,
+    K: int,
+    BLOCK_M: int,
+    BLOCK_N: int,
+    BLOCK_K: int,
+    num_cu: int,
+) -> int:
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+
+    # the split changes the fp32 summation order with M, so batch-invariant mode keeps one pass
+    if is_batch_invariant_mode_enabled():
+        return 1
+    base = triton.cdiv(M, BLOCK_M) * triton.cdiv(N, BLOCK_N)
+    num_k_tiles = triton.cdiv(K, BLOCK_K)
+    if not 0 < base < num_cu or num_k_tiles < _SPLIT_K_MIN_K_TILES:
+        return 1
+    # aim for ~4 workgroups per CU while keeping >= 4 k-tiles per program
+    split_k = _pow2_floor((4 * num_cu) // base)
+    return min(split_k, _pow2_floor(num_k_tiles // 4), _SPLIT_K_MAX)
+
+
 def _run_mxfp8_linear_kernel(
     x_q: torch.Tensor,  # [M, K] fp8 e4m3
     x_scale: torch.Tensor,  # [M, K//32] uint8 (E8M0)
@@ -99,12 +199,53 @@ def _run_mxfp8_linear_kernel(
 ) -> torch.Tensor:
     M, K = x_q.shape
     N = w.shape[0]
-    out = torch.empty((M, N), dtype=out_dtype, device=x_q.device)
     BLOCK_M, BLOCK_K = 64, 128
     if M <= 512 and (K >= 4096 or (N == 6144 and K in (2048, 3072))):
         BLOCK_N, num_warps = 64, 4
     else:
         BLOCK_N, num_warps = 128, 8
+
+    split_k = _mxfp8_linear_split_k(
+        M=M,
+        N=N,
+        K=K,
+        BLOCK_M=BLOCK_M,
+        BLOCK_N=BLOCK_N,
+        BLOCK_K=BLOCK_K,
+        num_cu=_mxfp8_linear_num_cu(x_q.device),
+    )
+    if split_k > 1:
+        partial = torch.empty((split_k, M, N), dtype=torch.float32, device=x_q.device)
+        grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N), split_k)
+        _mxfp8_linear_split_k_kernel[grid](
+            x_q,
+            x_scale,
+            w,
+            w_scale,
+            partial,
+            M,
+            N,
+            K,
+            x_q.stride(0),
+            x_q.stride(1),
+            x_scale.stride(0),
+            x_scale.stride(1),
+            w.stride(0),
+            w.stride(1),
+            w_scale.stride(0),
+            w_scale.stride(1),
+            partial.stride(0),
+            partial.stride(1),
+            partial.stride(2),
+            BLOCK_M=BLOCK_M,
+            BLOCK_N=BLOCK_N,
+            BLOCK_K=BLOCK_K,
+            SPLIT_K=split_k,
+            num_warps=num_warps,
+        )
+        return partial.sum(0).to(out_dtype)
+
+    out = torch.empty((M, N), dtype=out_dtype, device=x_q.device)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(N, BLOCK_N))
     _mxfp8_linear_kernel[grid](
         x_q,
