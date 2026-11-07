@@ -52,6 +52,7 @@ from sglang.srt.managers.io_struct import (
     wrap_as_pickle,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_reader
+from sglang.srt.managers.prefill_session_placement import PrefillSessionPlacement
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import run_scheduler_process
 from sglang.srt.managers.utils import is_health_check_generate_req
@@ -108,6 +109,7 @@ class LoadBalanceMethod(Enum):
     FOLLOW_BOOTSTRAP_ROOM = auto()
     TOTAL_REQUESTS = auto()
     TOTAL_TOKENS = auto()
+    PREFILL_SESSION_TOKENS = auto()
 
     @classmethod
     def from_str(cls, method: str):
@@ -123,6 +125,7 @@ class DPBudget:
         self.num_dp_ranks = num_dp_ranks
         self.total_requests = [0] * num_dp_ranks
         self.total_tokens = [0] * num_dp_ranks
+        self.capacity = [0] * num_dp_ranks
         self.last_timestamp = [0.0] * num_dp_ranks
 
     def update_budget(self, loads):
@@ -135,6 +138,7 @@ class DPBudget:
                 load.num_running_reqs + load.num_waiting_reqs
             )
             self.total_tokens[load.dp_rank] = load.num_total_tokens
+            self.capacity[load.dp_rank] = load.max_total_num_tokens
 
     def dispatch(self, method: LoadBalanceMethod, estimated_tokens: int = 0):
         if method == LoadBalanceMethod.TOTAL_REQUESTS:
@@ -190,11 +194,13 @@ class DataParallelController:
             LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM: self.follow_bootstrap_room_scheduler,
             LoadBalanceMethod.TOTAL_REQUESTS: self.total_requests_scheduler,
             LoadBalanceMethod.TOTAL_TOKENS: self.total_tokens_scheduler,
+            LoadBalanceMethod.PREFILL_SESSION_TOKENS: self.prefill_session_tokens_scheduler,
         }
         self.dispatching = dispatch_lookup[self.load_balance_method]
         self.refresh_load_budget_on_dispatch = self.load_balance_method in (
             LoadBalanceMethod.TOTAL_REQUESTS,
             LoadBalanceMethod.TOTAL_TOKENS,
+            LoadBalanceMethod.PREFILL_SESSION_TOKENS,
         )
 
         parallel = get_parallel()
@@ -221,6 +227,11 @@ class DataParallelController:
         )
 
         self.dp_budget = DPBudget(get_parallel().num_dp_ranks)
+        if self.load_balance_method == LoadBalanceMethod.PREFILL_SESSION_TOKENS:
+            self.prefill_sessions = PrefillSessionPlacement(
+                self.launch_dp_size,
+                slots_per_rank=envs.SGLANG_PREFILL_SESSION_SLOTS_PER_RANK.get(),
+            )
         self.load_snapshot_reader = create_load_snapshot_reader(
             port_args,
             caller="DataParallelController",
@@ -326,9 +337,14 @@ class DataParallelController:
         )
 
     def _refresh_active_workers(self) -> None:
-        self._active_workers = [
-            i for i, active in enumerate(self.dp_active) if active and self.status[i]
+        active = [
+            i for i, enabled in enumerate(self.dp_active) if enabled and self.status[i]
         ]
+        if self.load_balance_method == LoadBalanceMethod.PREFILL_SESSION_TOKENS:
+            removed = set(self._active_workers).difference(active)
+            if removed:
+                self.prefill_sessions.drop_ranks(removed)
+        self._active_workers = active
         self._active_count_cache = len(self._active_workers)
 
     def refresh_load_budget(self):
@@ -906,6 +922,29 @@ class DataParallelController:
             LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=estimated_tokens
         )
         sock_send(self.workers[target_worker], req)
+
+    def prefill_session_tokens_scheduler(self, req: Req):
+        # Explicit ranks still own placement. Remember a valid override so that
+        # the next unpinned turn follows it; validation happens before rebinding.
+        already_sent = self.maybe_external_dp_rank_routing(req)
+        input_tokens = len(
+            req.input_ids if req.input_ids is not None else req.input_embeds
+        )
+        params = getattr(req, "sampling_params", None)
+        rank = self.prefill_sessions.select(
+            getattr(req, "session_id", None),
+            input_tokens,
+            (params.max_new_tokens or 0) if params is not None else 0,
+            self._active_workers,
+            self.dp_budget.total_tokens,
+            self.dp_budget.total_requests,
+            self.dp_budget.capacity,
+            forced_rank=req.routed_dp_rank,
+        )
+        self.dp_budget.total_tokens[rank] += input_tokens
+        self.dp_budget.total_requests[rank] += 1
+        if not already_sent:
+            sock_send(self.workers[rank], req)
 
     def event_loop(self):
         while True:
