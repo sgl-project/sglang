@@ -28,6 +28,8 @@ ID_TO_TEXT = {
     63: ".",
     70: "X",
     71: "Y",
+    80: "1",
+    81: "2",
 }
 
 # "STOP" (index 3) sits 6 tokens back: outside the old (stop_str_max_len + 1)
@@ -133,7 +135,7 @@ class TestStopStrSpeculative(unittest.TestCase):
         req = _make_req([60, 61, 62, 63], stop_regex=[r"\.$"])
         req.update_finish_state(new_accepted_len=4)
         self.assertTrue(req.finished())
-        self.assertEqual(req.finished_reason.matched, r"\.$")
+        self.assertEqual(req.finished_reason.matched, ".")
         self.assertEqual(req.finished_len, 2)
 
     def test_stop_regex_end_anchored_midchunk(self):
@@ -142,8 +144,14 @@ class TestStopStrSpeculative(unittest.TestCase):
         req = _make_req([60, 61, 62], stop_regex=[r"[.!?]\s*$"])
         req.update_finish_state(new_accepted_len=3)
         self.assertTrue(req.finished())
-        self.assertEqual(req.finished_reason.matched, r"[.!?]\s*$")
+        self.assertEqual(req.finished_reason.matched, ".")
         self.assertEqual(req.finished_len, 2)
+
+    def test_stop_regex_records_the_matched_span(self):
+        req = _make_req([10, 80, 81, 20], stop_regex=[r"[0-9]+"])
+        req.update_finish_state(new_accepted_len=4)
+        self.assertTrue(req.finished())
+        self.assertEqual(req.finished_reason.matched, "12")
 
 
 if __name__ == "__main__":
