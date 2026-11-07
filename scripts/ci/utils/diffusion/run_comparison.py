@@ -22,7 +22,7 @@ Usage:
     python3 scripts/ci/utils/diffusion/run_comparison.py --dry-run
 
     # Run only specific case(s)
-    python3 scripts/ci/utils/diffusion/run_comparison.py --case-ids flux1_dev_t2i_1024
+    python3 scripts/ci/utils/diffusion/run_comparison.py --case-ids flux3_base_t2i_1024
 
     # Run only specific framework(s)
     python3 scripts/ci/utils/diffusion/run_comparison.py --frameworks sglang
