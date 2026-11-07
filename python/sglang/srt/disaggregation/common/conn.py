@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.utils import (
     filter_kv_indices_for_cp_rank,
     filter_kv_indices_for_shard_rank,
     get_dsv41_spec_layout,
+    get_spec_kv_layout,
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
@@ -130,6 +131,7 @@ class PrefillServerInfo:
     follow_bootstrap_room: bool
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
     kv_layout: Optional[str] = None
     decode_allocation_policy: str = "early"
     # Each prefill shard-group rank owns a subset of logical KV pages.
@@ -306,6 +308,7 @@ class CommonKVManager(BaseKVManager):
 
     kv_layout: Optional[str] = None
     dsv41_spec_layout: Optional[dict] = None
+    spec_kv_layout: Optional[dict] = None
 
     # Logical-page KV sharding (PD prefill only): this rank's slot in the
     # shard group. Each rank owns a subset of logical KV pages.
@@ -331,6 +334,7 @@ class CommonKVManager(BaseKVManager):
         self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_layout = args.kv_layout
         self.dsv41_spec_layout = get_dsv41_spec_layout(args)
+        self.spec_kv_layout = get_spec_kv_layout(args)
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -1345,7 +1349,11 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                info = PrefillServerInfo(**data)
+                # Drop fields from newer prefills.
+                known = {f.name for f in dataclasses.fields(PrefillServerInfo)}
+                info = PrefillServerInfo(
+                    **{key: value for key, value in data.items() if key in known}
+                )
             else:
                 logger.error(
                     f"Failed to get prefill server info: {response.status_code}, {response.text}"
@@ -1426,6 +1434,20 @@ class CommonKVManager(BaseKVManager):
                     "DeepSeek-V4.1 DSpark PD requires the same TP size on both "
                     "servers (including prefill CP ranks for MLA)"
                 )
+
+        # None (draftless PP stage, state-only draft) skips the check.
+        if (
+            info.spec_kv_layout is not None
+            and self.spec_kv_layout is not None
+            and info.spec_kv_layout != self.spec_kv_layout
+        ):
+            raise RuntimeError(
+                f"Speculative KV layout mismatch: prefill server has "
+                f"spec_kv_layout={info.spec_kv_layout}, but decode server has "
+                f"spec_kv_layout={self.spec_kv_layout}. DSpark and DFLASH decode "
+                "read the draft KV their prefill writes, so both servers must use "
+                "the same speculative algorithm and draft KV layout."
+            )
 
         # Every send path rejects head-sharded MXFP8 block scales across
         # attention TP sizes, so each request would fail at its first transfer.
@@ -1637,6 +1659,7 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
+            "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
@@ -3077,6 +3100,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.kv_cache_dtype: Optional[str] = None
         self.kv_layout: Optional[str] = None
         self.dsv41_spec_layout: Optional[dict] = None
+        self.spec_kv_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
@@ -3154,11 +3178,20 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         kv_layout = data.get("kv_layout")
         prefill_http_port = data.get("prefill_http_port")
         dsv41_spec_layout = data.get("dsv41_spec_layout")
+        spec_kv_layout = data.get("spec_kv_layout")
 
         if self._registered_count and self.dsv41_spec_layout != dsv41_spec_layout:
             return web.Response(
                 text="DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
                 status=400,
+            )
+        if (
+            self.spec_kv_layout is not None
+            and spec_kv_layout is not None
+            and self.spec_kv_layout != spec_kv_layout
+        ):
+            return web.Response(
+                text="Speculative KV layout differs across prefill ranks", status=400
             )
         policy = data.get("decode_allocation_policy", "early")
         if self._registered_count and self.decode_allocation_policy != policy:
@@ -3166,6 +3199,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 text="Inconsistent prefill allocation policies", status=400
             )
         self.dsv41_spec_layout = dsv41_spec_layout
+        if self.spec_kv_layout is None:
+            self.spec_kv_layout = spec_kv_layout
         self.decode_allocation_policy = policy
 
         if self.attn_tp_size is None:
@@ -3271,6 +3306,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 kv_cache_dtype=self.kv_cache_dtype,
                 kv_layout=self.kv_layout,
                 dsv41_spec_layout=self.dsv41_spec_layout,
+                spec_kv_layout=self.spec_kv_layout,
                 follow_bootstrap_room=(
                     self.follow_bootstrap_room
                     if self.follow_bootstrap_room is not None
@@ -3285,6 +3321,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             payload = dataclasses.asdict(info)
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
+            if info.spec_kv_layout is None:
+                payload.pop("spec_kv_layout")
             if info.kv_layout is None:
                 payload.pop("kv_layout")
             return web.json_response(payload, status=200)
