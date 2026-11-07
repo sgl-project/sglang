@@ -772,6 +772,18 @@ class TraceReqContextAsync:
         thread_finish_flag: bool = False,
     ) -> None:
         if self._check_fast_return(level):
+            if self.tracing_enable and thread_finish_flag:
+                # Forward completion without popping an ID for a filtered slice.
+                self._append_op(
+                    {
+                        "type": "slice_end",
+                        "name": name,
+                        "level": level,
+                        "ts": ts or _trace_mod.get_cur_time_ns(),
+                        "thread_finish_flag": True,
+                    }
+                )
+                self._flush()
             return
         ts = ts or _trace_mod.get_cur_time_ns()
 
@@ -797,6 +809,13 @@ class TraceReqContextAsync:
         self, slice_ctx: TraceSliceContext, thread_finish_flag: bool = False
     ) -> None:
         if self._check_fast_return(slice_ctx.level):
+            if self.tracing_enable and thread_finish_flag:
+                self.trace_slice_end(
+                    slice_ctx.slice_name,
+                    slice_ctx.level,
+                    ts=slice_ctx.end_time_ns,
+                    thread_finish_flag=True,
+                )
             return
 
         # Pre-generate span ID for this complete slice.
