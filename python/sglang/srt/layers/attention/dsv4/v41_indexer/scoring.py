@@ -27,6 +27,7 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -597,6 +598,12 @@ def decode_scores(
             lmax,
             ratio,
             candidate_mask,
+            rows_per_request=(
+                metadata.rows_per_request
+                if inputs.is_verify
+                and envs.SGLANG_OPT_DSV41_VERIFY_INDEXER_K_REUSE.get()
+                else 1
+            ),
         )
         return PagedDecodeScores(
             bs=bs,
