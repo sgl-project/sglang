@@ -544,7 +544,9 @@ def test_fp4_paged_logits_balanced_matches_per_row_replay(heads, ratio, masked):
     reason="Hopper paged indexer dispatch",
 )
 @pytest.mark.parametrize("ratio", [1, 2])
-def test_hopper_indexer_backends_replay(ratio):
+@pytest.mark.parametrize("budget", [None, 1])
+def test_hopper_indexer_backends_replay(ratio, budget):
+    from sglang.srt.environ import envs
     from sglang.srt.layers.attention.dsv4.v41_indexer import scoring
     from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
         DenseBlocksBackend,
@@ -571,6 +573,7 @@ def test_hopper_indexer_backends_replay(ratio):
         max_compressed_seq_len=capacity,
         page_table=page_table,
         compressed_page_size=1,
+        rows_per_request=6,
     )
     indexer = SimpleNamespace(
         queries=lambda q, freqs: q, head_weights=lambda x: x, index_topk=topk
@@ -625,18 +628,18 @@ def test_hopper_indexer_backends_replay(ratio):
         candidates.consume_decode(decode_inputs[2], published)
         return published
 
-    for _ in range(3):
-        run()
-    graph = torch.cuda.CUDAGraph()
-    with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
-        with torch.cuda.graph(graph):
-            published = run()
-    assert (
-        len(captured_scores) == 3
-    )  # all three runtime entrypoints took the paged path
+    with envs.SGLANG_DSV41_DECODE_SCORE_BUDGET_MIB.override(budget):
+        for _ in range(3):
+            run()
+        graph = torch.cuda.CUDAGraph()
+        with patch.object(scoring, "fp4_index_logits_paged", side_effect=record_scores):
+            with torch.cuda.graph(graph):
+                published = run()
+    chunks = 1 if budget is None else 2
+    assert len(captured_scores) == 3 * chunks
     mask = published.decode_mask
-    assert captured_masks[:2] == [None, None]
-    assert captured_masks[2] is mask
+    assert captured_masks[: 2 * chunks] == [None] * (2 * chunks)
+    assert torch.equal(torch.cat(captured_masks[2 * chunks :]), mask)
     for step, visible in enumerate([193, 0, 1, 7, 8, 9, 65, 193]):
         # -1 positions exercise zero-length padded rows, also for ratio 1.
         lens.copy_((visible - torch.arange(batch, device=q.device) % 6).clamp_min(0))
