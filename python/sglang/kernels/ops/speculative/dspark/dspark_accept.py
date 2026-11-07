@@ -12,7 +12,7 @@ from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 from sglang.srt.environ import envs
 from sglang.srt.sampling.sampling_batch_info import need_truncated_sampling
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
@@ -51,7 +51,7 @@ class AcceptSampling:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -339,7 +339,7 @@ except ImportError:
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if not inputs_on_cuda(*args, **kwargs):
+        if not inputs_on_triton_device(*args, **kwargs):
             return cls.torch(*args, **kwargs)
         if _flashinfer_softmax is not None:
             return cls.flashinfer(*args, **kwargs)
@@ -620,7 +620,7 @@ class MixedAcceptSelectResult(msgspec.Struct):
 class SelectMixedAccept:
     @classmethod
     def execute(cls, *args, **kwargs) -> MixedAcceptSelectResult:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -764,7 +764,7 @@ class AcceptGreedy:
     def execute(
         cls, *args, **kwargs
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -893,7 +893,7 @@ class FinalizeAcceptLensResult(msgspec.Struct):
 class FinalizeAcceptLens:
     @classmethod
     def execute(cls, *args, **kwargs) -> FinalizeAcceptLensResult:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -995,7 +995,7 @@ def finalize_accept_lens_triton(
 class CapCorrectLen:
     @classmethod
     def execute(cls, *args, **kwargs) -> tuple[torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

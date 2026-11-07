@@ -16,7 +16,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 
 MAX_LOG_ODDS = 40.0
 BIN_LOW, BIN_HIGH, NUM_BINS = -8.0, 24.0, 128
@@ -32,7 +32,7 @@ class PredictAcceptance:
 
     @classmethod
     def execute(cls, **kwargs) -> None:
-        if inputs_on_cuda(**kwargs):
+        if inputs_on_triton_device(**kwargs):
             return predict_acceptance(**kwargs)
         return predict_acceptance_torch(**kwargs)
 
@@ -44,7 +44,7 @@ class AccumulateAcceptanceCounts:
 
     @classmethod
     def execute(cls, **kwargs) -> None:
-        if inputs_on_cuda(**kwargs):
+        if inputs_on_triton_device(**kwargs):
             return accumulate_acceptance_counts(**kwargs)
         return accumulate_acceptance_counts_torch(**kwargs)
 
@@ -55,7 +55,7 @@ class RefitAcceptance:
 
     @classmethod
     def execute(cls, **kwargs) -> None:
-        if inputs_on_cuda(**kwargs):
+        if inputs_on_triton_device(**kwargs):
             return refit_acceptance(**kwargs)
         return refit_acceptance_torch(**kwargs)
 
