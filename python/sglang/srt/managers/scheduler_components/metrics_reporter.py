@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
+import json
 import logging
 import math
 import tempfile
@@ -44,6 +45,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     logs_expert_balancedness_to_server_log,
 )
+from sglang.srt.speculative.execution_info import SpecExecutionWindow
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.device_timer import DeviceTimer
 from sglang.srt.utils.scheduler_status_logger import SchedulerStatusLogger
@@ -300,6 +302,7 @@ class SchedulerMetricsReporter:
         self.spec_total_num_forward_ct = 0
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
+        self.spec_execution_window = SpecExecutionWindow()
 
         # For PD disaggregation
         self.kv_transfer_speed_gb_s: float = 0.0
@@ -551,6 +554,18 @@ class SchedulerMetricsReporter:
         self.spec_num_forward_ct += bs
         self.spec_num_block_accept_tokens += num_block_accept_tokens
         self.spec_num_cap_tokens += num_cap_tokens
+
+    def observe_spec_execution(self, result: GenerationBatchResult) -> None:
+        # Same per-DP stats rank as the decode log; no TP/CP-rank summation.
+        if self.is_stats_logging_rank:
+            self.spec_execution_window.observe(result)
+
+    def report_spec_execution(self) -> None:
+        if self.is_stats_logging_rank:
+            if execution := self.spec_execution_window.drain():
+                logger.info(
+                    "Completed speculative execution: %s", json.dumps(execution)
+                )
 
     def _init_estimated_perf_constants(self) -> None:
         model_config = self.scheduler.model_config
@@ -1057,6 +1072,7 @@ class SchedulerMetricsReporter:
 
         if self.is_stats_logging_rank:
             logger.info(msg)
+            self.report_spec_execution()
         if self.current_scheduler_metrics_enabled:
             priority_enabled = self.scheduler.enable_priority_scheduling
 
@@ -1195,6 +1211,7 @@ class SchedulerMetricsReporter:
 
     def _shutdown_fpm(self):
         """Shut down the FPM publisher thread."""
+        self.report_spec_execution()
         if self.scheduler.enable_fpm:
             self.forward_pass_device_timer._report()
             self.scheduler._fpm_publisher.shutdown()
@@ -1463,6 +1480,8 @@ class SchedulerMetricsReporter:
 
     def _maybe_log_idle_metrics(self):
         """Reset forward timing and publish idle metrics when needed."""
+        # Flush the final partial decode window even when Prometheus is off.
+        self.report_spec_execution()
         if self.scheduler.enable_fpm:
             self.forward_pass_device_timer._report()
         # Preserve the transition so the rate limit cannot leave a finite idle gauge.
