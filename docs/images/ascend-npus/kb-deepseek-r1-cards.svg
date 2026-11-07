@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="320" viewBox="0 0 760 320" role="img" aria-label="Cards needed to reach a 50 ms TPOT target (DeepSeek-R1)">
+<rect x="0" y="0" width="760" height="320" rx="12" fill="#f7f8fa"/>
+<text x="24" y="40" font-family="Helvetica, Arial, sans-serif" font-size="16" font-weight="600" fill="#1c2330">Cards needed to reach a 50 ms TPOT target (DeepSeek-R1)</text>
+<text x="24" y="62" font-family="Helvetica, Arial, sans-serif" font-size="11.5" fill="#6b7280">Ascend A3 Series, 3.5k input + 1.5k output. Lower is better.</text>
+<line x1="300" y1="86" x2="300" y2="250" stroke="#dfe3e9" stroke-width="1"/>
+<text x="286" y="113.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">W4A8 · PD mixed</text>
+<rect x="300" y="96.0" width="95.0" height="26" rx="4" fill="#2f6feb"/>
+<text x="405.0" y="113.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">8 cards</text>
+<text x="286" y="163.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">W4A8 · PD disaggregation</text>
+<rect x="300" y="146.0" width="190.0" height="26" rx="4" fill="#6ea0f7"/>
+<text x="500.0" y="163.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">16 cards</text>
+<text x="286" y="213.0" text-anchor="end" font-family="Helvetica, Arial, sans-serif" font-size="12" fill="#374151">W8A8 · PD disaggregation</text>
+<rect x="300" y="196.0" width="380.0" height="26" rx="4" fill="#f08a24"/>
+<text x="690.0" y="213.0" font-family="Helvetica, Arial, sans-serif" font-size="12" font-weight="600" fill="#1c2330">32 cards</text>
+<text x="24" y="302" font-family="Helvetica, Arial, sans-serif" font-size="10.5" fill="#8a919e">Source: published best-practice configurations, image v0.5.18-cann9.0.0-a3. Data: DeepSeek-R1 best practice.</text>
+</svg>

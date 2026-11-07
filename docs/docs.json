@@ -1125,6 +1125,15 @@
                     ]
                   },
                   {
+                    "group": "Knowledge Base",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/knowledge-base/index",
+                      "docs/hardware-platforms/ascend-npus/knowledge-base/quantization-selection",
+                      "docs/hardware-platforms/ascend-npus/knowledge-base/performance-baselines",
+                      "docs/hardware-platforms/ascend-npus/knowledge-base/troubleshooting"
+                    ]
+                  },
+                  {
                     "group": "Reference",
                     "pages": [
                       "docs/hardware-platforms/ascend-npus/reference/support_models",
