@@ -18,6 +18,10 @@ Device-native fallback used where the compiled
 e.g. Intel XPU. It reproduces that op's contract exactly, mutating
 ``positions`` / ``retrieve_*`` in place.
 
+On Ascend NPU (where the compiled op ships CUDA-only binaries), a host
+fallback (``_reconstruct_indices_from_tree_mask_host``) fills the same
+contract instead of a device kernel.
+
 Semantics (per batch ``b``, per node ``tid``; ``n = draft_token_num``):
   ``tree_mask[b, i, j]`` (row-major, flat) marks node ``j`` an ancestor of ``i``.
   ``ancestors[i, j]      = tree_mask[b, i, j] & (j < i)``          (strict ancestors)
@@ -36,17 +40,20 @@ zero materialized intermediates.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 import triton
 import triton.language as tl
 
 from sglang.srt.utils import is_cuda, is_hip, is_xpu, next_power_of_2
+from sglang.srt.utils.common import is_npu
 
 _is_xpu = is_xpu()
+_is_npu = is_npu()
 
 if is_cuda() or is_hip():
     from sglang.kernels.ops.speculative.tree import reconstruct_indices_from_tree_mask
-elif not _is_xpu:
+elif not (_is_xpu or _is_npu):
     from sgl_kernel.speculative import reconstruct_indices_from_tree_mask
 
 # Sentinel for "no ancestor / not-yet-found child": any value >= n. Reductions use
@@ -160,6 +167,84 @@ def reconstruct_indices_from_tree_mask_triton(
     )
 
 
+def _derive_tree_links_host(
+    mask: np.ndarray, bs: int, draft_token_num: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Host-side (retrieve_next_token, retrieve_next_sibling), mirroring
+    ``_derive_tree_links`` in ``srt/speculative/ngram_worker.py`` (grammar
+    path keeps its own copy to avoid a circular import).
+
+    ``mask[b, i, j]`` marks node j as an ancestor of node i, so i's immediate
+    parent is the largest such j < i, and both links follow from the parents.
+    """
+    tree = mask.reshape(bs, draft_token_num, draft_token_num)
+    node_order = np.arange(draft_token_num)
+    ancestors = tree & (node_order < node_order[:, None])
+    parents = np.where(ancestors.any(-1), (ancestors * node_order).argmax(-1), -1)
+
+    next_token = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    next_sibling = np.full((bs, draft_token_num), -1, dtype=np.int64)
+    for b in range(bs):
+        # Descending scan, so every k > i is already recorded when i is reached.
+        earliest_child_of = {}
+        for i in reversed(range(draft_token_num)):
+            next_token[b, i] = earliest_child_of.get(i, -1)
+            parent = int(parents[b, i])
+            if parent >= 0:
+                next_sibling[b, i] = earliest_child_of.get(parent, -1)
+                earliest_child_of[parent] = i
+    return torch.from_numpy(next_token), torch.from_numpy(next_sibling)
+
+
+def _reconstruct_indices_from_tree_mask_host(
+    tree_mask: torch.Tensor,
+    verified_seq_len: torch.Tensor,
+    positions: torch.Tensor,  # mutable
+    retrieve_index: torch.Tensor,  # mutable
+    retrieve_next_token: torch.Tensor,  # mutable
+    retrieve_next_sibling: torch.Tensor,  # mutable
+    batch_size: int,
+    draft_token_num: int,
+) -> None:
+    """Host fallback for platforms without a device kernel (e.g. NPU, where
+    the ``sgl_kernel`` package ships CUDA-only binaries).
+
+    Reproduces the kernel contract into the caller's preallocated device
+    tensors: ``retrieve_index`` (draft slot identity), ``positions`` (tree
+    depth + verified seq_len), and the tree links (via
+    :func:`_derive_tree_links_host`).
+    """
+    d = draft_token_num
+    mask = (
+        tree_mask.detach()
+        .reshape(-1)[: batch_size * d * d]
+        .reshape(batch_size, d, d)
+        .to("cpu", torch.bool)
+        .numpy()
+    )
+    node_order = np.arange(d)
+    depths = (mask & (node_order < node_order[:, None])).sum(-1)
+
+    next_token, next_sibling = _derive_tree_links_host(mask, batch_size, d)
+    seqs = np.asarray(verified_seq_len.detach().to("cpu").tolist(), dtype=np.int64)
+
+    dev = positions.device
+    positions.copy_(
+        torch.from_numpy(depths.reshape(-1) + np.repeat(seqs, d))
+        .to(dev)
+        .reshape(positions.shape)
+    )
+    retrieve_index.copy_(
+        torch.arange(batch_size * d, dtype=torch.int64)
+        .to(dev)
+        .reshape(retrieve_index.shape)
+    )
+    retrieve_next_token.copy_(next_token.to(dev).reshape(retrieve_next_token.shape))
+    retrieve_next_sibling.copy_(
+        next_sibling.to(dev).reshape(retrieve_next_sibling.shape)
+    )
+
+
 def reconstruct_indices_from_tree_mask_func(
     tree_mask: torch.Tensor,
     verified_seq_len: torch.Tensor,
@@ -172,6 +257,18 @@ def reconstruct_indices_from_tree_mask_func(
 ) -> None:
     if _is_xpu:
         reconstruct_indices_from_tree_mask_triton(
+            tree_mask,
+            verified_seq_len,
+            positions,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            batch_size,
+            draft_token_num,
+        )
+        return
+    if _is_npu:
+        _reconstruct_indices_from_tree_mask_host(
             tree_mask,
             verified_seq_len,
             positions,

@@ -224,6 +224,26 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
 
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        # The base tiled copy requires _kv_copy_config, which the NPU paged
+        # buffer layout never builds (see _init_kv_copy_and_warmup). Relocate
+        # slots with plain indexing, viewing each layer as flat
+        # [num_slots, head_num, head_dim] like get_cpu_copy / load_cpu_copy.
+        if self.layer_num == 0:
+            return
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        for local_layer_id in range(self.layer_num):
+            k_layer = self.k_buffer[local_layer_id].view(
+                -1, self.head_num, self.head_dim
+            )
+            v_layer = self.v_buffer[local_layer_id].view(
+                -1, self.head_num, self.v_head_dim
+            )
+            k_layer[tgt_loc] = k_layer[src_loc]
+            v_layer[tgt_loc] = v_layer[src_loc]
+
     # for disagg
     def get_contiguous_buf_infos(self):
         # layer_num x [seq_len, head_num, head_dim]
