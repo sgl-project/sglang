@@ -81,8 +81,8 @@ mis-mapped layout stays numerically correct and silently loses the performance
   ring adds an outer row split on top of Ulysses's inner one.
 - Ring requires an attention backend that declares
   `supports_ring_rotation()` — the per-hop merge needs the kernel's softmax
-  LSE. `fa` and `sage_attn` declare it; the launcher auto-selects `fa` when
-  unset.
+  LSE. `fa`, `sage_attn` and `aiter` declare it; the launcher auto-selects
+  `fa` when unset.
 - `USPAttention`'s masked/tail-padded text path and its replicated-prefix,
   -suffix, and -kv-prefix paths all support ring: the sharded K/V rotates
   through the ring while the tail-pad or replicated portion is attended

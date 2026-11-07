@@ -762,6 +762,22 @@ def test_validate_server_args_requires_packed_varlen_backend():
         MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
 
 
+@pytest.mark.parametrize("backend", ["fa", "aiter"])
+def test_validate_server_args_accepts_ring_on_lse_backends(backend):
+    config = MiniMaxH3PipelineConfig()
+    server_args = SimpleNamespace(
+        component_attention_backends={},
+        attention_backend=backend,
+        ring_degree=2,
+        performance_mode="speed",
+        resolve_component_attention_backend=lambda *_names: (None, None),
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.layers.attention.selector.get_attn_backend"
+    ):
+        MiniMaxH3PipelineConfig.validate_server_args(config, server_args)
+
+
 def test_validate_server_args_accepts_transformer_backend_override():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(

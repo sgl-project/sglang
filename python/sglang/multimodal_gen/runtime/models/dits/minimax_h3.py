@@ -920,6 +920,8 @@ def _minimax_h3_group_attend(
 # aiter's varlen kernel gives a head group the same bytes as those heads inside
 # the full call (checked at H3's shapes on MI355X)
 _COLLECTIVE_PIPELINED_ATTENTION_BACKENDS = (AttentionBackendEnum.AITER,)
+# packed kernels that return the softmax LSE the ring merge needs
+_RING_ATTENTION_BACKENDS = (AttentionBackendEnum.FA, AttentionBackendEnum.AITER)
 
 
 def _minimax_h3_collective_pipelined_attention(
@@ -1136,10 +1138,10 @@ def _minimax_h3_attention_core_impl(
 
     if ring_active:
         ring_ws, _ = get_ring_ctx()
-        if attention._attention_backend_enum is not AttentionBackendEnum.FA:
+        if attention._attention_backend_enum not in _RING_ATTENTION_BACKENDS:
             raise NotImplementedError(
-                "MiniMax H3 ring parallelism requires the FlashAttention "
-                "backend (matches --ring-degree's general restriction)."
+                "MiniMax H3 ring parallelism requires the FlashAttention or "
+                "aiter backend (their packed kernels return the softmax LSE)."
             )
         # max_seqlen is cu_seqlens[1] (`used`) by construction -- the real,
         # non-padding row count ring needs, already a host int here.
@@ -1326,9 +1328,9 @@ class MiniMaxH3Attention(nn.Module):
             prefix=self.prefix,
             packed_trailing_padding=True,
         )
-        # Ring only supports FA (see _minimax_h3_attention_core_impl); keep
-        # the resolved enum alongside the impl instance instead of a second
-        # get_attn_backend() call at the ring gate.
+        # Ring only supports _RING_ATTENTION_BACKENDS; keep the resolved enum
+        # alongside the impl instance instead of a second get_attn_backend()
+        # call at the ring gate.
         self._attention_backend_enum = backend.get_enum()
 
     def _install_qkv_weight_loader(self, arch: MiniMaxH3DiTArchConfig) -> None:
