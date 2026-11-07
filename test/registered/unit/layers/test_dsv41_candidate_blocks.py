@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -6,8 +7,14 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     select_candidate_block_ids,
     topk_among_blocks,
 )
-from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import BlockIds
+from sglang.srt.layers.attention.dsv4 import v41_indexer
+from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+    BlockIds,
+    DenseBlocksBackend,
+)
 from sglang.srt.layers.attention.dsv4.v41_indexer.types import get_tail_row_indices
+from sglang.srt.layers.deep_gemm_wrapper import configurer
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -114,6 +121,35 @@ class TestBlockIdsTail(CustomTestCase):
             ).tolist(),
             [3, 4, 5, 6, 7],
         )
+
+
+class TestCandidateIndexerGating(CustomTestCase):
+    """SM12x has no DeepGEMM paged sparse MQA logits; backend init must give it
+    the dense-blocks scheme, not fail, while SM100 without them still fails."""
+
+    def _make_without_sparse_logits(self, **platform):
+        with (
+            patch.object(v41_indexer, "is_sm100_or_newer", return_value=True),
+            patch.object(v41_indexer, "_use_deep_gemm_prefill", return_value=True),
+            patch.object(configurer, "DEEPGEMM_PAGED_SPARSE_MQA_LOGITS", False),
+            override_platform(**platform),
+        ):
+            return v41_indexer.make_candidate_indexer(
+                token_to_kv_pool=None,
+                req_to_token=None,
+                page_size=64,
+                candidate_topk_blocks=4,
+                candidate_block_size=8,
+            )
+
+    def test_sm12x_takes_dense_blocks(self):
+        prefill, decode = self._make_without_sparse_logits(is_sm120=True)
+        self.assertIsInstance(decode, DenseBlocksBackend)
+        self.assertIs(prefill, decode)
+
+    def test_sm100_still_requires_sparse_logits(self):
+        with self.assertRaisesRegex(RuntimeError, "paged sparse MQA logits"):
+            self._make_without_sparse_logits(is_sm120=False)
 
 
 if __name__ == "__main__":
