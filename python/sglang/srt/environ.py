@@ -2008,6 +2008,13 @@ class Envs:
     # bf16 logits vary with the tile's row count, so picks near the selection
     # floor can differ there.
     SGLANG_OPT_DSV4_INDEXER_TP_SHARD = EnvBool(False)
+    # ROCm, with SGLANG_OPT_DSV4_INDEXER_TP_SHARD: how the HIP prefill indexer's sharded
+    # selections are exchanged. rccl: one blocking all-gather. sdma: mori's
+    # SdmaAllGatherOp (single node, MORI_ENABLE_SDMA=1), overlapped with the layer's q_b
+    # and KV store; every rank falls back to rccl when any cannot set it up.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD_GATHER = EnvStr("rccl")
+    # Bytes per rank of the sdma window, outside the KV budget; larger exchanges use rccl.
+    SGLANG_OPT_DSV4_INDEXER_TP_SHARD_SDMA_BYTES = EnvInt(64 << 20)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),
     # not request ISL.

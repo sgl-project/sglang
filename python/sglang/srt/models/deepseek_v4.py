@@ -2332,6 +2332,7 @@ class MQALayer(MqaAttentionBase):
 
         # The indexer's wq_b reuses the fp8 quant of the normed q_lora made here.
         q_lora_quant = None
+        sources_first = False
         if do_fused_qk_norm_rope:
             q_lora_e8m0 = (
                 _is_gfx95_supported or _is_gfx1250_supported
@@ -2507,6 +2508,23 @@ class MQALayer(MqaAttentionBase):
                 q_out.copy_(q)
         else:
             q_lora, q_for_wqb = self._normalize_q_lora(q_lora)
+            sources_first = (
+                _is_hip
+                and not in_replay_tail_graph()
+                and _hip.low_ratio_sources_first(
+                    self, forward_batch, attn_backend, unified=unified, use_cp=use_cp
+                )
+            )
+            if sources_first:
+                # the indexer reads the operand wq_b reads, not its output
+                with attn_backend.deferred_indexer_gather():
+                    attn_backend.forward_low_ratio_sources(
+                        layer=self,
+                        x=x,
+                        q_lora=q_for_wqb,
+                        positions=positions,
+                        forward_batch=forward_batch,
+                    )
             if _is_hip:
                 q, q_lora, fuse_q_rope = _hip.compute_q_b(
                     self, q_lora, q_for_wqb, positions, q_out, unified, use_cp
@@ -2581,7 +2599,9 @@ class MQALayer(MqaAttentionBase):
 
         del qkv_a
 
-        if self.compress_ratio in (1, 2) and (
+        if sources_first:
+            attn_backend.finish_indexer_gather()
+        elif self.compress_ratio in (1, 2) and (
             self.compressor is not None or self.indexer is not None
         ):
             if _low_ratio_sources_break(attn_backend, forward_batch):
