@@ -21,6 +21,7 @@ import os
 from bisect import bisect_left
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
+from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -141,7 +142,10 @@ def _profile_inputs(tensors, capacity: int, num_experts: int):
 
 
 def _valid_native_cache(payload) -> bool:
-    if not isinstance(payload, dict) or payload.get("version") != 1:
+    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
+
+    # create_workspace reloads this payload; FlashInfer ignores other versions.
+    if not isinstance(payload, dict) or payload.get("version") != KNOB_CACHE_VERSION:
         return False
     entries = payload.get("entries")
     return (
@@ -198,6 +202,9 @@ class MegaMoeTunedForward:
             ):
                 continue
             value = getattr(self.backend.megakernel, item.name)
+            if isinstance(value, Enum):
+                # The key persists across restarts, so store enums by their stable name.
+                value = value.name
             if not isinstance(value, torch.Tensor):
                 config[item.name] = value
         # The enclosing flashinfer.autotune context validates runtime/compiler
