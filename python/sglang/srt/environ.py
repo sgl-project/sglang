@@ -1019,11 +1019,8 @@ class Envs:
     # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
     # attention, GDN prefill); each also falls back to the generic path where it does not apply.
     SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
-    # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
-    # pinned aiter still ships the pre-PR config (see
-    # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
-    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
-    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    # In-tree rows for aiter's GEMM and fused-MoE tuned tables (utils/aiter_tuned_tables.py)
+    # and DeepSeek-V4's in-tree Triton GEMM configs. 0 = use aiter as is.
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
