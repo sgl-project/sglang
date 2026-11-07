@@ -20,8 +20,10 @@ in any of these branches before it reaches the expensive GPU path.
 import os
 import socket
 import struct
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -160,6 +162,117 @@ class TestTransportBackend(CustomTestCase):
         finally:
             a.close()
             b.close()
+
+
+class TestDerivedBufferIpcContract(CustomTestCase):
+    def test_non_persistent_block32_scale_survives_ipc_and_sharded_save(self):
+        """IPC-derived scales must not become unexpected checkpoint keys."""
+        from sglang.srt.model_loader import loader as model_loader
+        from sglang.srt.weight_cache import ipc_loader
+        from sglang.srt.weight_cache.daemon import WeightCacheDaemon
+
+        def make_model(*args):
+            model = torch.nn.Module()
+            model.linear = torch.nn.Module()
+            model.linear.register_parameter(
+                "weight", torch.nn.Parameter(torch.ones(2, 2), requires_grad=False)
+            )
+            model.linear.register_parameter(
+                "weight_scale_inv",
+                torch.nn.Parameter(torch.ones(1, 1), requires_grad=False),
+            )
+            model.linear.register_buffer("calibration", torch.ones(1))
+            model.linear.register_buffer("rotary", torch.ones(2), persistent=False)
+            return model
+
+        daemon_model = make_model()
+        packed_scale = torch.arange(8, dtype=torch.int32).reshape(4, 2)
+        daemon_model.linear.register_buffer(
+            "_deepgemm_block32_weight_scale", packed_scale, persistent=False
+        )
+        name = "linear._deepgemm_block32_weight_scale"
+        self.assertNotIn(name, daemon_model.state_dict())
+
+        daemon = WeightCacheDaemon.__new__(WeightCacheDaemon)
+        daemon.model = daemon_model
+        daemon.gpu_id = 0
+        daemon.state_entries = {}
+        daemon.transport_backend = None
+        daemon._export_state()
+
+        a, b = socket.socketpair()
+        try:
+            daemon.transport_backend.send_fetch_state_response(
+                a, config={}, entries=daemon.state_entries, pid=os.getpid()
+            )
+            response = recv_msg(b)
+            response = daemon.transport_backend.recv_fetch_state_response(b, response)
+        finally:
+            a.close()
+            b.close()
+
+        entries = response["entries"]
+        self.assertFalse(entries[name]["is_param"])
+        self.assertFalse(entries[name]["persistent"])
+        self.assertTrue(entries["linear.calibration"]["persistent"])
+        loader = ipc_loader.IpcModelLoader.__new__(ipc_loader.IpcModelLoader)
+        loader.load_config = SimpleNamespace(model_loader_extra_config=None)
+        loader._transport_backend = daemon.transport_backend
+        with patch.object(ipc_loader, "_initialize_model", side_effect=make_model):
+            client_model = loader._load_zero_copy_mode(
+                SimpleNamespace(dtype=torch.float32), None, entries, None
+            )
+
+        self.assertIn(name, dict(client_model.named_buffers()))
+        self.assertNotIn(name, dict(client_model.named_parameters()))
+        self.assertEqual(set(client_model.state_dict()), set(daemon_model.state_dict()))
+        self.assertEqual(
+            client_model.linear._deepgemm_block32_weight_scale.dtype, torch.int32
+        )
+        torch.testing.assert_close(
+            client_model.linear._deepgemm_block32_weight_scale,
+            packed_scale,
+            rtol=0,
+            atol=0,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            config = SimpleNamespace(
+                model_path=directory, revision=None, dtype=torch.float32
+            )
+            with (
+                patch.object(
+                    model_loader,
+                    "get_parallel",
+                    return_value=SimpleNamespace(tp_rank=0),
+                ),
+                patch.object(
+                    model_loader, "_get_quantization_config", return_value=None
+                ),
+                patch.object(model_loader, "_initialize_model", side_effect=make_model),
+            ):
+                model_loader.ShardedStateLoader.save_model(client_model, directory)
+                restored = model_loader.ShardedStateLoader(
+                    loader.load_config
+                ).load_model(
+                    model_config=config,
+                    device_config=SimpleNamespace(device="cpu"),
+                )
+            self.assertEqual(set(restored.state_dict()), set(daemon_model.state_dict()))
+            for key, tensor in daemon_model.state_dict().items():
+                torch.testing.assert_close(restored.state_dict()[key], tensor)
+
+        daemon._export_state()
+        legacy_entries = daemon.state_entries
+        for entry in legacy_entries.values():
+            entry.pop("persistent")
+        with patch.object(ipc_loader, "_initialize_model", side_effect=make_model):
+            legacy_model = loader._load_zero_copy_mode(
+                SimpleNamespace(dtype=torch.float32), None, legacy_entries, None
+            )
+        self.assertIn(name, legacy_model.state_dict())
+        self.assertIn("linear.rotary", legacy_model.state_dict())
+        self.assertIn("linear.calibration", legacy_model.state_dict())
 
 
 class TestCacheConfig(CustomTestCase):

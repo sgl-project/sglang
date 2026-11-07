@@ -270,7 +270,7 @@ class IpcModelLoader(BaseModelLoader):
             logger.info(f"[IpcModelLoader] Rebuilt {count} stale conv_weights views")
 
     @staticmethod
-    def _set_module_tensor(model, name, tensor, is_param=True):
+    def _set_module_tensor(model, name, tensor, is_param=True, persistent=True):
         """Replace or register a parameter/buffer in the model by its full dotted name.
 
         This is necessary because setting param.data on a meta-device tensor
@@ -301,7 +301,7 @@ class IpcModelLoader(BaseModelLoader):
                 del obj._parameters[leaf_name]
             elif hasattr(obj, leaf_name) and leaf_name not in obj._buffers:
                 delattr(obj, leaf_name)
-            obj.register_buffer(leaf_name, tensor)
+            obj.register_buffer(leaf_name, tensor, persistent=persistent)
 
     def _load_zero_copy_mode(
         self,
@@ -377,7 +377,13 @@ class IpcModelLoader(BaseModelLoader):
                     continue
 
             # Replace or register the tensor in the model
-            self._set_module_tensor(model, name, imported_tensor, is_param=is_param)
+            self._set_module_tensor(
+                model,
+                name,
+                imported_tensor,
+                is_param=is_param,
+                persistent=entry.get("persistent", True),
+            )
             imported_refs.append(imported_tensor)
             imported_count += 1
 

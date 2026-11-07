@@ -235,12 +235,25 @@ def gemm_nt_f8f8bf16(
     _sanity_check_input(rhs)
 
     with compile_utils.deep_gemm_execution_hook(m, n, k, num_groups, kernel_type):
-        deep_gemm.fp8_gemm_nt(
-            lhs,
-            rhs,
-            out,
-            **({"recipe": recipe} if recipe is not None else {}),
-        )
+        if recipe == (1, 32, 32) and lhs[1].dtype == rhs[1].dtype == torch.int:
+            # The scales are already the packed bytes the kernel reads, and asking
+            # DeepGEMM to cast them trips its layout checks, so they go to
+            # fp8_fp4_gemm_nt with the cast off, as in gemm_nt_mxfp8_f8f8bf16 below.
+            deep_gemm.fp8_fp4_gemm_nt(
+                lhs,
+                rhs,
+                out,
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                disable_ue8m0_cast=True,
+            )
+        else:
+            deep_gemm.fp8_gemm_nt(
+                lhs,
+                rhs,
+                out,
+                **({"recipe": recipe} if recipe is not None else {}),
+            )
 
 
 def gemm_nt_mxfp8_f8f8bf16(

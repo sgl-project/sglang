@@ -19,6 +19,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_NEED_TMA_ALIGNED_SCALES,
+    DEEPGEMM_PACKED_BLOCK32,
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
@@ -272,7 +273,9 @@ class _BaseWarmupExecutor:
         return {
             DeepGemmKernelType.GEMM_NT_F8F8BF16: _NormalWarmupExecutor,
             DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32: partial(
-                _NormalWarmupExecutor, block_size=32
+                _NormalWarmupExecutor,
+                block_size=32,
+                packed_scales=DEEPGEMM_PACKED_BLOCK32,
             ),
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_CONTIG: _GroupedContWarmupExecutor,
             DeepGemmKernelType.GROUPED_GEMM_NT_F8F8BF16_MASKED: _GroupedMaskedWarmupExecutor,
@@ -413,20 +416,51 @@ _BLOCK_SIZE = 128
 
 class _NormalWarmupExecutor(_BaseWarmupExecutor):
     def __init__(
-        self, max_m: int, n: int, k: int, num_groups: int, block_size: int = 128
+        self,
+        max_m: int,
+        n: int,
+        k: int,
+        num_groups: int,
+        block_size: int = 128,
+        packed_scales: bool = False,
     ):
         self.recipe = (1, block_size, block_size)
+        self.packed_scales = packed_scales
         self.lhs_q, self.lhs_s = _empty_token_fp8((max_m, k), block_size)
         self.rhs_q, self.rhs_s = _empty_block_fp8((n, k), block_size)
         self.out = torch.empty((max_m, n), device="cuda", dtype=torch.bfloat16)
 
     def execute(self, m):
-        deep_gemm.fp8_gemm_nt(
-            (self.lhs_q[:m], self.lhs_s[:m]),
-            (self.rhs_q, self.rhs_s),
-            self.out[:m],
-            recipe=self.recipe,
-        )
+        if self.packed_scales:
+            lhs_s = deep_gemm.transform_sf_into_required_layout(
+                self.lhs_s[:m].contiguous(),
+                mn=m,
+                k=self.lhs_q.shape[-1],
+                recipe=self.recipe,
+                is_sfa=True,
+            )
+            rhs_s = deep_gemm.transform_sf_into_required_layout(
+                self.rhs_s.contiguous(),
+                mn=self.rhs_q.shape[-2],
+                k=self.rhs_q.shape[-1],
+                recipe=self.recipe,
+                is_sfa=False,
+            )
+            deep_gemm.fp8_fp4_gemm_nt(
+                (self.lhs_q[:m], lhs_s),
+                (self.rhs_q, rhs_s),
+                self.out[:m],
+                recipe_a=(1, 32),
+                recipe_b=(1, 32),
+                disable_ue8m0_cast=True,
+            )
+        else:
+            deep_gemm.fp8_gemm_nt(
+                (self.lhs_q[:m], self.lhs_s[:m]),
+                (self.rhs_q, self.rhs_s),
+                self.out[:m],
+                recipe=self.recipe,
+            )
 
 
 class _GroupedContWarmupExecutor(_BaseWarmupExecutor):
