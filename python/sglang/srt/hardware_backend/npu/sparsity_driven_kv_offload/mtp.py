@@ -24,24 +24,6 @@ def is_sparse_mtp_batch(forward_batch) -> bool:
     )
 
 
-def use_native_mtp_verify(backend, forward_batch, manager):
-    """Select the opt-in long Q4 verify path; short rows use the reference."""
-    if not (
-        getattr(manager.lim_adapter, "mtp_full_visible", False)
-        and forward_batch.forward_mode.is_target_verify()
-        and getattr(forward_batch.spec_info, "num_tokens_per_req", -1) == 4
-    ):
-        return False
-    if backend.graph_mode:
-        # Graph replay eligibility is checked against CPU lengths by the runner.
-        return True
-    lengths = forward_batch.seq_lens_cpu
-    return lengths is not None and all(
-        int(length) == 0 or int(length) >= manager.cache_capacity
-        for length in lengths.tolist()
-    )
-
-
 def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
     """Return [B,Q] request IDs, absolute positions and live-query masks.
 
@@ -49,30 +31,30 @@ def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
     includes the draft step. Draft-extend has a fixed Q stride but only its
     num_accept_tokens leading columns contain KV to publish.
     """
-    requests = forward_batch.req_pool_indices.long()
-    batch = requests.numel()
-    width = getattr(forward_batch.spec_info, "num_tokens_per_req", -1)
+    token_to_slots = forward_batch.req_pool_indices.long()
+    batch = token_to_slots.numel()
+    query_width = getattr(forward_batch.spec_info, "num_tokens_per_req", -1)
     if not (
         forward_batch.forward_mode.is_target_verify()
         or forward_batch.forward_mode.is_draft_extend_v2()
     ):
-        width = 1
-    if width <= 0:
+        query_width = 1
+    if query_width <= 0:
         if batch == 0 or num_tokens % batch:
             raise ValueError("Sparse MTP requires a fixed query width per request")
-        width = num_tokens // batch
-    logical_tokens = batch * width
+        query_width = num_tokens // batch
+    logical_tokens = batch * query_width
     if batch == 0 or logical_tokens > num_tokens:
         raise ValueError("Sparse MTP query window exceeds the padded token rows")
     if forward_batch.positions.numel() != num_tokens:
         raise ValueError("Sparse MTP requires one absolute position per query")
-    requests = requests[:, None].expand(batch, width)
+    token_to_slots = token_to_slots[:, None].expand(batch, query_width)
     # TP may append token rows independently of request padding (e.g. 2*3
     # queries padded to 8). Those rows are not another column of each request.
-    positions = forward_batch.positions[:logical_tokens].long().view(batch, width)
+    positions = forward_batch.positions[:logical_tokens].long().view(batch, query_width)
     valid = (
-        (requests > 0)
-        & (requests < request_rows)
+        (token_to_slots > 0)
+        & (token_to_slots < request_rows)
         & (forward_batch.seq_lens[:, None] > 0)
         & (positions >= 0)
         & (positions < context_len)
@@ -80,13 +62,13 @@ def prepare_mtp_rows(forward_batch, num_tokens, request_rows, context_len):
     if forward_batch.forward_mode.is_draft_extend_v2():
         counts = forward_batch.spec_info.num_accept_tokens
         valid = valid & (
-            torch.arange(width, device=positions.device)[None] < counts[:, None]
+            torch.arange(query_width, device=positions.device)[None] < counts[:, None]
         )
     if forward_batch.out_cache_loc is not None:
         valid = valid & (
-            forward_batch.out_cache_loc[:logical_tokens].view(batch, width) >= 0
+            forward_batch.out_cache_loc[:logical_tokens].view(batch, query_width) >= 0
         )
-    return requests, positions, valid
+    return token_to_slots, positions, valid
 
 
 def validate_mtp_chain(forward_batch, positions, live, request_rows):

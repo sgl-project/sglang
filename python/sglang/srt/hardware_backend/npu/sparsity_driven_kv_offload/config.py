@@ -17,6 +17,10 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
     BudgetPlan,
     resolve_sparse_kv_budget,
 )
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+)
 from sglang.srt.runtime_context import (
     attention_backends,
     get_disagg,
@@ -24,10 +28,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
     get_spec,
-)
-from sglang.srt.utils.common import (
-    get_cuda_graph_max_batch_size,
-    get_eager_max_batch_size,
 )
 from sglang.srt.utils.device import is_npu
 

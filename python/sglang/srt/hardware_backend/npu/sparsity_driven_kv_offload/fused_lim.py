@@ -11,9 +11,7 @@ from sglang.kernels.ops.attention.npu_lim import (
     load_fused_lim_operator,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    prepare_mtp_rows,
     sparse_query_width,
-    validate_mtp_chain,
 )
 
 
@@ -28,8 +26,7 @@ class LIMSelection:
     prefix_lens: torch.Tensor
     sparse_rows: torch.Tensor
     valid_rows: torch.Tensor
-    request_slots: torch.Tensor
-    seq_lens: torch.Tensor
+    request_safe_slots: torch.Tensor
     query_width: int = 1
 
 
@@ -105,14 +102,6 @@ class LIMDecodeAdapter:
             )
         if block_table.shape[0] != batch:
             raise ValueError("LIM source table must match the padded request batch.")
-        if width > 1:
-            from sglang.srt.environ import envs
-
-            if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
-                _, positions, live = prepare_mtp_rows(
-                    forward_batch, query.shape[0], self.rows, self.source_capacity
-                )
-                validate_mtp_chain(forward_batch, positions, live, self.rows)
         columns = min(block_table.shape[1], self.block_table.shape[1])
         layer_index = layer_id - manager.start_layer
         self._fused_prepare_lim_metadata(
@@ -122,7 +111,7 @@ class LIMDecodeAdapter:
             last_prefix=self.last_prefix[layer_index],
             block_table=block_table[:, :columns],
             out_block_table=self.block_table[:batch],
-            safe_slots=self._pre_safe_slots[:batch],
+            safe_slots=self.request_safe_slots[:batch],
             lengths=self._pre_lengths[:batch],
             prefixes=self._pre_prefixes[:batch],
             sparse_rows=self._pre_sparse[:batch],
@@ -150,7 +139,7 @@ class LIMDecodeAdapter:
             prefix_lens=self._pre_prefixes[:batch],
             cache_sizes=self._pre_cache_sizes[:batch],
             request_state=self._pre_states[:batch],
-            request_slots=self._pre_safe_slots[:batch],
+            request_slots=self.request_safe_slots[:batch],
             slot_pool=manager.device_slot_map[layer_index],
             source_ids=sources,
             device_slots=self.device_slots[:rows],
@@ -162,7 +151,7 @@ class LIMDecodeAdapter:
             full_visible=True,
         )
         self.last_prefix[layer_index].index_copy_(
-            0, self._pre_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
+            0, self.request_safe_slots[:batch].long(), self._pre_next_prefix[:batch]
         )
         return LIMSelection(
             sources[:, 0],
@@ -174,20 +163,19 @@ class LIMDecodeAdapter:
             self._pre_prefixes[:batch],
             self._pre_sparse[:batch],
             self._pre_valid[:batch],
-            self._pre_safe_slots[:batch],
-            self._pre_lengths[:batch],
+            self.request_safe_slots[:batch],
             width,
         )
 
     def copy_sfa_metadata(self, manager, plan):
-        batch = plan.request_slots.numel()
+        batch = plan.request_safe_slots.numel()
         self._fused_copy_sfa_metadata(
             source_ids=plan.source_ids,
             topk_misses=plan.topk_misses,
             miss_counts=plan.miss_counts,
             valid_rows=plan.valid_rows,
             sparse_rows=plan.sparse_rows,
-            request_slots=plan.request_slots,
+            request_slots=plan.request_safe_slots,
             next_prefix=plan.prefix_lens,
             last_prefix=self._metadata_prefix_scratch,
             actual_seq_lengths_kv=manager.planner_actual_seq_lengths_kv[:batch],
@@ -198,7 +186,7 @@ class LIMDecodeAdapter:
             host_context_len=manager.max_context_len,
             request_rows=self.rows,
             query_width=plan.query_width,
-            seq_lens=plan.seq_lens,
+            seq_lens=plan.prefix_lens,
             host_block_table=self.block_table[:batch],
         )
         return self.query_ends[plan.query_width - 1, :batch]

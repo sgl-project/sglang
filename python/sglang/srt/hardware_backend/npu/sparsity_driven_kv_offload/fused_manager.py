@@ -268,7 +268,7 @@ class SparseKVCacheManager:
         plan,
         current_inputs,
     ):
-        batch = plan.request_slots.numel()
+        batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
         ends = self.lim_adapter.copy_sfa_metadata(self, plan)
         padded_heads = self.fused_attn_out.shape[1]
@@ -306,7 +306,7 @@ class SparseKVCacheManager:
                 "current": current_inputs[0],
                 "positions": current_inputs[1],
                 "valid": current_inputs[2],
-                "request_slots": plan.request_slots,
+                "request_slots": plan.request_safe_slots,
                 "req_to_token": self.req_to_token_pool.req_to_token,
                 "resident_begin": self.resident_begin[layer_idx],
                 "resident_end": self.resident_end[layer_idx],
@@ -356,17 +356,17 @@ class SparseKVCacheManager:
         src_tensor = torch.cat([k, k_rope], dim=-1).contiguous()
         dst_tensor = self.host_kv_buffer[layer_idx]
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
-        num_src_rows = int(src_tensor.shape[0])
+        num_src_kvs = int(src_tensor.shape[0])
 
         if not forward_batch.forward_mode.is_extend_without_speculative():
             req_ids, token_pos, valid_mask = prepare_mtp_rows(
-                forward_batch, num_src_rows, self.size, self.logical_max_context_len
+                forward_batch, num_src_kvs, self.size, self.logical_max_context_len
             )
             token_to_slots = req_ids.reshape(-1).contiguous()
             token_positions = token_pos.reshape(-1).contiguous()
             valid_mask = valid_mask.reshape(-1).contiguous()
             # TP token padding is a suffix, independent of the request window.
-            padding = num_src_rows - token_to_slots.numel()
+            padding = num_src_kvs - token_to_slots.numel()
             token_to_slots = torch.nn.functional.pad(
                 token_to_slots, (0, padding), value=0
             )
@@ -424,22 +424,22 @@ class SparseKVCacheManager:
                 )
             else:
                 extend_seq_lens_sum = int(extend_seq_lens.sum().item())
-            if extend_seq_lens_sum == num_src_rows:
+            if extend_seq_lens_sum == num_src_kvs:
                 # Chunk prefill emits compact rows as [req0 tokens][req1 tokens]...
                 # instead of graph-captured padded [B, tokens_per_req] rows.
                 seq_starts = torch.cumsum(extend_seq_lens, dim=0) - extend_seq_lens
                 flat_req_ids = torch.repeat_interleave(
-                    req_ids, extend_seq_lens, output_size=num_src_rows
+                    req_ids, extend_seq_lens, output_size=num_src_kvs
                 )
                 flat_seq_starts = torch.repeat_interleave(
-                    seq_starts, extend_seq_lens, output_size=num_src_rows
+                    seq_starts, extend_seq_lens, output_size=num_src_kvs
                 )
                 flat_prefix_lens = torch.repeat_interleave(
-                    extend_prefix_lens, extend_seq_lens, output_size=num_src_rows
+                    extend_prefix_lens, extend_seq_lens, output_size=num_src_kvs
                 )
                 token_pos = (
                     flat_prefix_lens
-                    + torch.arange(num_src_rows, device=device, dtype=torch.long)
+                    + torch.arange(num_src_kvs, device=device, dtype=torch.long)
                     - flat_seq_starts
                 )
                 token_to_slots, token_positions = flat_req_ids, token_pos
@@ -449,18 +449,18 @@ class SparseKVCacheManager:
                     & (token_pos < self.max_context_len)
                 )
             else:
-                if num_src_rows % batch_size != 0:
+                if num_src_kvs % batch_size != 0:
                     raise RuntimeError(
                         "Sparse v2 prefill offload expects either compact ragged "
                         "layout with rows=sum(extend_seq_lens) or graph-style "
-                        f"row-major layout [B, tokens_per_req], got rows={num_src_rows}, "
+                        f"row-major layout [B, tokens_per_req], got rows={num_src_kvs}, "
                         f"batch={batch_size}, extend_seq_lens_sum={extend_seq_lens_sum}."
                     )
 
                 # Graph-friendly static layout:
                 # compact rows are interpreted as [batch_size, tokens_per_req].
                 # Invalid padded columns are masked by local_offsets < extend_seq_lens.
-                tokens_per_req = num_src_rows // batch_size
+                tokens_per_req = num_src_kvs // batch_size
 
                 local_offsets = (
                     torch.arange(tokens_per_req, device=device, dtype=torch.long)
@@ -481,7 +481,7 @@ class SparseKVCacheManager:
 
             if (
                 forward_batch.out_cache_loc is not None
-                and int(forward_batch.out_cache_loc.numel()) == num_src_rows
+                and int(forward_batch.out_cache_loc.numel()) == num_src_kvs
             ):
                 valid_mask = valid_mask & (
                     forward_batch.out_cache_loc.to(torch.long) >= 0

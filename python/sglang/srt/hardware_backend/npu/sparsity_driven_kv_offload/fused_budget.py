@@ -153,7 +153,7 @@ class BudgetPlan:
         }
         # Per batch row: six int32 metadata arrays and two boolean masks (26 bytes).
         for name in (
-            "_pre_safe_slots",
+            "request_safe_slots",
             "_pre_lengths",
             "_pre_prefixes",
             "_pre_states",

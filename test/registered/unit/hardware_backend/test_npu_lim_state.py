@@ -24,7 +24,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     mtp_topk_mask,
     mtp_topk_rows,
     prepare_mtp_rows,
-    use_native_mtp_verify,
     validate_mtp_chain,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
@@ -35,27 +34,6 @@ register_cpu_ci(est_time=3, stage="base-a")
 
 
 class TestLIMState(CustomTestCase):
-    def test_native_mtp_verify_dispatch_only_for_long_q4_chain(self):
-        backend = SimpleNamespace(graph_mode=False)
-        manager = SimpleNamespace(
-            lim_adapter=SimpleNamespace(mtp_full_visible=True), cache_capacity=12288
-        )
-        batch = SimpleNamespace(
-            forward_mode=ForwardMode.TARGET_VERIFY,
-            spec_info=SimpleNamespace(num_tokens_per_req=4),
-            seq_lens_cpu=torch.tensor([12288, 0]),
-        )
-        self.assertTrue(use_native_mtp_verify(backend, batch, manager))
-        batch.seq_lens_cpu = torch.tensor([12287, 12288])
-        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
-        batch.forward_mode = ForwardMode.DRAFT_EXTEND_V2
-        backend.graph_mode = True
-        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
-        batch.forward_mode = ForwardMode.TARGET_VERIFY
-        self.assertTrue(use_native_mtp_verify(backend, batch, manager))
-        batch.spec_info.num_tokens_per_req = 3
-        self.assertFalse(use_native_mtp_verify(backend, batch, manager))
-
     def test_mtp_chain_validation_rejects_partial_and_out_of_bounds_rows(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.TARGET_VERIFY,

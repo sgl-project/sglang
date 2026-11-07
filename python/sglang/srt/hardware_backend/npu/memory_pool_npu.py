@@ -767,14 +767,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     ),
                     device=self.device,
                 )
-            logger.info(
-                "NPU MLA attention KV allocation: role=%s offload=%s "
-                "CKV_bytes=%d KPE_bytes=%d",
-                "draft" if is_draft_worker else "target",
-                self.enable_sparsity_driven_kv_offload,
-                self.k_buffer.nbytes if self.k_buffer is not None else 0,
-                self.v_buffer.nbytes if self.v_buffer is not None else 0,
-            )
             self.index_k_buffer = None
             if self.index_head_dim is not None:
                 # index_size, not self.size: the indexer is replicated.

@@ -26,13 +26,13 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     is_sparse_mtp_batch,
     prepare_mtp_rows,
 )
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import get_eager_max_batch_size
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:

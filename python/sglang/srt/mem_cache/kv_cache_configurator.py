@@ -2184,18 +2184,6 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             modelslim_cache_layout=self.modelslim_cache_layout,
         )
-        if token_to_kv_pool.index_k_buffer is not None:
-            logger.info(
-                "NPU MLA index pool allocated: role=%s layers=[%s,%s) "
-                "owner_layer_ids=%s shape=%s dtype=%s nbytes=%d",
-                "draft" if self.is_draft_worker else "target",
-                self.layer_info.start_layer,
-                self.layer_info.end_layer,
-                token_to_kv_pool.indexer_layer_ids,
-                tuple(token_to_kv_pool.index_k_buffer.shape),
-                token_to_kv_pool.index_k_buffer.dtype,
-                token_to_kv_pool.index_k_buffer.nbytes,
-            )
         return token_to_kv_pool
 
     def get_dsa_indexer_layer_ids(self) -> tuple[int, ...]:
