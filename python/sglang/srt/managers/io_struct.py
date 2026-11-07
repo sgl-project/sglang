@@ -577,6 +577,8 @@ class GenerateReqInput:
         """Normalize inputs for a single example."""
         if self.sampling_params is None:
             self.sampling_params = {}
+        else:
+            self.sampling_params = self.sampling_params.copy()
         if self.rid is None:
             self.rid = uuid.uuid4().hex
         if self.return_logprob is None:
@@ -757,11 +759,15 @@ class GenerateReqInput:
     def _normalize_sampling_params(self, num):
         """Normalize sampling parameters for batch processing."""
         if self.sampling_params is None:
-            self.sampling_params = [{}] * num
+            self.sampling_params = [{} for _ in range(num)]
         elif isinstance(self.sampling_params, dict):
-            self.sampling_params = [self.sampling_params] * num
+            self.sampling_params = [self.sampling_params.copy() for _ in range(num)]
         else:  # Already a list
-            self.sampling_params = self.sampling_params * self.parallel_sample_num
+            self.sampling_params = [
+                params.copy()
+                for params in self.sampling_params * self.parallel_sample_num
+            ]
+        self.__dict__.pop("_sub_obj_cache", None)
 
     def _normalize_watermark(self, num):
         if isinstance(self.watermark, list):
@@ -1391,6 +1397,8 @@ class EmbeddingReqInput:
                 self.rid = uuid.uuid4().hex
             if self.sampling_params is None:
                 self.sampling_params = {}
+            else:
+                self.sampling_params = self.sampling_params.copy()
             self.sampling_params["max_new_tokens"] = 0
         else:
             if self.rid is None:
@@ -1399,14 +1407,21 @@ class EmbeddingReqInput:
                 assert isinstance(self.rid, list), "The rid should be a list."
 
             if self.sampling_params is None:
-                self.sampling_params = [{}] * self.batch_size
+                self.sampling_params = [{} for _ in range(self.batch_size)]
             elif isinstance(self.sampling_params, dict):
-                self.sampling_params = [self.sampling_params] * self.batch_size
+                self.sampling_params = [
+                    self.sampling_params.copy() for _ in range(self.batch_size)
+                ]
+            else:
+                self.sampling_params = [
+                    params.copy() for params in self.sampling_params
+                ]
             for i in range(self.batch_size):
                 self.sampling_params[i]["max_new_tokens"] = 0
 
             self._normalize_lora_paths(self.batch_size)
 
+        self.__dict__.pop("_sub_obj_cache", None)
         self._validate_rid_uniqueness()
 
     def _validate_mm_batch_lengths(self):
@@ -2245,7 +2260,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool
+    message: str
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):
