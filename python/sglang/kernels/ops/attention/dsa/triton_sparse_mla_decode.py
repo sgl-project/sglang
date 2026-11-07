@@ -31,6 +31,7 @@ from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
     _sparse_mla_split_k_kernel,
     _validate_input_dtypes,
 )
+from sglang.srt.utils import is_gfx95_supported
 
 _SplitKWorkspace = list[tuple[torch.Tensor, torch.Tensor]]
 _splitk_bufs: dict[tuple[torch.device, int], _SplitKWorkspace] = {}
@@ -44,6 +45,31 @@ def _gfx950_sparse_mla_decode_tile_config(
         if base_ctas == 1:
             max_kv_splits = 64
     return block_k, max_kv_splits
+
+
+def _sparse_mla_decode_tile_shape(
+    bs: int, H: int, kv: torch.Tensor, is_fp8: bool, block_k: int, num_cu: int
+) -> tuple[int, int]:
+    """(BLOCK_H, BLOCK_K) for the split-K decode kernels.
+
+    A BF16 KV cache at least 512 wide gives a BLOCK_K x KV_DIM tile that both
+    dots keep in registers, and at the LDS-derived BLOCK_K of 64 that spills on
+    gfx950 with the four warps the kernel launches. Halving BLOCK_K removes the
+    spill. FP8 tiles are half the size and keep their own tuning in
+    ``_gfx950_sparse_mla_decode_tile_config``.
+
+    BLOCK_H=32 then gathers each selected KV row once per 32 heads instead of
+    once per 16, which halves the gather traffic -- but it also halves the
+    number of head blocks, so it only pays once the halved grid still covers
+    the device. Below one wave the extra CTAs are the cheaper way to spend the
+    bandwidth, so the tile stays at 16 rows.
+    """
+    if is_fp8 or kv.shape[-1] < 512 or not is_gfx95_supported():
+        return 16, block_k
+    # The reduce kernel reads cdiv(H, BLOCK_H) * BLOCK_H rows, so only a
+    # BLOCK_H that divides H keeps the padded head count unchanged.
+    wide_heads = H % 32 == 0 and bs * (H // 32) >= num_cu
+    return (32 if wide_heads else 16), min(block_k, 32)
 
 
 def _get_splitk_bufs(
@@ -125,8 +151,10 @@ def triton_sparse_mla_decode_splitk(
     q_nope, stride_qn_t, stride_qn_h = _row_strides(q_nope)
     q_rope, stride_qr_t, stride_qr_h = _row_strides(q_rope)
 
-    BLOCK_H = 16
-    BLOCK_K = _sparse_mla_block_k(kv)
+    num_cu = _cu_count(q_nope.device)
+    BLOCK_H, BLOCK_K = _sparse_mla_decode_tile_shape(
+        bs, H, kv, is_fp8, _sparse_mla_block_k(kv), num_cu
+    )
     n_head_blocks = (H + BLOCK_H - 1) // BLOCK_H
     h_padded = n_head_blocks * BLOCK_H
 
@@ -136,7 +164,6 @@ def triton_sparse_mla_decode_splitk(
     # Keep the number of split partials independent of a smaller LDS-safe
     # BLOCK_K. This retains the existing reduction cost on 64 KiB devices.
     max_kv_splits = max(1, topk // _PREFERRED_BLOCK_K)
-    num_cu = _cu_count(q_nope.device)
     base_ctas = max(1, bs * n_head_blocks)
     optimize_gfx950_fp8 = H == 16 and _is_gfx950_sparse_mla_fp8(
         kv.dtype, H, d_v, d_tail, kv_dim
