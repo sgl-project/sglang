@@ -187,6 +187,10 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
+        # completion_tokens reported in each streaming chunk is cumulative,
+        # so only the delta since the previous chunk is accumulated into
+        # num_output_tokens. Reset whenever a new generation turn begins.
+        self._last_chunk_completion_tokens = 0
 
     @property
     def messages(self) -> list:
@@ -200,6 +204,23 @@ class StreamingHarmonyContext(HarmonyContext):
             # Check if we need to handle cumulative tokens
             meta_info = output.get("meta_info", {})
             completion_tokens = meta_info.get("completion_tokens")
+            # Keep the usage counters in sync with the streamed turn so the
+            # terminal response.completed event reports real token counts.
+            # prompt_tokens and cached_tokens are per-request constants, so
+            # they are assigned directly. completion_tokens is cumulative
+            # across streaming chunks, so only the delta since the last
+            # chunk is accumulated (mirrors the parent's per-turn +=).
+            self.num_prompt_tokens = meta_info.get(
+                "prompt_tokens", self.num_prompt_tokens
+            )
+            self.num_cached_tokens = meta_info.get(
+                "cached_tokens", self.num_cached_tokens
+            )
+            if completion_tokens is not None:
+                self.num_output_tokens += max(
+                    0, completion_tokens - self._last_chunk_completion_tokens
+                )
+                self._last_chunk_completion_tokens = completion_tokens
             if (
                 completion_tokens is not None
                 and len(output_token_ids) == completion_tokens
@@ -232,6 +253,9 @@ class StreamingHarmonyContext(HarmonyContext):
             for tok in toks:
                 self.parser.process(tok)
             self.last_tok = toks[-1]
+            # A new generation turn starts after a tool call, so the next
+            # chunks' cumulative completion_tokens begin from zero again.
+            self._last_chunk_completion_tokens = 0
 
     def is_expecting_start(self) -> bool:
         return self.parser.state == StreamState.EXPECT_START
