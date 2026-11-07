@@ -74,7 +74,13 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         else:  # w2
             out_features = hidden_size // 2
             in_features = intermediate_size_per_partition
-            bias_last_dim = 16 // self.tp_size
+            moe_tp_size = layer.moe_tp_size
+            if not 1 <= moe_tp_size <= 16 or 16 % moe_tp_size != 0:
+                raise ValueError(
+                    f"W4A8 MoE TP size must be a divisor of 16, got {moe_tp_size}"
+                )
+            # The checkpoint stores 16 K-block bias columns, sharded over MoE TP.
+            bias_last_dim = 16 // moe_tp_size
 
         prefix = self.weight_prefix
 
@@ -138,7 +144,11 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
-        set_weight_attrs(scale_bias, extra_weight_attrs)
+        scale_bias_attrs = {
+            **extra_weight_attrs,
+            "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+        }
+        set_weight_attrs(scale_bias, scale_bias_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
