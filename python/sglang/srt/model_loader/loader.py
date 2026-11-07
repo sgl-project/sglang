@@ -1146,29 +1146,43 @@ class LayeredModelLoader(DefaultModelLoader):
                     f"{model_config.model_path} does not support it."
                 )
 
-            # Get all weights from disk
-            weights = self._get_all_weights(model_config, model)
-
             # Helper function to recursively fill the weights of a module
-            def fill_module(module, fqn: List[str], weights):
+            def fill_module(module, fqn: List[str]):
                 """
                 fqn: list of strings representing the fully qualified name of `module`.
                 """
                 # Layer by layer
                 for name, submod in module.named_children():
-                    fill_module(submod, fqn + [name], weights)
+                    fill_module(submod, fqn + [name])
 
+                # Moving meta parameters to the target device replaces them.
+                # Preserve custom weight loaders and sharding metadata.
+                param_attrs = {
+                    name: param.__dict__.copy()
+                    for name, param in module.named_parameters(
+                        recurse=False, remove_duplicate=False
+                    )
+                }
                 # First materialize on target device
                 module.to_empty(device=target_device, recurse=False)
+                for name, param in module.named_parameters(
+                    recurse=False, remove_duplicate=False
+                ):
+                    param.__dict__.update(param_attrs[name])
+                if not param_attrs:
+                    return
+
                 fqn_path = ".".join(fqn)
-                # Fill weights
+                # Each module filters the full stream, exhausting its iterator.
+                # Reopen it for the next module instead of caching checkpoint
+                # tensors in memory. This trades repeated I/O for bounded memory.
                 model.load_weights_to_module(
                     fqn_path,
-                    weights,
+                    self._get_all_weights(model_config, model),
                 )
 
             # Start calling on root module
-            fill_module(model, [], weights)
+            fill_module(model, [])
 
         return model.eval()
 
