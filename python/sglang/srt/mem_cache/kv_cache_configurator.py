@@ -250,6 +250,10 @@ def mm_runtime_reservation_gb(
 MAMBA_CACHE_SIZE_MAX_RUNNING_REQUESTS_RATIO = 3
 MAMBA_CACHE_BASE_RATIO_DROP_ON_SKIP = 1
 MAMBA_CACHE_V2_ADDITIONAL_RATIO_NO_BUFFER = 1
+# Upper bound on the share of the cache budget the auto-fit Mamba state may
+# take when it grows to honor an explicit --max-running-requests. The rest
+# stays with the KV pool.
+MAMBA_AUTO_FIT_MAX_SHARE = 0.85
 
 
 def _pp_local_per_request_bytes(
@@ -3314,6 +3318,66 @@ class KVCacheConfigurator:
                 low = mid + 1
         return low * alignment
 
+    def _grow_mamba_budget_for_requested_requests(
+        self,
+        *,
+        mamba_budget_bytes: float,
+        total_rest_bytes: float,
+        per_req: int,
+        extra_per_slot: int,
+        replayssm_fixed_bytes: int,
+        reserves_spec_state: bool,
+    ) -> float:
+        """Grow the auto-fit Mamba budget to serve an explicit request limit.
+
+        The fallback --mamba-full-memory-ratio splits the cache budget roughly
+        in half between Mamba state and KV. With several state slots per
+        request (radix cache, speculative scratch) and an fp32 SSM state, that
+        half can hold far fewer requests than --max-running-requests asks for,
+        while the KV half holds millions of tokens. The request limit is then
+        silently capped in resolve_max_num_reqs.
+
+        Called when the caller set --max-running-requests and nobody chose
+        the ratio. Moves memory from KV to Mamba state until the requested
+        concurrency fits, keeping at least 1 - MAMBA_AUTO_FIT_MAX_SHARE of the
+        budget for KV. An explicit ratio, a model override's ratio, and the default
+        request limit keep the current sizing.
+        """
+        schedule = get_schedule()
+        ratio = self._calculate_mamba_ratio()
+        requested = max(1, schedule.max_running_requests // self.attn_dp_size)
+        slots = requested * ratio
+        if reserves_spec_state:
+            # Inverse of the joint solve in _handle_max_mamba_cache.
+            D = get_spec().speculative_num_draft_tokens
+            needed = (
+                slots * (per_req * (1 + D / ratio) + extra_per_slot)
+                + per_req * (1 + D)
+                + extra_per_slot
+            )
+        else:
+            needed = (slots + 1) * (per_req + extra_per_slot) + replayssm_fixed_bytes
+        # Headroom so the floor division in the solve lands on `slots`.
+        needed = math.ceil(needed) + 1
+        if needed <= mamba_budget_bytes:
+            return mamba_budget_bytes
+
+        grown = min(needed, total_rest_bytes * MAMBA_AUTO_FIT_MAX_SHARE)
+        if grown <= mamba_budget_bytes:
+            return mamba_budget_bytes
+        logger.info(
+            "Growing the mamba state budget from %.2f GB to %.2f GB of %.2f GB "
+            "to serve --max-running-requests=%d (%d state slots per request); "
+            "the rest stays with the KV cache. Set --mamba-full-memory-ratio "
+            "to choose the split yourself.",
+            mamba_budget_bytes / (1 << 30),
+            grown / (1 << 30),
+            total_rest_bytes / (1 << 30),
+            schedule.max_running_requests,
+            ratio,
+        )
+        return grown
+
     def _handle_max_mamba_cache(self, total_rest_memory):
         config = self.mambaish_config
         assert config is not None
@@ -3444,6 +3508,18 @@ class KVCacheConfigurator:
                 / (1 + get_schedule().mamba_full_memory_ratio)
             )
             mamba_budget_bytes = mamba_budget * (1 << 30)
+            if (
+                get_schedule().max_running_requests_is_explicit
+                and get_schedule().mamba_full_memory_ratio_is_fallback
+            ):
+                mamba_budget_bytes = self._grow_mamba_budget_for_requested_requests(
+                    mamba_budget_bytes=mamba_budget_bytes,
+                    total_rest_bytes=total_rest_memory * (1 << 30),
+                    per_req=per_req,
+                    extra_per_slot=extra_per_slot,
+                    replayssm_fixed_bytes=replayssm_fixed_bytes,
+                    reserves_spec_state=reserves_spec_state,
+                )
 
             if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
