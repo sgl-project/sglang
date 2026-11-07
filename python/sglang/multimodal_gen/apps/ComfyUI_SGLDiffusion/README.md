@@ -129,6 +129,43 @@ Reference workflow files are provided in the `workflows/` directory:
 
 For other workflows supporting the models, you can easily use SGLang by replacing the official `UNET Loader` node with the `SGLDUNETLoader` node. Similarly, for LoRA support, replace the official LoRA loader with the `SGLDiffusion LoRA Loader`.
 
+### Converting a workflow
+
+An offline converter makes those swaps and lists what is left to do by hand. It
+reads a UI or API workflow JSON and needs neither ComfyUI nor a GPU:
+
+```bash
+python -m sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.convert my_workflow.json
+# writes my_workflow_sgld.json and the report my_workflow_sgld.md;
+# -o picks the output path, -o - prints the workflow (report on stderr)
+```
+
+It changes, also inside subgraphs:
+
+- `UNETLoader` / `UnetLoaderGGUF` with an H3 / Qwen-Image / Z-Image / FLUX.1
+  file -> `SGLDUNETLoader`. Other models (e.g. an LTX or Wan stage) stay on
+  ComfyUI.
+- `LoraLoaderModelOnly` and `LoraLoader` whose MODEL comes from an SGLD loader ->
+  `SGLDiffusion LoRA Loader`. That node applies only the diffusion-model half of
+  a LoRA: for `LoraLoader`, the nodes that used its CLIP output are wired to its
+  CLIP input, so the LoRA's text-encoder half is dropped (the report lists each).
+
+The report also lists what it does not convert:
+
+- **Speed-only patch nodes** on the SGLD model (SageAttention patches such as
+  `PathchSageAttentionKJ`, `ModelAttentionBackend`, TeaCache / EasyCache and
+  other step caches, Sol / sparse attention, `TorchCompileModel`). The DiT runs
+  in the SGLD worker, so remove or bypass them and set the equivalent in
+  `SGLDiffusion Options`: `attention_backend` (e.g. `sage_attention2`),
+  `cache_mode` (e.g. `cache_dit` on H3), `execution_mode` (`torch_compile`).
+  The report names every MODEL -> MODEL node on the SGLD model except
+  `ModelSampling*`.
+- **LoRA stack nodes** (rgthree Power Lora Loader, AusBoss, LoraManager): replace
+  them with chained `SGLDiffusion LoRA Loader` nodes, one per LoRA.
+
+Without conversion, a stock LoRA or patch node on an SGLD model fails at run time
+with an error that names the converter.
+
 To use these workflows:
 1. Open ComfyUI.
 2. Load the workflow JSON file from the `workflows/` directory.
