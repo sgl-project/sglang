@@ -19,7 +19,7 @@ import torch.nn.functional as F
 
 ROOT = Path(__file__).resolve().parents[5]
 BACKEND = (
-    ROOT / "python/sglang/srt/hardware_backend/npu/attention/ascend_dsv4_backend.py"
+    ROOT / "python/sglang/srt/hardware_backend/npu/attention/ascend_dsv41_backend.py"
 )
 METADATA = ROOT / "python/sglang/srt/layers/attention/dsv4/metadata.py"
 MODEL = ROOT / "python/sglang/srt/models/deepseek_v4.py"
@@ -188,7 +188,7 @@ class TestA3Backend(unittest.TestCase):
 
     def test_tp_padded_decode_compressor_rows_have_zero_used_length(self):
         ns = _definitions(
-            BACKEND,
+            BACKEND.with_name("ascend_dsv4_backend.py"),
             {"CompressorAscendBackendMixin", "_build_cycle_state_block_table"},
             {"torch": torch},
         )
@@ -315,6 +315,7 @@ class TestA3Backend(unittest.TestCase):
         )
         rope_module = ModuleType("sglang.srt.hardware_backend.npu.dsv4.dsv4_rope")
         rope_module.Dsv4NpuRoPE = rope
+        self.ns["Dsv4NpuRoPE"] = rope
         # Any attribute access for quantization/format casting now fails.
         torch_npu_module = ModuleType("torch_npu")
         idx = self.layer.indexer
@@ -531,7 +532,9 @@ class TestA3GraphInitContract(unittest.TestCase):
     def setUp(self):
         backend_class = next(
             node
-            for node in ast.parse(BACKEND.read_text()).body
+            for node in ast.parse(
+                BACKEND.with_name("ascend_dsv4_backend.py").read_text()
+            ).body
             if isinstance(node, ast.ClassDef)
             and node.name == "DeepseekV4AscendAttnBackend"
         )
@@ -555,7 +558,9 @@ class TestA3GraphInitContract(unittest.TestCase):
             "ForwardMetadata": SimpleNamespace,
             "is_npu_arch35": lambda: False,
         }
-        exec(compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace)  # noqa: S102
+        exec(
+            compile(ast.fix_missing_locations(module), str(BACKEND), "exec"), namespace
+        )  # noqa: S102
         backend_type = type(
             "GraphInitBackend", (), {name: namespace[name] for name in names}
         )
@@ -584,7 +589,9 @@ class TestA3GraphInitContract(unittest.TestCase):
                 for name in ("c1a", "c4a", "c128a", "li_quant")
             }
         )
-        b.graph_metadata["c4_topk_indices"] = torch.full((2, 512), -1, dtype=torch.int32)
+        b.graph_metadata["c4_topk_indices"] = torch.full(
+            (2, 512), -1, dtype=torch.int32
+        )
         self.forward_batch = SimpleNamespace(
             batch_size=2,
             seq_lens=torch.tensor([129, 128], dtype=torch.int32),

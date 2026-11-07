@@ -1,6 +1,6 @@
 """
 Unit tests for the DeepSeek-V4.1 low-ratio (NPU) path in
-sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend and the row layout
+sglang.srt.hardware_backend.npu.attention.ascend_dsv41_backend and the row layout
 helpers in ...hardware_backend.npu.dsv4.dsv4_memory_pool.
 
 Everything here is pure device-agnostic torch arithmetic plus a stub for the
@@ -40,9 +40,10 @@ _ds2_stub = ModuleType("sglang.srt.models.deepseek_v2")
 _ds2_stub._is_hip = False
 sys.modules.setdefault("sglang.srt.models.deepseek_v2", _ds2_stub)
 
-import sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend as dsv4_backend
-from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
-    DeepseekV4AscendAttnBackend,
+import sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend as dsv4_base_backend
+import sglang.srt.hardware_backend.npu.attention.ascend_dsv41_backend as dsv4_backend
+from sglang.srt.hardware_backend.npu.attention.ascend_dsv41_backend import (
+    DeepseekV41AscendAttnBackend,
     LowRatioCompressAscendBackendMixin,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
@@ -97,7 +98,7 @@ def setUpModule():
     global _arch_patches
     _arch_patches = [
         patch.object(module, "is_npu_arch35", return_value=True)
-        for module in (dsv4_backend, dsv4_memory_pool)
+        for module in (dsv4_base_backend, dsv4_backend, dsv4_memory_pool)
     ]
     for arch_patch in _arch_patches:
         arch_patch.start()
@@ -109,7 +110,7 @@ def tearDownModule():
 
 
 def _low_ratio_backend(*, ratios=(1, 2), window=128):
-    backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
+    backend = DeepseekV41AscendAttnBackend.__new__(DeepseekV41AscendAttnBackend)
     backend._dsv4_compress_ratios = (0,) + tuple(ratios)
     backend._dsv4_unique_compress_ratios = list(
         dict.fromkeys(backend._dsv4_compress_ratios)

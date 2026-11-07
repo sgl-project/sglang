@@ -24,6 +24,7 @@ import torch_npu
 from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
     DSV4IndexerBufferInfo,
     DSV4PagedBufferInfo,
@@ -36,7 +37,6 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DeepSeekV4TokenToKVPool,
 )
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils import get_eager_max_batch_size
 
 _NPU_ARCH35_KV_QUANT_GROUP_SIZE = 64
 _NPU_ARCH35_KV_ROW_ALIGNMENT = 128
