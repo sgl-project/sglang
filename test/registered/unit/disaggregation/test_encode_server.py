@@ -36,7 +36,6 @@ from sglang.srt.managers.io_struct import unwrap_from_pickle
 from sglang.srt.mem_cache.multimodal_cache import MultiModalStaticCache
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.modality import Modality
-from sglang.srt.runtime_context import get_context
 from sglang.srt.utils.common import safe_pickle_loads
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -164,6 +163,8 @@ class TestEncoderCacheIdentity(CustomTestCase):
                 self.assertEqual(combine.call_count, 2)
             forward.assert_called_once()
             self.assertEqual(len(encoder.mm_cache), 1)
+
+        from sglang.srt.runtime_context import get_context
 
         override = get_context().override_server_args(enable_prefix_mm_cache=True)
         override.install()
