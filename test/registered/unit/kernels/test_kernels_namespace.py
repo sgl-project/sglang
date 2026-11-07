@@ -328,6 +328,7 @@ def test_import_stays_metadata_only():
     [
         ("activation.situ_and_mul", KernelBackend.JIT, "cuda"),
         ("moe.situ_and_mul_masked_post_quant", KernelBackend.JIT, "cuda"),
+        ("moe.route_radix4_with_sort", KernelBackend.JIT, "hip"),
         ("attention.attn_res_fused_tma", KernelBackend.JIT, "cuda"),
         ("attention.attn_res_hip", KernelBackend.TRITON, "hip"),
         ("elementwise.kimi_k3_mla_output_gate", KernelBackend.JIT, "cuda"),

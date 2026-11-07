@@ -1114,6 +1114,10 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # With the Kimi-K3 radix-4 router on (SGLANG_K3_RADIX4_TOPK), also emit
+    # AITER's BM=16 MoE sort from its launch for decode-sized M (needs
+    # ROCm/aiter#6484).
+    SGLANG_OPT_HIP_K3_RADIX4_FUSE_SORT = EnvBool(True)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Quark MXFP4 dense linear on gfx95: use AITER's preshuffled ASM/CK FP4 GEMM

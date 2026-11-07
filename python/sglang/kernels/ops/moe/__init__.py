@@ -257,6 +257,14 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="moe.route_radix4_with_sort",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.moe.moe_route_radix4:route_radix4_with_sort",
+        capabilities=_HIP,
+    )
+)
 
 
 # Public entry points inventoried by logical operator group (RFC #29630).

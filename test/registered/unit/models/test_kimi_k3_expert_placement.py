@@ -1,9 +1,14 @@
-"""Kimi text and multimodal models expose the same initial expert layout."""
+"""Kimi text and multimodal models expose the same initial expert layout, and a
+K3 MoE layer leaves no routing state behind for the next one."""
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
+
+import torch
 
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
+from sglang.srt.layers.moe import aiter_presort
 from sglang.srt.models.kimi_k3 import (
     KimiK3ForConditionalGeneration,
     KimiK3LinearForCausalLM,
@@ -52,6 +57,27 @@ class TestKimiK3ExpertPlacement(CustomTestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "without online EPLB"):
                     KimiK3MoE(config)
+
+
+class TestKimiK3MoEPresortLifetime(CustomTestCase):
+    def test_unconsumed_presort_is_cleared_on_the_unfused_path(self):
+        """AITER matches a registered presort by topk tensor address, so one that no
+        fused_moe consumed must not outlive the layer, whichever path routed it."""
+        registrations = []
+
+        def route_without_fused_moe(hidden_states, *, prefix_sum):
+            registrations.append({"M": hidden_states.shape[0]})
+            return hidden_states
+
+        moe = SimpleNamespace(
+            _eligible_for_fused_front=False,
+            _forward_unfused=route_without_fused_moe,
+        )
+        with patch.object(
+            aiter_presort, "_registrar", return_value=registrations.append
+        ):
+            KimiK3MoE.forward(moe, torch.zeros(2, 4))
+        self.assertIsNone(registrations[-1])
 
 
 if __name__ == "__main__":
