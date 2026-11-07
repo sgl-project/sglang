@@ -86,7 +86,7 @@ class UOCRDecodeGraphIO:
         """Load relayed inputs when the current decode runs eagerly."""
         forward_batch.input_ids = self.relay[forward_batch.req_pool_indices]
         forward_batch.positions = clamp_position(forward_batch.seq_lens)
-        forward_batch.uocr_graph_io_deferred = False
+        forward_batch.input_ids_from_graph = False
 
     def graph_published(
         self, batch: ScheduleBatch, result: GenerationBatchResult

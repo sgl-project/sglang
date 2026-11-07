@@ -15,10 +15,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
 from sglang.multimodal_gen.configs.sample.qwenimage import (
     QwenImageLayeredSamplingParams,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
 from sglang.multimodal_gen.runtime.entrypoints.diffusion_generator import DiffGenerator

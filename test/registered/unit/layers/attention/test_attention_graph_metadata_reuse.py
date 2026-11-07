@@ -10,7 +10,7 @@ import torch
 from sglang.srt.layers.attention import flashinfer_mla_backend as mla
 from sglang.srt.layers.attention import trtllm_mla_backend as trtllm_mla
 from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")

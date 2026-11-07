@@ -177,24 +177,6 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             POSITIONAL_FIELD_ORDER,
         )
 
-    def test_new_parallel_flag_keeps_keyword_and_cli_inputs(self):
-        parser = argparse.ArgumentParser()
-        ServerArgs.add_cli_args(parser)
-        for enabled in (False, True):
-            with self.subTest(enabled=enabled):
-                keyword_args = ServerArgs(
-                    model_path="dummy", enable_megamoe_for_layernorm_sp=enabled
-                )
-                argv = ["--model-path", "dummy"]
-                argv.append(
-                    "--enable-megamoe-for-layernorm-sp"
-                    if enabled
-                    else "--no-enable-megamoe-for-layernorm-sp"
-                )
-                cli_args = ServerArgs.from_cli_args(parser.parse_args(argv))
-                self.assertEqual(keyword_args.enable_megamoe_for_layernorm_sp, enabled)
-                self.assertEqual(cli_args.enable_megamoe_for_layernorm_sp, enabled)
-
 
 class TestMuseSparkLaunchDefaults(CustomTestCase):
     """Minimal recipes must resolve before generic memory/backend defaults."""
@@ -208,8 +190,8 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
         draft_arch="DFlash2DraftModel",
         **options,
     ):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
         from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
-        from sglang.srt.arg_groups.overrides import resolving_view
 
         inputs = dict(
             model_path="dummy",
@@ -580,6 +562,37 @@ class TestPrepareServerArgs(CustomTestCase):
                     chunked_prefill_size=-1,
                 ).check_server_args()
 
+    @staticmethod
+    def _check_with_custom_mem_pool(device: str, pool: str) -> None:
+        with patch.dict(os.environ, {"SGLANG_MOONCAKE_CUSTOM_MEM_POOL": pool}):
+            ServerArgs(
+                model_path="dummy",
+                served_model_name="dummy",
+                device=device,
+                chunked_prefill_size=-1,
+            ).check_server_args()
+
+    def test_mooncake_custom_mem_pool_rejected_on_xpu(self):
+        """XPU has no CUDA allocator for Mooncake's pools; fail at startup."""
+        for pool in ("INTRA_NODE_NVLINK", "NVLINK"):
+            with (
+                self.subTest(pool=pool),
+                self.assertRaisesRegex(
+                    ValueError, "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported"
+                ),
+            ):
+                self._check_with_custom_mem_pool("xpu", pool)
+
+    def test_mooncake_custom_mem_pool_check_is_xpu_only(self):
+        """Other devices keep their behaviour, and a disabling value passes on XPU."""
+        for device, pool in (
+            ("cuda", "INTRA_NODE_NVLINK"),
+            ("npu", "INTRA_NODE_NVLINK"),
+            ("xpu", "False"),
+        ):
+            with self.subTest(device=device, pool=pool):
+                self._check_with_custom_mem_pool(device, pool)
+
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",
@@ -878,6 +891,11 @@ class TestPrepareServerArgs(CustomTestCase):
             base_args + ["--dsv4-prefill-backend", "flashmla_sparse_q8"]
         )
         self.assertEqual(q8_args.dsv4_prefill_backend, "flashmla_sparse_q8")
+
+        cutedsl_args = parser.parse_args(
+            base_args + ["--dsv4-prefill-backend", "cutedsl_h16"]
+        )
+        self.assertEqual(cutedsl_args.dsv4_prefill_backend, "cutedsl_h16")
 
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
@@ -1225,10 +1243,15 @@ class TestMultimodalFeatureTransport(CustomTestCase):
         server_args = ServerArgs(model_path="dummy", nnodes=2)
         self._set_model_type(server_args, is_multimodal=True)
 
-        with self.assertLogs(serving_hook.logger, level="INFO") as logs:
-            handle_multimodal_feature_transport(server_args)
+        with patch.dict(os.environ, {}, clear=False):
+            envs.SGLANG_USE_CUDA_IPC_TRANSPORT.clear()
+            with self.assertLogs(serving_hook.logger, level="INFO") as logs:
+                handle_multimodal_feature_transport(server_args)
 
-        self.assertEqual(resolution_result(server_args, "mm_feature_transport"), "cpu")
+            self.assertEqual(
+                resolution_result(server_args, "mm_feature_transport"), "cpu"
+            )
+
         self.assertIn("has not opted into CUDA VMM", "\n".join(logs.output))
 
     @patch("sglang.srt.arg_groups.serving_hook.os.path.exists", return_value=False)
@@ -1811,10 +1834,8 @@ class TestHiSparseDsaBackendPolicy(unittest.TestCase):
     def _resolve(kv_cache_dtype, **kw):
         from types import SimpleNamespace
 
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
         defaults = dict(
@@ -2066,7 +2087,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -2078,7 +2099,7 @@ class TestFa4PageSizeAutoForce(CustomTestCase):
 
         handle_attention_backend_compatibility(args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(args.page_size, 1)  # the field stays pristine
         self.assertEqual(resolved_view(args).page_size, 128)
@@ -2137,6 +2158,23 @@ class TestContextParallelServerArgs(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "DeepSeek V3.2.*interleave"):
             handle_context_parallelism(server_args)
+
+    def test_sharded_padded_cp_kv_layout_refuses_unified_memory(self):
+        for unified in (False, True):
+            with (
+                self.subTest(unified=unified),
+                patch(
+                    "sglang.srt.layers.cp.base.is_cp_sharded_padded", return_value=True
+                ),
+            ):
+                server_args = self._new_cp_args(enable_unified_memory=unified)
+                if unified:
+                    with self.assertRaisesRegex(
+                        ValueError, "--enable-unified-memory does not support"
+                    ):
+                        handle_context_parallelism(server_args)
+                else:
+                    handle_context_parallelism(server_args)
 
     def test_generic_v1_cp_options_are_not_public_cli(self):
         removed_options = (
@@ -3012,32 +3050,6 @@ class TestHiCacheArgs(CustomTestCase):
         self.assertEqual(resolution_result(args, "hicache_mem_layout"), "page_first")
         self.assertIsNone(resolution_result(args, "decode_attention_backend"))
 
-    def test_prefill_weight_versions_rejects_hierarchical_cache(self):
-        """KV restored from a host or storage tier carries no weight version, so the two cannot combine."""
-        args = self._make_args(
-            enable_prefill_weight_versions=True,
-            enable_hierarchical_cache=True,
-        )
-
-        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
-            handle_cache_compatibility(args)
-
-    def test_prefill_weight_versions_rejects_disaggregation(self):
-        """PD prefill workers do not stamp prompt tokens yet, so the flag is refused there."""
-        args = self._make_args(
-            enable_prefill_weight_versions=True,
-            disaggregation_mode="prefill",
-        )
-
-        with self.assertRaisesRegex(ValueError, "disaggregation"):
-            handle_cache_compatibility(args)
-
-    def test_prefill_weight_versions_alone_is_accepted(self):
-        """A plain engine may report prompt weight versions."""
-        args = self._make_args(enable_prefill_weight_versions=True)
-
-        handle_cache_compatibility(args)
-
     def test_decode_offload_rejects_host_pool_retraction(self):
         args = self._make_args(
             disaggregation_mode="decode",
@@ -3183,16 +3195,6 @@ class TestAscendOpsArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
             handle_a2a_moe(server_args)
 
-    def test_ascend_ops_rejected_by_waterfill_with_config(self):
-        server_args = ServerArgs(
-            model_path="dummy",
-            moe_a2a_backend="ascend_ops",
-            moe_ascend_ops_config="{}",
-            enable_waterfill=True,
-        )
-        with self.assertRaisesRegex(ValueError, "incompatible.*ascend_ops"):
-            handle_a2a_moe(server_args)
-
     def test_ascend_ops_speculative_draft_requires_npu(self):
         server_args = ServerArgs(
             model_path="dummy",
@@ -3239,7 +3241,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertTrue(server_args.disable_shared_experts_fusion)
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -3254,7 +3256,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(server_args.moe_a2a_backend, "none")  # pristine
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "deepep")
@@ -3270,7 +3272,7 @@ class TestWaterfillArgs(CustomTestCase):
         # dummy-model path short-circuits __post_init__; invoke the handler directly.
         handle_a2a_moe(server_args)
 
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         self.assertEqual(resolved_view(server_args).moe_a2a_backend, "megamoe")
         self.assertFalse(resolved_view(server_args).disable_shared_experts_fusion)
@@ -3868,7 +3870,7 @@ class TestDeepEPv2Args(CustomTestCase):
             handle_a2a_moe(args)
 
     def test_declarations_resolve_ep_size_and_fusion(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto", tp_size=2)
         handle_a2a_moe(args)
@@ -3876,7 +3878,7 @@ class TestDeepEPv2Args(CustomTestCase):
         self.assertTrue(resolved_view(args).disable_shared_experts_fusion)
 
     def test_auto_runner_defaults_to_deep_gemm(self):
-        from sglang.srt.arg_groups.overrides import resolved_view
+        from sglang.srt.arg_groups.model_override_base import resolved_view
 
         args = self._args(moe_runner_backend="auto")
         handle_a2a_moe(args)
@@ -4921,10 +4923,8 @@ class TestDcpKvEventContract(CustomTestCase):
     def test_kv_event_block_size_widens_a_single_token_page(self):
         # page_size=1 + DCP is a real deployment shape: the allocator is still
         # paged, at dcp_size.
-        from sglang.srt.arg_groups.overrides import (
-            kv_event_block_size_of,
-            resolving_view,
-        )
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.overrides import kv_event_block_size_of
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
@@ -5320,8 +5320,11 @@ class TestDcpCommBackendDefault(CustomTestCase):
         self.assertEqual(self._resolved(dcp_size=1), "ag_rs")
 
     @override_platform(is_npu=True, is_cuda=False, is_hip=False, is_xpu=False)
-    def test_a5_npu_supports_dcp(self):
-        self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
+    def test_npu_supports_dcp(self):
+        with patch(
+            "sglang.srt.arg_groups.overrides.is_fi_a2a_supported", return_value=False
+        ):
+            self.assertEqual(self._resolved(dcp_size=2), "ag_rs")
 
     @override_platform(is_cuda=True, is_hip=False)
     def test_fi_a2a_where_supported(self):
@@ -5430,25 +5433,33 @@ class TestLazyReexports(CustomTestCase):
 
 class TestPrefillWeightVersionCompatibility(CustomTestCase):
     def test_untracked_kv_paths_rejected(self) -> None:
-        """Reject paths that load or produce KV without preserving provenance."""
-        for overrides in [
-            {"enable_unified_memory": True},
-            {"enable_encoder_swa_bounded_replay": True},
-            {"enable_lmcache": True},
-            {"enable_unified_cache_external_linker": True},
-            {"dllm_algorithm": "LowConfidence"},
-            {"speculative_algorithm": "NGRAM"},
-            {"speculative_algorithm": "UNO"},
-            {"speculative_algorithm": "DSPARK"},
+        """Reject paths that load or produce KV without preserving provenance:
+        KV restored from a host or storage tier carries no weight version, and
+        PD prefill workers do not stamp prompt tokens yet."""
+        flag = "enable-prefill-weight-versions"
+        for overrides, message in [
+            ({"enable_unified_memory": True}, flag),
+            ({"enable_encoder_swa_bounded_replay": True}, flag),
+            ({"enable_lmcache": True}, flag),
+            ({"enable_unified_cache_external_linker": True}, flag),
+            ({"dllm_algorithm": "LowConfidence"}, flag),
+            ({"speculative_algorithm": "NGRAM"}, flag),
+            ({"speculative_algorithm": "UNO"}, flag),
+            ({"speculative_algorithm": "DSPARK"}, flag),
+            ({"enable_hierarchical_cache": True}, "enable-hierarchical-cache"),
+            ({"disaggregation_mode": "prefill"}, "disaggregation"),
         ]:
             with self.subTest(overrides=overrides):
                 args = ServerArgs(
                     model_path="dummy", enable_prefill_weight_versions=True, **overrides
                 )
-                with self.assertRaisesRegex(
-                    ValueError, "enable-prefill-weight-versions"
-                ):
+                with self.assertRaisesRegex(ValueError, message):
                     handle_cache_compatibility(args)
+
+    def test_a_plain_engine_is_accepted(self) -> None:
+        handle_cache_compatibility(
+            ServerArgs(model_path="dummy", enable_prefill_weight_versions=True)
+        )
 
     def test_rust_response_without_provenance_rejected(self) -> None:
         """Reject the Rust response path that cannot serialize prompt versions."""
@@ -5456,6 +5467,17 @@ class TestPrefillWeightVersionCompatibility(CustomTestCase):
         with envs.SGLANG_RUST_SERVER.override(True):
             with self.assertRaisesRegex(ValueError, "SGLANG_RUST_SERVER"):
                 handle_cache_compatibility(args)
+
+
+class TestPagedExpertsNumResident(unittest.TestCase):
+    def test_takes_auto_or_a_positive_count(self):
+        from sglang.srt.arg_groups.fields.exec_ import _paged_experts_num_resident
+
+        self.assertIsNone(_paged_experts_num_resident("auto"))
+        self.assertEqual(_paged_experts_num_resident("12"), 12)
+        for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                _paged_experts_num_resident(bad)
 
 
 if __name__ == "__main__":

@@ -492,7 +492,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -505,7 +505,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency (Balanced)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -518,7 +518,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency (Throughput-Optimized)
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -534,7 +534,7 @@ python -m sglang.bench_serving \
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -547,7 +547,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -560,7 +560,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -575,7 +575,7 @@ python -m sglang.bench_serving \
 
 - Low Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -588,7 +588,7 @@ python -m sglang.bench_serving \
 
 - Medium Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -601,7 +601,7 @@ python -m sglang.bench_serving \
 
 - High Concurrency
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-4.7 \
   --dataset-name random \
@@ -634,7 +634,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
@@ -678,7 +678,7 @@ Median ITL (ms):                         9.05
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
@@ -722,7 +722,7 @@ Median ITL (ms):                         17.93
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
@@ -779,7 +779,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
@@ -823,7 +823,7 @@ Median ITL (ms):                         8.85
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
@@ -867,7 +867,7 @@ Median ITL (ms):                         16.53
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model nvidia/GLM-4.7-NVFP4 \
   --dataset-name random \
