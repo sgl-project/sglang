@@ -6,11 +6,23 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
-from sglang.srt.models.kimi_k3 import _is_unquantized_mergeable
-from sglang.srt.models.kimi_k3_rocm_quant import _k3_channel_fp8_to_bf16
+from sglang.kernels.ops.attention import (
+    kda_fused_decode_aiter_hip,
+    kda_fused_verify_aiter_hip,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.quantization.quark.quark import QuarkLinearMethod
+from sglang.srt.layers.quantization.quark.schemes import QuarkW8A8Fp8
+from sglang.srt.models import kimi_k3, kimi_k3_rocm_quant
+from sglang.srt.models.kimi_k3 import KimiK3DeltaAttention, _is_unquantized_mergeable
+from sglang.srt.models.kimi_k3_rocm_quant import (
+    _k3_channel_fp8_to_bf16,
+    k3_fused_decode_f_b_weight,
+)
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -92,6 +104,162 @@ class TestMergeDtypeGuard(CustomTestCase):
         check that only asks whether the operands match each other."""
         weights = [torch.zeros(4, 4, dtype=torch.float32) for _ in range(2)]
         self.assertFalse(_is_unquantized_mergeable(weights))
+
+
+class TestFusedDecodeFbWeight(CustomTestCase):
+    """The fused KDA decode takes a dense f_b with no scale argument,
+    so a Quark per-channel FP8 f_b must reach it with every channel's scale applied."""
+
+    def test_quark_fp8_f_b_is_dequantized_and_bf16_passes_through(self):
+        weight, scale, _ = _per_channel_fp8(out_features=16, in_features=8)
+        quark_f_b = SimpleNamespace(
+            weight=torch.nn.Parameter(weight, requires_grad=False),
+            weight_scale=scale.squeeze(1),
+            quant_method=mock.Mock(spec=QuarkLinearMethod),
+            scheme=QuarkW8A8Fp8(
+                {"qscheme": "per_channel"},
+                {"qscheme": "per_channel", "is_dynamic": True},
+            ),
+        )
+
+        out = k3_fused_decode_f_b_weight(quark_f_b)
+
+        self.assertEqual(out.dtype, torch.bfloat16)
+        torch.testing.assert_close(
+            out.float(), weight.float() * scale, rtol=0.01, atol=0.0
+        )
+        # The FP8 layer keeps serving the unfused path.
+        self.assertEqual(quark_f_b.weight.dtype, torch.float8_e4m3fn)
+
+        bf16 = torch.nn.Parameter(
+            torch.randn(16, 8, dtype=torch.bfloat16), requires_grad=False
+        )
+        plain_f_b = SimpleNamespace(weight=bf16, quant_method=mock.Mock())
+        self.assertEqual(
+            k3_fused_decode_f_b_weight(plain_f_b).data_ptr(), bf16.data_ptr()
+        )
+
+    def test_post_processed_quark_f_b_disables_fused_decode_instead_of_crashing(self):
+        """Sharded and remote loaders transpose the FP8 f_b before post_load_weights;
+        that weight must not crash the load."""
+        weight, scale, _ = _per_channel_fp8(out_features=32, in_features=16)
+        scheme = QuarkW8A8Fp8(
+            {"qscheme": "per_channel"},
+            {"qscheme": "per_channel", "is_dynamic": True},
+        )
+        f_b = torch.nn.Module()
+        f_b.weight = torch.nn.Parameter(weight, requires_grad=False)
+        f_b.weight_scale = torch.nn.Parameter(scale.squeeze(1), requires_grad=False)
+        f_b.quant_method = mock.Mock(spec=QuarkLinearMethod)
+        f_b.scheme = scheme
+        scheme.process_weights_after_loading(f_b)
+
+        with mock.patch.object(kimi_k3_rocm_quant, "print_warning_once") as warn:
+            self.assertIsNone(k3_fused_decode_f_b_weight(f_b))
+        warn.assert_called_once()
+
+
+class TestHipFusedDecodeArming(CustomTestCase):
+    """_prepare_fused_decode on ROCm, on a stand-in attention module."""
+
+    def test_failed_rearm_drops_the_previous_arming(self):
+        """A re-run that cannot arm (here the backend reports unavailable) must not
+        leave the previous f_b serving the fused decode or verify."""
+        stale = ("stale f_b", None, 1e-5, None)
+        layer = SimpleNamespace(
+            conv_weights=None,
+            _k3_hip_fused_decode_args=stale,
+            _k3_hip_fused_decode_backend="aiter",
+            _k3_hip_fused_decode_ops=kda_fused_decode_aiter_hip,
+            _k3_hip_fused_verify_args=stale,
+        )
+        attention = SimpleNamespace(
+            attn=layer,
+            _kda_hip_fused_decode_ready=True,
+            _kda_hip_fused_verify_ready=True,
+            f_b_proj=SimpleNamespace(weight=torch.empty(12 * 128, 128)),
+            config=SimpleNamespace(
+                mamba2_cache_params=SimpleNamespace(
+                    dtype=SimpleNamespace(temporal=torch.bfloat16)
+                )
+            ),
+        )
+
+        with (
+            mock.patch.object(kimi_k3, "_is_hip", True),
+            envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("aiter"),
+            mock.patch.object(
+                kda_fused_decode_aiter_hip, "available", return_value=False
+            ),
+        ):
+            KimiK3DeltaAttention._prepare_fused_decode(attention)
+
+        self.assertFalse(attention._kda_hip_fused_decode_ready)
+        self.assertFalse(attention._kda_hip_fused_verify_ready)
+        self.assertIsNone(layer._k3_hip_fused_decode_args)
+        self.assertIsNone(layer._k3_hip_fused_decode_ops)
+        self.assertIsNone(layer._k3_hip_fused_verify_args)
+
+    def test_fused_verify_arms_for_chain_speculation_only(self):
+        """The fused verify covers chain verify only: tree speculative decoding must
+        not arm or warm it, and an armed layer records the warmed draft-token count."""
+        decode_args = (torch.empty(12, 128, 128), None, 1e-5, None)
+        layer = SimpleNamespace(
+            conv_weights=None,
+            dt_bias=None,
+            lower_bound=-5.0,
+            _k3_hip_fused_decode_args=decode_args,
+            _k3_hip_fused_verify_args=None,
+        )
+        attention = SimpleNamespace(
+            attn=layer, use_full_rank_gate=True, _kda_hip_fused_verify_ready=False
+        )
+        for topk, armed in ((4, False), (1, True)):
+            spec = SimpleNamespace(
+                speculative_num_draft_tokens=5, speculative_eagle_topk=topk
+            )
+            exec_bag = SimpleNamespace(
+                mamba=SimpleNamespace(enable_linear_replayssm_spec=True)
+            )
+            with (
+                self.subTest(topk=topk),
+                mock.patch.object(kimi_k3, "get_spec", return_value=spec),
+                mock.patch.object(kimi_k3, "get_exec", return_value=exec_bag),
+                mock.patch.object(
+                    kda_fused_verify_aiter_hip, "available", return_value=True
+                ),
+                mock.patch.object(kda_fused_verify_aiter_hip, "warmup") as warmup,
+                mock.patch.object(kimi_k3, "print_warning_once") as warn,
+            ):
+                KimiK3DeltaAttention._prepare_fused_verify_hip(
+                    attention, state_dtype=torch.bfloat16
+                )
+                self.assertEqual(attention._kda_hip_fused_verify_ready, armed)
+                self.assertEqual(warmup.called, armed)
+                self.assertEqual(warn.called, not armed)
+        self.assertEqual(layer._k3_hip_fused_verify_args, (*decode_args, 5))
+
+    def test_block_fp8_f_b_arms_from_the_merged_bf16_copy(self):
+        """A block-FP8 f_b_proj holds FP8 with no Quark scheme; the fused decode must
+        take the BF16 copy _merge_bfa_weights() dequantized, and warn when none exists."""
+        merged = torch.randn(12 * 128, 128, dtype=torch.bfloat16)
+        attention = SimpleNamespace(
+            use_full_rank_gate=True,
+            _bfa_f_b_w=merged,
+            f_b_proj=SimpleNamespace(
+                weight=torch.nn.Parameter(
+                    torch.zeros(12 * 128, 128, dtype=torch.float8_e4m3fn),
+                    requires_grad=False,
+                ),
+                quant_method=mock.Mock(),
+            ),
+        )
+        self.assertIs(KimiK3DeltaAttention._fused_decode_f_b_weight(attention), merged)
+
+        attention._bfa_f_b_w = None
+        with mock.patch.object(kimi_k3, "print_warning_once") as warn:
+            self.assertIsNone(KimiK3DeltaAttention._fused_decode_f_b_weight(attention))
+        warn.assert_called_once()
 
 
 if __name__ == "__main__":
