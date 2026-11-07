@@ -11,7 +11,6 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 import torch
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
-from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -770,6 +769,7 @@ def eagle_sample(
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
         generate_simulated_accept_index_device,
+        spec_softmax,
     )
     from sglang.srt.utils.async_probe import sanitize_nan_logits
 
@@ -1064,7 +1064,7 @@ def eagle_sample(
         else:
             sampling_fn = tree_speculative_sampling_target_only
 
-        target_probs = sampling_softmax(
+        target_probs = spec_softmax(
             next_token_logits,
             temperatures=sampling_info.temperatures,
             rows_per_request=verify_input.draft_token_num,

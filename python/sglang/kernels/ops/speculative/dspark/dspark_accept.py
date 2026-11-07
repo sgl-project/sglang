@@ -13,6 +13,7 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -275,13 +276,22 @@ except ImportError:
     _flashinfer_softmax = None
 
 
+def _deterministic_inference() -> bool:
+    try:
+        return bool(get_exec().deterministic.enable_deterministic_inference)
+    except ValueError:
+        return False  # Server args are not published, as in a kernel test.
+
+
 # Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
 class SoftmaxTemp:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
         if not inputs_on_cuda(*args, **kwargs):
             return cls.torch(*args, **kwargs)
-        if _flashinfer_softmax is not None:
+        # FlashInfer selects its launch from the row count, so a request's bits can
+        # change with its batch.
+        if _flashinfer_softmax is not None and not _deterministic_inference():
             return cls.flashinfer(*args, **kwargs)
         return cls.triton(*args, **kwargs)
 
