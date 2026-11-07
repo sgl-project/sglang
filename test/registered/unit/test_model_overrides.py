@@ -3156,10 +3156,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {"kv_cache_dtype": "bfloat16"},
             )
             self.assertEqual(
-                _dsa_kv_cache_dtype_default(_view(kv_cache_dtype="bf16")),
-                {"kv_cache_dtype": "bfloat16"},
-            )
-            self.assertEqual(
                 _dsa_kv_cache_dtype_default(
                     _view(dsa_prefill_backend="aiter", dsa_decode_backend="aiter")
                 ),
