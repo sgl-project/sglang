@@ -2467,6 +2467,8 @@ class CommonKVSender(BaseKVSender):
         self.kv_mgr.request_status.pop(self.bootstrap_room, None)
         self.kv_mgr.req_to_decode_prefix_len.pop(self.bootstrap_room, None)
         self.kv_mgr.transfer_infos.pop(self.bootstrap_room, None)
+        with self.kv_mgr.failure_lock:
+            self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
         # A sender can be cleared while a counted transfer is still writing:
         # keep the target for the worker, or ACK now if nothing is in flight.
         self.kv_mgr._maybe_ack_drained_abort(self.bootstrap_room)
@@ -2487,9 +2489,9 @@ class CommonKVSender(BaseKVSender):
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
-        self.clear()
         with self.kv_mgr.failure_lock:
             failure_reason = self.kv_mgr.failure_records.pop(self.bootstrap_room, None)
+        self.clear()
         self.trace_ctx.trace_req_finish()
         raise KVTransferError(
             self.bootstrap_room,

@@ -74,6 +74,7 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.parallel_hook import (
     handle_context_parallelism,
     handle_data_parallelism,
+    handle_eplb_and_dispatch,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
@@ -530,6 +531,28 @@ class TestPrepareServerArgs(CustomTestCase):
         # This validation runs before model construction and should allow the
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
+
+    def test_eplb_recorder_mode_compatibility(self):
+        def make_args(mode):
+            return ServerArgs(
+                model_path="dummy",
+                tp_size=2,
+                ep_size=2,
+                enable_eplb=True,
+                expert_distribution_recorder_mode=mode,
+            )
+
+        for mode in ("per_pass", "per_token"):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    ValueError, "needs --expert-distribution-recorder-mode stat"
+                ),
+            ):
+                handle_eplb_and_dispatch(make_args(mode))
+        for mode in (None, "stat", "stat_approx"):
+            with self.subTest(mode=mode):
+                handle_eplb_and_dispatch(make_args(mode))
 
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
