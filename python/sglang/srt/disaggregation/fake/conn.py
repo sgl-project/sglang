@@ -146,7 +146,7 @@ class FakeKVReceiver(BaseKVReceiver):
     def __init__(
         self,
         mgr: BaseKVManager,
-        bootstrap_addr: str,
+        bootstrap_addr: Optional[str],
         bootstrap_room: Optional[int] = None,
     ):
         self.kv_mgr = mgr

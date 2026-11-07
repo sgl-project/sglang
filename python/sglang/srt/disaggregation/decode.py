@@ -1010,14 +1010,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _create_receiver_and_enqueue(
         self, req: Req, is_rebootstrap: bool = False
     ) -> DecodeRequest:
-        backend = (
-            TransferBackend.FAKE if _is_fake_transfer(req) else self.transfer_backend
-        )
+        is_fake_transfer = _is_fake_transfer(req)
+        backend = TransferBackend.FAKE if is_fake_transfer else self.transfer_backend
         kv_receiver_class = get_kv_class(backend, KVClassType.RECEIVER)
 
         kv_receiver = kv_receiver_class(
             mgr=self.kv_manager,
-            bootstrap_addr=_bootstrap_addr(req),
+            # A fake transfer has no prefill peer, and under the fake backend
+            # its request may carry no bootstrap_host at all.
+            bootstrap_addr=None if is_fake_transfer else _bootstrap_addr(req),
             bootstrap_room=req.bootstrap_room,
         )
 

@@ -3311,6 +3311,7 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
+                error_msg = None
                 if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
@@ -3319,6 +3320,17 @@ class Scheduler(
                         f"Invalid request: Disaggregated request received without "
                         f"bootstrap room id. {req.rid=}"
                     )
+                elif (
+                    recv_req.bootstrap_host is None
+                    and self.disaggregation_mode == DisaggregationMode.DECODE
+                    and self.transfer_backend != TransferBackend.FAKE
+                ):
+                    # Decode connects to the prefill's bootstrap server at this host.
+                    error_msg = (
+                        f"Invalid request: Disaggregated decode request received "
+                        f"without bootstrap host. {req.rid=}"
+                    )
+                if error_msg is not None:
                     logger.error(error_msg)
                     if not envs.SGLANG_RUST_SERVER.get():
                         recv_req.time_stats.trace_ctx.abort(
