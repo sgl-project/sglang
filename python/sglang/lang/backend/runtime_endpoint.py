@@ -130,8 +130,12 @@ class RuntimeEndpoint(BaseBackend):
         if sampling_params.dtype is None:
             return
 
-        if sampling_params.stop == ():
+        if not sampling_params.stop:
             sampling_params.stop = []
+        elif isinstance(sampling_params.stop, str):
+            sampling_params.stop = [sampling_params.stop]
+        else:
+            sampling_params.stop = list(sampling_params.stop)
 
         dtype_regex = None
         if sampling_params.dtype in ["int", int]:
