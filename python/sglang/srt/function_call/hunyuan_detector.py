@@ -586,3 +586,22 @@ class HunyuanDetector(BaseFormatDetector):
         # a dialect grammar, a json_schema constraint would force plain JSON the
         # model was not trained to produce here.
         return True
+
+    def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        """Release only user-visible text when the stream ends.
+
+        Inside ``<tool_calls>`` the buffer holds a truncated protocol block:
+        the closing marker can no longer arrive, so the block is dropped (the
+        prose in front of the marker was already streamed). A buffer outside a
+        tool-call block is a truncated marker prefix or trailing prose, which
+        is safe to release as normal text. Streaming state is reset either
+        way. Same rule as the Spark2.5 / Kimi-K3 / DeepSeek-V3.2 detectors.
+        """
+        buffered = self._buffer
+        inside_call = self._in_tool_calls
+        self._buffer = ""
+        self._in_tool_calls = False
+        self._reset_streaming_tool_state()
+        if inside_call or not buffered:
+            return StreamingParseResult()
+        return StreamingParseResult(normal_text=buffered)
