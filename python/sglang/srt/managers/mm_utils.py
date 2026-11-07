@@ -41,6 +41,9 @@ from sglang.srt.multimodal.transport import (
     determine_tensor_transport_mode,
 )
 from sglang.srt.multimodal.transport.cuda_ipc import CudaIpcTensorTransportProxy
+from sglang.srt.multimodal.transport.npu_ipc import (
+    current_device as current_transport_device,
+)
 from sglang.srt.runtime_context import (
     get_disagg,
     get_server_args,
@@ -49,6 +52,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     assert_int64_array,
     flatten_nested_list,
+    is_npu,
     print_warning_once,
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
@@ -902,7 +906,13 @@ def _identity_data(value):
         # Reading must not consume the handle needed by the encoder later.
         return value.tensor
     if isinstance(value, CudaIpcTensorTransportProxy):
-        raise RuntimeError("Multimodal identity must be computed before CUDA transport")
+        if is_npu():
+            # NPU ships proxies instead of pooled slices, so the identity
+            # is computed from the rebuilt feature.
+            return value.reconstruct_on_target_device(current_transport_device())
+        raise RuntimeError(
+            "Multimodal identity must be computed before CUDA transport"
+        )
     if isinstance(value, list):
         return [_identity_data(part) for part in value]
     if isinstance(value, tuple):

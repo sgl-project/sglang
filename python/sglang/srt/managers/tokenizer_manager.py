@@ -279,6 +279,20 @@ _INCREMENTAL_STREAMING_META_INFO_KEYS = (
 )
 
 
+def _bind_npu_ipc_keepalive(rid: str, mm_inputs) -> None:
+    """Keep exported NPU feature blocks alive until *rid* reaches a terminal
+    state, so consumers always rebuild them before torch_npu frees the block."""
+    from sglang.srt.multimodal.transport.npu_ipc import bind_keepalive
+
+    bind_keepalive(rid, mm_inputs)
+
+
+def _release_npu_ipc_keepalive(rid: str) -> None:
+    from sglang.srt.multimodal.transport.npu_ipc import release_keepalive
+
+    release_keepalive(rid)
+
+
 @dataclasses.dataclass
 class ReqState:
     """Store the state a request."""
@@ -1859,6 +1873,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
             tokenized_obj = wrap_shm_features(tokenized_obj)
             time_stats = tokenized_obj.time_stats
+            _bind_npu_ipc_keepalive(tokenized_obj.rid, tokenized_obj.mm_inputs)
             tokenized_obj.wrap_pickle_fields()
             self._dispatch_to_scheduler(tokenized_obj)
             self._mark_state_dispatched(tokenized_obj.rid)
@@ -1872,6 +1887,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                _release_npu_ipc_keepalive(tokenized_obj.rid)
 
     def _drop_aborted_before_dispatch(self, tokenized_objs):
         """Return *tokenized_objs* without the requests aborted before dispatch.
@@ -1978,6 +1994,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
             time_stats = [tokenized_obj.time_stats for tokenized_obj in tokenized_objs]
             for tokenized_obj in tokenized_objs:
+                _bind_npu_ipc_keepalive(tokenized_obj.rid, tokenized_obj.mm_inputs)
                 tokenized_obj.wrap_pickle_fields()
 
             if isinstance(tokenized_objs[0], TokenizedGenerateReqInput):
@@ -1996,6 +2013,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             if not dispatched:
                 self.cuda_vmm_feature_transport.cancel_for_dispatch(prepared_mm_items)
                 self.positional_embeds_transport.cancel_for_dispatch(prepared_embeds)
+                for tokenized_obj in tokenized_objs:
+                    _release_npu_ipc_keepalive(tokenized_obj.rid)
 
     def _coalesce_streaming_chunks(
         self,
@@ -2055,6 +2074,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A newer request may already be using the same rid.
         if self.rid_to_state.get(state.obj.rid) is state:
             del self.rid_to_state[state.obj.rid]
+        _release_npu_ipc_keepalive(state.obj.rid)
 
         release_task = self._release_lora_once(state)
         if release_task is not None:
@@ -2987,6 +3007,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     )
 
                 del self.rid_to_state[rid]
+                _release_npu_ipc_keepalive(rid)
 
                 self._release_lora_once(state)
 
@@ -3777,6 +3798,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if state.prompt_token_ids is not None:
             out["prompt_token_ids"] = state.prompt_token_ids
         del self.rid_to_state[recv_obj.rid]
+        _release_npu_ipc_keepalive(recv_obj.rid)
 
         self._release_lora_once(state)
 
@@ -4009,6 +4031,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         )
                 else:
                     del self.rid_to_state[rid]
+                    _release_npu_ipc_keepalive(rid)
                     self._release_lora_once(state)
             dispatch_ready = self.encoder_dispatch_ready.pop(rid, None)
             if dispatch_ready is not None:
