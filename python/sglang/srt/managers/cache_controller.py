@@ -202,6 +202,8 @@ class HiCacheAck(NamedTuple):
     # Total bytes moved by the op across all pools, including draft piggyback
     # and sidecar transfers that the per-pool token counts exclude.
     num_bytes: int = 0
+    # Routed-experts row copy of this transfer (mem_cache/hicache_topk_rows.py).
+    topk_rows_copy: Optional[Any] = None
 
 
 @dataclass
@@ -317,6 +319,7 @@ class HiCacheController:
         storage_backend_extra_config: Optional[dict] = None,
         enable_storage_metrics: bool = False,
         host_memory_mode: str = "cache",
+        mirror_topk_rows: bool = True,
     ):
         self.tp_group = tp_group
         self.host_memory_mode = host_memory_mode
@@ -383,6 +386,16 @@ class HiCacheController:
         self.ack_write_queue: List[HiCacheAck] = []
 
         self.l2_transfer_engine = L2TransferEngine(io_backend)
+        # Routed-experts rows follow their KV through the host tier; None
+        # without a routed-experts capturer, or for a controller that never
+        # loads host slots back (mirror_topk_rows=False).
+        from sglang.srt.mem_cache.hicache_topk_rows import HostTopkRows
+
+        self.topk_rows = (
+            HostTopkRows.create(host_pool=self.mem_pool_host, device=str(self.device))
+            if mirror_topk_rows
+            else None
+        )
 
         # If a storage backend is provided at startup, treat it as an implicit attach,
         # so init/runtime share the same lifecycle semantics and code paths.
@@ -712,6 +725,13 @@ class HiCacheController:
             self.page_set_func = self._generic_page_set
             raise
 
+        # getattr: test doubles build controllers without __init__.
+        if self.topk_rows is not None:
+            logger.warning(
+                "Routed experts are not stored in the HiCache storage backend: "
+                "prefix pages loaded from storage return stale routed-experts rows."
+            )
+
     def detach_storage_backend(self):
         """Detach (disable) storage backend at runtime.
 
@@ -927,6 +947,9 @@ class HiCacheController:
         # Reuse detach's queue wakeups and bounded joins, and fail if any
         # storage thread remains alive before clearing shared state.
         self._stop_storage_threads()
+        # getattr: test doubles build controllers without __init__.
+        if (topk_rows := self.topk_rows) is not None:
+            topk_rows.reset()
 
         self.write_queue.clear()
         self.load_queue.clear()
@@ -1010,6 +1033,13 @@ class HiCacheController:
                 self.write_fence_stream
             )
 
+        topk_rows_copy = None
+        if (topk_rows := self.topk_rows) is not None:
+            topk_rows_copy = topk_rows.copy_indices(
+                device_indices=op.device_indices,
+                host_indices=op.host_indices,
+                stream=self.l2_transfer_engine.index_stream,
+            )
         completion = self.l2_transfer_engine.submit_device_to_host(
             self._l2_transfers(host_indices, device_indices, pool_transfers)
         )
@@ -1027,6 +1057,7 @@ class HiCacheController:
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
                 num_bytes=self._transfer_num_bytes(op),
+                topk_rows_copy=topk_rows_copy,
             )
         )
 
@@ -1155,6 +1186,14 @@ class HiCacheController:
                 self.load_fence_stream
             )
 
+        topk_rows_copy = None
+        if (topk_rows := self.topk_rows) is not None:
+            topk_rows_copy = topk_rows.copy_indices(
+                device_indices=op.device_indices,
+                host_indices=op.host_indices,
+                stream=self.l2_transfer_engine.index_stream,
+            )
+            topk_rows.add_load(topk_rows_copy)
         completion = self.l2_transfer_engine.submit_host_to_device(
             self._l2_load_transfers(host_indices, device_indices, pool_transfers),
             start_event=producer_event.start_event,
@@ -1175,6 +1214,7 @@ class HiCacheController:
                 timing_enabled=completion.timing_enabled,
                 num_tokens_by_pool=self._num_tokens_by_pool(op),
                 num_bytes=self._transfer_num_bytes(op),
+                topk_rows_copy=topk_rows_copy,
             )
         )
         return producer_id

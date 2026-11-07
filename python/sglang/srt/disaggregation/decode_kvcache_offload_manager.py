@@ -123,6 +123,8 @@ class DecodeKVCacheOffloadManager:
                 storage_backend=get_memory().hicache_storage_backend,
                 model_name=get_serving().served_model_name,
                 storage_backend_extra_config=hicache_storage_backend_extra_config,
+                # Decode offload only writes to host and storage, never loads back.
+                mirror_topk_rows=False,
             )
 
         self.ongoing_offload = {}
@@ -299,6 +301,8 @@ class DecodeKVCacheOffloadManager:
         while finish_count > 0:
             ack = self.cache_controller.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            if (row_copy := ack.topk_rows_copy) is not None:
+                self.cache_controller.topk_rows.finish_write(row_copy)
             for ack_id in ack.node_ids:
                 (
                     req,

@@ -159,6 +159,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                         view=view_type.__name__, dcp_size=dcp_size, tp_rank=tp_rank
                     ):
                         controller = HiCacheController.__new__(HiCacheController)
+                        controller.topk_rows = None
                         controller.mem_pool_device = view_type.__new__(view_type)
                         controller.mem_pool_host = SimpleNamespace(
                             layout="page_first", storage_format_tag=None
@@ -207,6 +208,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
     @staticmethod
     def _attach_storage(pool, mode="cache"):
         cc = HiCacheController.__new__(HiCacheController)
+        cc.topk_rows = None
         cc.mem_pool_host = cc.storage_host_pool = pool
         cc.page_size = pool.logical_page_size
         cc.enable_storage = False
@@ -294,6 +296,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                                 cc = HybridCacheController.__new__(
                                     HybridCacheController
                                 )
+                                cc.topk_rows = None
                                 cc.mem_pool_host = group
                                 cc.storage_host_pool = host
                                 cc.page_size = allocator.page_size

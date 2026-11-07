@@ -101,6 +101,7 @@ def _group() -> HostPoolGroup:
 def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     """Only the attributes ``attach_storage_backend`` reads."""
     controller = object.__new__(cls)
+    controller.topk_rows = None
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
     controller.storage_host_pool = storage_host_pool
@@ -231,6 +232,30 @@ class TestRegistrationBurstOrder(CustomTestCase):
             order,
             ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
         )
+
+
+class TestAttachWithRoutedExperts(CustomTestCase):
+    def _attach_hybrid(self, topk_rows: Any) -> None:
+        # The hybrid controller builds its base with storage_backend=None and
+        # attaches storage afterwards, as at startup and at runtime.
+        order: List[str] = []
+        group = _group()
+        controller = _controller(
+            HybridCacheController, group.anchor_entry.host_pool, group
+        )
+        controller.topk_rows = topk_rows
+        _attach(controller, RecordingBackend(order), order, host_pools=group.entries)
+
+    def test_attach_warns_that_routed_experts_rows_are_not_stored(self):
+        with self.assertLogs(
+            "sglang.srt.managers.cache_controller", level="WARNING"
+        ) as logs:
+            self._attach_hybrid(topk_rows=object())
+        self.assertIn("Routed experts are not stored", "\n".join(logs.output))
+
+    def test_attach_without_routed_experts_does_not_warn(self):
+        with self.assertNoLogs("sglang.srt.managers.cache_controller", "WARNING"):
+            self._attach_hybrid(topk_rows=None)
 
 
 if __name__ == "__main__":

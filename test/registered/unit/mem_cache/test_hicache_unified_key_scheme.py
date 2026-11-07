@@ -146,6 +146,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
             ),
         )
         controller = object.__new__(HiCacheController)
+        controller.topk_rows = None
         controller.page_size = 16
         controller.storage_host_pool = host_pool
         if grouped:
@@ -440,6 +441,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
 
     def test_hybrid_write_back_preserves_cpu_host_indices(self):
         controller = object.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.io_backend = "kernel"
         controller.mem_pool_host = SimpleNamespace(
             layout="page_unified",

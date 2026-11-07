@@ -3971,6 +3971,7 @@ def test_full_load_back_does_not_pin_restored_ancestor_aux(
     event = Mock()
     cache.cache_controller.ack_load_queue = [
         SimpleNamespace(
+            topk_rows_copy=None,
             finish_event=event,
             node_ids=[child],
             num_tokens_by_pool={},

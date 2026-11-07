@@ -562,6 +562,10 @@ class TestWriteIds(CustomTestCase):
                 self.assertIsNotNone(virt)
                 src = _make_source(allocator, virt[None, :], 4)
                 cap = object.__new__(BaseTopkCapturer)
+                cap._pre_read_hooks = ()
+                cap._finalize_hooks = ()
+                cap.num_outputs = 0
+                cap.host_tier_cache = None
                 cap.topk_size = 1
                 expected = torch.arange(len(virt), dtype=torch.int32).reshape(-1, 1, 1)
                 cap.device_cache = SimpleNamespace(buffer=expected)
@@ -606,6 +610,10 @@ class TestWriteIds(CustomTestCase):
                             + 1
                         )
                         cap = object.__new__(BaseTopkCapturer)
+                        cap._pre_read_hooks = ()
+                        cap._finalize_hooks = ()
+                        cap.num_outputs = 0
+                        cap.host_tier_cache = None
                         cap.topk_size = 2
                         cap.device_cache = SimpleNamespace(
                             buffer=torch.cat([expected, expected.new_zeros(2, 2, 2)])

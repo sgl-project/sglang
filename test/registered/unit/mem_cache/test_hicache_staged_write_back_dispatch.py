@@ -219,6 +219,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         op = CacheOperation(_indices(0, 4), _indices(4, 8), 7)
         op.pool_transfers = [transfer]
         controller = mock.Mock(spec=HybridCacheController)
+        controller.topk_rows = None
         controller.is_kv_sharded = False
         controller.load_queue = [op, op]
         controller.layer_done_counter = mock.MagicMock()
@@ -241,7 +242,10 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.l2_transfer_engine = mock.Mock()
         controller.load_fence_stream = None
         completion = SimpleNamespace(
-            start_event=object(), finish_event=object(), timing_enabled=False
+            start_event=object(),
+            topk_rows_copy=None,
+            finish_event=object(),
+            timing_enabled=False,
         )
         controller.l2_transfer_engine.submit_host_to_device.return_value = completion
         controller.transfer_layer_id_max = 2
@@ -283,6 +287,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 layer_mapper=lambda layer_id: layer_id,
             )
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.mem_pool_host = SimpleNamespace(
             anchor_entry=entries[PoolName.KV], entry_map=entries
         )
@@ -457,6 +462,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host_pool = MHATokenToKVPoolHost.__new__(MHATokenToKVPoolHost)
         host_pool.load_to_device_per_layer = mock.Mock()
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         entry = PoolEntry(
             name=PoolName.KV,
             host_pool=host_pool,
@@ -533,6 +539,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             pool_transfers=[transfer],
         )
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.io_backend = "kernel"
         controller.mem_pool_host = host_group
         controller.move_indices = mock.Mock(
@@ -1264,6 +1271,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         captured = []
 
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.write_queue = [
             CacheOperation(
                 host_indices=_indices(0, 4),
@@ -1313,6 +1321,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             ],
         )
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.write_queue = [op]
         controller.io_backend = "kernel"
         controller.mem_pool_host = _host_group_stub(
@@ -1364,6 +1373,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 captured.append((host_indices, device_indices))
 
         controller = HybridCacheController.__new__(HybridCacheController)
+        controller.topk_rows = None
         controller.write_queue = []
         controller.io_backend = "kernel"
         controller.mem_pool_host = HostPoolGroup(
@@ -1461,6 +1471,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
                 captured["host_indices"] = host_indices
 
         controller = HiCacheController.__new__(HiCacheController)
+        controller.topk_rows = None
         controller.write_queue = [
             CacheOperation(
                 host_indices=_indices(0, 4),
@@ -1505,6 +1516,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             node_id=1,
         )
         controller = HiCacheController.__new__(HiCacheController)
+        controller.topk_rows = None
         controller.write_queue = [op]
         controller.io_backend = "kernel"
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)

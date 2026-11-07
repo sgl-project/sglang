@@ -3892,6 +3892,8 @@ class UnifiedRadixCache(BasePrefixCache):
             while self.ongoing_write_through:
                 for ack in cc.ack_write_queue:
                     ack.finish_event.synchronize()
+                    if (row_copy := ack.topk_rows_copy) is not None:
+                        cc.topk_rows.finish_write(row_copy)
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
@@ -3916,6 +3918,8 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_write_queue.pop(0)
             ack.finish_event.synchronize()
+            if (row_copy := ack.topk_rows_copy) is not None:
+                cc.topk_rows.finish_write(row_copy)
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
             self._log_write_ack_metrics(ack)
@@ -3962,6 +3966,8 @@ class UnifiedRadixCache(BasePrefixCache):
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
             ack.finish_event.synchronize()
+            if (row_copy := ack.topk_rows_copy) is not None:
+                cc.topk_rows.finish_load(row_copy)
             for ack_id in ack.node_ids:
                 if (
                     self.buffer_pipeline is not None
