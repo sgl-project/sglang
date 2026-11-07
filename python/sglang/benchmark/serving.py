@@ -42,7 +42,10 @@ from tqdm.asyncio import tqdm
 from transformers import AutoTokenizer, PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
-from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.datasets.mooncake import (
+    MooncakeBlocks,
+    get_mooncake_request_over_time,
+)
 from sglang.benchmark.goodput import (
     GOODPUT_SLO_METRICS,
     calculate_goodput,
@@ -1446,21 +1449,13 @@ async def benchmark(
         # We need to build a temporary DatasetRow for the warmup phase.
         warmup_record = input_requests[0]
 
-        # Build prompt from hash_ids, just like in the async generator
-        hash_ids = warmup_record.get("hash_ids", [])
-        prompt_text = ""
-        for hash_id in hash_ids:
-            prompt_text += f"{hash_id}" + " ".join(["hi"] * 512)
-        prompt_text += "Can you tell me a detailed story in 1000 words?"
-
-        output_len = warmup_record.get("output_length", 32)
-        prompt_len = len(tokenizer.encode(prompt_text))
-
-        # Create a temporary DatasetRow object for warmup
+        # The same block expansion as the async generator, so the warmup
+        # request's blocks are the ones the replay will later share.
+        prompt_ids = MooncakeBlocks(tokenizer.vocab_size).prompt(warmup_record)
         test_request = DatasetRow(
-            prompt=prompt_text,
-            prompt_len=prompt_len,
-            output_len=output_len,
+            prompt=prompt_ids,
+            prompt_len=len(prompt_ids),
+            output_len=warmup_record.get("output_length", 32),
             image_data=None,  # Mooncake doesn't have image data
         )
     else:
