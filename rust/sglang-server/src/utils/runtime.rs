@@ -744,6 +744,19 @@ mod tests {
         frame_decode_batch_cols(&header, &[&data])
     }
 
+    /// Take the post-startup `FreezeGCReq`, the first message on the scheduler
+    /// ring when the startup warmup is skipped, so a test sees its own
+    /// requests next.
+    fn take_startup_freeze_gc(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no FreezeGCReq after startup"
+        );
+        let first = rt.to_scheduler_rx.drain(1);
+        let header = rmpv::decode::read_value(&mut &first[0].header[..]).unwrap();
+        assert_eq!(header[0].as_str(), Some("FreezeGCReq"));
+    }
+
     /// Minimal boot config: no tokenizer load, complete `model_config` (from
     /// `Default`), unified role.
     fn test_server_args() -> ServerArgs {
@@ -815,6 +828,7 @@ mod tests {
     fn drain_answers_503_and_serves_in_flight_requests_before_closing() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
 
         let streaming = send_http(
             addr,
@@ -898,6 +912,7 @@ mod tests {
     fn forced_drain_closes_without_waiting() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let in_flight = send_http(
             addr,
             "POST",
@@ -931,6 +946,7 @@ mod tests {
             .unwrap();
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let mut wakeup = std::fs::File::from(rt.drain_signal_fd(15, false, Some(name)).unwrap());
         wakeup.write_all(&[2]).unwrap();
         std::thread::sleep(std::time::Duration::from_millis(200));
@@ -1008,6 +1024,7 @@ mod tests {
     fn drain_end_release_is_latched() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         rt.hold_drain_end().unwrap();
         let streaming = send_http(
             addr,
@@ -1076,6 +1093,7 @@ mod tests {
         let mut cfg = test_config(addr, None);
         cfg.rust_server_args.graceful_close_timeout = timeout;
         let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let stuck = send_http(addr, "GET", "/server_info", "");
         assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
 
@@ -1105,6 +1123,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let client_runtime = // Multi-threaded, so the client's connection task keeps answering
         // the server's HTTP/2 shutdown handshake between `block_on`s.
         tokio::runtime::Builder::new_multi_thread()
@@ -1228,7 +1247,9 @@ mod tests {
                 },
                 ..test_server_args()
             });
-            (start(cfg, None).expect("start runtime"), addr)
+            let rt = start(cfg, None).expect("start runtime");
+            take_startup_freeze_gc(&rt);
+            (rt, addr)
         };
         let send = |addr, method: &str, path: &str, body: &str| {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
@@ -1696,6 +1717,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         assert!(std::net::TcpStream::connect(http_addr).is_ok());
 
         let client_runtime = tokio::runtime::Builder::new_current_thread()
@@ -1768,6 +1790,7 @@ mod tests {
             ..test_server_args()
         });
         let rt = start(cfg, None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let request = std::thread::spawn(move || {
             let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
@@ -1878,6 +1901,7 @@ mod tests {
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
         let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         let client_runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
