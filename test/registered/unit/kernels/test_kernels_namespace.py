@@ -266,7 +266,7 @@ class TestCakeSoftmaxCapability(CustomTestCase):
 @pytest.mark.parametrize(
     "relative_path",
     (
-        "srt/utils/common.py",
+        "srt/utils/device.py",
         "multimodal_gen/runtime/utils/common.py",
     ),
 )

@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING, List, Optional
 
 import mlx.core as mx
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.runtime_context import get_device
 from sglang.srt.utils import DynamicGradMode
 
@@ -255,8 +255,7 @@ class SchedulerMlxOverlapMixin:
             ):
                 self.cur_batch_for_debug = pending_next.schedule_batch
                 self.last_batch = pending_next.schedule_batch
-                if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                    self.invariant_checker.self_check_during_busy()
+                self.invariant_checker.run(CheckPhase.BUSY, pending_next.schedule_batch)
                 continue
 
             # 4. Chain is broken. Finalise pending_next (if any), then
@@ -277,5 +276,4 @@ class SchedulerMlxOverlapMixin:
                 self.on_idle()
 
             self.last_batch = next_batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+            self.invariant_checker.run(CheckPhase.BUSY, next_batch)
