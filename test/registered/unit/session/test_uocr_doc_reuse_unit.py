@@ -1648,5 +1648,247 @@ class TestRetainedWindowClaim(CustomTestCase):
         self.assertEqual(cache.reuse.docs, {})
 
 
+class TestEarlyPrefill(CustomTestCase):
+    """A follow-up prefills its new page while its predecessor decodes, keeps its
+    last prompt token back, and gets the text splice once the predecessor ends."""
+
+    # Window 0 reads page 1 ahead; window 1 copies it and prefills page 2.
+    OLD = prompt([(0, 200), (1, 200)])
+    NEW = prompt([(1, 200), (2, 200)])
+    OUT = [PAGE] + list(range(30, 60))
+
+    def _windows(self):
+        cache = _MatchCache(backend=_backend_stub())
+        pred = SimpleNamespace(
+            rid="w0",
+            origin_input_ids=array("q", self.OLD),
+            sampling_params=SimpleNamespace(
+                custom_params={
+                    r.KEY_DOC_ID: "doc",
+                    r.KEY_KEEP: True,
+                    r.KEY_PAGE_BASE: 0,
+                    r.KEY_LOOKAHEAD: 1,
+                }
+            ),
+            kv=SimpleNamespace(holds_kv=True, req_pool_idx=1),
+            finished=lambda: False,
+            uocr_doc=None,
+        )
+        ids = array("q", self.NEW)
+        follow = SimpleNamespace(
+            rid="w1",
+            origin_input_ids=ids,
+            origin_input_ids_unpadded=ids,
+            full_untruncated_fill_ids=array("q", self.NEW),
+            multimodal_inputs=None,
+            sampling_params=SimpleNamespace(
+                max_new_tokens=1000,
+                custom_params={
+                    r.KEY_DOC_ID: "doc",
+                    r.KEY_REUSE: True,
+                    r.KEY_KEEP: True,
+                    r.KEY_PAGE_BASE: 1,
+                    r.KEY_LOOKAHEAD: 1,
+                    r.KEY_OVERLAP: 0,
+                },
+            ),
+            kv=ReqKvInfo(),
+            extra_key="ek",
+            retraction_count=0,
+            output_ids=[],
+            prefix_len=0,
+            uocr_doc=None,
+        )
+
+        def init_next_round_input(tree_cache):
+            result = cache.reuse.try_match_prefix(SimpleNamespace(req=follow))
+            follow.prefix_len = 0 if result is None else result.device_prefix_len
+
+        follow.init_next_round_input = init_next_round_input
+        return cache, pred, follow
+
+    def _held(self):
+        cache, pred, follow = self._windows()
+        self.assertTrue(cache.reuse.can_start_early(follow, pred))
+        cache.reuse.hold(follow, pred)
+        return cache, pred, follow
+
+    def _retain_pred(self, cache):
+        entry = r.DocEntry(
+            holder=_FakeHolder(allocated=len(self.OLD) + len(self.OUT)),
+            input_ids=list(self.OLD),
+            output_ids=list(self.OUT),
+            next_page=1,
+            lookahead=1,
+        )
+        cache.reuse.docs["doc"] = entry
+        return entry
+
+    @staticmethod
+    def _batch(mode, reqs):
+        return SimpleNamespace(forward_mode=mode, reqs=reqs)
+
+    def test_held_window_is_matched_only_by_the_early_path(self):
+        cache, _, follow = self._held()
+        self.assertTrue(cache.reuse.is_held(follow))
+        # The scheduler's own round setup must not match (or cache a miss).
+        follow.init_next_round_input(None)
+        self.assertEqual(follow.prefix_len, 0)
+        self.assertIsNone(follow.uocr_doc.match)
+        # Held windows queue ahead of new documents.
+        self.assertEqual(cache.reuse.queue_position([], follow), 0)
+
+    def test_early_match_copies_the_live_prompt_and_defers_the_text(self):
+        cache, pred, follow = self._held()
+        self.assertTrue(cache.reuse.match_early(follow, None))
+        plan = r.plan_tail_copy(self.OLD, self.NEW, 0, PAGE, IMG, 32, old_lookahead=1)
+        self.assertEqual(plan.copied_pages, 1)
+        self.assertEqual(follow.prefix_len, plan.copy_len)
+        self.assertEqual(list(follow.origin_input_ids), plan.new_ids)
+        st = follow.uocr_doc
+        self.assertIsNotNone(st.early_carry)
+        self.assertIsNone(st.text_plan)
+        self.assertIsNone(st.source)
+        # One queued copy, owned by the window, reading the predecessor's row.
+        self.assertEqual([owner for owner, _ in cache.reuse._ops], ["w1"])
+        # Chunks stop one token short of the prompt.
+        new_tokens = len(plan.new_ids) - plan.copy_len
+        self.assertEqual(
+            cache.reuse.early_first_chunk(follow),
+            min(r.EARLY_CHUNK_TOKENS, new_tokens - r.EARLY_HOLD_TOKENS),
+        )
+
+    def test_chunks_are_paced_by_decode_steps_and_hold_the_last_token(self):
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        cache, pred, follow = self._held()
+        cache.reuse.match_early(follow, None)
+        cache.reuse.note_forward(self._batch(ForwardMode.EXTEND, [follow]))
+        for _ in range(r.EARLY_CHUNK_STRIDE - 1):
+            cache.reuse.note_forward(self._batch(ForwardMode.DECODE, [pred]))
+            self.assertEqual(cache.reuse.early_chunk_cap(follow), 0)
+        cache.reuse.note_forward(self._batch(ForwardMode.DECODE, [pred]))
+        left = len(follow.full_untruncated_fill_ids) - follow.prefix_len - 1
+        self.assertEqual(
+            cache.reuse.early_chunk_cap(follow), min(r.EARLY_CHUNK_TOKENS, left)
+        )
+        # Once only the held token is left, the window parks until released.
+        follow.prefix_len = len(follow.full_untruncated_fill_ids) - 1
+        self.assertEqual(cache.reuse.early_chunk_cap(follow), 0)
+
+    def test_release_splices_the_retained_text(self):
+        cache, _, follow = self._held()
+        cache.reuse.match_early(follow, None)
+        entry = self._retain_pred(cache)
+        cache.reuse.attach_early(follow)
+        st = follow.uocr_doc
+        self.assertFalse(cache.reuse.is_held(follow))
+        self.assertFalse(cache.reuse.early_busy())
+        self.assertIsNone(cache.reuse.early_chunk_cap(follow))
+        self.assertEqual(st.text_plan.forced, list(range(30, 60)) + [PAGE])
+        start = 3 * 2048 + len(self.OLD) + 1
+        self.assertEqual(
+            st.text_plan.src_slots.tolist(), list(range(start, start + 30))
+        )
+        # The retained window is now this window's source, freed with it.
+        self.assertEqual(cache.reuse.docs, {})
+        self.assertIs(st.source, entry)
+
+    def test_release_without_a_retained_window_splices_the_marker_only(self):
+        cache, _, follow = self._held()
+        cache.reuse.match_early(follow, None)
+        cache.reuse.attach_early(follow)
+        plan = follow.uocr_doc.text_plan
+        self.assertEqual(plan.forced, [PAGE])
+        self.assertEqual(plan.src_slots.numel(), 0)
+
+    def test_unadmitted_early_match_waits_for_the_normal_reuse(self):
+        cache, _, follow = self._held()
+        cache.reuse.match_early(follow, None)
+        (alloc,) = cache.token_to_kv_pool_allocator.allocated
+        cache.reuse.unmatch_early(follow)
+        self.assertEqual(list(follow.origin_input_ids), self.NEW)
+        self.assertEqual(follow.prefix_len, 0)
+        self.assertEqual(cache.token_to_kv_pool_allocator.freed, [alloc])
+        self.assertEqual([o for o, _ in cache.reuse._ops if o == "w1"], [])
+        # Still held, but no longer tried early.
+        self.assertTrue(cache.reuse.is_held(follow))
+        self.assertFalse(cache.reuse.match_early(follow, None))
+        # Once the predecessor ends, the plain follow-up path reuses its window.
+        self._retain_pred(cache)
+        cache.reuse.attach_early(follow)
+        self.assertFalse(cache.reuse.is_held(follow))
+        follow.init_next_round_input(None)
+        self.assertGreater(follow.prefix_len, 0)
+        self.assertIsNotNone(follow.uocr_doc.text_plan)
+
+    def test_window_with_nothing_new_never_starts_early(self):
+        cache, pred, follow = self._windows()
+        last = prompt([(1, 200)])
+        follow.origin_input_ids = array("q", last)
+        follow.full_untruncated_fill_ids = array("q", last)
+        self.assertFalse(cache.reuse.can_start_early(follow, pred))
+        self.assertTrue(follow.uocr_doc.early_failed)
+
+    def test_adder_parks_a_held_window_and_keeps_the_chunk_slot(self):
+        from unittest import mock
+
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        cache, _, follow = self._held()
+        cache.reuse.match_early(follow, None)
+        adder = object.__new__(UocrPrefillAdder)
+        adder.tree_cache = SimpleNamespace(uocr_doc_reuse=cache.reuse)
+        adder.chunked_req_limit = None
+        adder.rem_chunk_tokens = 2048
+        with mock.patch.object(PrefillAdder, "add_chunked_req") as run:
+            self.assertIs(adder.add_chunked_req(follow), follow)
+            run.assert_not_called()
+            self.assertEqual(adder.rem_chunk_tokens, 0)
+            cache.reuse._early_idle = r.EARLY_CHUNK_STRIDE
+            adder.rem_chunk_tokens = 2048
+            run.return_value = follow
+            adder.add_chunked_req(follow)
+            run.assert_called_once_with(follow)
+            self.assertEqual(
+                adder.chunked_req_limit, cache.reuse.early_chunk_cap(follow)
+            )
+            self.assertEqual(adder.rem_chunk_tokens, 0)
+
+    def test_adder_starts_a_held_window_only_as_the_one_chunked_request(self):
+        from unittest import mock
+
+        from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
+
+        cache, _, follow = self._held()
+        adder = object.__new__(UocrPrefillAdder)
+        adder.tree_cache = SimpleNamespace(uocr_doc_reuse=cache.reuse)
+        adder.can_run_list = []
+        adder.waiting_queue_len = 1
+        adder.new_chunked_req = None
+        adder.rem_chunk_tokens = 2048
+
+        def admit(self_, req, has_chunked_req, truncation_align_size):
+            self_.new_chunked_req = req
+            return AddReqResult.CONTINUE
+
+        with mock.patch.object(PrefillAdder, "add_one_req") as run:
+            # Another request owns the chunked slot: wait without matching.
+            self.assertEqual(
+                adder.add_one_req(follow, True, None), AddReqResult.CONTINUE
+            )
+            run.assert_not_called()
+            self.assertIsNone(follow.uocr_doc.match)
+        with mock.patch.object(PrefillAdder, "add_one_req", autospec=True) as run:
+            run.side_effect = lambda *a: (
+                self.assertLessEqual(adder.rem_chunk_tokens, r.EARLY_CHUNK_TOKENS),
+                admit(*a),
+            )[1]
+            adder.add_one_req(follow, False, None)
+            self.assertIs(adder.new_chunked_req, follow)
+            self.assertEqual(adder.rem_chunk_tokens, 0)
+            self.assertIsNotNone(follow.uocr_doc.early_carry)
+
+
 if __name__ == "__main__":
     unittest.main()
