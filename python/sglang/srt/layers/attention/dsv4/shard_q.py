@@ -46,8 +46,14 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
 # Below this many prefill tokens in the step, the two all-to-alls' fixed
-# latency outweighs the indexer/attention time ShardQ removes.
-MIN_TOKENS = 1024
+# latency and the per-request zigzag runs outweigh the indexer/attention
+# time ShardQ removes; the measured crossover on H20 is ~8K tokens.
+MIN_TOKENS = 8192
+
+# A small step is still worth sharding as the tail chunk of a long-context
+# prefill: the indexer cost per row grows with the context length.
+LONG_CONTEXT_MIN_SEQ = 32768
+LONG_CONTEXT_MIN_TOKENS = 1024
 
 
 def zigzag_owner(extend_lens: List[int], world: int) -> np.ndarray:
@@ -98,9 +104,7 @@ def split_runs(
     run_qlen = (ends - starts).astype(np.int64)
     run_req = req[starts]
     run_last = token_ids[ends - 1]
-    run_seq = (
-        seq[run_req] - query_start[run_req + 1] + run_last + 1
-    ).astype(np.int64)
+    run_seq = (seq[run_req] - query_start[run_req + 1] + run_last + 1).astype(np.int64)
     return req, run_qlen, run_req, run_seq
 
 
@@ -133,9 +137,9 @@ class ShardQ(msgspec.Struct, frozen=True, kw_only=True):
         *,
         extend_lens: List[int],
         seq_lens: List[int],
-        group: "GroupCoordinator",
+        group: GroupCoordinator,
         device: torch.device,
-    ) -> Optional["ShardQ"]:
+    ) -> Optional[ShardQ]:
         """Build one rank's exchange plan, or return ``None`` on every rank.
 
         Eligibility is checked from the complete split, not just this rank's
@@ -159,9 +163,7 @@ class ShardQ(msgspec.Struct, frozen=True, kw_only=True):
         group_starts = np.cumsum(sizes) - sizes
         for r in range(world):
             rank_tokens = order[group_starts[r] : group_starts[r] + sizes[r]]
-            _, run_qlen, _, run_seq = split_runs(
-                rank_tokens, extend_lens, seq_lens
-            )
+            _, run_qlen, _, run_seq = split_runs(rank_tokens, extend_lens, seq_lens)
             if (
                 run_qlen.size == 0
                 or int(run_qlen.min()) <= 0

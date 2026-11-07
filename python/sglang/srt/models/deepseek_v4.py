@@ -3001,9 +3001,7 @@ class MQALayer(MqaAttentionBase):
                 # already hold every token (written above before the
                 # indexer's reduced pass), so the same pool serves this
                 # rank's query view unchanged.
-                assert kv is None, (
-                    "ShardQ expects the eager extend's fused KV store"
-                )
+                assert kv is None, "ShardQ expects the eager extend's fused KV store"
                 q_local = shard_q_plan.exchange.scatter_q(
                     attn_q[:, : self.n_local_heads]
                 )

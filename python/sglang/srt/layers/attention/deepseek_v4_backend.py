@@ -82,7 +82,13 @@ from sglang.srt.layers.attention.dsv4.metadata import (
     maybe_copy_inplace,
 )
 from sglang.srt.layers.attention.dsv4.online_c128_mtp import OnlineC128MTPController
-from sglang.srt.layers.attention.dsv4.shard_q import MIN_TOKENS, ShardQ, split_runs
+from sglang.srt.layers.attention.dsv4.shard_q import (
+    LONG_CONTEXT_MIN_SEQ,
+    LONG_CONTEXT_MIN_TOKENS,
+    MIN_TOKENS,
+    ShardQ,
+    split_runs,
+)
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
@@ -3007,6 +3013,11 @@ class DeepseekV4AttnBackend(
             else 0
         )
         real_tokens = forward_batch.global_num_token_non_padded_cpu
+        max_seq_len = (
+            int(forward_batch.seq_lens_cpu.max())
+            if forward_batch.seq_lens_cpu is not None
+            else 0
+        )
         if (
             parallel.attn_tp_size == 1
             or parallel.attn_cp_size != 1
@@ -3019,7 +3030,6 @@ class DeepseekV4AttnBackend(
             or self.mega_attn
             or self.trtllm_attn
             or not get_platform().is_sm90
-            or is_sm100_or_newer()
             or not self.enable_decoder_swa_bounded_replay
             or self.is_draft_runner
             or self.hisparse_coordinator is not None
@@ -3037,7 +3047,13 @@ class DeepseekV4AttnBackend(
             or forward_batch.seq_lens_cpu is None
             or forward_batch.positions is None
             or forward_batch.input_ids is None
-            or num_tokens < MIN_TOKENS
+            or (
+                num_tokens < MIN_TOKENS
+                and (
+                    num_tokens < LONG_CONTEXT_MIN_TOKENS
+                    or max_seq_len < LONG_CONTEXT_MIN_SEQ
+                )
+            )
             or num_tokens != forward_batch.positions.shape[0]
             or num_tokens != forward_batch.out_cache_loc.shape[0]
             or num_tokens != forward_batch.input_ids.shape[0]
