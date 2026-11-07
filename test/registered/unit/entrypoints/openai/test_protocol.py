@@ -188,6 +188,70 @@ class TestChatCompletionRequest(unittest.TestCase):
         self.assertEqual(params["min_new_tokens"], 5)
         self.assertEqual(params["stop"], ["</s>"])
 
+    def _chat_request(self, **kwargs):
+        return ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi"}],
+            **kwargs,
+        )
+
+    def test_preferred_sampling_params_fill_unset_keys(self):
+        """Regression test for #39096: --preferred-sampling-params must not be
+        shadowed by eagerly-resolved defaults in the tokenizer_manager merge."""
+        preferred = {
+            "temperature": 0.7,
+            "top_p": 0.80,
+            "top_k": 20,
+            "min_p": 0.0,
+            "presence_penalty": 1.5,
+            "repetition_penalty": 1.0,
+        }
+        params = self._chat_request().to_sampling_params(
+            [], {}, preferred_sampling_params=preferred
+        )
+        # the merge performed by TokenizerManager._create_tokenized_object
+        merged = {**preferred, **params}
+        for key, value in preferred.items():
+            self.assertEqual(merged[key], value, f"preferred {key} lost")
+
+    def test_preferred_sampling_params_user_value_wins(self):
+        preferred = {"temperature": 0.7, "top_k": 20, "presence_penalty": 1.5}
+        params = self._chat_request(
+            temperature=0.5, top_k=5, presence_penalty=0.3
+        ).to_sampling_params([], {}, preferred_sampling_params=preferred)
+        self.assertEqual(params["temperature"], 0.5)
+        self.assertEqual(params["top_k"], 5)
+        self.assertEqual(params["presence_penalty"], 0.3)
+
+    def test_preferred_sampling_params_generation_config_fallback(self):
+        generation_config = {"temperature": 0.9, "top_p": 0.85, "top_k": 40}
+        # keys absent from preferred still fall back to the generation config
+        params = self._chat_request().to_sampling_params(
+            [], generation_config, preferred_sampling_params={"temperature": 0.7}
+        )
+        self.assertEqual(params["temperature"], 0.7)
+        self.assertEqual(params["top_p"], 0.85)
+        self.assertEqual(params["top_k"], 40)
+        # keys present in both: preferred wins (the Qwen3.8 instruct-row case)
+        params = self._chat_request().to_sampling_params(
+            [],
+            generation_config,
+            preferred_sampling_params={"temperature": 0.7, "top_p": 0.8},
+        )
+        self.assertEqual(params["temperature"], 0.7)
+        self.assertEqual(params["top_p"], 0.8)
+
+    def test_preferred_sampling_params_absent_is_noop(self):
+        """Without --preferred-sampling-params the resolution is unchanged."""
+        params = self._chat_request().to_sampling_params([], {})
+        self.assertEqual(params["temperature"], 1.0)
+        self.assertEqual(params["top_p"], 1.0)
+        self.assertEqual(params["top_k"], -1)
+        self.assertEqual(params["min_p"], 0.0)
+        self.assertEqual(params["repetition_penalty"], 1.0)
+        self.assertEqual(params["presence_penalty"], 0.0)
+        self.assertEqual(params["frequency_penalty"], 0.0)
+
     def test_chat_completion_tool_choice_validation(self):
         """Test tool choice validation logic"""
         messages = [{"role": "user", "content": "Hello"}]
