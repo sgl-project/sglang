@@ -177,6 +177,7 @@ from sglang.srt.observability.request_metrics_exporter import (
 from sglang.srt.observability.trace import SpanAttributes, extract_trace_headers
 from sglang.srt.runtime_context import (
     assert_published,
+    attention_backends,
     get_context,
     get_device,
     get_disagg,
@@ -1483,6 +1484,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "The server is not configured to enable custom logit processor. "
                     "Please set `--enable-custom-logit-processor` to enable this feature."
                 )
+            if obj.bidir_prefix_len is not None and obj.bidir_prefix_len >= 0:
+                if attention_backends()[0] != "triton":
+                    raise ValueError(
+                        "bidir_prefix_len requires --attention-backend triton."
+                    )
+                prompt_len = len(input_ids) if input_ids is not None else 0
+                chunk = self.server_args.chunked_prefill_size
+                if obj.bidir_prefix_len > prompt_len or (
+                    chunk is not None and 0 < chunk < input_token_num
+                ):
+                    raise ValueError(
+                        f"bidir_prefix_len ({obj.bidir_prefix_len}) must lie within "
+                        f"the prompt ({prompt_len} tokens), and the prompt must fit "
+                        f"in --chunked-prefill-size ({chunk}); got {input_token_num}."
+                    )
             if (
                 obj.return_sampling_mask
                 and obj.custom_logit_processor
@@ -1672,6 +1688,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 session_id=obj.session_id,
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
+                bidir_prefix_len=(
+                    obj.bidir_prefix_len if obj.bidir_prefix_len is not None else -1
+                ),
                 require_reasoning=obj.require_reasoning,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,

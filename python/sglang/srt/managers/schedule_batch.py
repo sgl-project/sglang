@@ -477,6 +477,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         token_indices_to_pool: Optional[List[int]] = None,
+        bidir_prefix_len: int = -1,
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
@@ -513,6 +514,7 @@ class Req(ReqDllmMixin):
         self.positional_embed_overrides = positional_embed_overrides
         self.multi_item_delimiter_indices = multi_item_delimiter_indices
         self.token_indices_to_pool = token_indices_to_pool
+        self.bidir_prefix_len = bidir_prefix_len
         self.decision_layout = decision_layout
 
         # For req-level memory management
@@ -567,6 +569,9 @@ class Req(ReqDllmMixin):
             extra_key = (
                 extra_key or ""
             ) + lora_id  # lora_id is concatenated to the extra key
+
+        if bidir_prefix_len >= 0:
+            extra_key = (extra_key or "") + f"|bidir{bidir_prefix_len}"
 
         self.extra_key = extra_key
         self.cache_salt = cache_salt or None
@@ -1217,6 +1222,9 @@ class Req(ReqDllmMixin):
             max_prefix_len = min(max_prefix_len, self.dllm_block_offset)
         if self.return_logprob and self.logprob_start_len >= 0:
             max_prefix_len = min(max_prefix_len, self.logprob_start_len)
+        if self.bidir_prefix_len >= 0:
+            # Question tokens attend to each other; only the state block is reusable.
+            max_prefix_len = min(max_prefix_len, self.bidir_prefix_len)
         if self.is_dllm():
             # Appended masks and a partial prompt/output block are not reusable
             # KV: bidirectional attention depends on the rest of that block.
