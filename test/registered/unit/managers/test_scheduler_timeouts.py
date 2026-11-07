@@ -231,6 +231,25 @@ class TestQueuedAbort(CustomTestCase):
             req.cache_request_handle, CacheRequestOutcome.ABORT
         )
 
+    def test_hisparse_staged_request_is_finished_at_its_next_step(self):
+        req = _req("staged")
+        # Prefilled, in no batch, waiting for its host copy to land.
+        staging = IndexedReqList(ListKind.HISPARSE_STAGING, req_of=lambda x: x.req)
+        staging.join([SimpleNamespace(req=req)])
+        s = _scheduler([])
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.hisparse_coordinator = SimpleNamespace(
+            ack_staging_queue=staging,
+            request_lists=lambda: {ListKind.HISPARSE_STAGING: staging},
+        )
+        s.mm_receiver = None
+        s.dllm_config = None
+        s.grammar_manager = MagicMock()
+
+        s.abort_request(AbortReq(rid="staged"))
+
+        self.assertIsInstance(req.to_finish, FINISH_ABORT)
+
 
 class TestRunningTimeout(CustomTestCase):
     def setUp(self):
