@@ -193,6 +193,11 @@ def _per_token_group_quant_custom_op(
             for other_start, other_end in ranges[i + 1 :]:
                 if max(start, other_start) < min(end, other_end):
                     raise ValueError("FP32 power-of-two buffers must not overlap")
+        # Contiguity ignores singleton strides. Give both launchers a row-major
+        # view of the same FP32 storage so v2 cannot mistake it for packed scales.
+        scale_strides = (max(output_s.shape[1], 1), 1)
+        if output_s.stride() != scale_strides:
+            output_s = output_s.as_strided(output_s.shape, scale_strides)
         # Query the input device at execution time: no import-time CUDA/NVML
         # dependency and no device/pointer introspection in Dynamo tracing.
         if (

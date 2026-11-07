@@ -137,6 +137,27 @@ def test_fp32_pow2_public_offset_view(offset):
     _check_fp32_pow2(x[offset:].view(3, 160), public=True)
 
 
+@pytest.mark.parametrize("offset", [0, 8])
+def test_fp32_pow2_public_singleton_scale(offset):
+    """A contiguous transposed [8, 1] FP32 buffer must receive FP32 scales."""
+    torch.manual_seed(42)
+    # Exercise the Hopper trait path and its 16B-aligned v2 fallback.
+    storage = torch.randn(8 * 32 + offset, device="cuda", dtype=torch.bfloat16)
+    x = storage[offset:].view(8, 32)
+    q = torch.empty_like(x, dtype=fp8_dtype)
+    s = torch.full((1, 8), torch.nan, device="cuda", dtype=torch.float32).T
+    assert s.is_contiguous() and s.stride() == (1, 8)
+
+    q_out, s_out = sglang_per_token_group_quant_fp8(
+        x, 32, scale_ue8m0=True, output_q=q, output_s=s
+    )
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    assert q_out is q and s_out is s
+    assert s.stride() == (1, 8)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
 @pytest.mark.parametrize("mixed_groups", [False, True])
 def test_fp32_pow2_all_bf16_encodings(mixed_groups):
     # Includes signed zero, subnormals, exponent boundaries, infinities and
