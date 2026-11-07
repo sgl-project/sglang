@@ -10,6 +10,12 @@ Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on an SM120 device.
 Everything else goes to cuDNN SDPA. Each distinct sequence length compiles once
 (about 10 s); later calls with the same shape reuse the compiled kernel. The FP8 and
 output buffers are allocated per call and belong to the caller.
+
+``--attention-backend-config`` keys: ``bf16_layers`` lists exact attention-layer
+prefixes (e.g. ``blocks.45.attn``) that run cuDNN BF16 instead, for heads whose peaked
+scores per-head E4M3 Q/K cannot represent; ``min_seq_len`` sends shorter sequences to
+cuDNN BF16 as well. For MiniMax-H3 keep ``blocks.1.attn``, ``blocks.45.attn``,
+``blocks.48.attn`` and ``blocks.49.attn`` in BF16.
 """
 
 import torch
@@ -23,6 +29,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
 )
 from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import CudnnSDPAImpl
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -68,6 +75,11 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             prefix=prefix,
             **extra_impl_args,
         )
+        config = get_global_server_args().attention_backend_config or {}
+        self.keep_bf16 = prefix in config.get("bf16_layers", ())
+        self.min_seq_len = int(config.get("min_seq_len", 0))
+        if self.keep_bf16:
+            logger.info("fp8_fa_sm120 attention: %s runs in BF16 (bf16_layers)", prefix)
 
     # --- dispatch -------------------------------------------------------------
 
@@ -109,6 +121,8 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         # [B, S, H, D]; the kernel handles one dense sequence at a time.
+        if self.keep_bf16 or query.shape[1] < self.min_seq_len:
+            return self.fallback.forward(query, key, value, attn_metadata)
         if query.shape[0] != 1:
             self._report_fallback(f"batch {query.shape[0]}")
             return self.fallback.forward(query, key, value, attn_metadata)
@@ -141,6 +155,7 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         reason = self._fallback_reason(query, key, value)
         if reason is not None:
             self._report_fallback(reason)
+        if reason is not None or self.keep_bf16 or max_seqlen < self.min_seq_len:
             return self.fallback.forward_varlen(
                 query,
                 key,
