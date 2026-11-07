@@ -90,6 +90,14 @@ pub(super) fn chunk(rid: &str, text: &str, done: bool) -> ResponseItem {
     }
 }
 
+/// `item` with `cached` prefix-cache hits.
+pub(super) fn with_cached_tokens(mut item: ResponseItem, cached: u32) -> ResponseItem {
+    if let ResponseItem::Frame(output) | ResponseItem::Done(output) = &mut item {
+        output.cached_tokens = cached;
+    }
+    item
+}
+
 /// A submitted legacy completion choice.
 pub(super) fn submitted(
     index: usize,
