@@ -570,6 +570,42 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
             self.assertEqual(row.prompt_len, expected_prompt_len)
 
+    def test_openai_sampler_output_lengths(self):
+        cases = [
+            ({}, 256),
+            ({"max_tokens": 7}, 7),
+            ({"max_completion_tokens": 11}, 11),
+            ({"max_tokens": 7, "max_completion_tokens": 11}, 11),
+            ({"max_tokens": 7, "max_completion_tokens": None}, 7),
+            ({"max_tokens": None, "max_completion_tokens": 11}, 11),
+            ({"max_tokens": None, "max_completion_tokens": None}, 256),
+            ({"max_tokens": 0}, 0),
+            ({"max_completion_tokens": 0}, 0),
+        ]
+        messages = [{"role": "user", "content": "What is 1+1?"}]
+        dataset_path = self.tmpdir_path / "openai_output_lengths.jsonl"
+        for token_limits, expected in cases:
+            with open(dataset_path, "w") as f:
+                f.write(json.dumps({"messages": messages, **token_limits}) + "\n")
+            for fixed_output_len in (None, 16, 0):
+                with self.subTest(
+                    token_limits=token_limits, fixed_output_len=fixed_output_len
+                ):
+                    rows = sample_openai_requests(
+                        dataset_path=str(dataset_path),
+                        num_requests=1,
+                        tokenizer=self.tokenizer,
+                        fixed_output_len=fixed_output_len,
+                    )
+                    self.assertEqual(len(rows), 1)
+                    row = rows[0]
+                    self.assertEqual(
+                        row.output_len,
+                        expected if fixed_output_len is None else fixed_output_len,
+                    )
+                    self.assertNotIn("max_tokens", row.extra_request_body)
+                    self.assertNotIn("max_completion_tokens", row.extra_request_body)
+
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
         rows = sample_generated_shared_prefix_requests(
