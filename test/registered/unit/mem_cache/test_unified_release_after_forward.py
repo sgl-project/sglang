@@ -28,6 +28,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
+from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.srt.mem_cache.kv.alloc.band import (
     relieve_for_alloc,
     settle_pending_for_recovery,
@@ -86,9 +87,8 @@ class TestFreedPagesPendUntilTheirStepIsProcessed(CustomTestCase):
         self.steps = self.allocator.forward_steps
         self.owner = self.allocator.full_attn_allocator
 
-    def test_only_a_lazy_chain_counts_steps(self):
+    def test_the_chain_counts_steps(self):
         self.assertIsInstance(self.steps, ForwardSteps)
-        self.assertIsNone(build_swa_pool(page_size=4, lazy=False).forward_steps)
 
     def test_a_freed_page_is_unbound_at_once_counted_free_and_pending(self):
         allocator, owner, steps = self.allocator, self.owner, self.steps
@@ -498,21 +498,24 @@ class TestFreedPagesPendUntilTheirStepIsProcessed(CustomTestCase):
         self.assertEqual(window._byte_accounting_violations(), [])
 
     def test_page_choice_does_not_depend_on_whether_the_forward_finished(self):
-        """Every rank picks the same pages, whatever its local event state."""
-        taken = []
+        """Every rank picks the same pages, whatever its local event state:
+        whether the forward fired decides only whether a wait is queued."""
+        taken, waited = [], []
         for fired in (True, False):
             allocator = build_swa_pool(page_size=4, lazy=True)
             owner = allocator.full_attn_allocator
             event = mock.Mock(spec=["query"])
-            event.query.side_effect = AssertionError("decisions never query")
-            owner._latest_forward_done_event = event
+            event.query.return_value = fired
             rows = [allocator.alloc(8) for _ in range(3)]
             self.assertIsNotNone(allocator.alloc(allocator.available_size()))
             _launch(allocator.forward_steps, event)
             allocator.free_segment(rows[1], start_pos=0)
-            out = allocator.alloc(allocator.available_size())  # needs them
+            with mock.patch.object(band_module, "wait_signals") as wait:
+                out = allocator.alloc(allocator.available_size())  # needs them
+            waited.append(wait.called)
             taken.append(_physical(owner, out).tolist())
         self.assertEqual(taken[0], taken[1])
+        self.assertEqual(waited, [False, True])
 
 
 class TestFloatPendingPages(CustomTestCase):
@@ -740,6 +743,52 @@ def _fill(allocator):
     return rows
 
 
+class TestOneAllocationReadsBeforeItWaits(CustomTestCase):
+    def test_a_pending_reuse_over_two_bands_reads_nothing(self):
+        """Both bands of a chain take pages pending under an unfinished
+        forward that writes both of them: the settles wait the forward on the
+        stream and the allocation reads nothing on the host (checked at
+        invariant level STRICT too)."""
+        setup_allocator_context()
+        allocator = build_swa_pool(page_size=4, lazy=True)
+        steps = allocator.forward_steps
+        rows = allocator.alloc(allocator.available_size())
+        event = mock.Mock(spec=["query", "wait"])
+        event.query.return_value = False
+        _launch(steps, event)
+        allocator.set_latest_forward_done_event(event)
+        allocator.set_inflight_forward(event, rows[8:16].clone())
+        allocator.free_segment(rows[:8], start_pos=0)
+        for band in allocator.members:
+            self.assertGreater(band._pending_until_retire_pages, 0)
+        order = []
+        real_tolist, real_item = torch.Tensor.tolist, torch.Tensor.item
+        with (
+            _strict(),
+            mock.patch.object(
+                band_module,
+                "wait_signals",
+                lambda *a, **k: order.append("wait"),
+            ),
+            mock.patch.object(
+                torch.Tensor,
+                "tolist",
+                lambda t: order.append("read") or real_tolist(t),
+            ),
+            mock.patch.object(
+                torch.Tensor,
+                "item",
+                lambda t: order.append("read") or real_item(t),
+            ),
+        ):
+            self.assertIsNotNone(allocator.alloc(8))
+        # An ordinary pending reuse needs counts and stream order only.
+        self.assertIn("wait", order)
+        self.assertNotIn("read", order)
+        for band in allocator.members:
+            self.assertEqual(band._pending_until_retire_pages, 0)
+
+
 class TestUrgentRecoverySettlesFirst(CustomTestCase):
     """Every urgent recovery settles the pending pages of its bands, after one
     host read and before it decides anything: these succeed on the first try
@@ -878,7 +927,7 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         owner.set_latest_forward_done_event(event)
         owner.set_inflight_forward(event, rows[10].to(torch.int64))  # write race
         self.assertEqual(owner.flush_opportunistic(), 1)  # partial
-        self.assertTrue(owner._pending_reuse)
+        self.assertTrue(owner.usage.has_pending())
         self.assertIsNotNone(owner.alloc(int(owner._free_phys_pages.shape[0])))
         self.assertEqual(int(owner._free_phys_pages.shape[0]), 0)
         event.query.return_value = True
@@ -888,7 +937,7 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
                 return_value=level,
             ):
                 owner.flush_for_allocation()
-        self.assertFalse(owner._pending_reuse)
+        self.assertFalse(owner.usage.has_pending())
         self.assertEqual(owner._byte_accounting_violations(), [])
 
     def test_a_host_read_inside_a_recovery_raises(self):
@@ -896,10 +945,10 @@ class TestUrgentRecoverySettlesFirst(CustomTestCase):
         owner = allocator.full_attn_allocator
         allocator.free_segment(allocator.alloc(8), start_pos=0)
         with _strict(), settle_pending_for_recovery((owner,)):
-            self.assertEqual(len(owner._free_pages_host_view()), 2)  # read ahead
-            owner._free_phys_pages = owner._free_phys_pages.clone()  # view unknown
+            self.assertTrue(owner._free_pages_host_known())  # read ahead
+            owner._free_phys_pages = owner._free_phys_pages.clone()  # copy unknown
             with self.assertRaises(AssertionError):
-                owner._free_pages_host_view()
+                owner._free_pages_snapshot(after_wait=bool(owner._recovery_depth))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required (stream waits)")
@@ -908,7 +957,8 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         setup_allocator_context()
         allocator = build_swa_pool(page_size=4, lazy=True)
         owner = allocator.full_attn_allocator
-        event = object()
+        event = mock.Mock(spec=["query"])
+        event.query.return_value = False
         row = allocator.alloc(allocator.available_size())
         _launch(allocator.forward_steps, event)
         allocator.free_segment(row[:8], start_pos=0)
@@ -925,7 +975,9 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         allocator = build_swa_pool(page_size=4, lazy=True)
         owner = allocator.full_attn_allocator
         row = allocator.alloc(allocator.available_size())
-        events = (object(), object())
+        events = (mock.Mock(spec=["query"]), mock.Mock(spec=["query"]))
+        for event in events:
+            event.query.return_value = False
         _launch(allocator.forward_steps, events[0])
         allocator.free_segment(row[:8], start_pos=0)
         _launch(allocator.forward_steps, events[1])
@@ -947,23 +999,26 @@ class TestATakeOfPendingPagesWaitsForTheForward(CustomTestCase):
         stream.wait_event.assert_called_once_with(events[0])
         self.assertEqual(owner._pending_until_retire_pages, 2)
 
-    def test_a_take_queues_one_wait_per_event_and_no_host_read(self):
+    def test_a_take_queues_one_wait_per_event_and_reads_only_before(self):
+        """The chain reads ahead what the rest of the allocation reads on the
+        host, then the stream waits each event once: no read follows a wait."""
         allocator, owner, events = self._two_forwards_pending()
         stream, patches = self._cuda_stream(owner)
-        reads = []
+        order = []
+        stream.wait_event.side_effect = lambda e: order.append("wait")
         real_tolist = torch.Tensor.tolist
         with (
             patches[0],
             patches[1],
             mock.patch.object(
-                torch.Tensor, "tolist", lambda t: reads.append(1) or real_tolist(t)
+                torch.Tensor, "tolist", lambda t: order.append("read") or real_tolist(t)
             ),
         ):
             self.assertIsNotNone(owner.take_physical_pages(3))
         self.assertEqual(
             [c.args[0] for c in stream.wait_event.call_args_list], list(events)
         )
-        self.assertEqual(reads, [])
+        self.assertNotIn("read", order[order.index("wait") :])
         self.assertEqual(owner._pending_until_retire_pages, 0)
 
 

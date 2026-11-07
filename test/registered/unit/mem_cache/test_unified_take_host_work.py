@@ -13,6 +13,8 @@ import weakref
 from unittest import mock
 
 from sglang.srt.mem_cache.kv.alloc import band as band_module
+from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
+from sglang.srt.mem_cache.kv.alloc.signals import StreamTransfer
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
@@ -96,12 +98,61 @@ class TestTakesDoNoHostWorkPerHole(CustomTestCase):
                 self.assertLess(large, 10.0)
 
 
+class TestATinyTakeAmongManyCopyFences(CustomTestCase):
+    """Fences of host copies still reading pages a move vacated order no
+    choice of holes: a one-page take from a large fragmented free list walks
+    each ledger once, not once per hole."""
+
+    def test_a_one_page_take_walks_each_ledger_once(self):
+        owner = _holes_in_end(16384)
+        epp = owner.entry_bytes_per_page
+        holes = sorted(owner._free_pages_snapshot())
+        end = owner._hole_end()
+        # Copy fences on every other hole but the ones a take reaches first.
+        far = holes[64:-64]
+        for page in far[::16]:
+            owner.usage.vacate(
+                StreamTransfer(_Unfired()), [(page, page + 1)], page_bytes=epp
+            )
+        self.assertGreaterEqual(len(owner.usage.uses), 1000)
+        calls = {"spans": 0, "need": 0}
+        real_spans = PageUsage.ordering_spans
+        real_need = PageUsage.fences_need
+
+        def spans(usage, *a, **k):
+            calls["spans"] += 1
+            return real_spans(usage, *a, **k)
+
+        def need(usage, *a, **k):
+            calls["need"] += 1
+            return real_need(usage, *a, **k)
+
+        with (
+            mock.patch.object(PageUsage, "ordering_spans", spans),
+            mock.patch.object(PageUsage, "fences_need", need),
+        ):
+            start = time.perf_counter()
+            taken = owner.take_physical_pages(1)
+            elapsed = time.perf_counter() - start
+        self.assertIsNotNone(taken)
+        expected = holes[0] if end == "low" else holes[-1]
+        self.assertEqual(taken.tolist(), [expected])
+        self.assertEqual(calls["need"], 0)
+        self.assertLessEqual(calls["spans"], len(owner._chain_bands()))
+        self.assertLess(elapsed, 1.0)
+
+
+class _Unfired:
+    def query(self):
+        return False
+
+
 class TestClearAndParkDropTheHostCopy(CustomTestCase):
     """Clearing a band, or parking a float, empties its free list and must
     drop the old list's host copy with it, not keep it alive."""
 
     def _read_view(self, band):
-        band._free_pages_host_view()
+        band._free_pages_snapshot()
         self.assertTrue(band._free_pages_host_known())
         return weakref.ref(band._free_phys_pages)
 

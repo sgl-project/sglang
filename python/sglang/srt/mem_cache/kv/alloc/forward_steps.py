@@ -203,9 +203,10 @@ class ForwardSteps:
     def forward_processed(self, launch: Optional[ForwardLaunch]) -> None:
         """The result of the step launched as ``launch`` was processed, after
         a completion covering its forward was synchronized on the host. A
-        recorded forward advances the processed prefix: the pages pending under
-        it, and under every earlier forward, join their band's free list, the
-        only point they return without a take. A step without a recorded
+        recorded forward advances the processed prefix: it, and every earlier
+        forward, retire from each band's ledger, and the pages pending under
+        them join their band's free list, the only point they return without a
+        take. A step without a recorded
         forward advances nothing."""
         if launch is None:
             return
@@ -217,9 +218,13 @@ class ForwardSteps:
         assert launch.seq == oldest, (
             f"recorded forward {launch.seq} processed before forward {oldest}"
         )
-        del self._events[oldest]
+        event = self._events.pop(oldest)
         self._processed = oldest
         for band in self._bands:
+            if event is not None:
+                # The same proof retires the forward's ledger records (and every
+                # earlier forward's): what it writes, and what it may read.
+                band.retire_forward(event)
             band.release_pending_through(oldest)
         if not self._events:
             self.check_idle()

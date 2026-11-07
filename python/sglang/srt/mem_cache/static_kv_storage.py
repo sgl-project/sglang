@@ -64,30 +64,30 @@ def kv_storage_of(
     req_to_token_pool: ReqToTokenPool,
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     *,
-    tree_cache: Optional[BasePrefixCache] = None,
-    batch: Optional[ScheduleBatch] = None,
     shape: Optional[StaticPoolShape] = None,
     draft_token_to_kv_pool=None,
     num_hidden_layers: Optional[int] = None,
 ) -> KVStorage | StaticKVStorage:
     """What a request's lifecycle, the pool observers and a PD peer go through:
-    a unified pool's own storage, else the static pools behind
-    `StaticKVStorage` (the keyword arguments feed only what the static pools
-    need: ``tree_cache`` and ``batch`` their allocation, ``shape`` the
-    observers' usage, the draft pool and the target's layer count the state
-    entries they register with a draft's)."""
+    a unified pool's own storage, else the static pools' one `StaticKVStorage`,
+    built the first time it is asked for and kept by the pool. The keyword
+    arguments describe the static pools once, for what only they need:
+    ``shape`` their usage and prefix-tree slots, the draft pool and the
+    target's layer count the state entries a PD peer registers."""
     storage = token_to_kv_pool_allocator.storage
     if storage is not None:
         return storage
-    return StaticKVStorage(
-        req_to_token_pool,
-        token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
-        batch=batch,
-        shape=shape,
-        draft_token_to_kv_pool=draft_token_to_kv_pool,
-        num_hidden_layers=num_hidden_layers,
-    )
+    static = token_to_kv_pool_allocator.__dict__.get("_static_kv_storage")
+    if static is None or static.requests is not req_to_token_pool:
+        static = StaticKVStorage(req_to_token_pool, token_to_kv_pool_allocator)
+        if "_static_kv_storage" in token_to_kv_pool_allocator.__dict__:
+            static.adopt_bindings(token_to_kv_pool_allocator._static_kv_storage)
+        token_to_kv_pool_allocator._static_kv_storage = static
+    if shape is not None:
+        static.bind_shape(shape)
+    if draft_token_to_kv_pool is not None or num_hidden_layers is not None:
+        static.bind_transfer_draft(draft_token_to_kv_pool, num_hidden_layers)
+    return static
 
 
 def acquire_rows(
@@ -142,26 +142,61 @@ class StaticKVStorage:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         *,
-        tree_cache: Optional[BasePrefixCache] = None,
-        batch: Optional[ScheduleBatch] = None,
         shape: Optional[StaticPoolShape] = None,
         draft_token_to_kv_pool=None,
         num_hidden_layers: Optional[int] = None,
     ):
         self.requests = req_to_token_pool
         self._allocator = token_to_kv_pool_allocator
-        self._tree_cache = tree_cache
-        self._batch = batch
         self._shape = shape
         self._draft_token_to_kv_pool = draft_token_to_kv_pool
         self._num_hidden_layers = num_hidden_layers
         self._owner_region: Optional[Region] = None
         self._state_entries: Optional[_StaticStateEntries] = None
+        # A window pool's kept tail, by the window pool's name, bound once at
+        # startup (`bind_window_retention`).
+        self._window_retention: Optional[Dict[str, int]] = None
 
     def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
         """No static window states its retention: its length is the
         model's."""
         return {}
+
+    def bind_shape(self, shape: StaticPoolShape) -> None:
+        """Describe the static pools for their usage and prefix-tree slots.
+        Each caller knows part of the description (the prefix tree its window
+        and checkpoint interval, the scheduler the capacities), so a field
+        ``shape`` leaves None keeps what an earlier binding set."""
+        if self._shape is not None:
+            given = {
+                field: value
+                for field in shape.__struct_fields__
+                if (value := getattr(shape, field)) is not None
+            }
+            shape = msgspec.structs.replace(self._shape, **given)
+        self._shape = shape
+
+    def bind_transfer_draft(
+        self, draft_token_to_kv_pool, num_hidden_layers: Optional[int]
+    ) -> None:
+        """The draft pool a PD peer registers with the target's, and the
+        target's layer count; the state entries are rebuilt from them."""
+        if (draft_token_to_kv_pool, num_hidden_layers) != (
+            self._draft_token_to_kv_pool,
+            self._num_hidden_layers,
+        ):
+            self._draft_token_to_kv_pool = draft_token_to_kv_pool
+            self._num_hidden_layers = num_hidden_layers
+            self._state_entries = None
+
+    def adopt_bindings(self, other: StaticKVStorage) -> None:
+        """Keep what ``other``, the same pools' storage over another request
+        table, was told at startup."""
+        self._shape = other._shape
+        self._window_retention = other._window_retention
+        self.bind_transfer_draft(
+            other._draft_token_to_kv_pool, other._num_hidden_layers
+        )
 
     def resume_units(
         self,
@@ -248,6 +283,8 @@ class StaticKVStorage:
         make_room: Callable[[int], Any],
         window_tail: Optional[int] = None,
         stated_window_tails: Optional[Dict[str, int]] = None,
+        tree_cache: Optional[BasePrefixCache] = None,
+        batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
         # Static pools have no window with a stated retention.
         assert not stated_window_tails
@@ -274,8 +311,8 @@ class StaticKVStorage:
         kv_shard_rotation_bases = None
         if shard_size > 1:
             kv_shard_rotation_bases = _kv_shard_rotation_bases(
-                tree_cache=self._tree_cache,
-                batch=self._batch,
+                tree_cache=tree_cache,
+                batch=batch,
                 prefix_lens_cpu=prefix_lens_cpu,
             )
             extra_alloc_kwargs["rotation_bases"] = kv_shard_rotation_bases
@@ -283,11 +320,11 @@ class StaticKVStorage:
             c128_num_pages = allocator.c128_num_pages_needed(
                 prefix_lens_cpu, seq_lens_cpu
             )
-            allocator.ensure_c128_capacity(self._tree_cache, c128_num_pages)
+            allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
             extra_alloc_kwargs["req_pool_indices"] = rows
             # Per-call per-req table for the C128 KV last_loc lookup.
-            if self._batch is not None:
-                extra_alloc_kwargs["req_to_token_pool"] = self._batch.req_to_token_pool
+            if batch is not None:
+                extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
         if window_tail is not None:
             out = allocator.alloc_extend_swa_tail(
@@ -313,14 +350,14 @@ class StaticKVStorage:
         if is_dsv4:
             bundle = out
             out = None if bundle is None else bundle.out_full_loc
-            if self._batch is not None:
-                self._batch.out_cache_loc_dsv4 = bundle
+            if batch is not None:
+                batch.out_cache_loc_dsv4 = bundle
 
         if out is not None and kv_shard_rotation_bases is not None:
             # The allocator resolved None entries (new chains) in place from the
             # least-full class at each request's turn; record the bases for the
             # radix insert to stamp onto new tree nodes (UnifiedTreeNode.rotation_base).
-            for req, base in zip(self._batch.reqs, kv_shard_rotation_bases):
+            for req, base in zip(batch.reqs, kv_shard_rotation_bases):
                 req.kv_rotation_base = base
         return out
 
@@ -332,6 +369,8 @@ class StaticKVStorage:
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
         make_room: Callable[[int], Any],
+        tree_cache: Optional[BasePrefixCache] = None,
+        batch: Optional[ScheduleBatch] = None,
     ) -> Optional[torch.Tensor]:
         allocator = self._allocator
         # Over estimate the number of tokens: assume each request needs a new page.
@@ -345,11 +384,11 @@ class StaticKVStorage:
             c128_num_pages = allocator.c128_num_pages_needed(
                 (seq_lens_cpu - 1).clamp(min=0), seq_lens_cpu
             )
-            allocator.ensure_c128_capacity(self._tree_cache, c128_num_pages)
+            allocator.ensure_c128_capacity(tree_cache, c128_num_pages)
             extra_alloc_kwargs["req_pool_indices"] = rows
             # Per-call per-req C128 table for the last_loc lookup.
-            if self._batch is not None:
-                extra_alloc_kwargs["req_to_token_pool"] = self._batch.req_to_token_pool
+            if batch is not None:
+                extra_alloc_kwargs["req_to_token_pool"] = batch.req_to_token_pool
 
         out = allocator.alloc_decode(
             seq_lens, seq_lens_cpu, last_loc, **extra_alloc_kwargs
@@ -357,8 +396,8 @@ class StaticKVStorage:
         if is_dsv4:
             bundle = out
             out = None if bundle is None else bundle.out_full_loc
-            if self._batch is not None:
-                self._batch.out_cache_loc_dsv4 = bundle
+            if batch is not None:
+                batch.out_cache_loc_dsv4 = bundle
         return out
 
     def free_tokens(self, ids: torch.Tensor) -> None:
@@ -395,6 +434,25 @@ class StaticKVStorage:
             eviction_interval=eviction_interval,
             window_sub_pool=window_sub_pool or BaseSWAKVPool.WINDOW_SUB_POOL,
         )
+
+    def record_forward(
+        self,
+        forward_done,
+        *,
+        written_tokens,
+        token_writes_unknown: bool,
+        req_pool_indices,
+        state_slots,
+        state_writes_unknown: bool = False,
+    ) -> None:
+        """See `KVStorage.record_forward`: static pools never move a row, so
+        nothing races a forward."""
+
+    def retire_forward(self, forward_done) -> None:
+        """See `KVStorage.retire_forward`: nothing was recorded."""
+
+    def record_host_transfer(self, signal, transfers, *, writes: bool) -> None:
+        """See `KVStorage.record_host_transfer`: no row moves under a copy."""
 
     def release_row(self, req: Req) -> None:
         # The DSV4-NPU table's free() also releases the c4/c128 state pages.
@@ -649,10 +707,9 @@ class StaticKVStorage:
     def bind_window_retention(
         self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
     ) -> None:
-        """See `KVStorage.bind_window_retention`; kept on the allocator, which
-        outlives this view."""
+        """See `KVStorage.bind_window_retention`."""
         names = self._allocator.window_pool_names()
-        self._allocator.window_retention = (
+        self._window_retention = (
             {}
             if sliding_window is None
             else {
@@ -671,7 +728,7 @@ class StaticKVStorage:
             return {BaseSWAKVPool.WINDOW_SUB_POOL: pool.sliding_window}
         if not self._allocator.window_pool_names():
             return {}
-        retention = self._allocator.window_retention
+        retention = self._window_retention
         if retention is None:
             raise ValueError("the window's retention was never bound")
         return dict(retention)
@@ -680,7 +737,7 @@ class StaticKVStorage:
         shape = self._shape
         window = None
         if shape.window is not None:
-            window = (self._allocator.window_retention or {}).get(
+            window = (self._window_retention or {}).get(
                 BaseSWAKVPool.WINDOW_SUB_POOL, shape.window
             )
         return (

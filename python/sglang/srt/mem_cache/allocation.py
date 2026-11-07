@@ -161,15 +161,10 @@ def get_last_loc_torch(
     )
 
 
-def _storage(
-    tree_cache: BasePrefixCache, batch: Optional[ScheduleBatch] = None
-) -> KVStorage | StaticKVStorage:
+def _storage(tree_cache: BasePrefixCache) -> KVStorage | StaticKVStorage:
     """The storage the tree's pools present to a request's lifecycle."""
     return kv_storage_of(
-        tree_cache.req_to_token_pool,
-        tree_cache.token_to_kv_pool_allocator,
-        tree_cache=tree_cache,
-        batch=batch,
+        tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
     )
 
 
@@ -229,7 +224,7 @@ def alloc_paged_token_slots_extend(
     req_pool_indices: Optional[torch.Tensor] = None,
     batch=None,
 ):
-    out_cache_loc = _storage(tree_cache, batch).take_extend(
+    out_cache_loc = _storage(tree_cache).take_extend(
         rows=req_pool_indices,
         prefix_lens=prefix_lens,
         prefix_lens_cpu=prefix_lens_cpu,
@@ -238,6 +233,8 @@ def alloc_paged_token_slots_extend(
         last_loc=last_loc,
         num_tokens=extend_num_tokens,
         make_room=_room_in(tree_cache),
+        tree_cache=tree_cache,
+        batch=batch,
     )
 
     if out_cache_loc is None:
@@ -375,12 +372,7 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    storage = kv_storage_of(
-        batch.req_to_token_pool,
-        batch.token_to_kv_pool_allocator,
-        tree_cache=batch.tree_cache,
-        batch=batch,
-    )
+    storage = kv_storage_of(batch.req_to_token_pool, batch.token_to_kv_pool_allocator)
     # Allocate req slots (raises RuntimeError if the pool is exhausted)
     req_pool_indices = alloc_req_slots(
         storage,
@@ -642,12 +634,14 @@ def alloc_paged_token_slots_decode(
     batch=None,
 ) -> torch.Tensor:
     """Allocate paged KV cache for decode batch."""
-    out_cache_loc = _storage(tree_cache, batch).take_decode(
+    out_cache_loc = _storage(tree_cache).take_decode(
         rows=req_pool_indices,
         seq_lens=seq_lens,
         seq_lens_cpu=seq_lens_cpu,
         last_loc=last_loc,
         make_room=_room_in(tree_cache),
+        tree_cache=tree_cache,
+        batch=batch,
     )
 
     if out_cache_loc is None:
@@ -721,7 +715,7 @@ def alloc_for_decode_default(batch: ScheduleBatch, token_per_req: int) -> torch.
             target_seq_lens_cpu=batch.seq_lens_cpu + token_per_req,
         )
     except Exception:
-        _storage(batch.tree_cache, batch).free_tokens(out_cache_loc)
+        _storage(batch.tree_cache).free_tokens(out_cache_loc)
         raise
 
     for req in batch.reqs:

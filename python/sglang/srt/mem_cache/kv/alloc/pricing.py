@@ -46,15 +46,25 @@ class BandSnapshot(msgspec.Struct, frozen=True, gc=False):
     num_virtual_pages: int
     low_page: int = 0  # float only
     high_page: int = 0  # float only
+    # Pages ``[first, end)`` holding every page that cannot move (a load
+    # reservation); the band's extent must keep covering them. None when there
+    # is none.
+    fixed: Optional[Tuple[int, int]] = None
     # Pages pending until their step is processed: counted in `holes` (a take
     # uses them), yet their bytes stay the band's until they are settled.
     pending: int = 0
 
     @property
     def transparent(self) -> bool:
-        """An empty float: its neighbours' frontier walks see through it. Pages
-        pending until their step is processed keep a float opaque."""
-        return self.grow == "float" and self.live == 0 and self.pending == 0
+        """An empty float, none of its pages fixed or pending until their step
+        is processed: its neighbours' frontier walks see through it. A fixed or
+        pending page keeps a float's span over it."""
+        return (
+            self.grow == "float"
+            and self.live == 0
+            and self.fixed is None
+            and self.pending == 0
+        )
 
     @property
     def drains(self) -> bool:
@@ -140,6 +150,7 @@ def snapshot_band(band: Band) -> BandSnapshot:
         band.ids.num_virtual_ids,
         band.low_wm_page if floats else 0,
         band.high_wm_page if floats else 0,
+        band.fixed_extent(),
         band._pending_until_retire_pages,
     )
 
@@ -647,7 +658,8 @@ def reclaimed_snapshot(
 
     Unblocked ends can realize their compacted frontiers by an urgent flush.
     Pinned ends retain their spans. Partial float frees remain holes in place;
-    empty floats become transparent. No live float relocation is credited.
+    empty floats become transparent unless a page of theirs is fixed, which
+    keeps the span as holes. No live float relocation is credited.
     """
     bands = []
     for b in snapshot.bands:
@@ -657,9 +669,11 @@ def reclaimed_snapshot(
         live = b.live - reclaimed
         low, high, span = b.low_byte, b.high_byte, b.span
         holes, pending = b.holes + reclaimed, b.pending
-        # Recovery settles every pending page first: a float left with no live
-        # page parks, and an unblocked end's urgent flush absorbs them.
-        if empty_pool or (not live and (b.grow == "float" or not b.blocked)):
+        # A float's fixed page keeps its span, as an end's does. Recovery
+        # settles every pending page first: a float left with no live page
+        # parks, and an unblocked end's urgent flush absorbs them.
+        empties = b.fixed is None if b.grow == "float" else not b.blocked
+        if empty_pool or (not live and empties):
             span = holes = pending = 0
             low = high = (
                 b.num_pages if b.grow == "down" else b.min_page
@@ -684,6 +698,8 @@ def reclaimed_snapshot(
                     if empty_pool
                     else b.free_virtual_pages + reclaimed
                 ),
+                # An empty pool's floats hold nothing to keep in place.
+                fixed=None if empty_pool and b.grow == "float" else b.fixed,
             )
         )
     return msgspec.structs.replace(snapshot, bands=tuple(bands))

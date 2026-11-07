@@ -12,3 +12,8 @@ WINDOW_SEGMENT_BOUND = Invariant(
 WINDOW_SEGMENT_RELEASED = Invariant(
     "chain.window_segment_released", Bucket.FATAL_UNCONTAINABLE, IsTrue()
 )
+# An owner free never names a page a host load reserved: a cancelled load
+# unfixes its pages before it frees them.
+FREE_OUTSIDE_RESERVATION = Invariant(
+    "band.free_outside_reservation", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)

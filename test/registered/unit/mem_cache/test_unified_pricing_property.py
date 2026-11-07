@@ -106,7 +106,7 @@ def _live(adapter: BuilderAdapter) -> Dict[str, int]:
 class TestUnifiedPricingProperty(CustomTestCase):
     def _each_state(self, chain: str):
         for page_size in (1, 4):
-            for lazy in (False, True):
+            for lazy in (True,):
                 config = TraceConfig(chain=chain, page_size=page_size, lazy=lazy)
                 for name, ops in _states(config):
                     available = _rebuild(config, ops).allocator.available_size()

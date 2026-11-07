@@ -107,6 +107,7 @@ class TestTransferStreamOrdering(unittest.TestCase):
         controller.write_fence_stream = forward
         controller.l2_transfer_engine = engine
         controller.mem_pool_device_allocator = Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         # A tick's queued backup and the eviction victim share one drain.
         controller.write_queue = [
@@ -182,7 +183,9 @@ class TestTransferStreamOrdering(unittest.TestCase):
 
 
 class TestSwaBackupAfterCompaction(unittest.TestCase):
-    def test_backup_resolves_current_binding(self):
+    def test_backup_names_window_rows_by_owner_ids(self):
+        # The copy translates them at submission, so a page move between the
+        # backup's queueing and its submission cannot misdirect it.
         from sglang.srt.mem_cache.unified_cache.components.base import (
             CacheTransferPhase,
         )
@@ -201,14 +204,11 @@ class TestSwaBackupAfterCompaction(unittest.TestCase):
             tree_core=SimpleNamespace(has_swa_host_pool=True),
             _collect_unbacked_swa_nodes=lambda n: [n],
             _unified_allocator=lambda: object(),
-            _translate_full_to_swa=lambda x: x + 200,
         )
         transfers = SWAComponent.build_hicache_transfers(
             component, node, CacheTransferPhase.BACKUP_HOST
         )
-        torch.testing.assert_close(
-            transfers[0].device_indices, torch.tensor([203, 207])
-        )
+        torch.testing.assert_close(transfers[0].device_indices, torch.tensor([3, 7]))
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")

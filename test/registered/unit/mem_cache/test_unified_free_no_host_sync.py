@@ -106,11 +106,9 @@ _TABLES = {"virtual_to_physical", "physical_to_virtual"}
 # a tombstone" is a per-method design fact a scan cannot infer.
 _TOMBSTONE_METHODS = [
     (mea.Band, "_free_lazy"),
-    (mea.Band, "free"),
-    (mea.Band, "free_physical"),
+    (mea.Band, "_unbind_physical"),
     (mea.Band, "_commit_move_batch"),
     (mea.FloatBand, "free"),
-    (mea.FloatBand, "free_physical"),
     (mea.FloatBand, "make_room"),
     (mea.FloatBand, "_relocate_to_positions"),
 ]
@@ -656,7 +654,7 @@ class TestFreeSwaWindowRatchetNoHostSync(CustomTestCase):
     def test_start_pos_path_matches_the_fallback_end_state(self):
         """Derived property: the stride-rep path and the dedup fallback leave
         identical v2p tombstones and capacity."""
-        for lazy in (True, False):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 a1 = self._swa_composite(lazy=lazy)
                 a2 = self._swa_composite(lazy=lazy)

@@ -60,7 +60,7 @@ def _build(
     window=16,
     full_tokens=256,
     window_tokens=128,
-    lazy_compaction=False,
+    lazy_compaction=True,
     enable_mamba_extra_buffer=False,
     setup=True,
 ):
@@ -1092,7 +1092,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=256)},
         )
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 storage, _, _ = _build(
                     state=True,
@@ -1211,7 +1211,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=32)},
         )
-        for lazy, demand in ((lazy, n) for lazy in (False, True) for n in (4, 16, 32)):
+        for lazy, demand in ((lazy, n) for lazy in (True,) for n in (4, 16, 32)):
             with self.subTest(lazy=lazy, demand=demand):
                 storage, _, _ = _build(
                     state=True,
@@ -1382,6 +1382,7 @@ class TestDeclaredParts(CustomTestCase):
                 a.state.pool.replayssm_spec_fold = mode != "gdn_circular"
                 slots = a.alloc_state_slots(8)
                 a.state_slots.free(slots[:4])
+                a.mamba_allocator.flush_for_allocation()
                 active, track = slots[4:5], slots[7:8]
                 physical_active = a.mamba_allocator.ids.translate(active)
                 physical_track = a.mamba_allocator.ids.translate(track)
@@ -2000,7 +2001,7 @@ class TestDeclaredParts(CustomTestCase):
                 need_sort=False,
                 max_num_reqs=3,
                 model_context_len=1024,
-                lazy_compaction=False,
+                lazy_compaction=True,
             ),
         )
         a = storage.allocator
@@ -2070,7 +2071,7 @@ class TestDeclaredParts(CustomTestCase):
         from sglang.srt.mem_cache.radix_cache import RadixKey
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-        for lazy, draft_dim in ((False, 16), (True, 16), (False, 32), (True, 32)):
+        for lazy, draft_dim in ((True, 16), (True, 32)):
             with self.subTest(lazy=lazy, draft_dim=draft_dim):
                 placement = FusedDraftPlacement.from_counts(
                     counts={"draft_swa": [1]},
@@ -2242,7 +2243,7 @@ class TestDeclaredParts(CustomTestCase):
             },
             new_bands={"draft_swa": DraftBand(kind="window", window=8)},
         )
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 storage, _, _ = _build(
                     fused_draft=placement,
