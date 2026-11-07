@@ -1478,25 +1478,36 @@ def multi_thread_pt_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    # Limit both concurrent reads and completed checkpoints waiting for the
+    # consumer. Keeping every submitted Future would retain the entire model's
+    # CPU checkpoint storage even after its weights have been copied.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(_load_pt_file, bin_file) for bin_file in hf_weights_files
-        ]
+        file_iter = iter(hf_weights_files)
+        pending = {
+            executor.submit(_load_pt_file, bin_file)
+            for bin_file in itertools.islice(file_iter, max_workers)
+        }
+        with tqdm(
+            total=len(hf_weights_files),
+            desc="Multi-thread loading pt checkpoint shards",
+            disable=not enable_tqdm,
+            bar_format=BAR_FORMAT,
+        ) as pbar:
+            while pending:
+                done, pending = concurrent.futures.wait(
+                    pending, return_when=concurrent.futures.FIRST_COMPLETED
+                )
+                while done:
+                    future = done.pop()
+                    state = future.result()
+                    del future
+                    yield from state.items()
+                    del state
+                    pbar.update(1)
 
-        if enable_tqdm:
-            futures_iter = tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(hf_weights_files),
-                desc="Multi-thread loading pt checkpoint shards",
-                disable=not enable_tqdm,
-                bar_format=BAR_FORMAT,
-            )
-        else:
-            futures_iter = concurrent.futures.as_completed(futures)
-
-        for future in futures_iter:
-            state = future.result()
-            yield from state.items()
+                    next_file = next(file_iter, None)
+                    if next_file is not None:
+                        pending.add(executor.submit(_load_pt_file, next_file))
 
 
 def get_gguf_extra_tensor_names(
