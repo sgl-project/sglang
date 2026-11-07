@@ -19,9 +19,11 @@ from types import SimpleNamespace
 from PIL import Image
 
 from sglang.srt.arg_groups.serving_hook import handle_multimodal
+from sglang.srt.managers.multimodal_processor import get_mm_processor_cls
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
+from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.common import (
     resolve_gpu_image_decode,
@@ -63,10 +65,15 @@ class TestImageLoadOptions(CustomTestCase):
         self.assertEqual(
             resolve_rgb_conversion({"image_rgb_conversion": "white"}, "smart"), "white"
         )
-        with self.assertRaises(ValueError):
-            resolve_gpu_image_decode({"image_decoder": "cuda"}, True)
-        with self.assertRaises(ValueError):
-            resolve_rgb_conversion({"image_rgb_conversion": "black"}, "convert")
+        # JSON null means the default; a wrong name or a non-string is a ValueError, never a TypeError.
+        self.assertIs(resolve_gpu_image_decode({"image_decoder": None}, True), True)
+        self.assertEqual(resolve_rgb_conversion({"image_rgb_conversion": None}, "smart"), "smart")
+        for bad in ({"image_decoder": "cuda"}, {"image_decoder": ["pil"]}):
+            with self.assertRaises(ValueError):
+                resolve_gpu_image_decode(bad, True)
+        for bad in ({"image_rgb_conversion": "black"}, {"image_rgb_conversion": 1}):
+            with self.assertRaises(ValueError):
+                resolve_rgb_conversion(bad, "convert")
 
     def test_white_composites_transparent_pixels_and_convert_drops_alpha(self):
         image = Image.open(io.BytesIO(_rgba_png()))
@@ -99,18 +106,45 @@ class TestImageLoadOptions(CustomTestCase):
             _strategy(image_rgb_conversion="black")
 
     def test_the_keys_need_the_token_space_processor(self):
-        # Legacy processors never read the keys, so a server without the token-space processor rejects them.
+        # Legacy processors never read the keys, so a server without the token-space processor rejects them,
+        # and with it a bad value is rejected at argument resolution, before any process starts.
         with self.assertRaises(ValueError):
             handle_multimodal(
                 ServerArgs(model_path="dummy", mm_process_config={"image_decoder": "pil"})
             )
+        with self.assertRaises(ValueError):
+            handle_multimodal(
+                ServerArgs(
+                    model_path="dummy",
+                    mm_process_config={"image_rgb_conversion": "White"},
+                    enable_token_space_processor=True,
+                )
+            )
         handle_multimodal(
+            ServerArgs(
+                model_path="dummy",
+                mm_process_config={"image_decoder": "pil", "image_rgb_conversion": None},
+                enable_token_space_processor=True,
+            )
+        )
+
+    def test_a_model_without_a_strategy_rejects_the_keys(self):
+        # With the token-space processor on, a model that still gets a legacy processor would ignore the keys.
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(
             ServerArgs(
                 model_path="dummy",
                 mm_process_config={"image_decoder": "pil"},
                 enable_token_space_processor=True,
-            )
+            ),
+            role="test",
         )
+        hf_config = SimpleNamespace(
+            model_type="stub", architectures=["NoStrategyForConditionalGeneration"]
+        )
+        with self.assertRaisesRegex(ValueError, "token-space processor only"):
+            get_mm_processor_cls(hf_config)
 
 
 if __name__ == "__main__":

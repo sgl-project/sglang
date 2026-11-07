@@ -20,6 +20,8 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
     configure_media_url_security,
     get_device,
     is_gfx95_supported,
@@ -188,7 +190,11 @@ def handle_multimodal(server_args: Any):
                     f"mm_process_config['{key}'] must be a dict, "
                     f"but got {type(cfg.mm_process_config[key])}"
                 )
-        if not cfg.enable_token_space_processor:
+        if cfg.enable_token_space_processor:
+            # A bad value fails here, at argument resolution, not when the processor is built.
+            resolve_gpu_image_decode(cfg.mm_process_config, True)
+            resolve_rgb_conversion(cfg.mm_process_config, "convert")
+        else:
             for key in ("image_decoder", "image_rgb_conversion"):
                 if key in cfg.mm_process_config:
                     raise ValueError(
