@@ -298,6 +298,36 @@ class PrefetchOperation(StorageOperation):
             return self._terminated_flag
 
 
+def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
+    """Reject a host pool that HiCache L3 cannot store under DCP.
+
+    The DCP L3 path stores one physical page per logical page on each rank, so
+    every pool besides the MLA anchor must be either per-slot state or sharded
+    by the same DCP rows as the anchor.
+    """
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+    pool = entry.host_pool
+    if pool is anchor:
+        return
+    if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
+        return  # KDA state: one slot per key
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and dsa_shards_index_k()
+        and pool.dcp_size == anchor.dcp_size
+        and pool.size == anchor.size
+    ):
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    raise NotImplementedError(
+        f"HiCache L3 with DCP does not support the {entry.name} host pool "
+        f"({type(pool).__name__})."
+    )
+
+
 class HiCacheController:
     def __init__(
         self,
@@ -570,7 +600,6 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP does not support buffer_only host memory."
                 )
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
             if storage_backend not in ("file", "mooncake"):
@@ -584,17 +613,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a materialized MLA host pool."
                 )
-            if self.mem_pool_host is not self.storage_host_pool and any(
-                entry.host_pool is not self.storage_host_pool
-                and (
-                    entry.name != PoolName.MAMBA
-                    or not isinstance(entry.host_pool, MambaPoolHost)
-                )
-                for entry in self.mem_pool_host.entries
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
-                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                for entry in self.mem_pool_host.entries:
+                    check_dcp_l3_extra_pool(entry, self.storage_host_pool)
             if self.storage_host_pool.layout not in (
                 "layer_first",
                 "page_first",

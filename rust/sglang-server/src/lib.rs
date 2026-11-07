@@ -311,10 +311,37 @@ impl Server {
         self.rt.begin_drain(force);
     }
 
-    /// Whether a drain has begun and every listener has closed since: the
-    /// scheduler may stop.
+    /// Whether a drain has begun and every listener has closed since, its
+    /// end released if held (see [`Server::hold_drain_end`]): the scheduler
+    /// may stop.
     pub fn drain_complete(&self) -> bool {
         self.rt.drain_complete()
+    }
+
+    /// The drain's progress as bits: 1 a drain has begun, 2 it was begun
+    /// forced (`SGLANG_FORCE_SHUTDOWN`; a failed health probe does not set it),
+    /// 4 this server's listeners have closed, whether or not the drain's end
+    /// is held. Attention-DP ranks share it through the MLP-sync gather.
+    pub fn drain_state(&self) -> u8 {
+        self.rt.drain_state()
+    }
+
+    /// Hold the end of every later graceful drain until
+    /// [`Server::release_drain_end`]: the listeners still close once their
+    /// requests drained, but [`Server::drain_complete`] and the drain-ended
+    /// datagram wait for the release. DP rank 0 holds it until every other
+    /// DP rank's listener has closed, since its drain end stops every rank.
+    /// A forced drain does not wait. Raises if a drain has already begun.
+    pub fn hold_drain_end(&self) -> PyResult<()> {
+        self.rt
+            .hold_drain_end()
+            .map_err(pyo3::exceptions::PyRuntimeError::new_err)
+    }
+
+    /// Release a held drain end; latched until the listeners close. Ignored,
+    /// returning `False`, unless a drain has begun.
+    pub fn release_drain_end(&self) -> bool {
+        self.rt.release_drain_end()
     }
 
     /// Begin the drain from a runtime thread whenever signal `signum` is
