@@ -46,6 +46,8 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -67,12 +69,7 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils import (
-    add_prefix,
-    get_compiler_backend,
-    make_layers,
-    set_weight_attrs,
-)
+from sglang.srt.utils.device import get_compiler_backend
 
 logger = logging.getLogger(__name__)
 

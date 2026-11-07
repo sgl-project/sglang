@@ -20,6 +20,7 @@ from transformers import Lfm2Model
 from transformers.masking_utils import create_sliding_window_causal_mask
 
 from sglang.srt.configs.lfm3_audio import Lfm3AudioConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -28,7 +29,6 @@ from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm3 import Lfm3ForCausalLM
-from sglang.srt.utils import add_prefix
 
 
 class Lfm3AudioDownsampler(nn.Module):

@@ -38,12 +38,12 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     sharded_weight_loader,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, set_weight_attrs
 
 
 def _apply_rope_2d(

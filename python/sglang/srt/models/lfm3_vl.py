@@ -14,6 +14,7 @@ from torch import nn
 
 from sglang.srt.configs.lfm3_vl import Lfm3VlConfig
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     MultiModalityDataPaddingPatternMultimodalTokens,
     general_mm_embed_routine,
@@ -23,7 +24,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.lfm3 import Lfm3ForCausalLM
 from sglang.srt.models.lfm3_vl_vision import Lfm3VlProjector, Lfm3VlVisionEncoder
-from sglang.srt.utils import add_prefix
 
 
 class Lfm3VisionFeaturesMixin:

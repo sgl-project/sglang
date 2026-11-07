@@ -6,10 +6,10 @@
 #     http://www.apache.org/licenses/LICENSE-2.0
 """LFM3 Omni audio/image/video/text inputs using the native SGLang scheduler."""
 
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.lfm3_audio import Lfm3AudioForConditionalGeneration
 from sglang.srt.models.lfm3_vl import Lfm3VisionFeaturesMixin
 from sglang.srt.models.lfm3_vl_vision import Lfm3VlProjector, Lfm3VlVisionEncoder
-from sglang.srt.utils import add_prefix
 
 
 class Lfm3OmniForConditionalGeneration(
