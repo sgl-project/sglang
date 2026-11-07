@@ -2422,6 +2422,7 @@ class FlashInferIndicesUpdaterPrefill:
         sparse_query: Optional[SparseQueryMetadata] = None,
     ):
         bs = len(seq_lens)
+        kv_last_page_len = self.kv_last_page_len[:bs]
         # Unified SWA wrapper-0: gather from the swa canonical directly -- its
         # entries are already swa-side physical ids, so the in-place
         # full->swa translate below must not run on top of them.
@@ -2462,17 +2463,31 @@ class FlashInferIndicesUpdaterPrefill:
                     kv_start_idx=kv_start_idx,
                     kind=read_kind,
                 )
-            query_lens = seq_lens - prefix_lens
             custom_mask = cross_attention_custom_mask
             if sparse_query is not None:
                 if seq_lens_cpu is None:
                     raise ValueError("Sparse queries require host-known KV lengths")
+                # FlashInfer plans on the host; these lengths are already known
+                # without reading back the GPU prefixes used to gather KV.
                 query_lens = torch.tensor(
-                    sparse_query.query_lens, device=seq_lens.device, dtype=torch.int32
+                    sparse_query.query_lens, dtype=torch.int32, device="cpu"
+                )
+                qo_indptr = torch.empty(
+                    bs + 1, dtype=torch.int32, device="cpu", pin_memory=True
+                )
+                qo_indptr[0] = 0
+                torch.cumsum(query_lens, dim=0, out=qo_indptr[1:])
+                kv_indptr = torch.empty_like(qo_indptr, pin_memory=True)
+                kv_indptr[0] = 0
+                torch.cumsum(seq_lens_cpu, dim=0, dtype=torch.int32, out=kv_indptr[1:])
+                kv_last_page_len = torch.ones(
+                    bs, dtype=torch.int32, device="cpu", pin_memory=True
                 )
                 custom_mask = sparse_query.causal_mask(seq_lens_cpu.tolist())
-            qo_indptr[1 : bs + 1] = torch.cumsum(query_lens, dim=0)
-            qo_indptr = qo_indptr[: bs + 1]
+            else:
+                query_lens = seq_lens - prefix_lens
+                qo_indptr[1 : bs + 1] = torch.cumsum(query_lens, dim=0)
+                qo_indptr = qo_indptr[: bs + 1]
         else:
             assert isinstance(spec_info, SpecInput)
             # Every mode reads from its window read's first token on; a mask
@@ -2599,7 +2614,7 @@ class FlashInferIndicesUpdaterPrefill:
             qo_indptr,
             kv_indptr,
             kv_indices,
-            self.kv_last_page_len[:bs],
+            kv_last_page_len,
             self.num_qo_heads,
             self.num_kv_heads,
             self.head_dim,
