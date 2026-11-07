@@ -1,4 +1,5 @@
 import queue
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest.mock import ANY, Mock, patch
@@ -10,6 +11,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVSender
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
+from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mori_stub import mori_stub
@@ -153,6 +155,39 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.assertEqual(sender.poll(), KVPoll.Success)
         trace.trace_req_finish.assert_called_once()
+
+    def test_prefill_abort_release_clears_room_state(self):
+        for abort_fails in (False, True):
+            with self.subTest(abort_fails=abort_fails):
+                sender, manager, _ = make_sender(
+                    MooncakeKVManager, sender_type=MooncakeKVSender
+                )
+                manager.deferred_bootstrap = None
+                manager.req_to_decode_prefix_len = {42: 0}
+                manager.failure_records = {}
+                manager.failure_lock = threading.Lock()
+                manager._staging_ctx = None
+                manager._maybe_ack_drained_abort = Mock()
+                if abort_fails:
+                    sender.abort = Mock(side_effect=RuntimeError("transport down"))
+                req = SimpleNamespace(
+                    rid="r", disagg_kv_sender=sender, pending_bootstrap=True
+                )
+                scheduler = SimpleNamespace(
+                    clear_pending_chunk_send=Mock(),
+                    req_to_metadata_buffer_idx_allocator=None,
+                )
+                with patch(
+                    "sglang.srt.disaggregation.prefill.maybe_release_metadata_buffer"
+                ):
+                    SchedulerDisaggregationPrefillMixin.release_prefill_sender(
+                        scheduler, req, abort_sender=True
+                    )
+                self.assertNotIn(42, manager.request_status)
+                self.assertNotIn(42, manager.transfer_infos)
+                self.assertNotIn(42, manager.req_to_decode_prefix_len)
+                self.assertNotIn(42, manager.failure_records)
+                manager._maybe_ack_drained_abort.assert_called_once_with(42)
 
 
 if __name__ == "__main__":
