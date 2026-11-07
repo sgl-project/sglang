@@ -1228,6 +1228,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set (uses <code>--page-size</code>)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HICACHE_WRITE_BACK_EVICTION_HEADROOM_TOKENS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>With <code>--hicache-write-policy write_back</code>, extra device KV tokens each eviction frees beyond the shortfall, capped by the evictable size. A write_back eviction waits for the in-flight forward; a reserve of a few prefill steps spaces those waits out. A larger value trades device prefix hits (the coldest reserve tokens are demoted to host early) for fewer stalls. Applies to <code>UnifiedRadixCache.evict</code> and to <code>evict_for_alloc</code> without a reclaim predicate, on prefill and decode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HICACHE_NIXL_USE_DIRECT_IO</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable <code>O_DIRECT</code> for any file-based NIXL backend (POSIX, GDS, GDS_MT, 3FS) when opening cache files (bypasses the OS page cache, reducing memory pressure and improving throughput on NVMe). Can also be disabled via <code>{'{"use_direct_io": false}'}</code> in <code>--hicache-storage-backend-extra-config</code>. Falls back to buffered I/O with a warning when <code>O_DIRECT</code> is unavailable on the current OS.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
