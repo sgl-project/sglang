@@ -2858,6 +2858,25 @@ def _run_granian_server(
         server.serve()
 
 
+def _use_lazy_cuda_module_loading_for_http_workers():
+    """Spawn HTTP/tokenizer workers with CUDA_MODULE_LOADING=LAZY.
+
+    A spawned worker re-imports sglang, and platform detection at import time
+    initializes CUDA. Under EAGER that init loads every kernel module (minutes
+    of CPU and GBs of RSS), so the worker misses uvicorn's healthcheck and is
+    killed and respawned forever. Workers launch no kernels. The scheduler
+    processes, where EAGER is meant to apply, are already running and keep the
+    environment they were started with.
+    """
+    if os.environ.get("CUDA_MODULE_LOADING", "").upper() != "EAGER":
+        return
+    logger.info(
+        "CUDA_MODULE_LOADING=EAGER applies to scheduler processes only; "
+        "starting HTTP workers with CUDA_MODULE_LOADING=LAZY."
+    )
+    os.environ["CUDA_MODULE_LOADING"] = "LAZY"
+
+
 def _setup_and_run_http_server(
     server_args: ServerArgs,
     tokenizer_manager,
@@ -3032,6 +3051,8 @@ def _setup_and_run_http_server(
             # Multiple tokenizer and http processes.
             # Child processes re-import the app, so no stop hook here.
             from uvicorn.config import LOGGING_CONFIG
+
+            _use_lazy_cuda_module_loading_for_http_workers()
 
             LOGGING_CONFIG["loggers"]["sglang.srt.entrypoints.http_server"] = {
                 "handlers": ["default"],
