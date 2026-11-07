@@ -48,9 +48,85 @@ class TestDecodeSessionPlacement(CustomTestCase):
         placement = DecodeSessionPlacement(2)
         self.assertEqual(self.select(placement, ("one", None)), 0)
         self.assertEqual(
-            self.select(placement, ("one", None), prompt=70, live=[100, 0]), 0
+            self.select(placement, ("one", None), prompt=70, live=[20, 0]), 0
         )
         self.assertEqual(placement.retained, [100, 0])
+
+    def test_full_sticky_home_spills_to_rank_with_capacity(self):
+        """A long prompt must not wait behind a full home while another DP fits."""
+        placement = DecodeSessionPlacement(2)
+        self.select(placement, ("long-context", None), prompt=59543, forced=0)
+        rank = placement.select(
+            ("long-context", None),
+            60783,
+            0,
+            [0, 1],
+            [254000, 79000],
+            [2, 2],
+            [291840, 291840],
+        )
+        self.assertEqual(rank, 1)
+        self.assertEqual(placement.sessions[("long-context", None)].rank, 1)
+        self.assertEqual(placement.retained, [0, 62023])
+
+    def test_spill_preserves_affinity_without_a_known_fitting_target(self):
+        """Unknown or full targets must not turn pressure relief into churn."""
+        for live, capacity, forced in (
+            ([100000, 0], [291840, 291840], None),
+            ([254000, 270000], [291840, 291840], None),
+            ([254000, 0], [291840, 0], None),
+            ([254000, 0], [291840, 291840], 0),
+        ):
+            with self.subTest(live=live, capacity=capacity, forced=forced):
+                placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
+                self.select(placement, ("one", None), prompt=60783, forced=0)
+                rank = placement.select(
+                    ("one", None),
+                    60783,
+                    0,
+                    [0, 1],
+                    live,
+                    [2, 2],
+                    capacity,
+                    forced,
+                )
+                self.assertEqual(rank, 0)
+                self.assertEqual(placement.retained, [60783, 0])
+
+    def test_spill_accounts_for_all_active_decode_reservations(self):
+        """A raw prompt fit can still exceed KV once decode growth is reserved."""
+        for reserve, expected_rank in ((0, 0), (512, 1)):
+            with self.subTest(reserve=reserve):
+                placement = DecodeSessionPlacement(2, reserved_decode_tokens=reserve)
+                self.select(placement, ("one", None), prompt=60783, forced=0)
+                rank = placement.select(
+                    ("one", None),
+                    60783,
+                    0,
+                    [0, 1],
+                    [229000, 0],
+                    [5, 0],
+                    [291840, 291840],
+                )
+                self.assertEqual(rank, expected_rank)
+
+    def test_spill_rebinds_only_the_matching_cache_salt(self):
+        """Moving a hot session must preserve other namespaces and token counts."""
+        placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
+        for salt in ("a", "b"):
+            self.select(placement, ("same", salt), prompt=60783, output=0, forced=0)
+        placement.select(
+            ("same", "a"),
+            60783,
+            0,
+            [0, 1],
+            [254000, 0],
+            [2, 0],
+            [291840, 291840],
+        )
+        self.assertEqual(placement.sessions[("same", "a")].rank, 1)
+        self.assertEqual(placement.sessions[("same", "b")].rank, 0)
+        self.assertEqual(placement.retained, [60783, 60783])
 
     def test_cache_salt_separates_reservations(self):
         placement = DecodeSessionPlacement(2)
