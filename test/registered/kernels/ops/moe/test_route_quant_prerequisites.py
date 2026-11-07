@@ -73,6 +73,25 @@ class TestRouteQuant(CustomTestCase):
         self.assertIs(moe_topk_sum(x, out), out)
         self.assertTrue(torch.equal(out, x.float().sum(1).to(torch.bfloat16)))
 
+    def test_moe_topk_sum_rows_beyond_grid_y_limit(self):
+        # Attention-DP prefill gathers every rank's tokens into one MoE call, so M can
+        # pass CUDA's 65535 gridDim.y limit (e.g. 4 ranks x 16384 chunked tokens).
+        # 65537 and 131071 leave 1 and 2 padding rows in the y x z grid; the sentinel
+        # rows after `out` (and spare input rows) catch a padding row that writes.
+        pad = 2
+        for m in (65535, 65536, 65537, 131071):
+            x = torch.randn(m + pad, TOPK, 64, device="cuda", dtype=torch.bfloat16)[:m]
+            out_buf = torch.full(
+                (m + pad, 64), -7.0, device="cuda", dtype=torch.bfloat16
+            )
+            out = out_buf[:m]
+            moe_topk_sum(x, out)
+            ref = x[:, 0].float()
+            for j in range(1, TOPK):  # the kernel's fp32 accumulation order
+                ref = ref + x[:, j].float()
+            self.assertTrue(torch.equal(out, ref.to(torch.bfloat16)), m)
+            self.assertTrue(bool((out_buf[m:] == -7.0).all()), m)
+
     def test_moe_route_and_quant(self):
         torch.manual_seed(1)
         scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
