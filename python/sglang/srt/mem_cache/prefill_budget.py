@@ -186,12 +186,19 @@ class PrefillBudget:
         available_tokens = int(self.remaining_total)
         if is_cp_sharded_padded():
             available_tokens = get_cp_sharded_padded_available_tokens(available_tokens)
-        available = min(
-            chunk_limit,
-            available_tokens,
-        )
-        # Single-pool continuation must make progress to release its KV.
-        return available if available > 0 else chunk_limit
+        available = min(chunk_limit, available_tokens)
+        if available > 0:
+            return available
+        # The continuation may borrow the decode headroom counted in total_offset,
+        # never tokens the pool does not hold; one page stays for the chunk's page
+        # rounding, and under that None parks the chunk until a decode retracts.
+        physical = int(self._available_and_evictable())
+        if is_cp_sharded_padded():
+            physical = get_cp_sharded_padded_available_tokens(physical)
+        physical -= self.page_size
+        if physical < self.page_size:
+            return None
+        return min(chunk_limit, physical)
 
     def fit_chunk(
         self,
