@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional, Tuple
+from typing import TYPE_CHECKING, Callable, List, Optional, Tuple
 
 import torch
 
@@ -77,6 +77,10 @@ logger = logging.getLogger(__name__)
 
 
 class BaseTpWorker(ABC):
+    def enable_execution_lookahead(self) -> Optional[Callable[..., None]]:
+        """Enable worker-managed lookahead and return its scheduler fence."""
+        return None
+
     @abstractmethod
     def forward_batch_generation(self, forward_batch: ForwardBatch):
         pass
@@ -278,6 +282,17 @@ class BaseTpWorker(ABC):
 
 class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
+
+    def enable_execution_lookahead(self) -> Optional[Callable[..., None]]:
+        if get_exec().graph.mps_execution_backend != "mlx-compiled":
+            return None
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+
+        runner = self.model_runner.decode_cuda_graph_runner
+        if not isinstance(runner, CompiledMlxRunner):
+            raise RuntimeError("Asynchronous MPS decode requires the compiled runner")
+        runner.enable_lookahead()
+        return runner.drain
 
     def __init__(
         self,

@@ -287,7 +287,6 @@ class ServerArgs:
                     )
             if cfg.mps_execution_backend == "mlx-compiled" and (
                 cfg.disaggregation_mode != "null"
-                or cfg.enable_pdmux
                 or cfg.enable_hierarchical_cache
                 or cfg.enable_lmcache
                 or cfg.enable_session_radix_cache

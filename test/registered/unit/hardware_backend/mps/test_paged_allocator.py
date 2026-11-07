@@ -12,6 +12,28 @@ register_mps_ci(est_time=10, suite="stage-a-unit-test-mps")
 
 @unittest.skipUnless(torch.backends.mps.is_available(), "Requires Torch MPS")
 class TestMPSPagedAllocator(CustomTestCase):
+    def test_kv_buffers_use_separate_mps_allocations(self):
+        """Aliased K/V backing storage makes exported MLX decode copy whole pools."""
+        from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(device="mps"):
+            pool = MHATokenToKVPool(
+                size=64,
+                page_size=16,
+                dtype=torch.bfloat16,
+                head_num=2,
+                head_dim=64,
+                layer_num=2,
+                device="mps",
+                enable_memory_saver=False,
+            )
+            for key, value in zip(pool.k_buffer, pool.v_buffer):
+                self.assertNotEqual(
+                    key.untyped_storage().data_ptr(),
+                    value.untyped_storage().data_ptr(),
+                )
+
     def test_partial_pages_exhaustion_and_reuse(self):
         from sglang.srt.platforms.mps import MpsSRTPlatform
 

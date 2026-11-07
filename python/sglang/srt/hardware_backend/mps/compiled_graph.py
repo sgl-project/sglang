@@ -3,36 +3,21 @@
 from __future__ import annotations
 
 import logging
-import operator
 from collections.abc import Callable, Mapping
 
 import mlx.core as mx
 import torch
 from torch.export.graph_signature import InputKind, OutputKind
 
+from sglang.srt.hardware_backend.mlx.fx_lowering import (
+    MlxFxLoweringRegistry,
+    UnsupportedMlxFxGraphError,
+    build_mlx_fx_plan,
+)
 from sglang.srt.hardware_backend.mps.compiled_region import UnsupportedMlxRegion
 from sglang.srt.utils.tensor_bridge import MlxTensorView
 
 logger = logging.getLogger(__name__)
-
-_SUPPORTED_OPS = frozenset(
-    """
-    aten.view.default aten.reshape.default aten._unsafe_view.default
-    aten.clone.default aten.contiguous.default aten.detach.default aten.alias.default
-    aten._assert_tensor_metadata.default aten.to.dtype aten._to_copy.default
-    aten.linear.default aten.mm.default aten.bmm.default aten.matmul.default
-    aten.addmm.default aten.t.default aten.transpose.int aten.permute.default
-    aten.embedding.default aten.index_select.default aten.index.Tensor
-    aten.select.int aten.slice.Tensor aten.unsqueeze.default aten.squeeze.dim
-    aten.cat.default aten.stack.default aten.split.Tensor aten.split_with_sizes.default
-    aten.expand.default aten.add.Tensor aten.add.Scalar aten.sub.Tensor aten.sub.Scalar
-    aten.mul.Tensor aten.mul.Scalar aten.div.Tensor aten.div.Scalar
-    aten.pow.Tensor_Scalar aten.rsqrt.default aten.sqrt.default aten.cos.default
-    aten.sin.default aten.neg.default aten.sigmoid.default aten.silu.default
-    aten.mean.dim aten.rms_norm.default aten.layer_norm.default
-    aten.native_layer_norm.default aten.gelu.default aten.relu.default aten.tanh.default
-    """.split()
-)
 
 
 def host_alias(tensor: torch.Tensor) -> torch.Tensor:
@@ -60,176 +45,6 @@ def host_alias(tensor: torch.Tensor) -> torch.Tensor:
 
 def _signature(tensor):
     return tensor.shape, tensor.dtype, tensor.stride(), tensor.device
-
-
-def _dtype(dtype):
-    names = {
-        torch.float32: mx.float32,
-        torch.float16: mx.float16,
-        torch.bfloat16: mx.bfloat16,
-        torch.int64: mx.int64,
-        torch.int32: mx.int32,
-        torch.bool: mx.bool_,
-    }
-    return names[dtype]
-
-
-def _lower(target, args, kw):
-    if target is operator.getitem:
-        return args[0][args[1]]
-    name = str(target)
-    x = args[0] if args else None
-    if name in (
-        "aten.view.default",
-        "aten.reshape.default",
-        "aten._unsafe_view.default",
-    ):
-        return mx.reshape(x, args[1])
-    if name in (
-        "aten.clone.default",
-        "aten.contiguous.default",
-        "aten.detach.default",
-        "aten.alias.default",
-    ):
-        return x
-    if name == "aten._assert_tensor_metadata.default":
-        return None
-    if name in ("aten.to.dtype", "aten._to_copy.default"):
-        dtype = kw.get("dtype") if name == "aten._to_copy.default" else args[1]
-        return x if dtype is None else x.astype(_dtype(dtype))
-    if name == "aten.linear.default":
-        out = x @ args[1].T
-        return out if len(args) < 3 or args[2] is None else out + args[2]
-    if name in ("aten.mm.default", "aten.bmm.default", "aten.matmul.default"):
-        return x @ args[1]
-    if name == "aten.addmm.default":
-        return kw.get("beta", 1) * x + kw.get("alpha", 1) * (args[1] @ args[2])
-    if name == "aten.t.default":
-        return x.T
-    if name == "aten.transpose.int":
-        return mx.swapaxes(x, args[1], args[2])
-    if name == "aten.permute.default":
-        return mx.transpose(x, args[1])
-    if name == "aten.embedding.default":
-        return x[args[1].astype(mx.int32)]
-    if name == "aten.index_select.default":
-        return mx.take(x, args[2].astype(mx.int32), axis=args[1])
-    if name == "aten.index.Tensor":
-        return x[
-            tuple(slice(None) if i is None else i.astype(mx.int32) for i in args[1])
-        ]
-    if name == "aten.select.int":
-        index = [slice(None)] * x.ndim
-        index[args[1]] = args[2]
-        return x[tuple(index)]
-    if name == "aten.slice.Tensor":
-        index = [slice(None)] * x.ndim
-        dim = args[1] if len(args) > 1 else 0
-        index[dim] = slice(
-            args[2] if len(args) > 2 else None,
-            min(args[3], x.shape[dim]) if len(args) > 3 else None,
-            args[4] if len(args) > 4 else 1,
-        )
-        return x[tuple(index)]
-    if name == "aten.unsqueeze.default":
-        return mx.expand_dims(x, args[1])
-    if name == "aten.squeeze.dim":
-        return mx.squeeze(x, axis=args[1]) if x.shape[args[1]] == 1 else x
-    if name in ("aten.cat.default", "aten.stack.default"):
-        fn = mx.concatenate if name == "aten.cat.default" else mx.stack
-        return fn(x, axis=args[1] if len(args) > 1 else 0)
-    if name in ("aten.split.Tensor", "aten.split_with_sizes.default"):
-        dim = args[2] if len(args) > 2 else 0
-        if isinstance(args[1], int):
-            points = list(range(args[1], x.shape[dim], args[1]))
-        else:
-            points, total = [], 0
-            for size in args[1][:-1]:
-                total += size
-                points.append(total)
-        return mx.split(x, points, axis=dim)
-    if name == "aten.expand.default":
-        padded = (1,) * (len(args[1]) - x.ndim) + x.shape
-        shape = [old if new == -1 else new for old, new in zip(padded, args[1])]
-        return mx.broadcast_to(x, shape)
-    if name in ("aten.add.Tensor", "aten.add.Scalar"):
-        return x + args[1] * kw.get("alpha", 1)
-    if name in ("aten.sub.Tensor", "aten.sub.Scalar"):
-        return x - args[1] * kw.get("alpha", 1)
-    if name in ("aten.mul.Tensor", "aten.mul.Scalar"):
-        return x * args[1]
-    if name in ("aten.div.Tensor", "aten.div.Scalar"):
-        return x / args[1]
-    if name == "aten.pow.Tensor_Scalar":
-        return mx.power(x, args[1])
-    unary = {
-        "aten.rsqrt.default": mx.rsqrt,
-        "aten.sqrt.default": mx.sqrt,
-        "aten.cos.default": mx.cos,
-        "aten.sin.default": mx.sin,
-        "aten.neg.default": mx.negative,
-        "aten.sigmoid.default": mx.sigmoid,
-    }
-    if name in unary:
-        return unary[name](x)
-    if name == "aten.silu.default":
-        value = x.astype(mx.float32)
-        return (value * mx.sigmoid(value)).astype(x.dtype)
-    if name == "aten.relu.default":
-        return mx.maximum(x, 0)
-    if name == "aten.tanh.default":
-        return mx.tanh(x)
-    if name == "aten.gelu.default":
-        value = x.astype(mx.float32)
-        if kw.get("approximate", "none") == "tanh":
-            out = (
-                0.5
-                * value
-                * (
-                    1
-                    + mx.tanh(
-                        (2 / 3.141592653589793) ** 0.5 * (value + 0.044715 * value**3)
-                    )
-                )
-            )
-        else:
-            out = 0.5 * value * (1 + mx.erf(value / 2**0.5))
-        return out.astype(x.dtype)
-    if name in ("aten.layer_norm.default", "aten.native_layer_norm.default"):
-        axes = tuple(range(x.ndim - len(args[1]), x.ndim))
-        value = x.astype(mx.float32)
-        mean = mx.mean(value, axis=axes, keepdims=True)
-        variance = mx.mean(mx.square(value - mean), axis=axes, keepdims=True)
-        eps = args[4] if len(args) > 4 else 1e-5
-        inverse = mx.rsqrt(variance + eps)
-        weight = args[2] if len(args) > 2 else None
-        bias = args[3] if len(args) > 3 else None
-        if len(axes) == 1:
-            out = mx.fast.layer_norm(x, weight, bias, eps)
-        else:
-            out = (value - mean) * inverse
-            if weight is not None:
-                out = out * weight.astype(mx.float32)
-            if bias is not None:
-                out = out + bias.astype(mx.float32)
-        out = out.astype(x.dtype)
-        if name == "aten.native_layer_norm.default":
-            stats_dtype = args[2].dtype if args[2] is not None else x.dtype
-            return out, mean.astype(stats_dtype), inverse.astype(stats_dtype)
-        return out
-    if name == "aten.mean.dim":
-        return mx.mean(
-            x, axis=tuple(args[1]), keepdims=args[2] if len(args) > 2 else False
-        )
-    if name == "aten.rms_norm.default":
-        if tuple(args[1]) != (x.shape[-1],):
-            raise ValueError("Direct MLX RMSNorm requires a single normalized axis")
-        weight = args[2] if len(args) > 2 else None
-        eps = args[3] if len(args) > 3 else None
-        return mx.fast.rms_norm(
-            x, weight, mx.finfo(x.dtype).eps if eps is None else eps
-        )
-    raise ValueError(f"No direct MLX lowering for {target}")
 
 
 def _rms_pattern(node):
@@ -297,7 +112,6 @@ class CompiledMlxGraph:
     ):
         self.model = model
         self.attention = attention
-        self.custom_lowerings = dict(custom_lowerings or {})
         self.input_signatures = tuple(_signature(x) for x in example_inputs)
         exported = torch.export.export(model, example_inputs, strict=False)
         exported = exported.run_decompositions({})
@@ -309,21 +123,26 @@ class CompiledMlxGraph:
                 "Direct MLX graphs must not mutate inputs or buffers"
             )
         self.nodes = tuple(exported.graph.nodes)
-        for node in self.nodes:
-            if node.op in ("placeholder", "output"):
-                continue
-            if node.op != "call_function":
-                raise UnsupportedMlxRegion(
-                    f"Unsupported direct MLX graph node: {node.op}"
-                )
-            if node.target is operator.getitem or node.target in self.custom_lowerings:
-                continue
-            if str(node.target) == "sglang.mlx_radix_decode.default":
-                if self.attention is not None:
-                    continue
-                raise UnsupportedMlxRegion("Radix attention lowering was not provided")
-            if str(node.target) not in _SUPPORTED_OPS:
-                raise UnsupportedMlxRegion(f"No direct MLX lowering for {node.target}")
+        registry = MlxFxLoweringRegistry.standard_export_decoder()
+        for target, lowering in (custom_lowerings or {}).items():
+            registry.register_function(
+                target,
+                lambda mx, args, kwargs, fn=lowering: fn(*args, **kwargs),
+            )
+        if attention is not None:
+            from sglang.kernels.ops.attention.mlx.radix_attention_export import (
+                radix_decode,
+            )
+
+            registry.register_function(
+                radix_decode._opoverload,
+                lambda mx, args, kwargs: attention(*args, **kwargs),
+            )
+        self.plan = build_mlx_fx_plan(exported.graph_module, registry)
+        try:
+            self.plan.require_fully_supported()
+        except UnsupportedMlxFxGraphError as error:
+            raise UnsupportedMlxRegion(str(error)) from error
         self.bindings = []
         self.attribute_signatures = {}
         self.views = {}
@@ -345,6 +164,7 @@ class CompiledMlxGraph:
                 self.bindings.append((spec.kind, exported.constants[spec.target]))
             else:
                 raise ValueError(f"Unsupported graph input kind: {spec.kind}")
+        self._refresh_binding_owners()
         self.norms = {
             node: pattern for node in self.nodes if (pattern := _rms_pattern(node))
         }
@@ -369,7 +189,7 @@ class CompiledMlxGraph:
         def forward(*flat):
             values = {}
             position = layer = 0
-            for node in self.nodes:
+            for node, node_plan in zip(self.nodes, self.plan.nodes):
                 if node.op == "placeholder":
                     values[node] = flat[position]
                     position += 1
@@ -400,30 +220,45 @@ class CompiledMlxGraph:
                     tails = (flat[-2][layer], flat[-1][layer]) if tail else None
                     values[node] = self.attention(*args, **kw, tails=tails)
                     layer += 1
-                elif node.target in self.custom_lowerings:
-                    values[node] = self.custom_lowerings[node.target](*args, **kw)
                 else:
-                    values[node] = _lower(node.target, args, kw)
+                    values[node] = node_plan.implementation(mx, args, kw)
             raise ValueError("Direct MLX graph has no output")
 
         return forward
+
+    def _refresh_binding_owners(self):
+        modules = dict(self.model.named_modules(remove_duplicate=False))
+        self._module_links = tuple(
+            (modules[path.rpartition(".")[0]], path.rpartition(".")[2], module)
+            for path, module in modules.items()
+            if path
+        )
+        self._binding_owners = {
+            target: (modules[target.rpartition(".")[0]], target.rpartition(".")[2])
+            for kind, target in self.bindings
+            if kind in (InputKind.PARAMETER, InputKind.BUFFER)
+        }
 
     def bind(self, inputs):
         if self.closed:
             raise RuntimeError("Direct MLX graph is closed")
         if tuple(_signature(x) for x in inputs) != self.input_signatures:
             raise ValueError("Direct MLX input shape, dtype, stride or device changed")
-        # Export may bind an alias path rather than the first name of a tied tensor.
-        parameters = dict(self.model.named_parameters(remove_duplicate=False))
-        buffers = dict(self.model.named_buffers(remove_duplicate=False))
+        if any(
+            parent._modules[name] is not child
+            for parent, name, child in self._module_links
+        ):
+            self._refresh_binding_owners()
         arrays = []
         for index, (kind, target) in enumerate(self.bindings):
             if kind == InputKind.USER_INPUT:
                 tensor = inputs[target]
             elif kind == InputKind.PARAMETER:
-                tensor = parameters[target]
+                owner, name = self._binding_owners[target]
+                tensor = owner._parameters[name]
             elif kind == InputKind.BUFFER:
-                tensor = buffers[target]
+                owner, name = self._binding_owners[target]
+                tensor = owner._buffers[name]
             else:
                 tensor = target
             if (

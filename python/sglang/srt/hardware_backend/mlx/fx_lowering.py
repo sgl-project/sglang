@@ -326,7 +326,15 @@ def _lower_assert_metadata(mx, args, kwargs):
     return None
 
 
-@mlx_lowering("alias", aten=(torch.ops.aten.alias.default,))
+@mlx_lowering(
+    "alias",
+    aten=(
+        torch.ops.aten.alias.default,
+        torch.ops.aten.clone.default,
+        torch.ops.aten.contiguous.default,
+        torch.ops.aten.detach.default,
+    ),
+)
 def _lower_alias(mx, args, kwargs):
     return args[0]
 
@@ -369,8 +377,6 @@ def _admit_rms_norm(args, kwargs) -> Optional[str]:
             "MLX rms_norm only normalizes the last axis, found "
             f"normalized_shape={tuple(normalized_shape)}"
         )
-    if _arg(args, kwargs, 2, "weight") is None:
-        return "MLX RMSNorm requires an explicit weight"
     return None
 
 
@@ -389,8 +395,6 @@ def _lower_rms_norm(mx, args, kwargs):
             "MLX rms_norm only normalizes the last axis, found "
             f"normalized_shape={tuple(normalized_shape)}"
         )
-    if weight is None:
-        raise UnsupportedMlxFxGraphError("MLX RMSNorm requires an explicit weight")
     if epsilon is None:
         epsilon = mx.finfo(value.dtype).eps
     return mx.fast.rms_norm(value, weight, float(epsilon))
@@ -398,11 +402,8 @@ def _lower_rms_norm(mx, args, kwargs):
 
 def _admit_layer_norm(args, kwargs) -> Optional[str]:
     normalized_shape = _arg(args, kwargs, 1, "normalized_shape")
-    if isinstance(normalized_shape, Sequence) and len(normalized_shape) != 1:
-        return (
-            "MLX layer_norm only normalizes the last axis, found "
-            f"normalized_shape={tuple(normalized_shape)}"
-        )
+    if isinstance(normalized_shape, Sequence) and not normalized_shape:
+        return "MLX layer_norm requires a nonempty normalized shape"
     return None
 
 
@@ -414,12 +415,25 @@ def _lower_layer_norm(mx, args, kwargs):
     weight = _arg(args, kwargs, 2, "weight")
     bias = _arg(args, kwargs, 3, "bias")
     epsilon = _arg(args, kwargs, 4, "eps", 1e-5)
-    if len(normalized_shape) != 1 or normalized_shape[0] != value.shape[-1]:
+    if tuple(normalized_shape) != value.shape[-len(normalized_shape) :]:
         raise UnsupportedMlxFxGraphError(
-            "MLX layer_norm only normalizes the last axis, found "
+            "MLX layer_norm normalized_shape must match the trailing axes, found "
             f"normalized_shape={tuple(normalized_shape)}"
         )
-    return mx.fast.layer_norm(value, weight, bias, float(epsilon))
+    if len(normalized_shape) == 1:
+        return mx.fast.layer_norm(value, weight, bias, float(epsilon))
+    axes = tuple(range(value.ndim - len(normalized_shape), value.ndim))
+    fp32 = value.astype(mx.float32)
+    mean = mx.mean(fp32, axis=axes, keepdims=True)
+    inverse = mx.rsqrt(
+        mx.mean(mx.square(fp32 - mean), axis=axes, keepdims=True) + epsilon
+    )
+    output = (fp32 - mean) * inverse
+    if weight is not None:
+        output = output * weight.astype(mx.float32)
+    if bias is not None:
+        output = output + bias.astype(mx.float32)
+    return output.astype(value.dtype)
 
 
 @mlx_lowering(
@@ -437,6 +451,18 @@ def _lower_linear(mx, args, kwargs):
 @mlx_lowering("matmul", aten=(torch.ops.aten.matmul.default, torch.ops.aten.mm.default))
 def _lower_matmul(mx, args, kwargs):
     return args[0] @ args[1]
+
+
+@mlx_lowering("bmm", aten=(torch.ops.aten.bmm.default,))
+def _lower_bmm(mx, args, kwargs):
+    return args[0] @ args[1]
+
+
+@mlx_lowering("addmm", aten=(torch.ops.aten.addmm.default,))
+def _lower_addmm(mx, args, kwargs):
+    alpha, beta = kwargs.get("alpha", 1), kwargs.get("beta", 1)
+    result = (args[1] @ args[2]) * alpha
+    return result if beta == 0 else result + args[0] * beta
 
 
 def _admit_dtype_kwarg(args, kwargs) -> Optional[str]:
@@ -521,7 +547,8 @@ def _lower_sdpa(mx, args, kwargs):
 
 @mlx_lowering("silu", aten=(torch.ops.aten.silu.default,), functions=(F.silu,))
 def _lower_silu(mx, args, kwargs):
-    return mx.sigmoid(args[0]) * args[0]
+    value = args[0].astype(mx.float32)
+    return (mx.sigmoid(value) * value).astype(args[0].dtype)
 
 
 @mlx_lowering("sigmoid", aten=(torch.ops.aten.sigmoid.default,))
@@ -543,24 +570,44 @@ def _admit_gelu(args, kwargs) -> Optional[str]:
 
 @mlx_lowering("gelu", aten=(torch.ops.aten.gelu.default,), admit=_admit_gelu)
 def _lower_gelu(mx, args, kwargs):
-    value = args[0]
+    value = args[0].astype(mx.float32)
     approximate = kwargs.get("approximate", "none")
     if approximate == "tanh":
         return (
             0.5
             * value
             * (1 + mx.tanh(sqrt(2 / math.pi) * (value + 0.044715 * value**3)))
-        )
+        ).astype(args[0].dtype)
     if approximate != "none":
         raise UnsupportedMlxFxGraphError(
             f"unsupported GELU approximation: {approximate}"
         )
-    return value * 0.5 * (1 + mx.erf(value / sqrt(2)))
+    return (value * 0.5 * (1 + mx.erf(value / sqrt(2)))).astype(args[0].dtype)
 
 
 @mlx_lowering("tanh", aten=(torch.ops.aten.tanh.default,))
 def _lower_tanh(mx, args, kwargs):
     return mx.tanh(args[0])
+
+
+@mlx_lowering("sqrt", aten=(torch.ops.aten.sqrt.default,))
+def _lower_sqrt(mx, args, kwargs):
+    return mx.sqrt(args[0])
+
+
+@mlx_lowering("cos", aten=(torch.ops.aten.cos.default,))
+def _lower_cos(mx, args, kwargs):
+    return mx.cos(args[0])
+
+
+@mlx_lowering("sin", aten=(torch.ops.aten.sin.default,))
+def _lower_sin(mx, args, kwargs):
+    return mx.sin(args[0])
+
+
+@mlx_lowering("negative", aten=(torch.ops.aten.neg.default,))
+def _lower_negative(mx, args, kwargs):
+    return mx.negative(args[0])
 
 
 @mlx_lowering("stack", aten=(torch.ops.aten.stack.default,))
@@ -576,6 +623,7 @@ def _lower_getitem(mx, args, kwargs):
 @mlx_lowering(
     "add", aten=(torch.ops.aten.add.Tensor,), functions=(operator.add, torch.add)
 )
+@mlx_lowering("add_scalar", aten=(torch.ops.aten.add.Scalar,))
 def _lower_add(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:
@@ -586,6 +634,7 @@ def _lower_add(mx, args, kwargs):
 @mlx_lowering(
     "multiply", aten=(torch.ops.aten.mul.Tensor,), functions=(operator.mul, torch.mul)
 )
+@mlx_lowering("multiply_scalar", aten=(torch.ops.aten.mul.Scalar,))
 def _lower_multiply(mx, args, kwargs):
     return args[0] * args[1]
 
@@ -593,11 +642,18 @@ def _lower_multiply(mx, args, kwargs):
 @mlx_lowering(
     "subtract", aten=(torch.ops.aten.sub.Tensor,), functions=(operator.sub, torch.sub)
 )
+@mlx_lowering("subtract_scalar", aten=(torch.ops.aten.sub.Scalar,))
 def _lower_subtract(mx, args, kwargs):
     alpha = _arg(args, kwargs, 2, "alpha", 1)
     if alpha == 1:
         return args[0] - args[1]
     return args[0] - args[1] * alpha
+
+
+@mlx_lowering("divide", aten=(torch.ops.aten.div.Tensor,))
+@mlx_lowering("divide_scalar", aten=(torch.ops.aten.div.Scalar,))
+def _lower_divide(mx, args, kwargs):
+    return args[0] / args[1]
 
 
 @mlx_lowering("chunk", aten=(torch.ops.aten.chunk.default,), methods=("chunk",))
@@ -633,7 +689,11 @@ def _lower_split_with_sizes(mx, args, kwargs):
 
 @mlx_lowering(
     "reshape",
-    aten=(torch.ops.aten.reshape.default, torch.ops.aten.view.default),
+    aten=(
+        torch.ops.aten.reshape.default,
+        torch.ops.aten.view.default,
+        torch.ops.aten._unsafe_view.default,
+    ),
     methods=("reshape",),
     aliases=("view",),
 )
@@ -661,7 +721,9 @@ def _lower_index_select(mx, args, kwargs):
     return mx.take(args[0], args[2], axis=args[1])
 
 
-@mlx_lowering("numpy_transpose", aten=(torch.ops.aten.numpy_T.default,))
+@mlx_lowering(
+    "numpy_transpose", aten=(torch.ops.aten.numpy_T.default, torch.ops.aten.t.default)
+)
 def _lower_numpy_transpose(mx, args, kwargs):
     return mx.transpose(args[0], axes=tuple(reversed(range(args[0].ndim))))
 
@@ -686,6 +748,67 @@ def _admit_to_dtype(args, kwargs) -> Optional[str]:
 @mlx_lowering("to_dtype", aten=(torch.ops.aten.to.dtype,), admit=_admit_to_dtype)
 def _lower_to_dtype(mx, args, kwargs):
     return args[0].astype(_mlx_dtype(args[1], mx))
+
+
+@mlx_lowering(
+    "to_copy", aten=(torch.ops.aten._to_copy.default,), admit=_admit_dtype_kwarg
+)
+def _lower_to_copy(mx, args, kwargs):
+    dtype = kwargs.get("dtype")
+    return args[0] if dtype is None else args[0].astype(_mlx_dtype(dtype, mx))
+
+
+@mlx_lowering("select", aten=(torch.ops.aten.select.int,))
+def _lower_select(mx, args, kwargs):
+    value, dim, index = args[:3]
+    indices = [slice(None)] * value.ndim
+    indices[dim] = index
+    return value[tuple(indices)]
+
+
+@mlx_lowering("index", aten=(torch.ops.aten.index.Tensor,))
+def _lower_index(mx, args, kwargs):
+    return args[0][tuple(slice(None) if index is None else index for index in args[1])]
+
+
+@mlx_lowering("expand", aten=(torch.ops.aten.expand.default,))
+def _lower_expand(mx, args, kwargs):
+    value, size = args[:2]
+    padded = (1,) * (len(size) - value.ndim) + value.shape
+    shape = tuple(old if new == -1 else new for old, new in zip(padded, size))
+    return mx.broadcast_to(value, shape)
+
+
+@mlx_lowering("squeeze", aten=(torch.ops.aten.squeeze.dim,))
+def _lower_squeeze(mx, args, kwargs):
+    value, dim = args[:2]
+    return mx.squeeze(value, axis=dim) if value.shape[dim] == 1 else value
+
+
+@mlx_lowering("permute", aten=(torch.ops.aten.permute.default,))
+def _lower_permute(mx, args, kwargs):
+    return mx.transpose(args[0], args[1])
+
+
+@mlx_lowering(
+    "native_layer_norm",
+    aten=(torch.ops.aten.native_layer_norm.default,),
+    admit=_admit_layer_norm,
+)
+def _lower_native_layer_norm(mx, args, kwargs):
+    value = args[0]
+    fp32 = value.astype(mx.float32)
+    axes = tuple(range(value.ndim - len(args[1]), value.ndim))
+    mean = mx.mean(fp32, axis=axes, keepdims=True)
+    variance = mx.mean(mx.square(fp32 - mean), axis=axes, keepdims=True)
+    inverse = mx.rsqrt(variance + _arg(args, kwargs, 4, "eps", 1e-5))
+    weight = _arg(args, kwargs, 2, "weight")
+    dtype = weight.dtype if weight is not None else value.dtype
+    return (
+        _lower_layer_norm(mx, args, kwargs),
+        mean.astype(dtype),
+        inverse.astype(dtype),
+    )
 
 
 @mlx_lowering("unsqueeze", aten=(torch.ops.aten.unsqueeze.default,))
@@ -724,7 +847,7 @@ def _lower_slice(mx, args, kwargs):
     return value[tuple(slices)]
 
 
-@mlx_lowering("transpose", methods=("transpose",))
+@mlx_lowering("transpose", aten=(torch.ops.aten.transpose.int,), methods=("transpose",))
 def _lower_transpose(mx, args, kwargs):
     return mx.swapaxes(args[0], args[1], args[2])
 

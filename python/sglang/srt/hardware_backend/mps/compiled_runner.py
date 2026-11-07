@@ -31,14 +31,14 @@ from sglang.srt.hardware_backend.mps.compiled_region import (
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import (
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import (
     CaptureHiddenMode,
-    ForwardBatch,
     ForwardMode,
 )
-from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_schedule
 from sglang.srt.utils.tensor_bridge import MlxTensorView, _export_evaluated_mlx
 
 logger = logging.getLogger(__name__)
@@ -208,6 +208,7 @@ class CompiledMlxRunner(BaseRunner):
         self._unsupported_batches = {}
         self._pool_identity = None
         self._model_structure = None
+        self._weight_sources = ()
         self._fallback_reasons = set()
         self.execution_count = 0
         self.compile_seconds = 0.0
@@ -259,7 +260,7 @@ class CompiledMlxRunner(BaseRunner):
             logger.info("%s using eager MPS: %s", type(self).__name__, reason)
             self._fallback_reasons.add(reason)
         if reason is not None:
-            self.drain(discard=True)
+            self.drain(discard=True, reason="ineligible")
         return reason is None
 
     def _refresh_region(self):
@@ -270,12 +271,22 @@ class CompiledMlxRunner(BaseRunner):
         )
         if structure == self._model_structure:
             return
-        self.drain(discard=True)
+        self.drain(discard=True, reason="model")
         for graph in self._graphs.values():
             graph.close()
         self._graphs.clear()
         self._unsupported_batches.clear()
         self._model_structure = structure
+        self._weight_sources = tuple(
+            (module, name, is_parameter)
+            for module in model.modules()
+            for is_parameter, tensors in (
+                (True, module._parameters),
+                (False, module._buffers),
+            )
+            for name, tensor in tensors.items()
+            if tensor is not None
+        )
         try:
             self._region = discover_decode_region(model)
         except UnsupportedMlxRegion as error:
@@ -344,7 +355,7 @@ class CompiledMlxRunner(BaseRunner):
             for tensor in (mr.req_to_token_pool.req_to_token, *pools)
         )
         if self._pool_identity != identity:
-            self.drain(discard=True)
+            self.drain(discard=True, reason="pool")
             for graph in self._graphs.values():
                 graph.close()
             self._graphs.clear()
@@ -386,8 +397,11 @@ class CompiledMlxRunner(BaseRunner):
         self.prefetch_count = 0
         self.prefetch_hits = 0
         self.prefetch_discards = 0
+        self.prefetch_discard_reasons = {}
 
     def enable_lookahead(self):
+        if not get_schedule().disable_overlap_schedule:
+            raise RuntimeError("Compiled MLX lookahead requires the normal scheduler")
         self._async = True
 
     def _make_wrapper(self):
@@ -406,19 +420,27 @@ class CompiledMlxRunner(BaseRunner):
             attention=mlx_radix_decode,
         )
 
-    def drain(self, *, discard=False):
+    def drain(self, *, discard=False, reason="explicit"):
         """Fence before scheduler ingress, pool reuse, weight updates or shutdown."""
         if self._pending is not None:
             mx.eval(*self._pending.outputs)
             if discard:
-                self.prefetch_discards += 1
+                self._record_discard(reason)
                 self._pending = None
 
+    def _record_discard(self, reason):
+        self.prefetch_discards += 1
+        self.prefetch_discard_reasons[reason] = (
+            self.prefetch_discard_reasons.get(reason, 0) + 1
+        )
+
     def _weights(self):
-        model = self.model_runner.model
         return tuple(
             (tensor.data_ptr(), None if tensor.is_inference() else tensor._version)
-            for tensor in (*model.parameters(), *model.buffers())
+            for module, name, is_parameter in self._weight_sources
+            for tensor in (
+                module._parameters[name] if is_parameter else module._buffers[name],
+            )
         )
 
     def _metadata(self, batch):
@@ -437,28 +459,31 @@ class CompiledMlxRunner(BaseRunner):
         if pending is None:
             return None
         table = host_alias(self.model_runner.req_to_token_pool.req_to_token)
-        matches = (
-            pending.graph is graph
-            and metadata
-            == (
-                pending.requests,
-                pending.lengths,
-                pending.positions,
-                pending.generations,
+        reason = None
+        if pending.graph is not graph:
+            reason = "graph"
+        elif metadata != (
+            pending.requests,
+            pending.lengths,
+            pending.positions,
+            pending.generations,
+        ):
+            reason = "metadata"
+        elif weights != pending.weights:
+            reason = "weights"
+        elif host_alias(batch.input_ids).tolist() != pending.tokens.tolist():
+            reason = "tokens"
+        elif not all(
+            table[request, length - 2].item() == location
+            for request, length, location in zip(
+                pending.requests, pending.lengths, pending.locations
             )
-            and weights == pending.weights
-            and host_alias(batch.input_ids).tolist() == pending.tokens.tolist()
-            and all(
-                table[request, length - 2].item() == location
-                for request, length, location in zip(
-                    pending.requests, pending.lengths, pending.locations
-                )
-            )
-        )
-        if matches:
+        ):
+            reason = "cache_mapping"
+        if reason is None:
             self.prefetch_hits += 1
             return pending.outputs
-        self.prefetch_discards += 1
+        self._record_discard(reason)
         return None
 
     def _prefetch(self, *, graph, arrays, outputs, batch, metadata, weights):
@@ -499,6 +524,7 @@ class CompiledMlxRunner(BaseRunner):
         self.drain()
         if not self.can_run_graph(forward_batch):
             raise ValueError("Ineligible batch passed to compiled MLX")
+        # A lookahead hit does not validate the new write slot or its table entry.
         self._validate_metadata(forward_batch)
         graph = self._graph(forward_batch)
         arrays = graph.bind(_batch_inputs(forward_batch))
@@ -528,11 +554,12 @@ class CompiledMlxRunner(BaseRunner):
         self.execution_count += 1
         if self.execution_count == 1 or self.execution_count % 100 == 0:
             logger.info(
-                "Compiled MLX: executions=%d, enqueued=%d, hits=%d, discarded=%d",
+                "Compiled MLX: executions=%d, enqueued=%d, hits=%d, discarded=%d, discard_reasons=%s",
                 self.execution_count,
                 self.prefetch_count,
                 self.prefetch_hits,
                 self.prefetch_discards,
+                self.prefetch_discard_reasons,
             )
         # The Torch sampler may mutate logits; it must not overwrite a source
         # still being consumed by the dependent MLX argmax/forward.

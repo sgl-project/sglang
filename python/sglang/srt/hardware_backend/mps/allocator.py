@@ -6,7 +6,7 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
     alloc_extend_naive,
 )
-from sglang.srt.utils import get_num_new_pages
+from sglang.srt.mem_cache.utils import get_num_new_pages
 
 
 class MPSPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):

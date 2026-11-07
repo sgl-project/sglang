@@ -107,14 +107,12 @@ class TestCompiledGraph(CustomTestCase):
         from sglang.srt.hardware_backend.mps.compiled_runner import _DecodeModule
         from sglang.srt.layers.logits_processor import LogitsProcessor
         from sglang.srt.layers.radix_attention import RadixAttention
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.runtime_context import get_context
         from sglang.srt.utils.tensor_bridge import mlx_to_torch
 
@@ -313,6 +311,22 @@ class TestCompiledGraph(CustomTestCase):
                 for actual, expected in zip(outputs, model(*inputs)):
                     torch.testing.assert_close(mlx_to_torch(actual), expected)
 
+    def test_shared_sdpa_lowering_extends_compiled_regions(self):
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Model(torch.nn.Module):
+            def forward(self, q, k, v):
+                return torch.nn.functional.scaled_dot_product_attention(q, k, v)
+
+        model = Model().eval()
+        inputs = tuple(torch.randn(2, 4, 8, 32, device="mps") for _ in range(3))
+        graph = CompiledMlxGraph(model=model, example_inputs=inputs)
+        self.addCleanup(graph.close)
+        torch.mps.synchronize()
+        actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
+        torch.testing.assert_close(actual, model(*inputs))
+
     def test_custom_metal_lowering_survives_export_and_dependent_compile(self):
         import mlx.core as mx
 
@@ -351,7 +365,7 @@ class TestCompiledGraph(CustomTestCase):
 
         model = Model().eval()
         inputs = (torch.randn(2, 32, device="mps"),)
-        with self.assertRaisesRegex(ValueError, "No direct MLX lowering"):
+        with self.assertRaisesRegex(ValueError, "no MLX lowering"):
             CompiledMlxGraph(model=model, example_inputs=inputs)
         torch.mps.synchronize()
         graph = CompiledMlxGraph(
@@ -481,10 +495,8 @@ class TestCompiledGraph(CustomTestCase):
             CompiledMlxRunner,
             _batch_inputs,
         )
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         class Decoder(torch.nn.Module):
             def __init__(self):
@@ -536,6 +548,7 @@ class TestCompiledGraph(CustomTestCase):
             (name, id(module))
             for name, module in model.named_modules(remove_duplicate=False)
         )
+        runner._weight_sources = ((model.embedding, "weight", True),)
         model.static_reads = {}
         runner._fallback_reasons = set()
         runner._layers = ()
@@ -543,6 +556,7 @@ class TestCompiledGraph(CustomTestCase):
         runner._pending = None
         runner.execution_count = runner.prefetch_count = 0
         runner.prefetch_hits = runner.prefetch_discards = 0
+        runner.prefetch_discard_reasons = {}
         events = []
         launch, evaluate = graph.launch, mx.eval
 
@@ -557,7 +571,14 @@ class TestCompiledGraph(CustomTestCase):
             weights=runner._weights(),
         )
         self.assertIsNone(runner._pending)
-        runner.enable_lookahead()
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(disable_overlap_schedule=False):
+            with self.assertRaisesRegex(RuntimeError, "normal scheduler"):
+                runner.enable_lookahead()
+            self.assertFalse(runner._async)
+        with get_context().override_server_args(disable_overlap_schedule=True):
+            runner.enable_lookahead()
 
         def record_launch(*args, **kwargs):
             events.append("launch")
@@ -633,6 +654,10 @@ class TestCompiledGraph(CustomTestCase):
                 )
                 batch.input_ids = torch.tensor(pending.tokens.tolist(), device="mps")
         self.assertEqual(runner.prefetch_discards, 5)
+        self.assertEqual(
+            runner.prefetch_discard_reasons,
+            {"metadata": 2, "weights": 1, "tokens": 1, "cache_mapping": 1},
+        )
         runner._pending = pending
         batch.forward_mode = ForwardMode.EXTEND
         self.assertFalse(runner.can_run_graph(batch))
