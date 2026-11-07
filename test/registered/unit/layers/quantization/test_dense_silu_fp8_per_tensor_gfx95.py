@@ -1,8 +1,12 @@
 """Dense SiLU-and-mul + per-tensor FP8 on gfx95: real MLPs, dispatch and graph replay."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
+
+# Set before importing SGLang: the unfused reference quantizer is chosen at import.
+os.environ.setdefault("SGLANG_USE_AITER", "1")
 
 import torch
 
@@ -88,6 +92,17 @@ class TestDenseSiluAndMulQuantPerTensor(CustomTestCase):
         out = mlp.activation_quant.forward_decode(gate_up, mlp.act_fn, mlp.down_proj)
         self.assertIsInstance(out, torch.Tensor)
         self.assertEqual(out.dtype, torch.bfloat16)
+
+    @torch.inference_mode()
+    def test_aiter_silu_and_mul_keeps_the_separate_activation(self):
+        """Decode keeps aiter's SiluAndMul, whose rounding the fusion does not copy."""
+        with envs.SGLANG_OPT_USE_AITER_SILU_MUL.override(True):
+            mlp = self._make_mlp("qwen")
+        x = torch.randn(1, 512, device="cuda", dtype=torch.bfloat16)
+        gate_up, _ = mlp.gate_up_proj(x)
+        out = mlp.activation_quant.forward_decode(gate_up, mlp.act_fn, mlp.down_proj)
+        self.assertIsInstance(out, torch.Tensor)
+        torch.testing.assert_close(out, mlp.act_fn(gate_up), rtol=0, atol=0)
 
     @torch.inference_mode()
     def test_non_decode_bypass(self):

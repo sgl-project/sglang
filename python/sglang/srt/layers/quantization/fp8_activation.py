@@ -120,6 +120,8 @@ class DenseSiluAndMulQuant:
             or down_proj is not self.down_proj
             or down_proj.quant_method is not self.quant_method
             or type(act_fn) is not SiluAndMul
+            or (act_fn._forward_method or act_fn._resolve_forward_method())
+            != act_fn.forward_cuda
             or act_fn.is_torch_compile
             or get_fused_op_backend() is not None
             or deterministic.enable_deterministic_inference
