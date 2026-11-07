@@ -1,4 +1,4 @@
-"""Interleave BCG adapter for GLM-5.3 Flash text prefills.
+"""Interleave BCG adapter for hybrid DSA/KDA text prefills.
 
 Keep full-sequence KPool positions separate from the local DSA positions.
 Graph row capacity is fixed while live token counts and prefix state can change.
@@ -77,20 +77,31 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
-    # GLM-5.3 Flash (KDA hybrid) and the dense-DSA GLM MoE family
-    # (GLM-5.2 / GLM-5.3 and their fine-tunes) share the interleave BCG path.
+    # GLM-5.3 Flash and Kimi-K3.1 (KDA hybrids) and the dense-DSA GLM MoE
+    # family (GLM-5.2 / GLM-5.3 and their fine-tunes) share the interleave BCG
+    # path.
     _SUPPORTED_ARCHITECTURES = (
         "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
+        "KimiK31ForConditionalGeneration",
     )
 
     @staticmethod
     def supports(server_args):
         cfg = resolving_view(server_args)
+        view = resolved_view(server_args)
         architectures = model_config_of(server_args).hf_config.architectures
+        if "KimiK31ForConditionalGeneration" in architectures and view.ep_size > 1:
+            # MegaMoE EP over the CP group: each rank owns its CP shard's rows.
+            if not (
+                view.ep_size == cfg.tp_size == view.attn_cp_size
+                and view.moe_a2a_backend == "megamoe"
+                and cfg.moe_dp_size == 1
+            ):
+                return False
         return (
             cfg.dp_size == 1
-            and resolved_view(server_args).attn_cp_size > 1
+            and view.attn_cp_size > 1
             and any(
                 arch in architectures
                 for arch in InterleaveCPBCGInput._SUPPORTED_ARCHITECTURES
