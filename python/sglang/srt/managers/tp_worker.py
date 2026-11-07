@@ -24,6 +24,7 @@ import torch
 from sglang.srt.beam_search.logits_capture import capture_pre_sample_logits
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.load_config import _DEFAULT_LOAD_GROUP, LoadGroup
+from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import (
     get_processor,
@@ -597,6 +598,18 @@ class TpModelWorker(BaseTpWorker):
         batch: Optional[ScheduleBatch] = None,
     ) -> GenerationBatchResult:
         algo_states = None
+        if self.dllm_algorithm.fdfo and type(self.dllm_algorithm) is LowConfidence:
+            prefill_tokens = self.dllm_algorithm.prefill_tokens(batch)
+            if prefill_tokens is not None:
+                out = self.model_runner.forward(forward_batch, pp_proxy_tensors=None)
+                return GenerationBatchResult(
+                    logits_output=out.logits_output,
+                    next_token_ids=prefill_tokens,
+                    accept_length_per_req_cpu=[self.dllm_algorithm.block_size]
+                    * len(prefill_tokens),
+                    dllm_algo_state=[None] * len(prefill_tokens),
+                    can_run_cuda_graph=out.can_run_graph,
+                )
         if self.dllm_algorithm.fdfo and batch is not None:
             algo_states = [req.dllm_algo_state for req in batch.reqs]
 
