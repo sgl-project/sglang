@@ -276,12 +276,20 @@ class TestMlxHybridInitializeAllocation(CustomTestCase):
         )
         with _arch(hybrid=True), _published(stub):
             stub.initialize()
-        pool = stub.req_to_token_pool
-        component = MlxAuxiliaryStateComponent(
-            SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
-        )
+
+            pool = stub.req_to_token_pool
+
+            component = MlxAuxiliaryStateComponent(
+                SimpleNamespace(req_to_token_pool=pool),
+                SimpleNamespace(
+                    enable_mamba_extra_buffer=False,
+                    page_size=1,
+                ),
+                tree_slots_of(
+                    (ComponentType.MAMBA,),
+                    checkpoint_interval=64,
+                )[0],
+            )
         aux_capacity = pool.auxiliary_state_pool.available_size()
         for _ in range(3 * aux_capacity):
             req = _fake_req()
