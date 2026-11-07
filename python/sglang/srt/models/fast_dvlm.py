@@ -38,7 +38,7 @@ class Fast_dVLMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
 
     def set_block_attention_causal(self, causal: bool) -> None:
         # Backends read attn_type at forward time, so this only holds for
-        # eager forwards; HierarchyBlock disables DLLM_EXTEND CUDA graphs.
+        # eager forwards; HierarchyBlock disables CUDA graphs.
         attn_type = AttentionType.DECODER if causal else AttentionType.ENCODER_ONLY
         for layer in self._block_attention_layers:
             layer.attn_type = attn_type
