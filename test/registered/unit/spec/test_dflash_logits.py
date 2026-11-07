@@ -97,14 +97,15 @@ class _FakeQuantMethod:
     call contract (packed dtype, no bias). The padded tail comes out as
     dominant garbage so a masking regression surfaces as wrong candidates."""
 
-    def __init__(self, dense_weight, num_padded):
+    def __init__(self, dense_weight, num_padded, packed_attr="weight"):
         self.dense_weight = dense_weight
         self.num_padded = num_padded
+        self.packed_attr = packed_attr
         self.called = False
 
     def apply(self, layer, x, bias):
         self.called = True
-        assert layer.weight.dtype == torch.int8
+        assert getattr(layer, self.packed_attr).dtype in (torch.int8, torch.int32)
         assert bias is None
         logits = torch.matmul(x, self.dense_weight.T)
         pad = logits.new_full((logits.shape[0], self.num_padded), 100.0)
@@ -153,6 +154,42 @@ def test_selector_projects_a_quantized_target_lm_head_through_its_quant_method(
     assert quant_method.called
     torch.testing.assert_close(candidate_ids, expected_ids)
     torch.testing.assert_close(unary_logits, expected_logits)
+
+
+def test_selector_projects_a_pack_quantized_target_lm_head(monkeypatch):
+    """A compressed-tensors WNA16 head keeps its codes in `weight_packed` and
+    has no `weight`; the selector must still project through its quant method
+    instead of refusing the head."""
+    torch.manual_seed(0)
+    hidden = torch.randn(2, 4)
+    dense_weight = torch.randn(6, 4)
+
+    quant_method = _FakeQuantMethod(
+        dense_weight, num_padded=2, packed_attr="weight_packed"
+    )
+    lm_head = SimpleNamespace(
+        weight_packed=torch.empty(8, 1, dtype=torch.int32),
+        quant_method=quant_method,
+        org_vocab_size=6,
+    )
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        candidate_selector=SimpleNamespace(top_k=4),
+        _transform_unary_logits=lambda logits: logits.float(),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash.get_parallel",
+        lambda: SimpleNamespace(tp_size=1),
+    )
+    monkeypatch.setattr(
+        "sglang.srt.models.dflash._flashinfer_top_k", _flashinfer_contract_topk
+    )
+
+    candidate_ids, _ = DFlash2DraftModel.compute_candidates(model, hidden)
+
+    _, expected_ids = torch.topk(torch.matmul(hidden, dense_weight.T), 4, dim=-1)
+    assert quant_method.called
+    torch.testing.assert_close(candidate_ids, expected_ids)
 
 
 def test_selector_gathers_global_candidates_across_vocab_shards(monkeypatch):
