@@ -176,6 +176,12 @@ def _should_emit_normal_text_as_message(
 
 _RESPONSE_OUTPUT = TypeAdapter(ResponsesResponse.model_fields["output"].annotation)
 
+# SSE event types both responses stream generators emit before the engine
+# request is validated. A kick-start must pull past them to trigger
+# validation (e.g. the context-length check in
+# ``tokenizer_manager._validate_one_request``).
+_RESPONSES_STREAM_PREAMBLE_EVENTS = ("response.created", "response.in_progress")
+
 
 class OpenAIServingResponses(OpenAIServingChat):
     """Handler for /v1/responses requests"""
@@ -691,7 +697,7 @@ class OpenAIServingResponses(OpenAIServingChat):
 
             if request.stream:
                 if self.use_harmony:
-                    return self.responses_stream_generator(
+                    stream_generator = self.responses_stream_generator(
                         request,
                         sampling_params,
                         result_generator,
@@ -701,16 +707,49 @@ class OpenAIServingResponses(OpenAIServingChat):
                         request_metadata,
                         require_reasoning=require_reasoning,
                     )
-                return self.responses_stream_generator_non_harmony(
-                    request,
-                    sampling_params,
-                    result_generator,
-                    model_name,
-                    tokenizer,
-                    request_metadata,
-                    require_reasoning=require_reasoning,
-                    tool_adapter=tool_adapter,
-                )
+                else:
+                    stream_generator = self.responses_stream_generator_non_harmony(
+                        request,
+                        sampling_params,
+                        result_generator,
+                        model_name,
+                        tokenizer,
+                        request_metadata,
+                        require_reasoning=require_reasoning,
+                        tool_adapter=tool_adapter,
+                    )
+
+                # Kick-start the generator to trigger validation before HTTP
+                # 200 is sent. The stream opens with synthetic preamble events
+                # (``response.created`` / ``response.in_progress``) that are
+                # emitted before the engine request is validated, so keep
+                # pulling until the first event after them: a ``ValueError``
+                # there is a client error (e.g. context length exceeded) and
+                # still becomes a proper HTTP 400 instead of a 200 stream
+                # that ends in ``response.failed``. Other exceptions keep
+                # their existing in-stream handling.
+                first_events: list[str] = []
+                try:
+                    while True:
+                        event = await stream_generator.__anext__()
+                        first_events.append(event)
+                        if not any(
+                            event.startswith(f"event: {event_type}\n")
+                            for event_type in _RESPONSES_STREAM_PREAMBLE_EVENTS
+                        ):
+                            break
+                except ValueError as e:
+                    return self.create_error_response(str(e))
+                except StopAsyncIteration:
+                    pass
+
+                async def _prepend_first_events():
+                    for event in first_events:
+                        yield event
+                    async for event in stream_generator:
+                        yield event
+
+                return _prepend_first_events()
             try:
                 result: Union[
                     ORJSONResponse, ResponsesResponse
@@ -2632,8 +2671,13 @@ class OpenAIServingResponses(OpenAIServingChat):
             state["done"] = True
             return events
 
+        # Whether the engine generator has produced its first chunk. A
+        # ``ValueError`` raised before that point is a validation error
+        # (e.g. context length exceeded), not a mid-stream server failure.
+        engine_started = False
         try:
             async for ctx in result_generator:
+                engine_started = True
                 if isinstance(ctx, dict):
                     chunk = ctx
                 else:
@@ -2985,6 +3029,13 @@ class OpenAIServingResponses(OpenAIServingChat):
                 for ev in _emit_tool_calls(opening):
                     yield ev
         except Exception as e:
+            # A validation error raised before the first engine chunk is a
+            # client error: let it propagate so the caller can return a real
+            # HTTP error instead of ``response.failed`` with ``server_error``.
+            # Anything raised later in the stream keeps the existing
+            # ``response.failed`` behavior below.
+            if isinstance(e, ValueError) and not engine_started:
+                raise
             logger.exception(
                 "Error while streaming /v1/responses %s", request.request_id
             )

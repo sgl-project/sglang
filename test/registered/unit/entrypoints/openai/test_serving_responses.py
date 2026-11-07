@@ -3,7 +3,7 @@ import asyncio
 import functools
 import sys
 import unittest
-from contextlib import asynccontextmanager
+from contextlib import ExitStack, asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -23,6 +23,7 @@ from utils import (
     StreamFixture,
     engine_chunk,
     event_payloads,
+    event_types,
     make_serving,
 )
 from xgrammar import Grammar
@@ -2316,6 +2317,124 @@ def test_background_task_lifecycle(response_serving, outcome):
         assert not serving.background_tasks
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("harmony", [False, True])
+def test_streaming_context_length_error_returns_400(response_serving, harmony):
+    """A validation error raised before the first engine chunk must return
+    HTTP 400 instead of a 200 stream ending in ``response.failed``."""
+    serving = response_serving(enabled=False, harmony=harmony)
+
+    async def failing_generate(*args, **kwargs):
+        raise ValueError(
+            "Requested token count exceeds the model's maximum context "
+            "length of 262144 tokens."
+        )
+        yield  # unreachable; makes this an async generator function
+
+    serving.tokenizer_manager.generate_request = failing_generate
+    request = ResponsesRequest(model="x", input="hi", stream=True)
+    # The harmony path renders the prompt and builds its streaming context
+    # through the harmony encoding, whose vocab file cannot load in this
+    # CPU-only environment; stub just those encoding lookups so the test
+    # exercises the kick-start. The failing generator raises before any
+    # harmony parsing runs, so the stubs are never consulted for output.
+    stack = ExitStack()
+    if harmony:
+        stack.enter_context(
+            patch(
+                "sglang.srt.entrypoints.openai.serving_responses.render_for_completion",
+                return_value=[1, 2, 3],
+            )
+        )
+        stack.enter_context(
+            patch(
+                "sglang.srt.entrypoints.context.get_encoding",
+                return_value=Mock(),
+            )
+        )
+        stack.enter_context(
+            patch(
+                "sglang.srt.entrypoints.context.get_streamable_parser_for_assistant",
+                return_value=Mock(messages=[]),
+            )
+        )
+    with stack:
+        result = asyncio.run(serving.create_responses(request))
+    assert result.status_code == 400
+    body = orjson.loads(result.body)
+    assert body["error"]["type"] == "invalid_request_error"
+    assert body["error"]["code"] == 400
+    assert "maximum context length" in body["error"]["message"]
+
+
+def test_streaming_kick_start_preserves_preamble(response_serving):
+    """The kick-start must not lose or duplicate the preamble events: the
+    stream still opens with exactly one ``response.created`` followed by
+    ``response.in_progress`` and ends with ``response.completed``."""
+    serving = response_serving(enabled=False, harmony=False)
+    request = ResponsesRequest(model="x", input="hi", stream=True)
+
+    async def run():
+        stream = await serving.create_responses(request)
+        return [event async for event in stream]
+
+    events = asyncio.run(run())
+    types = event_types(events)
+    assert types[0] == "response.created"
+    assert types[1] == "response.in_progress"
+    assert types.count("response.created") == 1
+    assert types[-1] == "response.completed"
+
+
+def test_streaming_mid_stream_error_stays_response_failed(response_serving):
+    """A non-ValueError raised after streaming started keeps the existing
+    in-stream ``response.failed`` behavior and is not turned into a 400."""
+    serving = response_serving(enabled=False, harmony=False)
+
+    async def generate(*args, **kwargs):
+        yield engine_chunk("ok", finish=True)
+        raise RuntimeError("engine died")
+
+    serving.tokenizer_manager.generate_request = generate
+    request = ResponsesRequest(model="x", input="hi", stream=True)
+
+    async def run():
+        stream = await serving.create_responses(request)
+        assert not hasattr(stream, "status_code")
+        return [event async for event in stream]
+
+    events = asyncio.run(run())
+    types = event_types(events)
+    assert types[0] == "response.created"
+    assert types[-1] == "response.failed"
+    assert event_payloads(events)[-1]["response"]["error"]["code"] == "server_error"
+
+
+def test_streaming_value_error_after_first_chunk_stays_response_failed(
+    response_serving,
+):
+    """A ValueError raised after the first engine chunk was consumed is a
+    mid-stream failure, not a pre-stream validation error: it stays
+    ``response.failed`` instead of becoming a 400."""
+    serving = response_serving(enabled=False, harmony=False)
+
+    async def generate(*args, **kwargs):
+        yield engine_chunk("ok", finish=True)
+        raise ValueError("generation failed after first chunk")
+
+    serving.tokenizer_manager.generate_request = generate
+    request = ResponsesRequest(model="x", input="hi", stream=True)
+
+    async def run():
+        stream = await serving.create_responses(request)
+        assert not hasattr(stream, "status_code")
+        return [event async for event in stream]
+
+    events = asyncio.run(run())
+    types = event_types(events)
+    assert types[0] == "response.created"
+    assert types[-1] == "response.failed"
 
 
 def test_active_stream_cancel_and_final_history(response_serving):
