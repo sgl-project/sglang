@@ -18,7 +18,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.2
+ARG FLASHINFER_VERSION=0.7.3
 ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -209,7 +209,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY python/pyproject.toml /tmp/sglang_deps/python/pyproject.toml
 COPY rust/sglang-grpc      /tmp/sglang_deps/rust/sglang-grpc
 COPY rust/sglang-mm        /tmp/sglang_deps/rust/sglang-mm
-COPY rust/sglang-api-types /tmp/sglang_deps/rust/sglang-api-types
+COPY rust/sglang-runtime-v1-types /tmp/sglang_deps/rust/sglang-runtime-v1-types
 
 # Install sglang dependencies (torch, transformers, etc.).
 # Generate constraints.txt to prevent reinstalling these deps in later stages.
@@ -621,31 +621,7 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd /sgl-workspace/sglang \
     && uv pip install --no-deps -e "python[${BUILD_TYPE}]" \
-    && kernels lock python \
-    && ( success=0; \
-         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
-         # Remove this branch once arm cubins are published upstream.
-         if [ "$(uname -m)" = "aarch64" ]; then \
-             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
-             success=1; \
-         else \
-             for i in 1 2 3; do \
-                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
-                 kernels download python && \
-                 success=1 && break; \
-                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
-             done; \
-             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
-             # combo, fall back to runtime JIT instead of failing the build, \
-             # mirroring the aarch64 branch. \
-             if [ "$success" != "1" ]; then \
-                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
-                 success=1; \
-             fi; \
-         fi; \
-         [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
-    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 ENV SGLANG_RUST_BUILD_MODE=never

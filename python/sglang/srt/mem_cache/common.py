@@ -244,6 +244,26 @@ def _req_radix_key(
     )
 
 
+def storage_prefetch_end(
+    tree_cache: BasePrefixCache,
+    req: Req,
+    max_prefix_len: int,
+) -> int:
+    """Raw-token end of the L3 prefetch span for ``req`` (before page alignment).
+
+    The span must stop where the match key stops. :func:`_req_radix_key` caps
+    the key at ``len - swa_reprefill_tail_tokens()``: a prefetch commits its
+    only SWA host window to the span's last page, so a span reaching past that
+    cap puts the window beyond the boundary the matcher may consume. The
+    boundary node then carries no SWA host value and admission drops the whole
+    transfer, after the L3 read has already been paid for.
+
+    ``prefetch_from_storage`` still floors the result to ``page_size``.
+    """
+    token_ids = req.full_untruncated_fill_ids
+    return len(_req_radix_key(tree_cache, req, token_ids, max_prefix_len))
+
+
 def touch_waiting_prefix(req: Req, tree_cache: BasePrefixCache) -> None:
     tree_cache.touch_prefix(
         _req_radix_key(tree_cache, req, req.origin_input_ids + req.output_ids)

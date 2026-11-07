@@ -561,5 +561,6 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_max_page_tokens",
     "pp_min_chunked_prefill_size",
     "pp_chunk_overhead_tokens",
+    "enable_fp4_indexer",
 )
 # fmt: on
