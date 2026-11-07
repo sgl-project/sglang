@@ -67,6 +67,14 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        sender = getattr(req, "disagg_kv_sender", None)
+        defer = getattr(type(sender), "defer_source_release", None)
+        if defer is not None and defer(
+            sender, req, "kv", lambda: self.release(req, checkpoint=checkpoint)
+        ):
+            # Preserve the original request row/cache locks, including every
+            # auxiliary component. Strong Python tensor references are not pins.
+            return
         if isinstance(req.finished_reason, FINISH_ABORT):
             self._detach(req)
             # A checkpoint hands the KV to the cache, whose store settles the attempt.

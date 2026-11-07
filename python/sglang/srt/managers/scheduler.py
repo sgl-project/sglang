@@ -4802,6 +4802,13 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+            tracker = getattr(
+                self.disagg_prefill_bootstrap_queue.kv_manager,
+                "source_release_tracker",
+                None,
+            )
+            if tracker is not None:
+                lists[ListKind.PD_RELEASING] = tracker.requests
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.
@@ -5798,6 +5805,11 @@ class Scheduler(
 
         if not for_health_check:
             idle &= not self.request_receiver.has_pending()
+            if self.disagg_prefill_bootstrap_queue is not None:
+                manager = self.disagg_prefill_bootstrap_queue.kv_manager
+                pending = getattr(manager, "has_unsettled_source_transfers", None)
+                if pending is not None:
+                    idle &= not pending()
             if self.uocr_runtime is not None:
                 idle &= not self.uocr_runtime.blocks_flush(
                     ignore_waiting=ignore_waiting

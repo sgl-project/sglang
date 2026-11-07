@@ -173,15 +173,23 @@ def disagg_transfers_in_flight(scheduler):
     # The scheduler and pool outlive the queues rebuilt by a PD role switch.
     def busy() -> bool:
         if scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            manager = getattr(
+                getattr(scheduler, "disagg_prefill_bootstrap_queue", None),
+                "kv_manager",
+                None,
+            )
+            pending = getattr(manager, "has_unsettled_source_transfers", None)
             return bool(
                 scheduler.disagg_prefill_transfer_queue
                 or scheduler.disagg_prefill_pending_chunk_rids
+                or (pending is not None and pending())
             )
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
                 scheduler.disagg_decode_prealloc_queue.has_device_destinations
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
+                or scheduler.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 or (
                     decode_offload_manager is not None
                     and decode_offload_manager.has_inflight_device_transfer()
@@ -290,6 +298,28 @@ def all_reduce_flags(
 def _all_reduce_polls(polls: List[int], group: dist.ProcessGroup) -> List[int]:
     """MIN-reduce poll states so no rank commits ahead of its peers."""
     return all_reduce_flags(flags=polls, group=group, op=dist.ReduceOp.MIN)
+
+
+def validate_source_release_roster(rooms, attn_tp_cpu_group, attn_cp_cpu_group):
+    """Check exact room order before any variable-sized ownership collective.
+
+    These are the scheduler's native attention TP/CP CPU groups, scoped to one
+    attention DP shard. None must never silently select the global world group.
+    Empty rosters participate too, so a missing hold fails before a size mismatch.
+    """
+    mismatch = False
+    for group in (attn_tp_cpu_group, attn_cp_cpu_group):
+        if group is None:
+            raise RuntimeError("Source releases require explicit attention CPU groups")
+        size = dist.get_world_size(group)
+        if size > 1:
+            rosters = [None] * size
+            # Do not raise after TP alone: unaffected TP rows still have to
+            # enter CP. Carry the failure through CP so every sender rejects.
+            dist.all_gather_object(rosters, (rooms, mismatch), group=group)
+            mismatch |= any(failed or roster != rooms for roster, failed in rosters)
+    if mismatch:
+        raise RuntimeError("Source release room rosters differ between sender ranks")
 
 
 def poll_and_all_reduce(

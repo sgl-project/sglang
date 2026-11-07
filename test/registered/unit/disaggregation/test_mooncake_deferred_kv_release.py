@@ -20,6 +20,7 @@ from test_deferred_decode_kv_release import (
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -82,6 +83,50 @@ class TestMooncakeAbortNotification(
     room = ROOM
     decode_ip = DECODE_IP
     decode_port = DECODE_PORT
+
+    def test_late_worker_skips_aborted_queued_chunk_without_posting_dma(self):
+        manager = _manager(status=KVPoll.Failed)
+        manager.enable_trace = False
+        manager._staging_outstanding = defaultdict(int)
+        manager.engine = MagicMock()
+        queue = MagicMock()
+        queue.get.side_effect = [_chunk(), None]
+        manager.transfer_worker(queue, MagicMock())
+        manager.engine.batch_transfer_sync.assert_not_called()
+        self.assertFalse(manager._staging_outstanding)
+
+    def test_enqueued_chunks_hold_source_and_abort_ack_until_last_skip(self):
+        manager = _manager(status=KVPoll.WaitingForInput)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.enable_trace = False
+        manager.transfer_infos = {ROOM: {"127.0.0.1:9": object()}}
+        queue = MagicMock()
+        manager.transfer_queues = [queue]
+        manager.engine = MagicMock()
+        for _ in range(2):
+            manager.add_transfer_request(
+                ROOM, np.array([1], dtype=np.int32), slice(0, 1), False
+            )
+        chunks = [call.args[0] for call in queue.put.call_args_list]
+        self.assertEqual(manager._staging_outstanding[ROOM], 2)
+        self.assertTrue(all(chunk.staging_counted for chunk in chunks))
+        manager.request_status[ROOM] = KVPoll.Failed
+        target = AckTarget(DECODE_IP, DECODE_PORT, ABORT_GENERATION)
+        manager.register_deferred_ack_target(ROOM, target)
+        pending = iter([*chunks, None])
+
+        def dequeue():
+            chunk = next(pending)
+            if chunk is chunks[1]:
+                self.assertEqual(manager._staging_outstanding[ROOM], 1)
+                self.assertEqual(manager._sent, [])
+            return chunk
+
+        queue.get.side_effect = dequeue
+        manager.transfer_worker(queue, MagicMock())
+        manager.engine.batch_transfer_sync.assert_not_called()
+        self.assertEqual(manager._sent, [(ROOM, target)])
+        self.assertFalse(manager._staging_outstanding)
 
     def _make_abort_manager(self, status: KVPoll | None):
         return _manager(status=status)

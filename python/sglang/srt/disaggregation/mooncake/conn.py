@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.source_release import SourceReleaseTracker
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
@@ -266,6 +267,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     supports_role_switch = True
     # Bootstrap thread defers the ABORT ack until the transfer worker drains.
     supports_deferred_decode_kv_release = True
+    # A timeout or a legacy transfer error is not physical DMA completion.
+    requires_abort_drain = True
 
     def __init__(
         self,
@@ -281,6 +284,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             enable_custom_mem_pool, custom_mem_pool_type
         )
         super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+        if not self.enable_deferred_decode_kv_release:
+            raise ValueError("Mooncake PD requires deferred decode KV release")
+        self.source_release_tracker = SourceReleaseTracker()
+        self._source_worker_busy_rooms: Dict[int, int] = {}
+        self._source_ownership_lock = threading.RLock()
         self.init_engine()
         self.register_buffer_to_engine()
         self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
@@ -442,7 +450,57 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ptrs, lens = zip(*regions)
             self.engine.batch_register(list(ptrs), list(lens))
 
+    def source_release_is_safe(self, room: int) -> bool:
+        with self._source_ownership_guard():
+            return (
+                self._staging_outstanding.get(room, 0) <= 0
+                and room not in self._deferred_ack_poisoned_rooms
+                and room not in getattr(self, "_source_worker_busy_rooms", ())
+            )
+
+    def _source_ownership_guard(self):
+        # Also supports native unit fixtures that bypass engine construction.
+        if not hasattr(self, "_source_ownership_lock"):
+            self._source_ownership_lock = threading.RLock()
+        return self._source_ownership_lock
+
+    def _finish_source_worker(self, room):
+        with self._source_ownership_guard():
+            workers = self._source_worker_busy_rooms[room] - 1
+            if workers:
+                self._source_worker_busy_rooms[room] = workers
+            else:
+                self._source_worker_busy_rooms.pop(room)
+
+    def has_unsettled_source_transfers(self) -> bool:
+        return bool(
+            self.source_release_tracker
+            or self._staging_outstanding
+            or self._deferred_ack_poisoned_rooms
+            or getattr(self, "_source_worker_busy_rooms", ())
+        )
+
+    def require_transfer_idle(self) -> None:
+        if self.request_status or self.has_unsettled_source_transfers():
+            raise RuntimeError("Mooncake buffers are still owned by transfers")
+
+    def update_status(self, bootstrap_room: int, status: KVPoll):
+        tracker = getattr(self, "source_release_tracker", None)
+        if (
+            bootstrap_room not in self.request_status
+            and status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput)
+            and (
+                (tracker is not None and tracker.holds_room(bootstrap_room))
+                or bootstrap_room in self._staging_outstanding
+                or bootstrap_room in self._deferred_ack_poisoned_rooms
+                or bootstrap_room in getattr(self, "_source_worker_busy_rooms", ())
+            )
+        ):
+            raise RuntimeError("A retained Mooncake source room cannot be reused")
+        super().update_status(bootstrap_room, status)
+
     def deregister_buffer_to_engine(self):
+        self.require_transfer_idle()
         regions = self._registerable_regions()
         if regions:
             ptrs, _ = zip(*regions)
@@ -459,6 +517,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         The KV cache pool memory is owned by the scheduler and is NOT freed
         here; only mooncake-side registrations / sockets are released.
         """
+        self.require_transfer_idle()
         self._stopped = True
 
         # Stop the failed-session probe loop (PREFILL role) if running.
@@ -2624,10 +2683,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
         batch_transfer_sync returns -1 on its wall-clock timeout with the batch
         still running (freeBatchID refuses a busy batch and the handle is
-        dropped), so a failed send may still be writing decode's pages; decode
-        falls back to its release timeout instead."""
-        if self.enable_deferred_decode_kv_release:
-            self.poison_deferred_ack_room(room)
+        dropped), so neither source nor destination may be recycled. Keep the
+        source and suppress the drain ACK until whole-context teardown; elapsed
+        time cannot recover a native handle that the legacy API dropped."""
+        self.poison_deferred_ack_room(room)
 
     def transfer_worker(
         self,
@@ -2637,6 +2696,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         worker_index=0,
     ):
         staging_strategy = None
+        if not hasattr(self, "_source_worker_busy_rooms"):
+            self._source_worker_busy_rooms = {}
         if self.enable_trace:
             trace_set_thread_info(
                 f"mooncake transfer worker {worker_index}",
@@ -2653,6 +2714,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # _stopped alone can never wake a parked worker during a role switch.
                 if kv_chunk is None:
                     break
+                with self._source_ownership_guard():
+                    self._source_worker_busy_rooms[kv_chunk.room] = (
+                        self._source_worker_busy_rooms.get(kv_chunk.room, 0) + 1
+                    )
                 if self.enable_trace:
                     kv_chunk.trace_ctx.rebuild_thread_context()
                     kv_chunk.trace_ctx.trace_slice_start(
@@ -2660,12 +2725,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                     )
 
-                # Counted at dequeue, before the status check, so
-                # `outstanding == 0` means nothing is dequeued or in flight --
-                # the predicate the abort ack relies on. The flag survives
-                # re-enqueue on defer.
+                # Production chunks are counted before enqueue, including ones
+                # not yet seen by a worker. Keep the fallback for internal callers
+                # supplying an uncounted chunk. The flag survives staging defer.
                 if not kv_chunk.staging_counted:
-                    self._staging_outstanding[kv_chunk.room] += 1
+                    with self._source_ownership_guard():
+                        self._staging_outstanding[kv_chunk.room] = (
+                            self._staging_outstanding.get(kv_chunk.room, 0) + 1
+                        )
                     kv_chunk.staging_counted = True
 
                 # Under overlap scheduling an early cached-prefix send can
@@ -2699,10 +2766,14 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    with self._source_ownership_guard():
+                        self._staging_outstanding[kv_chunk.room] -= 1
+                        if self._staging_outstanding[kv_chunk.room] <= 0:
+                            self._staging_outstanding.pop(kv_chunk.room, None)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
+                    self._finish_source_worker(kv_chunk.room)
                     continue
 
                 if (
@@ -2995,9 +3066,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
 
                 if staging_deferred:
+                    self._finish_source_worker(kv_chunk.room)
                     continue
 
-                self._staging_outstanding[kv_chunk.room] -= 1
+                with self._source_ownership_guard():
+                    self._staging_outstanding[kv_chunk.room] -= 1
                 if self.enable_deferred_decode_kv_release:
                     # In-flight write finished; if aborted and nothing outstanding,
                     # the pages are idle -> release the held ack.
@@ -3029,6 +3102,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     # acknowledge Success while this worker can still erase
                     # bookkeeping for a subsequent transfer using the same room.
                     self._staging_outstanding.pop(kv_chunk.room, None)
+                self._finish_source_worker(kv_chunk.room)
 
             except Exception as e:
                 # NOTE(shangming): Remove this when we make sure the transfer thread is bug-free
@@ -3275,20 +3349,32 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         if trace_ctx is None:
             trace_ctx = TraceNullContext()
 
-        self.transfer_queues[shard_idx].put(
-            TransferKVChunk(
-                room=bootstrap_room,
-                prefill_kv_indices=kv_indices,
-                index_slice=index_slice,
-                is_last_chunk=is_last_chunk,
-                prefill_aux_index=aux_index,
-                state_indices=state_indices,
-                num_kv_tokens=num_kv_tokens,
-                trace_ctx=trace_ctx,
-                wait_event=wait_event,
-                indices_event=indices_event,
-            )
+        chunk = TransferKVChunk(
+            room=bootstrap_room,
+            prefill_kv_indices=kv_indices,
+            index_slice=index_slice,
+            is_last_chunk=is_last_chunk,
+            prefill_aux_index=aux_index,
+            state_indices=state_indices,
+            num_kv_tokens=num_kv_tokens,
+            trace_ctx=trace_ctx,
+            wait_event=wait_event,
+            indices_event=indices_event,
+            staging_counted=True,
         )
+        # A queued old-generation chunk must keep both source ownership and its
+        # room until the worker skips/drains it. Counting only at dequeue lets a
+        # reopened room turn an old queued chunk into a new write.
+        with self._source_ownership_guard():
+            self._staging_outstanding[bootstrap_room] = (
+                self._staging_outstanding.get(bootstrap_room, 0) + 1
+            )
+        try:
+            self.transfer_queues[shard_idx].put(chunk)
+        except BaseException:
+            # Queue failure can be ambiguous; never undo a possible enqueue.
+            self.poison_deferred_ack_room(bootstrap_room)
+            raise
 
     def get_session_id(self):
         return self.engine.get_session_id()
@@ -3473,6 +3559,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
 
 class MooncakeKVSender(CommonKVSender):
     supports_host_tensor_indices = True
+
+    def defer_source_release(self, req, key, callback) -> bool:
+        if (
+            key == "metadata"
+            and getattr(req, "pending_bootstrap", False)
+            and getattr(self, "aux_index", None) is None
+            and self.kv_mgr.source_release_is_safe(self.bootstrap_room)
+        ):
+            # An optimistic yield can requeue this live Req immediately. Before
+            # sender.init it has never exposed this metadata source, so release
+            # it synchronously rather than retain a callback to its mutable slot.
+            return False
+        deferred = self.kv_mgr.source_release_tracker.defer(req, key, callback)
+        if (
+            deferred
+            and key == "kv"
+            and getattr(self, "conclude_state", None) == KVPoll.Failed
+            and self.bootstrap_room in self.kv_mgr.request_status
+        ):
+            # Chunk cancellation can retire without ever entering the final
+            # transfer queue. Close admission of further chunks, but preserve
+            # the manager's outstanding/poison state and the native Req pins.
+            self.clear()
+            # An earlier non-final chunk can have finished before cancellation,
+            # leaving a zero count while its worker is already parked. Do not
+            # erase a zero entry until the worker's bookkeeping also finished.
+            with self.kv_mgr._source_ownership_guard():
+                if self.kv_mgr.source_release_is_safe(self.bootstrap_room):
+                    self.kv_mgr._staging_outstanding.pop(self.bootstrap_room, None)
+        return deferred
 
     @mooncake_trace_func(MooncakeRequestStage.MOONCAKE_SEND)
     def send(
