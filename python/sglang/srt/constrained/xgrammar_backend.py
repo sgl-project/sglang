@@ -75,6 +75,19 @@ def _allocate_token_bitmask(vocab_size: int, batch_size: int) -> torch.Tensor:
     )
 
 
+def _unmask_rows_that_allow_no_token(vocab_mask: torch.Tensor) -> torch.Tensor:
+    """Return the mask with every all-zero row replaced by an unconstrained row.
+
+    A grammar can reach a state that allows no token, for example after "a" in
+    the EBNF `root ::= "a" b` with `b ::= b`. Masking such a row sets every
+    logit to -inf, the sampler then gets NaN probabilities, and the scheduler
+    crashes. With the row unconstrained, the grammar rejects the sampled token
+    in accept_token and only that request is aborted.
+    """
+    allows_no_token = (vocab_mask == 0).all(dim=-1, keepdim=True)
+    return torch.where(allows_no_token, -1, vocab_mask)
+
+
 class XGrammarGrammar(BaseGrammarObject):
     def __init__(
         self,
@@ -123,11 +136,26 @@ class XGrammarGrammar(BaseGrammarObject):
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         self.matcher.fill_next_token_bitmask(vocab_mask, idx)
 
+    def allows_no_token(self) -> bool:
+        """Whether the current state allows no token at all, stop tokens included.
+
+        Masking with such a state turns every logit into -inf, so the sampler
+        gets NaN probabilities.
+        """
+        if self.matcher.is_terminated():
+            return False
+        bitmask = torch.full(
+            get_bitmask_shape(1, self.vocab_size), -1, dtype=bitmask_dtype
+        )
+        self.matcher.fill_next_token_bitmask(bitmask, 0)
+        return not bool(bitmask.any())
+
     @staticmethod
     def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
         return vocab_mask.to(device, non_blocking=True)
 
     def apply_vocab_mask(self, logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        vocab_mask = _unmask_rows_that_allow_no_token(vocab_mask)
         if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
@@ -299,6 +327,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
 
     @staticmethod
     def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        vocab_mask = _unmask_rows_that_allow_no_token(vocab_mask)
         if logits.device.type in {"cuda", "xpu", "musa"}:
             if _is_hip:
                 apply_token_bitmask_inplace_cuda(logits, vocab_mask)
@@ -381,6 +410,21 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
             grammar_stats,
         )
 
+    def _from_context_checked(
+        self, ctx: CompiledGrammar, key_string: str, grammar_stats: GrammarStats
+    ) -> BaseGrammarObject:
+        grammar = self._from_context(ctx, key_string, grammar_stats)
+        if grammar.allows_no_token():
+            # e.g. a JSON schema whose $ref only points back to itself, or the
+            # EBNF `root ::= root`. Such a request would crash the sampler.
+            logger.error(f"Hit grammar that allows no token: {key_string=}")
+            return InvalidGrammarObject(
+                "The grammar allows no token at the start of the output, so no "
+                "output can match it. Check for rules or $ref chains that only "
+                "refer back to themselves."
+            )
+        return grammar
+
     def dispatch_json(self, key_string: str) -> BaseGrammarObject:
         try:
             if key_string == "$$ANY$$":
@@ -405,7 +449,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         ) as e:
             logger.error(f"Hit invalid json_schema: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="json"))
+        return self._from_context_checked(
+            ctx, key_string, GrammarStats(dispatch_type="json")
+        )
 
     def dispatch_ebnf(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -413,7 +459,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid ebnf: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="ebnf"))
+        return self._from_context_checked(
+            ctx, key_string, GrammarStats(dispatch_type="ebnf")
+        )
 
     def dispatch_regex(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -421,7 +469,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except RuntimeError as e:
             logger.error(f"Hit invalid regex: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(ctx, key_string, GrammarStats(dispatch_type="regex"))
+        return self._from_context_checked(
+            ctx, key_string, GrammarStats(dispatch_type="regex")
+        )
 
     def dispatch_structural_tag(self, key_string: str) -> BaseGrammarObject:
         try:
@@ -452,7 +502,7 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
         except (RuntimeError, json.decoder.JSONDecodeError) as e:
             logger.error(f"Hit invalid structural_tag: {key_string=}, {e=}")
             return InvalidGrammarObject(str(e))
-        return self._from_context(
+        return self._from_context_checked(
             ctx, key_string, GrammarStats(dispatch_type="structural_tag")
         )
 
