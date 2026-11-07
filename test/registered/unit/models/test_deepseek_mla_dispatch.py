@@ -11,6 +11,7 @@ Pure Python (no GPU, no model weights): `_is_hip` is patched and `attn` /
 """
 
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest import mock
 
@@ -235,16 +236,22 @@ class TestKVShardedMLADispatch(CustomTestCase):
                             AttnForwardMethod.MLA,
                         )
 
-    def test_trtllm_mla_keeps_chunked_mha_for_prefill(self):
-        # TRTLLM has a separate dispatcher and requires prefix caching for
-        # sharding; changing FA3 dispatch must not change its supported path.
-        for prefix in (0, 64):
-            with self.subTest(prefix=prefix):
+    def test_trtllm_and_cutedsl_mla_dispatch(self):
+        for backend, prefix, (mode, expected) in product(
+            ("trtllm_mla", "cutedsl_mla"),
+            (0, 64),
+            (
+                (ForwardMode.EXTEND, AttnForwardMethod.MHA_CHUNKED_KV),
+                (ForwardMode.DECODE, AttnForwardMethod.MLA),
+                (ForwardMode.DRAFT_EXTEND_V2, AttnForwardMethod.MLA),
+            ),
+        ):
+            with self.subTest(backend=backend, prefix=prefix, mode=mode):
+                batch = self._batch(prefix=prefix)
+                batch.forward_mode = mode
                 self.assertEqual(
-                    abh.handle_attention_trtllm_mla(
-                        self.attn, self._batch(prefix=prefix)
-                    ),
-                    AttnForwardMethod.MHA_CHUNKED_KV,
+                    abh.AttentionBackendRegistry.get_handler(backend)(self.attn, batch),
+                    expected,
                 )
 
 
