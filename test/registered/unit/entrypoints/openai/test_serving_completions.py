@@ -4,7 +4,7 @@ Run with:
     python -m unittest tests.test_serving_completions_unit -v
 """
 
-from sglang.test.test_utils import maybe_stub_sgl_kernel
+from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()  # must precede any import that pulls in sgl_kernel
 
@@ -63,7 +63,7 @@ class _MockTemplateManager:
         self.jinja_template_may_reorder_tool_results = False
 
 
-class ServingCompletionTestCase(unittest.TestCase):
+class ServingCompletionTestCase(CustomTestCase):
     """Bundle all prompt/echo tests in one TestCase."""
 
     # ---------- shared test fixtures ----------
@@ -90,6 +90,22 @@ class ServingCompletionTestCase(unittest.TestCase):
         self.fastapi_request = Mock(spec=Request)
 
     # ---------- prompt-handling ----------
+    def test_validate_nonempty_prompts(self):
+        """Zero-valued token IDs must not make a nonempty prompt look empty."""
+        for prompt in ([0], [0, 0], [0, 1], [[0]], [[], [0]], ["", "hello"]):
+            with self.subTest(prompt=prompt):
+                req = CompletionRequest(model="x", prompt=prompt, max_tokens=1)
+                self.assertIsNone(self.sc._validate_request(req))
+
+    def test_validate_empty_prompts(self):
+        """Empty inputs and batches containing only empty prompts stay invalid."""
+        for prompt in ("", [], [""], ["", ""], [[]], [[], []]):
+            with self.subTest(prompt=prompt):
+                req = CompletionRequest(model="x", prompt=prompt, max_tokens=1)
+                self.assertEqual(
+                    self.sc._validate_request(req), "Prompt cannot be empty"
+                )
+
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)
         internal, _ = self.sc._convert_to_internal_request(req)
