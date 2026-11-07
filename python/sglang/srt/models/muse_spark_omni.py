@@ -24,6 +24,7 @@ from sglang.srt.layers.muse_spark.muse_spark_navit import (
     get_navit_video_patch_count,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -35,7 +36,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel
-from sglang.srt.utils import add_prefix, is_cpu
+from sglang.srt.utils import is_cpu
 
 
 def _run_dp_sharded_encode(
