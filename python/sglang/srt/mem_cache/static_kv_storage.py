@@ -1020,9 +1020,8 @@ def _static_state_entries(
                 c128_item_lens,
             )
 
-        # On Ascend 950 (CYCLE cache_mode), C4 state uses request-local ring rows rather
-        # than SWA pages.  Register it separately so P and D can independently
-        # map logical positions when their local ring sizes differ.
+        # On Ascend 950, register C4 state by row so prefill and decode can
+        # pair logical positions even when their SWA-page ring sizes differ.
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
         if is_npu_arch35():
