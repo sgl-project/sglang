@@ -1024,6 +1024,7 @@ mod tests {
     fn drain_end_release_is_latched() {
         let (addr, _) = free_loopback_addrs();
         let rt = start(test_config(addr, None), None).expect("start runtime");
+        take_startup_freeze_gc(&rt);
         rt.hold_drain_end().unwrap();
         let streaming = send_http(
             addr,
