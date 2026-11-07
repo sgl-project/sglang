@@ -1257,6 +1257,8 @@ def _deterministic_attention_backend(view: Any) -> dict:
         if get_platform().is_xpu:
             # fa3 and flashinfer have no XPU kernels.
             backend = "intel_xpu"
+        elif get_platform().is_hip:
+            backend = "triton"
         elif get_platform().is_sm100 or get_platform().is_sm120:
             # Blackwell and newer architectures
             if _deterministic_is_deepseek_model(view):
