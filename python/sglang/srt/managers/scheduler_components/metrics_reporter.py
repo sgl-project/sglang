@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
@@ -345,9 +346,7 @@ class SchedulerMetricsReporter:
             enabled=self.enable_metrics,
             query_forward_active=(
                 self.forward_pass_device_timer.is_active
-                if self.enable_metrics
-                and self.forward_pass_device_timer is not None
-                and self.scheduler.device == "cuda"
+                if self.enable_metrics and self.forward_pass_device_timer is not None
                 else None
             ),
         )
@@ -558,6 +557,51 @@ class SchedulerMetricsReporter:
 
         hidden_size = float(model_config.hidden_size)
         num_layers = float(getattr(model_config, "num_attention_layers", 0))
+        # Per-layer attention/MLP/Mamba split for hybrid architectures. Two
+        # distinct conventions exist across real HF configs:
+        #   - Dedicated-layer (NemotronH): each layer is *exclusively* one of
+        #     "attention"/"mamba"/"mlp"/"moe" -- a "mamba" layer has no MLP of
+        #     its own, since the FFN lives in its own separately-indexed
+        #     layer. Only count the dedicated labels.
+        #   - Bundled-layer (FalconH1's uniform "hybrid" label; Jamba/Bamba's
+        #     "attention"/"mamba" with no separate FFN label at all): every
+        #     layer carries its own attention-or-mamba mixer *and* its own
+        #     MLP together. These vocabularies never contain "mlp"/"moe" at
+        #     all, so detect the convention by that and fall back to
+        #     "every layer pays the FFN cost" instead of silently zeroing it.
+        layers_block_type = getattr(hf_text_config, "layers_block_type", None)
+        if layers_block_type:
+            num_attn_layers = float(
+                sum(1 for t in layers_block_type if t not in ("mamba", "mlp", "moe"))
+            )
+            has_dedicated_ffn_layers = any(
+                t in ("mlp", "moe") for t in layers_block_type
+            )
+            num_mlp_layers = (
+                float(layers_block_type.count("mlp") + layers_block_type.count("moe"))
+                if has_dedicated_ffn_layers
+                else num_layers
+            )
+        else:
+            # full_attention_layer_ids is usually computed by sglang itself
+            # (ModelConfig.__init__, via get_hybrid_layer_ids()) and stored on
+            # model_config -- NOT on hf_text_config, which only ever has it
+            # when a model's own HF config class defines the field natively
+            # (e.g. KimiLinear/KimiK3). Check both so neither source is
+            # silently ignored.
+            full_attention_layer_ids = getattr(
+                model_config, "full_attention_layer_ids", None
+            )
+            if full_attention_layer_ids is None:
+                full_attention_layer_ids = getattr(
+                    hf_text_config, "full_attention_layer_ids", None
+                )
+            num_attn_layers = (
+                float(len(full_attention_layer_ids))
+                if full_attention_layer_ids is not None
+                else num_layers
+            )
+            num_mlp_layers = num_layers
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
             model_config.get_num_attention_heads(get_parallel().tp_size)
@@ -577,40 +621,115 @@ class SchedulerMetricsReporter:
         w_bytes = float(dtype_num_bytes)
         cache_bytes = float(dtype_num_bytes)
 
-        # Linear-layer FLOPs per token on one GPU.
-        attn_linear_flops = (
-            2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
-            + 2.0 * hidden_size * head_dim * num_attn_heads
-        )
-        mlp_flops = (
-            6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
-        )
+        # MLA has a shared per-token KV latent (not per-head K/V like GQA).
+        is_mla = getattr(model_config, "attention_arch", None) == AttentionArch.MLA
+        if is_mla and num_attn_heads > 0:
+            kv_lora_rank = float(getattr(model_config, "kv_lora_rank", 0) or 0)
+            qk_rope_head_dim = float(getattr(model_config, "qk_rope_head_dim", 0) or 0)
+            qk_nope_head_dim = getattr(model_config, "qk_nope_head_dim", None)
+            qk_nope_head_dim = (
+                float(qk_nope_head_dim)
+                if qk_nope_head_dim is not None
+                else max(0.0, head_dim - qk_rope_head_dim)
+            )
+            v_head_dim = getattr(model_config, "v_head_dim", None)
+            v_head_dim = (
+                float(v_head_dim)
+                if v_head_dim is not None and v_head_dim != head_dim
+                else hidden_size / num_attn_heads
+            )
+            qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+            q_lora_rank = float(getattr(hf_text_config, "q_lora_rank", 0) or 0)
+
+            if q_lora_rank > 0:
+                q_proj_flops = 2.0 * hidden_size * q_lora_rank + 2.0 * q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+                q_proj_weight_elems = hidden_size * q_lora_rank + q_lora_rank * (
+                    num_attn_heads * qk_head_dim
+                )
+            else:
+                q_proj_flops = 2.0 * hidden_size * num_attn_heads * qk_head_dim
+                q_proj_weight_elems = hidden_size * num_attn_heads * qk_head_dim
+
+            kv_a_dim = kv_lora_rank + qk_rope_head_dim
+            kv_a_proj_flops = 2.0 * hidden_size * kv_a_dim
+            kv_a_proj_weight_elems = hidden_size * kv_a_dim
+            kv_b_out_dim = num_attn_heads * (qk_nope_head_dim + v_head_dim)
+            kv_b_proj_flops = 2.0 * kv_lora_rank * kv_b_out_dim
+            kv_b_proj_weight_elems = kv_lora_rank * kv_b_out_dim
+            o_proj_flops = 2.0 * num_attn_heads * v_head_dim * hidden_size
+            o_proj_weight_elems = num_attn_heads * v_head_dim * hidden_size
+
+            attn_linear_flops = (
+                q_proj_flops + kv_a_proj_flops + kv_b_proj_flops + o_proj_flops
+            )
+            attn_linear_weight_elems_per_layer = (
+                q_proj_weight_elems
+                + kv_a_proj_weight_elems
+                + kv_b_proj_weight_elems
+                + o_proj_weight_elems
+            )
+            attn_dot_flops_per_layer = 2.0 * num_attn_heads * (qk_head_dim + v_head_dim)
+            kv_cache_elems_per_token_per_layer = kv_a_dim
+        else:
+            attn_linear_flops = (
+                2.0 * hidden_size * head_dim * (num_attn_heads + 2.0 * num_kv_heads)
+                + 2.0 * hidden_size * head_dim * num_attn_heads
+            )
+            attn_linear_weight_elems_per_layer = attn_linear_flops / 2.0
+            attn_dot_flops_per_layer = 4.0 * num_attn_heads * head_dim
+            kv_cache_elems_per_token_per_layer = 2.0 * num_kv_heads * head_dim
+
+        # MoE FFN: num_experts_per_tok routed experts (+ shared experts) at
+        # moe_intermediate_size, not the dense intermediate_size.
+        moe_intermediate_size = getattr(hf_text_config, "moe_intermediate_size", None)
+        num_experts_per_tok = getattr(hf_text_config, "num_experts_per_tok", None)
+        if moe_intermediate_size is None and num_experts_per_tok:
+            total_experts = (
+                getattr(hf_text_config, "num_experts", None)
+                or getattr(hf_text_config, "num_local_experts", None)
+                or getattr(hf_text_config, "n_routed_experts", None)
+            )
+            if total_experts:
+                moe_intermediate_size = intermediate_size
+        if moe_intermediate_size and num_experts_per_tok:
+            moe_intermediate_size = float(moe_intermediate_size)
+            shared_expert_count = float(
+                getattr(hf_text_config, "n_shared_experts", None)
+                or getattr(hf_text_config, "num_shared_experts", None)
+                or getattr(hf_text_config, "moe_num_shared_experts", None)
+                or 0
+            )
+            active_expert_units = float(num_experts_per_tok) + shared_expert_count
+            mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
+            mlp_weight_elems_per_layer = (
+                3.0 * hidden_size * moe_intermediate_size * active_expert_units
+            )
+        else:
+            mlp_flops = (
+                6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+            )
+            mlp_weight_elems_per_layer = (
+                3.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+            )
+
         self._linear_flops_per_token = max(
-            0.0, (attn_linear_flops + mlp_flops) * num_layers
+            0.0, attn_linear_flops * num_attn_layers + mlp_flops * num_mlp_layers
         )
 
         # Attention dot-product FLOPs coefficient to multiply token-context product.
-        # attn_qk + attn_av = 4 * q * TC * d * L
-        self._attn_dot_flops_coeff = 4.0 * num_attn_heads * head_dim * num_layers
+        self._attn_dot_flops_coeff = attn_dot_flops_per_layer * num_attn_layers
 
-        # KV cache bytes (write one K and one V vector per generated token).
+        # KV cache bytes per generated token (num_attn_layers, not num_layers).
         self._kv_cache_bytes_per_token = (
-            2.0 * num_layers * num_kv_heads * head_dim * cache_bytes
+            kv_cache_elems_per_token_per_layer * num_attn_layers * cache_bytes
         )
 
         # Weight read bytes per token.
         self._weight_read_bytes_per_token = (
-            hidden_size
-            * head_dim
-            * (num_attn_heads + 2.0 * num_kv_heads)
-            * w_bytes
-            * num_layers
-            + hidden_size * head_dim * num_attn_heads * w_bytes * num_layers
-            + (
-                3.0 * hidden_size * intermediate_size * w_bytes * num_layers
-                if intermediate_size > 0
-                else 0.0
-            )
+            attn_linear_weight_elems_per_layer * w_bytes * num_attn_layers
+            + mlp_weight_elems_per_layer * w_bytes * num_mlp_layers
         )
 
         # Activation movement bytes per token (coarse approximation).
