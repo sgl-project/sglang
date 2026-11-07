@@ -1,6 +1,7 @@
 """CUDA graph executable reuse across capture sizes and rejected updates."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -10,6 +11,37 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+
+class TestClusterDedupSignature(CustomTestCase):
+    def test_cluster_signature_sharing(self):
+        params = SimpleNamespace(
+            kern=0,
+            func=123,
+            blockDimX=256,
+            blockDimY=1,
+            blockDimZ=1,
+            sharedMemBytes=0,
+        )
+        cases = (
+            ((("clusterDim", (2, 1, 1)),), False),
+            ((("clusterDim", (0, 0, 0)),), True),
+            (
+                (("clusterDim", (2, 1, 1)), ("preferredClusterDim", (2, 4, 1))),
+                True,
+            ),
+        )
+        for attrs, can_share in cases:
+            with (
+                self.subTest(attrs=attrs),
+                patch.object(dedup, "cuda_drv"),
+                patch.object(dedup, "checkCudaErrors", return_value=params),
+                patch.object(dedup, "kernel_attrs", return_value=attrs),
+            ):
+                self.assertEqual(
+                    dedup.kernel_node_payload(1) == dedup.kernel_node_payload(2),
+                    can_share,
+                )
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")

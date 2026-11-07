@@ -162,6 +162,7 @@ class FusedRMSNormGate(BaseFusedOp):
         KernelBackend.JIT: {CapabilityRequirement.CUDA},
         KernelBackend.TRITON: {
             CapabilityRequirement.CUDA,
+            CapabilityRequirement.HIP,
         },
     }
 
@@ -192,6 +193,11 @@ class FusedRMSNormGate(BaseFusedOp):
         # This inference-only view must not become a second registered Parameter.
         object.__setattr__(self, "_effective_weight", effective_weight)
         object.__setattr__(self, "_weight_cached", True)
+
+    def refresh_cached_weight(self) -> None:
+        """Re-resolve the norm weight view after a weight load or streamed update."""
+        object.__setattr__(self, "_weight_cached", False)
+        self._ensure_cached_weight()
 
     def backend_eligible(
         self,

@@ -1,0 +1,490 @@
+diff --git a/aiter/ops/flydsl/muse_paged_decode.py b/aiter/ops/flydsl/muse_paged_decode.py
+new file mode 100644
+index 000000000..5a459500b
+--- /dev/null
++++ b/aiter/ops/flydsl/muse_paged_decode.py
+@@ -0,0 +1,484 @@
++# SPDX-License-Identifier: MIT
++"""FlyDSL split-K paged GQA decode prototype for Muse Spark on gfx950.
++
++This intentionally targets only the deployed Muse shape:
++  BF16, q_len=1, GQA=8, head_dim=64, page_size=16.
++
++Stage 1 launches one wave64 per (batch, kv_head, 64-token KV segment). A wave
++keeps all eight GQA query-head accumulators, so K/V are loaded once and shared
++by the eight Q heads. Stage 2 reduces 32 segments (the Muse 2048-token SWA
++window) and writes BF16 output. Full-attention layers keep aiter's existing
++3D kernel, which is already split-K.
++"""
++
++import functools
++import math
++
++import flydsl.compiler as flyc
++import flydsl.expr as fx
++import torch
++from flydsl.expr import arith, range_constexpr
++from flydsl.expr.arith import ArithValue, CmpFPredicate, CmpIPredicate
++from flydsl.expr.typing import Int32, T
++
++from aiter.ops.flydsl.kernels import buffer_ops, vector
++from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
++
++
++HEAD_DIM = 64
++PAGE_SIZE = 16
++GQA = 8
++DEFAULT_NUM_SPLITS = 32
++DEFAULT_SEGMENT_SIZE = 64
++BLOCK_THREADS = 64
++LOG2E = math.log2(math.e)
++
++
++def _build_launcher(num_splits: int, segment_size: int):
++    if num_splits * segment_size != 2048:
++        raise ValueError("Prototype configs must cover the 2048-token SWA window")
++    fm_fast = arith.FastMathFlags.fast
++
++    def wave_sum(x):
++        value = _to_raw(x)
++        for shift in (32, 16, 8, 4, 2, 1):
++            peer = _to_raw(ArithValue(value).shuffle_xor(shift, BLOCK_THREADS))
++            value = arith.AddFOp(value, peer, fastmath=fm_fast).result
++        return value
++
++    def exp_f32(x):
++        f32 = T.f32
++        return fx.rocdl.exp2(
++            f32,
++            arith.mulf(x, arith.constant(LOG2E, type=f32)),
++        )
++
++    def load_bf16_f32(resource, offset):
++        f32 = T.f32
++        value = buffer_ops.buffer_load(
++            resource, _to_raw(offset), vec_width=1, dtype=T.bf16
++        )
++        return arith.extf(f32, value)
++
++    @flyc.kernel(name="muse_paged_gqa_decode_stage1_flydsl")
++    def stage1(
++        query: fx.Tensor,
++        key_cache: fx.Tensor,
++        value_cache: fx.Tensor,
++        seq_lens: fx.Tensor,
++        block_table: fx.Tensor,
++        partial_out: fx.Tensor,
++        partial_max: fx.Tensor,
++        partial_sum: fx.Tensor,
++        batch_size: Int32,
++        num_kv_heads: Int32,
++        block_table_stride: Int32,
++        window_size: Int32,
++        softmax_scale: fx.Float32,
++    ):
++        f32 = T.f32
++        i32 = T.i32
++        pid = fx.block_idx.x
++        lane = fx.thread_idx.x
++
++        c_num_splits = arith.constant(num_splits, type=i32)
++        c_gqa = arith.constant(GQA, type=i32)
++        c_d = arith.constant(HEAD_DIM, type=i32)
++        c_page = arith.constant(PAGE_SIZE, type=i32)
++        c_segment = arith.constant(segment_size, type=i32)
++        c_zero_i32 = arith.constant(0, type=i32)
++        c_zero = arith.constant(0.0, type=f32)
++        c_neg_inf = arith.constant(float("-inf"), type=f32)
++
++        split = arith.remui(_to_raw(pid), c_num_splits)
++        tmp = arith.divui(_to_raw(pid), c_num_splits)
++        kv_head = arith.remui(tmp, _to_raw(num_kv_heads))
++        batch = arith.divui(tmp, _to_raw(num_kv_heads))
++        seq_len_i64 = buffer_ops.buffer_load(
++            buffer_ops.create_buffer_resource(seq_lens, max_size=True),
++            batch,
++            vec_width=1,
++            dtype=T.i64,
++        )
++        seq_len = arith.trunci(i32, seq_len_i64)
++        window_start = arith.subi(seq_len, _to_raw(window_size))
++        window_start = arith.select(
++            arith.cmpi(CmpIPredicate.sgt, window_start, c_zero_i32),
++            window_start,
++            c_zero_i32,
++        )
++        attended_len = arith.subi(seq_len, window_start)
++
++        q_rsrc = buffer_ops.create_buffer_resource(query, max_size=True)
++        k_rsrc = buffer_ops.create_buffer_resource(key_cache, max_size=True)
++        v_rsrc = buffer_ops.create_buffer_resource(value_cache, max_size=True)
++        bt_rsrc = buffer_ops.create_buffer_resource(block_table, max_size=True)
++        po_rsrc = buffer_ops.create_buffer_resource(partial_out, max_size=True)
++        pm_rsrc = buffer_ops.create_buffer_resource(partial_max, max_size=True)
++        ps_rsrc = buffer_ops.create_buffer_resource(partial_sum, max_size=True)
++
++        q_values = []
++        for qg in range_constexpr(GQA):
++            query_head = ArithValue(kv_head) * c_gqa + arith.constant(qg, type=i32)
++            q_offset = (
++                (ArithValue(batch) * ArithValue(num_kv_heads) * c_gqa + query_head)
++                * c_d
++                + lane
++            )
++            q_values.append(load_bf16_f32(q_rsrc, q_offset))
++
++        init = []
++        for _ in range_constexpr(GQA):
++            init.extend((c_neg_inf, c_zero, c_zero))
++
++        for token_i, state in range(0, segment_size, 1, init=init):
++            token = (
++                ArithValue(window_start)
++                + ArithValue(split) * c_segment
++                + arith.index_cast(i32, _to_raw(token_i))
++            )
++            token_in_window = (
++                ArithValue(split) * c_segment
++                + arith.index_cast(i32, _to_raw(token_i))
++            )
++            valid = arith.cmpi(
++                CmpIPredicate.slt, _to_raw(token_in_window), attended_len
++            )
++            safe_token = arith.select(valid, _to_raw(token), c_zero_i32)
++            logical_page = arith.divui(safe_token, c_page)
++            page_offset = arith.remui(safe_token, c_page)
++            bt_offset = (
++                ArithValue(batch) * ArithValue(block_table_stride) + logical_page
++            )
++            physical_page = buffer_ops.buffer_load(
++                bt_rsrc, bt_offset, vec_width=1, dtype=i32
++            )
++            kv_offset = (
++                (
++                    (ArithValue(physical_page) * c_page + page_offset)
++                    * ArithValue(num_kv_heads)
++                    + kv_head
++                )
++                * c_d
++                + lane
++            )
++            key_value = load_bf16_f32(k_rsrc, kv_offset)
++            value_value = load_bf16_f32(v_rsrc, kv_offset)
++
++            next_state = []
++            for qg in range_constexpr(GQA):
++                base = qg * 3
++                old_max = state[base]
++                old_sum = state[base + 1]
++                old_out = state[base + 2]
++
++                dot = wave_sum(
++                    arith.MulFOp(
++                        q_values[qg], key_value, fastmath=fm_fast
++                    ).result
++                )
++                score = arith.MulFOp(
++                    dot, _to_raw(softmax_scale), fastmath=fm_fast
++                ).result
++                score = arith.select(valid, score, c_neg_inf)
++                new_max = arith.maximumf(old_max, score)
++
++                first = arith.cmpf(CmpFPredicate.OEQ, old_max, c_neg_inf)
++                old_scale_active = exp_f32(arith.subf(old_max, new_max))
++                old_scale = arith.select(first, c_zero, old_scale_active)
++                new_scale_active = exp_f32(arith.subf(score, new_max))
++                new_scale = arith.select(valid, new_scale_active, c_zero)
++
++                new_sum = arith.AddFOp(
++                    arith.MulFOp(old_sum, old_scale, fastmath=fm_fast).result,
++                    new_scale,
++                    fastmath=fm_fast,
++                ).result
++                new_out = arith.AddFOp(
++                    arith.MulFOp(old_out, old_scale, fastmath=fm_fast).result,
++                    arith.MulFOp(
++                        new_scale, value_value, fastmath=fm_fast
++                    ).result,
++                    fastmath=fm_fast,
++                ).result
++                next_state.extend((new_max, new_sum, new_out))
++
++            final_state = yield next_state
++
++        for qg in range_constexpr(GQA):
++            base = qg * 3
++            row = (
++                (
++                    (
++                        ArithValue(batch) * ArithValue(num_kv_heads) + kv_head
++                    )
++                    * c_num_splits
++                    + split
++                )
++                * c_gqa
++                + arith.constant(qg, type=i32)
++            )
++            out_offset = ArithValue(row) * c_d + lane
++            buffer_ops.buffer_store(final_state[base + 2], po_rsrc, out_offset)
++            if lane == 0:
++                buffer_ops.buffer_store(final_state[base], pm_rsrc, row)
++                buffer_ops.buffer_store(final_state[base + 1], ps_rsrc, row)
++
++    @flyc.kernel(name="muse_paged_gqa_decode_stage2_flydsl")
++    def stage2(
++        partial_out: fx.Tensor,
++        partial_max: fx.Tensor,
++        partial_sum: fx.Tensor,
++        output: fx.Tensor,
++        batch_size: Int32,
++        num_kv_heads: Int32,
++    ):
++        f32 = T.f32
++        i32 = T.i32
++        pid = fx.block_idx.x
++        lane = fx.thread_idx.x
++        c_gqa = arith.constant(GQA, type=i32)
++        c_d = arith.constant(HEAD_DIM, type=i32)
++        c_splits = arith.constant(num_splits, type=i32)
++        c_zero = arith.constant(0.0, type=f32)
++        c_neg_inf = arith.constant(float("-inf"), type=f32)
++
++        q_head = arith.remui(_to_raw(pid), ArithValue(num_kv_heads) * c_gqa)
++        batch = arith.divui(_to_raw(pid), ArithValue(num_kv_heads) * c_gqa)
++        kv_head = arith.divui(q_head, c_gqa)
++        q_group = arith.remui(q_head, c_gqa)
++
++        po_rsrc = buffer_ops.create_buffer_resource(partial_out, max_size=True)
++        pm_rsrc = buffer_ops.create_buffer_resource(partial_max, max_size=True)
++        ps_rsrc = buffer_ops.create_buffer_resource(partial_sum, max_size=True)
++        out_rsrc = buffer_ops.create_buffer_resource(output, max_size=True)
++
++        init = (c_neg_inf, c_zero, c_zero)
++        for split_i, state in range(0, num_splits, 1, init=init):
++            split = arith.index_cast(i32, _to_raw(split_i))
++            row = (
++                (
++                    (
++                        ArithValue(batch) * ArithValue(num_kv_heads) + kv_head
++                    )
++                    * c_splits
++                    + split
++                )
++                * c_gqa
++                + q_group
++            )
++            part_max = buffer_ops.buffer_load(
++                pm_rsrc, row, vec_width=1, dtype=f32
++            )
++            part_sum = buffer_ops.buffer_load(
++                ps_rsrc, row, vec_width=1, dtype=f32
++            )
++            part_out = buffer_ops.buffer_load(
++                po_rsrc, ArithValue(row) * c_d + lane, vec_width=1, dtype=f32
++            )
++
++            old_max, old_sum, old_out = state
++            valid = arith.cmpf(CmpFPredicate.OGT, part_sum, c_zero)
++            new_max = arith.maximumf(old_max, part_max)
++            first = arith.cmpf(CmpFPredicate.OEQ, old_max, c_neg_inf)
++            old_scale = arith.select(
++                first, c_zero, exp_f32(arith.subf(old_max, new_max))
++            )
++            part_scale = arith.select(
++                valid, exp_f32(arith.subf(part_max, new_max)), c_zero
++            )
++            new_sum = arith.AddFOp(
++                arith.MulFOp(old_sum, old_scale, fastmath=fm_fast).result,
++                arith.MulFOp(part_sum, part_scale, fastmath=fm_fast).result,
++                fastmath=fm_fast,
++            ).result
++            new_out = arith.AddFOp(
++                arith.MulFOp(old_out, old_scale, fastmath=fm_fast).result,
++                arith.MulFOp(part_out, part_scale, fastmath=fm_fast).result,
++                fastmath=fm_fast,
++            ).result
++            final_state = yield (new_max, new_sum, new_out)
++
++        normalized = arith.divf(final_state[2], final_state[1])
++        output_bf16 = arith.truncf(T.bf16, normalized)
++        output_offset = (
++            (ArithValue(batch) * ArithValue(num_kv_heads) * c_gqa + q_head)
++            * c_d
++            + lane
++        )
++        buffer_ops.buffer_store(output_bf16, out_rsrc, output_offset)
++
++    @flyc.jit
++    def launch(
++        query: fx.Tensor,
++        key_cache: fx.Tensor,
++        value_cache: fx.Tensor,
++        seq_lens: fx.Tensor,
++        block_table: fx.Tensor,
++        partial_out: fx.Tensor,
++        partial_max: fx.Tensor,
++        partial_sum: fx.Tensor,
++        output: fx.Tensor,
++        batch_size: fx.Int32,
++        num_kv_heads: fx.Int32,
++        block_table_stride: fx.Int32,
++        window_size: fx.Int32,
++        softmax_scale: fx.Float32,
++        stream: fx.Stream,
++    ):
++        stage1(
++            query,
++            key_cache,
++            value_cache,
++            seq_lens,
++            block_table,
++            partial_out,
++            partial_max,
++            partial_sum,
++            batch_size,
++            num_kv_heads,
++            block_table_stride,
++            window_size,
++            softmax_scale,
++        ).launch(
++            grid=(
++                fx.Int64(batch_size)
++                * fx.Int64(num_kv_heads)
++                * num_splits,
++                1,
++                1,
++            ),
++            block=(BLOCK_THREADS, 1, 1),
++            stream=stream,
++        )
++        stage2(
++            partial_out,
++            partial_max,
++            partial_sum,
++            output,
++            batch_size,
++            num_kv_heads,
++        ).launch(
++            grid=(
++                fx.Int64(batch_size)
++                * fx.Int64(num_kv_heads)
++                * GQA,
++                1,
++                1,
++            ),
++            block=(BLOCK_THREADS, 1, 1),
++            stream=stream,
++        )
++
++    return launch
++
++
++@functools.lru_cache(maxsize=8)
++def _launcher(num_splits: int, segment_size: int):
++    return _build_launcher(num_splits, segment_size)
++
++
++_SCRATCH_CACHE = {}
++
++
++def prepare_muse_paged_gqa_decode_scratch(
++    device: torch.device | str,
++    batches=range(1, 9),
++    num_kv_heads: int = 2,
++    num_splits: int = 128,
++):
++    """Preallocate graph-stable scratch for small Muse decode batches."""
++    device = torch.device(device)
++    for batch in batches:
++        key = (device, int(batch), num_kv_heads, num_splits)
++        if key in _SCRATCH_CACHE:
++            continue
++        rows = int(batch) * num_kv_heads * num_splits * GQA
++        partial_out = torch.empty(
++            rows, HEAD_DIM, dtype=torch.float32, device=device
++        )
++        partial_max = torch.empty(rows, dtype=torch.float32, device=device)
++        partial_sum = torch.empty_like(partial_max)
++        _SCRATCH_CACHE[key] = (partial_out, partial_max, partial_sum)
++
++
++def muse_paged_gqa_decode_flydsl(
++    q: torch.Tensor,
++    k_cache: torch.Tensor,
++    v_cache: torch.Tensor,
++    seq_lens: torch.Tensor,
++    block_table: torch.Tensor,
++    out: torch.Tensor | None = None,
++    softmax_scale: float | None = None,
++    window_size: int = 2048,
++    num_splits: int = DEFAULT_NUM_SPLITS,
++    segment_size: int = DEFAULT_SEGMENT_SIZE,
++    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
++):
++    """Run the Muse-specialized FlyDSL split-K decode kernel.
++
++    Expected layouts:
++      q         [B, Hq, 64]
++      k/v cache [num_pages, 16, Hkv, 64]
++      table     [B, max_pages], int32
++    """
++    batch, num_q_heads, head_dim = q.shape
++    num_kv_heads = k_cache.shape[2]
++    if (
++        q.dtype != torch.bfloat16
++        or k_cache.dtype != torch.bfloat16
++        or v_cache.dtype != torch.bfloat16
++        or head_dim != HEAD_DIM
++        or k_cache.shape[1] != PAGE_SIZE
++        or num_q_heads != num_kv_heads * GQA
++        or seq_lens.dtype != torch.int64
++        or block_table.dtype != torch.int32
++    ):
++        raise ValueError(
++            "FlyDSL Muse decode requires BF16, d64, page16, GQA8 and int32 "
++            f"metadata; got q={q.dtype}/{tuple(q.shape)}, "
++            f"k={k_cache.dtype}/{tuple(k_cache.shape)}, "
++            f"v={v_cache.dtype}/{tuple(v_cache.shape)}, "
++            f"seq={seq_lens.dtype}/{tuple(seq_lens.shape)}, "
++            f"table={block_table.dtype}/{tuple(block_table.shape)}"
++        )
++    if out is None:
++        out = torch.empty_like(q)
++    if num_splits * segment_size < window_size:
++        raise ValueError("split coverage must be at least window_size")
++    rows = batch * num_kv_heads * num_splits * GQA
++    if scratch is None:
++        prepare_muse_paged_gqa_decode_scratch(
++            q.device,
++            batches=(batch,),
++            num_kv_heads=num_kv_heads,
++            num_splits=num_splits,
++        )
++        partial_out, partial_max, partial_sum = _SCRATCH_CACHE[
++            (q.device, batch, num_kv_heads, num_splits)
++        ]
++    else:
++        partial_out, partial_max, partial_sum = scratch
++    if softmax_scale is None:
++        softmax_scale = HEAD_DIM**-0.5
++    stream = torch.cuda.current_stream(q.device).cuda_stream
++    _run_compiled(
++        _launcher(num_splits, segment_size),
++        q,
++        k_cache,
++        v_cache,
++        seq_lens,
++        block_table,
++        partial_out,
++        partial_max,
++        partial_sum,
++        out,
++        batch,
++        num_kv_heads,
++        block_table.stride(0),
++        window_size,
++        float(softmax_scale),
++        fx.Stream(stream),
++    )
++    return out, (partial_out, partial_max, partial_sum)
++

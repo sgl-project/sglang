@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import logging
 from collections.abc import Iterable
 from typing import Optional
 
@@ -15,6 +16,7 @@ from sglang.srt.layers.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.muse_spark.muse_spark_audio import AudioEncoder
 from sglang.srt.layers.muse_spark.muse_spark_layers import MuseSpark1xRMSNorm
 from sglang.srt.layers.muse_spark.muse_spark_navit import (
@@ -39,6 +41,8 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.runtime_context import get_disagg, get_mm, get_parallel
 from sglang.srt.utils import add_prefix, is_cpu
+
+logger = logging.getLogger(__name__)
 
 
 def _run_dp_sharded_encode(
@@ -239,6 +243,17 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
         forward_batch: ForwardBatch,
         input_embeds: Optional[torch.Tensor] = None,
     ):
+        # Covers the text embedding norm too; the decoder's own scope nests.
+        with expert_tp.default_fused_ops_for_single_request(forward_batch):
+            return self._forward_omni(input_ids, positions, forward_batch, input_embeds)
+
+    def _forward_omni(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+    ):
         if input_ids is None:
             if input_embeds is None:
                 raise ValueError("input_embeds is required for multimodal forwarding")
@@ -418,6 +433,14 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         parameters = dict(self.named_parameters())
 
+        # The released Quark MXFP4 export also carries a second set of multimodal towers
+        # in the pre-release layout -- vision_model.* and modalities.* -- with different
+        # weights and no counterpart under model.vision_tower.* / model.audio_tower.*,
+        # which are complete on their own. Those strays are counted per root and left
+        # unread rather than force-fitted. The BF16 and NVFP4 releases do not ship them.
+        stray_roots = ("vision_model.", "modalities.")
+        stray = {}
+
         def text_weights():
             for name, weight in weights:
                 if name.startswith("model.language_model.") or name == "lm_head.weight":
@@ -432,6 +455,10 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
                         "model.audio_tower.",
                     )
                 ):
+                    continue
+                if name.startswith(stray_roots) and name not in parameters:
+                    root = name.split(".", 2)[0] + "." + name.split(".", 2)[1]
+                    stray[root] = stray.get(root, 0) + 1
                     continue
                 if ".attn." in name:
                     for projection in ("q", "k", "v"):
@@ -469,6 +496,13 @@ class MuseSparkForConditionalGeneration(MuseSparkTextForCausalLM):
                 pass
         else:
             super().load_weights(text_weights())
+        if stray:
+            logger.warning(
+                "Skipped stray pre-release-layout tensors that no parameter claims "
+                "(%s); the checkpoint carries a second set of towers beside "
+                "model.vision_tower.* / model.audio_tower.*.",
+                ", ".join(f"{root}*={n}" for root, n in sorted(stray.items())),
+            )
 
 
 EntryClass = [MuseSparkForConditionalGeneration]

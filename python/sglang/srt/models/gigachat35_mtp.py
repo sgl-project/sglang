@@ -144,6 +144,7 @@ class GigaChat35ForCausalLMNextN(DeepseekV2WeightLoaderMixin, nn.Module):
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
         self.num_fused_shared_experts = 0
+        self.init_unified_loader_mappings()
         self.draft_model_idx = draft_model_idx or 0
 
         self.model = GigaChat35ModelNextN(

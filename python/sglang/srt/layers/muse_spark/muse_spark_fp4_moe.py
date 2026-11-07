@@ -29,9 +29,13 @@ from sglang.kernels.ops.layernorm.muse_spark_rmsnorm_nvfp4_quant import (
 from sglang.kernels.ops.moe.muse_spark_post_expert_finalize_triton import (
     fused_post_expert_norm_weighted_sum,
 )
+from sglang.srt.distributed import get_moe_tp_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunnerBackend, get_moe_runner_backend
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.muse_spark import muse_spark_expert_tp as expert_tp
 from sglang.srt.layers.muse_spark.muse_spark_nvfp4_moe import (
+    _DROPPED_CHECKPOINT_LAYOUT_ERROR,
     MuseSparkNvFp4FusedMoEMethod,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -51,6 +55,10 @@ _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
 
 _MARLIN_SHAPE_ALIGNMENT = 64
 _MARLIN_BLOCK_SIZE_M_CANDIDATES = (8, 16, 32, 48, 64)
+
+
+def _native_finalize_enabled() -> bool:
+    return envs.SGLANG_USE_MUSE_SPARK_NVFP4_NATIVE_FINALIZE.get()
 
 
 def _resolve_moe_runner_backend():
@@ -98,6 +106,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         params_dtype: Optional[torch.dtype] = None,
     ) -> None:
         super().__init__()
+        intermediate_size, self.expert_tp = expert_tp.partition(intermediate_size)
         # create_weights sizes the activation scales from ``num_experts``, so it
         # must be the LOCAL count; the kernel separately wants the global count.
         self.num_experts = num_local_experts
@@ -128,9 +137,15 @@ class MuseSpark1xFp4Experts(nn.Module):
             inplace=False,
         )
         self.dispatcher = _DirectDispatcher()
+        self.helion_verify_bank = None
 
         capability = get_device_capability() if is_cuda() else None
         self.use_marlin = self.moe_runner_backend.is_marlin()
+        if self.use_marlin and self.expert_tp:
+            raise ValueError(
+                "Muse NVFP4 expert TP needs FlashInfer's TRT-LLM MoE: the Marlin "
+                "path does not reduce the expert-TP partials. Use EP equal to TP."
+            )
         self._sm_major = capability[0] if capability is not None else 0
         if not self.use_marlin and capability is not None and capability < (10, 0):
             raise ValueError(
@@ -152,7 +167,6 @@ class MuseSpark1xFp4Experts(nn.Module):
                 "Marlin preparation asserts on the unpadded shape instead of "
                 "padding."
             )
-
         # post_expert_norm is unknown until set_post_expert_norm; start with the
         # OSS default (standard, eps=1e-8) and rebuild when the real module arrives.
         self._post_expert_norm: Optional[nn.Module] = None
@@ -174,6 +188,8 @@ class MuseSpark1xFp4Experts(nn.Module):
             expert_map[start : start + num_local_experts] = torch.arange(
                 num_local_experts, dtype=torch.int32
             )
+            # Routing table derived from the EP layout; no weight update writes it.
+            expert_map._skip_weight_check = True
         self.register_buffer("_expert_map", expert_map, persistent=False)
 
         self.quant_method = MuseSparkNvFp4FusedMoEMethod(quant_config)
@@ -195,6 +211,89 @@ class MuseSpark1xFp4Experts(nn.Module):
         if self.use_marlin:
             self.w13_blockscale_swizzled = None
             self.w2_blockscale_swizzled = None
+
+    @torch.no_grad()
+    def load_expert_tensor(
+        self,
+        *,
+        projection: str,
+        suffix: str,
+        expert_id: int,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        """Copy one expert's checkpoint-layout tensor into the expert stacks.
+
+        ``projection`` is ``gate_proj``, ``up_proj`` or ``down_proj``; ``suffix``
+        is ``weight``, ``weight_scale``, ``weight_scale_2`` or ``input_scale``.
+        Gate and up fill their own rows of ``gate_up_proj`` and their own column
+        of its per-expert ``[gate, up]`` scalars. Experts owned by other EP
+        ranks are ignored.
+        """
+        self.check_checkpoint_layout_writable()
+        local_id = expert_id - self.local_expert_offset
+        if not 0 <= local_id < self.num_local_experts:
+            return
+        target = self._checkpoint_slot(projection, suffix, local_id)
+        if suffix in ("weight", "weight_scale"):
+            # Packed e2m1 bytes and e4m3 block scales: a dtype cast would corrupt them.
+            matches = (
+                target.shape == loaded_weight.shape
+                and target.dtype == loaded_weight.dtype
+            )
+        else:
+            matches = loaded_weight.numel() == 1
+        if not matches:
+            raise RuntimeError(
+                f"Expert {suffix} mismatch for expert {expert_id} {projection}: "
+                f"parameter={tuple(target.shape)} {target.dtype}, "
+                f"checkpoint={tuple(loaded_weight.shape)} {loaded_weight.dtype}"
+            )
+        target.copy_(loaded_weight.reshape(target.shape))
+        if self.use_marlin:
+            self.nvfp4_stale_experts.add(local_id)
+
+    def mark_checkpoint_layout_written(self) -> None:
+        """A whole-stack load rewrote every local expert."""
+        if self.use_marlin:
+            self.nvfp4_stale_experts.update(range(self.num_local_experts))
+
+    def check_checkpoint_layout_writable(self) -> None:
+        if not self.nvfp4_weights_prepared:
+            return
+        if not self.use_marlin:
+            raise NotImplementedError(
+                "Per-expert NVFP4 weight updates are implemented for the Marlin "
+                "backend only; the TRT-LLM experts hold shuffled weights."
+            )
+        if not self.quant_method.keep_checkpoint_layout:
+            raise ValueError(_DROPPED_CHECKPOINT_LAYOUT_ERROR)
+
+    def _checkpoint_slot(
+        self, projection: str, suffix: str, local_id: int
+    ) -> torch.Tensor:
+        stack = "down_proj" if projection == "down_proj" else "gate_up_proj"
+        param = getattr(self, stack if suffix == "weight" else f"{stack}_{suffix}")
+        slot = param.data[local_id]
+        if projection == "down_proj":
+            return slot
+        half = 0 if projection == "gate_proj" else 1
+        if suffix in ("weight", "weight_scale"):
+            size = self.intermediate_size_per_partition
+            return slot.narrow(0, half * size, size)
+        return slot[half]
+
+    @torch.no_grad()
+    def refresh_after_weight_load(self) -> None:
+        """Refresh kernel-side copies of the weights in place after a load or update."""
+        if (
+            self._post_expert_norm is not None
+            and self._post_expert_norm_weight is not None
+        ):
+            weight = self._post_expert_norm._get_effective_weight()
+            if weight is not None:
+                self._post_expert_norm_weight.copy_(weight.detach())
+        if self.use_marlin:
+            self.quant_method.refresh_marlin_weights(self)
 
     @torch.no_grad()
     def set_post_expert_norm(self, post_expert_norm: Optional[nn.Module]) -> None:
@@ -249,6 +348,71 @@ class MuseSpark1xFp4Experts(nn.Module):
                 eps=eps,
                 weight_first=weight_first,
             )
+
+    def bind_helion_verify_bank(self) -> None:
+        """Build the verify megakernel bank (collective over the MoE-TP group) and
+        rebind FI W13 to views of it. FI W2 stays resident for the stock path."""
+        from sglang.kernels.ops.speculative.muse_spark_helion.integration import (
+            DERIVED_WEIGHT_CACHE_ERROR,
+            require_helion_features,
+        )
+        from sglang.kernels.ops.speculative.muse_spark_helion.moe_tp4_verify_megakernel import (
+            build_moe_tp4_verify_bank,
+        )
+
+        require_helion_features()
+        # The bank is derived from the loaded weights; updates would leave it stale.
+        self._derived_weight_cache_error = DERIVED_WEIGHT_CACHE_ERROR
+        bank = build_moe_tp4_verify_bank(
+            w13=self.gate_up_proj,
+            w13_scale=self.gate_up_proj_weight_scale,
+            w2=self.down_proj,
+            w2_scale=self.down_proj_weight_scale,
+            group=get_moe_tp_group().device_group,
+        )
+        scale = self.gate_up_proj_weight_scale
+        self.gate_up_proj.data = bank.w13.view(self.gate_up_proj.dtype)
+        scale.data = bank.w13_scale.view(scale.dtype).view(scale.shape)
+        self.helion_verify_bank = bank
+
+    def forward_helion_verify(
+        self,
+        *,
+        hs_fp4: torch.Tensor,
+        hs_scale: torch.Tensor,
+        per_token_scale: torch.Tensor,
+        packed_topk_ids: torch.Tensor,
+        post_expert_norm: nn.Module,
+    ) -> torch.Tensor:
+        """16-token experts and post-expert norm on the Helion MoE megakernel;
+        returns the route sum, replicated on every MoE-TP rank."""
+        from sglang.kernels.ops.speculative.muse_spark_helion.moe_tp4_verify_megakernel import (
+            get_moe_tp4_verify_megakernel,
+        )
+
+        if self._post_expert_norm is not post_expert_norm:
+            self.set_post_expert_norm(post_expert_norm)
+        if not self._post_expert_norm_weight_first:
+            raise RuntimeError(
+                "the Helion verify MoE megakernel fuses only the weight-first "
+                "post-expert norm"
+            )
+        megakernel = get_moe_tp4_verify_megakernel(
+            device=hs_fp4.device,
+            group=get_moe_tp_group().device_group,
+            norm_eps=self._post_expert_norm_eps,
+        )
+        return megakernel(
+            bank=self.helion_verify_bank,
+            packed_routing=packed_topk_ids,
+            hidden_states=hs_fp4,
+            hidden_states_scale=hs_scale,
+            per_token_scale=per_token_scale,
+            output1_scale_scalar=self.g1_scale_c,
+            output1_scale_gate_scalar=self.g1_alphas,
+            output2_scale_scalar=self.g2_alphas,
+            norm_weight=self._post_expert_norm_weight,
+        )
 
     def _pre_norm_weight(self, pre_expert_norm: nn.Module) -> Optional[torch.Tensor]:
         weight = pre_expert_norm._get_effective_weight()
@@ -334,6 +498,8 @@ class MuseSpark1xFp4Experts(nn.Module):
         out_dtype: torch.dtype,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
+        if self.expert_tp:
+            deferred_output = expert_tp.reduce_deferred(deferred_output)
         use_fused = (
             self._post_expert_norm is not None
             and self._post_expert_norm is post_expert_norm
@@ -367,7 +533,12 @@ class MuseSpark1xFp4Experts(nn.Module):
             dtype=torch.bfloat16,
             device=deferred_output.gemm2_out.device,
         )
-        self._fused_finalize_op(
+        finalize = (
+            self._fused_finalize_op.forward_native
+            if _native_finalize_enabled()
+            else self._fused_finalize_op
+        )
+        finalize(
             gemm2_output=deferred_output.gemm2_out,
             expert_weights=deferred_output.expert_weights,
             expanded_idx_to_permuted_idx=(deferred_output.expanded_idx_to_permuted_idx),
@@ -449,6 +620,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         )
         cache1 = cache13[: num_tokens * topk * gemm1_n].view(-1, gemm1_n)
         cache3 = cache13[: num_tokens * topk * size_k].view(-1, size_k)
+        use_atomic_add = hidden_states.dtype == torch.half or self._sm_major >= 9
 
         cache1 = moe_wna16_marlin_gemm(
             hidden_states,
@@ -486,6 +658,8 @@ class MuseSpark1xFp4Experts(nn.Module):
             expert_ids=local_topk_ids.view(-1),
             expert_step=1,
         )
+        if _native_finalize_enabled():
+            cache3.zero_()
         return moe_wna16_marlin_gemm(
             cache2,
             cache3,
@@ -510,7 +684,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             size_n=size_k,
             size_k=size_n,
             is_k_full=True,
-            use_atomic_add=False,
+            use_atomic_add=_native_finalize_enabled() and use_atomic_add,
             use_fp32_reduce=True,
             is_zp_float=False,
             expert_ids_are_sorted=True,
@@ -543,7 +717,7 @@ class MuseSpark1xFp4Experts(nn.Module):
         )
         if self._post_expert_norm is not post_expert_norm:
             self.set_post_expert_norm(post_expert_norm)
-        if self._post_expert_norm_weight is not None:
+        if self._post_expert_norm_weight is not None and not _native_finalize_enabled():
             return fused_post_expert_norm_weighted_sum(
                 expert_outputs,
                 topk_scores,
@@ -662,6 +836,23 @@ class MuseSpark1xFp4Experts(nn.Module):
         if prepared_input is None:
             prepared_input = self.prepare_input(hidden_states, pre_expert_norm)
         hs_fp4, hs_scale, per_token_scale = prepared_input
+        # The MoE megakernel's 16 rows; shorter verify windows run it padded
+        # through the layer megakernels, not here.
+        if (
+            self.helion_verify_bank is not None
+            and num_tokens == 16
+            and packed_topk_ids is not None
+            and per_token_scale is not None
+            and post_expert_norm is not None
+            and ar_workspace is None
+        ):
+            return self.forward_helion_verify(
+                hs_fp4=hs_fp4,
+                hs_scale=hs_scale,
+                per_token_scale=per_token_scale,
+                packed_topk_ids=packed_topk_ids,
+                post_expert_norm=post_expert_norm,
+            )
         # Preserve Muse's packed fast path; the upstream FlashInfer API also
         # accepts materialized IDs and FP32 routing weights directly.
         routing = packed_topk_ids
