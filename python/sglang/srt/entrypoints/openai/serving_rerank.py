@@ -439,7 +439,9 @@ class OpenAIServingRerank(OpenAIServingBase):
                         "temperature": 0,
                     },
                     return_logprob=True,
-                    top_logprobs_num=50,  # Get enough logprobs to find yes/no tokens
+                    # Request the two label tokens directly: either can rank
+                    # outside any fixed top-k list.
+                    token_ids_logprob=[self._yes_token_id, self._no_token_id],
                     logprob_start_len=0,
                 )
 
@@ -536,10 +538,12 @@ class OpenAIServingRerank(OpenAIServingBase):
         """Extract reranking score from generation response with logprobs."""
         # Get logprobs from the response
         meta_info = ret.get("meta_info", {})
-        output_top_logprobs = meta_info.get("output_top_logprobs", [])
+        output_token_ids_logprobs = meta_info.get("output_token_ids_logprobs", [])
 
-        # Use output_top_logprobs[0] - the model's prediction for the first generated token
-        top_logprobs = output_top_logprobs[0] if output_top_logprobs else []
+        # Use the requested yes/no logprobs of the first generated token
+        label_logprobs = (
+            output_token_ids_logprobs[0] if output_token_ids_logprobs else []
+        )
 
         # Find yes and no token probabilities
         # Format: list of tuples (logprob, token_id, token_text)
@@ -548,7 +552,7 @@ class OpenAIServingRerank(OpenAIServingBase):
         found_yes = False
         found_no = False
 
-        for item in top_logprobs:
+        for item in label_logprobs:
             logprob, token_id = item[0], item[1]
             if token_id == self._yes_token_id:
                 p_yes = math.exp(logprob)
