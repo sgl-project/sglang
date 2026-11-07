@@ -1409,33 +1409,6 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
     @requires_hicache
     @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
-        "one FULL page_size=4 fixture covers the host-tier occupancy gauges",
-    )
-    def test_host_storage_occupancy_counts_l3_writes_until_ack(self):
-        """L2->L3 writes stay counted as in-flight host tokens until their
-        storage ack drains, and the staging cap is the controller's limit."""
-        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
-        self._init_hicache(
-            cache, storage_backend="file", storage_dir=self._make_storage_dir()
-        )
-        seq = self._make_seq(1, 3)
-        self._insert(cache, allocator, req_to_token_pool, seq)
-        leaf = cache.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", seq)))
-        ).last_device_node
-        # Write-through publishes each node to L2 and queues its L3 write at once.
-        self._backup_node(cache, leaf)
-
-        limit = cache.cache_controller.prefetch_capacity_limit
-        self.assertGreater(limit, 0)
-        self.assertEqual(cache.host_storage_occupancy(), (0, limit, len(seq)))
-        self._flush_l3_backups(cache)
-        self.assertEqual(cache.host_storage_occupancy(), (0, limit, 0))
-        cache.sanity_check()
-
-    @requires_hicache
-    @requires(
-        lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
         "one FULL page_size=4 fixture covers the decode L3 promise",
     )
     def test_decode_promises_only_the_prefetched_l3_span(self):

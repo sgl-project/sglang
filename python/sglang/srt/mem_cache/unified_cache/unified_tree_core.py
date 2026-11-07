@@ -3703,6 +3703,39 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def mamba_protected_size(self) -> int:
         return self.component_protected_size_.get(self.slot_id(TREE_STATE), 0)
 
+    def full_host_occupancy(self, include_duplicates: bool) -> tuple[int, int]:
+        mirror = 0
+        reclaimable = 0
+        reclaimable_subtree: set[int] = set()
+        # Pre-order reversed: every child is visited before its parent.
+        for node in reversed(self._collect_all_nodes()):
+            if node is self.root_node:
+                continue
+            host_value = node.component_data[BASE_COMPONENT_TYPE].host_value
+            if not node.evicted:
+                if host_value is not None:
+                    mirror += len(host_value)
+                    if include_duplicates and self._can_reclaim_full_host_duplicate(
+                        node
+                    ):
+                        reclaimable += len(host_value)
+                continue
+            # Host eviction takes a host-only node once it is a host leaf, so
+            # its whole subtree must be reclaimable first.
+            if (
+                node.backuped
+                and not any(
+                    cd.host_lock_ref > 0 or cd.lock_ref > 0
+                    for cd in node.component_data
+                )
+                and all(
+                    child.id in reclaimable_subtree for child in node.children.values()
+                )
+            ):
+                reclaimable += len(host_value)
+                reclaimable_subtree.add(node.id)
+        return mirror, reclaimable
+
     def total_size(self) -> tuple[int, int]:
         total_size = 0
         total_aux_size = 0

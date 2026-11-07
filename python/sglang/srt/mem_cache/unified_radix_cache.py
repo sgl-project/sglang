@@ -181,14 +181,6 @@ class _OngoingWriteThrough(NamedTuple):
     publish_node_ids: list[NodeId]
 
 
-class _OngoingStorageBackup(NamedTuple):
-    """Tracks an in-flight H→L3 backup; the node stays host-pinned until it acks."""
-
-    node_id: NodeId
-    lock_params: DecLockRefParams
-    num_tokens: int
-
-
 class _OngoingLoadBack(NamedTuple):
     """Tracks an in-flight H→D load-back operation."""
 
@@ -518,7 +510,10 @@ class UnifiedRadixCache(BasePrefixCache):
             CacheRequestHandle, int
         ] = {}
         self.storage_prefetch_retries = StoragePrefetchRetries()
-        self.ongoing_backup: dict[int, _OngoingStorageBackup] = {}
+        self.ongoing_backup: dict[int, tuple[NodeId, DecLockRefParams]] = {}
+        # host_tier_occupancy walks the tree; metrics read it at most this often.
+        self._host_tier_occupancy: tuple[int, int, int] = (0, 0, 0)
+        self._host_tier_occupancy_at = float("-inf")
         if self.buffer_pipeline is not None:
             self.buffer_pipeline.reset()
             # The dropped writes' content no longer reaches a storage ack.
@@ -2406,10 +2401,9 @@ class UnifiedRadixCache(BasePrefixCache):
             spec.prefix_keys,
             extra_pools=aux_xfers or None,
         )
-        self.ongoing_backup[operation_id] = _OngoingStorageBackup(
+        self.ongoing_backup[operation_id] = (
             node_id,
             self.inc_host_lock_ref(node_id).to_dec_params(),
-            len(spec.host_value),
         )
 
     def is_backuped(self, node_id: NodeId) -> bool:
@@ -3295,16 +3289,24 @@ class UnifiedRadixCache(BasePrefixCache):
         stats["l1l2_miss_tokens"] += requested
         stats["l3_miss_tokens"] += miss
 
-    def host_storage_occupancy(self) -> tuple[int, int, int]:
-        """Host tokens held by L3 traffic: (prefetch staging, the staging cap,
-        backups awaiting the L3 ack); all 0 without a storage backend."""
+    def host_tier_occupancy(self, max_age_s: float = 1.0) -> tuple[int, int, int]:
+        """Full host-tier breakdown: (host copies of device-resident KV, L3->L2
+        prefetch staging, room a storage prefetch could obtain now). The tree
+        walk is refreshed at most every ``max_age_s`` seconds."""
         cc = self.cache_controller
-        if not self.enable_storage or cc is None:
+        if cc is None:
             return 0, 0, 0
-        backup_inflight = sum(
-            entry.num_tokens for entry in self.ongoing_backup.values()
-        )
-        return cc.prefetch_tokens_occupied, cc.prefetch_capacity_limit, backup_inflight
+        now = time.monotonic()
+        if now - self._host_tier_occupancy_at >= max_age_s:
+            mirror, reclaimable = self.tree_core.full_host_occupancy(
+                self.is_write_back
+                and not envs.SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM.get()
+            )
+            staging = cc.prefetch_tokens_occupied if self.enable_storage else 0
+            room = cc.mem_pool_host.available_size() + reclaimable
+            self._host_tier_occupancy = (mirror, staging, room)
+            self._host_tier_occupancy_at = now
+        return self._host_tier_occupancy
 
     def prefetch_outcome_stats_snapshot(self) -> dict:
         return self._prefetch_outcome_stats.copy()
@@ -3668,7 +3670,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 else:
                     entry = self.ongoing_backup.pop(operation.id, None)
                     if entry is not None:
-                        self.dec_host_lock_ref(entry.node_id, entry.lock_params)
+                        node_id, lock_params = entry
+                        self.dec_host_lock_ref(node_id, lock_params)
                 if (
                     log_metrics
                     and self.enable_storage_metrics

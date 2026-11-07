@@ -168,12 +168,13 @@ class SchedulerStats:
     # HiCache metrics
     hicache_host_used_tokens: int = 0
     hicache_host_total_tokens: int = 0
-    # Host tokens held by L3->L2 prefetches that have not joined the tree yet,
-    # and the cap new prefetches stop at; both stay 0 without a storage backend.
+    # What fills the host tier: copies of device-resident KV, and L3->L2
+    # prefetches not yet in the tree (0 without a storage backend).
+    hicache_host_device_mirror_tokens: int = 0
+    hicache_storage_enabled: bool = False
     hicache_host_prefetch_staging_tokens: int = 0
-    hicache_host_prefetch_staging_limit_tokens: int = 0
-    # Host tokens pinned until their L2->L3 write is acknowledged.
-    hicache_host_storage_backup_inflight_tokens: int = 0
+    # Host tokens a storage prefetch could obtain now: free plus reclaimable.
+    hicache_host_prefetch_room_tokens: int = 0
     # Host Mamba state pool of hybrid-SSM models; stays 0/0 when there is none.
     hicache_host_mamba_used_states: int = 0
     hicache_host_mamba_total_states: int = 0
@@ -790,30 +791,31 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
+            self.hicache_host_device_mirror_tokens = Gauge(
+                name="sglang:hicache_host_device_mirror_tokens",
+                documentation="Host KV tokens whose node is still on the "
+                "device: host copies of device-resident KV. Under write_through "
+                "this tracks device usage, so the host tier keeps only "
+                "hicache_host_total_tokens minus this for anything else.",
+                labelnames=labels.keys(),
+                multiprocess_mode="mostrecent",
+            )
             self.hicache_host_prefetch_staging_tokens = Gauge(
                 name="sglang:hicache_host_prefetch_staging_tokens",
                 documentation="Host KV tokens held by L3->L2 prefetches that "
-                "have not joined the cache tree yet. They cannot be evicted, so "
-                "with hicache_host_used_tokens they show how much of the host "
-                "tier is free to absorb device evictions.",
+                "have not joined the cache tree yet. Exported only with a "
+                "storage backend.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
-            self.hicache_host_prefetch_staging_limit_tokens = Gauge(
-                name="sglang:hicache_host_prefetch_staging_limit_tokens",
-                documentation="Prefetch staging level at which new L3->L2 "
-                "prefetches are declined; see "
-                "sglang:storage_prefetch_rate_limited_tokens_total.",
-                labelnames=labels.keys(),
-                multiprocess_mode="mostrecent",
-            )
-            self.hicache_host_storage_backup_inflight_tokens = Gauge(
-                name="sglang:hicache_host_storage_backup_inflight_tokens",
-                documentation="Host KV tokens whose L2->L3 write is in flight. "
-                "They stay pinned in the host tier until the storage backend "
-                "acknowledges the write; a rising value means L3 writes lag "
-                "behind host-tier churn. Cache host-memory mode only; "
-                "buffer_only mode stages its writes elsewhere and reports 0.",
+            self.hicache_host_prefetch_room_tokens = Gauge(
+                name="sglang:hicache_host_prefetch_room_tokens",
+                documentation="Host KV tokens a storage prefetch could obtain "
+                "now: free slots plus host-only tokens host eviction can "
+                "reclaim (nothing pinned or in flight in their subtree). A "
+                "hybrid-pool model (sliding-window or Mamba) drops any storage "
+                "hit longer than this instead of shortening it. With a shared "
+                "host allocation domain this counts the anchor KV pool.",
                 labelnames=labels.keys(),
                 multiprocess_mode="mostrecent",
             )
@@ -1775,19 +1777,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             self._log_gauge(
                 self.hicache_host_total_tokens, stats.hicache_host_total_tokens
             )
-            # Without a storage backend these stay 0; skip the series.
-            if stats.hicache_host_prefetch_staging_limit_tokens > 0:
+            self._log_gauge(
+                self.hicache_host_device_mirror_tokens,
+                stats.hicache_host_device_mirror_tokens,
+            )
+            self._log_gauge(
+                self.hicache_host_prefetch_room_tokens,
+                stats.hicache_host_prefetch_room_tokens,
+            )
+            if stats.hicache_storage_enabled:
                 self._log_gauge(
                     self.hicache_host_prefetch_staging_tokens,
                     stats.hicache_host_prefetch_staging_tokens,
-                )
-                self._log_gauge(
-                    self.hicache_host_prefetch_staging_limit_tokens,
-                    stats.hicache_host_prefetch_staging_limit_tokens,
-                )
-                self._log_gauge(
-                    self.hicache_host_storage_backup_inflight_tokens,
-                    stats.hicache_host_storage_backup_inflight_tokens,
                 )
             # Non-hybrid models have no host Mamba pool; skip the series rather
             # than exporting a permanent 0/0.
@@ -2330,8 +2331,8 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
         self.storage_prefetch_rate_limited_tokens_total = Counter(
             name="sglang:storage_prefetch_rate_limited_tokens_total",
             documentation="Prefetch-candidate tokens whose L3 lookup was "
-            "skipped because L3->L2 prefetch staging reached "
-            "sglang:hicache_host_prefetch_staging_limit_tokens. Attempt-level: "
+            "skipped because L3->L2 prefetch staging reached its cap (half "
+            "the host pool in cache mode). Attempt-level: "
             "a request that retries after staging drains counts again.",
             labelnames=labels.keys(),
         )
