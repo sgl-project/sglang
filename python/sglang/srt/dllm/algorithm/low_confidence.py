@@ -12,6 +12,8 @@ class LowConfidence(DllmAlgorithm):
     threshold (falling back to the highest-confidence masked position).
     """
 
+    config_keys = ("threshold",)
+
     def __init__(self, config: DllmConfig):
         super().__init__(config)
         self.threshold = config.algorithm_config.get("threshold", 0.95)
