@@ -440,7 +440,7 @@ class Step3p5DecoderLayer(nn.Module):
         enable_sliding_window = layer_types[layer_id] == "sliding_attention"
 
         if enable_sliding_window:
-            self.sliding_window = config.sliding_window
+            self.sliding_window = config.sliding_window - 1
             self.num_attention_heads = config.attention_other_setting[
                 "num_attention_heads"
             ]
