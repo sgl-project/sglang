@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     normalize_dtype,
     plan_unified_kv,
 )
-from sglang.srt.mem_cache.kv.memory.views import MLAKVView
+from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
@@ -296,6 +296,36 @@ class PrefetchOperation(StorageOperation):
     def is_terminated(self) -> bool:
         with self._lock:
             return self._terminated_flag
+
+
+def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
+    """Reject a host pool that HiCache L3 cannot store under DCP.
+
+    The DCP L3 path stores one physical page per logical page on each rank, so
+    every pool besides the MLA anchor must be either per-slot state or sharded
+    by the same DCP rows as the anchor.
+    """
+    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
+    from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
+
+    pool = entry.host_pool
+    if pool is anchor:
+        return
+    if entry.name == PoolName.MAMBA and isinstance(pool, MambaPoolHost):
+        return  # KDA state: one slot per key
+    if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and dsa_shards_index_k()
+        and pool.dcp_size == anchor.dcp_size
+        and pool.size == anchor.size
+    ):
+        return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
+    raise NotImplementedError(
+        f"HiCache L3 with DCP does not support the {entry.name} host pool "
+        f"({type(pool).__name__})."
+    )
 
 
 class HiCacheController:
@@ -570,7 +600,6 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP does not support buffer_only host memory."
                 )
-            from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
             from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 
             if storage_backend not in ("file", "mooncake"):
@@ -584,17 +613,9 @@ class HiCacheController:
                 raise NotImplementedError(
                     "HiCache L3 with DCP requires a materialized MLA host pool."
                 )
-            if self.mem_pool_host is not self.storage_host_pool and any(
-                entry.host_pool is not self.storage_host_pool
-                and (
-                    entry.name != PoolName.MAMBA
-                    or not isinstance(entry.host_pool, MambaPoolHost)
-                )
-                for entry in self.mem_pool_host.entries
-            ):
-                raise NotImplementedError(
-                    "HiCache L3 with DCP supports only MLA KV and optional KDA state."
-                )
+            if self.mem_pool_host is not self.storage_host_pool:
+                for entry in self.mem_pool_host.entries:
+                    check_dcp_l3_extra_pool(entry, self.storage_host_pool)
             if self.storage_host_pool.layout not in (
                 "layer_first",
                 "page_first",
@@ -784,11 +805,25 @@ class HiCacheController:
         # data. storage only needs rank 0 to write it back.
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
-        is_mla_model = isinstance(self.mem_pool_device, MLAKVView)
+        device = self.mem_pool_device
+        router = getattr(device, "layer_router", None)
+        if router is None or isinstance(device, KVLayoutView):
+            # A static pool, or a view handed over directly, is its own layout.
+            token_views = [device]
+        else:
+            token_views = [router.view(p.name) for p in router.sub_pools()]
+        anchor = token_views[0] if token_views else device
+        is_mla_model = isinstance(anchor, MLAKVView)
         is_compressed_mla_model = isinstance(
             self.mem_pool_device, DeepSeekV4TokenToKVPool
         )
-        is_rank_replicated = is_mla_model or is_compressed_mla_model
+        is_rank_replicated = (
+            is_mla_model
+            and all(
+                isinstance(view, MLAKVView) and view.storage_rank_replicated
+                for view in token_views
+            )
+        ) or is_compressed_mla_model
         # Least Common Multiple among heterogeneous tp size
         tp_lcm_size = storage_backend_extra_config.pop("tp_lcm_size", None)
         should_split_heads = False
@@ -826,8 +861,8 @@ class HiCacheController:
             pp_size=parallel.pp_size,
             attn_cp_rank=attn_cp_rank,
             attn_cp_size=attn_cp_size,
-            # TODO(hzh): Rename is_mla_model to is_rank_replicated.
-            is_mla_model=is_rank_replicated,
+            is_mla_model=is_mla_model or is_compressed_mla_model,
+            rank_replicated=is_rank_replicated,
             enable_storage_metrics=self.enable_storage_metrics,
             is_page_first_layout=self.mem_pool_host.layout == "page_first",
             model_name=model_name,
@@ -1427,6 +1462,14 @@ class HiCacheController:
 
         return hash_value, storage_query_count
 
+    def _on_prefetch_dequeue(self, operation: PrefetchOperation) -> None:
+        """Prepare an op after dequeue on the prefetch storage thread.
+
+        The default controller does no extra preparation. Subclasses can use
+        this hook to initialize backreferences or observability state while
+        keeping the work out of the scheduler thread.
+        """
+
     def prefetch_thread_func(self):
         """
         Manage prefetching operations from storage backend to host memory.
@@ -1436,6 +1479,7 @@ class HiCacheController:
                 operation = self.prefetch_queue.get(block=True, timeout=1)
                 if operation is None:
                     continue
+                self._on_prefetch_dequeue(operation)
                 try:
                     if operation.is_terminated():
                         hash_value, storage_hit_count = [], 0
