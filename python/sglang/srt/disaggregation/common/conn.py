@@ -749,7 +749,7 @@ class CommonKVManager(BaseKVManager):
             return True
         # Retain cancellation even if it beats source creation. Let the backend
         # process ABORT normally as well, including ACK/draining after allocation.
-        self.deferred_bootstrap.fail(room)
+        self.deferred_bootstrap.cancel(room)
         if room in self.request_status and self.request_status[room] != KVPoll.Success:
             self.update_status(room, KVPoll.Failed)
         return False
@@ -930,10 +930,18 @@ class CommonKVManager(BaseKVManager):
         if targets is None:
             targets = self._room_notify_targets(bootstrap_room)
         self.update_status(bootstrap_room, status)
-        if status == KVPoll.Success and self.deferred_bootstrap is not None:
-            # Success permits decode to reuse the room after true retraction.
-            # Publish it from sender.clear(), after worker and scheduler cleanup.
-            return status
+        # Commit before decode hears it, so a retraction recompute of this room
+        # waits for the sender's release (see PrefillBootstrapQueue.add); a
+        # failure that won the race owns decode's notification instead.
+        if (
+            status == KVPoll.Success
+            and self.deferred_bootstrap is not None
+            and not self.deferred_bootstrap.conclude(bootstrap_room)
+        ):
+            # cancel() marks only the room table; fail the request too, before
+            # this worker's cleanup lets the scheduler latch Success.
+            self.update_status(bootstrap_room, KVPoll.Failed)
+            return KVPoll.Failed
         self.send_kv_status_message(
             targets=targets,
             bootstrap_room=bootstrap_room,
@@ -973,7 +981,8 @@ class CommonKVManager(BaseKVManager):
             logger.debug("Dropping late status for cleared room %s", bootstrap_room)
             return
         if status == KVPoll.WaitingForInput and self.defer_decode_allocation:
-            # The policy currently requires one authoritative prefill rank.
+            # Any prefill rank's readiness admits the room: each PP stage sends
+            # its readiness before its own Success on the same socket.
             # Do not mix this notification into the transfer-success counter.
             self.update_status(bootstrap_room, KVPoll.WaitingForInput)
             return
@@ -2390,6 +2399,8 @@ class CommonKVSender(BaseKVSender):
 
     def _poll_with_status(self, check_status) -> KVPoll:
         if self.conclude_state is not None:
+            if self._concluded_room_in_worker_cleanup():
+                return KVPoll.Transferring
             return self.conclude_state
 
         if self.bootstrap_room in self.kv_mgr.request_status:
@@ -2423,6 +2434,18 @@ class CommonKVSender(BaseKVSender):
                 )
             self.trace_ctx.trace_req_finish()
         return status
+
+    def _concluded_room_in_worker_cleanup(self) -> bool:
+        """An abort after the worker's Success caches Failed, yet releasing the
+        room must still wait for the worker's room-keyed cleanup, as the Success
+        path does; a recompute reusing the room would otherwise lose its state."""
+        deferred = self.kv_mgr.deferred_bootstrap
+        return (
+            deferred is not None
+            and self._owns_bootstrap_room
+            and self.bootstrap_room in self.kv_mgr._staging_outstanding
+            and deferred.awaits_release(self.bootstrap_room)
+        )
 
     def _check_bootstrap_timeout(self) -> Optional[KVPoll]:
         start = (
@@ -2476,14 +2499,8 @@ class CommonKVSender(BaseKVSender):
             for key in list(staging_ctx.prefetch_requested):
                 if key[0] == self.bootstrap_room:
                     staging_ctx.prefetch_requested.discard(key)
-        if notification is not None:
-            endpoint, failed = notification
-            self.kv_mgr.send_kv_status_message(
-                targets=[endpoint],
-                bootstrap_room=self.bootstrap_room,
-                status=KVPoll.Failed if failed else KVPoll.Success,
-                failure_reason="Prefill bootstrap failed" if failed else None,
-            )
+        # Only a failure: the transfer worker already sent Success.
+        self.kv_mgr._notify_bootstrap(self.bootstrap_room, notification)
 
     def failure_exception(self):
         self.conclude_state = KVPoll.Failed
@@ -2577,9 +2594,9 @@ class CommonKVReceiver(BaseKVReceiver):
                 "Set --disaggregation-decode-allocation-policy identically on both roles."
             )
         elif policy == "prefill_complete" and (
-            info.attn_tp_size != 1 or info.attn_cp_size != 1 or info.pp_size != 1
+            info.attn_tp_size != 1 or info.attn_cp_size != 1
         ):
-            reason = "prefill_complete requires peer attention TP1/CP1/PP1"
+            reason = "prefill_complete requires peer attention TP1/CP1"
         if reason is not None:
             self.kv_mgr.record_failure(self.bootstrap_room, reason)
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)

@@ -4738,6 +4738,9 @@ class Scheduler(
         # Read at call time: a PD role switch rebuilds the PD queues.
         if self.disagg_prefill_bootstrap_queue is not None:
             lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+            lists[ListKind.PD_ROOM_WAITERS] = (
+                self.disagg_prefill_bootstrap_queue.room_waiters
+            )
         lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
         if self.dllm_config is not None:
             # Its staging queue is the part of this queue the current round runs.

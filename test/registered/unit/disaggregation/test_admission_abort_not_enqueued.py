@@ -90,6 +90,7 @@ def _prefill_queue(sched):
         scheduler=sched,
         queue=IndexedReqList(ListKind.PD_BOOTSTRAP),
         create_sender=MagicMock(return_value=True),
+        kv_manager=SimpleNamespace(deferred_bootstrap=None),
     )
     return q
 
