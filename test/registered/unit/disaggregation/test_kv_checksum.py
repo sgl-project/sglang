@@ -24,7 +24,7 @@ from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
@@ -295,7 +295,7 @@ def _make_req(
     bootstrap_host="127.0.0.1",
     start_idx=0,
 ):
-    return SimpleNamespace(
+    return FakeReq(
         rid=rid,
         bootstrap_host=bootstrap_host,
         bootstrap_port=8998,
