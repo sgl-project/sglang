@@ -62,6 +62,11 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.server_utils import (
+    launch_dummy_health_check_server,
+    set_prometheus_multiproc_dir,
+    start_follower_grpc_server,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
@@ -147,13 +152,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_mnnvl_fabric_device,
     kill_process_tree,
-    launch_dummy_health_check_server,
     maybe_reindex_device_id,
     normalize_serialized_named_tensor_payloads,
     numa_utils,
-    set_prometheus_multiproc_dir,
     set_ulimit,
-    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -1992,7 +1994,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                "0.7.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -2140,8 +2142,11 @@ def _block_until_follower_schedulers_exit(
     backstop. Rust listeners on this node (one per attention DP group whose
     first rank is here) still drain as node 0's do: SIGTERM is relayed to them
     (``RustServerSigtermDrain``), so their health answers 503 and their
-    in-flight requests finish before they close; their schedulers then exit on
-    rank 0's ShutdownReq. Without a local listener, the caller has already
+    in-flight requests finish before they close; rank 0's drain waits for them
+    (the MLP-sync gather carries every DP listener's drain state, and a drain
+    on any listener begins on all of them), and their schedulers then exit on
+    rank 0's ShutdownReq. Without a SIGTERM here, the first scheduler exiting
+    0 bounds the others. Without a local listener, the caller has already
     routed SIGTERM to ``Engine._handle_follower_sigterm``.
     """
     on_main_thread = threading.current_thread() is threading.main_thread()
