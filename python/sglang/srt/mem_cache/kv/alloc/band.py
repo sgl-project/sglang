@@ -279,6 +279,11 @@ class Band:
     watermark_physical: _CapacityField[int] = _CapacityField()
     live_page_count: _CapacityField[int] = _CapacityField()
     _free_phys_pages: _CapacityField[torch.Tensor] = _CapacityField()
+    # Lazily freed pages the latest forwards may still read, as (forward_done
+    # event, pages) entries; `_settle_freed` moves them into `_free_phys_pages`.
+    _unsettled_free: _CapacityField[
+        Tuple[Tuple[torch.cuda.Event, torch.Tensor], ...]
+    ] = _CapacityField()
     # The owner's unminted virtual pages (None on a band that binds the owner's).
     free_virtual_ids: _CapacityField[Optional[torch.Tensor]] = _CapacityField()
 
@@ -390,6 +395,8 @@ class Band:
         ] = {}
         # CPU mirror of `_pending_reuse` for O(1) membership in the survivor walk.
         self._pending_reuse_pages_cpu: Set[int] = set()
+        # Frees a prepared attention page table may still read (`_free_lazy`).
+        self._unsettled_free = ()
         # Cumulative observability counters (NOT reset at clear()).
         self._stats_n_free_lazy: int = 0
         self._stats_n_release_batch: int = 0
@@ -415,6 +422,11 @@ class Band:
         # relocates: the engine reads or writes the addresses it was handed.
         self.pin_sources: Tuple[Callable[[], bool], ...] = ()
         self._latest_forward_done_event: Optional[torch.cuda.Event] = None
+        # The stream the forwards run on, and an event on it that every writer of
+        # pages handed out while a forward may still read them follows
+        # (`_order_reuse`); None once it has completed.
+        self._forward_stream: Optional[torch.cuda.Stream] = None
+        self._reuse_fence: Optional[torch.cuda.Event] = None
         # Most-recent forward's (done_event, out_cache_loc_virtual) for `_flush`'s
         # write-race check. Single slot: at most ONE forward in flight per call
         # site; `_flush` materializes the write-set lazily, avoiding a sync here.
@@ -528,9 +540,11 @@ class Band:
         self._free_phys_pages = torch.empty(0, dtype=torch.int64, device=self.device)
         self._pending_reuse.clear()
         self._pending_reuse_pages_cpu.clear()
+        self._unsettled_free = ()
         self.live_page_count = 0
         self._inflight_forward = None
         self._latest_forward_done_event = None
+        self._reuse_fence = None
         self._hicache_transfer_done_events.clear()
         self._load_pinned_pages = 0
 
@@ -599,11 +613,13 @@ class Band:
             # (eager has no holes/pending -- span == live by construction).
             holes = int(self._free_phys_pages.numel())
             pending = len(self._pending_reuse_pages_cpu)
+            unsettled = self._unsettled_page_count()
             wm_span = self._allocated_pages()
-            if wm_span != self.live_page_count + holes + pending:
+            if wm_span != self.live_page_count + holes + pending + unsettled:
                 out.append(
                     f"[{self.sub_pool_name}] span {wm_span} != live "
-                    f"{self.live_page_count} + holes {holes} + pending {pending}"
+                    f"{self.live_page_count} + holes {holes} + pending {pending} "
+                    f"+ unsettled {unsettled}"
                 )
         out.extend(self._capacity_memo_violations())
         return out
@@ -711,8 +727,13 @@ class Band:
             self.num_pages - self.min_page_index - self._allocated_pages()
         )
         pages_extend = min(pages_by_bytes, pages_by_index_space)
-        # Lazy: drainable holes don't consume new bytes.
-        pages_drain = len(self._free_phys_pages) if self.lazy_compaction else 0
+        # Lazy: drainable holes don't consume new bytes; unsettled frees drain
+        # once their forward completes, or after a stream-side wait for it.
+        pages_drain = (
+            len(self._free_phys_pages) + self._unsettled_page_count()
+            if self.lazy_compaction
+            else 0
+        )
         return (pages_extend + pages_drain) * self.page_size
 
     def available_size(self) -> int:
@@ -729,13 +750,16 @@ class Band:
 
     def _peer_drainable_hole_bytes(self) -> int:
         """Gap bytes an urgent flush of the growth-side chain neighbor would
-        release. Only `_free_phys_pages` counts -- NOT `_pending_reuse`, which
-        awaits an event -- so the credit is realizable.
+        release. Only `_free_phys_pages` and unsettled frees count (an urgent
+        flush settles those) -- NOT `_pending_reuse`, which awaits an event -- so
+        the credit is realizable.
         """
         neighbor = self._growth_side_neighbor()
         if not _drains_on_urgent_flush(neighbor):
             return 0
-        return len(neighbor._free_phys_pages) * neighbor.entry_bytes_per_page
+        return (
+            len(neighbor._free_phys_pages) + neighbor._unsettled_page_count()
+        ) * neighbor.entry_bytes_per_page
 
     def add_pin_source(self, busy: Callable[[], bool]) -> None:
         """Keep this band's pages in place whenever ``busy()`` holds."""
@@ -824,6 +848,14 @@ class Band:
                 return self._take_physical_eager(num_pages)
 
             # Lazy: slice the GPU free list (no D2H).
+            self._settle_freed(urgent=False)
+            if num_pages > self._free_phys_pages.shape[0] and self._unsettled_free:
+                # Held frees count as drainable holes in the capacity checks, so
+                # take them before growing into the gap a chain peer may have been
+                # promised; their writers follow the forwards that may still read
+                # them (`_order_reuse`). The watermark then moves the same way on
+                # every rank, whichever forwards have completed there.
+                self._order_reuse(self._settle_freed(urgent=True))
             n_drain = min(num_pages, int(self._free_phys_pages.shape[0]))
             need_more = num_pages - n_drain
 
@@ -1024,9 +1056,14 @@ class Band:
                 return None
             if N == 0:
                 return torch.empty(0, dtype=torch.int64, device=self.device)
+            if self.lazy_compaction:
+                self._settle_freed(urgent=False)
 
-            # FAST PATH: eager, or lazy with no current holes.
-            if not self.lazy_compaction or self._free_phys_pages.numel() == 0:
+            # FAST PATH: eager, or lazy with no current holes and no held frees
+            # (those drain before the watermark grows, `take_physical_pages`).
+            if not self.lazy_compaction or (
+                self._free_phys_pages.numel() == 0 and not self._unsettled_free
+            ):
                 start_wm = self.watermark_physical  # kernel's `start_phys`
 
                 # Lazy uses `_extend_watermark` (index + peer checks); eager
@@ -1065,25 +1102,42 @@ class Band:
                 self._maybe_zero_pages(phys_pages)
                 return phys_pages
 
-            # SLOW PATH: holes exist -- drain them first, then bind.
-            phys_pages = self.take_physical_pages(N)
-            if phys_pages is None:
-                return None
-            self.ids.bind(v_pages, phys_pages)
-            self._maybe_zero_pages(phys_pages)
-            return phys_pages
+            return self._place_pages_drain(v_pages, N)
+
+    def _place_pages_drain(
+        self, v_pages: torch.Tensor, N: int
+    ) -> Optional[torch.Tensor]:
+        """`place_pages` slow path: drain holes first, then bind."""
+        phys_pages = self.take_physical_pages(N)
+        if phys_pages is None:
+            return None
+        self.ids.bind(v_pages, phys_pages)
+        self._maybe_zero_pages(phys_pages)
+        return phys_pages
 
     def _maybe_zero_pages(self, phys_pages: torch.Tensor) -> None:
         """Zero the page ENVELOPES on hand-out (MHA and MLA pools): the MLA
         kernels and trtllm_mha's fmha_v2 prefill (and fp8 XQA decode) load whole
         pages and give the rows past seq_len a zero weight, so a NaN there still
         reaches the output. Never-written bytes must read as finite values; a
-        mamba neighbour's fp32 state, read as bf16, may not.
+        mamba neighbour's fp32 state, read as bf16, may not. Under a reuse fence
+        the zeroing runs on the forward stream, after the forwards that may still
+        read the pages, instead of making the current stream wait for them.
         """
         if not self._zero_pages_on_alloc or phys_pages.numel() == 0:
             return
         with record_function("Band._maybe_zero_pages"):
-            self.arena.zero_units(self.sub_pool_name, phys_pages)
+            if self.reuse_fence() is None:
+                self.arena.zero_units(self.sub_pool_name, phys_pages)
+                return
+            stream = self._forward_stream
+            # The page ids come from the current stream.
+            stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(stream):
+                self.arena.zero_units(self.sub_pool_name, phys_pages)
+            phys_pages.record_stream(stream)
+            self._reuse_fence = torch.cuda.Event()
+            self._reuse_fence.record(stream)
 
     # -- alloc --
 
@@ -1148,8 +1202,8 @@ class Band:
         the data-dependent dedup is skipped. `free_index` is token-granular and
         need not be page-aligned. EAGER drops one `wait_stream(forward_stream)`
         barrier so the v2p/p2v writes and the compaction move serialize with the
-        in-flight forward; LAZY needs none (a freed `v` has no live reader) and
-        defers compaction to `_flush`.
+        in-flight forward; LAZY holds the freed physical storage until the latest
+        forward completes (`_settle_freed`) and defers compaction to `_flush`.
         """
         with record_function("Band.free"):
             if free_index is None or free_index.numel() == 0:
@@ -1233,17 +1287,93 @@ class Band:
                 free_v_pages = free_v_pages_raw
             else:
                 free_v_pages = torch.unique(free_v_pages_raw // self.page_size)
-            # One kernel for the v2p read and both tombstones; disjoint-element
-            # scatters need no barrier (a freed v has no live reader). Never the
-            # scalar `t[idx] = -1` form: it materialises -1 on the CPU and blocks
+            # One kernel for the v2p read and both tombstones. Never the scalar
+            # `t[idx] = -1` form: it materialises -1 on the CPU and blocks
             # the scheduler on a pageable H2D copy (~16 ms per 8192-token free).
             freed_p_pages = free_unbind_inplace(
                 free_v_pages, self.ids.virtual_to_physical, self.ids.physical_to_virtual
             )
             if self.is_id_owner:
                 self.free_virtual_ids = torch.cat([self.free_virtual_ids, free_v_pages])
-            self._free_phys_pages = torch.cat([self._free_phys_pages, freed_p_pages])
+            # A prepared attention page table can still read the freed storage
+            # after shared metadata reads finish. Hold the pages out of the free
+            # list until the latest forward completes, so no later allocation can
+            # overwrite or zero them first (`_settle_freed`; under pressure their
+            # writers are ordered instead, `_order_reuse`). The current stream
+            # does not wait here: work queued after the free stays independent of
+            # the forward.
+            event = self._latest_forward_done_event
+            if event is not None and torch.device(self.device).type == "cuda":
+                self._hold_until(event, freed_p_pages)
+            else:
+                self._free_phys_pages = torch.cat(
+                    [self._free_phys_pages, freed_p_pages]
+                )
             self.live_page_count -= int(freed_p_pages.shape[0])
+
+    def _hold_until(self, event: torch.cuda.Event, pages: torch.Tensor) -> None:
+        """Hold freed `pages` until `event` fires; frees under the same forward
+        share one entry."""
+        held = self._unsettled_free
+        if held and held[-1][0] is event:
+            merged = torch.cat([held[-1][1], pages])
+            self._unsettled_free = held[:-1] + ((event, merged),)
+        else:
+            self._unsettled_free = held + ((event, pages),)
+
+    def _unsettled_page_count(self) -> int:
+        return sum(int(pages.shape[0]) for _, pages in self._unsettled_free)
+
+    def _settle_freed(self, *, urgent: bool) -> List[torch.cuda.Event]:
+        """Move held frees whose forward has completed into `_free_phys_pages`.
+        Urgent releases the rest too and returns their pending events; the caller
+        orders the released pages' writers after them before any can run.
+        """
+        if not self._unsettled_free:
+            return []
+        with record_function("Band._settle_freed"):
+            ready: List[torch.Tensor] = []
+            held: List[Tuple[torch.cuda.Event, torch.Tensor]] = []
+            pending: List[torch.cuda.Event] = []
+            for event, pages in self._unsettled_free:
+                if event.query():
+                    ready.append(pages)
+                elif urgent:
+                    pending.append(event)
+                    ready.append(pages)
+                else:
+                    held.append((event, pages))
+            if ready:
+                self._free_phys_pages = torch.cat([self._free_phys_pages, *ready])
+                self._unsettled_free = tuple(held)
+            return pending
+
+    def _order_reuse(self, pending: List[torch.cuda.Event]) -> None:
+        """Order every writer of pages released before `pending` fire after them.
+        With the forward stream known the current stream does not wait: the
+        reuse fence marks that stream's tail, zeroing runs there
+        (`_maybe_zero_pages`), copies into the pages already wait for that stream
+        (HiCache loads, decode restores, storage loads), `_flush` waits for the
+        fence and so do writers that follow no stream (`reuse_fence`).
+        Otherwise the current stream waits for `pending`.
+        """
+        if not pending:
+            return
+        if self._forward_stream is None:
+            for event in pending:
+                torch.cuda.current_stream().wait_event(event)
+            return
+        self._reuse_fence = torch.cuda.Event()
+        self._reuse_fence.record(self._forward_stream)
+
+    def reuse_fence(self) -> Optional[torch.cuda.Event]:
+        """The event a writer that follows no stream (e.g. an RDMA into a
+        published destination) waits for before writing pages handed out so far;
+        None when they may be written now."""
+        fence = self._reuse_fence
+        if fence is not None and fence.query():
+            self._reuse_fence = fence = None
+        return fence
 
     def _release_phys_pages_batch(self, pages: torch.Tensor) -> None:
         """Cat `pages` onto `_free_phys_pages`. `_flush` calls it only AFTER its
@@ -1394,12 +1524,21 @@ class Band:
 
     # -- lazy compaction primitives --
 
-    def set_latest_forward_done_event(self, event: Optional[torch.cuda.Event]) -> None:
+    def set_latest_forward_done_event(
+        self,
+        event: Optional[torch.cuda.Event],
+        stream: Optional[torch.cuda.Stream] = None,
+    ) -> None:
         """Stash the most-recent forward's `forward_done` event; `_pending_reuse`
         uses it to gate src reuse on read-path settling. None = no in-flight forward.
+        `stream` is the stream the forwards run on; with it, frees a forward may
+        still read can be handed out under pressure without the current stream
+        waiting (`_order_reuse`).
         """
         with record_function("Band.set_latest_forward_done_event"):
             self._latest_forward_done_event = event
+            if stream is not None:
+                self._forward_stream = stream
 
     def set_inflight_forward(
         self,
@@ -1650,12 +1789,25 @@ class Band:
             return 0
         if self.moves_blocked():
             # Holes stay in the free list; the next flush picks them up. Fired
-            # pending sources rejoin it now, since that copies nothing.
+            # pending sources and settled frees rejoin it now (nothing is copied).
+            self._settle_freed(urgent=False)
             self._drain_pending_reuse(urgent=False)
             return 0
         self._wait_hicache_transfers()
         self._stats_n_flush_calls += 1
         with record_function("Band._flush"):
+            # Urgent releases the held frees; the moves wait for their forwards
+            # and the reuse fence only after the D2H below, so the host read does
+            # not wait for those forwards.
+            held_waits = self._settle_freed(urgent=urgent)
+            fence = self.reuse_fence()
+            if fence is not None:
+                held_waits.append(fence)
+            if not urgent and (self._unsettled_free or held_waits):
+                # A forward may still read held frees or released holes, or a
+                # reuse zeroing is pending: moves wait for a later flush point.
+                self._drain_pending_reuse(urgent=False)
+                return 0
             self._drain_pending_reuse(urgent=urgent)
 
             # Sort ASCENDING.
@@ -1663,6 +1815,8 @@ class Band:
                 self._free_phys_pages, _ = torch.sort(self._free_phys_pages)
 
             all_cpu = self._free_phys_pages.tolist()  # one batched D2H sync
+            for event in held_waits:
+                torch.cuda.current_stream().wait_event(event)
 
             # `holes_cpu` = interior holes; `_free_phys_pages == holes_cpu` after.
             new_wm, holes_cpu = self._absorb_boundary_holes(all_cpu)
@@ -1860,7 +2014,11 @@ class Band:
         with record_function("Band.flush_opportunistic"):
             if not self.lazy_compaction:
                 return 0
-            if self._free_phys_pages.numel() == 0 and not self._pending_reuse:
+            if (
+                self._free_phys_pages.numel() == 0
+                and not self._pending_reuse
+                and not self._unsettled_free
+            ):
                 return 0
             return self._flush(urgent=False)
 
@@ -2150,7 +2308,9 @@ class FloatBand(Band):
         p = self._side_neighbor(side)
         if not _drains_on_urgent_flush(p):
             return 0
-        return len(p._free_phys_pages) * p.entry_bytes_per_page
+        return (
+            len(p._free_phys_pages) + p._unsettled_page_count()
+        ) * p.entry_bytes_per_page
 
     def _peer_drainable_hole_bytes(self) -> int:
         """The better of the two sides. `_growth_side_neighbor()` is undefined

@@ -1,12 +1,13 @@
 import unittest
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(
@@ -57,7 +58,8 @@ class TestSmallMRouterGfx950(CustomTestCase):
             x[:, :2048],
         ):
             self.assertFalse(R.smallm_router_supported(bad))
-        with envs.SGLANG_ROCM_SMALLM_ROUTER.override(False):
+        gfx942 = SimpleNamespace(hip=SimpleNamespace(gcn_arch="gfx942"))
+        with mock.patch.object(R, "current_arch", return_value=gfx942):
             self.assertFalse(R.smallm_router_supported(x))
 
         g = torch.cuda.CUDAGraph()
