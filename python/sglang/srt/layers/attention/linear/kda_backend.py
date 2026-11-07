@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -45,6 +46,7 @@ elif is_cpu():
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1793,9 +1795,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         pool = self.state_pool
         if pool is not None and pool.replayssm_request_ring:
             return False
-        if importlib.util.find_spec("cutlass") is None:
+        major = current_arch().cuda.major
+        if major not in (9, 10):
             return False
-        if torch.cuda.get_device_capability()[0] != 10:
+        # SM90 runs it only in CUDA graphs: an eager verify is bound by the
+        # launcher's host time, and Triton's kernels launch faster.
+        if major == 9 and not get_is_capture_mode():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
