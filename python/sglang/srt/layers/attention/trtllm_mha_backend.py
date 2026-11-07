@@ -58,8 +58,8 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
+    decode_cuda_graph_max_bs,
     get_buffer,
-    get_exec,
     get_parallel,
     get_platform,
     get_schedule,
@@ -342,7 +342,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 decode_limit = _native_fp4_decode_output_capacity(
                     model_runner.max_running_requests,
                     max_speculative_num_draft_tokens(),
-                    get_exec().graph.cuda_graph_config.decode.max_bs,
+                    decode_cuda_graph_max_bs(),
                 )
             max_native_tokens = max(prefill_limit, decode_limit)
             num_q_heads = config.num_attention_heads // get_parallel().attn_tp_size

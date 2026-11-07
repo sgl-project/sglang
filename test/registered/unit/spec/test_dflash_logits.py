@@ -232,15 +232,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         "_SelectorDraftSampler",
         build_sampler,
     )
-    monkeypatch.setattr(
-        worker_mod,
-        "get_exec",
-        lambda: SimpleNamespace(
-            graph=SimpleNamespace(
-                cuda_graph_config=SimpleNamespace(decode=SimpleNamespace(bs=[1]))
-            )
-        ),
-    )
+    monkeypatch.setattr(worker_mod, "decode_cuda_graph_max_bs", lambda: 1)
     quant_head = SimpleNamespace(
         weight=torch.empty(8, 2, dtype=torch.int8),
         quant_method=_FakeQuantMethod(torch.randn(6, 4), num_padded=2),
