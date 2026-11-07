@@ -2045,6 +2045,28 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
                 8.000,
             ]
 
+        self.histogram_frontend_request = Histogram(
+            name="sglang:frontend_request_stage_seconds",
+            documentation="Per-request frontend wall time by stage; stages may overlap.",
+            labelnames=[*labels.keys(), "stage"],
+            buckets=(
+                0.001,
+                0.005,
+                0.01,
+                0.025,
+                0.05,
+                0.1,
+                0.25,
+                0.5,
+                1,
+                2.5,
+                5,
+                10,
+                30,
+                60,
+            ),
+        )
+
         self.histogram_time_to_first_token = Histogram(
             name="sglang:time_to_first_token_seconds",
             documentation="Histogram of time to first token in seconds.",
@@ -2158,6 +2180,13 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.generation_tokens_histogram.labels(**labels).observe(
             float(generation_tokens)
         )
+
+    def observe_frontend_request_timing(self, durations: Dict[str, float]):
+        for stage in ("total", "text", "multimodal"):
+            if stage in durations:
+                self.histogram_frontend_request.labels(
+                    **self.labels, stage=stage
+                ).observe(durations[stage])
 
     def observe_time_to_first_token(
         self, labels: Dict[str, str], value: float, *, stream: bool

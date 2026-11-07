@@ -7,9 +7,11 @@ to reduce tokenization overhead when multiple requests arrive concurrently.
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
-from functools import partial
 from typing import Any, Dict, List, Optional
+
+from sglang.srt.observability.frontend_request_timing import current_frontend_timing
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +61,7 @@ class AsyncDynamicbatchTokenizer:
         """Encode a single prompt."""
         self._ensure_initialized()
         result_future: asyncio.Future = asyncio.get_running_loop().create_future()
+        result_future._frontend_timing = current_frontend_timing.get()
         await self._queue.put((prompt, kwargs, result_future))
         return await result_future
 
@@ -128,7 +131,18 @@ class AsyncDynamicbatchTokenizer:
             # If every request uses identical kwargs we can run a single
             # batch tokenizer call for a big speed-up.
             if can_batch and len(prompts) > 1:
-                encode_fn = partial(self.tokenizer, prompts, **kwargs)
+
+                def encode_fn():
+                    started = time.perf_counter()
+                    try:
+                        return self.tokenizer(prompts, **kwargs)
+                    finally:
+                        finished = time.perf_counter()
+                        for future in result_futures:
+                            timing = getattr(future, "_frontend_timing", None)
+                            if timing is not None:
+                                timing.add_span("text", started, finished)
+
                 results = await asyncio.get_running_loop().run_in_executor(
                     self._executor, encode_fn
                 )
@@ -146,9 +160,20 @@ class AsyncDynamicbatchTokenizer:
                         f"Consider using consistent tokenization parameters across requests."
                     )
 
-                encode_fn = lambda prompts=prompts, kwargs=kwargs_list: [
-                    self.tokenizer(p, **kw) for p, kw in zip(prompts, kwargs_list)
-                ]
+                def encode_fn():
+                    results = []
+                    for prompt, kwargs, future in zip(
+                        prompts, kwargs_list, result_futures
+                    ):
+                        started = time.perf_counter()
+                        try:
+                            results.append(self.tokenizer(prompt, **kwargs))
+                        finally:
+                            timing = getattr(future, "_frontend_timing", None)
+                            if timing is not None:
+                                timing.add_span("text", started, time.perf_counter())
+                    return results
+
                 results = await asyncio.get_running_loop().run_in_executor(
                     self._executor, encode_fn
                 )
