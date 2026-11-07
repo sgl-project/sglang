@@ -2142,8 +2142,11 @@ def _block_until_follower_schedulers_exit(
     backstop. Rust listeners on this node (one per attention DP group whose
     first rank is here) still drain as node 0's do: SIGTERM is relayed to them
     (``RustServerSigtermDrain``), so their health answers 503 and their
-    in-flight requests finish before they close; their schedulers then exit on
-    rank 0's ShutdownReq. Without a local listener, the caller has already
+    in-flight requests finish before they close; rank 0's drain waits for them
+    (the MLP-sync gather carries every DP listener's drain state, and a drain
+    on any listener begins on all of them), and their schedulers then exit on
+    rank 0's ShutdownReq. Without a SIGTERM here, the first scheduler exiting
+    0 bounds the others. Without a local listener, the caller has already
     routed SIGTERM to ``Engine._handle_follower_sigterm``.
     """
     on_main_thread = threading.current_thread() is threading.main_thread()
