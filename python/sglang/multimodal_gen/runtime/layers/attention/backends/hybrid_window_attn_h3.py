@@ -37,7 +37,10 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend i
     AttentionMetadataBuilder,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
 _DIT_BLOCK_PREFIX = re.compile(r"^blocks\.(\d+)\.")
 
@@ -306,6 +309,25 @@ def _fa_varlen(
     scale: float,
     out: torch.Tensor | None = None,
 ) -> torch.Tensor:
+    if q.device.type == "npu":
+        # Ascend TND packed attention keeps the exact same decomposition math;
+        # only the dense per-segment kernel differs from CUDA FlashAttention.
+        from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+            fused_infer_attention_varlen,
+        )
+
+        attn_out = fused_infer_attention_varlen(
+            q,
+            k,
+            v,
+            cu_q,
+            cu_k,
+            softmax_scale=scale,
+        )
+        if out is not None:
+            out.copy_(attn_out)
+            return out
+        return attn_out
     attn_out = flash_attn_varlen_func(
         q,
         k,
@@ -344,14 +366,28 @@ class HybridWindowAttentionH3Impl(AttentionImpl):
         match = _DIT_BLOCK_PREFIX.match(prefix)
         self.layer_idx = int(match.group(1)) if match else None
         # non-DiT callers (the token refiner) resolve this backend too: dense FA
-        self._dense_fallback = _flash_attn_backend.FlashAttentionImpl(
-            num_heads=num_heads,
-            head_size=head_size,
-            causal=causal,
-            softmax_scale=softmax_scale,
-            num_kv_heads=num_kv_heads,
-            prefix=prefix,
-        )
+        if current_platform.is_npu():
+            from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+                AscendFAImpl,
+            )
+
+            self._dense_fallback = AscendFAImpl(
+                num_heads=num_heads,
+                head_size=head_size,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                num_kv_heads=num_kv_heads,
+                prefix=prefix,
+            )
+        else:
+            self._dense_fallback = _flash_attn_backend.FlashAttentionImpl(
+                num_heads=num_heads,
+                head_size=head_size,
+                causal=causal,
+                softmax_scale=softmax_scale,
+                num_kv_heads=num_kv_heads,
+                prefix=prefix,
+            )
 
     def forward(
         self,
