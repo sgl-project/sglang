@@ -921,6 +921,9 @@ class ChatCompletionRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
+    # What the prompt's renderer reports: where parsing begins and whether the
+    # prompt leaves reasoning open; None when recipe did not render it.
+    _recipe_prompt: Any = PrivateAttr(default=None)
     _format_add_generation_prompt: Optional[bool] = PrivateAttr(default=None)
     _format_add_special_tokens: bool = PrivateAttr(default=False)
 
@@ -1975,11 +1978,9 @@ class ResponsesRequest(PDRoutingFields):
     _response_parser_grammar_start: Optional[str] = PrivateAttr(default=None)
     _response_parser_json_response_format: bool = PrivateAttr(default=False)
     _response_parser_tool_grammar: bool = PrivateAttr(default=False)
-    # The messages the prompt was rendered from, so an output parser can follow
-    # a turn the prompt continues and tell where the prompt ends.
-    _chat_messages: Optional[List[ChatCompletionMessageParam]] = PrivateAttr(
-        default=None
-    )
+    # What the prompt's renderer reports: where parsing begins and whether the
+    # prompt leaves reasoning open; None when recipe did not render it.
+    _recipe_prompt: Any = PrivateAttr(default=None)
 
     # Core OpenAI API fields (ordered by official documentation)
     background: Optional[bool] = False

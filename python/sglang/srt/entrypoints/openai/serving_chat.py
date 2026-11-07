@@ -675,7 +675,6 @@ class OpenAIServingChat(OpenAIServingBase):
                 revision=get_model().revision,
                 default_chat_template_kwargs=get_serving().default_chat_template_kwargs,
                 preferred_sampling_params=get_serving().preferred_sampling_params,
-                chat_template_name=self.template_manager.chat_template_name,
             )
         )
 
@@ -3603,9 +3602,7 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
 
-    def _thinking_requested(
-        self, request: ChatCompletionRequest | ResponsesRequest
-    ) -> bool:
+    def _thinking_requested(self, request: ChatCompletionRequest) -> bool:
         return (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )

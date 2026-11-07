@@ -37,7 +37,6 @@ from sglang.srt.utils import ImageData
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.chat_encoding_adapters import ChatOutputHooks
     from sglang.srt.entrypoints.openai.protocol import (
-        ChatCompletionMessageParam,
         ChatCompletionRequest,
         ResponsesRequest,
         Tool,
@@ -65,7 +64,6 @@ class DeepSeekRecipeChatEncodingAdapter:
         chat_hooks: ChatOutputHooks,
         default_chat_template_kwargs: Optional[dict[str, Any]],
         preferred_sampling_params: Optional[dict[str, Any]],
-        chat_template_name: Optional[str],
     ):
         self._spec = chat_encoding_spec
         self.deepseek_recipe = DeepSeekRecipe.from_hf_tokenizer(
@@ -96,8 +94,6 @@ class DeepSeekRecipeChatEncodingAdapter:
             )
         self._separate_reasoning = reasoning_parser is not None
         self._hooks = chat_hooks
-        # A --chat-template conversation template renders prompts in recipe's place.
-        self._renders_prompts = chat_template_name is None
         # Chat requests pass their own regex and ebnf, even when None,
         # so only these preferred grammars reach them.
         preferred = preferred_sampling_params or {}
@@ -153,15 +149,22 @@ class DeepSeekRecipeChatEncodingAdapter:
             body["tool_choice"] = wire.get("tool_choice")
         body = {key: value for key, value in body.items() if value is not None}
         image_urls = []
+        parse_start = []
         prompt_ids = self._encode(
             body,
             effort=request.reasoning_effort,
             task=request.task,
             image_urls=image_urls,
+            parse_start=parse_start,
         )
         image_data.extend(ImageData(url=url) for url in image_urls)
         if task_prefix:
             prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
+        if _recipe_reports_start(request):
+            request._recipe_prompt = (
+                *parse_start,
+                self.deepseek_recipe.reasoning_open(prompt_ids),
+            )
         return prompt_ids
 
     def _encode(
@@ -171,6 +174,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         effort: Union[str, int, float, None],
         task: Optional[str] = None,
         image_urls: Optional[list[str]] = None,
+        parse_start: Optional[list[Any]] = None,
     ) -> list[int]:
         effort = _numeric_effort(effort)
         if effort is None or effort == "none":
@@ -185,7 +189,11 @@ class DeepSeekRecipeChatEncodingAdapter:
         elif effort is not None:
             body["reasoning_effort"] = effort
         return self.deepseek_recipe.encode(
-            body, task=task, effort_budget=budget, image_urls=image_urls
+            body,
+            task=task,
+            effort_budget=budget,
+            image_urls=image_urls,
+            parse_start=parse_start,
         )
 
     def parse_chat_response(
@@ -340,20 +348,20 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
-        # Without recipe's prompt, as with input_ids or a conversation template,
-        # the parse start is a guess, so the output is not checked.
-        recipe_rendered = self._renders_prompts and request.input_ids is None
+        # Only recipe's own prompt reports where parsing begins and whether it
+        # left reasoning open, so only its output is checked; a client's input_ids,
+        # a conversation template and a task keep main's start and go unchecked.
+        recipe_prompt = request._recipe_prompt
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
-            thinking_stage=self.deepseek_recipe.parse_start(
-                thinking=self._hooks.thinking_requested(request),
-                task=request.task,
-                continued=_continued_turn(
-                    request.messages[-1] if request.messages else None,
-                    continue_final_message=request.continue_final_message,
-                    # Under a task, recipe keeps no non-text final turn.
-                    recipe_rendered=recipe_rendered and request.task is None,
-                ),
+            thinking_stage=(
+                recipe_prompt[0]
+                if recipe_prompt is not None
+                else self.deepseek_recipe.parse_start(
+                    thinking=self._hooks.thinking_requested(request),
+                    task=request.task,
+                    continued=_requested_continuation(request),
+                )
             ),
             parse_tool_calls=request.task is None
             and self._hooks.tool_call_parsing_active(request),
@@ -361,8 +369,8 @@ class DeepSeekRecipeChatEncodingAdapter:
             and response_format.type in JSON_RESPONSE_FORMATS,
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
-            reasoning_must_close=recipe_rendered
-            and _parse_start_placed(request.messages)
+            reasoning_must_close=recipe_prompt is not None
+            and recipe_prompt[1]
             and self._reasoning_must_close(request),
             stop=_stop_strings(request.stop),
             stop_regex=_stop_strings(request.stop_regex),
@@ -371,9 +379,7 @@ class DeepSeekRecipeChatEncodingAdapter:
 
     def _reasoning_must_close(self, request: ChatCompletionRequest) -> bool:
         return (
-            # A task output, such as an action label, has no reasoning to close.
-            request.task is None
-            and not _forces_nonempty_content(request.chat_template_kwargs)
+            not _forces_nonempty_content(request.chat_template_kwargs)
             # A grammar applies from the first token unless reasoning is required,
             # and may never allow </think> (#45614).
             and (
@@ -389,26 +395,19 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
-        messages = request._chat_messages
+        recipe_prompt = request._recipe_prompt
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
-            thinking_stage=self.deepseek_recipe.parse_start(
-                thinking=require_reasoning,
-                continued=_continued_turn(
-                    messages[-1] if messages else None,
-                    continue_final_message=False,
-                    recipe_rendered=self._renders_prompts,
-                ),
+            thinking_stage=(
+                recipe_prompt[0]
+                if recipe_prompt is not None
+                else self.deepseek_recipe.parse_start(thinking=require_reasoning)
             ),
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
-            # The parse start follows require_reasoning, which a template's
-            # reasoning toggle can set for a request that asked for no thinking,
-            # and such a prompt has closed its reasoning already.
-            reasoning_must_close=self._renders_prompts
-            and self._hooks.thinking_requested(request)
-            and _parse_start_placed(messages)
+            reasoning_must_close=recipe_prompt is not None
+            and recipe_prompt[1]
             and not _forces_nonempty_content(request.chat_template_kwargs),
         )
 
@@ -462,49 +461,26 @@ def _trailing_assistant_turn(
     return None
 
 
-def _parse_start_placed(
-    messages: Optional[list[ChatCompletionMessageParam]],
-) -> bool:
-    """Whether recipe's prompt leaves its reasoning where `parse_start` reports
-    it. recipe hoists a trailing system or developer turn over a `prefix` turn
-    before it, and opens no reasoning for a first message, so either prompt
-    continues an answer where the parse start reports a fresh reasoning block."""
-    if not messages:
-        return True
-    if len(messages) == 1:
-        return messages[0].role != "assistant"
-    before, last = messages[-2:]
-    return not (
-        last.role in ("system", "developer")
-        and before.role == "assistant"
-        and bool(before.prefix)
-    )
+def _recipe_reports_start(request: ChatCompletionRequest) -> bool:
+    """Whether recipe's report describes where the rendered prompt ends:
+    a task appends its own tail after it."""
+    return request.task is None
 
 
-def _continued_turn(
-    message: Optional[ChatCompletionMessageParam],
-    *,
-    continue_final_message: bool,
-    recipe_rendered: bool,
+def _requested_continuation(
+    request: ChatCompletionRequest,
 ) -> Optional[dict[str, Any]]:
-    """The assistant turn the prompt continues, without its tool calls:
-    a text turn under continue_final_message and, where recipe renders the prompt,
-    also a non-text turn under it or with `prefix`."""
-    if message is None:
+    """The turn a prompt not of recipe's continues, from the request's fields."""
+    if not request.continue_final_message:
         return None
-    (turn,) = _null_content_as_empty(
-        [message.model_dump(exclude_unset=True, by_alias=True, mode="json")]
-    )
-    if isinstance(turn["content"], str):
-        continued = continue_final_message
-    else:
-        # encode_messages passes a non-text turn through, `prefix` included.
-        continued = recipe_rendered and (
-            continue_final_message or bool(turn.get("prefix"))
+    return _trailing_assistant_turn(
+        _null_content_as_empty(
+            [
+                message.model_dump(exclude_unset=True, by_alias=True, mode="json")
+                for message in request.messages[-1:]
+            ]
         )
-    if turn["role"] == "assistant" and continued:
-        return {key: value for key, value in turn.items() if key != "tool_calls"}
-    return None
+    )
 
 
 def _forces_nonempty_content(chat_template_kwargs: Optional[dict[str, Any]]) -> bool:

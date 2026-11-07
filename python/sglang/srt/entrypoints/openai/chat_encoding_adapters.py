@@ -22,7 +22,7 @@ EncodingBackend = Literal["builtin", "recipe"]
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
     """Chat-handler policies an output adapter needs, bound to one handler."""
 
-    thinking_requested: Callable[[ChatCompletionRequest | ResponsesRequest], bool]
+    thinking_requested: Callable[[ChatCompletionRequest], bool]
     # The handler's require_reasoning: whether a grammar waits for </think>.
     # Unlike `thinking_requested`, it does not follow SGLANG_DEFAULT_THINKING (#45614).
     reasoning_required: Callable[[ChatCompletionRequest], bool]
@@ -233,8 +233,6 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
         (deepseek-recipe validates the default effort at startup).
       preferred_sampling_params: the workers' --preferred-sampling-params
         (DeepSeek-V4 / V4.1 output parsing exempts a grammar there).
-      chat_template_name: a --chat-template conversation template, which renders
-        prompts instead of the adapter (DeepSeek-V4 / V4.1 output parsing).
       backend: selects the builder; every spec has a "builtin" one.
     """
 
@@ -248,7 +246,6 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     revision: Optional[str]
     default_chat_template_kwargs: Optional[dict[str, Any]] = None
     preferred_sampling_params: Optional[dict[str, Any]] = None
-    chat_template_name: Optional[str] = None
     backend: EncodingBackend = "builtin"
 
     def require(self, field: str) -> Any:
@@ -289,7 +286,6 @@ def _build_deepseek_recipe(
         chat_hooks=ctx.chat_hooks,
         default_chat_template_kwargs=ctx.default_chat_template_kwargs,
         preferred_sampling_params=ctx.preferred_sampling_params,
-        chat_template_name=ctx.chat_template_name,
     )
 
 

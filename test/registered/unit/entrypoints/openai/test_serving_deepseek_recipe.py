@@ -24,7 +24,7 @@ OUTPUT_TEXT = {
     "content": [{"type": "output_text", "text": "Hello"}],
 }
 PREFIX = {"prefix": True}
-# recipe hoists a trailing system turn, and rejects a filled one after `prefix`.
+# recipe drops an empty system turn, and rejects a filled one after `prefix`.
 SYSTEM_EMPTY = {"role": "system", "content": ""}
 # recipe accepts json_object only when the prompt mentions json.
 JSON_OBJECT = {
@@ -360,6 +360,9 @@ class TestHandlerRequestSemantics(CustomTestCase):
             messages=fields.pop("messages", [{"role": "user", "content": "hi"}]),
             **fields,
         )
+        # As serving does: the prompt is rendered from the request first, and its
+        # renderer reports on it where parsing begins.
+        chat._process_messages(request, False)
         output_ids = self.tokenizer.encode(text, add_special_tokens=False)
         if finish_reason is None:
             eos = self._token("<｜end▁of▁sentence｜>")
@@ -394,6 +397,10 @@ class TestHandlerRequestSemantics(CustomTestCase):
             {"messages": [HI, ASSISTANT_LIST], "continue_final_message": True},
             # Without continue_final_message, recipe continues a non-text `prefix` turn.
             {"messages": [HI, ASSISTANT_LIST | PREFIX]},
+            # recipe drops an empty system turn, so the turn before it still ends
+            # the prompt, however many of them follow.
+            {"messages": [HI, ASSISTANT_LIST | PREFIX, SYSTEM_EMPTY]},
+            {"messages": [HI, ASSISTANT_LIST | PREFIX, SYSTEM_EMPTY, SYSTEM_EMPTY]},
         ):
             with self.subTest(fields=fields):
                 prompt_ids = self._prompt(chat, **thinking, **fields).prompt_ids
@@ -413,6 +420,24 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self.assertEqual(
                     self._parse(chat, answer, messages=messages, **thinking)[:2],
                     ("Let me think.", "Hello"),
+                )
+        # V4.1 opens no reasoning for a first message, so a prompt that continues
+        # one ends in the answer, with or without a system turn recipe drops.
+        for messages in ([ASSISTANT_TEXT], [SYSTEM_EMPTY, ASSISTANT_TEXT]):
+            with self.subTest(messages=messages):
+                prompt_ids = self._prompt(
+                    chat, messages=messages, continue_final_message=True, **thinking
+                ).prompt_ids
+                self.assertEqual(prompt_ids[-len(hello) :], hello)
+                self.assertEqual(
+                    self._parse(
+                        chat,
+                        " world",
+                        messages=messages,
+                        continue_final_message=True,
+                        **thinking,
+                    )[:2],
+                    (None, " world"),
                 )
         # Without recipe's prompt, as with input_ids or a conversation template,
         # only a text turn under continue_final_message is continued.
@@ -490,14 +515,24 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 " think more.",
                 {"messages": [HI, ASSISTANT_REASONING], "continue_final_message": True},
             ),
-            # A trailing system turn that hoists over no `prefix` turn leaves the
-            # prompt opening a fresh reasoning block, so it is still checked.
+            # A prompt whose reasoning is still open is checked, with or without
+            # a trailing system turn recipe drops.
             ("Still thinking.", {"messages": [HI, SYSTEM_EMPTY]}),
             (
                 "Still thinking.",
                 {
                     "messages": [HI, ASSISTANT_TEXT, SYSTEM_EMPTY],
                     "continue_final_message": True,
+                },
+            ),
+            (
+                " think more.",
+                {
+                    "messages": [
+                        HI,
+                        {"content": [], **ASSISTANT_REASONING, **PREFIX},
+                        SYSTEM_EMPTY,
+                    ]
                 },
             ),
         ):
@@ -518,6 +553,8 @@ class TestHandlerRequestSemantics(CustomTestCase):
     def test_reasoning_cut_on_purpose_is_returned(self):
         """A length or abort finish, or a stop the client asked for,
         returns the reasoning so far."""
+        import asyncio
+
         from sglang.srt.entrypoints.openai.protocol import ResponsesRequest
 
         chat = _serving(self, self.tokenizer)
@@ -544,10 +581,16 @@ class TestHandlerRequestSemantics(CustomTestCase):
                 self.assertTrue(reasoning.startswith("Still thinking"))
                 self.assertEqual(content, "")
         # On Responses, `stop` is the only client stop.
-        reasoning, content, _ = chat._encoding_output().parse_responses_output(
-            request=ResponsesRequest(
-                input="hi", stop=["."], chat_template_kwargs={"thinking": True}
-            ),
+        responses = _serving(self, self.tokenizer, responses=True)
+        stopping = ResponsesRequest(
+            model="dummy",
+            input="hi",
+            stop=["."],
+            chat_template_kwargs={"thinking": True},
+        )
+        asyncio.run(responses._make_request(stopping, None, self.tokenizer))
+        reasoning, content, _ = responses._encoding_output().parse_responses_output(
+            request=stopping,
             require_reasoning=True,
             output_ids=self.tokenizer.encode(
                 "Still thinking.", add_special_tokens=False
@@ -583,21 +626,6 @@ class TestHandlerRequestSemantics(CustomTestCase):
             with self.subTest(fields=fields):
                 reasoning, content, _ = self._parse(chat, text, **(thinking | fields))
                 self.assertEqual((reasoning or "") + content, text)
-        # Nor output whose prompt recipe closed where the parse start says it is
-        # open: it hoists a trailing system turn, so the `prefix` turn before it
-        # ends the prompt, and it closes a first message's empty reasoning.
-        for messages, more in (
-            ([HI, ASSISTANT_LIST | PREFIX, SYSTEM_EMPTY], {}),
-            (
-                [{"role": "assistant", "content": ""}],
-                {"continue_final_message": True},
-            ),
-        ):
-            with self.subTest(messages=messages):
-                reasoning, content, _ = self._parse(
-                    chat, " world", messages=messages, **thinking, **more
-                )
-                self.assertEqual((reasoning, content), (" world", ""))
         # Nor is output after a conversation template's prompt, on chat or Responses.
         chatml = _serving(
             self, self.tokenizer, responses=True, chat_template_name="chatml"
@@ -743,13 +771,16 @@ class TestHandlerRequestSemantics(CustomTestCase):
 
     def test_other_paths_fail_at_a_natural_stop_inside_reasoning(self):
         """Streamed chat and both Responses paths fail at such a finish too."""
+        import asyncio
+
         from sglang.srt.entrypoints.openai.protocol import (
             ChatCompletionRequest,
             ResponsesRequest,
         )
         from sglang.srt.parser.deepseek_recipe_output import UnclosedReasoningError
 
-        adapter = _serving(self, self.tokenizer)._encoding_output()
+        chat = _serving(self, self.tokenizer, responses=True)
+        adapter = chat._encoding_output()
         eos = self._token("<｜end▁of▁sentence｜>")
         output_ids = self.tokenizer.encode("Still thinking.", add_special_tokens=False)
         output_ids.append(eos)
@@ -758,10 +789,15 @@ class TestHandlerRequestSemantics(CustomTestCase):
             messages=[{"role": "user", "content": "hi"}],
             chat_template_kwargs={"thinking": True},
         )
+        # As serving does: each request's prompt is rendered before its output
+        # is parsed, which is where recipe reports on the prompt.
+        chat._process_messages(request, False)
+        responses_request = ResponsesRequest(
+            model="dummy", input="hi", chat_template_kwargs={"thinking": True}
+        )
+        asyncio.run(chat._make_request(responses_request, None, self.tokenizer))
         responses = {
-            "request": ResponsesRequest(
-                input="hi", chat_template_kwargs={"thinking": True}
-            ),
+            "request": responses_request,
             "require_reasoning": True,
             "separate_reasoning": True,
             "parse_tool_calls": False,
@@ -833,6 +869,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
         calling = ChatCompletionRequest(
             messages=[HI], tools=[TOOL], chat_template_kwargs={"thinking": True}
         )
+        chat._process_messages(calling, False)
         parsers.clear()
         for end in range(1, len(called)):
             stream_chat(chunk(called[:end], False), None, calling)

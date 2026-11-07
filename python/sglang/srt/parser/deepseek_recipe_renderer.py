@@ -143,11 +143,20 @@ class DeepSeekRecipe:
         task: Optional[str] = None,
         effort_budget: Optional[int] = None,
         image_urls: Optional[list[str]] = None,
+        parse_start: Optional[list[Any]] = None,
     ) -> list[int]:
         """Prompt ids for `body` (see `pre_normalize`); a request recipe rejects
-        raises ValueError. `image_urls` receives the images in placeholder order."""
-        conversation = self.convert(body, effort_budget=effort_budget)
+        raises ValueError. `image_urls` receives the images in placeholder order,
+        `parse_start` the stage recipe reports this prompt ends in."""
+        converted = self._convert(body, effort_budget=effort_budget)
+        conversation = converted.conversation
         prompt_ids = self.encode_conversation(conversation, effort_budget=effort_budget)
+        if parse_start is not None:
+            parse_start.append(
+                converted.parsing_options.thinking_initial_stage
+                if body["thinking"]
+                else None
+            )
         if image_urls is not None:
             rendered = self._encoding.render_conversation(conversation)
             image_urls.extend(
@@ -157,21 +166,38 @@ class DeepSeekRecipe:
             prompt_ids = self._attach_task(prompt_ids, task, body["thinking"])
         return prompt_ids
 
+    def reasoning_open(self, prompt_ids: list[int]) -> bool:
+        """Whether the prompt's last thinking delimiter leaves reasoning open.
+        recipe reports a continued empty first turn as a reasoning start even
+        though it renders `</think>`, so the prompt is what the output follows."""
+        think_start = self.hf_tokenizer.token_to_id(THINK_START_TOKEN)
+        think_end = self.hf_tokenizer.token_to_id(THINK_END_TOKEN)
+        for token_id in reversed(prompt_ids):
+            if token_id == think_start:
+                return True
+            if token_id == think_end:
+                return False
+        return False
+
     def convert(
         self, body: dict[str, Any], *, effort_budget: Optional[int] = None
     ) -> Any:
         """Convert `body` to recipe's `Conversation`; invalid requests raise ValueError.
         Pass the same `effort_budget` to `encode_conversation`."""
+        return self._convert(body, effort_budget=effort_budget).conversation
+
+    def _convert(
+        self, body: dict[str, Any], *, effort_budget: Optional[int] = None
+    ) -> Any:
         recipe = load_deepseek_recipe()
         normalized = pre_normalize(body)
         normalized["model"] = self.model
         if effort_budget is not None:
             normalized["reasoning_effort"] = BUDGET_TIER
         try:
-            converted = recipe.ChatCompletionRequest(normalized).convert(self._options)
+            return recipe.ChatCompletionRequest(normalized).convert(self._options)
         except recipe.ConversionError as error:
             raise ValueError(_error_message(error.body)) from error
-        return converted.conversation
 
     def encode_conversation(
         self, conversation: Any, *, effort_budget: Optional[int] = None
