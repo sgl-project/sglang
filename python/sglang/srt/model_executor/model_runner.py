@@ -748,6 +748,14 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        if self.device == "npu":
+            from sglang.srt.hardware_backend.npu.pinned_host import (
+                maybe_prewarm_pinned_host,
+            )
+
+            maybe_prewarm_pinned_host(
+                device=self.device, is_draft_worker=self.is_draft_worker
+            )
         if self.model_config.is_layer_types_hybrid_swa:
             check_layer_types_hybrid_swa_split(
                 model=self.model, model_config=self.model_config
