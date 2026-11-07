@@ -11,9 +11,8 @@ import numpy as np
 import torch
 
 from sglang.multimodal_gen.configs.pipeline_configs import WanI2V480PConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.mova import MOVAPipelineConfig
-from sglang.multimodal_gen.configs.task_type import get_request_task_type
+from sglang.multimodal_gen.configs.task_type import ModelTaskType, get_request_task_type
 from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
     expand_request_outputs,
 )

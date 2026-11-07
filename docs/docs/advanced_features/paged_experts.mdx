@@ -30,20 +30,23 @@ the other quantized formats. See [Correctness](#correctness).
 ```bash
 python -m sglang.launch_server \
   --model-path Qwen/Qwen3-30B-A3B-GPTQ-Int4 \
-  --enable-paged-experts \
-  --paged-experts-num-resident 92
+  --enable-paged-experts
 ```
 
-See [Choosing K](#choosing-k) for the value. The default CUDA graphs stay on: decode graphs are captured up to
-`K // top_k` concurrent requests, and breakable prefill graphs run the paged MoE layers as eager
-breaks.
+At startup the KV cache keeps room for one request of the model's context, and the rest of the
+static memory holds as many experts per layer (K) as fit; the log names the K it chose and what
+would change it. See [Choosing K](#choosing-k) to trade context or concurrency for resident
+experts, or to set K yourself.
+
+The default CUDA graphs stay on: decode graphs are captured up to `K // top_k` concurrent
+requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
 
 ## Related Parameters
 
 - **`--enable-paged-experts`**: Enable Paged Experts. Off by default.
-- **`--paged-experts-num-resident K`**: Routed experts per MoE layer kept on the GPU. Required
-  with `--enable-paged-experts`, at least the router's `top_k`; larger values page less but leave
-  less memory for the KV cache.
+- **`--paged-experts-num-resident K|auto`**: Routed experts per MoE layer kept on the GPU, at least
+  the router's `top_k`; larger values page less but leave less memory for the KV cache. `auto` (the
+  default) sizes K after the model is loaded; see [Choosing K](#choosing-k).
 
 ## Supported Configurations and Limitations
 
@@ -64,31 +67,46 @@ breaks.
 
   Other quantization methods and MoE runners are rejected at startup.
 - **Single GPU:** tensor, expert, pipeline and data parallelism, EPLB, fused shared experts
-  (use `--disable-shared-experts-fusion`), `--enable-fused-moe-sum-all-reduce` and
-  `--load-format dummy` are rejected at startup.
+  (use `--disable-shared-experts-fusion`) and `--enable-fused-moe-sum-all-reduce` are rejected
+  at startup.
 - **Speculative decoding** is rejected at startup.
+- **Load formats:** `--load-format auto` (the default), `safetensors`, `pt`, `npcache`,
+  `mistral`, `fastsafetensors`, `instanttensor` and `runai_streamer`. The others are rejected
+  at startup: `dummy` has no real weights, `gguf` holds GGUF-quantized experts, and the rest
+  load the weights without Paged Experts' loader and post-load step.
 - **CUDA graphs:** decode graphs may use the `full` backend (the default) or be disabled;
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
   the host must be able to pin that much memory. Under WSL2, pinned memory is capped at about
   half of system RAM.
-- **Startup:** on the Marlin runner, the repack runs over the host store K experts at a time at load.
+- **Startup:** with mapped safetensors (`--load-format auto`, `safetensors` or `mistral`, without
+  `--weight-loader-disable-mmap`), loading makes no second copy of the experts: each expert is
+  read from the checkpoint once, straight into the pinned host store. With other loaders, and
+  for checkpoints that store every expert in one tensor (e.g. gpt-oss), the experts are first
+  loaded into a pageable copy of every expert, as large as the host store.
 
 ## How It Works
 
 ### The K-slot table and the host store
 
 The paged method wraps the layer's own fused-MoE method. It creates the layer's expert tensors
-with K rows instead of E, so the GPU holds only the K slots, and allocates a host store holding
-all E experts of each per-expert tensor. Each tensor's weight loader is redirected to a one-row
-view of the host store, so checkpoint weights are written by SGLang's native per-expert loader
-(sharding, gate/up placement, scale layout) and the host rows have exactly the layout the GPU
-slots would have.
+with K rows instead of E, so the GPU holds only the K slots. Each tensor's weight loader is
+redirected: a load of one expert's weights does not run yet, but waits as a view of the mapped
+checkpoint file. After loading, the waiting loads run K experts at a time, each through
+SGLang's native per-expert loader (sharding, gate/up placement, scale layout) into K rows laid
+out as the GPU slots, and the wrapped method's post-load step runs on those rows as it would
+without paging (on the Marlin runner, the repack into Marlin's layout). Each chunk's result is
+copied into the host store, a page-locked table of all E experts of each per-expert tensor, and
+the chunk's checkpoint pages are given back to the kernel, so the checkpoint never occupies
+memory beside the host store. The slots then hold experts 0..K-1.
 
-After loading, the wrapped method's post-load step runs as it would without paging. On the
-Marlin runner, whose methods repack their experts into Marlin's layout, it runs over the host
-store K experts at a time, so the host store holds every expert in the repacked layout.
+A repack must treat each expert on its own to run K at a time: the step runs once more on
+experts 1..K in a chunk of their own and must give the same bytes. A step that does not repack
+must leave the loaded weights as they are, since paging copies host rows verbatim. Either is
+checked at startup. Loads that cannot wait (a checkpoint tensor holding every expert, or a
+loader whose tensors are not views of mapped files) go to a table of every expert instead,
+which the chunks are taken from.
 
 ### A step: waves, page-in, merge
 
@@ -126,19 +144,71 @@ uncaptured steps.
 
 ## Choosing K
 
-The K-slot table counts as model weights in SGLang's memory accounting, so K and the KV cache
-come out of the same static budget (`--mem-fraction-static`): whatever K does not take becomes KV
-cache, as without paging. One resident expert per layer costs `per_expert_bytes × num_moe_layers`
-of GPU memory, so K is roughly
+The K-slot table and the KV cache come out of the same static budget (`--mem-fraction-static`).
+One resident expert per layer costs `per_expert_bytes × num_moe_layers` of GPU memory; the more
+experts stay resident, the fewer are paged in per step and the faster decode is, up to a plateau.
+
+### `auto` (the default)
+
+With `--paged-experts-num-resident auto`, or the flag omitted, K is chosen once every weight is
+loaded, in two steps:
+
+1. **The KV cache comes first.** By default it keeps room for one request of the model's own
+   context. `--context-length` sets that length, and `--max-running-requests`, if you set it, how
+   many such requests it aims to hold at once: one full-length request is a promise, more of them a
+   target that the experts never take memory from. `--max-total-tokens` sets the KV cache's size
+   directly instead. As always in SGLang, requests beyond what the KV cache holds at a time queue.
+2. **The experts take the rest.** What the static budget has left after the KV cache is allocated
+   goes to the expert slots, one slot per layer at a time, up to all experts.
+
+So under `auto`, `--context-length`, `--max-running-requests` and `--max-total-tokens` decide
+the KV cache, and they are also the knobs that trade context and concurrency for resident experts.
+At startup the server logs the chosen K, the KV cache it kept and why, and how many full-length
+requests fit at once:
 
 ```
-K ≈ (free_memory × mem_fraction_static − non_expert_bytes − kv_cache_bytes) / (per_expert_bytes × num_moe_layers)
+Paged experts: K=63 of 128 experts per MoE layer resident (6.85 GiB); KV cache 40960 tokens,
+1 request(s) of 40960 at once (aim 40960: the model's context 40960 x 1 request(s)). To pin:
+--paged-experts-num-resident 63
 ```
 
-For example, Qwen3-30B-A3B-GPTQ-Int4 (2.43 MB per expert, 48 MoE layers, 117 MB per slot) fits
-K = 92 of 128 on a 16 GB GPU with `--mem-fraction-static 0.88 --max-total-tokens 10240`.
-If the server runs out of memory for the KV cache at startup, lower K; for more concurrency,
-lower K or use `--kv-cache-dtype fp8`.
+If a `--max-total-tokens` you set, or one request of a `--context-length` you set, cannot be met
+even at K = `top_k`, the server stops at startup and names the flag. If fewer requests of that
+length fit than `--max-running-requests` asks for, the log says how many do, and the rest queue.
+If one request of the model's own context does not fit, K stays at `top_k`, the KV cache takes what
+is left, and requests are capped at its size, as SGLang caps them whenever the KV cache is shorter
+than the context; a warning says so.
+
+On hybrid models with Mamba layers and no `--max-mamba-cache-size`, the Mamba state pool holds
+the requests the KV cache aims for: the `--max-running-requests` you set, or one; never more
+than SGLang's own share of the budget (`--mamba-full-memory-ratio`), and never so many that one
+full-length request no longer fits in the KV cache next to it: the rest queue. Each running
+request needs its own Mamba state however short it is, so these are the requests that run at a
+time: without `--max-running-requests`, one. SGLang's startup warning that requests are capped
+by the Mamba state refers to this; set `--max-running-requests` to run more.
+
+Ways to give the experts more memory:
+
+- a shorter `--context-length` or `--max-total-tokens`, if your requests are shorter than the
+  model's context, or fewer `--max-running-requests`;
+- `--kv-cache-dtype fp8`, which halves the KV cache's cost per token;
+- a larger `--mem-fraction-static`, if the GPU has activation memory to spare.
+
+`auto` cannot be combined with `--enable-memory-saver`, `--enable-lora`,
+`--enable-nvidia-megakernel` or post-capture KV sizing (`SGLANG_ENABLE_POST_CAPTURE_KV_SIZING`); set
+an explicit K with those.
+
+### An explicit K
+
+`--paged-experts-num-resident K` is used as given, and the KV cache takes what is left, as without
+paging; if the server then runs out of memory for the KV cache at startup, lower K. The K that
+`auto` logs can be pinned this way.
+
+For example, Qwen3-30B-A3B-GPTQ-Int4 (2.43 MB per expert, 48 MoE layers, 117 MB per slot) on a
+16 GB GPU with `--mem-fraction-static 0.88` (the log above): its own 40,960-token context leaves
+K = 63 of 128 experts (208 tok/s), `--context-length 16384` K = 86 (231 tok/s) and
+`--max-total-tokens 10240` K = 92 (233 tok/s). Decode speed on this model is flat from K ≈ 88 up
+and falls below it.
 
 ## Correctness
 
