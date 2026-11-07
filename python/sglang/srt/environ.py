@@ -1212,6 +1212,8 @@ class Envs:
     # routed front / DeepEP dispatch / routed GEMMs, respectively.
     SGLANG_NPU_FINE_GRAINED_MOE_DUAL_STREAM = EnvBool(False)
     SGLANG_NPU_USE_MLAPO = EnvBool(False)
+    # Keep A2/A3 Normal communication in BF16 with quantized LowLatency.
+    SGLANG_NPU_DEEPEP_NORMAL_BF16 = EnvBool(False)
     # Fuse grouped Kimi-K3 SiTU with valid-row MXFP8 quantization before GMM2.
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
