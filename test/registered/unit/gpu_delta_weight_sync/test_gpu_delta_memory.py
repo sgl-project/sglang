@@ -1,6 +1,7 @@
 """Typed CUDA host-allocation admission and cleanup mocks."""
 
 import ctypes
+import mmap
 import sys
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -11,6 +12,82 @@ from sglang.srt.weight_sync.gpu_delta import memory as memory
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+@pytest.mark.parametrize(
+    "pinned,registration_failure", [(False, False), (True, False), (True, True)]
+)
+def test_shared_host_registration_owns_mapping_until_close(
+    monkeypatch, pinned, registration_failure
+):
+    mapping = mmap.mmap(-1, 4096)
+    calls = []
+    contexts = [13]
+
+    def register(address, size, flags):
+        assert size == len(mapping) and flags == 0
+        calls.append(("register", address))
+        return (int(registration_failure),)
+
+    def unregister(address):
+        assert not mapping.closed and contexts[-1] == 13
+        calls.append(("unregister", address))
+        return (0,)
+
+    def push(context):
+        contexts.append(context)
+        calls.append(("push", context))
+        return (0,)
+
+    def pop():
+        context = contexts.pop()
+        calls.append(("pop", context))
+        return 0, context
+
+    monkeypatch.setattr(
+        memory,
+        "_driver",
+        lambda: SimpleNamespace(
+            cuMemHostRegister=register,
+            cuMemHostUnregister=unregister,
+            cuCtxGetCurrent=lambda: (0, contexts[-1]),
+            cuCtxPushCurrent=push,
+            cuCtxPopCurrent=pop,
+        ),
+    )
+    if registration_failure:
+        with pytest.raises(RuntimeError, match="cuMemHostRegister"):
+            memory.HostMapping(mapping, pinned)
+        assert len(calls) == 1
+    else:
+        allocation = memory.HostMapping(mapping, pinned)
+        allocation.view[:4] = b"test"
+        escaped = allocation.view[:4]
+        assert allocation.registered is pinned
+        assert mapping[:4] == b"test"
+        if pinned:
+            assert ctypes.string_at(allocation.address, 4) == b"test"
+        assert allocation.capacity == 4096 and allocation.mapping is mapping
+        contexts[-1] = 29  # Explicit clear can run on a different caller thread.
+        allocation.close()
+        allocation.close()
+        assert contexts == [29]
+        assert allocation.mapping is None and allocation.view is None
+        assert bytes(escaped) == b"test"
+        escaped.release()
+        assert calls == (
+            [
+                ("register", allocation.address),
+                ("push", 13),
+                ("unregister", allocation.address),
+                ("pop", 13),
+            ]
+            if pinned
+            else []
+        )
+    assert not mapping.closed  # This local owner outlives the allocation wrapper.
+    mapping.close()
+    assert mapping.closed
 
 
 class Driver:

@@ -1,6 +1,9 @@
 """CPU tests for distributed delta transaction failure boundaries."""
 
+import hashlib
 import io
+import json
+import os
 import sys
 import threading
 import time
@@ -165,6 +168,53 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
     assert backend.payload.closed.wait(2)
     assert session.status()["state"] == "ABORTED"
     assert not backend.payload.released.is_set()
+
+
+def test_abort_unblocks_rank_waiting_for_shared_preparation_owner(
+    make_session, monkeypatch, tmp_path
+):
+    from sglang.srt.weight_sync.gpu_delta import host
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setattr(host, "_cache_base", lambda: cache)
+    manifest = {"codec": "bitcomp-zstd", "files": [], "tensors": []}
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps(manifest))
+    participants = [
+        identity(rank=rank)
+        | dict(host_cache_id="shared-host", dp_rank=0, pid=os.getpid())
+        for rank in range(2)
+    ]
+    arena = host.HostArena("a", 0, participants[1])
+
+    class WaitingBackend(Backend):
+        def prepare(self, path, digest, metadata, cancelled):
+            self.started.set()
+            return arena.prepare_encoded(
+                path, digest, manifest, {}, metadata, False, cancelled
+            )
+
+    backend = WaitingBackend()
+    backend.host_arena = arena
+    session, _ = make_session(participants[1], backend)
+    req = request(participants) | dict(
+        manifest_path=str(path),
+        manifest_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+        validate_payload_hash=True,
+    )
+    try:
+        session.prepare(req)
+        assert backend.started.wait(2)
+        assert session.status()["state"] == "PREPARING"
+        assert arena._pool is None
+    finally:
+        session.abort(req["session_id"])
+        # A queued callback proves the blocked prepare actually exited.
+        session._executor.submit(lambda: None).result(timeout=2)
+        arena.close()
+    assert session.status()["state"] == "ABORTED"
+    assert arena.allocation is None and not backend.payload.released.is_set()
 
 
 def test_engine_release_runs_off_scheduler_and_before_next_prepare(make_session):

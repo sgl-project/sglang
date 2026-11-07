@@ -472,37 +472,54 @@ class TestOuterZstd(unittest.TestCase):
                 payload.extend(compressed)
             target = bytearray(sum(map(len, values)))
             pool.executor.submit(
-                pool.decode_zstd, memoryview(payload), chunks, memoryview(target)
+                pool.decode_zstd,
+                zstd.BufferWithSegments(
+                    payload,
+                    np.asarray(
+                        [
+                            [chunk["encoded_offset"], chunk["encoded_bytes"]]
+                            for chunk in chunks
+                        ],
+                        dtype=np.uint64,
+                    ),
+                ),
+                [chunk["decoded_bytes"] for chunk in chunks],
+                [chunk["decoded_offset"] for chunk in chunks],
+                memoryview(target),
             ).result()
             self.assertEqual(target, b"".join(values))
 
     def test_invalid_frames_fail_without_publishing_a_decoded_result(self):
         raw = bytes(range(64)) * 128
-        encoded = bytearray(zstd.ZstdCompressor(write_checksum=True).compress(raw))
+        encoded = zstd.ZstdCompressor(write_checksum=True).compress(raw)
+        corrupt = bytearray(encoded)
+        corrupt[-1] ^= 1
         pool = HostPayloadPool(2)
         self.addCleanup(pool.close)
-        chunk = dict(
-            encoded_offset=0,
-            encoded_bytes=len(encoded),
-            decoded_offset=0,
-            decoded_bytes=len(raw) + 1,
-        )
-        with self.assertRaisesRegex(ValueError, "truncated"):
-            pool.executor.submit(
-                pool.decode_zstd,
-                memoryview(encoded),
-                [chunk],
-                memoryview(bytearray(len(raw) + 1)),
-            ).result()
-        chunk["decoded_bytes"] = len(raw)
-        encoded[-1] ^= 1
-        with self.assertRaises(zstd.ZstdError):
-            pool.executor.submit(
-                pool.decode_zstd,
-                memoryview(encoded),
-                [chunk],
-                memoryview(bytearray(len(raw))),
-            ).result()
+        for payload, size in (
+            (encoded, len(raw) - 1),
+            (encoded, len(raw) + 1),
+            (encoded[:-1], len(raw)),
+            (corrupt, len(raw)),
+            (b"not-zstd", len(raw)),
+        ):
+            target = bytearray(2 * len(raw) + 1)
+            with self.subTest(size=size, payload=bytes(payload[:8])):
+                with self.assertRaises(zstd.ZstdError):
+                    pool.executor.submit(
+                        pool.decode_zstd,
+                        zstd.BufferWithSegments(
+                            encoded + bytes(payload),
+                            np.asarray(
+                                [[0, len(encoded)], [len(encoded), len(payload)]],
+                                dtype=np.uint64,
+                            ),
+                        ),
+                        [len(raw), size],
+                        [0, len(raw)],
+                        memoryview(target),
+                    ).result()
+                self.assertEqual(target, bytes(len(target)))
 
 
 if __name__ == "__main__":

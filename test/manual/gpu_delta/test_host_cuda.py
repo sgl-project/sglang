@@ -8,10 +8,12 @@ production preparation.
 
 import hashlib
 import json
+import mmap
 import multiprocessing
 import os
 import random
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +35,7 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
 
     from sglang.srt.weight_sync.gpu_delta import checkpoint
     from sglang.srt.weight_sync.gpu_delta.bindings import _digest
+    from sglang.srt.weight_sync.gpu_delta.host import host_cache_id
     from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
 
     device = torch.device("cuda", torch.cuda.current_device())
@@ -63,14 +66,23 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
     monkeypatch.setenv("GPU_DELTA_LAYERS_PER_BATCH", "1")
     monkeypatch.setenv("GPU_DELTA_SKIP_PAYLOAD_HASH", "0")
     encoder = GpuBatchEncoder(device, codec=codec, frame_bytes=frame_bytes)
-    with tempfile.TemporaryDirectory(
-        prefix="gpu-delta-bitcomp-", dir="/dev/shm"
-    ) as directory:
+    with (
+        tempfile.TemporaryDirectory(
+            prefix="gpu-delta-bitcomp-", dir="/dev/shm"
+        ) as directory,
+        ThreadPoolExecutor(max_workers=1) as prepare_executor,
+    ):
         root = Path(directory)
         monkeypatch.setenv("GPU_DELTA_HOST_CACHE_DIR", str(root / "cache"))
-        backend = GpuDeltaBackend(
-            SimpleNamespace(model=model), {"engine_id": directory}
+        identity = dict(
+            engine_id=directory,
+            host_cache_id=host_cache_id(directory),
+            tp_rank=0,
+            dp_rank=0,
+            pid=os.getpid(),
+            rank_id="bitcomp-original-rank",
         )
+        backend = GpuDeltaBackend(SimpleNamespace(model=model), identity)
         definitions = backend.describe()["tensors"]
         plan_digest = _digest(sorted(definitions, key=lambda row: row["name"]))
         prepared = None
@@ -131,17 +143,22 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
                     descriptor,
                     session_id="tiny-receiver",
                     validate_payload_hash=True,
-                    participants=[{"engine_id": directory, "rank": 0}],
+                    participants=[identity],
                 )
-                prepared = backend.prepare(
-                    descriptor["manifest_path"], descriptor["manifest_sha256"], metadata
-                )
+                # Match the scheduler's persistent preparation worker: CUDA
+                # allocations on this foreground thread do not bind its context.
+                prepared = prepare_executor.submit(
+                    backend.prepare,
+                    descriptor["manifest_path"],
+                    descriptor["manifest_sha256"],
+                    metadata,
+                ).result()
                 assert not prepared.hardware
                 assert (
                     not prepared.decode_plan.decoded_slots
                     and not prepared.decode_plan.input_slots
                 )
-                assert backend.host_arena.allocation.tensor.is_pinned()
+                assert backend.host_arena.tensor.is_pinned()
                 assert prepared.timings["compressed_batches"] == 5
                 assert prepared.timings["decoded_zero_bytes"] == 5 * frame_bytes
                 assert prepared.timings["host_batch_plan_reused"] == int(version > 1)
@@ -173,6 +190,76 @@ def test_bitcomp_receiver_double_buffer_exact_updates_and_stale_target(
             if prepared is not None:
                 prepared.close()
             backend.close()
+
+
+def _pinned_mapping_consumer(rank, path, expected, barrier, output):
+    import torch
+
+    from sglang.srt.weight_sync.gpu_delta.memory import HostMapping
+
+    torch.cuda.set_device(rank)
+    stream = torch.cuda.Stream()
+    with Path(path).open("r+b") as source:
+        inode = (os.fstat(source.fileno()).st_dev, os.fstat(source.fileno()).st_ino)
+        mapping = mmap.mmap(source.fileno(), 0)
+    allocation = HostMapping(mapping, True)
+    tensor = torch.frombuffer(allocation.view, dtype=torch.uint8)
+    try:
+        assert tensor.is_pinned()
+        with torch.cuda.stream(stream):
+            copied = tensor.to("cuda", non_blocking=True)
+        stream.synchronize()
+        assert bytes(copied.cpu().numpy()) == expected
+        barrier.wait(timeout=90)
+        if rank == 0:
+            tensor = None
+            allocation.close()
+        barrier.wait(timeout=90)
+        if rank == 1:
+            # Unregistering one rank must leave its peer's registration usable.
+            with torch.cuda.stream(stream):
+                copied = tensor.to("cuda", non_blocking=True)
+            stream.synchronize()
+            assert bytes(copied.cpu().numpy()) == expected
+        output.put((rank, inode))
+    finally:
+        stream.synchronize()
+        tensor = None
+        allocation.close()
+        mapping.close()
+
+
+def test_shared_pinned_mapping_survives_peer_unregister():
+    context = multiprocessing.get_context("spawn")
+    with tempfile.TemporaryDirectory(
+        prefix="gpu-delta-shared-pin-", dir="/dev/shm"
+    ) as directory:
+        path = Path(directory) / "prepared.bin"
+        expected = random.Random(189).randbytes(1 << 20)
+        path.write_bytes(expected)
+        barrier, output = context.Barrier(2), context.Queue()
+        children = [
+            context.Process(
+                target=_pinned_mapping_consumer,
+                args=(rank, str(path), expected, barrier, output),
+            )
+            for rank in range(2)
+        ]
+        try:
+            for child in children:
+                child.start()
+            rows = [output.get(timeout=120) for _ in children]
+            for child in children:
+                child.join(timeout=30)
+                assert child.exitcode == 0
+        finally:
+            for child in children:
+                if child.is_alive():
+                    child.terminate()
+                    child.join(timeout=15)
+        assert {row[0] for row in rows} == {0, 1}
+        assert len({row[1] for row in rows}) == 1
+        assert path.read_bytes() == expected
 
 
 def _publication(directory, version, repeat, codec):
@@ -269,7 +356,6 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     from sglang.srt.weight_sync.gpu_delta import host as host
     from sglang.srt.weight_sync.gpu_delta import memory as memory
     from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
-    from sglang.srt.weight_sync.gpu_delta.host import HostPayloadPool
 
     os.environ["GPU_DELTA_HOST_CACHE_DIR"] = cache
     # Exercise the exact capacity-growth algorithm with small oracle tensors.
@@ -277,11 +363,23 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
     host._CAPACITY_ALIGNMENT = 1 << 20
     torch.cuda.set_device(rank % 2)
     device = torch.device("cuda", rank % 2)
-    pool, arena = HostPayloadPool(workers), host.HostArena(engine, device.index)
+    os.environ["GPU_DELTA_CPU_WORKERS"] = str(workers)
+    identity = host.host_cache_id(engine)
+    participants = [
+        dict(
+            engine_id=engine,
+            host_cache_id=identity,
+            tp_rank=local,
+            dp_rank=0,
+            pid=100 + local,
+            rank_id=f"{engine}-original-{local}",
+        )
+        for local in range(2)
+    ]
+    arena = host.HostArena(engine, device.index, participants[rank % 2])
     stream = torch.cuda.Stream(device=device)
     records = []
     try:
-        identity = host.host_cache_id(engine)
         names = {f"tensor-{i}" for i in range(4 * (rank % 2), 4 * (rank % 2 + 1))} | {
             "raw"
         }
@@ -292,27 +390,26 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 base_version=version - 1,
                 target_version=version,
                 validate_payload_hash=True,
-                participants=[
-                    {"engine_id": engine, "rank": 0},
-                    {"engine_id": engine, "rank": 1},
-                ],
+                participants=participants,
             )
             barrier.wait(timeout=90)
             metrics = {}
             manifest = json.loads(Path(path).read_text())
             codec = manifest["codec"]
-            index, files = arena.prepare_encoded(
+            index = arena.prepare_encoded(
                 path,
                 digest,
                 manifest,
-                pool,
                 metrics,
                 metadata,
             )
             entries = [entry for entry in manifest["tensors"] if entry["name"] in names]
             del manifest
-            snapshot = arena.prepare_local(index, files, entries, pool, metrics)
-            del files
+            snapshot = arena.prepare_local(index, entries, metrics)
+            assert set(snapshot.records) == names
+            assert metrics["host_rank_staging_copy_bytes"] == sum(
+                item["nbytes"] for item in snapshot.records.values()
+            )
             source = arena.tensor
             frames, offsets, size = [], {}, 0
             for entry in entries:
@@ -389,13 +486,13 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
         stream.synchronize()
         arena.close()
         assert arena.allocation is None and arena.mapping is None
+        assert arena.shared_allocation is None
         output.put(
             dict(rank=rank, engine_id=engine, updates=records, final_unmapped=True)
         )
     finally:
         stream.synchronize()
         arena.close()
-        pool.close()
 
 
 @pytest.mark.parametrize("workers", [4, 8])
@@ -449,6 +546,21 @@ def test_two_engines_reuse_host_de_capacity_and_grow(workers):
             for version in range(3):
                 rows = [record["updates"][version] for record in engine_records]
                 assert rows[0]["arena_identity"] != rows[1]["arena_identity"]
+                assert (
+                    sum(row["metrics"]["host_rank_cpu_workers"] for row in rows)
+                    == workers
+                )
+                assert (
+                    sum(row["metrics"]["host_prepared_cache_created"] for row in rows)
+                    == 1
+                )
+                assert (
+                    sum(row["metrics"]["host_prepared_cache_reused"] for row in rows)
+                    == 1
+                )
+                assert all(
+                    row["metrics"]["host_rank_staging_copy_bytes"] > 0 for row in rows
+                )
                 assert set(rows[0]["local_names"]) & set(rows[1]["local_names"]) == {
                     "raw"
                 }
