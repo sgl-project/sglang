@@ -71,11 +71,7 @@ class TokenSpaceProcessor(MultimodalProcessorMixin):
         return type(
             f"{cls.__name__}[{strategy_class.__name__}]",
             (cls,),
-            {
-                "strategy_class": strategy_class,
-                "gpu_image_decode": strategy_class.gpu_image_decode,
-                "smart_rgb_conversion": strategy_class.smart_rgb_conversion,
-            },
+            {"strategy_class": strategy_class},
         )
 
     def __init__(

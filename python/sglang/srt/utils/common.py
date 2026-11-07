@@ -2025,6 +2025,35 @@ class VideoData:
 
 image_extension_names = (".png", ".jpg", ".jpeg", ".webp", ".gif")
 GPUImageDecodeMode = Union[bool, Literal["nvjpeg_fancy"]]
+# mm_process_config["image_decoder"] -> the JPEG decoder a processor uses.
+IMAGE_DECODE_MODES = {"pil": False, "nvjpeg": True, "nvjpeg_fancy": "nvjpeg_fancy"}
+# mm_process_config["image_rgb_conversion"] -> how a processor turns an image with alpha into RGB.
+RGB_CONVERSIONS = ("convert", "white", "smart")
+
+
+def resolve_gpu_image_decode(
+    mm_process_config: dict, default: GPUImageDecodeMode
+) -> GPUImageDecodeMode:
+    """The JPEG decoder of a processor: ``mm_process_config["image_decoder"]`` over the processor's default."""
+    mode = mm_process_config.get("image_decoder")
+    if mode is None:
+        return default
+    if mode not in IMAGE_DECODE_MODES:
+        raise ValueError(
+            f"mm_process_config image_decoder must be one of {sorted(IMAGE_DECODE_MODES)}, got {mode!r}"
+        )
+    return IMAGE_DECODE_MODES[mode]
+
+
+def resolve_rgb_conversion(mm_process_config: dict, default: str) -> str:
+    """How a processor drops alpha: ``mm_process_config["image_rgb_conversion"]`` over the processor's default."""
+    mode = mm_process_config.get("image_rgb_conversion", default)
+    if mode not in RGB_CONVERSIONS:
+        raise ValueError(
+            f"mm_process_config image_rgb_conversion must be one of {RGB_CONVERSIONS}, got {mode!r}"
+        )
+    return mode
+
 
 
 def smart_to_rgb(
@@ -2064,6 +2093,19 @@ def smart_to_rgb(
         return background
 
     return image.convert("RGB")
+
+
+def to_rgb(image: Image.Image, conversion: str) -> Image.Image:
+    """RGB for the processor: "convert" drops alpha, "white" composites it onto white as qwen_vl_utils does,
+    "smart" picks a light or dark background from the edge pixels."""
+    if conversion == "smart":
+        return smart_to_rgb(image)
+    # Only an alpha channel is composited, as in qwen_vl_utils; LA and palette transparency are dropped.
+    if conversion == "white" and image.mode == "RGBA":
+        background = Image.new("RGB", image.size, (255, 255, 255))
+        background.paste(image, mask=image.getchannel("A"))
+        return background
+    return image if image.mode == "RGB" else image.convert("RGB")
 
 
 def is_jpeg_with_cuda(
