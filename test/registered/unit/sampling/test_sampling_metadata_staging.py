@@ -91,7 +91,7 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         reqs[0].tokenizer.additional_stop_token_ids = {4, None}
         reqs[0].tokenizer.eos_token_id = 1
         orch = BatchedPenalizerOrchestrator(
-            VOCAB_SIZE, _Batch(reqs, self.device), {BatchedMinNewTokensPenalizer}
+            VOCAB_SIZE, _Batch(reqs, self.device), (BatchedMinNewTokensPenalizer,)
         )
         self.assert_device_tensor(
             orch.penalizers[BatchedMinNewTokensPenalizer].min_new_tokens,
@@ -113,7 +113,7 @@ class TestSamplingMetadataCPU(_SamplingMetadataTestBase):
         orch = BatchedPenalizerOrchestrator(
             VOCAB_SIZE,
             _Batch([_req(min_new_tokens=1)], self.device),
-            {BatchedMinNewTokensPenalizer},
+            (BatchedMinNewTokensPenalizer,),
         )
         logits = torch.zeros(1, VOCAB_SIZE, device=self.device)
         orch.apply(logits)
@@ -155,7 +155,7 @@ class TestSamplingMetadataCUDA(_SamplingMetadataTestBase):
                 orch = BatchedPenalizerOrchestrator(
                     VOCAB_SIZE,
                     _Batch(reqs, self.device),
-                    {BatchedMinNewTokensPenalizer},
+                    (BatchedMinNewTokensPenalizer,),
                 )
                 logits = torch.zeros(batch_size, VOCAB_SIZE, device=self.device)
                 orch.apply(logits)
