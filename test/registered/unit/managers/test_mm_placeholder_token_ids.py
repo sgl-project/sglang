@@ -147,6 +147,33 @@ def _case_image_and_video_get_their_own_placeholder():
     )
 
 
+def _case_only_a_later_request_carries_the_video_id():
+    # Request 0 has images only and no video id; request 1 brings the video.
+    reqs = [
+        _request(1, IMAGE_TOKEN_ID),
+        _request(
+            2,
+            IMAGE_TOKEN_ID,
+            modalities=(Modality.IMAGE, Modality.VIDEO),
+            video_token_id=VIDEO_TOKEN_ID,
+        ),
+    ]
+    mm_inputs_list = [mm for mm, _, _ in reqs]
+    host_ids = torch.cat([ids for _, ids, _ in reqs])
+    image = torch.cat([pos[Modality.IMAGE] for _, _, pos in reqs])
+    video = torch.cat([pos[Modality.VIDEO] for _, _, pos in reqs])
+    input_ids = host_ids.clone()
+
+    embeds, embedding = _embed(mm_inputs_list, input_ids, [0, 0], [SEQ_LEN] * 2)
+
+    assert bool((input_ids[image] == IMAGE_TOKEN_ID).all())
+    assert bool((input_ids[video] == VIDEO_TOKEN_ID).all())
+    assert torch.equal(input_ids[~(image | video)], host_ids[~(image | video)])
+    torch.testing.assert_close(
+        embeds, _expected_embeds(mm_inputs_list, host_ids, embedding), rtol=0, atol=0
+    )
+
+
 def _case_chunk_boundary_inside_an_image():
     # Second chunk of a chunked prefill: it starts inside the first image.
     mm, ids, positions = _request(3, IMAGE_TOKEN_ID)
@@ -279,6 +306,9 @@ class TestMMPlaceholderTokenIds(CustomTestCase):
 
     def test_image_and_video_get_their_own_placeholder(self):
         _case_image_and_video_get_their_own_placeholder()
+
+    def test_only_a_later_request_carries_the_video_id(self):
+        _case_only_a_later_request_carries_the_video_id()
 
     def test_chunk_boundary_inside_an_image(self):
         _case_chunk_boundary_inside_an_image()

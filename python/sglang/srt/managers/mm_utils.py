@@ -454,10 +454,10 @@ def _fill_mm_placeholder_token_ids(
     modalities: List[Modality],
     masks: List[Optional[torch.Tensor]],
 ) -> None:
-    """Write each modality's placeholder token id over its pad values, in place."""
     for modality, mask in zip(modalities, masks):
         if mask is None:
             continue
+        # One processor config per server: requests that carry the id agree.
         token_ids = (
             _mm_placeholder_token_id(mm_inputs=mm_inputs, modality=modality)
             for mm_inputs in mm_inputs_list
@@ -484,7 +484,6 @@ def _sorted_pad_values_tensor(
 def _fill_mm_placeholder_token_ids_from_pad_values(
     input_ids: torch.Tensor, mm_inputs_list: List[MultimodalInputs]
 ) -> None:
-    """Placeholder fill for ranks that skip embed_mm_inputs (later PP stages)."""
     items = [
         item
         for mm_inputs in mm_inputs_list
@@ -580,6 +579,9 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
+            # TODO(esarafian): when EVS prunes tokens this returns a new
+            # input_ids, so forward_batch.input_ids keeps the pad values there
+            # and per-layer embeddings still differ from HF.
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
