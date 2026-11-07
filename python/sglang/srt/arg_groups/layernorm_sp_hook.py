@@ -207,3 +207,13 @@ def validate_muse_megamoe_token_budget(
             "increase SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK "
             "or reduce --chunked-prefill-size."
         )
+    from sglang.srt.utils import is_npu
+
+    if is_npu():
+        logger.warning(
+            "--enable-layernorm-sp on NPU runs via the CANN MC2 fused "
+            "matmul+collective fast-path when available, else the un-fused "
+            "reduce-scatter/all-gather fallback. Sequence-parallel semantics "
+            "are only covered by the NPU e2e test; validate it before relying "
+            "on the flag in production on Ascend."
+        )
