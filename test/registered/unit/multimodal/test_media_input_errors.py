@@ -11,7 +11,7 @@ import requests
 from PIL import Image
 
 from sglang.srt.multimodal.cache.identity import snapshot_media
-from sglang.srt.utils.common import (
+from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     get_image_bytes,
     load_image,
@@ -52,7 +52,8 @@ class TestMediaURLTimeout(unittest.TestCase):
         with (
             patch.dict(os.environ, {"SGLANG_MEDIA_URL_TIMEOUT": "7"}),
             patch(
-                "sglang.srt.utils.common.download_remote_media", return_value=b"x"
+                "sglang.srt.multimodal.media_io.download_remote_media",
+                return_value=b"x",
             ) as download,
         ):
             get_image_bytes("https://example.com/a.png")
@@ -133,7 +134,9 @@ class TestSnapshotMediaErrors(unittest.TestCase):
         ):
             with (
                 self.subTest(error=type(error).__name__),
-                patch("sglang.srt.utils.get_image_bytes", side_effect=error),
+                patch(
+                    "sglang.srt.multimodal.media_io.get_image_bytes", side_effect=error
+                ),
             ):
                 with self.assertRaises(ValueError):
                     snapshot_media("https://example.com/" + "a" * 200)

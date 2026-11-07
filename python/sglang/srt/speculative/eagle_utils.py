@@ -963,7 +963,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
 
         if _is_hip:
@@ -1007,7 +1006,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
     elif sparse:
         from sglang.srt.speculative.uno_utils import (
@@ -1044,7 +1042,6 @@ def eagle_sample(
                 retrieve_next_token=verify_input.retrieve_next_token,
                 retrieve_next_sibling=verify_input.retrieve_next_sibling,
                 target_predict=target_predict,
-                topk=verify_input.tree_topk,
             )
 
         tp_group = (

@@ -60,7 +60,7 @@ def _init_state() -> Optional[_State]:
     from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
         CustomAllReduceV2,
     )
-    from sglang.srt.utils.common import get_device_sm
+    from sglang.srt.utils.device import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend
     group = get_parallel().attn_tp_group
