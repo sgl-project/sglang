@@ -213,6 +213,24 @@ class TestConversationGetPrompt(CustomTestCase):
         # i=1: tag + " " + message + sep2
         self.assertIn("[/INST] A1 </s><s>", prompt)
 
+    def test_mistral_system_prompt_opens_first_user_turn(self):
+        """With a system message, mistral and devstral must still open the first
+        user turn with [INST] instead of emitting only the closing [/INST]."""
+        request = ChatCompletionRequest(
+            model="m",
+            messages=[
+                ChatCompletionMessageGenericParam(role="system", content="Sys"),
+                ChatCompletionMessageUserParam(role="user", content="Q1"),
+            ],
+        )
+        for template_name in ("mistral", "devstral"):
+            with self.subTest(template_name=template_name):
+                prompt = generate_chat_conv(request, template_name).get_prompt()
+                self.assertEqual(
+                    prompt,
+                    "[SYSTEM_PROMPT]\nSys\n[/SYSTEM_PROMPT]\n\n[INST] Q1 [/INST]",
+                )
+
     def test_llama4(self):
         """Test prompt generation with LLAMA4 style."""
         conv = Conversation(
