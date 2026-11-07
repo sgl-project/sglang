@@ -47,12 +47,12 @@ class ZayaConfig(PretrainedConfig):
         lm_head_bias: bool = False,
         vocab_size: int = 262272,
         hidden_size: int = 2048,
-        ffn_hidden_size: int = 4096,
+        ffn_hidden_size: Optional[int] = None,
         num_hidden_layers: int = 80,
         num_experts: int = 16,
         num_attention_heads: int = 8,
         head_dim: int = 128,
-        activation_func: str = "swiglu",
+        activation_func: Optional[str] = None,
         max_position_embeddings: int = 32768,
         norm_epsilon: float = 1e-5,
         pad_token_id: int = 0,
@@ -93,6 +93,75 @@ class ZayaConfig(PretrainedConfig):
         _attn_implementation: str = "eager",
         **kwargs,
     ):
+        # --- Checkpoint-schema detection (legacy vs transformers-native) ---
+        # Zyphra ships ZAYA1 in two config schemas. The legacy Megatron-style
+        # exports (ZAYA1-base, ZAYA1-8B-legacy) carry ``activation_func`` /
+        # ``ffn_hidden_size`` / ``zaya_layers``; the transformers-native
+        # (>= v5.13) schema (ZAYA1-8B, ZAYA1-74B-preview) instead describes L
+        # folded hybrid layers (attention + MoE each) via ``layer_types`` /
+        # ``moe_intermediate_size`` plus per-layer-type nested rope
+        # parameters. SGLang's internal module tree is legacy-shaped (2L
+        # interleaved layers), so native fields are translated to the legacy
+        # surface here and the rest of the constructor runs unchanged. Legacy
+        # markers win on conflict (e.g. hand-merged configs).
+        # The native per-layer types are stored as ``zaya_layer_types`` rather
+        # than ``layer_types``: the ``PretrainedConfig`` validator checks
+        # ``layer_types`` entries against a global whitelist that only gains
+        # "hybrid_sliding" together with the upstream zaya port (transformers
+        # v5.13), so the pinned older transformers would reject the 74B
+        # schedule outright.
+        layer_types = list(kwargs.pop("layer_types", None) or []) or None
+        native_keys_present = (
+            layer_types is not None or "moe_intermediate_size" in kwargs
+        )
+        legacy_markers_present = (
+            activation_func is not None
+            or ffn_hidden_size is not None
+            or bool(zaya_layers)
+        )
+        self.checkpoint_format = (
+            "native" if native_keys_present and not legacy_markers_present else "legacy"
+        )
+        if self.checkpoint_format == "native":
+            # Each native hybrid layer folds onto one attention + one MoE
+            # internal layer, so the internal layer count doubles and the
+            # even/odd interleaving rule below applies unchanged.
+            num_native_layers = len(layer_types) if layer_types else num_hidden_layers
+            num_hidden_layers = 2 * num_native_layers
+            # Expand per-layer types to the internal layout (native layer k
+            # covers internal layers 2k and 2k+1) so the list length stays
+            # consistent with the internal ``num_hidden_layers``.
+            self.zaya_layer_types = (
+                [t for t in layer_types for _ in range(2)] if layer_types else None
+            )
+            # ``moe_intermediate_size`` is the per-expert intermediate size I;
+            # the legacy ``ffn_hidden_size`` is the gate+up concatenation 2I.
+            ffn_hidden_size = 2 * int(kwargs.get("moe_intermediate_size", 2048))
+            activation_func = "swiglu"
+            num_query_groups = num_key_value_heads
+            norm_epsilon = float(kwargs.get("rms_norm_eps", norm_epsilon))
+            zaya_mlp_expansion = int(
+                kwargs.get("router_hidden_size", zaya_mlp_expansion)
+            )
+            moe_router_topk = int(kwargs.get("num_experts_per_tok", moe_router_topk))
+            # Native rope parameters are nested per layer type; full-attention
+            # ("hybrid") layers are the only ones the model serves today, and
+            # their entry becomes the flat rope surface.
+            if isinstance(rope_parameters, dict) and "hybrid" in rope_parameters:
+                rope_parameters = dict(rope_parameters["hybrid"])
+            else:
+                rope_parameters = None
+            rope_theta = float((rope_parameters or {}).get("rope_theta", 5_000_000.0))
+            partial_rotary_factor = float(
+                (rope_parameters or {}).get(
+                    "partial_rotary_factor", partial_rotary_factor
+                )
+            )
+        else:
+            self.zaya_layer_types = None
+            activation_func = "swiglu" if activation_func is None else activation_func
+            ffn_hidden_size = 4096 if ffn_hidden_size is None else ffn_hidden_size
+
         self.cca = cca
         self.use_cache = use_cache
         self.attention_bias = attention_bias
