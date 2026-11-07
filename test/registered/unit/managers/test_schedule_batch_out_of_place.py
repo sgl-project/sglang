@@ -337,6 +337,44 @@ class TestMergeBatchOutOfPlace(unittest.TestCase):
 
 
 class TestMixWithRunningOutOfPlace(unittest.TestCase):
+    def test_mixed_logprob_starts(self):
+        for prefill_lp, decode_lp in product((False, True), repeat=2):
+            with (
+                self.subTest(prefill=prefill_lp, decode=decode_lp),
+                get_context().override_server_args(),
+            ):
+                prefill, running = [
+                    make_schedule_batch(
+                        1,
+                        reqs=[_FakeReq(name, origin_len=3, output_len=0)],
+                        model_config=types.SimpleNamespace(is_encoder_decoder=False),
+                        sampling_info=MagicMock(),
+                        return_logprob=lp,
+                        enable_overlap=False,
+                        prefix_lens=[0],
+                        extend_lens=[3],
+                        extend_num_tokens=3,
+                        extend_logprob_start_lens=[0],
+                        extend_input_logprob_token_ids=torch.tensor([1, 2, 3])
+                        if lp
+                        else None,
+                        seq_lens_cpu=torch.tensor([3]),
+                    )
+                    for name, lp in (("prefill", prefill_lp), ("decode", decode_lp))
+                ]
+                old_starts = prefill.extend_logprob_start_lens
+                targets = prefill.extend_input_logprob_token_ids
+                prefill.mix_with_running(running)
+                self.assertEqual(
+                    prefill.extend_logprob_start_lens,
+                    [
+                        3 if decode_lp and not prefill_lp else 0,
+                        int(prefill_lp or decode_lp),
+                    ],
+                )
+                self.assertEqual(old_starts, [0])
+                self.assertIs(prefill.extend_input_logprob_token_ids, targets)
+
     def test_mix_with_running_rebinds_extend_fields_without_mutating_either_side(self):
         """mix_with_running must append via rebound lists; no field of either side may be mutated in place."""
         extend_batch = make_schedule_batch(
