@@ -24,7 +24,8 @@ the prefix *and* of the current chunk. Attention reads a per-layer assembled
 scratch slot laid out ``[prefix region | chunk region | trash page]``:
 
 - The prefix is NCCL-allgathered from the shard group into the slot one layer
-  ahead, on a dedicated side stream with a dedicated ``PyNcclCommunicator``.
+  ahead, on the gather's own ``TransferChain`` streams with a dedicated
+  ``PyNcclCommunicator``.
   Under rotated owner-classed allocation the owners of a cached prefix's
   pages are exactly cyclic, so per-rank owned counts differ by <= 1: each
   rank sends its own prefix pages in local-page order, padded to
@@ -38,6 +39,14 @@ scratch slot laid out ``[prefix region | chunk region | trash page]``:
   The dedicated gather communicator requests ``NCCL_CTA_POLICY_ZERO``
   for eligible copy-engine transfers. Leave the global ``NCCL_CTA_POLICY``
   unset so forward-pass communicators retain their default policy.
+- Push transports (``SGLANG_KV_SHARD_GATHER_TRANSPORT=multicast``, which
+  needs NVLS, or ``unicast``): instead of the NCCL allgather, each rank pushes
+  its packed block into its slot on every rank with copy-engine copies,
+  through the window's multicast VA or each peer's window
+  (``SymmetricAllGather``). One barrier pair per layer covers every gather
+  pair, and with ``SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE`` the chunked copies run
+  behind the NVLink transfer gate, so they stop while the forward's
+  collectives run (``gated_transfer.paused_background_transfers``).
 - The chunk region is staged locally on the compute stream where the write
   path already holds the full chunk (GQA CP allgathers K/V before the pool
   write; MLA latent is replicated across the shard group at write time).
@@ -57,6 +66,7 @@ every rank, so the collective order is symmetric by construction.
 
 from __future__ import annotations
 
+import functools
 import logging
 import math
 from contextlib import contextmanager, nullcontext
@@ -70,13 +80,24 @@ from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
 from sglang.kernels.ops.kvcache.mla_buffer import get_mla_kv_buffer_triton
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.distributed.device_communicators.gated_transfer import (
+    Link,
+    TransferChain,
+)
 from sglang.srt.distributed.device_communicators.pynccl import PyNcclCommunicator
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
-    allocate_symmetric_buffer,
+    SymmetricWindowBuffer,
+    allocate_symmetric_window,
 )
 from sglang.srt.distributed.device_communicators.pynccl_wrapper import (
     NCCL_CTA_POLICY_ZERO,
     NCCLLibrary,
+)
+from sglang.srt.distributed.device_communicators.symmetric_transfer import (
+    SymmetricAllGather,
+    WindowBarrier,
+    control_bytes,
+    window_targets,
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.environ import envs
@@ -109,6 +130,10 @@ _SCRATCH_ALIGN_BYTES = 4096
 # two-rank multicast-team setup race (upstream commit 430afbc). Zeroing our
 # scratch cannot initialize NCCL's internal buffers.
 _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION = 23102
+
+# Prefix gather transports: the NCCL copy-engine allgather, or a one-sided
+# push into the scratch window's multicast VA / every peer's window.
+_GATHER_TRANSPORTS = ("nccl", "multicast", "unicast")
 
 
 def _symmetric_scratch_supported(
@@ -157,8 +182,29 @@ def _view_bytes(
     return buf[offset : offset + nbytes].view(dtype).view(shape)
 
 
+def _pack_rows(
+    pool_buf: torch.Tensor,
+    rows: torch.Tensor,
+    out: torch.Tensor,
+    stream: torch.cuda.Stream,
+) -> None:
+    with torch.cuda.stream(stream):
+        torch.index_select(pool_buf, 0, rows, out=out)
+
+
+def _nccl_all_gather(
+    comm: PyNcclCommunicator,
+    output: torch.Tensor,
+    input_: torch.Tensor,
+    stream: torch.cuda.Stream,
+) -> None:
+    with comm.change_state(enable=True), torch.cuda.stream(stream):
+        comm.all_gather(output, input_)
+
+
 class _ScratchSlot:
-    """One half of the double buffer: scratch tensors + ready event.
+    """One half of the double buffer: scratch tensors + the ticket of the
+    gather that fills them.
 
     ``resident_key`` identifies what the slot currently holds — ``(layer_id,
     epoch)`` — so repeated reads of the same layer skip the re-gather and a
@@ -166,9 +212,9 @@ class _ScratchSlot:
     walk.
     """
 
-    def __init__(self, tensors: Dict[str, torch.Tensor], device_module):
+    def __init__(self, tensors: Dict[str, torch.Tensor]):
         self.tensors = tensors
-        self.ready = device_module.Event()
+        self.ready: Optional[int] = None
         self.resident_key: Optional[Tuple[int, int]] = None
 
 
@@ -212,7 +258,28 @@ class PageInterleaveKVPoolMixin:
                 custom_mem_pool=self.custom_mem_pool,
                 shard_group=shard_group,
             )
-        # Dedicated communicator + stream so the layer-ahead gathers never
+        transport = envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.get()
+        if transport not in _GATHER_TRANSPORTS:
+            raise ValueError(
+                f"SGLANG_KV_SHARD_GATHER_TRANSPORT must be one of "
+                f"{_GATHER_TRANSPORTS}, got {transport!r}"
+            )
+        # "multicast" / "unicast", or None for the NCCL allgather.
+        self._symmetric_mode = transport if transport != "nccl" else None
+        if self._symmetric_mode and not self._use_symmetric_scratch:
+            logger.warning(
+                "The %s KV-shard gather needs the symmetric gather scratch; "
+                "keeping the NCCL gather.",
+                transport,
+            )
+        if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get() and not self._symmetric_mode:
+            logger.warning(
+                "SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE applies to the multicast "
+                "and unicast gather transports; the NCCL gather runs unpaused."
+            )
+        # Set by _alloc_symmetric_scratch when the window reaches every rank.
+        self._sym_gather: Optional[SymmetricAllGather] = None
+        # Dedicated communicator + chain so the layer-ahead gathers never
         # interleave with the group's main collectives.
         self.kv_gather_comm: PyNcclCommunicator = PyNcclCommunicator(
             group=shard_group.cpu_group,
@@ -232,9 +299,16 @@ class PageInterleaveKVPoolMixin:
         slot_tensors, self._scratch_window_registered = self._alloc_scratch(
             scratch_rows
         )
-        self._slots = [
-            _ScratchSlot(tensors, self.device_module) for tensors in slot_tensors
-        ]
+        self._slots = [_ScratchSlot(tensors) for tensors in slot_tensors]
+        # The gather's own streams; a push transport brings its own chain
+        # (gated when the forward's collectives may pause it). The prefix
+        # gather runs on CUDA devices only.
+        self._gather_chain: Optional[TransferChain] = None
+        if self._sym_gather is not None:
+            self._gather_chain = self._sym_gather.chain
+        elif torch.device(self.device).type == "cuda":
+            with torch.cuda.device(self.device):
+                self._gather_chain = TransferChain(None)
         with self._torch_alloc_context():
             # Per-batch absolute scratch-page index of every logical page.
             # Unplanned pages initially target the trash page. Logical page
@@ -269,7 +343,7 @@ class PageInterleaveKVPoolMixin:
             "Page-interleave KV sharding enabled: shard_rank=%d shard_size=%d "
             "page_size=%d prefix_tokens=%d chunk_tokens=%d scratch_rows=%d x2 "
             "(%.2f MiB per rank, charged against the KV budget), "
-            "NCCL symmetric scratch=%s. "
+            "NCCL symmetric scratch=%s, prefix gather on %s. "
             "Batch admission is limited by this scratch capacity.",
             self.shard_rank,
             self.shard_size,
@@ -279,7 +353,20 @@ class PageInterleaveKVPoolMixin:
             scratch_rows,
             scratch_bytes / (1024 * 1024),
             self._scratch_window_registered,
+            self._gather_transport_name(),
         )
+
+    def _gather_transport_name(self) -> str:
+        if self._sym_gather is not None:
+            chunk = self._sym_gather.chunk_bytes
+            return "%s copy-engine push (%s, %s)" % (
+                self._symmetric_mode,
+                "one copy per block" if chunk is None else f"{chunk >> 20} MiB chunks",
+                "pausable" if self._gather_chain.link is not None else "not pausable",
+            )
+        if self._scratch_window_registered:
+            return "the NCCL allgather (copy engines where NCCL picks them)"
+        return "the NCCL allgather"
 
     @contextmanager
     def _torch_alloc_context(self):
@@ -310,7 +397,17 @@ class PageInterleaveKVPoolMixin:
         self, specs: Dict[str, _TensorSpec]
     ) -> Tuple[List[Dict[str, torch.Tensor]], bool]:
         offsets, nbytes = _symmetric_scratch_layout(specs, num_slots=_NUM_SCRATCH_SLOTS)
-        buf, registered = allocate_symmetric_buffer(self.kv_gather_comm, nbytes)
+        # A push transport's barrier lanes follow the slots.
+        control_offset = nbytes
+        if self._symmetric_mode:
+            nbytes += ceil_align(control_bytes(self.shard_size), _SCRATCH_ALIGN_BYTES)
+        window = allocate_symmetric_window(self.kv_gather_comm, nbytes)
+        buf = window.tensor
+        registered = window.window is not None
+        if self._symmetric_mode:
+            self._sym_gather = self._create_symmetric_gather(
+                window, control_offset=control_offset
+            )
         if not registered:
             logger.warning(
                 "NCCL returned no symmetric window for the KV-shard gather "
@@ -328,6 +425,55 @@ class PageInterleaveKVPoolMixin:
             for slot_offsets in offsets
         ]
         return slots, registered
+
+    def _create_symmetric_gather(
+        self, window: SymmetricWindowBuffer, *, control_offset: int
+    ) -> Optional[SymmetricAllGather]:
+        """Collective over the shard group: every rank gets one or None."""
+        group = self.kv_gather_comm.group
+        targets = window_targets(self.kv_gather_comm, window, self._symmetric_mode)
+        reachable = torch.tensor([int(targets is not None)], dtype=torch.int32)
+        torch.distributed.all_reduce(
+            reachable, op=torch.distributed.ReduceOp.MIN, group=group
+        )
+        if not reachable.item():
+            logger.warning(
+                "The KV-shard gather window cannot reach every rank for the %s "
+                "push (%s); keeping the NCCL gather unpaused.",
+                self._symmetric_mode,
+                "no symmetric window"
+                if window.window is None
+                else "NCCL < 2.29.2, an LSA team short of the group, or no "
+                "multicast VA (NCCL_NVLS_ENABLE=0?)",
+            )
+            return None
+        chunk_mb = envs.SGLANG_KV_SHARD_GATHER_CHUNK_MB.get()
+        chunk_bytes = chunk_mb << 20 if chunk_mb > 0 else None
+        link = None
+        if envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.get():
+            if chunk_bytes is None:
+                logger.warning(
+                    "SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE needs "
+                    "SGLANG_KV_SHARD_GATHER_CHUNK_MB > 0; the KV-shard gather "
+                    "runs unpaused."
+                )
+            else:
+                link = Link.NVLINK
+        barrier = WindowBarrier(
+            rank=self.shard_rank,
+            world_size=self.shard_size,
+            local_base=window.tensor.data_ptr(),
+            targets=targets,
+            control_offset=control_offset,
+        )
+        with torch.cuda.device(window.tensor.device):
+            chain = TransferChain(link)
+        gather = SymmetricAllGather(barrier, chunk_bytes=chunk_bytes, chain=chain)
+        # Every rank's lanes must read 0 before any rank's first signal.
+        barrier.init_control(window.tensor)
+        torch.cuda.synchronize(window.tensor.device)
+        torch.distributed.barrier(group=group)
+        return gather
 
     def set_kv_buffer_prefix_valid(self, *args, **kwargs):
         raise NotImplementedError(
@@ -510,7 +656,7 @@ class PageInterleaveKVPoolMixin:
 
     def _prefetch_layer(self, layer_id: int) -> None:
         """Kick the allgather assembling ``layer_id``'s prefix into its slot,
-        on the gather stream. Idempotent per ``(layer_id, epoch)``."""
+        on the gather's chain. Idempotent per ``(layer_id, epoch)``."""
         local_layer = layer_id - self.start_layer
         if local_layer >= self.layer_num:
             return
@@ -518,33 +664,57 @@ class PageInterleaveKVPoolMixin:
         key = (layer_id, self._epoch)
         if slot.resident_key == key:
             return
-        # Order the gather after all prior compute-stream work: the
+        assert self._gather_chain is not None, "the prefix gather needs a CUDA pool"
+        # The gather's chain runs after all prior compute-stream work: the
         # previous tenant's reads (attention of layer_id - 2) and the pool
-        # writes that produced the prefix rows.
-        self.kv_gather_stream.wait_stream(self.device_module.current_stream())
-        with self.device_module.stream(self.kv_gather_stream):
-            if self.layer_transfer_counter is not None:
-                # HiCache loads this layer's rows on its own stream, and the gather
-                # bypasses the waiting base getters.
+        # writes that produced the prefix rows. It first packs this rank's
+        # prefix rows into its own block of the slot (the send buffer).
+        after = self.device_module.current_stream()
+        if self.layer_transfer_counter is not None:
+            # HiCache loads this layer's rows on its own stream, and the gather
+            # bypasses the waiting base getters. Record the wait before submitting
+            # the chain: its feeder may run after the load counter advances.
+            self.kv_gather_stream.wait_stream(after)
+            with self.device_module.stream(self.kv_gather_stream):
                 self.layer_transfer_counter.wait_until(local_layer)
-            for pool_buf, name in self._gather_pairs(local_layer):
-                send_rows = self._gather_send_rows(name)
-                block = send_rows.numel()
-                scratch = slot.tensors[name]
-                send = scratch[self.shard_rank * block : (self.shard_rank + 1) * block]
-                torch.index_select(pool_buf, 0, send_rows, out=send)
-                # In-place regular allgather: send is exactly the rank's
-                # block of the output, every rank contributes `block` rows.
-                with self.kv_gather_comm.change_state(enable=True):
-                    self.kv_gather_comm.all_gather(
-                        scratch[: self.shard_size * block], send
-                    )
-            slot.ready.record(self.kv_gather_stream)
+            after = self.kv_gather_stream
+        sends = []
+        pack = []
+        for pool_buf, name in self._gather_pairs(local_layer):
+            send_rows = self._gather_send_rows(name)
+            block = send_rows.numel()
+            send = slot.tensors[name][
+                self.shard_rank * block : (self.shard_rank + 1) * block
+            ]
+            sends.append((name, send))
+            pack.append(functools.partial(_pack_rows, pool_buf, send_rows, send))
+        if self._sym_gather is not None:
+            # Every gather pair of the layer under one barrier pair; each own
+            # block is pushed from where it was packed.
+            base = self._sym_gather.local_base
+            blocks = [
+                (send.data_ptr(), send.data_ptr() - base, send.nbytes)
+                for _, send in sends
+            ]
+            slot.ready = self._sym_gather.all_gather(blocks, after, setup=pack)
+        else:
+            # In-place regular allgather: send is exactly the rank's block of
+            # the output, every rank contributes `block` rows.
+            ops = [
+                functools.partial(
+                    _nccl_all_gather,
+                    self.kv_gather_comm,
+                    slot.tensors[name][: self.shard_size * send.shape[0]],
+                    send,
+                )
+                for name, send in sends
+            ]
+            slot.ready = self._gather_chain.run(ops, setup=pack, after=after)
         slot.resident_key = key
 
     def _acquire_slot_for_read(self, layer_id: int) -> _ScratchSlot:
-        """Block the compute stream on the slot's ready event (a no-op when
-        the layer-ahead gather already landed) and kick the next layer's
+        """Block the compute stream on the slot's gather (a no-op when the
+        layer-ahead gather already landed) and kick the next layer's
         gather. A residency miss is a caller bug — the batch plan captured by
         ``begin_shard_extend`` must have prefetched this layer."""
         assert self._shard_extend_active, (
@@ -557,7 +727,12 @@ class PageInterleaveKVPoolMixin:
                 f"prefix scratch miss for layer {layer_id} "
                 f"(resident={slot.resident_key}, epoch={self._epoch})"
             )
-            self.device_module.current_stream().wait_event(slot.ready)
+            current = self.device_module.current_stream()
+            if self._sym_gather is not None:
+                # Also waits for every peer's copies (the exit barrier).
+                self._sym_gather.wait(current, slot.ready)
+            else:
+                self._gather_chain.wait(slot.ready, stream=current)
             self._prefetch_layer(layer_id + 1)
         return slot
 

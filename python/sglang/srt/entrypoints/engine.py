@@ -1946,20 +1946,43 @@ def _set_envs_and_config(server_args: ServerArgs):
         os.environ["NCCL_CUMEM_ENABLE"] = str(
             int(cfg.enable_symm_mem or kv_shard_symmetric_scratch)
         )
+    # The multicast transport of that gather copies into the window's NVLS
+    # multicast VA, which NCCL returns as NULL with NVLS off (the unicast
+    # transport needs only the window).
+    kv_shard_multicast_gather = (
+        kv_shard_symmetric_scratch
+        and envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.get() == "multicast"
+    )
     if (
         "NCCL_NVLS_ENABLE" not in os.environ
         or cfg.enable_nccl_nvls
         or cfg.enable_symm_mem
     ):
         os.environ["NCCL_NVLS_ENABLE"] = str(
-            int(cfg.enable_nccl_nvls or cfg.enable_symm_mem)
+            int(
+                cfg.enable_nccl_nvls or cfg.enable_symm_mem or kv_shard_multicast_gather
+            )
         )
     if "NCCL_GRAPH_MIXING_SUPPORT" not in os.environ or cfg.enable_symm_mem:
         # Note(wh): NCCL_GRAPH_MIXING_SUPPORT=0 can help improve performance for symmetric kernels.
         # details in https://github.com/NVIDIA/nccl-tests/issues/333#issuecomment-3103636985
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
-    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    # At least 8 hardware queues. A larger user value (CUDA allows 32) is kept
+    # so fewer streams share a queue: a parked stream wait, such as the gate
+    # of a paused background transfer, stalls every stream on its queue.
+    connections = os.environ.get("CUDA_DEVICE_MAX_CONNECTIONS", "")
+    os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = str(
+        max(8, int(connections)) if connections.isdigit() else 8
+    )
+    # The values every worker process inherits, including the ones set above.
+    logger.info(
+        "Worker process env: NCCL_CUMEM_ENABLE=%s NCCL_NVLS_ENABLE=%s "
+        "CUDA_DEVICE_MAX_CONNECTIONS=%s",
+        os.environ.get("NCCL_CUMEM_ENABLE"),
+        os.environ.get("NCCL_NVLS_ENABLE"),
+        os.environ["CUDA_DEVICE_MAX_CONNECTIONS"],
+    )
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels

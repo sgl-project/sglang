@@ -763,6 +763,16 @@ def paused_background_transfers(links: Link) -> Union[_PausedTransfers, nullcont
     return _PausedTransfers(links)
 
 
+def background_transfers_pending(links: Link) -> bool:
+    """Host-side hint: whether a bracket on ``links`` may pause anything now
+    (some gate has chunks that may still be in flight). Lets a caller skip
+    work it does only to make a bracket safe."""
+    return any(
+        gate.link & links and (gate._pause_thread is not None or gate.busy())
+        for gate in _gates
+    )
+
+
 # ---- copy chunks ----------------------------------------------------------------
 
 

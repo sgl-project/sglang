@@ -15,7 +15,9 @@
 
 Covers symmetric-window ownership and release, zero NCCL kernel launches,
 the cross-node fallback, and comparisons against ordinary NCCL on 2 and 4
-ranks, including CUDA graph replay. Needs NCCL >= 2.31.2 (CI pins an older
+ranks, including CUDA graph replay. Also covers gated multicast and unicast
+push gathers, their pause/resume ordering, and the NCCL fallback when NVLS
+is unavailable. Needs NCCL >= 2.31.2 (CI pins an older
 NCCL) and at least 2 GPUs. Run with:
     CUDA_VISIBLE_DEVICES=0,1,2,3 python3 \
         test/manual/mem_cache/test_page_interleave_zero_sm_gather.py
@@ -24,6 +26,7 @@ NCCL) and at least 2 GPUs. Run with:
 import gc
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
@@ -44,6 +47,7 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION,
     _symmetric_scratch_layout,
 )
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,6 +58,8 @@ sys.path.insert(
 from test_page_interleave_gather_multi_gpu import (  # noqa: E402
     _GATHER_LAYER_NUM,
     _GATHER_WORLD,
+    _check,
+    _run_mha,
     _run_mla,
 )
 
@@ -307,6 +313,119 @@ class TestPageInterleaveZeroSmGatherMultiGpu(CustomTestCase):
                 nprocs=_GATHER_WORLD,
                 join=True,
             )
+
+
+def _run_symmetric_mha(rank, world, port, mode, paused, expect_push, skipped):
+    # _run_mha checks the gathered prefix whichever transport runs it.
+    pool, req_to_token, prefix_len, seq_len = _run_mha(rank, world, port)
+    if not expect_push:
+        # The window cannot reach every rank this way: the pool falls back
+        # to the ungated NCCL allgather.
+        assert pool._sym_gather is None, f"[rank {rank}] {mode} did not fall back"
+        assert pool._gather_chain.link is None
+        assert "NCCL allgather" in pool._gather_transport_name()
+        torch.distributed.barrier()
+        return
+    if pool._sym_gather is None:
+        if rank == 0:
+            skipped.put(f"no {mode} push on this host (NVLS or LSA reach)")
+        torch.distributed.barrier()
+        return
+    assert pool._sym_gather.chain is pool._gather_chain
+    gate = pool._gather_chain._gate
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"{mode} gather launched NCCL kernels: {nccl_kernels}"
+    if not paused:
+        assert gate is None, f"[rank {rank}] the {mode} gather is gated"
+        torch.distributed.barrier()
+        return
+    # Drained: the forward's brackets no longer pause anything.
+    assert gate is not None and not gate.busy()
+
+    # A gather enqueued while one rank is paused completes on no rank until
+    # that rank resumes: every rank's read waits for it. The pause is flipped
+    # from the host: GPU work queued behind a parked gate can share its
+    # hardware queue.
+    cpu_group = get_parallel().attn_cp_group.cpu_group
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    prefix_rows = pool.translate_loc_to_scratch(req_to_token[0, :prefix_len].long())
+    expected = pool.get_key_buffer(pool.start_layer)[prefix_rows].clone()
+    slot = pool._slots[pool.start_layer % 2]
+    slot.tensors["k"].zero_()
+    # Drain the next layer's prefetch first: a paused gather would hang a
+    # device-wide sync.
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=cpu_group)
+    if rank == 0:
+        gate._word.value = 3
+    pool.begin_shard_extend(req_to_token, torch.tensor([0]), [prefix_len], [seq_len])
+    if rank == 0:
+        # Held by its own pause. A peer's chunks drain; its read then waits
+        # for this rank's copies, which no pause on the peer can help.
+        assert gate.busy()
+    got = pool.get_key_buffer(pool.start_layer)[prefix_rows]
+    read = torch.cuda.Event()
+    read.record()
+    time.sleep(0.2)
+    stalled = not read.query()
+    # Host-only barrier: a device-wide sync here would wait on rank 0's gather.
+    torch.distributed.barrier(group=cpu_group)
+    if rank == 0:
+        gate.force_open()
+    read.synchronize()
+    assert stalled, f"[rank {rank}] {mode} read finished while rank 0 was paused"
+    _check(rank, f"{mode} k after resume", got, expected)
+    torch.cuda.synchronize()
+    torch.distributed.barrier()
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
+)
+class TestPageInterleaveSymmetricGatherMultiGpu(CustomTestCase):
+    def _spawn(self, mode, port, *, paused=True, nvls=None, expect_push=True):
+        """The push transport assembles the same K/V prefix without NCCL
+        kernels; paused, a paused rank holds every rank's read until resumed.
+        A window that cannot reach every rank falls back to the NCCL gather."""
+        # The library the pool gates on, which may differ from torch's NCCL.
+        if NCCLLibrary().ncclGetRawVersion() < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
+            self.skipTest("the symmetric gather scratch needs NCCL >= 2.31.2")
+        # The window needs cuMem, the multicast VA NVLS; the ranks inherit
+        # both. Unicast runs with NVLS off, as the engine sets it.
+        if nvls is None:
+            nvls = mode == "multicast"
+        skipped = mp.get_context("spawn").SimpleQueue()
+        with (
+            temp_set_env(
+                NCCL_CUMEM_ENABLE="1",
+                NCCL_NVLS_ENABLE=str(int(nvls)),
+                NCCL_CTA_POLICY=None,
+            ),
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            envs.SGLANG_KV_SHARD_GATHER_TRANSPORT.override(mode),
+            envs.SGLANG_ENABLE_KV_SHARD_GATHER_PAUSE.override(paused),
+        ):
+            mp.spawn(
+                _run_symmetric_mha,
+                args=(_GATHER_WORLD, port, mode, paused, expect_push, skipped),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+        if not skipped.empty():
+            self.skipTest(skipped.get())
+
+    def test_pausable_multicast_gather(self):
+        self._spawn("multicast", 29813)
+
+    def test_pausable_unicast_gather(self):
+        self._spawn("unicast", 29814)
+
+    def test_ungated_unicast_gather(self):
+        self._spawn("unicast", 29816, paused=False)
+
+    def test_multicast_without_nvls_falls_back(self):
+        self._spawn("multicast", 29817, nvls=False, expect_push=False)
 
 
 if __name__ == "__main__":
