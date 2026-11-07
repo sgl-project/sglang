@@ -92,7 +92,6 @@ MI45X_DEEPSEEK_V4_FLASH_MODELS = [
             "SGLANG_USE_ROCM700A": "0",
             "SGLANG_HACK_FLASHMLA_BACKEND": "unified_kv_triton",
             "AITER_BF16_FP8_MOE_BOUND": "0",
-            "AITER_FORCE_A8W4": "1",
             "SGLANG_USE_AITER_MOE_GU_ITLV": "0",
             "SGLANG_OPT_FUSE_MHC_POST_PRE": "0",
             "ENABLE_CK": "0",

@@ -95,7 +95,7 @@ def _use_exact_chunk_fill() -> bool:
     on that kernel, against 1% for the hipBLASLt GEMMs that just run one extra
     partial tile.
     """
-    return envs.SGLANG_EXACT_CHUNK_FILL.get() and is_gfx95_supported()
+    return is_gfx95_supported()
 
 
 # Threshold for in-batch prefix cache.

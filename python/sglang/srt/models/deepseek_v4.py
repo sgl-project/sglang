@@ -65,6 +65,7 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -74,6 +75,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.graph_utils import (
+    pad_with_zero_rows,
+    real_rows_scope,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
@@ -416,26 +421,23 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _wo_a_aiter_gemm_eligible(
-    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
-) -> bool:
+def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
-    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
-    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    Folds the global ``SGLANG_USE_AITER`` switch and the HIP/gfx95 platform
+    gates into one predicate. Evaluated once at import (see
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(flag and use_aiter and is_hip and is_gfx95)
+    return bool(use_aiter and is_hip and is_gfx95)
 
 
-# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# Resolve eligibility and import the aiter kernel ONCE at module import: the
 # decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
-# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
-# path is eligible but the kernel import fails, disable it here and fall back to
-# the einsum for the process (logged once) instead of retrying every step.
+# not pay a function-local import on every call. If the path is eligible but
+# the kernel import fails, disable it here and fall back to the einsum for the
+# process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
-    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
@@ -482,12 +484,9 @@ if _is_hip:
     if is_wo_a_fp8_mxscale_supported():
         _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
         _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
-        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
-        # bind it when both the flatmm and the fused aiter op are available.
-        if (
-            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
-            and is_wo_a_fp8_fused_invrope_supported()
-        ):
+        # Fused inverse-RoPE + quant front end, bound when both the flatmm and
+        # the fused aiter op are available.
+        if is_wo_a_fp8_fused_invrope_supported():
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
         _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
@@ -1540,7 +1539,6 @@ class MQALayer(MqaAttentionBase):
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
-            and envs.SGLANG_DSV41_FUSED_WO_A.get()
             and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
             and not self.use_npu_arch35_mxfp8_wo_a
@@ -2641,6 +2639,28 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_real_rows(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        real_num_tokens: int,
+        defer_all_reduce: bool,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        # x_quant is laid out for every row (MXFP8 scales are swizzled), so the
+        # real rows are quantized again inside attention.
+        with real_rows_scope(forward_batch, real_num_tokens):
+            out = self.forward(
+                x[:real_num_tokens],
+                positions[:real_num_tokens],
+                forward_batch,
+                defer_all_reduce=defer_all_reduce,
+            )
+        if isinstance(out, mhc.AttnOutput):
+            return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
+        return pad_with_zero_rows(out, x.shape[0])
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2657,6 +2677,19 @@ class MQALayer(MqaAttentionBase):
             assert isinstance(
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
+        metadata = attn_backend.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and metadata.real_num_tokens is not None
+            and x.shape[0] > metadata.real_num_tokens
+        ):
+            return self._forward_real_rows(
+                x,
+                positions,
+                forward_batch,
+                real_num_tokens=metadata.real_num_tokens,
+                defer_all_reduce=defer_all_reduce,
             )
 
         enable_multi_stream = (
@@ -3522,6 +3555,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not _is_hip
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
@@ -3606,7 +3640,7 @@ def _scatter_tail_rows(
         return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
