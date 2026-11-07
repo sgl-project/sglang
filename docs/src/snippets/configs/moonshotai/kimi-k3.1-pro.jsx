@@ -61,8 +61,7 @@ export const config = {
   // Throughput shapes verify K = 5 (block 6): at large batch the verify rows (requests ×
   // block) dominate a step. The High-Throughput decode and every MI35x cell (whose PD prefill must
   // match its decode) use block 6; everything else runs K = 7 (block 8). The MI35x unified
-  // High-Throughput cell, at its 48-agent shape, verifies K = 4 (block 5): from 48 requests the
-  // shorter verify outweighs its lower acceptance.
+  // High-Throughput cell runs block 5 at its 48-agent shape.
   dflashBlock(s) {
     if (config.isAmd(s) && s.pdMode === "unified" && s.strategy === "high-throughput") return 5;
     return (s.pdMode === "decode" && s.strategy === "high-throughput") || config.isAmd(s) ? 6 : 8;
@@ -136,8 +135,7 @@ export const config = {
             // KV pool collapses (5.13M -> 0.77M tokens measured on decode). The PD prefill role
             // never runs verify and rejects the flag at startup.
             ...(s.pdMode !== "prefill" ? ["--enable-linear-replayssm-spec"] : []),
-            // The MI35x single-node acceptance was measured with block verification of sampled
-            // drafts; greedy requests skip it.
+            // the MI35x single-node acceptance was measured with it (sampled drafts only)
             ...(config.isAmd(s) && s.pdMode === "unified" ? ["--speculative-use-block-verification"] : []),
           ],
           hints: (s) =>
@@ -215,7 +213,7 @@ export const config = {
           ],
           // Keeps every rank on the Rust TreeCore; write-back asserts on a mix with the Python one.
           env: (s) => [`SGLANG_HICACHE_MAMBA_HOST_RATIO=${s.pdMode === "prefill" ? 8 : 10}`, "RUSTUP_TOOLCHAIN=stable"],
-          hints: ["The host pools pin 170-185 GB of host memory per GPU, and the 8 ranks share the node's GTT (1511 GiB on MI355X); ratio 12 overflowed it at 32 agents. Check the node's GTT limit before raising either ratio."],
+          hints: ["The host pools pin 170-185 GB per GPU against the node's shared GTT limit; ratio 12 overflowed it."],
         },
         { id: "amd-off", label: "Off", showWhen: (s) => config.isAmd(s) },
         {
@@ -1072,7 +1070,7 @@ sgl-router \\
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
         "--prefill-decode-interval 16",
-        // 150 state slots keep agent sessions' prefixes cached.
+        // keeps agent sessions' prefixes cached
         "--max-mamba-cache-size 150",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
@@ -1101,8 +1099,7 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // From 48 agents: the MoE front and residual stream on row shards in prefill (no extra
-        // memory) and a draft block's ring locations in one launch.
+        // 48+ agents: row-sharded prefill, fused draft ring locations
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1118,7 +1115,6 @@ sgl-router \\
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        // Below 48 agents the recipe runs 16k chunks every 16 decode steps with block 6.
         "--prefill-decode-interval 8",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
@@ -1252,7 +1248,7 @@ sgl-router \\
         "--cuda-graph-max-bs-decode 4",
         "--schedule-policy lpm",
         "--prefill-decode-interval 16",
-        // 150 state slots keep agent sessions' prefixes cached.
+        // keeps agent sessions' prefixes cached
         "--max-mamba-cache-size 150",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
         "--cuda-graph-backend-prefill breakable",
@@ -1281,8 +1277,7 @@ sgl-router \\
         "SGLANG_ROCM_RUNTIME_RESERVE_GB=10",
         "SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK=1",
         "HSA_USERPTR_FOR_PAGED_MEM=0",
-        // From 48 agents: the MoE front and residual stream on row shards in prefill (no extra
-        // memory) and a draft block's ring locations in one launch.
+        // 48+ agents: row-sharded prefill, fused draft ring locations
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_ROUTED_FRONT=1",
         "SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM=1",
         "SGLANG_OPT_DFLASH_RING_LOCS_FUSED=1",
@@ -1298,7 +1293,6 @@ sgl-router \\
         "--max-running-requests 48",
         "--cuda-graph-max-bs-decode 48",
         "--schedule-policy lpm",
-        // Below 48 agents the recipe runs 16k chunks every 16 decode steps with block 6.
         "--prefill-decode-interval 8",
         "--mamba-full-memory-ratio 0.65",
         "--mamba-radix-cache-strategy extra_buffer_lazy",
