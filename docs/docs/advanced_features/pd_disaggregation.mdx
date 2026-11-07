@@ -34,6 +34,14 @@ new-session scores are normalized by that capacity. History is limited to 4,096
 sessions with 1,800 seconds of inactivity expiry. Requests without a session ID
 use projected load without creating a history entry.
 
+Existing sessions keep their shard while its reported live load can accommodate
+the incoming prompt and `--num-reserved-decode-tokens` for each active, queued,
+and incoming request. If the home shard exceeds capacity and another shard fits,
+the policy moves the session to the fitting shard with the lowest projected
+capacity usage. This check assumes the full incoming prompt, without prefix
+reuse on the destination. Unknown capacity, no fitting alternative, or an
+explicit DP rank override preserves the existing routing decision.
+
 The scheduler still performs KV admission. The controller's history estimates
 residency and can overestimate prefixes that have been evicted. Compare TTFT,
 cache hits, KV waits and per-shard loads before enabling this policy broadly.
