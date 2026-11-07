@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     UnifiedKvMetadata,
     _match_num_queries,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase

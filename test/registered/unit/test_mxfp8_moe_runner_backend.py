@@ -10,17 +10,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import (
-    ResolvedView,
-    _moe_runner_backend_quant_constraints,
-)
+from sglang.srt.arg_groups.model_override_base import ResolvedView
+from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
 from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 
 
 @contextlib.contextmanager
 def _platform(*, is_hip: bool, is_gfx95: bool = False, arch: str = "none"):
-    """gfx95 is read straight from utils.common, not through the platform
+    """gfx95 is read straight from utils.device, not through the platform
     probes, so it is patched where overrides.py imported it.
 
     Every case pins the Blackwell probes rather than letting them answer from

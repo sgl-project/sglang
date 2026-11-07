@@ -15,7 +15,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -28,6 +27,8 @@ from sglang.kernels.ops.attention.kv_indices import spec_kv_index_token_blocks
 from sglang.kernels.ops.attention.utils import (
     assert_buffer_fits,
 )
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import (
@@ -35,6 +36,12 @@ from sglang.srt.layers.attention.base_attn_backend import (
     resolve_window_id_space,
     resolve_window_kv_pool,
 )
+from sglang.srt.layers.cp.base import (
+    CPAttentionBackendKind,
+    get_cp_strategy,
+)
+from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -45,13 +52,15 @@ from sglang.srt.mem_cache.kv.alloc.id_space import (
     WindowRead,
     window_read,
 )
+from sglang.srt.mem_cache.kv.memory.views import MHAKVView
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -61,15 +70,9 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
     fill_draft_window_rail,
-    generate_draft_decode_kv_indices,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
-    get_int_env_var,
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -172,6 +175,7 @@ class PrefillMetadata:
     extend_no_prefix: bool
     multi_item_params: Optional[MultiItemScoringParams] = None
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    cp_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
 
 
 # Reuse this workspace buffer across all flashinfer wrappers
@@ -303,6 +307,10 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    # FlashInfer's plan() clears this on every call and may set it again for its
+    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
+    # here too rather than let run() launch it with a previous plan's state.
+    self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
         self._float_workspace_buffer,
@@ -325,6 +333,7 @@ def fast_prefill_plan(
         False,  # disable_split_kv
         0,  # num_colocated_ctas
         0,  # uniform_q_len
+        False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -467,6 +476,8 @@ class FlashInferAttnBackend(AttentionBackend):
             envs.SGLANG_FLASHINFER_WORKSPACE_SIZE.set(2048 * 1024 * 1024)
 
         self.use_paged = envs.SGLANG_FLASHINFER_USE_PAGED.get()
+        # Read by prefill_cp_unsupported_reason; the CP strategy owns the check.
+        self._model_config = model_runner.model_config
 
         # Allocate buffers
         # different from flashinfer zero_init_global_workspace_buffer
@@ -596,6 +607,101 @@ class FlashInferAttnBackend(AttentionBackend):
         self.full_cg_prefill_wrappers: Optional[
             List[BatchPrefillWithPagedKVCacheWrapper]
         ] = None
+
+    def prefill_cp_unsupported_reason(self) -> Optional[str]:
+        """Why zigzag prefill CP cannot run on this backend, or None if it can.
+
+        Asked by ``ZigzagCPStrategy.can_apply`` only when FlashInfer is the
+        prefill backend, so subclasses such as TRTLLM-MHA never reach it.
+        """
+        model_config = self._model_config
+        if self.skip_prefill:
+            return "the backend was built without prefill wrappers"
+        if model_config.attention_arch != AttentionArch.MHA:
+            return "only dense MHA/GQA attention is supported"
+        # Set for sliding-window and encoder-decoder models.
+        if self.dispatch_reason is not None:
+            return "sliding-window and cross attention are not supported"
+        if model_config.head_dim != model_config.v_head_dim:
+            return "K and V head dims must match"
+        if not check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            return "prefill CUDA graphs must be disabled"
+        if self.prefill_uses_dequant_workspace:
+            return "KV caches read through a dequant workspace are not supported"
+        # Unified MHA views label token-major NHD rows as page_major.
+        if not all(
+            isinstance(view, MHAKVView)
+            and view.kv_cache_layout in ("nhd", "page_major")
+            for view in (
+                self.kv_layers.view(sub_pool.name)
+                for sub_pool in self.kv_layers.sub_pools()
+            )
+        ):
+            return "the KV cache must use a direct NHD layout"
+        return None
+
+    def _init_forward_metadata_cp(self, forward_batch: ForwardBatch) -> None:
+        cp_metadata = forward_batch.attn_cp_metadata
+        req_pool_indices = forward_batch.req_pool_indices
+
+        q_lens_cpu = (
+            cp_metadata.actual_seq_q_prev_list + cp_metadata.actual_seq_q_next_list
+        )
+        kv_lens_cpu = cp_metadata.kv_len_prev_list + cp_metadata.kv_len_next_list
+        virtual_bs = len(q_lens_cpu)
+        device = req_pool_indices.device
+        q_lens = torch.tensor(q_lens_cpu, dtype=torch.int32, device=device)
+        kv_lens = torch.tensor(kv_lens_cpu, dtype=torch.int32, device=device)
+
+        qo_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        qo_indptr[0] = 0
+        qo_indptr[1:] = torch.cumsum(q_lens, dim=0)
+        paged_kv_indptr = torch.empty(virtual_bs + 1, dtype=torch.int32, device=device)
+        paged_kv_indptr[0] = 0
+        paged_kv_indptr[1:] = torch.cumsum(kv_lens, dim=0)
+        paged_kv_indices = torch.empty(
+            sum(kv_lens_cpu), dtype=torch.int32, device=device
+        )
+        kv_start_idx = torch.zeros_like(kv_lens)
+        bs = len(req_pool_indices)
+        # Keep both halves indexed by the iteration's original request rows.
+        for start in (0, bs):
+            end = start + bs
+            self.runner_ids.pack_read_stream(
+                forward_batch.iteration_ids,
+                req_pool_indices=req_pool_indices,
+                seq_lens=kv_lens[start:end],
+                indptr=paged_kv_indptr[start : end + 1],
+                out=paged_kv_indices,
+                kv_start_idx=kv_start_idx[start:end],
+            )
+        paged_kv_last_page_len = torch.ones(
+            virtual_bs, dtype=torch.int32, device=device
+        )
+
+        wrapper = self.prefill_wrappers_paged[0]
+        updater = self.indices_updater_prefill
+        wrapper.begin_forward(
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
+            updater.num_qo_heads,
+            updater.num_kv_heads,
+            updater.head_dim,
+            1,
+            causal=True,
+            q_data_type=updater.q_data_type,
+            kv_data_type=updater.data_type,
+            non_blocking=True,
+            fixed_split_size=self.prefill_split_tile_size,
+        )
+        self.forward_metadata = PrefillMetadata(
+            prefill_wrappers=[wrapper],
+            use_ragged=False,
+            extend_no_prefix=False,
+            cp_wrapper=wrapper,
+        )
 
     def _check_kv_attention_access(self, phase: str, access) -> None:
         if access is not None:
@@ -1003,6 +1109,10 @@ class FlashInferAttnBackend(AttentionBackend):
         return layer.k_scale, layer.v_scale
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
+        if is_cp_active(forward_batch):
+            self._init_forward_metadata_cp(forward_batch)
+            return
+
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
             swa_out_cache_loc = self.runner_ids.write_ids(
@@ -1389,6 +1499,37 @@ class FlashInferAttnBackend(AttentionBackend):
         forward_batch: ForwardBatch,
         save_kv_cache=True,
     ):
+        cp_wrapper = self.forward_metadata.cp_wrapper
+        if cp_wrapper is not None:
+            cp_strategy = get_cp_strategy()
+            cp_strategy.materialize_full_kv(
+                forward_batch=forward_batch, layer=layer, k=k, v=v
+            )
+            kv_cache = self.kv_layers.read(layer.layer_id).kv()
+
+            def _flashinfer_cp_attn(logical_q: torch.Tensor) -> torch.Tensor:
+                return cp_wrapper.forward(
+                    logical_q.contiguous().view(
+                        -1, layer.tp_q_head_num, layer.head_dim
+                    ),
+                    kv_cache,
+                    causal=True,
+                    sm_scale=layer.scaling,
+                    window_left=-1,
+                    logits_soft_cap=layer.logit_cap,
+                    k_scale=layer.k_scale_float,
+                    v_scale=layer.v_scale_float,
+                )
+
+            output = cp_strategy.run_attention(
+                q=q,
+                forward_batch=forward_batch,
+                device=q.device,
+                attn_fn=_flashinfer_cp_attn,
+                attention_backend=CPAttentionBackendKind.FLASHINFER,
+            )
+            return output.view(-1, layer.tp_q_head_num * layer.head_dim)
+
         prefill_wrapper_paged = self.forward_metadata.prefill_wrappers[
             self._get_wrapper_idx(layer)
         ]
@@ -2834,10 +2975,9 @@ def should_use_tensor_core(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
+    forced = envs.SGLANG_FLASHINFER_USE_TENSOR_CORE.get()
+    if forced is not None:
+        return forced
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
     # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
