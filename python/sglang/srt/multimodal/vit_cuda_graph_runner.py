@@ -23,8 +23,8 @@ from typing import Dict, Hashable, List, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.attention.vision import VisionAttention
+from sglang.srt.runtime_context import get_parallel
 
 
 class ViTCudaGraphRunner:
@@ -64,9 +64,9 @@ class ViTCudaGraphRunner:
         # captured before the workspace grew.
         self.sin_cos_ws: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
         self._retired_sin_cos_ws: List[Tuple[torch.Tensor, torch.Tensor]] = []
-        self._sin_cos_ws_by_graph: Dict[Hashable, Tuple[torch.Tensor, torch.Tensor]] = (
-            {}
-        )
+        self._sin_cos_ws_by_graph: Dict[
+            Hashable, Tuple[torch.Tensor, torch.Tensor]
+        ] = {}
         self.max_context_len = getattr(vit, "max_context_len", None)
 
         # Qwen2.5-VL specific viarable.
@@ -167,7 +167,7 @@ class ViTCudaGraphRunner:
         # graph, and all layers are local in DP mode, so capture locally.
         if getattr(self.vit, "use_data_parallel", False):
             return nullcontext()
-        ca_comm = get_tp_group().ca_comm
+        ca_comm = get_parallel().tp_group.ca_comm
         return ca_comm.capture() if ca_comm is not None else nullcontext()
 
     def _create_graph(
@@ -199,19 +199,25 @@ class ViTCudaGraphRunner:
             warmup_cu_ws = [cu_window, cu_window_kk, max_window_len]
         else:
             warmup_cu_ws = [cu_full, cu_full_kk, max_full_len]
-        if backend == "fa3":
-            warmup_cu_ws = [warmup_cu_ws[0], warmup_cu_ws[2]]
+        warmup_layouts = [warmup_cu_ws]
+        if backend in ("fa3", "fa4"):
+            warmup_layouts = [[warmup_cu_ws[0], warmup_cu_ws[2]]]
+        if backend == "fa4" and self._fullatt_block_indexes:
+            # FA4 JIT-compiles each kernel variant on first use, which must not
+            # happen inside the capture: warm up the windowed and the full layout.
+            warmup_layouts = [[cu_window, max_window_len], [cu_full, max_full_len]]
 
-        warmup_kwargs = dict(
-            cu_seqlens=warmup_cu_ws, output_ws=self.block_ws[graph_key]
-        )
+        warmup_kwargs = dict(output_ws=self.block_ws[graph_key])
         if position_embeddings is not None:
             warmup_kwargs["position_embeddings"] = position_embeddings
         elif rotary_pos_emb_cos is not None and rotary_pos_emb_sin is not None:
             warmup_kwargs["rotary_pos_emb_cos"] = rotary_pos_emb_cos
             warmup_kwargs["rotary_pos_emb_sin"] = rotary_pos_emb_sin
         with torch.no_grad():
-            vit.blocks[0](self.block_input[graph_key], **warmup_kwargs)
+            for layout in warmup_layouts:
+                vit.blocks[0](
+                    self.block_input[graph_key], cu_seqlens=layout, **warmup_kwargs
+                )
         torch.cuda.synchronize()
 
         with self._capture_context(), torch.cuda.graph(graph):
@@ -236,7 +242,7 @@ class ViTCudaGraphRunner:
 
                 if backend == "triton_attn":
                     cu_seq_len_ws = [cu_seqlens_now, cu_seqlens_kk_now, max_len]
-                elif backend == "fa3":
+                elif backend in ("fa3", "fa4"):
                     cu_seq_len_ws = [cu_seqlens_now, max_len]
                 else:
                     raise RuntimeError(

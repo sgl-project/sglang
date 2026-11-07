@@ -608,7 +608,7 @@ def _run_server_and_dump(
         "--mem-fraction-static",
         "0.9",
         "--disable-cuda-graph",
-        "--disable-piecewise-cuda-graph",
+        "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
         "--flashinfer-allreduce-fusion-backend",
         PRECISION_FUSION_BACKEND,

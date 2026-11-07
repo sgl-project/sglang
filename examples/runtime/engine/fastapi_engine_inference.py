@@ -130,7 +130,7 @@ def send_requests(server_url, prompts, max_new_tokens, temperature):
     """Sends generation requests to the running server for a list of prompts."""
     # Iterate through prompts and send requests
     for i, prompt in enumerate(prompts):
-        print(f"\n[{i+1}/{len(prompts)}] Sending prompt: '{prompt}'")
+        print(f"\n[{i + 1}/{len(prompts)}] Sending prompt: '{prompt}'")
         payload = {
             "prompt": prompt,
             "max_new_tokens": max_new_tokens,

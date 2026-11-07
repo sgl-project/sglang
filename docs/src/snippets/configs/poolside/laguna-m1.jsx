@@ -71,7 +71,7 @@ export const config = {
 
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -82,7 +82,7 @@ export const config = {
     // (AIME 25 to be added back once truncation-free numbers are measured.)
     accuracy: {
       gsm8k_pct:
-`# pip install git+https://github.com/sgl-project/sgl-eval
+`# pip install sgl-eval
 sgl-eval run gsm8k \\
   --base-url http://{{CURL_HOST}}:{{CURL_PORT}}/v1 \\
   --num-threads 128`,

@@ -13,6 +13,7 @@
 # ==============================================================================
 
 
+import logging
 import typing
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
@@ -20,12 +21,13 @@ from dataclasses import dataclass
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.utils import logger
 
 from .evs_core import compute_retention_mask, replace_offsets_with_tokens_per_frame
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -72,9 +74,9 @@ class EVSEmbeddingResult(EmbeddingResult):
             input_ids, filler_token_id
         )
         input_ids = input_ids[extend_prefix_len : extend_prefix_len + extend_seq_len]
-        assert (
-            len(input_ids) == extend_seq_len
-        ), f"Input ids length changed after redistribution, got {len(input_ids)} != {extend_seq_len}"
+        assert len(input_ids) == extend_seq_len, (
+            f"Input ids length changed after redistribution, got {len(input_ids)} != {extend_seq_len}"
+        )
         return input_ids, offsets
 
 
@@ -84,9 +86,9 @@ class EVSConfig:
     spatial_merge_size: int = 1
 
     def __post_init__(self):
-        assert (
-            self.video_pruning_rate >= 0.0 and self.video_pruning_rate < 1.0
-        ), f"Video pruning rate must be between 0.0 and 1.0, got {self.video_pruning_rate=}"
+        assert self.video_pruning_rate >= 0.0 and self.video_pruning_rate < 1.0, (
+            f"Video pruning rate must be between 0.0 and 1.0, got {self.video_pruning_rate=}"
+        )
 
 
 class EVS(torch.nn.Module, ABC):
@@ -130,16 +132,22 @@ class EVS(torch.nn.Module, ABC):
                 f"[EVS] requested on model {model_name} but is disabled for pruning_rate == 0.0."
             )
 
-    def evs_video(self, items: list[MultimodalDataItem]) -> EVSEmbeddingResult:
+    def evs_video(
+        self, items: list[MultimodalDataItem]
+    ) -> EVSEmbeddingResult | torch.Tensor:
         """
         Apply EVS pruning to video embeddings.
 
         Args:
-            items: List containing a single EVS video item with video features.
+            items: EVS video items; more than one only when every video is a single frame.
 
         Returns:
-            EVSEmbeddingResult with pruned embeddings and actual token counts per frame.
+            EVSEmbeddingResult with pruned embeddings and actual token counts per frame,
+            or the unpruned features when every video is a single frame.
         """
+        if all(t == 1 for item in items for t, _, _ in item.thw_grids):
+            # The first frame is never pruned, so single-frame videos have nothing to prune.
+            return self.original_get_video_feature(items)
         logger.debug(
             f"[EVS] beginning for model {self.__class__.__name__} [evs_config={self.evs_config=}]"
         )

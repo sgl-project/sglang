@@ -84,9 +84,7 @@ MI45X_DEEPSEEK_R1_0528_MXFP4_MODELS = [
             "AMD_COREDUMP": "0",
             "ENABLE_CK": "0",
             "SGLANG_USE_AITER": "1",
-            "AITER_FORCE_A8W4": "1",
             "AITER_GROUPED_FORCE_SPLIT_K1": "1",
-            "SGLANG_MOE_SHUFFLE_GFX1250": "1",
             "ROCM_QUICK_REDUCE_QUANTIZATION": "NONE",
             "SGLANG_AITER_FP8_PREFILL_ATTN": "0",
             "SGLANG_AITER_MLA_PERSIST": "0",
@@ -193,9 +191,9 @@ class TestDeepSeekR10528MXFP4EvalMI45x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

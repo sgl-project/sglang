@@ -26,13 +26,16 @@ from transformers.models.ernie4_5_moe.configuration_ernie4_5_moe import (
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )
-from sglang.srt.layers.communicator import enable_moe_dense_fully_dp
+from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers.layer_boundary import is_dense_ffn_fully_dp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -42,8 +45,7 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_cpu, is_npu, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import is_cpu, is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -60,7 +62,7 @@ class MoEGate(nn.Module):
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts))
+            torch.empty((1, config.moe_num_experts), dtype=torch.float32)
         )
 
     def forward(self, hidden_states):
@@ -110,6 +112,7 @@ class Ernie4Moe(nn.Module):
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         if self.moe_num_shared_experts > 0:
             intermediate_size = (
@@ -198,18 +201,14 @@ class Ernie4DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
             )
         else:
-            if enable_moe_dense_fully_dp():
-                mlp_tp_rank, mlp_tp_size = 0, 1
-            else:
-                mlp_tp_rank, mlp_tp_size = None, None
+            mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
             self.mlp = Ernie4MLP(
                 hidden_size=config.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
                 quant_config=quant_config,
                 prefix=add_prefix("mlp", prefix),
-                tp_rank=mlp_tp_rank,
-                tp_size=mlp_tp_size,
+                parallel_group=mlp_parallel_group,
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

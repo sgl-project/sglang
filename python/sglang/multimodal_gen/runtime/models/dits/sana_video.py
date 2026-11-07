@@ -10,10 +10,10 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection
 
 from sglang.kernels.ops.diffusion import (
+    SANA_VIDEO_LINEAR_ATTENTION,
     BitExactFusionGate,
-    can_use_interleaved_rope_fp64,
+    fused_depthwise_conv3x3_bias_glu,
     fused_interleaved_rope_fp64,
-    mark_sana_video_linear_attention_site,
     tensors_equal,
     try_sana_video_linear_attention,
 )
@@ -34,11 +34,17 @@ from sglang.multimodal_gen.runtime.models.dits.sana import (
     sana_ln_modulate,
     sana_residual_gate_add,
 )
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+_is_cuda = current_platform.is_cuda()
 
 logger = init_logger(__name__)
 
 _SANA_VIDEO_ROPE = BitExactFusionGate("SANA-Video fused RoPE")
+_SANA_VIDEO_DEPTHWISE_GLU = BitExactFusionGate(
+    "SANA-Video fused depthwise GLU", per_signature=True
+)
 
 
 def apply_interleaved_rotary_emb(
@@ -63,37 +69,21 @@ def apply_interleaved_rotary_emb_pair(
     freqs_sin: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Apply paired interleaved RoPE, with a bit-exact eager fallback."""
-    verified = _SANA_VIDEO_ROPE.verified
-    if (
-        not _SANA_VIDEO_ROPE.disabled
-        and can_use_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
-        and (verified or _SANA_VIDEO_ROPE.can_attempt_once())
-    ):
-        try:
-            fused = fused_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin)
-        except Exception as exc:
-            _SANA_VIDEO_ROPE.on_exception(exc, logger=logger)
-        else:
-            if verified:
-                return fused
-            eager = (
-                apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
-                apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
-            )
-            return _SANA_VIDEO_ROPE.accept_or_fallback(
-                fused,
-                eager,
-                equal=tensors_equal,
-                logger=logger,
-                mismatch_msg=(
-                    "SANA-Video fused RoPE is not bit-exact on this platform; "
-                    "falling back to eager"
-                ),
-            )
-    return (
-        apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
-        apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
-    )
+
+    def reference():
+        return (
+            apply_interleaved_rotary_emb(query, freqs_cos, freqs_sin),
+            apply_interleaved_rotary_emb(key, freqs_cos, freqs_sin),
+        )
+
+    if _is_cuda and query.is_cuda and query.dtype is torch.bfloat16:
+        return _SANA_VIDEO_ROPE.run(
+            lambda: fused_interleaved_rope_fp64(query, key, freqs_cos, freqs_sin),
+            reference,
+            equal=tensors_equal,
+            logger=logger,
+        )
+    return reference()
 
 
 class SanaVideoRotaryPosEmbed(nn.Module):
@@ -203,13 +193,61 @@ class GLUMBTempConv(nn.Module):
             bias=False,
         )
 
+    def _depthwise_glu(self, x: torch.Tensor) -> torch.Tensor:
+        conv = self.conv_depth
+
+        def reference():
+            return sana_conv_bias_glu(conv, x, allow_eager=True)
+
+        if (
+            torch.compiler.is_compiling()
+            or not _is_cuda
+            or not x.is_cuda
+            or torch.is_grad_enabled()
+            or x.dtype is not torch.bfloat16
+            or x.ndim != 4
+            or x.numel() < 2**24
+            or not x.is_contiguous(memory_format=torch.channels_last)
+            or torch.cuda.get_device_capability(x.device) != (12, 0)
+            or not torch.backends.cudnn.enabled
+            or type(conv) is not nn.Conv2d
+            or conv.kernel_size != (3, 3)
+            or conv.stride != (1, 1)
+            or conv.padding != (1, 1)
+            or conv.dilation != (1, 1)
+            or conv.groups != x.shape[1]
+            or conv.padding_mode != "zeros"
+            or conv.bias is None
+        ):
+            return reference()
+        sig = (
+            x.shape,
+            x.stride(),
+            x.device,
+            conv.weight.stride(),
+            torch.backends.cudnn.benchmark,
+            torch.backends.cudnn.deterministic,
+            torch.backends.cudnn.allow_tf32,
+            torch.are_deterministic_algorithms_enabled(),
+        )
+        return _SANA_VIDEO_DEPTHWISE_GLU.run(
+            lambda: fused_depthwise_conv3x3_bias_glu(x, conv.weight, conv.bias),
+            reference,
+            sig=sig,
+            logger=logger,
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, num_frames, height, width, channels = hidden_states.shape
         hidden_states = hidden_states.reshape(
             batch_size * num_frames, height, width, channels
         ).permute(0, 3, 1, 2)
-        hidden_states = sana_conv_bias_silu(self.conv_inverted, hidden_states)
-        hidden_states = sana_conv_bias_glu(self.conv_depth, hidden_states)
+        # Video's frame-batched activations are large enough to benefit from
+        # the rounded post-processing fusions in eager execution as well.
+        hidden_states = sana_conv_bias_silu(
+            self.conv_inverted, hidden_states, allow_eager=True
+        )
+        hidden_states = self._depthwise_glu(hidden_states)
         hidden_states = self.conv_point(hidden_states)
 
         temporal = hidden_states.reshape(
@@ -242,7 +280,7 @@ class SanaVideoLinearAttention(nn.Module):
         self.to_out = nn.ModuleList(
             [nn.Linear(self.inner_dim, query_dim, bias=True), nn.Identity()]
         )
-        mark_sana_video_linear_attention_site(self)
+        SANA_VIDEO_LINEAR_ATTENTION.mark(self)
 
     def forward(
         self,

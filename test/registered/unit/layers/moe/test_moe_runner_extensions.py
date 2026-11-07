@@ -32,7 +32,7 @@ from sglang.srt.lora.layers import FusedMoEWithLoRA
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=15, suite="base-c-test-cpu")
+register_cpu_ci(est_time=15, suite="stage-b-test-cpu-intel")
 
 
 class _TestDispatchRunnerCore(DispatchMoeRunnerCore):
@@ -141,27 +141,29 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
 
     def create_runner(layer, config) -> None:
         calls.append("runner")
-        method.runner = SimpleNamespace()
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
 
     monkeypatch.setattr(method, "create_moe_runner", create_runner)
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
-    with get_context().override_server_args(
-        model_path="dummy"
-    ), get_flags().moe.override(
-        runner_backend=MoeRunnerBackend.AUTO,
-        a2a_backend=MoeA2ABackend.NONE,
-    ), get_parallel().override(
-        moe_ep_size=1,
-        moe_ep_rank=0,
-        moe_tp_size=1,
-        moe_tp_rank=0,
-        tp_size=1,
-        tp_rank=0,
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.AUTO,
+            a2a_backend=MoeA2ABackend.NONE,
+        ),
+        get_parallel().override(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            tp_size=1,
+            tp_rank=0,
+        ),
     ):
         layer = FusedMoE(
             num_experts=2,
@@ -201,15 +203,14 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     base_layer.moe_tp_rank = 0
     base_layer.intermediate_size_per_partition = 8
     base_layer.runner = SimpleNamespace(runner_backend=backend)
-    lora_backend = SimpleNamespace(is_moe_lora=False)
+    lora_backend = SimpleNamespace(name="triton", is_moe_lora=False)
     created_runners = []
     monkeypatch.setattr(
         runner_module,
         "MoeRunner",
-        lambda selected_backend, config, lora_enabled: created_runners.append(
-            (selected_backend, config, lora_enabled)
-        )
-        or object(),
+        lambda selected_backend, config, lora_enabled: (
+            created_runners.append((selected_backend, config, lora_enabled)) or object()
+        ),
     )
 
     wrapper = FusedMoEWithLoRA(base_layer, lora_backend)
@@ -345,21 +346,23 @@ def test_fused_moe_layer_runner_is_none_when_method_builds_no_runner(
     monkeypatch.setattr(
         fused_moe_layer_module,
         "create_moe_dispatcher",
-        lambda config: SimpleNamespace(),
+        lambda config, quant_method: SimpleNamespace(),
     )
 
-    with get_context().override_server_args(
-        model_path="dummy"
-    ), get_flags().moe.override(
-        runner_backend=MoeRunnerBackend.AUTO,
-        a2a_backend=MoeA2ABackend.NONE,
-    ), get_parallel().override(
-        moe_ep_size=1,
-        moe_ep_rank=0,
-        moe_tp_size=1,
-        moe_tp_rank=0,
-        tp_size=1,
-        tp_rank=0,
+    with (
+        get_context().override_server_args(model_path="dummy"),
+        get_flags().moe.override(
+            runner_backend=MoeRunnerBackend.AUTO,
+            a2a_backend=MoeA2ABackend.NONE,
+        ),
+        get_parallel().override(
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_tp_size=1,
+            moe_tp_rank=0,
+            tp_size=1,
+            tp_rank=0,
+        ),
     ):
         layer = FusedMoE(
             num_experts=2,

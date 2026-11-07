@@ -40,8 +40,15 @@ struct PrefillServerInfo {
     pp_size: i64,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kv_layout: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dsv41_spec_layout: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spec_kv_layout: Option<serde_json::Value>,
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
+    stores_to_linker: bool,
     prefill_http_port: Option<i64>,
 }
 
@@ -106,8 +113,12 @@ struct Topology {
     pp_size: Option<i64>,
     page_size: Option<i64>,
     kv_cache_dtype: Option<String>,
+    kv_layout: Option<String>,
+    dsv41_spec_layout: Option<serde_json::Value>,
+    spec_kv_layout: Option<serde_json::Value>,
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
+    stores_to_linker: Option<bool>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -153,12 +164,20 @@ struct Route {
     page_size: i64,
     #[serde(default)]
     kv_cache_dtype: Option<String>,
+    #[serde(default)]
+    kv_layout: Option<String>,
+    #[serde(default)]
+    dsv41_spec_layout: Option<serde_json::Value>,
+    #[serde(default)]
+    spec_kv_layout: Option<serde_json::Value>,
     #[serde(default, deserialize_with = "parse_int_opt")]
     prefill_http_port: Option<i64>,
     #[serde(default)]
     load_balance_method: Option<String>,
     #[serde(default)]
     enable_dsa_cache_layer_split: Option<bool>,
+    #[serde(default)]
+    stores_to_linker: Option<bool>,
 }
 
 async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) -> Response {
@@ -176,8 +195,22 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
 
     // Copy-on-write update. `rcu` may re-run the closure under write
     // contention, so it only reads `body` and clones what it stores.
+    let mut layout_mismatch = false;
+    let mut spec_mismatch = false;
     state.topology.rcu(|current| {
         let mut topo = (**current).clone();
+        layout_mismatch =
+            topo.registered_count > 0 && topo.dsv41_spec_layout != body.dsv41_spec_layout;
+        spec_mismatch = topo.spec_kv_layout.is_some()
+            && body.spec_kv_layout.is_some()
+            && topo.spec_kv_layout != body.spec_kv_layout;
+        if layout_mismatch || spec_mismatch {
+            return topo;
+        }
+        topo.dsv41_spec_layout = body.dsv41_spec_layout.clone();
+        if topo.spec_kv_layout.is_none() {
+            topo.spec_kv_layout = body.spec_kv_layout.clone();
+        }
         topo.attn_tp_size.get_or_insert(body.attn_tp_size);
         topo.attn_cp_size.get_or_insert(body.attn_cp_size);
         topo.dp_size.get_or_insert(dp_size);
@@ -185,6 +218,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo.page_size.get_or_insert(body.page_size);
         if topo.kv_cache_dtype.is_none() {
             topo.kv_cache_dtype = body.kv_cache_dtype.clone();
+        }
+        if topo.kv_layout.is_none() {
+            topo.kv_layout = body.kv_layout.clone();
         }
         if topo.prefill_http_port.is_none() {
             topo.prefill_http_port = body.prefill_http_port;
@@ -197,6 +233,8 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         );
         topo.enable_dsa_cache_layer_split
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
+        topo.stores_to_linker
+            .get_or_insert(body.stores_to_linker.unwrap_or(false));
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -207,6 +245,19 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
         topo.registered_count += 1;
         topo
     });
+
+    if layout_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "DeepSeek-V4.1 DSpark PD layout differs across prefill ranks",
+        );
+    }
+    if spec_mismatch {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "Speculative KV layout differs across prefill ranks",
+        );
+    }
 
     let topo = state.topology.load();
     tracing::debug!(
@@ -262,8 +313,12 @@ async fn route_get(
             pp_size: topo.pp_size.unwrap(),
             page_size: topo.page_size,
             kv_cache_dtype: topo.kv_cache_dtype.clone(),
+            kv_layout: topo.kv_layout.clone(),
+            dsv41_spec_layout: topo.dsv41_spec_layout.clone(),
+            spec_kv_layout: topo.spec_kv_layout.clone(),
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
+            stores_to_linker: topo.stores_to_linker.unwrap_or(false),
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -450,8 +505,14 @@ mod tests {
                 ..Default::default()
             },
             server_args: Arc::new(server_args),
+            generate_hook: None,
+            generate_validator: None,
+            server_info_state_keys: Vec::new(),
         };
-        (crate::runtime::start(cfg).expect("start runtime"), addr)
+        (
+            crate::runtime::start(cfg, None).expect("start runtime"),
+            addr,
+        )
     }
 
     /// The full wire contract the Python decode side / PD router depends on:
@@ -498,6 +559,7 @@ mod tests {
                 "page_size": 64, "kv_cache_dtype": "auto",
                 "follow_bootstrap_room": true,
                 "enable_dsa_cache_layer_split": false,
+                "stores_to_linker": false,
                 "prefill_http_port": 30000,
             })
         );
@@ -524,6 +586,48 @@ mod tests {
             None,
         );
         assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn dspark_layout_round_trip_and_rank_mismatch() {
+        let (_rt, addr) = start_on_free_port();
+        let layout = serde_json::json!({"num_draft_tokens": 6, "state_item_lens": [[4096]]});
+        let body = put_route(serde_json::json!({"dsv41_spec_layout": layout}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["dsv41_spec_layout"], layout);
+
+        let incompatible = put_route(serde_json::json!({"dsv41_spec_layout": null}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
+        let (_, body) = request(addr, "GET", SENTINEL, None);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["dsv41_spec_layout"], layout);
+    }
+
+    #[test]
+    fn spec_kv_layout_rank_compatibility() {
+        let (_rt, addr) = start_on_free_port();
+        let layout = serde_json::json!({
+            "algorithm": "DSPARK", "num_draft_entries": 6, "dspark_block_size": 4
+        });
+        let body = put_route(serde_json::json!({"pp_size": 2, "spec_kv_layout": layout}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+
+        let incompatible = put_route(serde_json::json!({
+            "pp_size": 2, "pp_rank": 1,
+            "spec_kv_layout": {"algorithm": "DSPARK", "num_draft_entries": 7},
+        }));
+        assert_eq!(request(addr, "PUT", "/route", Some(&incompatible)).0, 400);
+        assert_eq!(request(addr, "GET", SENTINEL, None).0, 503);
+
+        let draftless = put_route(serde_json::json!({"pp_size": 2, "pp_rank": 1}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&draftless)).0, 200);
+        let (status, body) = request(addr, "GET", SENTINEL, None);
+        assert_eq!(status, 200);
+        let info: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(info["spec_kv_layout"], layout);
     }
 
     /// System-dp topology derivation: with `system_dp_size > 1` the dp axis

@@ -35,6 +35,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -45,11 +46,9 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class GPTJAttention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -118,7 +117,6 @@ class GPTJAttention(nn.Module):
 
 
 class GPTJMLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -151,7 +149,6 @@ class GPTJMLP(nn.Module):
 
 
 class GPTJBlock(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -194,7 +191,6 @@ class GPTJBlock(nn.Module):
 
 
 class GPTJModel(nn.Module):
-
     def __init__(
         self,
         config: GPTJConfig,
@@ -242,7 +238,6 @@ class GPTJModel(nn.Module):
 
 
 class GPTJForCausalLM(nn.Module):
-
     def __init__(
         self,
         config: GPTJConfig,

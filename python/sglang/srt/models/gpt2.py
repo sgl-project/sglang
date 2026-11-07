@@ -33,15 +33,14 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 
 class GPT2Attention(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -95,7 +94,6 @@ class GPT2Attention(nn.Module):
 
 
 class GPT2MLP(nn.Module):
-
     def __init__(
         self,
         intermediate_size: int,
@@ -133,7 +131,6 @@ class GPT2MLP(nn.Module):
 
 
 class GPT2Block(nn.Module):
-
     def __init__(
         self,
         layer_id: int,
@@ -182,7 +179,6 @@ class GPT2Block(nn.Module):
 
 
 class GPT2Model(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,
@@ -230,7 +226,6 @@ class GPT2Model(nn.Module):
 
 
 class GPT2LMHeadModel(nn.Module):
-
     def __init__(
         self,
         config: GPT2Config,

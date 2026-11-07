@@ -40,7 +40,6 @@ DEFAULT_HYBRID_ATTN_SERVER_ARGS = [
 
 @unittest.skipIf(get_device_sm() < 90, "Test requires CUDA SM 90 or higher")
 class TestHybridAttnBackendBase(CustomTestCase):
-
     model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
     accuracy_threshold = 0.65  # derived tests need to override this

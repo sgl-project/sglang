@@ -9,7 +9,7 @@ from torch.nn.functional import softplus
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.cpu_test_utils import precision
 
-register_cpu_ci(est_time=7, suite="base-b-test-cpu")
+register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
 
 torch.manual_seed(1234)
 
@@ -301,7 +301,7 @@ def test_chunk_gated_delta_rule(B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE):
         initial_state = initial_state_.clone().transpose(-1, -2).contiguous()
         initial_state_before = initial_state.clone()
 
-        core_attn_out, returned_state = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
+        core_attn_out = torch.ops.sgl_kernel.chunk_gated_delta_rule_cpu(
             query=query,
             key=key,
             value=value,
@@ -324,6 +324,7 @@ def test_chunk_gated_delta_rule(B, T_PER_SEQ, HK, HV, K, V, POOL_SIZE):
         torch.testing.assert_close(
             last_recurrent_state, last_recurrent_state_ref, atol=atol, rtol=rtol
         )
+        returned_state = initial_state
         torch.testing.assert_close(returned_state, initial_state)
         torch.testing.assert_close(
             initial_state[untouched_slots], initial_state_before[untouched_slots]

@@ -37,9 +37,10 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
         # group lookup to prove the guard is not what rejected it.
         q = torch.zeros(1, 128, 8, 64)
         group = mock.MagicMock(return_value=None)
-        with mock.patch.object(
-            usp, "get_ulysses_parallel_world_size", lambda: 2
-        ), mock.patch.object(usp, "_ipc_ready_group", group):
+        with (
+            mock.patch.object(usp, "get_ulysses_parallel_world_size", lambda: 2),
+            mock.patch.object(usp, "_ipc_ready_group", group),
+        ):
             self.assertIsNone(usp._ipc_input_a2a_qkv(q, q.clone(), q.clone()))
         # Reached the group lookup, so the shape guard did not reject it.
         self.assertEqual(group.call_count, 1)
@@ -48,6 +49,23 @@ class TestIpcInputA2AQkvGuard(unittest.TestCase):
         q = torch.zeros(1, 128, 8, 64)
         with mock.patch.object(usp, "get_ulysses_parallel_world_size", lambda: 4):
             self.assertIsNone(usp._ipc_input_a2a_qkv(q, q.clone(), q.clone()))
+
+
+class TestIpcSkippedUnderCompile(unittest.TestCase):
+    """The transport's custom-class handles cannot be traced: a compiled graph
+    keeps the NCCL all-to-all instead of breaking at every exchange."""
+
+    def test_ipc_group_is_unavailable_while_compiling(self):
+        ready = mock.MagicMock(return_value=True)
+        with (
+            mock.patch.object(usp.torch.compiler, "is_compiling", lambda: True),
+            mock.patch(
+                "sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a.ipc_a2a_ready",
+                ready,
+            ),
+        ):
+            self.assertIsNone(usp._ipc_ready_group())
+        ready.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -4,7 +4,8 @@ python3 offline_batch_inference.py  --model meta-llama/Llama-3.1-8B-Instruct
 """
 
 import argparse
-import dataclasses
+
+import msgspec
 
 import sglang as sgl
 from sglang.srt.server_args import ServerArgs
@@ -24,7 +25,7 @@ def main(
     sampling_params = {"temperature": 0.8, "top_p": 0.95}
 
     # Create an LLM.
-    llm = sgl.Engine(**dataclasses.asdict(server_args))
+    llm = sgl.Engine(**msgspec.structs.asdict(server_args))
 
     outputs = llm.generate(prompts, sampling_params)
     # Print the outputs.

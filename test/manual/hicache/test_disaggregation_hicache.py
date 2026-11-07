@@ -242,7 +242,7 @@ class TestDisaggregationDecodeWithHiCache(DisaggregationHiCacheBase):
             self.assertGreater(
                 cached_tokens,
                 previous_cached_tokens,
-                f"Turn {turn} should have more cached tokens than turn {turn-1}",
+                f"Turn {turn} should have more cached tokens than turn {turn - 1}",
             )
 
             # Update context and cached tokens for next iteration

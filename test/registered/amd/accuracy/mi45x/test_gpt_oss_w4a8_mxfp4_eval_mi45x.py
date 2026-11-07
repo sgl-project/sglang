@@ -78,7 +78,6 @@ MI45X_GPT_OSS_W4A8_MXFP4_MODELS = [
         # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
-            "AITER_FORCE_A8W4": "1",
             "ENABLE_CK": "0",
             "HSA_COREDUMP_PATTERN": "/dev/null",
             "SGLANG_USE_AITER": "1",
@@ -182,9 +181,9 @@ class TestGptOssW4A8Mxfp4EvalMI45x(unittest.TestCase):
 
         for config in self.models:
             with self.subTest(model=config.model_path):
-                print(f"\n{'='*60}")
+                print(f"\n{'=' * 60}")
                 print(f"Testing: {config.model_path}")
-                print(f"{'='*60}")
+                print(f"{'=' * 60}")
 
                 env = os.environ.copy()
                 for key, value in config.env_vars.items():

@@ -73,7 +73,8 @@ export const config = {
 -d '{ "model": "{{MODEL_NAME}}", "messages": [{"role":"user","content":"Hello"}] }'`,
 
   // NVIDIA: two multi-arch CUDA builds (dev-inkling-dspark for CUDA 13,
-  // dev-cu12-inkling-dspark for CUDA 12) — pick by your CUDA version, not by GPU.
+  // dev-cu12-inkling-dspark for CUDA 12, a final build since that lane is
+  // retired) — pick by your CUDA version, not by GPU.
   // Panel defaults to cu13. AMD: dev-rocm720-mi35x-inkling-dspark (sglang-rocm repo).
   // All tiers ship from the same images, DSpark included.
   dockerImages: {
@@ -205,9 +206,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -232,9 +231,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -258,9 +255,7 @@ export const config = {
     },
     {
       match: { hw: "gb200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -285,9 +280,7 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -316,9 +309,7 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -348,7 +339,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -374,7 +364,6 @@ export const config = {
       verified: true,
       env: [
         "SGLANG_USE_AITER=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -406,9 +395,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -434,9 +421,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -461,9 +446,7 @@ export const config = {
     },
     {
       match: { hw: "gb200", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -489,9 +472,7 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "long_context", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -524,9 +505,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -557,9 +536,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -589,9 +566,7 @@ export const config = {
     },
     {
       match: { hw: "gb200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -622,9 +597,7 @@ export const config = {
     {
       match: { hw: "gb300", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -655,9 +628,7 @@ export const config = {
     {
       match: { hw: "h200", variant: "default", quant: "nvfp4", strategy: "mtp", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -695,9 +666,7 @@ export const config = {
     {
       match: { hw: "b200", variant: "default", quant: "nvfp4", strategy: "dspark", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -741,7 +710,6 @@ export const config = {
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -771,7 +739,6 @@ export const config = {
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
       ],
       flags: [
         "--trust-remote-code",
@@ -803,9 +770,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "balanced", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -830,9 +795,7 @@ export const config = {
     {
       match: { hw: "b300", variant: "default", quant: "bf16", strategy: "mtp", nodes: "single" },
       verified: true,
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -862,9 +825,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "balanced", nodes: "multi-2" },
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -886,9 +847,7 @@ export const config = {
     },
     {
       match: { hw: "b200", variant: "default", quant: "bf16", strategy: "mtp", nodes: "multi-2" },
-      env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
-      ],
+      env: [],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -924,7 +883,6 @@ export const config = {
       match: { hw: "b200", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
       ],
@@ -959,7 +917,6 @@ export const config = {
       match: { hw: "b300", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
       ],
@@ -993,7 +950,6 @@ export const config = {
     {
       match: { hw: "gb200", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
       ],
@@ -1028,7 +984,6 @@ export const config = {
       match: { hw: "gb300", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
       ],
@@ -1063,7 +1018,6 @@ export const config = {
       match: { hw: "h200", variant: "lora", quant: "nvfp4", strategy: "balanced", nodes: "single" },
       verified: true,
       env: [
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
       ],
@@ -1101,7 +1055,6 @@ export const config = {
         "NCCL_MNNVL_ENABLE=1",
         "NCCL_NVLS_ENABLE=1",
         "NCCL_CUMEM_ENABLE=1",
-        "SGLANG_ENABLE_UNIFIED_RADIX_TREE=1",
         "SGLANG_EXPERIMENTAL_LORA_OPTI=1",
         "SGLANG_OPT_LORA_OVERLAP_MAIN_ALLOC=1",
         "SGLANG_OPT_USE_JIT_KERNEL_MOE_ALIGN=1",

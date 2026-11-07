@@ -2,11 +2,15 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
+import numpy as np
 import torch
+import trimesh
 from diffusers import AutoencoderKL as DiffusersAutoencoderKL
 from diffusers import LCMScheduler, UNet2DConditionModel
 
+from sglang.kernels.ops.diffusion.ext import mesh_processor
 from sglang.multimodal_gen.configs.models.vaes.stable_diffusion import (
     StableDiffusionVAEConfig,
 )
@@ -26,11 +30,32 @@ from sglang.multimodal_gen.runtime.pipelines.hunyuan3d_pipeline import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.paint import (
     Hunyuan3DPaintPostprocessStage,
+    Hunyuan3DPaintPreprocessStage,
     Hunyuan3DPaintTexGenStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan3d.shape import (
     Hunyuan3DShapeSaveStage,
 )
+from sglang.multimodal_gen.runtime.utils import mesh3d_utils
+from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_simplify
+
+
+def _reference_qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
+    """Reference for the original full 16-entry accumulation."""
+    p0 = v[f[:, 0]]
+    n = np.cross(v[f[:, 1]] - p0, v[f[:, 2]] - p0)
+    n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
+    plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
+    face_q = (plane[:, :, None] * plane[:, None, :]).reshape(len(f), 16)
+    idx = f.T.ravel()
+    q = np.stack(
+        [
+            np.bincount(idx, weights=np.tile(face_q[:, c], 3), minlength=len(v))
+            for c in range(16)
+        ],
+        axis=1,
+    )
+    return q.reshape(-1, 4, 4)
 
 
 def _unet_config() -> dict:
@@ -185,9 +210,19 @@ class TestHunyuan3DWarmupOutput(unittest.TestCase):
 
     def test_paint_postprocess_skips_export_during_warmup(self):
         stage = Hunyuan3DPaintPostprocessStage(Hunyuan3D2PipelineConfig())
-
-        output = stage.forward(self._batch(), SimpleNamespace())
-
+        kernel = Mock()
+        with (
+            patch.object(mesh_processor, "_mesh_processor_kernel", None),
+            patch.object(
+                mesh_processor, "load_extension_with_recovery", return_value=kernel
+            ) as build,
+        ):
+            output = stage.forward(self._batch(), SimpleNamespace())
+            build.assert_called_once()
+            array = np.zeros((1, 3), dtype=np.float32)
+            mesh_processor.meshVerticeInpaint(array, array, array, array, array, array)
+            build.assert_called_once()
+            kernel.meshVerticeInpaint.assert_called_once()
         self.assertEqual(output.output_file_paths, [])
 
 
@@ -221,6 +256,63 @@ class TestHunyuan3DPaintTurboSchedule(unittest.TestCase):
             [989, 890, 791, 692, 593, 494, 395, 296, 197, 98],
         )
         self.assertFalse(stage.scheduler.custom_timesteps)
+
+
+class TestHunyuan3DPaintRemesh(unittest.TestCase):
+    def _unwrap(self, use_remesh: bool) -> trimesh.Trimesh:
+        stage = Hunyuan3DPaintPreprocessStage.__new__(Hunyuan3DPaintPreprocessStage)
+        stage.config = Hunyuan3D2PipelineConfig(paint_use_remesh=use_remesh)
+        mesh = trimesh.creation.icosphere(subdivisions=6)  # 81,920 faces
+        with patch(
+            "sglang.multimodal_gen.runtime.utils.mesh3d_utils.mesh_uv_wrap",
+            side_effect=lambda m: m,
+        ):
+            return stage._unwrap_mesh(mesh)
+
+    def test_remesh_decimates_to_40k_faces_before_uv_unwrap(self):
+        mesh = self._unwrap(use_remesh=True)
+        self.assertLessEqual(len(mesh.faces), 40000)
+        self.assertGreater(len(mesh.faces), 39000)
+
+    def test_remesh_disabled_keeps_all_faces(self):
+        self.assertEqual(len(self._unwrap(use_remesh=False).faces), 81920)
+
+    def test_decimation_keeps_shape_and_topology(self):
+        sphere = trimesh.creation.icosphere(subdivisions=6, radius=1.0)
+        mesh = mesh_simplify(sphere, target_faces=5000)
+        self.assertLessEqual(len(mesh.faces), 5000)
+        self.assertGreater(len(mesh.faces), 4500)
+        self.assertTrue(mesh.is_watertight)
+        radius = np.linalg.norm(mesh.vertices, axis=1)
+        self.assertLess(np.abs(radius - 1.0).max(), 0.02)
+
+    def test_decimation_keeps_open_boundary(self):
+        sphere = trimesh.creation.icosphere(subdivisions=5)
+        half = trimesh.Trimesh(
+            sphere.vertices, sphere.faces[sphere.triangles_center[:, 2] > 0]
+        )
+        mesh = mesh_simplify(half, target_faces=2000)
+        self.assertLessEqual(len(mesh.faces), 2000)
+        boundary = lambda m: (np.bincount(m.edges_unique_inverse) == 1).sum()
+        self.assertEqual(boundary(mesh), boundary(half))
+
+    def test_vertex_quadrics_match_reference_exactly(self):
+        closed = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
+        open_boundary = trimesh.Trimesh(
+            vertices=closed.vertices.copy(),
+            faces=closed.faces[closed.triangles_center[:, 2] > 0],
+            process=False,
+        )
+        for mesh_kind, mesh in (("closed", closed), ("open", open_boundary)):
+            with self.subTest(mesh=mesh_kind):
+                reference = _reference_qem_vertex_quadrics(mesh.vertices, mesh.faces)
+                actual = mesh3d_utils._qem_vertex_quadrics(mesh.vertices, mesh.faces)
+
+                self.assertEqual(actual.shape, (len(mesh.vertices), 4, 4))
+                self.assertEqual(actual.dtype, np.float64)
+                np.testing.assert_array_equal(
+                    actual.view(np.uint64), reference.view(np.uint64)
+                )
 
 
 if __name__ == "__main__":

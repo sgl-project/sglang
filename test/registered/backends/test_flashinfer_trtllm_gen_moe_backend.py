@@ -155,6 +155,55 @@ class FlashinferTrtllmGenMoeBackendMXFP8Base:
         self.assertGreater(metrics["score"], 0.93)
 
 
+class FlashinferTrtllmGenMoeBackendMXFP8A2ABase:
+    backend = "flashinfer_trtllm_routed"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = "zianglih/Qwen3-30B-A3B-Instruct-2507-MXFP8"
+        cls.base_url = DEFAULT_URL_FOR_TEST
+        cls.process = popen_launch_server(
+            cls.model,
+            cls.base_url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+            env={**os.environ, "SGLANG_ENABLE_JIT_DEEPGEMM": "False"},
+            other_args=[
+                "--quantization",
+                "mxfp8",
+                "--attn-dp-size",
+                "4",
+                "--tp-size",
+                "4",
+                "--moe-a2a-backend",
+                "flashinfer",
+                "--moe-runner-backend",
+                cls.backend,
+                "--flashinfer-a2a-dispatch-type",
+                "mxfp8",
+                "--mem-fraction-static",
+                "0.7",
+            ],
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        kill_process_tree(cls.process.pid)
+
+    def test_gsm8k(self):
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            api="completion",
+            max_tokens=512,
+            num_examples=200,
+            num_threads=128,
+        )
+        metrics = run_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], 0.93)
+
+
 class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
     backend = None
 
@@ -201,11 +250,12 @@ class FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base:
 
 class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
     extra_env = {}
+    gsm8k_threshold = 0.89
 
     @classmethod
     def setUpClass(cls):
-        cls.model = "nvidia/Qwen3-30B-A3B-NVFP4"
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
@@ -240,7 +290,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
         )
         metrics = run_eval(args)
         print(f"{metrics=}")
-        self.assertGreater(metrics["score"], 0.89)
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 class TestFlashinferTrtllmGenMoeBackendFP8(
@@ -261,6 +311,12 @@ class TestFlashinferTrtllmGenMoeBackendMXFP8Routed(
     backend = "flashinfer_trtllm_routed"
 
 
+class TestFlashinferTrtllmGenMoeBackendMXFP8A2A(
+    FlashinferTrtllmGenMoeBackendMXFP8A2ABase, CustomTestCase
+):
+    pass
+
+
 class TestFlashinferTrtllmRoutedMxfp8MixedBF16(
     FlashinferTrtllmGenMoeBackendMXFP8MixedBF16Base, CustomTestCase
 ):
@@ -278,6 +334,17 @@ class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRouted(
 ):
     extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
     backend = "flashinfer_trtllm_routed"
+
+
+class TestFlashinferTrtllmGenMoeBackendNvFp4PerTokenActivationRelu2(
+    FlashinferTrtllmGenMoeBackendNVFP4Base, CustomTestCase
+):
+    """Non-gated ReLU2 experts with per-token NVFP4 activations."""
+
+    model = "nvidia/NVIDIA-Nemotron-3-Super-120B-A12B-NVFP4"
+    extra_env = {"SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "1"}
+    backend = "flashinfer_trtllm"
+    gsm8k_threshold = 0.93
 
 
 if __name__ == "__main__":

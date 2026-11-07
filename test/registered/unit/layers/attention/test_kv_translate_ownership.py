@@ -1,20 +1,20 @@
 """Nothing under layers/attention may translate KV ids for itself.
 
-Ownership is exactly two places: `KVIndexTranslator` for READS (indices are
-born kernel-facing, backends consume its tables) and the ForwardBatch rebind
-(`rebind_write_loc`) for WRITES. Virtual and physical ids share a value range,
-so a backend that forgets a translate -- or does one twice -- reads the wrong
-rows and nothing crashes. This scan makes both unrepresentable.
+Ownership is exactly one place: the iteration's `IterationIds`, built through
+`RunnerIds`, translates the WRITE window and the READ table once, and
+backends read the result. Virtual and physical ids share a value range, so a
+backend that forgets a translate -- or does one twice -- reads the wrong rows
+and nothing crashes.
 
-Out of scope, deliberately: the allocator-internal implementations
-(`multi_ended_allocator` / `unified_memory_pool`), which ARE the mechanism the
-translator calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
+Deliberately out of scope: the allocator-internal implementations
+(`allocator/unified_*`, `unified_memory_pool`), which ARE the mechanism the
+runner_ids calls; the PD transfer plane's `translate_kv_indices_for_transfer`,
 which stages for RDMA outside the forward path; and the STATIC SWA pool's
 legacy full->swa slot map, a different mapping kind with no virtual/physical
-ambiguity -- its call sites are count-pinned below so new ones are added
-consciously.
+ambiguity.
 
-    python3 -m pytest test/registered/unit/layers/attention/test_kv_translate_ownership.py -v
+The wrapper fixtures here also check that wrappers forward
+`get_decode_graph_variants` to the child that runs decode attention.
 """
 
 import ast
@@ -37,11 +37,12 @@ from sglang.srt.layers.attention.minimax_sparse_backend import (
     MiniMaxHybridAttnBackend,
 )
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # The attention package is a namespace package (no __init__), so anchor the
 # scan on a concrete module inside it.
@@ -60,30 +61,21 @@ def _iter_sources():
 
 class TestUnifiedTranslateBanned(CustomTestCase):
     def test_no_unified_translate_calls(self):
-        """No backend calls the unified translate surfaces. A hit here means
-        a backend re-grew its own id-space transition -- the design whose two
-        failure modes (forgotten translate, duplicated translate) this scan
-        exists to prevent. Route reads through KVIndexTranslator views and
-        writes through the ForwardBatch rebind instead."""
+        """No backend calls the unified translate surfaces, and none probes an
+        allocator for translate capability through getattr."""
         banned = re.compile(r"\.translate_kv_loc(_kernel_id)?\(")
-        hits = [
-            f"{rel}: {m.group(0)}"
-            for rel, src in _iter_sources()
-            for m in banned.finditer(src)
-        ]
-        self.assertEqual(hits, [])
-
-    def test_no_translate_capability_probing(self):
-        """No backend probes an allocator for translate capability -- the
-        getattr-hook pattern is how per-backend translation grew the first
-        time."""
         probing = re.compile(r"""getattr\([^)]*['"]translate_kv_loc""")
-        hits = [rel for rel, src in _iter_sources() if probing.search(src)]
-        self.assertEqual(hits, [])
+        calls, probes = [], []
+        for rel, src in _iter_sources():
+            calls += [f"{rel}: {m.group(0)}" for m in banned.finditer(src)]
+            if probing.search(src):
+                probes.append(rel)
+        self.assertEqual(calls, [])
+        self.assertEqual(probes, [])
 
     def test_hooks_module_deleted_and_unimported(self):
-        """The per-backend hooks module (the previous owner of backend-side
-        v2p knowledge) stays deleted, and nothing imports it."""
+        """The per-backend v2p hooks module stays deleted, and nothing imports
+        it."""
         self.assertFalse(
             os.path.exists(os.path.join(_ATTN_DIR, "unified_mem_hooks.py"))
         )
@@ -96,10 +88,9 @@ class TestUnifiedTranslateBanned(CustomTestCase):
 
 
 def _derive_wrapper_names():
-    """Wrapper classes, read off the source so a NEW one shows up the day it is
-    written: an AttentionBackend subclass whose own __init__ takes another
-    backend. Per class, not per file -- a file-wide scan passes as soon as any
-    one class in it forwards."""
+    """Wrapper classes discovered from source, so a new one shows up the day it
+    is written: an AttentionBackend subclass whose own __init__ takes another
+    backend. Per class, not per file."""
     backend = re.compile(r"Att(?:ention|n)Backend")
     names = set()
     for _rel, src in _iter_sources():
@@ -130,8 +121,8 @@ class _Inner(AttentionBackend):
     """Stand-in for a wrapped backend, carrying only what the wrappers' __init__
     bodies read off their inners."""
 
-    def __init__(self, translator=None):
-        self.kv_index_translator = translator
+    def __init__(self, runner_ids=None):
+        self.runner_ids = runner_ids
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.needs_cpu_seq_lens = False
@@ -143,25 +134,25 @@ class _InnerModelConfig:
 
 
 class _Runner:
-    """HybridAttnBackend takes its translator from the runner, not an inner."""
+    """HybridAttnBackend takes its `RunnerIds` from the runner, not an inner."""
 
-    def __init__(self, translator):
-        self.kv_index_translator = translator
+    def __init__(self, runner_ids):
+        self.runner_ids = runner_ids
         self.kv_cache_dtype = None
         self.token_to_kv_pool = None
         self.req_to_token_pool = None
         self.model_config = _InnerModelConfig()
 
 
-def _build_wrappers(translator):
+def _build_wrappers(runner_ids):
     """One live instance per wrapper. Only the inner that MUST supply the
-    translator carries it; every other inner carries None, so a wrapper that
-    copies from the linear / sparse / DSA side ends up with None and fails."""
-    carrier = _Inner(translator)
+    runner_ids carries it, so a wrapper copying off the linear / sparse / DSA
+    side ends up with None and fails."""
+    carrier = _Inner(runner_ids)
     # HybridAttnBackend reads the spec bag in __init__; the bag is unpublished
     # outside a launched server.
     with get_context().override_server_args(speculative_attention_mode="decode"):
-        hybrid = HybridAttnBackend(_Runner(translator), _Inner(), _Inner())
+        hybrid = HybridAttnBackend(_Runner(runner_ids), _Inner(), _Inner())
     return {
         "DotsSWAMLAAttnBackend": DotsSWAMLAAttnBackend(carrier),
         "DotsHybridAttnBackend": DotsHybridAttnBackend(_Inner(), carrier),
@@ -176,24 +167,75 @@ def _build_wrappers(translator):
 
 
 class TestWrapperBackendsForwardTranslator(CustomTestCase):
-    """BUG REGRESSION. `AttentionBackend.kv_index_translator` defaults to None,
-    so a wrapper that does not re-expose its inner's copy reads as "needs no
-    translation" and producers that fetch it off `get_attn_backend()` skip the
-    virtual->kernel-facing translation instead of failing."""
+    """Bug regression: `AttentionBackend.runner_ids` defaults to None,
+    so a wrapper that does not re-expose its inner's copy makes producers skip
+    the virtual->physical translation instead of failing."""
 
     def test_every_wrapper_is_constructed_here(self):
         self.assertEqual(
             _derive_wrapper_names(),
             set(_build_wrappers(object())),
             "a wrapper backend has no instance in _build_wrappers; add one so "
-            "its translator forwarding is checked",
+            "its `RunnerIds` forwarding is checked",
         )
 
     def test_wrappers_forward_the_translator(self):
-        translator = object()
-        for name, wrapper in _build_wrappers(translator).items():
+        runner_ids = object()
+        for name, wrapper in _build_wrappers(runner_ids).items():
             with self.subTest(wrapper=name):
-                self.assertIs(wrapper.kv_index_translator, translator)
+                self.assertIs(wrapper.runner_ids, runner_ids)
+
+
+class _VariantsInner(_Inner):
+    def __init__(self, variants):
+        super().__init__()
+        self.variants = variants
+
+    def get_decode_graph_variants(self, capture_forward_mode, captured_req_width):
+        return self.variants
+
+
+def _variant_wrappers(owner, other):
+    """Each wrapper with `owner` as the child that runs decode attention."""
+    with get_context().override_server_args(speculative_attention_mode="decode"):
+        hybrid = HybridAttnBackend(_Runner(None), other, owner)
+    return {
+        "HybridAttnBackend": hybrid,
+        "HybridLinearAttnBackend": HybridLinearAttnBackend(owner, other, [0]),
+        "ShortConvHybridAttnBackend": ShortConvHybridAttnBackend(owner, other, [0]),
+        "MiniMaxHybridAttnBackend": MiniMaxHybridAttnBackend(owner, other, [0]),
+        "TboAttnBackend": TboAttnBackend(owner, [other, other]),
+        "DotsSWAMLAAttnBackend": DotsSWAMLAAttnBackend(other),
+        "DotsHybridAttnBackend": DotsHybridAttnBackend(other, other),
+    }
+
+
+# Dots wraps MLA / FlashAttention / DSA backends only, which capture one decode
+# graph; MiniMax's dense side is unverified with partition buckets on ROCm.
+_NOT_FORWARDED = {
+    "DotsSWAMLAAttnBackend",
+    "DotsHybridAttnBackend",
+    "MiniMaxHybridAttnBackend",
+}
+
+
+class TestWrapperBackendsForwardDecodeGraphVariants(CustomTestCase):
+    """Bug regression: the base hook returns None, so a wrapper that does not
+    forward it captures one decode graph and aiter partition buckets turn off."""
+
+    def test_wrappers_report_their_decode_childs_variants(self):
+        owner_variants, other_variants = object(), object()
+        for owner in (owner_variants, None):
+            wrappers = _variant_wrappers(
+                _VariantsInner(owner), _VariantsInner(other_variants)
+            )
+            self.assertEqual(set(wrappers), _derive_wrapper_names())
+            for name, wrapper in wrappers.items():
+                with self.subTest(wrapper=name, owner=owner):
+                    self.assertIs(
+                        wrapper.get_decode_graph_variants(ForwardMode.DECODE, 1),
+                        None if name in _NOT_FORWARDED else owner,
+                    )
 
 
 if __name__ == "__main__":

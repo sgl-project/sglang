@@ -12,7 +12,7 @@ from sglang.srt.layers.parameter import (
     PackedvLLMParameter,
     RowvLLMParameter,
 )
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 from .gptq_scheme import GPTQLinearSchemeBase
 
@@ -29,11 +29,10 @@ class GPTQLinearScheme(GPTQLinearSchemeBase):
         self.kernel = self._init_kernel(quant_config)
 
     def _init_kernel(self, quant_config: GPTQConfig):
-        from sglang.srt.hardware_backend.gpu.quantization.gptq_kernels import (
-            GPTQLinearKernel,
+        raise RuntimeError(
+            "The non-Marlin GPTQ CUDA kernel has been removed. Use "
+            "quantization='gptq_marlin' (or a Marlin-compatible checkpoint) instead."
         )
-
-        return GPTQLinearKernel(quant_config)
 
     def create_weights(
         self,
