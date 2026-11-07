@@ -67,6 +67,8 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -184,6 +186,8 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -301,6 +305,8 @@ spec:
             value: "{{ trouble_shotting }}"
           - name: TRANSFORMERS_VERSION_FOR_SGLANG
             value: "{{ transformers_version }}"
+          - name: SGLANG_NPU_CONTAINER_PATCHES
+            value: "{{ container_patches }}"
           command: ["/bin/bash", "-c"]
           args:
             - |

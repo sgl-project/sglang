@@ -576,6 +576,7 @@ def run_npu_e2e_test_case(
     trouble_shotting=False,
     transformers_version="",
     run_id: str = "",
+    container_patches: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -688,6 +689,7 @@ def run_npu_e2e_test_case(
                 "prefill_size": resource_info["prefill_size"],
                 "decode_size": resource_info["decode_size"],
                 "router_size": resource_info["router_size"],
+                "container_patches": container_patches,
                 "sglang_source_relative_path": sglang_source_relative_path,
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
@@ -898,6 +900,14 @@ if __name__ == "__main__":
         help="GitHub Actions run_id, used to label pods for run-scoped isolation.",
     )
 
+    parser.add_argument(
+        "--container-patches",
+        type=str,
+        required=False,
+        default="",
+        help="Comma separated container patch sets applied inside every pod before the test. Empty keeps the image untouched.",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -915,6 +925,7 @@ if __name__ == "__main__":
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
     run_id = args.run_id
+    container_patches = args.container_patches
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -945,4 +956,5 @@ if __name__ == "__main__":
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
         run_id=run_id,
+        container_patches=container_patches,
     )

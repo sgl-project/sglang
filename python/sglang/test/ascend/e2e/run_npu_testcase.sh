@@ -13,6 +13,15 @@ cd "${sglang_source_path}"
 echo "NPU info:"
 npu-smi info
 
+# Apply the declarative container patch sets requested by the workflow
+# (SGLANG_NPU_CONTAINER_PATCHES, comma separated set names).
+echo "===== Apply container patches - Begin ====="
+if ! bash "${sglang_source_path}/python/sglang/test/ascend/e2e/apply_container_patches.sh"; then
+  echo "Failed to apply the requested container patches."
+  exit 1
+fi
+echo "===== Apply container patches - End ====="
+
 echo "===== Install kubernetes - Begin ====="
 KUBERNETES_PKG_PATH_SOURCE=/root/.cache/.cache/kubernetes
 if [ ! -d "${KUBERNETES_PKG_PATH_SOURCE}" ]; then
@@ -149,6 +158,11 @@ if [ -n "${METRICS_DATA_FILE}" ]; then
     # Archive the test log into the output directory for result collection
     cp "${log_path}/${tc_name}.log" "${METRICS_DATA_FILE}/test_output.log"
     echo "Metrics log saved to ${METRICS_DATA_FILE}/test_output.log"
+    # Record which container patch sets (if any) produced this result.
+    if [ -f "/tmp/sglang_npu_patches_applied.json" ]; then
+        cp /tmp/sglang_npu_patches_applied.json "${METRICS_DATA_FILE}/patch_info.json"
+        echo "Container patch info saved to ${METRICS_DATA_FILE}/patch_info.json"
+    fi
 fi
 
 source_plog_path="/root/ascend/log/debug/plog"
