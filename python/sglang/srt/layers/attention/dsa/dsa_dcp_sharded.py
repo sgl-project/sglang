@@ -27,6 +27,8 @@ resolve by global position at both steps. With 8 or 16 ranks and multicast,
 decode rows instead merge in one kernel (``DcpTopKMerge``).
 """
 
+from __future__ import annotations
+
 from functools import partial
 from typing import Callable, Optional
 
@@ -137,10 +139,8 @@ class DcpCandidateAllGather:
         return out.view(self.group.world_size * t.shape[0], *t.shape[1:])
 
     def merge_scores(self, rows: int, width: int) -> torch.Tensor:
-        # Like the candidate buffer, this scratch is consumed before the next
-        # merge. Reserve it during eager warmup and reuse it across graph batch
-        # sizes: a context-sized allocation per capture can exhaust VRAM.
-        # Never replace storage that a captured graph may still reference.
+        # Reserved outside capture and reused by every graph; never rebound once captured.
+        # TODO(kpham-sgl): reserve at init inside the KV budget; it is max_rows x context fp32.
         if (
             self.merge_buffer is None
             and 0 < rows <= self.max_rows
@@ -165,14 +165,12 @@ def init_dcp_candidate_all_gather(max_rows: int, topk: int) -> None:
     """Collective over the DCP group; call on every rank before CUDA graph
     capture."""
     global _CANDIDATE_ALL_GATHER
-    if _CANDIDATE_ALL_GATHER is not None:  # one buffer per process
+    if _CANDIDATE_ALL_GATHER is not None:
         return
     _CANDIDATE_ALL_GATHER = DcpCandidateAllGather(
         get_parallel().dcp_group, max_rows, topk
     )
 
-
-_CANDIDATE_CLUSTER_FLOOR = 16384
 
 # Candidates per rank in the merge. Over 109824 decode rows of six real
 # workloads (32K and 100K contexts, all 24 DSA layers), a rank held at most 339
@@ -205,7 +203,7 @@ class DcpTopKMerge:
     @classmethod
     def create(
         cls, group, max_rows: int, topk: int, dcp_rank: int
-    ) -> Optional["DcpTopKMerge"]:
+    ) -> Optional[DcpTopKMerge]:
         """Collective over ``group``. None unless it has 8 ranks (16 with the
         megakernel), top-k is 2048, and its GPUs share NVLink multicast."""
         import torch.distributed._symmetric_memory as symm_mem
@@ -271,21 +269,20 @@ class DcpTopKMerge:
 
 
 _TOPK_MERGE: Optional[DcpTopKMerge] = None
-_TOPK_MERGE_INITIALIZED = False
+_TOPK_MERGE_CREATED = False
 
 
-def init_dcp_topk_merge(max_rows: int, topk: int) -> None:
+def init_dcp_topk_merge(max_rows: int, topk: int) -> bool:
     """Collective over the DCP group; call on every rank before CUDA graph
-    capture."""
-    global _TOPK_MERGE, _TOPK_MERGE_INITIALIZED
-    if _TOPK_MERGE_INITIALIZED:  # one buffer per process
-        return
-    _TOPK_MERGE_INITIALIZED = True
-    parallel = get_parallel()
-    group = parallel.dcp_group
-    # the kernel's rank must be the one the local candidates encode positions with
-    assert group.world_size == parallel.attn_dcp_size
-    _TOPK_MERGE = DcpTopKMerge.create(group, max_rows, topk, parallel.attn_dcp_rank)
+    capture. Returns whether decode rows merge in one kernel."""
+    global _TOPK_MERGE, _TOPK_MERGE_CREATED
+    if not _TOPK_MERGE_CREATED:  # one buffer per process, also when create declined
+        _TOPK_MERGE_CREATED = True
+        parallel = get_parallel()
+        _TOPK_MERGE = DcpTopKMerge.create(
+            parallel.dcp_group, max_rows, topk, parallel.attn_dcp_rank
+        )
+    return _TOPK_MERGE is not None
 
 
 def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
@@ -303,8 +300,6 @@ def _zeros_i32(n: int, device: torch.device) -> torch.Tensor:
 
 @triton.jit
 def _fill_visible_kernel(dense, dense_stride, lens, BLOCK: tl.constexpr):
-    # -inf over [0, lens[row]), the only columns the top-k reads; a fixed
-    # number of programs per row strides over it
     row = tl.program_id(0)
     n = tl.load(lens + row)
     base = dense + row.to(tl.int64) * dense_stride
@@ -325,12 +320,12 @@ def _scatter_candidates_kernel(
     BLOCK: tl.constexpr,
     COMPACT_PREFIX: tl.constexpr = False,
 ):
-    # one program per (rank, row) block of candidates
     src_row = tl.program_id(0)
     row = src_row % num_rows
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    # Prefix-only gathers leave the padding undefined, including on graph
-    # replays with shorter lengths. Never read it or scatter stale positions.
+    # a rank holds ceil((len - rank) / WORLD) keys of the row. Prefix-only
+    # gathers leave the padding undefined, including on graph replays with
+    # shorter lengths: never read it or scatter stale positions.
     n = (tl.load(global_lens + row) + WORLD - 1 - src_row // num_rows) // WORLD
     mask = offs < tl.minimum(n, TOPK)
     base = gathered + src_row.to(tl.int64) * TOPK * 2
@@ -360,8 +355,6 @@ def _localize_compact_kernel(
     dcp_rank,
     TOPK: tl.constexpr,
 ):
-    # owned slots (slot % N == rank) -> local rows slot // N at the front, in
-    # order, -1 after them; lengths[row] = number of owned slots
     row = tl.program_id(0)
     offs = tl.arange(0, TOPK)
     x = tl.load(slots + row.to(tl.int64) * slots_stride + offs)
@@ -420,7 +413,6 @@ def _local_candidates(
         dcp_size=parallel.attn_dcp_size,
         dcp_rank=parallel.attn_dcp_rank,
         deterministic=True,
-        cluster_floor=_CANDIDATE_CLUSTER_FLOOR,
     )
     return out
 
@@ -514,7 +506,7 @@ def dcp_global_topk(
     return out
 
 
-def dcp_all_visible(
+def dcp_select_all_slots(
     global_lens: torch.Tensor,
     page_table: torch.Tensor,
     topk: int,

@@ -153,6 +153,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             fake_sparse_fwd,
         )
         backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+        backend.dsa_shards_index_k = False
+        backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.__dict__.update(
             dsa_prefill_impl=implementation,
             attn_dcp_size=1,
@@ -252,7 +254,6 @@ class TestDSABackendDPPadding(CustomTestCase):
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
-            attn_dcp_size=1,
             _trtllm_fused_q=False,
             kv_cache_dtype=torch.bfloat16,
             kv_layers=_routed(
@@ -270,7 +271,8 @@ class TestDSABackendDPPadding(CustomTestCase):
             device="cpu",
             num_q_heads=2,
             num_dcp_q_heads=2,
-            dcp_size=1,
+            attn_dcp_size=1,
+            dsa_shards_index_k=False,
         )
         backend._pad_topk_indices = MethodType(
             DeepseekSparseAttnBackend._pad_topk_indices, backend

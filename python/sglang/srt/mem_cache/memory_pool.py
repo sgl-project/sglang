@@ -5423,7 +5423,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_size = get_parallel().attn_dcp_size
             index_buf_size = (
                 size
-                # K3.1 shards index-K by token like the MLA KV
                 if dcp_replicated or dsa_shards_index_k()
                 else (size + self.page_size) * dcp_size - self.page_size
             )
@@ -5740,8 +5739,6 @@ class DSATokenToKVPool(MLATokenToKVPool):
             )
 
     def _index_k_rows(self, indices):
-        """Logical slots -> index-K buffer rows. Index-K sharded by token like the
-        MLA KV (K3.1 DCP) keeps this rank's rows, as the KV copy does."""
         if not dsa_shards_index_k():
             return indices
         return maybe_dcp_kernel_indices(

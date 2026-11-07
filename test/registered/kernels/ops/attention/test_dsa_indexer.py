@@ -1395,6 +1395,8 @@ class TestDSAIndexer(CustomTestCase):
                 backend.device = self.device
                 backend.physical_page_size = 64
                 backend.real_page_span = 64
+                backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
+                backend.dsa_shards_index_k = False
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True

@@ -4464,6 +4464,7 @@ class TestKimiK31DcpOverrides(CustomTestCase):
             enable_hisparse=False,
             enable_prefill_cp=False,
             attn_cp_size=None,
+            dsa_topk_backend="sgl-kernel",
         )
         for name, value in fields.items():
             setattr(cfg, name, value)

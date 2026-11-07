@@ -28,9 +28,9 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_split_rows,
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
-    dcp_all_visible,
     dcp_gather_request_rows,
     dcp_global_topk,
+    dcp_select_all_slots,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import DSANPUIndexerMixin
@@ -270,9 +270,8 @@ def _index_k_write_targets(pool, layer_id: int, loc: torch.Tensor):
     return shard_pool.index_key_cache.write_targets(layer_id, loc)
 
 
+# TODO(kpham-sgl): shard index-K under DCP by default (dsa_shards_index_k() always on) and remove this switch.
 def _index_k_dcp() -> Tuple[int, int]:
-    """(size, rank) of the DCP group Kimi-K3.1 shards index-K over by token, or
-    (1, 0): other models keep index-K replicated under DCP."""
     if not dsa_shards_index_k():
         return 1, 0
     parallel = get_parallel()
@@ -1174,7 +1173,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
-            # under DCP the store goes through _store_index_k_cache's owner rule
             and not dsa_shards_index_k()
             and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
         ):
@@ -1661,8 +1659,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         if dcp_size > 1:
-            # block_tables and seqlens_32_2d are this rank's: the page ids of
-            # its index-K shard and its share of each sequence.
             topk_result = dcp_global_topk(
                 logits[:q_offset],
                 seqlens_32_2d.view(-1)[:q_offset],
@@ -1979,12 +1975,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         block_tables: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Prefill under DCP: every request's index-K from all ranks, in DCP1's
-        # get_index_k_scale_buffer layout, so the ragged indexer runs unchanged.
         parallel = get_parallel()
         dcp_size, dcp_rank = parallel.attn_dcp_size, parallel.attn_dcp_rank
         local_lens_cpu = get_dcp_lens(seq_lens_cpu, dcp_size, dcp_rank)
-        # block_tables holds this rank's page ids of each request
         k_fp8, k_scale = get_token_to_kv_pool().get_index_k_scale_buffer(
             layer_id,
             get_dcp_lens(metadata.get_indexer_seq_len(), dcp_size, dcp_rank),
@@ -2152,7 +2145,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             # Widened slots of every visible position; verify rows pass their
             # per-row (causal) global lengths.
-            raw_topk_result = dcp_all_visible(
+            raw_topk_result = dcp_select_all_slots(
                 seq_lens_expanded,
                 metadata.get_page_table_64(),
                 self.index_topk,
@@ -2224,7 +2217,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
             if dcp_size > 1:
-                # K3.1 shards index-K by token: the kernel keeps this rank's rows
                 buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
                 fused_store_index_k_cache(
                     key,
@@ -2246,9 +2238,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     )
             return
 
-        # K3.1 shards index-K like the MLA KV under DCP; only the fused store
-        # maps the widened write loc to this rank's row (slot // N) and skips
-        # the tokens of other ranks.
         assert dcp_size == 1, "DSA index-K writes under DCP need the CUDA fused store"
 
         # Fast path: AITER fused quant + cache store

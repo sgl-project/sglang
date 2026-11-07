@@ -2567,10 +2567,7 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
         # The fused Ascend split+RMSNorm path is not numerically equivalent for
         # Kimi-K3. Other MLA models retain the existing fused fast path.
         self._disable_npu_fused_split_qk_norm = True
-        if getattr(config, "index_topk", None) is not None and (
-            get_parallel().attn_dcp_size > 1
-        ):
-            # K3.1 DSA layers: index-K sharded by token, global top-k merge
+        if is_kimi_k31(config) and get_parallel().attn_dcp_size > 1:
             set_dsa_shards_index_k()
         super().__init__(
             layer_id=layer_idx,

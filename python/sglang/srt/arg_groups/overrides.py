@@ -795,49 +795,47 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
                 "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
             )
         backend = _KIMI_K31_DSA_BACKEND_HIP
-        declared = _pin_dsa_backends(
+        return _pin_dsa_backends(
             view,
             backend,
             lambda option, value: (
-                f"Kimi-K3.1 requires {option} {backend!r} to match "
-                f"the reference fp8_ds_mla numerics; got {value!r}."
+                f"Kimi-K3.1 requires {option} {backend!r} on ROCm; got {value!r}."
             ),
         )
-    else:
-        fields = ("dsa_prefill_backend", "dsa_decode_backend")
-        for field in fields:
-            value = getattr(view, field)
-            if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
-                option = "--" + field.replace("_", "-")
-                raise ValueError(
-                    f"Kimi-K3.1 supports {option} "
-                    f"{' / '.join(_KIMI_K31_DSA_BACKENDS)}; got {value!r}."
-                )
-        # Both phases read one KV pool (and PD peers exchange it), so an unset
-        # phase follows the set one.
-        chosen = {getattr(view, f) for f in fields} - {None}
-        if len(chosen) > 1:
+    fields = ("dsa_prefill_backend", "dsa_decode_backend")
+    for field in fields:
+        value = getattr(view, field)
+        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+            option = "--" + field.replace("_", "-")
             raise ValueError(
-                "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-                "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
-                f"different KV layouts); got {view.dsa_prefill_backend!r} and "
-                f"{view.dsa_decode_backend!r}."
+                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
+                f"got {value!r}."
             )
-        backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-        if backend in ("trtllm", "prims_ts"):
-            logger.warning(
-                f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
-                "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
-                "both use a raw-FP8-KV backend (trtllm or prims_ts)."
-            )
-        if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
-            # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
-            # flashmla_kv among the K3.1 backends.
-            raise ValueError(
-                f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
-                f"got {backend!r}."
-            )
-        declared = {f: backend for f in fields if getattr(view, f) is None}
+    # Both phases read one KV pool (and PD peers exchange it), so an unset
+    # phase follows the set one.
+    chosen = {getattr(view, f) for f in fields} - {None}
+    if len(chosen) > 1:
+        raise ValueError(
+            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
+            f"{view.dsa_decode_backend!r}."
+        )
+    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    if backend in ("trtllm", "prims_ts"):
+        logger.warning(
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
+        )
+    declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
         "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
     )

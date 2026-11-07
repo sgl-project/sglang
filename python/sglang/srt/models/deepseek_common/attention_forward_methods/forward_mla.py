@@ -880,7 +880,7 @@ class DeepseekMLAForwardMixin:
                         q_pe=q_pe,
                     )
             elif forward_batch.forward_mode.is_extend():
-                # for extend, gather kv (K3.1's DSA backend gathers its own cache)
+                # for extend, gather kv
                 if not self.use_dsa:
                     bcg_dcp_extend_kv_gather(
                         get_token_to_kv_pool(),
