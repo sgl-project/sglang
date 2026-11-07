@@ -19,6 +19,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.overlap_utils import RelayPayload
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
@@ -44,7 +45,7 @@ from sglang.srt.sampling.sampling_observer_pp import (
     pop_auxiliary_output_from_pp_tensors,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
-from sglang.srt.utils.common import async_d2h, is_npu
+from sglang.srt.utils.device import async_d2h, is_npu
 
 _is_npu = is_npu()
 logger = logging.getLogger(__name__)
@@ -218,6 +219,10 @@ class SchedulerPPMixin:
 
                 self.pp_outputs = next_pp_outputs
 
+                # `self.last_batch` is the one reloaded for this micro-batch, so
+                # pass the batch this iteration launched.
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
+
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
                 self._sched_idled = True
@@ -374,6 +379,8 @@ class SchedulerPPMixin:
                 release_rids = next_release_rids
 
                 self.running_batch.batch_is_full = False
+
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
             if server_is_idle:
@@ -565,6 +572,8 @@ class SchedulerPPMixin:
                 consensus_prealloc_rids = next_consensus_prealloc_rids
 
                 self.running_batch.batch_is_full = False
+
+                self.invariant_checker.run(CheckPhase.BUSY, cur_batch)
 
             # When the server is idle, self-check and re-init some states
             queue_size = (

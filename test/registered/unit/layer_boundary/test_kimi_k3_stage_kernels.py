@@ -38,8 +38,8 @@ CONFIG = SimpleNamespace(
     first_k_dense_replace=1,
     moe_layer_freq=1,
     routed_expert_hidden_size=2,
-    is_kda_layer=lambda layer_idx: False,
     num_hidden_layers=4,
+    is_kda_layer=lambda layer_idx: False,
 )
 
 

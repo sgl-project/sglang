@@ -31,6 +31,34 @@ When a cache miss occurs in L1 and L2, HiCache automatically fetches the require
 
 This integration is particularly valuable for production deployments involving long-context models, multi-turn conversations, and high-throughput serving scenarios where traditional caching approaches become capacity-constrained.
 
+### Direct linker prefetch
+
+Set common load options alongside Mooncake connection settings:
+
+```bash
+--enable-unified-cache-external-linker \
+--unified-cache-external-linker-config '{"load_mode":"prefetch","prefetch_policy":"timeout","master_server_address":"HOST:50051"}'
+```
+
+`load_mode` defaults to `layer_wise`. Prefetch starts at `_prefetch_kvcache()` on
+enqueue and reuses the load thread for concurrent requests. It supports
+Full/SWA/Mamba within existing linker layout limits and requires PP=1.
+All attention TP ranks read into private GPU slots; only complete KV confirmed
+successful by every rank joins the radix tree. Failed reads fall back to recomputation.
+
+Set `prefetch_policy` in the same JSON:
+
+- `best_effort`: use completed KV at admission; otherwise stop waiting and recompute.
+- `wait_complete`: wait until every rank finishes.
+- `timeout` (default): wait from the first blocked admission poll for
+  `prefetch_timeout_base` + tokens / 1024 * `prefetch_timeout_per_ki_token` seconds.
+  These JSON options default to 1 and 0.25 respectively.
+
+Stopping the wait cancels queued reads. Running reads retain their private slots
+until every rank stops writing, then discard them without publishing. Pending
+slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
+The deprecated HiCache extra config is used only when linker JSON is omitted.
+
 ### Decode context parallelism (DCP)
 
 Mooncake L3 supports DCP for one materialized MLA KV pool and optional KDA
@@ -52,15 +80,14 @@ to 16 MiB. Size it for concurrent reads and writes, including large recurrent
 state objects. This is per-client transient memory, separate from the shared
 `global_segment_size`; include both in the host memory budget.
 
-### Direct Linker with PCP and RDMA
+### Direct Linker with RDMA
 
 The direct Linker requires `--pp-size 1`; pipeline parallelism is not supported.
-For K31's hybrid DSA/KDA pools, interleave PCP keeps complete DSA KV and
-indexer pages on each GPU. The direct Linker shares these objects across
-replicated PCP and attention-TP ranks, with one writer per shared pool.
-Every rank reads the shared objects into its own GPU buffers. KDA state keeps
-rank-specific objects; replicated MLA draft pools also share across attention-TP
-ranks. This deduplicates L3 storage, not GPU allocations.
+For K31's hybrid DSA/KDA pools, every attention-TP rank holds identical DSA KV,
+indexer and MLA draft pages. The direct Linker shares these objects across
+attention-TP ranks, with one writer per shared pool. Every rank reads the shared
+objects into its own GPU buffers. KDA state keeps rank-specific objects. This
+deduplicates L3 storage, not GPU allocations.
 Use a distinct `extra_backend_tag` for each model/draft revision, dtype, page
 layout and parallel topology; the shared keys do not enable cross-topology reuse.
 

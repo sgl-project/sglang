@@ -12,13 +12,8 @@ from sglang.srt.runtime_context import (
     mamba_checkpoint_grid,
     mamba_track_grid,
 )
-from sglang.srt.utils.common import (
-    async_h2d,
-    ceil_align,
-    flatten_arrays_to_pinned_cpu,
-    is_hip,
-    is_pin_memory_available,
-)
+from sglang.srt.utils.common import ceil_align, flatten_arrays_to_pinned_cpu
+from sglang.srt.utils.device import async_h2d, is_hip, is_pin_memory_available
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpans,
@@ -129,10 +124,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
-    backup_kv_cache,
     evict_from_tree_cache,
     match_kv_cache,
-    release_kv_cache,
 )
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -165,6 +158,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.mem_cache.storage_prefetch import StagedPrefetchPlan
     from sglang.srt.models.unlimited_ocr_v2_support.document_reuse import UocrReqState
     from sglang.srt.sampling.custom_logit_processor import PageGuardState
@@ -1803,35 +1799,12 @@ def release_req(
     *,
     req: Req,
     remaing_req_count: int,
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
+    request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> bool:
     """Returns whether the request can be resumed."""
-    if hisparse_coordinator is not None and not req.finished():
-        hisparse_coordinator.retract_req(req)
-
-    # In decode disaggregation the retracted KV is offloaded to host so it can be
-    # restored later without recompute (see resume_retracted_reqs/load_kv_cache).
-    # Callers that will recompute the KV instead (PD true-retraction rebootstrap)
-    # pass offload_kv=False to skip the wasteful device->host copy.
-    # The config bag reflects role flips; server_args keeps the launch role.
-    if get_disagg().disaggregation_mode != "decode":
-        resumable = req.resumable_by_reprefill
-    elif offload_kv:
-        resumable = backup_kv_cache(
-            req,
-            tree_cache,
-            req_to_token_pool,
-            token_to_kv_pool_allocator,
-            get_disagg().disaggregation_decode_retraction_backup,
-        )
-    else:
-        resumable = req.resumable_by_rebootstrap
-    # TODO (csy): for preempted requests, we may want to insert into the tree
-    release_kv_cache(req, tree_cache, checkpoint=False)
+    resumable = request_retirer.retract(req, offload_kv=offload_kv)
     # NOTE(lsyin): we should use the newly evictable memory instantly.
     num_tokens = remaing_req_count * envs.SGLANG_RETRACT_DECODE_STEPS.get()
     evict_from_tree_cache(tree_cache, num_tokens)
@@ -1840,29 +1813,63 @@ def release_req(
     return resumable
 
 
+def free_beam_member_rows(
+    req: Req, req_to_token_pool, token_to_kv_pool_allocator
+) -> None:
+    """Free a beam leader's member rows. Call before releasing the leader:
+    the member rows are found through its lockstep allocated length."""
+    free_member_rows(
+        req.beam_group, kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator)
+    )
+
+
 def retract_all(
     *,
     reqs: List[Req],
-    req_to_token_pool: ReqToTokenPool,
-    token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
     tree_cache: BasePrefixCache,
-    hisparse_coordinator: Optional[HiSparseCoordinator],
+    request_retirer: RequestRetirer,
     offload_kv: bool = True,
 ) -> List[Req]:
-    """Returns the requests that cannot be resumed."""
-    unresumable = []
-    for idx in range(len(reqs)):
+    """Returns the requests to abort, each with its abort reason recorded: those
+    that cannot be resumed, and beam leaders, since beam groups cannot be
+    requeued."""
+    reqs_to_abort = []
+    for idx, req in enumerate(reqs):
+        if req.beam_group is not None:
+            req.request_finish(
+                FINISH_ABORT(
+                    "Beam search group aborted: beam groups cannot be retracted, "
+                    "so they are aborted instead of being requeued.",
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            free_beam_member_rows(
+                req, tree_cache.req_to_token_pool, tree_cache.token_to_kv_pool_allocator
+            )
+            release_req(
+                req=req,
+                remaing_req_count=len(reqs) - idx,
+                tree_cache=tree_cache,
+                request_retirer=request_retirer,
+                offload_kv=False,
+            )
+            reqs_to_abort.append(req)
+            continue
         if not release_req(
-            req=reqs[idx],
+            req=req,
             remaing_req_count=len(reqs) - idx,
-            req_to_token_pool=req_to_token_pool,
-            token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             tree_cache=tree_cache,
-            hisparse_coordinator=hisparse_coordinator,
+            request_retirer=request_retirer,
             offload_kv=offload_kv,
         ):
-            unresumable.append(reqs[idx])
-    return unresumable
+            req.request_finish(
+                FINISH_ABORT(
+                    unresumable_abort_message(),
+                    status_code=HTTPStatus.SERVICE_UNAVAILABLE,
+                )
+            )
+            reqs_to_abort.append(req)
+    return reqs_to_abort
 
 
 def compute_extend_logprob_start_len(
@@ -2909,7 +2916,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
-    def retract_decode(self) -> Tuple[List[Req], float, List[Req]]:
+    def retract_decode(
+        self, request_retirer: RequestRetirer
+    ) -> Tuple[List[Req], float, List[Req]]:
         """Retract the decoding requests when there is not enough memory."""
         sorted_indices = self._get_decode_retraction_order(self.reqs)
         sorted_indices = beam_retraction_order(sorted_indices, self.reqs)
@@ -2928,8 +2937,6 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             idx = sorted_indices.pop()
             req = self.reqs[idx]
             if req.beam_group is not None:
-                # Free member rows before release_req: they need the leader's kv
-                # info, which still carries the lockstep allocated length.
                 req.request_finish(
                     FINISH_ABORT(
                         "Beam search group aborted: KV cache pool is full. Beam "
@@ -2939,17 +2946,16 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                     )
                 )
                 reqs_to_abort.append(req)
-                free_member_rows(
-                    req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
                 # Aborting, so a host backup to resume from would be wasted.
-                self.release_req(idx, len(sorted_indices), offload_kv=False)
+                self.release_req(
+                    idx, len(sorted_indices), request_retirer, offload_kv=False
+                )
                 continue
             # release memory and don't insert into the tree because we need the space instantly
-            if self.release_req(idx, len(sorted_indices)):
+            if self.release_req(idx, len(sorted_indices), request_retirer):
                 retracted_reqs.append(req)
             else:
                 # No backup or rebuild exists and the device KV is already freed.
@@ -2989,13 +2995,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             )
             reqs_to_abort.append(last_req)
             if last_req.beam_group is not None:
-                free_member_rows(
-                    last_req.beam_group,
-                    kv_storage_of(
-                        self.req_to_token_pool, self.token_to_kv_pool_allocator
-                    ),
+                free_beam_member_rows(
+                    last_req, self.req_to_token_pool, self.token_to_kv_pool_allocator
                 )
-            self.release_req(last_idx, 0, offload_kv=False)
+            self.release_req(last_idx, 0, request_retirer, offload_kv=False)
             logger.warning(
                 "retract_decode: aborted last request %s due to OOM", last_req.rid
             )
@@ -3054,15 +3057,14 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self,
         idx: int,
         remaing_req_count: int,
+        request_retirer: RequestRetirer,
         offload_kv: bool = True,
     ) -> bool:
         return release_req(
             req=self.reqs[idx],
             remaing_req_count=remaing_req_count,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
-            hisparse_coordinator=self.hisparse_coordinator,
+            request_retirer=request_retirer,
             offload_kv=offload_kv,
         )
 
@@ -3524,9 +3526,12 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         per-request token gating synchronizes SWA pressure across DP ranks and
         triggers a retraction / re-prefill storm at high concurrency.
         """
-        if _is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get():
-            due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
-            return lambda req: due_this_forward
+        if _is_hip:
+            from sglang.srt.layers.moe.utils import get_moe_a2a_backend
+
+            if get_moe_a2a_backend().is_megamoe():
+                due_this_forward = (self.forward_iter or 0) % eviction_interval == 0
+                return lambda req: due_this_forward
         return lambda req: (
             req.seqlen - 1 - sliding_window_size
             >= req.kv.get_evicted_seqlen(ComponentType.SWA) + eviction_interval

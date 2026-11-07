@@ -42,7 +42,7 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadataDsa
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_fi_a2a_supported
+from sglang.srt.utils.device import is_fi_a2a_supported
 
 logger = logging.getLogger(__name__)
 

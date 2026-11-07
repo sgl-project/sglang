@@ -35,6 +35,7 @@ from sglang.srt.layers.dcp import (
     update_local_kv_lens_for_dcp,
 )
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
+from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -50,11 +51,7 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.flashinfer_mla_backend import (

@@ -1124,6 +1124,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 ]
             elif self.is_mla_backend:
                 suffixes = [f"_{self.mla_suffix}_{pool_name}"]
+        else:
+            from sglang.srt.mem_cache.memory_pool_host import DeepSeekV4PagedHostPool
+
+            if isinstance(host_pool, DeepSeekV4PagedHostPool):
+                # A compressed-KV pool's extra_host_regions are page-packed
+                # single-object pools too.
+                suffixes = [f"_{self.mla_suffix}_{pool_name}"]
 
         if not suffixes:
             raise ValueError(

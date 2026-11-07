@@ -102,7 +102,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        if not is_kimi_k31(hf_config):  # K3.1 DCP: _kimi_k31_dcp_overrides
+        if not is_kimi_k31(hf_config):
             overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):

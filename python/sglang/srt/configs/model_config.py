@@ -29,25 +29,30 @@ from transformers.utils import cached_file
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
 from sglang.srt.configs.embedding_model_spec import resolve_embedding_model_spec
+from sglang.srt.configs.ernie55 import (
+    ERNIE5_5_ARCHS,
+    ERNIE5_5_MOE_ARCH,
+    to_dspark_draft_config,
+    to_nextn_draft_config,
+)
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
     UocrDocumentConfig,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
-from sglang.srt.utils.hf_transformers import (
+from sglang.srt.hf_transformers import (
     get_config,
     get_context_length,
     get_generation_config,
     get_hf_text_config,
     get_sparse_attention_config,
 )
-from sglang.srt.utils.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
+from sglang.srt.runtime_context import get_platform
+from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -214,6 +219,8 @@ def is_deepseek_dsa(config) -> bool:
             "KimiK31ForConditionalGeneration",
             "KimiLinearForCausalLM",
             "KimiK3LinearForCausalLM",
+            "Ernie5_5_MoeForCausalLM",
+            "Ernie5_5_MoeForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     ) or is_kimi_k31(config)
@@ -449,6 +456,16 @@ def is_deepseek_v4(config) -> bool:
     )
 
 
+def is_ernie5_5(config) -> bool:
+    return _hf_arch(config) in ERNIE5_5_ARCHS
+
+
+def uses_compressed_kv_attention(config) -> bool:
+    """Whether the model's attention runs on the compressed sliding-window KV
+    layout (SWA plus C4 / C128 sub-pools) and its backend."""
+    return is_deepseek_v4(config) or is_ernie5_5(config)
+
+
 def is_qwen4_exp(config) -> bool:
     return _hf_arch(config) in (
         "Qwen4ExpForConditionalGeneration",
@@ -459,16 +476,18 @@ def is_qwen4_exp(config) -> bool:
 def resolve_spec_hidden_size(
     hf_config, hidden_size: int, hc_mult: int
 ) -> tuple[int, Optional[int]]:
-    # DSV4 and Qwen4-Exp carry the hc-flattened stream across the target->draft
-    # boundary; other hc models (hy_v4) collapse to hidden_size first.
-    if hc_mult <= 1 or not (is_deepseek_v4(hf_config) or is_qwen4_exp(hf_config)):
+    # DSV4, ERNIE 5.5 and Qwen4-Exp carry the hc-flattened stream across the
+    # target->draft boundary; other hc models (hy_v4) collapse to hidden_size first.
+    if hc_mult <= 1 or not (
+        uses_compressed_kv_attention(hf_config) or is_qwen4_exp(hf_config)
+    ):
         return hidden_size, None
     hc_hidden_size = hidden_size * hc_mult
     return hc_hidden_size, hc_hidden_size
 
 
 def get_dsa_index_head_dim(config: PretrainedConfig) -> int:
-    assert is_deepseek_dsa(config) or is_deepseek_v4(config)
+    assert is_deepseek_dsa(config) or uses_compressed_kv_attention(config)
     return config.index_head_dim
 
 
@@ -481,15 +500,16 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 
 
 def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
-    """Whether an NVFP4 checkpoint runs its native Blackwell stack.
+    """Whether an NVFP4 checkpoint runs its native MSA-v1 stack.
 
     The attention backend, the KV pool class and the KV cell-size budget must
     all agree on this answer; sizing the pool for one layout while allocating
-    the other runs out of memory at startup.
+    the other runs out of memory at startup. The MSA-v1 kernels are built for
+    SM10x only, so SM11x/SM12x Blackwell is excluded.
     """
     from sglang.srt.runtime_context import get_platform
 
-    return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
+    return quantization == "minimax_m3_nvfp4" and get_platform().is_sm100
 
 
 # v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.
@@ -1158,6 +1178,12 @@ class ModelConfig:
                 self.hf_config.architectures[0] = "DeepseekV4ForCausalLMNextN"
                 self.hf_config.num_nextn_predict_layers = 1
 
+        if is_draft_model and self.hf_config.architectures[0] == ERNIE5_5_MOE_ARCH:
+            if self.speculative_algorithm == "DSPARK":
+                to_dspark_draft_config(self.hf_config)
+            else:
+                to_nextn_draft_config(self.hf_config)
+
         if is_draft_model and self.hf_config.architectures[0] == "Glm4MoeForCausalLM":
             self.hf_config.architectures[0] = "Glm4MoeForCausalLMNextN"
         if (
@@ -1328,17 +1354,9 @@ class ModelConfig:
         if self.is_hybrid_swa:
             logger.debug(f"Hybrid swa model: {self.hf_config.architectures=}")
 
-            self.is_deepseek_v4_arch = any(
-                arch
-                in [
-                    "DeepseekV4ForCausalLM",
-                    "DeepseekV4ForCausalLMNextN",
-                    "DeepseekV4ForCausalLMDSpark",
-                ]
-                for arch in self.hf_config.architectures
-            )
+            self.is_compressed_kv_arch = uses_compressed_kv_attention(self.hf_config)
 
-            if not self.is_deepseek_v4_arch:
+            if not self.is_compressed_kv_arch:
                 self.swa_attention_layer_ids, self.full_attention_layer_ids = (
                     get_hybrid_layer_ids(
                         self.hf_config.architectures,
@@ -1413,7 +1431,7 @@ class ModelConfig:
                 )
                 if (
                     envs.SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN.get()
-                    or is_in_ci()  # FIXME: fix this special case
+                    or envs.SGLANG_IS_IN_CI.get()  # FIXME: fix this special case
                 ):
                     logger.warning(msg)
                     self.context_len = context_length
@@ -1546,11 +1564,7 @@ class ModelConfig:
                 self.hf_text_config, "rope_parameters", None
             ) or getattr(self.hf_text_config, "rope_scaling", None)
             self._init_mla_scaling(rope_scaling)
-        elif (
-            "DeepseekV4ForCausalLM" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMNextN" in self.hf_config.architectures
-            or "DeepseekV4ForCausalLMDSpark" in self.hf_config.architectures
-        ):
+        elif uses_compressed_kv_attention(self.hf_config):
             self.qk_rope_head_dim = self.hf_config.qk_rope_head_dim
             self.qk_nope_head_dim = self.hf_config.head_dim - self.qk_rope_head_dim
             self.window_size = self.hf_config.sliding_window
@@ -1558,6 +1572,11 @@ class ModelConfig:
             self.v_head_dim = self.head_dim
             self.index_head_dim = self.hf_config.index_head_dim
             self.compress_ratios = self.hf_config.compress_ratios
+            # Layers that run full-context MLA, with their own latent KV, instead
+            # of compressed attention.
+            self.mla_layer_ids = (
+                self.hf_config.mla_layer_ids if is_ernie5_5(self.hf_config) else ()
+            )
             self.attention_arch = AttentionArch.MHA
             self._init_mla_scaling(self.hf_config.rope_scaling)
         elif "Glm4MoeForCausalLMNextN" in self.hf_config.architectures:
@@ -2074,7 +2093,7 @@ class ModelConfig:
         # Check for HuggingFace quantization config
         quant_cfg = getattr(self.hf_config, "quantization_config", None)
         if quant_cfg is None:
-            from sglang.srt.utils import has_hf_quant_config
+            from sglang.srt.configs.quant_utils import has_hf_quant_config
 
             return has_hf_quant_config(self.model_path)
         return True
@@ -2641,6 +2660,9 @@ piecewise_cuda_graph_disabled_model_archs = [
     "DeepseekV4ForCausalLM",
     "DeepseekV4ForCausalLMNextN",
     "DeepseekV4ForCausalLMDSpark",
+    "Ernie5_5_MoeForCausalLM",
+    "Ernie5_5_MoeForCausalLMNextN",
+    "Ernie5_5_MoeForCausalLMDSpark",
     "Qwen3NextForCausalLM",
     "Glm5NextForConditionalGeneration",
     "BailingMoeV2_5ForCausalLM",

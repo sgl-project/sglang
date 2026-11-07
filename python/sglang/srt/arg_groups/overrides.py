@@ -53,6 +53,7 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.prefill_buffer_ceiling import prefill_buffer_ceiling_of
 
 logger = logging.getLogger(__name__)
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.runtime_context import (
@@ -61,8 +62,7 @@ from sglang.srt.runtime_context import (
     get_platform,
     num_dp_ranks_of,
 )
-from sglang.srt.utils.common import (
-    get_quantization_config,
+from sglang.srt.utils.device import (
     is_fi_a2a_supported,
     is_gfx95_supported,
     xpu_has_xmx_support,
@@ -795,49 +795,47 @@ def _kimi_k31_dsa_backends(view: Any) -> dict:
                 "Kimi-K3.1 does not support --enable-hisparse on ROCm yet."
             )
         backend = _KIMI_K31_DSA_BACKEND_HIP
-        declared = _pin_dsa_backends(
+        return _pin_dsa_backends(
             view,
             backend,
             lambda option, value: (
-                f"Kimi-K3.1 requires {option} {backend!r} to match "
-                f"the reference fp8_ds_mla numerics; got {value!r}."
+                f"Kimi-K3.1 requires {option} {backend!r} on ROCm; got {value!r}."
             ),
         )
-    else:
-        fields = ("dsa_prefill_backend", "dsa_decode_backend")
-        for field in fields:
-            value = getattr(view, field)
-            if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
-                option = "--" + field.replace("_", "-")
-                raise ValueError(
-                    f"Kimi-K3.1 supports {option} "
-                    f"{' / '.join(_KIMI_K31_DSA_BACKENDS)}; got {value!r}."
-                )
-        # Both phases read one KV pool (and PD peers exchange it), so an unset
-        # phase follows the set one.
-        chosen = {getattr(view, f) for f in fields} - {None}
-        if len(chosen) > 1:
+    fields = ("dsa_prefill_backend", "dsa_decode_backend")
+    for field in fields:
+        value = getattr(view, field)
+        if value is not None and value not in _KIMI_K31_DSA_BACKENDS:
+            option = "--" + field.replace("_", "-")
             raise ValueError(
-                "Kimi-K3.1 needs the same --dsa-prefill-backend and "
-                "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
-                f"different KV layouts); got {view.dsa_prefill_backend!r} and "
-                f"{view.dsa_decode_backend!r}."
+                f"Kimi-K3.1 supports {option} {' / '.join(_KIMI_K31_DSA_BACKENDS)}; "
+                f"got {value!r}."
             )
-        backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
-        if backend in ("trtllm", "prims_ts"):
-            logger.warning(
-                f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
-                "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
-                "both use a raw-FP8-KV backend (trtllm or prims_ts)."
-            )
-        if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
-            # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
-            # flashmla_kv among the K3.1 backends.
-            raise ValueError(
-                f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
-                f"got {backend!r}."
-            )
-        declared = {f: backend for f in fields if getattr(view, f) is None}
+    # Both phases read one KV pool (and PD peers exchange it), so an unset
+    # phase follows the set one.
+    chosen = {getattr(view, f) for f in fields} - {None}
+    if len(chosen) > 1:
+        raise ValueError(
+            "Kimi-K3.1 needs the same --dsa-prefill-backend and "
+            "--dsa-decode-backend (flashmla_kv and trtllm / prims_ts use "
+            f"different KV layouts); got {view.dsa_prefill_backend!r} and "
+            f"{view.dsa_decode_backend!r}."
+        )
+    backend = chosen.pop() if chosen else _KIMI_K31_DSA_BACKEND
+    if backend in ("trtllm", "prims_ts"):
+        logger.warning(
+            f"Kimi-K3.1 {backend} DSA uses FP8 q and an unscaled FP8 KV cache, not "
+            "the reference fp8_ds_mla numerics. PD prefill and decode servers must "
+            "both use a raw-FP8-KV backend (trtllm or prims_ts)."
+        )
+    if view.enable_hisparse and backend != _KIMI_K31_DSA_BACKEND:
+        # The HiSparse FP8 backend allow-list (hisparse_hook) admits only
+        # flashmla_kv among the K3.1 backends.
+        raise ValueError(
+            f"Kimi-K3.1 HiSparse requires DSA backend {_KIMI_K31_DSA_BACKEND!r}; "
+            f"got {backend!r}."
+        )
+    declared = {f: backend for f in fields if getattr(view, f) is None}
     logger.warning(
         "Set DSA backends for Kimi-K3.1: prefill=%s, decode=%s.", backend, backend
     )
@@ -897,7 +895,7 @@ def _deepseek_moe_quant_resolution(view: Any) -> dict:
             # Moonlight-16B-A3B) are purely BF16.  Check the actual
             # safetensors header instead of assuming FP8 by arch name.
             if quant_method is None and model_arch in ["DeepseekV3ForCausalLM"]:
-                from sglang.srt.utils.common import has_fp8_weights_in_checkpoint
+                from sglang.srt.configs.quant_utils import has_fp8_weights_in_checkpoint
 
                 if has_fp8_weights_in_checkpoint(view.model_path):
                     overrides["quantization"] = quantization = "fp8"
@@ -1890,7 +1888,7 @@ def _speculative_moe_runner_default(view: Any) -> dict:
 
 @register_post_process
 def _gguf_quantization(view: Any) -> dict:
-    from sglang.srt.utils.hf_transformers import check_gguf_file
+    from sglang.srt.hf_transformers import check_gguf_file
 
     if (view.load_format == "auto" or view.load_format == "gguf") and check_gguf_file(
         view.model_path
@@ -2074,10 +2072,13 @@ def post_capture_kv_sizing_planned(server_args: Any) -> bool:
         ):
             return False
 
-    from sglang.srt.configs.model_config import is_deepseek_v4, is_minimax_sparse
+    from sglang.srt.configs.model_config import (
+        is_minimax_sparse,
+        uses_compressed_kv_attention,
+    )
 
     hf_config = model_config.hf_config
-    if is_deepseek_v4(hf_config) or is_minimax_sparse(hf_config):
+    if uses_compressed_kv_attention(hf_config) or is_minimax_sparse(hf_config):
         return False
 
     return True

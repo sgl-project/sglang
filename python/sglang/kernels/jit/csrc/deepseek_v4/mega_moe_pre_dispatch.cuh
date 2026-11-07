@@ -96,7 +96,6 @@ __global__ __launch_bounds__(kMaxBlockThreads, 2) void  //
       if (valid) {
         in_vec.load(token_in, chunk);
       } else {
-        // Do not read poisoned graph padding, even before quantization.
 #pragma unroll
         for (uint32_t i = 0; i < kVecElems / 2; ++i)
           in_vec[i] = bf16x2_t{};

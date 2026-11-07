@@ -21,6 +21,7 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
@@ -42,6 +43,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -50,7 +52,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -61,9 +63,8 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
-from sglang.srt.utils.common import get_compiler_backend
-from sglang.srt.utils.hf_transformers import get_rope_config
+from sglang.srt.utils import BumpAllocator, is_npu
+from sglang.srt.utils.device import get_compiler_backend
 
 _is_npu = is_npu()
 if _is_npu:

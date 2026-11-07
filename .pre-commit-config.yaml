@@ -149,6 +149,12 @@ repos:
         entry: python3 scripts/lint/check_indirect_imports.py
         language: system
         files: ^(python|test)/.*\.py$
+      - id: check-srt-utils-imports
+        name: reject srt domain imports in sglang.srt.utils and sglang.utils imports in the runtime
+        entry: python3 scripts/lint/check_srt_utils_imports.py
+        language: system
+        files: ^(python/sglang/(srt|kernels)/.*\.py|scripts/lint/check_srt_utils_imports\.py)$
+        pass_filenames: false
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)
         entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'

@@ -40,8 +40,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory. On ROCm, set "
-            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
+            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2."
         )
 
 
@@ -126,7 +125,7 @@ def flydsl_decode_tokens_per_rank(cfg) -> int | None:
 
 
 def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
-    if not (get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()):
+    if not get_platform().is_hip:
         return
     decode_mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get()
     if decode_mtpr <= 0 or decode_mtpr >= envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get():
@@ -168,12 +167,11 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
     )
     if cfg.disaggregation_mode != "prefill":
         decode_tokens = mega_moe_decode_tokens_per_rank(cfg)
-        if model_label == "KimiK31ForConditionalGeneration":
+        if (
+            model_label == "KimiK31ForConditionalGeneration"
+            and cfg.max_running_requests is not None
+        ):
             # Kimi repacks its experts at load and has no oversized eager fallback.
-            if cfg.max_running_requests is None:
-                raise ValueError(
-                    "Kimi MegaMoE needs --max-running-requests to bound eager decode / verify rows."
-                )
             eager_requests = ceil_align(
                 cfg.max_running_requests // cfg.attn_dp_size,
                 cfg.tp_size // cfg.attn_dp_size,
@@ -222,6 +220,19 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         if graph is not None and graph.backend != "disabled":
             prefill_tokens = max(
                 prefill_tokens, graph.max_bs or 0, max(graph.bs or [0])
+            )
+        # Kimi repacks its experts at load and has no non-mega fallback, so the
+        # whole prefill forward must fit the MegaMoE workspace of the EP group.
+        ep_capacity = max_tokens_per_rank * (cfg.ep_size or 1)
+        if prefill_tokens > ep_capacity:
+            raise ValueError(
+                f"{model_label} with MegaMoE has no non-mega MoE fallback, so the "
+                f"largest prefill forward ({prefill_tokens} tokens, from "
+                "--chunked-prefill-size / --max-prefill-tokens / the prefill "
+                "CUDA graph buckets) must not exceed "
+                "SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK x ep_size = "
+                f"{max_tokens_per_rank} x {cfg.ep_size or 1} = {ep_capacity}. "
+                "Lower --chunked-prefill-size or raise the env var."
             )
 
     if cfg.enable_prefill_cp:

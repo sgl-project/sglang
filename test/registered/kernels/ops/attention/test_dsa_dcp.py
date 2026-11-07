@@ -27,8 +27,8 @@ from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
 from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     _scatter_candidates_kernel,
-    dcp_all_visible,
     dcp_global_topk,
+    dcp_select_all_slots,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
 from sglang.srt.layers.attention.dsa_backend import (
@@ -711,7 +711,7 @@ class TestDSADCPVerifyTopK(TestDSADCPTopK):
         req, glob = req[keep], glob[keep]
         table = _real_table(r2t, dcp_size)[req]
         with published_topology(tp_size=dcp_size, dcp_size=dcp_size):
-            out = dcp_all_visible(glob, table, TOPK, PAGE)
+            out = dcp_select_all_slots(glob, table, TOPK, PAGE)
         for r in range(glob.numel()):
             n = int(glob[r])
             slots = out[r]
@@ -743,6 +743,7 @@ class TestDSADCPVerifyTopK(TestDSADCPTopK):
             speculative_num_draft_tokens=NEXT_N,
             attn_dcp_size=dcp_size,
             attn_dcp_rank=rank,
+            dsa_shards_index_k=True,
         )
         backend._dcp_local_ctx_lens = lambda lens: (
             DeepseekSparseAttnBackend._dcp_local_ctx_lens(backend, lens)

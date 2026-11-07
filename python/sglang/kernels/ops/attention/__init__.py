@@ -531,7 +531,6 @@ for _mod, _fn, _backend in [
         )
     )
 del _mod, _fn, _backend
-# Its PDL probe reads the device major only, which also enables PDL on ROCm gfx9.
 register_kernel(
     KernelSpec(
         op="attention.dash_sparse_attn_decode",
@@ -613,7 +612,23 @@ register_kernel(
     )
 )
 
-
+register_kernel(
+    KernelSpec(
+        op="attention.append_window_to_topk",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.append_window_to_topk:append_window_to_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.postmix_fp8_wo_a_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
+        # The UE8M0 packed scales are an SM100 layout.
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
 register_kernel(
     KernelSpec(
         op="attention.indexer_q_quant_head_gate",

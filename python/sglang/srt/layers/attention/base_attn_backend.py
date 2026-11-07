@@ -10,7 +10,7 @@ from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -277,7 +277,6 @@ class AttentionBackend(ABC):
         self,
         forward_batch: ForwardBatch,
         *,
-        num_qo_tokens: int,
         build_snapshot: bool = True,
     ) -> SharedReadEnds:
         """Return this batch's prefill read end, building a snapshot when asked.
@@ -292,13 +291,11 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
         if build_snapshot:
-            return self._snapshot_prefill_shared_reads(
-                forward_batch, num_qo_tokens=num_qo_tokens
-            )
+            return self._snapshot_prefill_shared_reads(forward_batch)
         return self.shared_read_ends(forward_batch.forward_mode)
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         """Snapshot late shared reads; return PRE_REPLAY only if none remain.
 

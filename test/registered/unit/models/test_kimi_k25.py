@@ -45,6 +45,7 @@ from sglang.srt.multimodal.media_artifacts.kimi_k3 import (
     KimiK3PreprocessConfig,
     KimiK3ResizeConfig,
 )
+from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.multimodal.mm_utils import run_dp_sharded_mrope_vision_model
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
@@ -72,7 +73,6 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_context, get_parallel, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import ImageData
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")

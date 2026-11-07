@@ -539,7 +539,7 @@ def draft_swa_layer_ids(draft_model_config) -> Tuple[int, ...]:
     the pool-routing convention (`SWAKVPool.layers_mapping`), not a per-layer
     kernel window: an attention-only draft window stays full-kind."""
     mc = draft_model_config
-    if mc.is_hybrid_swa and not mc.is_deepseek_v4_arch:
+    if mc.is_hybrid_swa and not mc.is_compressed_kv_arch:
         return tuple(int(i) for i in mc.swa_attention_layer_ids)
     return ()
 

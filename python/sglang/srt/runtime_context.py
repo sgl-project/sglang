@@ -1846,6 +1846,7 @@ _PLATFORM_PROBES: Dict[str, str] = {
     "is_xpu": "is_xpu",
     "is_musa": "is_musa",
     "is_mps": "is_mps",
+    "is_mlu": "is_mlu",
     "is_sail": "is_sail",
     "is_sm90": "is_sm90_supported",
     "is_sm100": "is_sm100_supported",
@@ -1868,7 +1869,7 @@ _PLATFORM_VALUES: Dict[str, str] = {
 class PlatformContext:
     """The machine's own facts, with one place to override them.
 
-    Every name maps to a probe in `utils.common`; the probes are
+    Every name maps to a probe in `utils.device`; the probes are
     `lru_cache`-d, so reading through here costs a call and a dict lookup
     (~26 ns) rather than a device query.
     """
@@ -1888,9 +1889,9 @@ class PlatformContext:
         overrides = object.__getattribute__(self, "_overrides")
         if name in overrides:
             return overrides[name]
-        from sglang.srt.utils import common as _common
+        from sglang.srt.utils import device as _device
 
-        return getattr(_common, probe)()
+        return getattr(_device, probe)()
 
     def __setattr__(self, name: str, value: Any) -> None:
         raise AttributeError(
