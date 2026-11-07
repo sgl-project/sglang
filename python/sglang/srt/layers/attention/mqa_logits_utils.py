@@ -13,7 +13,7 @@ from typing import Callable, Optional, Tuple
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_schedule
+from sglang.srt.runtime_context import get_exec, get_schedule
 from sglang.srt.utils import get_device_module, is_hip, is_xpu
 from sglang.srt.utils.common import ceil_div
 
@@ -58,9 +58,17 @@ def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
 
 def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
     """Static budget capped by current free memory; mem_get_info syncs, so
-    callers pass allow_sync=False under CUDA graph capture."""
+    callers pass allow_sync=False under CUDA graph capture.
+
+    Deterministic inference uses the static budget alone: free memory changes
+    from run to run, so a budget capped by it would change how the indexers
+    split the logits into row chunks, and with it the result."""
     budget = mqa_logits_static_budget_bytes(device_index=device_index)
-    if allow_sync and not is_xpu():
+    if (
+        allow_sync
+        and not is_xpu()
+        and not get_exec().deterministic.enable_deterministic_inference
+    ):
         free_mem, _ = torch.cuda.mem_get_info(device_index)
         budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
     if is_hip():
