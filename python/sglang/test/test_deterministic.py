@@ -522,6 +522,8 @@ def test_deterministic(args):
                 responses = full_responses[prompt_idx]
 
                 if len(responses) < 2:
+                    print("  ✗ Need at least two responses to compare logprobs")
+                    logprob_results.append(0)
                     continue
 
                 # Compare all responses against the first one
@@ -533,7 +535,10 @@ def test_deterministic(args):
                     ref_logprobs = reference["meta_info"]["output_token_logprobs"]
                     resp_logprobs = resp["meta_info"]["output_token_logprobs"]
 
-                    match, msg = compare_logprobs(ref_logprobs, resp_logprobs)
+                    if not ref_logprobs or not resp_logprobs:
+                        match, msg = False, "Missing output logprobs"
+                    else:
+                        match, msg = compare_logprobs(ref_logprobs, resp_logprobs)
 
                     if not match:
                         print(f"  ✗ Sample {j + 1}: {msg}")
@@ -554,6 +559,8 @@ def test_deterministic(args):
                 print("✓✓✓ Logprobs are identical across all batch sizes! ✓✓✓")
             else:
                 print("✗✗✗ Some logprobs differ across batch sizes! ✗✗✗")
+
+            results.extend(logprob_results)
 
         return results
 
