@@ -126,8 +126,19 @@ class DeepSeekRecipeOutputParser:
             )
         ):
             held -= 1
+        held = self._char_boundary(self._pending_ids, held)
         ready, self._pending_ids = self._pending_ids[:held], self._pending_ids[held:]
         return ready
+
+    def _char_boundary(self, token_ids: list[int], end: int) -> int:
+        for cut in range(end, 0, -1):
+            tail = self._hf_tokenizer.decode(
+                token_ids[max(cut - _MAX_UTF8_BYTES, 0) : cut],
+                skip_special_tokens=False,
+            )
+            if not tail.endswith("�"):
+                return cut
+        return 0
 
     def finish(
         self,
@@ -154,6 +165,7 @@ class DeepSeekRecipeOutputParser:
             and token_ids[-1] == matched
         ):
             token_ids = token_ids[:-1]
+        token_ids = self._without_split_char(token_ids)
         chunks = (
             self._processor.push(self._recipe.InferenceChunk.tokens(token_ids))
             if token_ids
@@ -171,6 +183,16 @@ class DeepSeekRecipeOutputParser:
                     self._recipe.InferenceChunk.finish(reason)
                 )
         return self._deltas(chunks)
+
+    def _without_split_char(self, token_ids: list[int]) -> list[int]:
+        cut = self._char_boundary(token_ids, len(token_ids))
+        if cut == len(token_ids):
+            return token_ids
+        text = self._hf_tokenizer.decode(token_ids[cut:], skip_special_tokens=False)
+        return (
+            token_ids[:cut]
+            + self._hf_tokenizer.encode(text.rstrip("�"), add_special_tokens=False).ids
+        )
 
     def _cut_at_stop_string(
         self, token_ids: list[int], stop: str, *, keep_stop: bool
