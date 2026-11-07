@@ -132,6 +132,17 @@ python -m sglang.launch_server \
   --model-loader-extra-config '{"distributed": true}'
 ```
 
+### Model-owned shard selection
+
+RunAI reuses [model-owned selection rules](/docs/advanced_features/model_loading#model-owned-checkpoint-shard-selection)
+before streaming: local files use safetensors headers; object storage uses the
+cached `model.safetensors.index.json`. Mixed and unindexed shards are retained.
+Missing or invalid selection metadata, absent hooks, prefixed sources, indexed
+drafts, and empty selections keep the full file list.
+
+Distributed workers agree on the union of required shards when their original
+file lists match; otherwise each keeps its original list.
+
 ## Limitations
 
 - **Supported formats**: Only the `.safetensors` weight format is supported.
