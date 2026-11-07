@@ -19,7 +19,7 @@ name: Nightly Benchmark (AMD)
 # (see the launcher's header).
 on:
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 13 * * *'  # with PR Test (AMD)'s 13:00 UTC rocm10 run, first after the 09:00 UTC rocm10 image
   workflow_dispatch:
     inputs:
       ref:
