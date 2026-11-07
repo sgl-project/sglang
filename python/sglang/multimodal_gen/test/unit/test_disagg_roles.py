@@ -337,6 +337,7 @@ class TestPipelineStageRoleFilter(unittest.TestCase):
             pipeline.server_args = SimpleNamespace(
                 model_subfolder=None,
                 revision="a" * 40,
+                model_checksum=None,
             )
 
             with patch(
