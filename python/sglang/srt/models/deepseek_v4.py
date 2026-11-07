@@ -4113,8 +4113,11 @@ class DeepseekV4Model(nn.Module):
             and forward_batch.forward_mode.is_extend_without_speculative()
         ):
             attn_backend = get_attn_backend()
-            tail = attn_backend.tail_forward_metadata.late_layer_tail
-            self._check_late_layer_tail_readers(forward_batch, tail)
+            # None inside a HIP prefill CUDA graph: the late layers run every row.
+            tail_metadata = attn_backend.tail_forward_metadata
+            if tail_metadata is not None:
+                tail = tail_metadata.late_layer_tail
+                self._check_late_layer_tail_readers(forward_batch, tail)
         tail_in_graph = (
             tail is not None
             and tail.scatter_indices is not None
@@ -5054,6 +5057,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             self.capture_aux_hidden_states
             and self.model.late_layer_start is not None
             and forward_batch.forward_mode.is_extend_without_speculative()
+            and get_attn_backend().tail_forward_metadata is not None
         ):
             tail = get_attn_backend().tail_forward_metadata.late_layer_tail
             input_ids = tail.rows(input_ids)
