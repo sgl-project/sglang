@@ -276,7 +276,9 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
             side_effect=lambda *_args, **_kwargs: events.append("attach")
         )
         forward_batch = SimpleNamespace(
-            attn_cp_metadata=SimpleNamespace(per_rank_actual_token=[2, 2])
+            attn_cp_metadata=SimpleNamespace(
+                per_rank_actual_token=[2, 2], local_index=None
+            )
         )
 
         with (
@@ -309,7 +311,7 @@ class TestDSV4HipBreakableCudaGraphMetadata(unittest.TestCase):
         self.assertEqual(
             backend.make_core_attn_metadata.call_args.kwargs["num_tokens"], 3
         )
-        core.apply_cp_reindex.assert_called_once_with(num_tokens=3)
+        core.apply_cp_reindex.assert_called_once_with(num_tokens=3, local_index=None)
         # Target prefill rebuilds FlashMLA on the local rows; the draft skips it.
         self.assertEqual(
             events, ["attach", "reindex"] + (["flashmla"] if need_compress else [])

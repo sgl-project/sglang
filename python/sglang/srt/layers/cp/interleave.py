@@ -36,6 +36,7 @@ import torch
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import (
     BaseContextParallelMetadata,
     ContextParallelStrategy,
@@ -172,6 +173,9 @@ class InterleaveCPStrategy(ContextParallelStrategy):
             return False
         cp_size = self.cp_size
         seq_len = sum(forward_batch.extend_seq_lens_cpu)
+        # tokens are dealt by global index, so the smallest shard holds seq_len // cp_size
+        if seq_len // cp_size < envs.SGLANG_CP_MIN_TOKENS_PER_RANK.get():
+            return False
         return seq_len > 0 and seq_len >= cp_size and cp_size > 1
 
     def build_metadata(

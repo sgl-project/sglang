@@ -840,6 +840,9 @@ class Envs:
     )
     SGLANG_ENABLE_COLOCATED_BATCH_GEN = EnvBool(False)
     SGLANG_SHARED_EXPERT_TP1 = EnvBool(False)
+    # Interleave prefill CP runs a batch unsharded when its smallest shard would hold
+    # fewer rows than this.
+    SGLANG_CP_MIN_TOKENS_PER_RANK = EnvInt(0)
     # Replicate the input embedding across TP ranks instead of sharding it
     # along the vocab dimension (saves an all-reduce/all-gather in the embed
     # lookup at the cost of replicated embedding weights). Drives both the
