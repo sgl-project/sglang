@@ -72,6 +72,130 @@ see [Best practices](#best-practices), which may require additional cards or nod
 For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
 
+## MegaMoE on A3 with BF16 or INT experts
+
+Use `--moe-a2a-backend ascend_fuseep --fuseep-mode 3` for fused dispatch,
+expert GEMMs, activation, and combine on Atlas A3 (`Ascend910_93`).
+The adapter uses the layer's configuration rather than a model-name allowlist.
+Compatible GLM, Kimi, and other MoE layers can use these combinations:
+
+| Expert format | Quantization setting | Activation | Expert bias |
+| --- | --- | --- | --- |
+| BF16 | No quantization flag; BF16 checkpoint | SwiGLU or SiTU | Unsupported |
+| W8A8 INT | `--quantization modelslim`, per-channel scales | SwiGLU or SiTU | Unsupported |
+| W4A8 INT | `--quantization modelslim`, per-channel scales | SwiGLU or SiTU | Loaded compensation required |
+
+Hidden states must be BF16 for every format. Ordinary SwiGLU is selected by
+`activation="silu"` or `"swiglu"`. Kimi's SiTU is selected by `"situ"` or
+`"situglu"`, with `gemm1_alpha` forwarded as `beta` (default 4.0) and
+`gemm1_clamp_limit` forwarded as `linear_beta`. A `None` clamp remains unclamped;
+the adapter does not replace it with a fixed Kimi default.
+
+Keep shared experts separate with `--disable-shared-experts-fusion`.
+Speculative decoding, expert load balancing, input-side router weighting,
+non-gated/no-combine execution, clipped SwiGLU, SwiGLU-OAI, and other activation
+contracts are rejected. FP8, MXFP and FP4 layouts are not reinterpreted as INT
+weights: the current DeepEP A3 MegaMoE path exposes BF16 and INT modes, while
+A5 MXFP formats require a separate platform/layout adapter. Groupwise INT scales,
+activation clipping, nonzero weight offsets, mixed projection formats and BF16
+expert biases are unsupported.
+
+Use matching CANN toolkit/operator packages and DeepEP exposing
+`FuseMode.MEGA_MOE` and `Buffer.fused_deep_moe(..., fuse_mode=3, activation=...,
+l1_bias=..., l2_bias=...)`. The MegaMoE JIT extension requires `ninja`.
+If the operator rejects `activation_params`, upgrade the CANN toolkit and its
+matching `cann_ops_transformer` operator package instead of applying a legacy
+DeepEP patch. The recorded API reference environment loads both ACL and MegaMoE
+from **CANN 9.2.0-beta.2**. A version label alone is insufficient: verify the
+actual imported module and accepted keywords in the serving environment.
+Keep PyTorch and `torch_npu` compatible with the selected toolkit; no separate
+Torch upgrade is implied by this keyword mismatch.
+
+After sourcing the selected CANN `set_env.sh`, check the serving Python:
+
+```bash
+python3 - <<'PY_CHECK'
+import inspect
+import cann_ops_transformer
+import deep_ep
+from cann_ops_transformer.ops import mega_moe
+
+print("operator package:", cann_ops_transformer.__file__)
+print("DeepEP:", deep_ep.__file__)
+inspect.signature(mega_moe).bind_partial(
+    activation="swiglu", activation_params=None
+)
+assert {"fuse_mode", "quant_mode", "activation", "beta", "linear_beta", "l1_bias", "l2_bias"} <= set(
+    inspect.signature(deep_ep.Buffer.fused_deep_moe).parameters
+)
+print("Required Python APIs available; device validation is still required")
+PY_CHECK
+```
+
+SGLang neither patches dependency sources nor replaces DeepEP strategy methods.
+
+The following eager recipe uses a compatible ModelSlim INT checkpoint on one
+A3 node with 16 dies and MoE EP16/TP1. For BF16 experts, use an unquantized BF16
+checkpoint and omit `--quantization modelslim`; do not reinterpret packed INT
+checkpoint weights as BF16. Model activation settings are read from its MoE
+configuration, including Kimi's SiTU parameters.
+
+```bash
+export MODEL_PATH=/path/to/GLM-5.2-modelslim-int
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=512
+export SGLANG_NPU_ENABLE_DSA_TOKEN_SHARD=0
+
+python3 -m sglang.launch_server \
+    --model-path "$MODEL_PATH" \
+    --trust-remote-code \
+    --device npu --attention-backend ascend \
+    --quantization modelslim --dtype bfloat16 \
+    --tp-size 16 --ep-size 16 \
+    --moe-a2a-backend ascend_fuseep --fuseep-mode 3 \
+    --disable-shared-experts-fusion \
+    --chunked-prefill-size 512 --max-running-requests 16 \
+    --context-length 8192 --mem-fraction-static 0.82 \
+    --disable-cuda-graph --host 0.0.0.0 --port 30000
+```
+
+This is a validation recipe, not a measured performance recommendation. Select
+a compatible full-weight BF16, W4A8 INT or W8A8 INT checkpoint. A3 expert
+intermediate dimensions up to 3584 are accepted with the existing 512 alignment;
+remaining geometry and platform constraints are checked before conversion or by
+CANN. The dispatch capacity must be
+identical across ranks and within `[1, 4096]`; it bounds each rank's input rows,
+including prefill. The scheduler chunk is global, so verify logged rank-local
+rows before increasing either limit. Older native operators size workspace from
+the configured capacity even for tiny batches.
+
+The native workspace-reuse fix is upstream in CANN
+[merge request !11324](https://gitcode.com/cann/ops-transformer/merge_requests/11324)
+(`c465a55ac0cd`). Verify that the installed native build contains it; accepting
+the Python API does not prove workspace reuse. No native CANN backport or
+dependency patch is bundled in SGLang.
+
+Run the dependency's existing numerical tests in a matching built environment:
+
+```bash
+export DEEP_EP_ROOT=/path/to/sgl-kernel-npu
+for quant in w4a8 w8a8; do
+    python3 "$DEEP_EP_ROOT/tests/python/deepep/test_mega_moe.py" \
+        --num-processes 16 --quant-mode "$quant" --activation swiglu \
+        --num-tokens 1024 --hidden 6144 --moe-intermediate-size 2048 \
+        --num-experts 256 --num-topk 8
+done
+```
+
+These operator tests do not establish full-model quality or NPUGraph replay
+correctness. For a TP baseline, replace the FuseEP flags and `--ep-size 16` with
+`--moe-a2a-backend none --ep-size 1`. Keep attention TP16, checkpoint, graph mode,
+shared-expert setting, and workload identical, and record the MoE topology change.
+Check prefill/decode accuracy before enabling graphs, then validate capture and
+repeated changing-shape replay separately. Record resolved arguments, runtime
+identity, TTFT, TPOT, and peak memory. Target-A3 acceptance of the BF16/INT and
+SwiGLU/SiTU combinations remains pending; host matrix tests do not establish
+full-model quality.
+
 ## Installation
 
 <Warning>
