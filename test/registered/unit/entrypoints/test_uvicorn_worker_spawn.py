@@ -62,7 +62,9 @@ _SLOW_MAIN_SERVER = textwrap.dedent(
                 host="127.0.0.1",
                 port=int(sys.argv[1]),
                 workers=2,
-                timeout_worker_healthcheck=5,
+                # Far below the 600 s re-import, with headroom for a loaded
+                # CI runner to import uvicorn in the worker.
+                timeout_worker_healthcheck=20,
                 lifespan="off",
                 log_level="warning",
             )
@@ -181,7 +183,7 @@ class TestUvicornWorkerSpawn(CustomTestCase):
                 start_new_session=True,
             )
             try:
-                deadline = time.monotonic() + 60
+                deadline = time.monotonic() + 90
                 body = None
                 while time.monotonic() < deadline and proc.poll() is None:
                     try:
@@ -194,6 +196,8 @@ class TestUvicornWorkerSpawn(CustomTestCase):
                         time.sleep(0.5)
                 self.assertEqual(body, b"ok")
             finally:
+                # The workers share the supervisor's session: this also kills
+                # the 600 s re-imports if the assertion failed.
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
 
