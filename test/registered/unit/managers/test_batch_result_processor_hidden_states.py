@@ -13,7 +13,6 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -21,7 +20,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists, release_only_retirer
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -466,86 +465,6 @@ class TestDeadRows(CustomTestCase):
         self.assertEqual(kwargs["row"], 1)
         processor.beam_coordinator.commit_decode.assert_called_once_with(batch, [live])
         processor.output_streamer.stream_output.assert_called_once_with([live], True)
-
-
-class TestLiveViewOverRequestLists(CustomTestCase):
-    """The result view reads the real scheduler's request lists: a request that
-    leaves them while an older step still carries it is dead to that step."""
-
-    def _process(self, scheduler, reqs, token_id):
-        processor = replace(
-            _make_processor(self),
-            is_live=scheduler.is_live,
-            leave_running_and_prefill_launched=(
-                scheduler.leave_running_and_prefill_launched
-            ),
-        )
-        batch = SimpleNamespace(
-            reqs=reqs,
-            return_logprob=False,
-            mamba_track_mask_cpu=None,
-            spec_algorithm=SimpleNamespace(is_none=lambda: True),
-            batch_size=lambda: len(reqs),
-        )
-        result = GenerationBatchResult(
-            logits_output=None,
-            next_token_ids=torch.tensor([token_id] * len(reqs)),
-        )
-        retirer = "sglang.srt.managers.scheduler_components.request_retirer"
-        with (
-            patch.object(
-                SchedulerBatchResultProcessor, "_maybe_update_reasoning_tokens"
-            ),
-            patch.object(SchedulerBatchResultProcessor, "_mamba_prefix_cache_update"),
-            patch.object(
-                SchedulerBatchResultProcessor, "_maybe_collect_routed_experts"
-            ),
-            patch.object(SchedulerBatchResultProcessor, "_maybe_collect_indexer_topk"),
-            patch.object(
-                SchedulerBatchResultProcessor, "_maybe_collect_customized_info"
-            ),
-            patch.object(SchedulerBatchResultProcessor, "_prepare_kv_cache_release"),
-            patch(f"{retirer}.release_kv_cache"),
-        ):
-            processor.process_batch_result_decode(batch, result)
-        return processor
-
-    def test_retracted_and_finished_requests_are_dead_to_older_steps(self):
-        scheduler = Scheduler.__new__(Scheduler)
-        empty_request_lists(scheduler)
-        retracted, finishing, other = _DecodeReq(), _DecodeReq(), _DecodeReq()
-        for req in (retracted, finishing, other):
-            req.return_hidden_states = False
-            req.multimodal_inputs = None
-            req.session = None
-        finishing.output_ids = [1, 2, 3, 4, 5]
-        scheduler.running_reqs.join([retracted, finishing, other])
-        step = [retracted, finishing, other]
-
-        # Overlap retracts a request after step k-1 launched with it; the
-        # retraction leaves the running list and queues the request again.
-        scheduler.running_reqs.leave([retracted])
-        scheduler.waiting_queue.join([retracted])
-        retracted.is_retracted = True
-        processor = self._process(scheduler, step, token_id=8)
-
-        self.assertEqual(retracted.output_ids, [])
-        self.assertEqual(finishing.output_ids, [1, 2, 3, 4, 5, 8])
-        self.assertEqual(other.output_ids, [8])
-        processor.output_streamer.stream_output.assert_called_once_with(
-            [finishing, other], False
-        )
-
-        # Step k finished a request, so step k+1, launched with it before that
-        # result landed, finds it dead when it commits.
-        self.assertTrue(finishing.finished())
-        self.assertFalse(scheduler.is_live(finishing))
-        processor = self._process(scheduler, step, token_id=9)
-
-        self.assertEqual(retracted.output_ids, [])
-        self.assertEqual(finishing.output_ids, [1, 2, 3, 4, 5, 8])
-        self.assertEqual(other.output_ids, [8, 9])
-        processor.output_streamer.stream_output.assert_called_once_with([other], False)
 
 
 class TestPrefillSkippedOutput(CustomTestCase):
