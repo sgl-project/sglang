@@ -102,7 +102,7 @@ deepseek:
       - '**/*deepseek*'
 
 # Reflection Beam model (exclude ordinary beam search)
-beam:
+Beam:
   - changed-files:
     - any-glob-to-any-file:
       - 'python/sglang/srt/models/beam.py'

@@ -27,24 +27,16 @@ const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const labelTitle = new AsyncFunction('github', 'context', extractScript(workflow));
 
 const repo = { owner: 'sgl-project', repo: 'sglang' };
-async function run(payload, { getLabel = async () => ({}), createLabel = async () => ({}) } = {}) {
+async function run(payload) {
   const calls = [];
-  const record = (name, handler = async () => ({})) => async params => {
-    calls.push([name, params]);
-    return handler(params);
-  };
   await labelTitle({
-    rest: { issues: {
-      getLabel: record('getLabel', getLabel),
-      createLabel: record('createLabel', createLabel),
-      addLabels: record('addLabels'),
-    } },
+    rest: { issues: { addLabels: async params => { calls.push(params); } } },
   }, { repo, payload });
   return calls;
 }
 async function labels(title) {
   const calls = await run({ action: 'opened', pull_request: { number: 7, title } });
-  return calls.some(([name]) => name === 'addLabels');
+  return calls.length > 0;
 }
 
 // Real SGLang and vLLM titles for Reflection Beam work.
@@ -105,41 +97,15 @@ test('labels the PR or issue from the event', async () => {
     { action: 'edited', pull_request: { number: 7, title } },
     { action: 'reopened', issue: { number: 9, title } },
   ]) {
-    const calls = await run(payload);
-    assert.deepEqual(calls.at(-1), ['addLabels', {
+    assert.deepEqual(await run(payload), [{
       ...repo,
       issue_number: (payload.pull_request ?? payload.issue).number,
-      labels: ['beam'],
+      labels: ['Beam'],
     }]);
   }
 });
 
 test('does not re-add title labels on push', async () => {
   const calls = await run({ action: 'synchronize', pull_request: { number: 7, title: 'Reflection Beam' } });
-  assert.deepEqual(calls.map(([name]) => name), ['getLabel']);
-});
-
-test('creates the label when missing', async () => {
-  const missing = async () => { throw Object.assign(new Error('Not Found'), { status: 404 }); };
-  const calls = await run({ action: 'opened', issue: { number: 9, title: 'Unrelated' } }, { getLabel: missing });
-  assert.deepEqual(calls.map(([name]) => name), ['getLabel', 'createLabel']);
-  assert.deepEqual(calls[1][1], {
-    ...repo,
-    name: 'beam',
-    color: '5319e7',
-    description: 'Reflection Beam model support',
-  });
-
-  // Another run may create it first.
-  const exists = async () => {
-    throw Object.assign(new Error('Validation Failed'), {
-      status: 422,
-      response: { data: { errors: [{ code: 'already_exists' }] } },
-    });
-  };
-  await run({ action: 'opened', issue: { number: 9, title: 'Unrelated' } }, { getLabel: missing, createLabel: exists });
-
-  const forbidden = async () => { throw Object.assign(new Error('Forbidden'), { status: 403 }); };
-  await assert.rejects(run({ action: 'opened', issue: { number: 9, title: 'Unrelated' } }, { getLabel: forbidden }));
-  await assert.rejects(run({ action: 'opened', issue: { number: 9, title: 'Unrelated' } }, { getLabel: missing, createLabel: forbidden }));
+  assert.deepEqual(calls, []);
 });

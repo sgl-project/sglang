@@ -22,26 +22,6 @@ jobs:
         uses: actions/github-script@v8
         with:
           script: |
-            const label = 'beam';
-            try {
-              await github.rest.issues.getLabel({ ...context.repo, name: label });
-            } catch (error) {
-              if (error.status !== 404) throw error;
-              try {
-                await github.rest.issues.createLabel({
-                  ...context.repo,
-                  name: label,
-                  color: '5319e7',
-                  description: 'Reflection Beam model support',
-                });
-              } catch (error) {
-                // Another labeling run may have created it concurrently.
-                const alreadyExists = error.status === 422 &&
-                  error.response?.data?.errors?.some(e => e.code === 'already_exists');
-                if (!alreadyExists) throw error;
-              }
-            }
-
             // Check titles only when they are new or edited, so pushes do not
             // re-add a title label that a maintainer removed.
             if (context.payload.action === 'synchronize') return;
@@ -65,7 +45,7 @@ jobs:
               await github.rest.issues.addLabels({
                 ...context.repo,
                 issue_number: number,
-                labels: [label],
+                labels: ['Beam'],
               });
             }
 
