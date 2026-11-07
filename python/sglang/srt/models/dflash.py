@@ -44,6 +44,7 @@ from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -1124,6 +1125,14 @@ class DFlashDraftModel(nn.Module):
                     "DFLASH checkpoint contains Domino projector weights but "
                     f"projector_type={self.projector_type!r}."
                 )
+            # KV-cache scales go to RadixAttention; map them before the
+            # k_proj/v_proj -> qkv_proj rename below takes their names.
+            if "scale" in name:
+                kv_scale_name = maybe_remap_kv_scale_name(unprefixed_name, params_dict)
+                if kv_scale_name is None:
+                    continue
+                if kv_scale_name != unprefixed_name:
+                    name = kv_scale_name
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if f".{weight_name}." not in name:
                     continue
