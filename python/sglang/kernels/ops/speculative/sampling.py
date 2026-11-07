@@ -41,11 +41,15 @@ def tree_speculative_sampling_target_only(
     uniform_samples: torch.Tensor,
     uniform_samples_for_final_sampling: torch.Tensor,
     target_probs: torch.Tensor,
-    draft_probs: torch.Tensor,
     threshold_single: float = 1.0,
     threshold_acc: float = 1.0,
     deterministic: bool = True,
 ) -> None:
+    """Verify a draft tree against ``target_probs`` and sample the residual.
+
+    The residual distribution masks the tokens rejected at the last accepted
+    node inside the kernel, so no draft distribution buffer is needed.
+    """
     vec_size = math.gcd(4, target_probs.shape[-1])
     module = _jit_sampling_module(vec_size, deterministic)
     module.sample(
@@ -59,7 +63,6 @@ def tree_speculative_sampling_target_only(
         uniform_samples,
         uniform_samples_for_final_sampling,
         target_probs,
-        draft_probs,
         threshold_single,
         threshold_acc,
     )
