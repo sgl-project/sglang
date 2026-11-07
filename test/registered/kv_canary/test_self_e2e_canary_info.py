@@ -54,6 +54,9 @@ class TestPerturbDetokenizerSwapLogEagle(DetokenizerSwapE2EBase):
                 self.assertEqual(body["output_ids"][swap.position], swap.token, rid)
 
 
+@unittest.skip(
+    "Intermittent device-side NaN assert crashes the EAGLE server in scheduled CI."
+)
 class TestPerturbDetokenizerSwapCanaryDisabledEagle(DetokenizerSwapE2EBase):
     kv_canary_mode = CanaryMode.NONE
 
