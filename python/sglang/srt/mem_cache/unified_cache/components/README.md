@@ -157,7 +157,7 @@ Free cached tokens to reclaim memory.
 **Algorithm detail:**
 1. Drives each component's walk via `evict_device_start()` / `evict_device_next_node()` / `evict_device_end()`:
    - Full: drives eviction from `evictable_device_leaves` using `last_access_time`; only device leaves are evicted atomically
-   - SWA: scans SWA LRU from tail; **internal** nodes are tombstoned (evict SWA data, keep node), **leaf** nodes are fully deleted; both trigger cascade
+   - SWA: scans SWA LRU from tail; **internal** nodes are tombstoned (evict SWA data, keep node), **leaf** nodes are fully deleted; both trigger cascade. Nodes less than one window above a leaf or a fork are passed over until no other candidate is left, so a branch keeps its last reusable window as long as possible
    - Mamba: scans Mamba LRU from tail; **internal** nodes are tombstoned, **leaf** nodes are fully deleted; both trigger cascade
 2. After each node eviction, calls `_cascade_evict`:
    - Queries `eviction_priority()` per component; evicts all with priority ≤ trigger's
