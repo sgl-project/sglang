@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -13,7 +14,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()
@@ -253,6 +255,7 @@ def _can_skip_pre_embed_feature_move(data_embedding_func: DataEmbeddingFunc) -> 
         "Qwen3_5MoeForConditionalGeneration",
         "KimiK25ForConditionalGeneration",
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
     }
 
 
@@ -642,9 +645,9 @@ def _get_chunked_prefill_embedding(
             for item in embedding_items_per_req
         )
         if is_per_image:
-            if _is_hip or _is_npu or _is_xpu:
+            if _is_hip or _is_xpu:
                 # ROCm CI regressed with one large cross-request ViT batch; keep
-                # the previous per-request path on HIP/NPU/XPU while CUDA uses batching.
+                # the previous per-request path on HIP/XPU while CUDA and NPU use batching.
                 chunk_slices = _get_chunked_embedding_by_item(
                     data_embedding_func,
                     embedding_items_per_req,

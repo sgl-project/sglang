@@ -41,10 +41,11 @@ Pins the pure arithmetic that rotated owner-classed allocation hangs on:
    owner-classed host slots, the per-rank narrowing of a transfer, an N-rank
    backup -> evict -> load-back round trip, and the layer-load waits.
 
-The real NCCL MLA/MHA/MTP gathers, zero-SM gather correctness and release,
-and symmetric buffer lifetime tests live in
-``test_page_interleave_gather_multi_gpu.py``. DSA indexer and attention
-coverage lives in ``test_page_sharded_dsa_attention.py``.
+The real NCCL MLA/MHA/MTP gathers and symmetric buffer lifetime tests live in
+``test_page_interleave_gather_multi_gpu.py``; the zero-SM gathers, which need
+a newer NCCL than CI has, live in
+``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``. DSA indexer
+and attention coverage lives in ``test_page_sharded_dsa_attention.py``.
 """
 
 import ctypes
@@ -312,6 +313,34 @@ class TestZeroSmScratchLayout(CustomTestCase):
                 if version < _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION:
                     same_node.assert_not_called()
 
+    def test_cross_node_group_keeps_sm_gather(self):
+        with (
+            envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.is_cuda",
+                return_value=True,
+            ),
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.NCCLLibrary"
+            ) as library,
+            unittest.mock.patch(
+                "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+                return_value=[True, False],
+            ) as same_node,
+        ):
+            library.return_value.ncclGetRawVersion.return_value = (
+                _NCCL_SYMMETRIC_SCRATCH_MIN_VERSION
+            )
+            cpu_group = object()
+            self.assertFalse(
+                _symmetric_scratch_supported(
+                    memory_saver_enabled=False,
+                    custom_mem_pool=None,
+                    shard_group=SimpleNamespace(cpu_group=cpu_group),
+                )
+            )
+            same_node.assert_called_once_with(cpu_group, source_rank=0)
+
     def test_slot_tensors_are_window_aligned_and_disjoint(self):
         """Both slots share one symmetric window: every tensor must start on
         NCCL's 4 KiB window alignment and no two tensors may overlap."""
@@ -460,11 +489,13 @@ def _make_mtp_configurator(use_mla=True):
     return kvc, target
 
 
-def _build_mtp_pool(kvc, *, capacity=128, is_dsa_model=False, is_dsv4_model=False):
+def _build_mtp_pool(
+    kvc, *, capacity=128, is_dsa_model=False, is_compressed_kv_model=False
+):
     return kvc._build_token_to_kv_pool(
         sizes=SimpleNamespace(max_total_num_tokens=capacity),
         is_dsa_model=is_dsa_model,
-        is_dsv4_model=is_dsv4_model,
+        is_compressed_kv_model=is_compressed_kv_model,
         req_to_token_pool=None,
     )
 
@@ -524,7 +555,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                     kvc._build_token_to_kv_pool_allocator(
                         sizes=SimpleNamespace(max_total_num_tokens=128),
                         token_to_kv_pool=pool,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=None,
                         token_to_kv_pool_allocator=allocator,
                     ),
@@ -641,7 +672,7 @@ class TestMTPKVShardConfig(CustomTestCase):
                 _build_mtp_pool(kvc)
         for options, message in (
             ({"is_dsa_model": True}, "same DSA indexer layout"),
-            ({"is_dsv4_model": True}, "MLA, DSA and MHA"),
+            ({"is_compressed_kv_model": True}, "MLA, DSA and MHA"),
         ):
             with (
                 self.subTest(options=options),
