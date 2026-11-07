@@ -5,15 +5,18 @@ from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
 from diffusers.models.modeling_outputs import AutoencoderKLOutput
+from PIL import Image
 
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput
 from sglang.multimodal_gen.runtime.cache.conditioning import (
+    _DIGEST_CHUNK_BYTES,
     ConditioningCache,
     cached_conditioning,
     cached_encoder_call,
@@ -329,6 +332,41 @@ def test_cuda_snapshot_waits_for_producing_stream_before_restore():
         restored.hidden_states, (expected, expected.T, expected[::2, ::2]), strict=True
     ):
         torch.testing.assert_close(actual.cpu(), reference, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_chunked_input_digest_covers_every_byte():
+    # inputs larger than one digest chunk hash chunk by chunk on threads
+    cache = ConditioningCache(256 * 1024 * 1024)
+    vae = VAE().eval()
+    # three float32 chunks and a partial one
+    x = torch.rand(1, 2, 3 * _DIGEST_CHUNK_BYTES // 8 + 1)
+    with cache.scope():
+        vae.encode(x)
+        vae.encode(x.clone())
+        for index in (0, _DIGEST_CHUNK_BYTES // 4, x.numel() - 1):
+            changed = x.clone()
+            changed.view(-1)[index] += 1
+            vae.encode(changed)
+        vae.encode(x[..., :-1])
+    assert vae.calls == 5
+    assert cache.hits == 1
+
+    model = Encoder().eval()
+    pixels = np.random.default_rng(0).integers(0, 256, (513, 1024, 4), dtype=np.uint8)
+    changed = pixels.copy()
+    changed[-1, -1, -1] ^= 1
+    calls = []
+    with cache.scope():
+        for array in (pixels, pixels.copy(), changed):
+            cache.run(
+                model,
+                "image",
+                (Image.fromarray(array),),
+                {},
+                lambda: calls.append(1) or torch.ones(1),
+            )
+    assert len(calls) == 2
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA transfers")
