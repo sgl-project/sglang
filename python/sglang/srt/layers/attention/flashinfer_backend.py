@@ -566,7 +566,8 @@ class FlashInferAttnBackend(AttentionBackend):
                     BatchPrefillWithRaggedKVCacheWrapper(
                         self.workspace_buffer,
                         "NHD",
-                        # CUTLASS ragged attention does not apply a sliding mask.
+                        # FlashInfer fmha_varlen hardcodes use_sliding_window=False;
+                        # use CUTLASS ragged here once it honors window_left.
                         backend=(
                             "fa2"
                             if fmha_backend == "cutlass"
