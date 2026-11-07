@@ -776,13 +776,23 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
         ((2, 1024, 2240), 6, False),
         ((2, 1024, 2240), 2, False),
         ((1, 1024, 2240), 6, True),
+        pytest.param((2, 1024, 2240), 6, True, id="batch-2-transposed"),
         ((1, 37, 2240), 6, False),
     ],
 )
-def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
+def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed, monkeypatch):
     # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
     # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
     # chunk layouts, transposed the permuted layout the Sana DiT serves.
+    gate = BitExactFusionGate("Sana test", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
+    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+
     torch.manual_seed(0)
     batch, seq, hidden = shape
     norm = torch.nn.LayerNorm(hidden, eps=1e-6, elementwise_affine=False).cuda()
@@ -792,9 +802,10 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     emb = torch.randn(batch, nmod, hidden, device="cuda").bfloat16()
     shift, scale = emb.chunk(nmod, dim=1)[0], emb.chunk(nmod, dim=1)[-1]
     # default-stream eager serving must stay on the untouched eager chain
-    n_sigs = len(sana._SANA_LN_MOD.verified_sigs)
     sana_ln_modulate(norm, x, scale, shift)
-    assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs
+    assert not gate.verified_sigs
+    contiguous_kernel.assert_not_called()
+    strided_kernel.assert_not_called()
     # The fusion engages on non-default streams (the BCG warmup/capture path).
     # x/scale/shift were filled on the default stream, so the side stream must
     # wait for that work before reading them -- without this the fused kernel
@@ -806,12 +817,151 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed):
     side.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(side):
         out = sana_ln_modulate(norm, x, scale, shift)
-        assert len(sana._SANA_LN_MOD.verified_sigs) == n_sigs + 1  # verified
+        assert len(gate.verified_sigs) == 1  # verified
         out2 = sana_ln_modulate(norm, x, scale, shift)  # verified-sig lane
+    if transposed:
+        assert strided_kernel.call_count == 2
+        contiguous_kernel.assert_not_called()
+    else:
+        assert contiguous_kernel.call_count == 2
+        strided_kernel.assert_not_called()
     torch.cuda.current_stream().wait_stream(side)
     torch.cuda.synchronize()
     assert torch.equal(out, _sana_eager_ln_modulate(norm, x, scale, shift))
-    assert torch.equal(out2, out) and not sana._SANA_LN_MOD.disabled
+    assert torch.equal(out2, out) and not gate.disabled
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_sana_cached_signature_cannot_bypass_plain_layernorm_requirement(monkeypatch):
+    gate = BitExactFusionGate("Sana plain LayerNorm test", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
+    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+
+    batch, seq, hidden = 2, 17, 128
+    x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
+    scale = torch.randn(batch, 1, hidden, device=x.device, dtype=x.dtype)
+    shift = torch.randn_like(scale)
+    plain_norm = torch.nn.LayerNorm(
+        hidden, eps=1e-6, elementwise_affine=False, device=x.device, dtype=x.dtype
+    )
+    affine_norm = torch.nn.LayerNorm(
+        hidden, eps=1e-6, elementwise_affine=True, device=x.device, dtype=x.dtype
+    )
+    with torch.no_grad():
+        affine_norm.weight.copy_(torch.linspace(0.5, 1.5, hidden, device=x.device))
+        affine_norm.bias.copy_(torch.linspace(-0.25, 0.25, hidden, device=x.device))
+    expected_plain = _sana_eager_ln_modulate(plain_norm, x, scale, shift)
+    expected_affine = _sana_eager_ln_modulate(affine_norm, x, scale, shift)
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        actual_plain = sana_ln_modulate(plain_norm, x, scale, shift)
+        calls_after_plain = contiguous_kernel.call_count
+        actual_affine = sana_ln_modulate(affine_norm, x, scale, shift)
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    assert calls_after_plain == 1
+    assert contiguous_kernel.call_count == calls_after_plain
+    strided_kernel.assert_not_called()
+    assert len(gate.verified_sigs) == 1
+    assert torch.equal(actual_plain, expected_plain)
+    assert torch.equal(actual_affine, expected_affine)
+
+
+@requires_inline_ptx
+@torch.no_grad()
+def test_sana_unsupported_layouts_fall_back(monkeypatch):
+    gate = BitExactFusionGate("Sana layout fallback test", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
+    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+
+    batch, seq, hidden = 2, 17, 128
+    norm = torch.nn.LayerNorm(
+        hidden, eps=1e-6, elementwise_affine=False, device="cuda", dtype=torch.bfloat16
+    )
+    invalid_outer = torch.empty_strided(
+        (batch, seq, hidden),
+        (seq * hidden + 1, 1, seq),
+        device="cuda",
+        dtype=torch.bfloat16,
+    ).normal_()
+    valid_source = torch.randn(batch, hidden, seq, device="cuda", dtype=torch.bfloat16)
+    valid_transposed = valid_source.transpose(1, 2)
+    scale = torch.randn(batch, 1, hidden, device="cuda", dtype=torch.bfloat16)
+    shift = torch.randn_like(scale)
+    scale_storage = torch.randn(
+        batch, 1, 2 * hidden, device="cuda", dtype=torch.bfloat16
+    )
+    invalid_scale = scale_storage[..., ::2]
+    assert invalid_outer.stride() == (seq * hidden + 1, 1, seq)
+    assert valid_transposed.stride() == (seq * hidden, 1, seq)
+    assert invalid_scale.stride(-1) == 2
+    expected_outer = _sana_eager_ln_modulate(norm, invalid_outer, scale, shift)
+    expected_invalid_modulation = _sana_eager_ln_modulate(
+        norm, valid_transposed, invalid_scale, shift
+    )
+
+    side = torch.cuda.Stream()
+    side.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(side):
+        actual_outer = sana_ln_modulate(norm, invalid_outer, scale, shift)
+        actual_invalid_modulation = sana_ln_modulate(
+            norm, valid_transposed, invalid_scale, shift
+        )
+    torch.cuda.current_stream().wait_stream(side)
+    torch.cuda.synchronize()
+
+    assert contiguous_kernel.call_count == 1
+    strided_kernel.assert_not_called()
+    assert len(gate.verified_sigs) == 1
+    assert torch.equal(actual_outer, expected_outer)
+    assert torch.equal(actual_invalid_modulation, expected_invalid_modulation)
+
+
+@torch.no_grad()
+def test_sana_unverified_signature_uses_eager_during_capture(monkeypatch):
+    gate = BitExactFusionGate("Sana graph capture test", per_signature=True)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
+    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+
+    source = torch.randn(1, 128, 17, device="cuda", dtype=torch.bfloat16)
+    x = source.transpose(1, 2)
+    norm = torch.nn.LayerNorm(
+        128, eps=1e-6, elementwise_affine=False, device=x.device, dtype=x.dtype
+    )
+    scale = torch.randn(1, 1, 128, device=x.device, dtype=x.dtype)
+    shift = torch.randn_like(scale)
+    expected = _sana_eager_ln_modulate(norm, x, scale, shift)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        out = sana_ln_modulate(norm, x, scale, shift)
+    assert not gate.verified_sigs
+    assert not gate.disabled
+    contiguous_kernel.assert_not_called()
+    strided_kernel.assert_not_called()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert not gate.verified_sigs
+    assert torch.equal(out, expected)
 
 
 # -------------------------------------------------------------------------

@@ -76,6 +76,48 @@ def test_strided_modulation_preserves_bits_and_returns_contiguous(batch, seq, hi
     assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
 
 
+@pytest.mark.parametrize("has_shift", [False, True], ids=["scale-only", "with-shift"])
+def test_strided_graph_replay_reads_updated_values(has_shift):
+    source = torch.randn(1, 128, 17, device="cuda", dtype=torch.bfloat16)
+    x = source.transpose(1, 2)
+    scale = torch.randn(1, 128, device=x.device, dtype=x.dtype)
+    shift = torch.randn_like(scale) if has_shift else None
+    eps = 1e-6
+
+    assert x.shape == (1, 17, 128)
+    assert x.stride() == (2176, 1, 17)
+    assert not x.is_contiguous()
+    actual = fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    assert actual.is_contiguous()
+    expected = reference(x, scale, shift, eps)
+    assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+
+    current_stream = torch.cuda.current_stream()
+    warmup_stream = torch.cuda.Stream()
+    warmup_stream.wait_stream(current_stream)
+    with torch.cuda.stream(warmup_stream):
+        for _ in range(3):
+            fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    current_stream.wait_stream(warmup_stream)
+    current_stream.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph, stream=current_stream):
+        replayed = fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
+    assert replayed.is_contiguous()
+
+    with torch.cuda.stream(current_stream):
+        source.normal_()
+        scale.normal_()
+        if shift is not None:
+            shift.normal_()
+        graph.replay()
+    current_stream.synchronize()
+
+    expected = reference(x, scale, shift, eps)
+    assert torch.equal(replayed.view(torch.int16), expected.view(torch.int16))
+
+
 @pytest.mark.parametrize("has_shift", [False, True])
 def test_compile_and_graph_replay(has_shift):
     x = torch.randn(2, 17, 128, device="cuda", dtype=torch.bfloat16)
