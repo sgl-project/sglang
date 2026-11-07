@@ -3,6 +3,7 @@ import importlib
 import logging
 import math
 import threading
+import weakref
 from typing import Tuple
 
 import torch
@@ -32,6 +33,41 @@ logger = logging.getLogger(__name__)
 
 _AITER_MHC_RUNTIME_DISABLED = False
 _AITER_MHC_ACTIVE_LOGGED = False
+
+# id(hc_fn) -> (weakref to hc_fn, its _version when packed, AITER BF16 hi/lo layout).
+# Keyed by id because tensor __eq__ is elementwise. Packing happens at weight load,
+# never inside a forward, so captured graphs stay allocation-free.
+_AITER_PACKED_HC_FN = {}
+# Only the GLM-5.3-Flash geometry (hc_mult=4, hidden_size=4096) is measured.
+_AITER_PACKED_HC_FN_SHAPE = (24, 4 * 4096)
+
+
+def prepack_aiter_mhc_fn(fn: torch.Tensor) -> bool:
+    """Pack an FP32 hc_fn once for AITER's BF16 hi/lo mHC pre GEMM on gfx950."""
+    if (
+        not _use_aiter_mhc()
+        or fn.dtype != torch.float32
+        or tuple(fn.shape) != _AITER_PACKED_HC_FN_SHAPE
+    ):
+        return False
+    try:
+        from aiter.ops.mhc import mhc_shuffle_fn
+    except Exception as err:
+        logger.warning("AITER mHC weight packing is unavailable: %s", err)
+        return False
+    with torch.no_grad():
+        packed = mhc_shuffle_fn(fn.detach())
+    key = id(fn)
+    ref = weakref.ref(fn, lambda _: _AITER_PACKED_HC_FN.pop(key, None))
+    _AITER_PACKED_HC_FN[key] = (ref, fn._version, packed)
+    return True
+
+
+def _aiter_packed_hc_fn(fn: torch.Tensor) -> torch.Tensor | None:
+    entry = _AITER_PACKED_HC_FN.get(id(fn))
+    if entry is None or entry[0]() is not fn or entry[1] != fn._version:
+        return None
+    return entry[2]
 
 
 def _use_aiter_mhc() -> bool:
@@ -68,11 +104,16 @@ def _try_aiter_mhc_pre(
     if norm_weight is not None:
         kwargs["norm_weight"] = norm_weight
         kwargs["norm_eps"] = norm_eps if norm_eps is not None else rms_eps
+    gemm_fn = _aiter_packed_hc_fn(fn)
+    if gemm_fn is None:
+        gemm_fn = fn
+    else:
+        kwargs["w_preshuffle_bf16"] = 1
 
     try:
         result = aiter_mhc_pre(
             residual,
-            fn,
+            gemm_fn,
             hc_scale,
             hc_base,
             rms_eps,

@@ -144,6 +144,23 @@ _MHC_POST_MULT_VALUE = 2.0
 _MHC_FUSED_BOUNDARY_MAX_TOKENS = 16
 
 
+def _prepack_mhc_fn(model: nn.Module) -> None:
+    # Also reached through the NextN draft model, which is not a subclass.
+    from sglang.kernels.ops.layernorm.mhc import prepack_aiter_mhc_fn
+
+    packed = sum(
+        prepack_aiter_mhc_fn(fn)
+        for module in model.modules()
+        for fn in (
+            getattr(module, "hc_attn_fn", None),
+            getattr(module, "hc_ffn_fn", None),
+        )
+        if isinstance(fn, torch.Tensor)
+    )
+    if packed:
+        logger.info("Packed %d mHC pre weights for AITER BF16 GEMM", packed)
+
+
 @torch.compile
 def swiglu_clamped(y: torch.Tensor, limit: float):
     gate, up = torch.chunk(y, 2, dim=-1)
@@ -1922,6 +1939,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             DeepseekV2WeightLoaderMixin.post_load_weights(
                 self, is_nextn=is_nextn, weight_names=weight_names
             )
+        _prepack_mhc_fn(self)
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
@@ -1929,6 +1947,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+        _prepack_mhc_fn(self)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

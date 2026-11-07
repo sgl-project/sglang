@@ -25,18 +25,30 @@ FWD_FN_MAP = {"jit": jit_causal_conv1d_fwd, "aot": aot_causal_conv1d_fwd}
 UPDATE_FN_MAP = {"jit": jit_causal_conv1d_update, "aot": aot_causal_conv1d_update}
 
 
-@marker.parametrize("seqlen", [128, 512, 2048, 8192], [512])
-@marker.parametrize("dim", [2048, 4096, 8192], [4096])
+@marker.parametrize("seqlen", [128, 512, 2048, 8192, 32768, 131072], [8192])
+@marker.parametrize("dim", [2048, 3072, 4096, 6144, 8192], [3072, 6144])
+@marker.parametrize("batch", [1, 4, 8], [1, 8])
+@marker.parametrize("ragged", [False, True])
 @marker.parametrize("dtype", [torch.float16, torch.bfloat16])
 @marker.benchmark("impl", ["jit", "aot"])
-def benchmark_fwd(seqlen: int, dim: int, dtype: torch.dtype, impl: str):
-    """Prefill: one varlen batch of four sequences, conv state written back."""
-    batch = 4
+def benchmark_fwd(
+    seqlen: int,
+    dim: int,
+    batch: int,
+    ragged: bool,
+    dtype: torch.dtype,
+    impl: str,
+):
+    """Prefill: varlen GLM shapes with conv state written back."""
     x = create_random(dim, seqlen, dtype=dtype)
     weight = create_random(dim, WIDTH, dtype=dtype)
     bias = create_random(dim, dtype=dtype)
     conv_states = create_random(batch, dim, WIDTH - 1, dtype=dtype)
-    lengths = [seqlen // batch] * batch
+    if ragged and batch > 1:
+        longest = seqlen // 2
+        lengths = [longest] + [(seqlen - longest) // (batch - 1)] * (batch - 1)
+    else:
+        lengths = [seqlen // batch] * batch
     lengths[-1] += seqlen - sum(lengths)
     query_start_loc = torch.tensor(
         [0] + torch.cumsum(torch.tensor(lengths), 0).tolist(),
