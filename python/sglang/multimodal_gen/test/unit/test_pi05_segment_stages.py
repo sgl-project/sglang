@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import unittest
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +13,7 @@ from sglang.multimodal_gen.runtime.vla.prefix_cache import (
     VLADensePrefixCache,
     slice_prefix_context,
 )
+from sglang.test.test_utils import CustomTestCase
 
 
 class Model:
@@ -61,6 +63,8 @@ def request(name, steps, length):
         num_inference_steps=steps,
         is_warmup=False,
         generator=None,
+        seed=42,
+        generator_device=None,
         prompt="task",
         metrics=None,
         extra={
@@ -135,7 +139,7 @@ def test_unmarked_request_uses_existing_whole_trajectory_path(setup):
     prefix.forward(req, args)
     action.forward(req, args)
     result = post.forward(req, args)
-    assert model.native_calls == 1 and model.noise_calls == 0
+    assert model.native_calls == 1 and model.noise_calls == 1
     assert "pi05_flow" not in vla.vla_state(req)
     assert result.output[0]["parameters"] == {"num_inference_steps": 5}
     assert result.output[0]["actions"] == [[0.0] * 4] * 3
@@ -221,3 +225,99 @@ def test_segment_disables_mutable_prefix_graph_output(setup):
     assert vla._cuda_graph_enabled(req) is True
     vla.vla_state(req)["pi05_segment_length"] = 3
     assert vla._cuda_graph_enabled(req) is False
+
+
+class SeededModel(Model):
+    def sample_noise(self, size, generator=None):
+        self.noise_calls += 1
+        return torch.randn(size, 3, 4, generator=generator)
+
+    def sample_actions(self, observation, pc, **kwargs):
+        self.native_calls += 1
+        return kwargs["noise"]
+
+    def denoise_step(self, pc, x, t, **kwargs):
+        return torch.zeros_like(x)
+
+
+class TestPi05RequestSeeds(CustomTestCase):
+    def setUp(self):
+        self.model = SeededModel()
+        self.stage = vla.VLAActionDenoisingStage(self.model)
+        self.args = SimpleNamespace(
+            pipeline_config=Pi05PipelineConfig(
+                enable_segmented_actions=True, output_action_dim=4
+            )
+        )
+        kv = torch.ones(1, 1, 2, 4)
+        self.prefix = PrefixContext(
+            VLADensePrefixCache([(kv, kv.clone(), None)]),
+            torch.ones(1, 2, dtype=torch.bool),
+            2,
+            {"full_attention": True},
+        )
+
+    def make_request(self, seed, noise=None):
+        req = request(str(seed), 3, 2)
+        req.seed = seed
+        req.generator_device = "cpu"
+        vla.vla_state(req).update(
+            observation_batch=SimpleNamespace(batch_size=1, noise=noise),
+            prefix_context=self.prefix,
+        )
+        return req
+
+    def single(self, req):
+        self.stage.forward(req, self.args)
+        return vla.vla_state(req)["actions"]
+
+    def test_seed_repeats_and_changes_noise_without_using_global_rng(self):
+        rng = torch.random.get_rng_state()
+        first = self.single(self.make_request(17))
+        torch.testing.assert_close(first, self.single(self.make_request([17])))
+        self.assertFalse(torch.equal(first, self.single(self.make_request(18))))
+        self.assertTrue(torch.equal(rng, torch.random.get_rng_state()))
+
+    def test_grouped_noise_matches_single_requests_in_either_order(self):
+        expected = {seed: self.single(self.make_request(seed))[0] for seed in (17, 18)}
+        for seeds in ((17, 18), (18, 17)):
+            reqs = [self.make_request(seed) for seed in seeds]
+            group = object()
+            for req in reqs:
+                vla.vla_state(req).update(
+                    prefix_context_group=group,
+                    observation_group=SimpleNamespace(noise=None),
+                )
+            calls = self.model.native_calls
+            self.stage.run_grouped_requests(reqs, self.args)
+            self.assertEqual(self.model.native_calls, calls + 1)
+            for seed, req in zip(seeds, reqs):
+                torch.testing.assert_close(
+                    torch.tensor(vla.vla_state(req)["actions_output"]), expected[seed]
+                )
+                self.assertIsNone(req.generator)
+
+    def test_explicit_noise_overrides_seed(self):
+        noise = torch.arange(12, dtype=torch.float32).reshape(1, 3, 4)
+        for seed in (17, 18):
+            torch.testing.assert_close(
+                self.single(self.make_request(seed, noise)), noise
+            )
+        self.assertEqual(self.model.noise_calls, 0)
+
+    def test_segment_continuation_reuses_seeded_initial_noise(self):
+        expected = self.single(self.make_request(17))
+        req = self.make_request(17)
+        state = vla.vla_state(req)
+        state["pi05_segment_length"] = 1
+        self.stage.forward(req, self.args)
+        calls = self.model.noise_calls
+        state["pi05_segment_length"] = 2
+        self.stage.forward(req, self.args)
+        self.assertEqual(self.model.noise_calls, calls)
+        self.assertEqual(state["pi05_flow"].remaining, 0)
+        torch.testing.assert_close(state["actions"], expected)
+
+
+if __name__ == "__main__":
+    unittest.main()
