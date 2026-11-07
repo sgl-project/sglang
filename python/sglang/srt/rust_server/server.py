@@ -31,6 +31,7 @@ import psutil
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
+from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
@@ -88,6 +89,11 @@ logger = logging.getLogger(__name__)
 # `hidden_poslens`). A frame without extras that sends a later column pads
 # them empty; `push_generation` asserts the count whenever it sends extras.
 _EXTRAS_HEADER_COLS = 12
+
+# `Server.drain_state()` bits (sglang-server `utils/runtime.rs`).
+DRAIN_DRAINING = 1
+DRAIN_FORCE_REQUESTED = 2
+DRAIN_CLOSED = 4
 
 
 def _is_loopback(host: str) -> bool:
@@ -217,6 +223,15 @@ class RustServer:
         # (global TP rank 0), and so stops them once its drain completes.
         self._broadcasts_shutdown = False
         self._shutdown_sent = False
+        self._force_shutdown = False
+        # Whether this listener holds its drain's end until every
+        # attention-DP listener closed (see `on_drain_rows`), how many listener
+        # rows the gather then carries, whether a gathered row set that does
+        # not match disabled that wait, and whether the end was released.
+        self._holds_drain_end = False
+        self._drain_rows = 0
+        self._drain_rows_mismatch = False
+        self._drain_end_released = False
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
@@ -559,7 +574,9 @@ class RustServer:
         thread.start()
         return thread
 
-    def install_sigterm_drain(self, notify: Optional[str] = None) -> None:
+    def install_sigterm_drain(
+        self, notify: Optional[str] = None, hold_drain_end: bool = False
+    ) -> None:
         """Drain this listener on SIGTERM, which the main process forwards
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
         manager drains: health answers 503 at once, requests are still
@@ -573,13 +590,22 @@ class RustServer:
         when its last health probe failed. On the rank that stops the
         schedulers, ``notify`` names the main process's socket
         (``drain_notify_name``) that hears when the listener closed.
+
+        With ``hold_drain_end``, that rank's drain ends only once every
+        attention-DP listener has closed too (see :meth:`on_drain_rows`), since
+        the ``ShutdownReq`` stops every rank.
         """
+        force = envs.SGLANG_FORCE_SHUTDOWN.get()
+        self._force_shutdown = force
+        if hold_drain_end:
+            self.server.hold_drain_end()
+            self._holds_drain_end = True
+            self._drain_rows = get_parallel().attn_dp_size
         if threading.current_thread() is not threading.main_thread():
             logger.warning(
                 "rust server: not on the main thread; SIGTERM will not drain"
             )
             return
-        force = envs.SGLANG_FORCE_SHUTDOWN.get()
         if not self._broadcasts_shutdown:
             notify = None
 
@@ -595,6 +621,67 @@ class RustServer:
                 "rust server: replaced the signal wakeup fd %d to drain on SIGTERM",
                 previous,
             )
+
+    def drain_state(self) -> int:
+        """This listener's ``DRAIN_*`` bits, which the MLP-sync gather shares
+        with the other attention-DP listeners."""
+        return self.server.drain_state()
+
+    def on_drain_rows(self, rows: List[int]) -> None:
+        """React to every attention-DP listener's drain state, one row per DP
+        group from the MLP-sync gather (``DPDrainColumn``). Runs on the
+        scheduler thread after each gather; idempotent, as a step can gather
+        twice.
+
+        A drain on any listener begins this one's, forced if any listener's
+        was, so a SIGTERM reaching one listener drains them all. A listener
+        holding its drain's end releases it once it is draining and every
+        listener row reports closed. A gathered row set that is not one
+        listener row per attention-DP group disables that wait, with an
+        error, rather than hold the drain forever: the end is then released
+        once this listener closed, as without the hold.
+        """
+        state = self.drain_state()
+        if any(row & DRAIN_DRAINING for row in rows):
+            force = any(row & DRAIN_FORCE_REQUESTED for row in rows)
+            if not state & DRAIN_DRAINING or (
+                force and not state & DRAIN_FORCE_REQUESTED
+            ):
+                logger.info(
+                    "rust server: a DP listener is draining; draining this one "
+                    "(forced=%s)",
+                    force or self._force_shutdown,
+                )
+                self.server.begin_drain(force or self._force_shutdown)
+                state = self.drain_state()
+        if (
+            not self._holds_drain_end
+            or self._drain_end_released
+            or self._shutdown_sent  # a forced drain skipped the hold
+        ):
+            return
+        if not self._drain_rows_mismatch and (
+            len(rows) != self._drain_rows
+            or any(row & DRAIN_STATE_NO_LISTENER for row in rows)
+        ):
+            logger.error(
+                "rust server: drain barrier disabled: row count/listener mismatch "
+                "(gathered %s for %d attention-DP listeners); the drain ends "
+                "once this listener closed, so the other DP listeners' last "
+                "requests may be cut",
+                rows,
+                self._drain_rows,
+            )
+            self._drain_rows_mismatch = True
+        if not state & DRAIN_DRAINING:
+            return
+        if self._drain_rows_mismatch:
+            closed = bool(state & DRAIN_CLOSED)
+        else:
+            closed = all(row & DRAIN_CLOSED for row in rows)
+        if closed and self.server.release_drain_end():
+            logger.info("rust server: every DP listener closed; ending the drain")
+            self._drain_end_released = True
 
     def _wrap_mm_result(self, buffers: dict) -> MultimodalProcessorOutput:
         """Wrap one request's ``mm.*`` buffers (``{name: numpy array |
@@ -735,13 +822,18 @@ class RustServer:
             and self.server.drain_complete()
         ):
             # Rides the broadcast to every scheduler rank, as Python mode's
-            # `sigterm_watchdog` dispatches it once its requests drained.
-            # TODO(attention DP): wait for every DP listener's drain, not just
-            # this one's; until then their last requests may be cut.
+            # `sigterm_watchdog` dispatches it once its requests drained. With
+            # a held drain end (`on_drain_rows`) every DP listener has closed.
             logger.info("rust server: drain complete; stopping the schedulers")
-            out.append(ShutdownReq())
             self._shutdown_sent = True
+            self._before_shutdown_req()
+            out.append(ShutdownReq())
         return out
+
+    def _before_shutdown_req(self) -> None:
+        """Runs once, on the scheduler thread, just before :meth:`drain`
+        returns the ``ShutdownReq`` that stops the schedulers; a subclass stops
+        the helpers that must not outlive them here."""
 
     def _admit(self, header: bytes, buffers: dict):
         """Decode and attach one drained request, or report the rejection to
