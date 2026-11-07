@@ -288,6 +288,40 @@ def test_match_reports_split_prefix_and_zero_match_clears_walk_facts(backend):
     core.sanity_check([], [])
 
 
+@pytest.mark.parametrize("is_eagle", [False, True])
+@pytest.mark.parametrize("page_size", [1, 4])
+def test_limit_capped_match_equals_match_on_the_truncated_key(is_eagle, page_size):
+    """A ``limit``-capped key matches exactly like the key sliced to ``limit``
+    raw tokens, on both cores."""
+    stored = list(range(1, 42))
+    cores = {
+        backend: _tree_core(backend, page_size=page_size, is_eagle=is_eagle)
+        for backend in ("python", "rust")
+    }
+    for core in cores.values():
+        _insert(core, stored[:25], list(range(25)))
+        _insert(core, stored, list(range(len(stored))))
+    query = array("q", stored + [99, 98, 97])
+    for limit in (None, 0, 1, 2, 5, 24, 25, 26, 41, 42, 44, 100):
+        truncated = RadixKey(query if limit is None else query[:limit])
+        capped = RadixKey(query, limit=limit)
+        expected = (
+            cores["python"]
+            .match_prefix(MatchPrefixParams(key=truncated))
+            .device_prefix_len
+        )
+        for backend, core in cores.items():
+            got = core.match_prefix(MatchPrefixParams(key=capped)).device_prefix_len
+            assert got == expected, (backend, limit)
+            assert core.match_full_device_prefix(capped)[0] == expected, (
+                backend,
+                limit,
+            )
+    query.append(1)  # BufferError if a match left a view of the key exported
+    for core in cores.values():
+        core.sanity_check([], [])
+
+
 @pytest.mark.parametrize("backend", ["python", "rust"])
 @pytest.mark.parametrize("hicache", [False, True])
 def test_match_reports_host_only_node_independent_of_device_acceptance(
