@@ -42,6 +42,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    supports_track_state_snapshot: bool = not (is_cpu() or is_npu() or is_xpu())
 
     def packed_decode(
         self,
@@ -190,6 +191,14 @@ class TritonGDNKernel(LinearAttnKernelBase):
                 "chunk_indices": kwargs["chunk_indices"],
                 "chunk_offsets": kwargs["chunk_offsets"],
             }
+        snapshot_arguments = (
+            {
+                "track_state": kwargs.get("track_state"),
+                "track_chunk_idx": kwargs.get("track_chunk_idx"),
+            }
+            if self.supports_track_state_snapshot
+            else {}
+        )
         if is_cpu():
             if not inplace_update:
                 raise NotImplementedError(
@@ -220,6 +229,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **recurrent_state_indices_args,
             **inplace_update_args,
             **graph_table_args,
+            **snapshot_arguments,
         )
 
     def target_verify(

@@ -561,6 +561,9 @@ class GDNAttnBackend(MambaAttnBackendBase):
     def __init__(self, model_runner: ModelRunner):
         _validate_gdn_linear_attn_backends(model_runner.linear_attn_backends)
         super().__init__(model_runner)
+        self.enable_fp32_prefix_snapshots = (
+            envs.SGLANG_ENABLE_GDN_FP32_PREFIX_SNAPSHOTS.get()
+        )
         self.enable_mis = get_exec().features.enable_mis
         self.mis_metadata: Optional[GDNMISMetadata] = None
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
@@ -633,6 +636,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Any replay of this bucket may carry prefix-cache snapshots (the
             # extra buffer is only on with the radix cache).
             track=get_exec().mamba.enable_mamba_extra_buffer,
+            fp32_snapshots=self.enable_fp32_prefix_snapshots,
             cache_index_dtype=cache_indices.dtype,
             device=self.device,
         )
@@ -1187,6 +1191,16 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        # note (wirybeaver): snapshots must bypass activation-dtype chunk states.
+        snapshot = (
+            torch.empty(
+                (meta.max_seqs, *ssm_states.shape[1:]),
+                dtype=torch.float32,
+                device=ssm_states.device,
+            )
+            if meta.track and self.enable_fp32_prefix_snapshots
+            else None
+        )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1198,13 +1212,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            track_state=snapshot,
+            track_chunk_idx=meta.track_chunk_idx if snapshot is not None else None,
         )
         if meta.track:
             gdn_track_ssm_state(
                 ssm_pool=ssm_states,
-                h=h,
+                h=snapshot if snapshot is not None else h,
+                track_h_row=meta.track_h_row if snapshot is None else None,
                 track_mode=meta.track_mode,
-                track_h_row=meta.track_h_row,
                 track_dst=meta.track_dst,
                 cache_indices=meta.cache_indices,
             )
@@ -1436,6 +1452,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if (
                 forward_metadata.has_mamba_track_mask
                 and forward_metadata.track_ssm_h_src.numel() > 0
+                and self.enable_fp32_prefix_snapshots
                 and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
             ):
                 # Snapshot-capable kernels can supply just the selected FP32
