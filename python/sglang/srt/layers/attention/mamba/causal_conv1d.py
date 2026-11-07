@@ -18,12 +18,14 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update as _causal_conv1d_update_triton,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cpu, is_cuda
 
 # The compiled causal conv1d is CUDA-only -- the sgl_kernel wheel never built it
 # for ROCm / MUSA either, so the old import probe always fell through to Triton
 # there. Select that fallback directly instead of via a failed import.
 _HAS_CONV1D_KERNEL = is_cuda()
+# Triton has no CPU driver; CPU uses the BF16 sgl_kernel operators.
+_is_cpu = is_cpu()
 
 if _HAS_CONV1D_KERNEL:
     from sglang.kernels.ops.mamba import (
@@ -38,6 +40,10 @@ def _get_seq_lens_cpu(query_start_loc, x):
     if query_start_loc is not None:
         return (query_start_loc[1:] - query_start_loc[:-1]).cpu().tolist()
     return [x.shape[-1]]
+
+
+def _as_int32(t: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    return t.to(torch.int32) if t is not None and t.dtype != torch.int32 else t
 
 
 def causal_conv1d_fn(
@@ -81,6 +87,27 @@ def causal_conv1d_fn(
 
     out: (batch, dim, seqlen)
     """
+    if _is_cpu:
+        if activation not in [None, "silu", "swish"]:
+            raise NotImplementedError("activation must be None, silu, or swish")
+        # The CPU kernel reads x as the transposed view of a token-major buffer.
+        if x.stride(-2) != 1:
+            x = x.transpose(-1, -2).contiguous().transpose(-1, -2)
+        if has_initial_state is not None and has_initial_state.dtype != torch.bool:
+            has_initial_state = has_initial_state.to(torch.bool)
+        assert query_start_loc is not None, "CPU causal_conv1d_fn expects varlen input"
+        return torch.ops.sgl_kernel.causal_conv1d_fwd_cpu(
+            x,
+            weight.contiguous(),
+            bias,
+            conv_states,
+            _as_int32(query_start_loc),
+            _as_int32(cache_indices),
+            has_initial_state,
+            activation in ["silu", "swish"],
+            pad_slot_id,
+            False,
+        )
     # Use Triton when: (1) there is no compiled conv1d kernel for this device,
     # or (2) input is non-contiguous and seq_lens_cpu is pre-computed by caller.
     # The Triton kernel accepts arbitrary strides, avoiding a .contiguous()
@@ -157,6 +184,29 @@ def causal_conv1d_update(
             indices 0 and 3
     out: (batch, dim) or (batch, dim, seqlen)
     """
+    if _is_cpu:
+        if activation not in [None, "silu", "swish"]:
+            raise NotImplementedError(
+                f"activation must be None, silu, or swish, actual: {activation}"
+            )
+        # The CPU kernel handles exactly one new token per request.
+        squeeze = x.dim() == 3
+        if squeeze:
+            assert x.size(-1) == 1, "CPU causal_conv1d_update supports seqlen == 1"
+            x = x.squeeze(-1)
+        assert cache_seqlens is None, "CPU causal_conv1d_update has no circular buffer"
+        out = torch.ops.sgl_kernel.causal_conv1d_update_cpu(
+            x.contiguous(),
+            conv_state,
+            weight.contiguous(),
+            bias,
+            activation in ["silu", "swish"],
+            cache_seqlens,
+            _as_int32(conv_state_indices),
+            pad_slot_id,
+            False,
+        )
+        return out.unsqueeze(-1) if squeeze else out
     use_triton = not _HAS_CONV1D_KERNEL
     if use_triton:
         return _causal_conv1d_update_triton(
