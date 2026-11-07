@@ -2301,6 +2301,11 @@ class Envs:
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
+    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
+    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
+    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
+    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
