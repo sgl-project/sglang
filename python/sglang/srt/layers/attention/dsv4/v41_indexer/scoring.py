@@ -17,7 +17,11 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_paged,
 )
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import index_q_rope_pack_weights
-from sglang.kernels.ops.attention.dsv4.index_logits import flat_index_logits_tiles
+from sglang.kernels.ops.attention.dsv4.index_logits import (
+    flat_index_logits_tiles,
+    flat_index_logits_tiles_fp8,
+)
+from sglang.kernels.ops.attention.dsv4.index_q_fp8 import quantize_index_q_fp8
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
@@ -64,20 +68,24 @@ class DeepGEMMDecodeData(msgspec.Struct, frozen=True):
 
 class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
     """The rows of one request are consecutive; a selection is a flattened-K
-    column, request start plus compressed position."""
+    column, request start plus compressed position.
+
+    The query operand is either packed fp4 (SM100) or fp8 whose per-row-head
+    scale is already folded into ``weights`` (SM90)."""
 
     k_slots: torch.Tensor  # [columns] index-K pool slot of each flattened-K column
     request_starts: torch.Tensor  # [rows] int32, first column of the row's request
     lens_per_request: List[int]  # compressed positions at each request's newest token
     rows_per_request: List[int]  # query rows of each request
     compress_lens: torch.Tensor  # [rows] int32, compressed positions the row sees
-    q_fp4: torch.Tensor  # [rows, heads, 64] int8, packed fp4
-    q_sf: torch.Tensor  # [rows, heads] int32, packed ue8m0
     weights: torch.Tensor  # [rows, heads] fp32 head weights
+    q_fp4: Optional[torch.Tensor] = None  # [rows, heads, 64] int8, packed fp4
+    q_sf: Optional[torch.Tensor] = None  # [rows, heads] int32, packed ue8m0
+    q_fp8: Optional[torch.Tensor] = None  # [rows, heads, 128] e4m3
 
     @property
     def num_rows(self) -> int:
-        return self.q_fp4.shape[0]
+        return self.request_starts.shape[0]
 
     def narrow(self, rows: slice) -> DeepGEMMPrefillData:
         """A contiguous query-row view, retaining the global flattened-K layout
@@ -95,8 +103,9 @@ class DeepGEMMPrefillData(msgspec.Struct, frozen=True):
             request_starts=self.request_starts[rows],
             rows_per_request=local_counts,
             compress_lens=self.compress_lens[rows],
-            q_fp4=self.q_fp4[rows],
-            q_sf=self.q_sf[rows],
+            q_fp4=None if self.q_fp4 is None else self.q_fp4[rows],
+            q_sf=None if self.q_sf is None else self.q_sf[rows],
+            q_fp8=None if self.q_fp8 is None else self.q_fp8[rows],
             weights=self.weights[rows],
         )
 
@@ -152,7 +161,7 @@ def get_index_k_cache(
     return k_cache.view(k_cache.shape[0], page_size, 1, 68)
 
 
-def _index_q_and_weights(
+def _index_q_fp4_and_weights(
     *,
     indexer: DeepseekV41Indexer,
     x: torch.Tensor,
@@ -174,13 +183,29 @@ def _index_q_and_weights(
     return q_fp4.view(rows, heads, 64), q_sf.view(rows, heads), weights
 
 
+def _index_q_fp8_and_weights(
+    *,
+    indexer: DeepseekV41Indexer,
+    x: torch.Tensor,
+    q_lora: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """fp8 index queries ``[rows, heads, 128]`` and fp32 head weights with the
+    per-row-head query scale folded in."""
+    # The reference rounds queries to the fp4 grid; keep that, in a form
+    # DeepGEMM's Hopper fp8 logits can read.
+    q = indexer.queries(q_lora, freqs_cis, positions=positions)
+    return quantize_index_q_fp8(q, indexer.head_weights(x))
+
+
 def get_deep_gemm_decode_data(
     inputs: DecodeInputs, token_to_kv_pool: DeepSeekV4TokenToKVPool
 ) -> DeepGEMMDecodeData:
     indexer = inputs.indexer
     # The kernel sums head scores locally, so the indexer heads must be replicated.
     assert indexer.n_local_heads == indexer.n_heads
-    q_fp4, q_sf, weights = _index_q_and_weights(
+    q_fp4, q_sf, weights = _index_q_fp4_and_weights(
         indexer=indexer,
         x=inputs.x,
         q_lora=inputs.q_lora,
@@ -261,8 +286,11 @@ def prefill_index_plan(inputs: PrefillInputs) -> Optional[PrefillIndexPlan]:
     )
 
 
-def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefillData]:
-    """None when the chunk has no row or no visible compressed position."""
+def get_deep_gemm_prefill_data(
+    inputs: PrefillInputs, *, fp8_logits: bool
+) -> Optional[DeepGEMMPrefillData]:
+    """None when the chunk has no row or no visible compressed position;
+    ``fp8_logits`` is the backend's stored prefill variant."""
     ratio = inputs.compress_ratio
     plans = inputs.index_plans
     if plans is not None and ratio in plans:
@@ -273,23 +301,48 @@ def get_deep_gemm_prefill_data(inputs: PrefillInputs) -> Optional[DeepGEMMPrefil
             plans[ratio] = plan
     if plan is None:
         return None
-    q_fp4, q_sf, weights = _index_q_and_weights(
-        indexer=inputs.indexer,
-        x=inputs.x,
-        q_lora=inputs.q_lora,
-        freqs_cis=inputs.freqs_cis,
-        positions=inputs.positions,
-    )
+    indexer = inputs.indexer
+    q_fp4 = q_sf = q_fp8 = None
+    if fp8_logits:
+        q_fp8, weights = _index_q_fp8_and_weights(
+            indexer=indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
+    else:
+        q_fp4, q_sf, weights = _index_q_fp4_and_weights(
+            indexer=indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
     return DeepGEMMPrefillData(
         k_slots=inputs.k_slots,
         request_starts=plan.request_starts,
         lens_per_request=plan.lens_per_request,
         rows_per_request=inputs.rows_per_request,
         compress_lens=plan.compress_lens,
+        weights=weights,
         q_fp4=q_fp4,
         q_sf=q_sf,
-        weights=weights,
+        q_fp8=q_fp8,
     )
+
+
+def get_deep_gemm_prefill_kv(
+    *,
+    token_to_kv_pool: DeepSeekV4TokenToKVPool,
+    layer_id: int,
+    data: DeepGEMMPrefillData,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """The score kernel's K operand: fp8 rows read back from the fp4 pool when
+    ``data`` scores fp8 queries, packed fp4 otherwise."""
+    if data.q_fp8 is not None:
+        return token_to_kv_pool.get_low_ratio_index_k_fp8(layer_id, data.k_slots)
+    return token_to_kv_pool.get_low_ratio_index_k_fp4(layer_id, data.k_slots)
 
 
 def score_tiles(
@@ -297,6 +350,18 @@ def score_tiles(
     kv: Tuple[torch.Tensor, torch.Tensor],
 ) -> Generator[Tuple[slice, torch.Tensor], None, None]:
     """Score tiles whose row slices are relative to this data's query-row view."""
+    if data.q_fp8 is not None:
+        yield from flat_index_logits_tiles_fp8(
+            q=data.q_fp8,
+            kv=kv,
+            weights=data.weights,
+            starts=data.request_starts,
+            lengths=data.compress_lens,
+            context_lengths=data.lens_per_request,
+            budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        )
+        return
+    assert data.q_fp4 is not None and data.q_sf is not None
     yield from flat_index_logits_tiles(
         q=(data.q_fp4, data.q_sf),
         kv=kv,

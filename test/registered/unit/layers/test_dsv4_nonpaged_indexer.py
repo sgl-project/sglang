@@ -1222,13 +1222,14 @@ class TestCandidateIndexerGating(CustomTestCase):
 
         def make(topk_blocks, block_size):
             # The prefill choice reads the real DeepGEMM build and is cached.
-            with patch.object(v41_indexer, "_use_deep_gemm_prefill", lambda: False):
+            with patch.object(v41_indexer, "_prefill_path", lambda **_: (False, False)):
                 return v41_indexer.make_candidate_indexer(
                     token_to_kv_pool=None,
                     req_to_token=torch.zeros((1, 1), dtype=torch.int32),
                     page_size=256,
                     candidate_topk_blocks=topk_blocks,
                     candidate_block_size=block_size,
+                    index_n_heads=32,
                 )
 
         flag = "sglang.srt.layers.deep_gemm_wrapper.configurer.DEEPGEMM_PAGED_SPARSE_MQA_LOGITS"

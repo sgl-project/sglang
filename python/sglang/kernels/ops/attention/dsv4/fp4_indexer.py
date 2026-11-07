@@ -288,7 +288,7 @@ def index_k_rope_pack(
 
 
 @triton.jit
-def _e2m1_decode(code):
+def e2m1_decode(code):
     # code: uint 0..15 -> e2m1 value. exp = bits 2..1, mantissa = bit 0, sign = bit 3.
     e = (code >> 1) & 3
     m = (code & 1).to(tl.float32)
@@ -328,8 +328,8 @@ def _fp4_index_logits_tile(
         mask=valid[:, None],
         other=0,
     )
-    low = _e2m1_decode(pay & 0x0F)
-    high = _e2m1_decode((pay >> 4) & 0x0F)
+    low = e2m1_decode(pay & 0x0F)
+    high = e2m1_decode((pay >> 4) & 0x0F)
     # e8m0 block scales: element j uses block j // 32 -> byte i uses block i // 16.
     sc_idx = offs_i // 16
     exps = tl.load(
@@ -609,7 +609,7 @@ def fp4_index_logits_paged(
 
 @triton.jit
 def _e2m1_decode_bits(code):
-    # Same values as _e2m1_decode (including -0.0), built from the fp32 bit pattern.
+    # Same values as e2m1_decode (including -0.0), built from the fp32 bit pattern.
     c = code.to(tl.int32)
     e = (c >> 1) & 3
     m = c & 1

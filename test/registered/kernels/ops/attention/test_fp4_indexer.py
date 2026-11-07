@@ -28,6 +28,9 @@ from sglang.test.kernels.deepseek_v4.common import (
     quantize_fp4_indexer_ref,
     store_fp4_index_cache_ref,
 )
+from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
+    read_fp4_index_k_rows,
+)
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -587,7 +590,10 @@ def test_hopper_indexer_backends_replay(ratio):
         is_verify=True,
     )
     kwargs = dict(
-        token_to_kv_pool=pool, req_to_token=req_table, use_deep_gemm_prefill=False
+        token_to_kv_pool=pool,
+        req_to_token=req_table,
+        use_deep_gemm_prefill=False,
+        prefill_fp8_logits=False,
     )
     full = FullTopKIndexer(**kwargs, use_deep_gemm_decode=False)
     candidates = DenseBlocksBackend(
@@ -728,6 +734,361 @@ def test_expand_index_page_table_matches_cpu(bs, n, bpp):
         out = expand(table)
         assert out.dtype == torch.int32
         assert torch.equal(out.cpu(), expand(table.cpu()))
+
+
+def _hopper_fp8_available() -> bool:
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
+        return False
+    try:
+        import deep_gemm
+    except ImportError:
+        return False
+    return hasattr(deep_gemm, "fp8_mqa_logits")
+
+
+@pytest.mark.skipif(
+    not _hopper_fp8_available(),
+    reason="requires Hopper DeepGEMM fp8_mqa_logits",
+)
+def test_hopper_fp4_index_k_fp8_readback_matches_dequant():
+    """The fp8 K operand times its per-token scale is the fp4 dequant exactly:
+    each e2m1 block shares one power of two, and the row's largest block keeps
+    exponent 0, so no value rescaled onto it can round."""
+    from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
+        gather_fp4_index_k_fp8,
+        store_fp4_index_k_cache,
+    )
+
+    page_size, num_tokens = 256, 2048
+    torch.manual_seed(311)
+    dev = get_device()
+    k = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16) * 0.5
+    cache = torch.zeros(
+        (num_tokens // page_size, page_size * 68), device=dev, dtype=torch.uint8
+    )
+    loc = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    store_fp4_index_k_cache(k, cache, loc, page_size=page_size, rne=True)
+
+    slots = torch.randperm(num_tokens, device=dev).to(torch.int64)
+    k_fp8, k_scale = gather_fp4_index_k_fp8(cache, slots, page_size=page_size)
+    torch.testing.assert_close(
+        k_fp8.float() * k_scale[:, None],
+        read_fp4_index_k_rows(cache, slots, page_size=page_size).float(),
+        rtol=0,
+        atol=0,
+    )
+
+
+@pytest.mark.skipif(
+    not _hopper_fp8_available(),
+    reason="requires Hopper DeepGEMM fp8_mqa_logits",
+)
+@pytest.mark.parametrize("heads", [32, 64])
+def test_hopper_index_q_fp8_folds_pow2_scale_into_weights(heads):
+    from sglang.kernels.ops.attention.dsv4.index_q_fp8 import quantize_index_q_fp8
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
+
+    rows = 96
+    torch.manual_seed(312)
+    dev = get_device()
+    q = torch.randn(rows, heads, HEAD_DIM, device=dev, dtype=torch.bfloat16) * 0.5
+    q = fake_quant_fp4(q)
+    signs = torch.where(torch.rand(rows, heads, device=dev) < 0.5, -1.0, 1.0)
+    weights = (torch.rand(rows, heads, device=dev) * 0.75 + 0.25) * signs
+
+    q_fp8, weights_out = quantize_index_q_fp8(q, weights)
+    scale = weights_out / weights
+    assert torch.equal(scale, torch.log2(scale).round().exp2())
+    torch.testing.assert_close(
+        q_fp8.float() * scale[:, :, None], q.float(), rtol=0, atol=0
+    )
+
+
+@pytest.mark.skipif(
+    not _hopper_fp8_available(),
+    reason="requires Hopper DeepGEMM fp8_mqa_logits",
+)
+@pytest.mark.parametrize("heads", [32, 64])
+def test_hopper_fp8_prefill_logits_tiles(heads):
+    """The tiled wrapper maps each row's own [start, start + length) window of
+    the flattened K onto row-relative columns, matching the torch score."""
+    from sglang.kernels.ops.attention.dsv4.index_logits import (
+        flat_index_logits_tiles_fp8,
+    )
+    from sglang.kernels.ops.attention.dsv4.index_q_fp8 import quantize_index_q_fp8
+    from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
+        gather_fp4_index_k_fp8,
+        store_fp4_index_k_cache,
+    )
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
+
+    page_size = 256
+    request_rows = [24, 40]
+    lens_per_request = [100, 220]
+    # Two pages of pool so no row's window reaches the end of the K operand.
+    num_tokens = 2 * page_size
+    torch.manual_seed(313)
+    dev = get_device()
+    k = torch.randn(num_tokens, HEAD_DIM, device=dev, dtype=torch.bfloat16) * 0.5
+    cache = torch.zeros((2, page_size * 68), device=dev, dtype=torch.uint8)
+    loc = torch.arange(num_tokens, device=dev, dtype=torch.int64)
+    store_fp4_index_k_cache(k, cache, loc, page_size=page_size, rne=True)
+
+    # A shuffled pool order makes a wrong slot mapping visible in the scores.
+    k_slots = torch.randperm(num_tokens, device=dev).to(torch.int64)
+    k_ref = read_fp4_index_k_rows(cache, k_slots, page_size=page_size)
+
+    q = fake_quant_fp4(
+        torch.randn(
+            sum(request_rows), heads, HEAD_DIM, device=dev, dtype=torch.bfloat16
+        )
+        * 0.5
+    )
+    weights = torch.rand(sum(request_rows), heads, device=dev) * 0.75 + 0.25
+    q_fp8, weights_fp8 = quantize_index_q_fp8(q, weights)
+    k_fp8, k_scale = gather_fp4_index_k_fp8(cache, k_slots, page_size=page_size)
+
+    starts = torch.repeat_interleave(
+        torch.tensor([0, lens_per_request[0]], device=dev, dtype=torch.int32),
+        torch.tensor(request_rows, device=dev, dtype=torch.int64),
+    )
+    lens = torch.cat(
+        [
+            torch.randint(1, lc + 1, (n,), device=dev, dtype=torch.int32)
+            for n, lc in zip(request_rows, lens_per_request)
+        ]
+    )
+    ref = torch.einsum("rhd,nd->rhn", q.float(), k_ref.float())
+    ref = (ref.relu() * weights[:, :, None]).sum(dim=1)
+
+    budget_bytes = 8192  # forces several row tiles at this width
+    tiles = list(
+        flat_index_logits_tiles_fp8(
+            q=q_fp8,
+            kv=(k_fp8, k_scale),
+            weights=weights_fp8,
+            starts=starts,
+            lengths=lens,
+            context_lengths=lens_per_request,
+            budget_bytes=budget_bytes,
+        )
+    )
+    assert [logits.shape[0] for _, logits in tiles] == [8] * 8
+    covered = torch.cat([torch.arange(t.start, t.stop, device=dev) for t, _ in tiles])
+    torch.testing.assert_close(covered, torch.arange(sum(request_rows), device=dev))
+    for rows, logits in tiles:
+        for i, r in enumerate(range(rows.start, rows.stop)):
+            lo = int(starts[r])
+            hi = lo + int(lens[r])
+            torch.testing.assert_close(
+                logits[i, : int(lens[r])],
+                ref[r, lo:hi],
+                rtol=1e-5,
+                atol=1e-4,
+            )
+
+
+def _hopper_prefill_case(heads, ratio, seed=314):
+    """Two requests over one shuffled fp4 index-K pool, the eager-extend inputs
+    of their last tokens, and the torch score of every row."""
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
+
+    rows_per_request, contexts = [13, 29], [400, 220]
+    page_size, topk = 256, 128
+    dev = get_device()
+    torch.manual_seed(seed)
+    num_slots = 3 * page_size
+    cache = torch.zeros((3, page_size * 68), device=dev, dtype=torch.uint8)
+    store_fp4_index_k_cache(
+        torch.randn(num_slots, HEAD_DIM, device=dev, dtype=torch.bfloat16) * 0.5,
+        cache,
+        torch.arange(num_slots, device=dev, dtype=torch.int64),
+        page_size=page_size,
+        rne=True,
+    )
+    slots = torch.randperm(num_slots, device=dev).to(torch.int64)
+    lens_per_request = [context // ratio for context in contexts]
+    k_slots = slots[: sum(lens_per_request)]
+    positions = torch.cat(
+        [
+            torch.arange(context - rows, context, device=dev, dtype=torch.int32)
+            for context, rows in zip(contexts, rows_per_request)
+        ]
+    )
+    rows = sum(rows_per_request)
+    rows_dev = torch.tensor(rows_per_request, device=dev)
+    q = fake_quant_fp4(
+        torch.randn(rows, heads, HEAD_DIM, device=dev, dtype=torch.bfloat16) * 0.5
+    )
+    weights = torch.rand(rows, heads, device=dev) * 0.75 + 0.25
+    k_ref = read_fp4_index_k_rows(cache, k_slots, page_size=page_size).float()
+
+    def scores_of(q_rows, row_weights):
+        scores = torch.einsum("rhd,nd->rhn", q_rows.float(), k_ref)
+        return (scores.relu() * row_weights[:, :, None]).sum(dim=1)
+
+    starts_per_request = torch.tensor(
+        [0] + lens_per_request[:-1], device=dev, dtype=torch.int32
+    )
+    return SimpleNamespace(
+        cache=cache,
+        k_slots=k_slots,
+        q=q,
+        weights=weights,
+        scores=scores_of(q, weights),
+        positions=positions,
+        request_of_row=torch.repeat_interleave(
+            torch.arange(len(contexts), device=dev), rows_dev
+        ),
+        starts=torch.repeat_interleave(starts_per_request, rows_dev),
+        compress_lens=(positions + 1) // ratio,
+        seq_lens_cpu=contexts,
+        rows_per_request=rows_per_request,
+        lens_per_request=lens_per_request,
+        topk=topk,
+        page_size=page_size,
+        scores_of=scores_of,
+    )
+
+
+def _prefill_inputs(case, heads, ratio, *, q=None, weights=None):
+    from sglang.srt.layers.attention.dsv4.v41_indexer.types import PrefillInputs
+
+    q = case.q if q is None else q
+    weights = case.weights if weights is None else weights
+    rows, dev = q.shape[0], q.device
+    indexer = SimpleNamespace(
+        n_local_heads=heads,
+        index_topk=case.topk,
+        queries=lambda q_lora, freqs_cis, positions=None: q_lora,
+        head_weights=lambda x: x,
+    )
+    out_raw = torch.full((rows, case.topk), -1, dtype=torch.int32, device=dev)
+    return PrefillInputs(
+        indexer=indexer,
+        layer_id=0,
+        compress_ratio=ratio,
+        freqs_cis=torch.empty(0, device=dev),
+        x=weights,
+        q_lora=q,
+        positions=case.positions,
+        req_rows=case.request_of_row,
+        req_pool_indices=torch.arange(
+            len(case.rows_per_request), device=dev, dtype=torch.int32
+        ),
+        k_slots=case.k_slots,
+        index_plans=None,
+        kv_page_table=torch.empty((rows, 0), dtype=torch.int32, device=dev),
+        seq_lens_cpu=case.seq_lens_cpu,
+        rows_per_request=case.rows_per_request,
+        rows_per_request_device=torch.tensor(
+            case.rows_per_request, device=dev, dtype=torch.int32
+        ),
+        out_raw_indices=out_raw,
+        out_page_indices=torch.full_like(out_raw, -1),
+    )
+
+
+def _check_prefill_selection(
+    case, inputs, scores, *, candidate_blocks=None, block_size=None
+):
+    """Each row's picks are the torch top-k of its candidates: the request-local
+    positions its window exposes (and, for a consumer, that its published blocks
+    cover), written back as request-local positions and pool slots."""
+    topk = inputs.out_raw_indices.shape[1]
+    starts = case.starts.tolist()
+    lens = case.compress_lens.tolist()
+    for row in range(inputs.out_raw_indices.shape[0]):
+        local = torch.arange(lens[row], device=scores.device)
+        visible = torch.ones_like(local, dtype=torch.bool)
+        if candidate_blocks is not None:
+            blocks = candidate_blocks(row)
+            visible = (local[None, :] // block_size == blocks[:, None]).any(0)
+        count = min(topk, int(visible.sum()))
+        raw = inputs.out_raw_indices[row]
+        chosen = raw[raw >= 0]
+        assert chosen.numel() == count, (row, chosen.numel(), count)
+        assert chosen.unique().numel() == count
+        picked = chosen.long()
+        torch.testing.assert_close(
+            scores[row, starts[row] + picked].sort(descending=True).values,
+            scores[row, starts[row] + local[visible]].topk(count).values,
+            rtol=1e-5,
+            atol=1e-4,
+        )
+        torch.testing.assert_close(
+            inputs.out_page_indices[row][raw >= 0].sort().values,
+            case.k_slots[starts[row] + picked].to(torch.int32).sort().values,
+        )
+        assert (inputs.out_page_indices[row][raw < 0] == -1).all()
+
+
+@pytest.mark.skipif(
+    not _hopper_fp8_available(),
+    reason="requires Hopper DeepGEMM fp8_mqa_logits",
+)
+@pytest.mark.parametrize("heads", [32, 64])
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_hopper_fp8_prefill_end_to_end(heads, ratio):
+    """The runtime prefill wiring on Hopper: the stored fp8 variant projects the
+    queries, reads the fp4 pool back as fp8, scores, selects, and writes both
+    selection buffers; the candidate scheme publishes and consumes the same way."""
+    from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
+        gather_fp4_index_k_fp8,
+    )
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_fp4
+    from sglang.srt.layers.attention.dsv4.v41_indexer.dense_blocks import (
+        DenseBlocksBackend,
+    )
+    from sglang.srt.layers.attention.dsv4.v41_indexer.full_topk import (
+        FullTopKIndexer,
+    )
+
+    block_size, topk_blocks = 8, 8
+    case = _hopper_prefill_case(heads, ratio)
+    dev = get_device()
+    pool = SimpleNamespace(
+        get_low_ratio_index_k_fp8=lambda layer_id, slots: gather_fp4_index_k_fp8(
+            case.cache, slots, page_size=case.page_size
+        )
+    )
+    backend = dict(
+        token_to_kv_pool=pool,
+        req_to_token=torch.empty((0, 0), device=dev, dtype=torch.int32),
+        use_deep_gemm_prefill=True,
+        prefill_fp8_logits=True,
+    )
+
+    full = FullTopKIndexer(**backend, use_deep_gemm_decode=False)
+    inputs = _prefill_inputs(case, heads, ratio)
+    full.topk_prefill(inputs)
+    _check_prefill_selection(case, inputs, case.scores)
+
+    candidates = DenseBlocksBackend(
+        **backend,
+        candidate_topk_blocks=topk_blocks,
+        candidate_block_size=block_size,
+    )
+    source = _prefill_inputs(case, heads, ratio)
+    published = candidates.publish_prefill(source)
+    assert published is not None
+    _check_prefill_selection(case, source, case.scores)
+
+    consumer_q = fake_quant_fp4(torch.randn_like(case.q))
+    consumer_weights = torch.rand_like(case.weights)
+    consumer = _prefill_inputs(
+        case, heads, ratio, q=consumer_q, weights=consumer_weights
+    )
+    candidates.consume_prefill(consumer, published)
+    _check_prefill_selection(
+        case,
+        consumer,
+        case.scores_of(consumer_q, consumer_weights),
+        candidate_blocks=lambda row: published.blocks[row][
+            published.blocks[row] >= 0
+        ].long(),
+        block_size=block_size,
+    )
 
 
 if __name__ == "__main__":

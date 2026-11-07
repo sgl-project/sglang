@@ -21,6 +21,7 @@ from .scoring import (
     PagedDecodeScores,
     decode_scores,
     get_deep_gemm_prefill_data,
+    get_deep_gemm_prefill_kv,
     prefill_requests,
     score_tiles,
     select_decode,
@@ -67,12 +68,14 @@ class DenseBlocksBackend:
         candidate_topk_blocks: int,
         candidate_block_size: int,
         use_deep_gemm_prefill: bool,
+        prefill_fp8_logits: bool,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.prefill_fp8_logits = prefill_fp8_logits
 
     def publish_prefill(self, inputs: PrefillInputs):
         if self.use_deep_gemm_prefill:
@@ -146,13 +149,15 @@ class DenseBlocksBackend:
 
     def _deep_gemm_publish_prefill(self, inputs: PrefillInputs):
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, fp8_logits=self.prefill_fp8_logits)
         if data is None:
             return None
         selected, blocks = _publish_prefill_blocks(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
+            kv=get_deep_gemm_prefill_kv(
+                token_to_kv_pool=self.token_to_kv_pool,
+                layer_id=inputs.layer_id,
+                data=data,
             ),
             topk=inputs.indexer.index_topk,
             topk_blocks=self.topk_blocks,
@@ -167,14 +172,16 @@ class DenseBlocksBackend:
         published: Optional[BlockIds],
     ) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, fp8_logits=self.prefill_fp8_logits)
         if data is None:
             return
         assert published is not None
         selected = _consume_prefill_blocks(
             data=data,
-            kv=self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-                inputs.layer_id, data.k_slots
+            kv=get_deep_gemm_prefill_kv(
+                token_to_kv_pool=self.token_to_kv_pool,
+                layer_id=inputs.layer_id,
+                data=data,
             ),
             topk=inputs.indexer.index_topk,
             blocks=published.blocks,

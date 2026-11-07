@@ -1343,15 +1343,21 @@ class DeepseekV4AttnBackend(
         self.has_c128: bool = 128 in self.present_ratios
         cfg = model_runner.model_config.hf_text_config
         self.is_dsv41: bool = getattr(cfg, "model_type", None) == "deepseek_v41"
+        # The indexer's head count decides whether DeepGEMM's Hopper fp8 logits
+        # apply (32 or 64); configs without the field keep the torch path.
+        index_n_heads = int(getattr(cfg, "index_n_heads", None) or 0)
         self.prefill_candidates, self.decode_candidates = make_candidate_indexer(
             token_to_kv_pool=self.token_to_kv_pool,
             req_to_token=self.req_to_token,
             page_size=self.page_size,
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
+            index_n_heads=index_n_heads,
         )
         self.full_topk_indexer = make_full_topk_indexer(
-            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            index_n_heads=index_n_heads,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 

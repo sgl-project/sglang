@@ -21,6 +21,7 @@ from .scoring import (
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_deep_gemm_prefill_kv,
     prefill_requests,
     select_decode,
     sharded_dense_prefill_topk,
@@ -42,11 +43,13 @@ class FullTopKIndexer:
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         req_to_token: torch.Tensor,
         use_deep_gemm_prefill: bool,
+        prefill_fp8_logits: bool,
         use_deep_gemm_decode: bool,
     ):
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.prefill_fp8_logits = prefill_fp8_logits
         self.use_deep_gemm_decode = use_deep_gemm_decode
         self.use_deep_select_decode = (
             not use_deep_gemm_decode and is_deep_select_supported()
@@ -66,11 +69,13 @@ class FullTopKIndexer:
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
         inputs.reset_outputs()
-        data = get_deep_gemm_prefill_data(inputs)
+        data = get_deep_gemm_prefill_data(inputs, fp8_logits=self.prefill_fp8_logits)
         if data is None:
             return
-        kv = self.token_to_kv_pool.get_low_ratio_index_k_fp4(
-            inputs.layer_id, data.k_slots
+        kv = get_deep_gemm_prefill_kv(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=inputs.layer_id,
+            data=data,
         )
         out = inputs.out_raw_indices[: data.num_rows]
         if inputs.row_shard is None:

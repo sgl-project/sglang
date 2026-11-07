@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Tuple
 import torch
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.dsv4.index_logits import use_fp8_prefill_logits
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -43,8 +44,8 @@ __all__ = [
 
 @functools.cache
 def is_sm100() -> bool:
-    # The DeepGEMM fp8_fp4 mqa-logits paths are SM100-family only; other devices
-    # (Hopper, SM120, non-CUDA) take the torch / Triton indexer.
+    # The DeepGEMM fp8_fp4 mqa-logits paths are SM100-family only; SM120 and
+    # non-CUDA devices take the torch / Triton indexer.
     return current_arch().is_sm(10)
 
 
@@ -60,19 +61,28 @@ def has_dense_fp4_indexer() -> bool:
 
 
 @functools.cache
-def _use_deep_gemm_prefill() -> bool:
-    return is_sm100() and has_dense_fp4_indexer()
+def _prefill_path(*, index_n_heads: int) -> Tuple[bool, bool]:
+    """``(use_deep_gemm_prefill, prefill_fp8_logits)``: whether the prefill
+    top-k runs on DeepGEMM, and whether it scores fp8 operands read back from
+    the fp4 pool rather than the fp4 operands themselves."""
+    fp8_logits = use_fp8_prefill_logits(index_n_heads=index_n_heads)
+    return (is_sm100() and has_dense_fp4_indexer()) or fp8_logits, fp8_logits
 
 
 def make_full_topk_indexer(
     *,
     token_to_kv_pool: DeepSeekV4TokenToKVPool,
     req_to_token: torch.Tensor,
+    index_n_heads: int,
 ) -> FullTopKIndexer:
+    use_deep_gemm_prefill, prefill_fp8_logits = _prefill_path(
+        index_n_heads=index_n_heads
+    )
     return FullTopKIndexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
-        use_deep_gemm_prefill=_use_deep_gemm_prefill(),
+        use_deep_gemm_prefill=use_deep_gemm_prefill,
+        prefill_fp8_logits=prefill_fp8_logits,
         use_deep_gemm_decode=is_sm100(),
     )
 
@@ -84,18 +94,22 @@ def make_candidate_indexer(
     page_size: int,
     candidate_topk_blocks: int,
     candidate_block_size: int,
+    index_n_heads: int,
 ) -> Tuple[PrefillCandidates, DecodeCandidates]:
     from sglang.srt.runtime_context import get_parallel
 
     from .dense_blocks import DenseBlocksBackend
 
-    use_deep_gemm_prefill = _use_deep_gemm_prefill()
+    use_deep_gemm_prefill, prefill_fp8_logits = _prefill_path(
+        index_n_heads=index_n_heads
+    )
     dense_blocks = DenseBlocksBackend(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
         use_deep_gemm_prefill=use_deep_gemm_prefill,
+        prefill_fp8_logits=prefill_fp8_logits,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
     if not is_sm100() or candidate_topk_blocks <= 0:
@@ -117,6 +131,7 @@ def make_candidate_indexer(
         page_size=page_size,
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
+        prefill_fp8_logits=prefill_fp8_logits,
     )
     # A CP rank's rows are an interleaved subset of the batch, and without the dense
     # fp4 indexer prefill scores on torch: both keep the sparse table on decode only.

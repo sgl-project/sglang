@@ -84,3 +84,12 @@ register_kernel(
         ),
     )
 )
+register_kernel(
+    KernelSpec(
+        op="kvcache.gather_fp4_index_k_fp8",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache:gather_fp4_index_k_fp8"
+        ),
+    )
+)

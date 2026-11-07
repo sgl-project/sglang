@@ -8,6 +8,27 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     _KV_BLOCK_SIZE,
     index_k_page8_views,
 )
+from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
+    dequantize_e2m1_codes,
+)
+
+
+def read_fp4_index_k_rows(
+    cache: torch.Tensor, slots: torch.Tensor, *, page_size: int
+) -> torch.Tensor:
+    """bf16 ``[n, 128]`` rows at ``slots`` of the fused fp4 index-K cache: each
+    slot is 64 packed e2m1 bytes followed by four ue8m0 block exponents."""
+    slots = slots.to(torch.int64)
+    page, off = slots // page_size, slots % page_size
+    columns = torch.arange(64, device=cache.device)
+    payload = cache[page[:, None], (off * 64)[:, None] + columns]
+    codes = torch.stack([payload & 0x0F, (payload >> 4) & 0x0F], dim=-1).flatten(1)
+    exps = cache[
+        page[:, None],
+        page_size * 64 + (off * 4)[:, None] + torch.arange(4, device=cache.device),
+    ]
+    scales = torch.exp2(exps.to(torch.int32) - 127).repeat_interleave(32, dim=-1)
+    return (dequantize_e2m1_codes(codes) * scales).to(torch.bfloat16)
 
 
 def read_fp4_index_k_split(

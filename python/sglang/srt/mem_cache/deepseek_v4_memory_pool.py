@@ -818,6 +818,23 @@ class DeepSeekV4IndexerPool(KVCache):
         scales = buf[page, scale_cols].contiguous().view(torch.int32).squeeze(-1)
         return payload, scales
 
+    def get_index_k_fp8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """fp8 rows at `slots` and their per-token fp32 scales: (e4m3
+        [n, index_head_dim], scale [n]), the K operand of DeepGEMM's Hopper
+        `fp8_mqa_logits`."""
+        assert self.use_fp4_indexer, "fp8 readback only applies to the fp4 layout"
+        assert self.index_k_with_scale_buffer is not None, (
+            "the fp8 readback needs the fused CUDA index-K layout"
+        )
+        buf = self.index_k_with_scale_buffer[layer_id - self.start_layer]
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import (
+            gather_fp4_index_k_fp8,
+        )
+
+        return gather_fp4_index_k_fp8(buf, slots, page_size=self.page_size)
+
     def get_index_k_dequant(
         self, layer_id: int, slots: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -2279,6 +2296,17 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
         self.wait_layer_transfer(layer_id)
         compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
         return self._indexer_pool(compress_ratio).get_index_k_fp4(
+            compress_layer_id, slots
+        )
+
+    def get_low_ratio_index_k_fp8(
+        self, layer_id: int, slots: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """fp8 index-K rows at `slots` and their per-token fp32 scales, read back
+        from the fp4 pool."""
+        self.wait_layer_transfer(layer_id)
+        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
+        return self._indexer_pool(compress_ratio).get_index_k_fp8(
             compress_layer_id, slots
         )
 

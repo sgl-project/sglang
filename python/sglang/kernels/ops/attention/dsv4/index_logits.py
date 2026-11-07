@@ -48,6 +48,28 @@ def deep_gemm_paged_varlen() -> bool:
     return index_weights_dtype() == torch.bfloat16
 
 
+def _is_sm90() -> bool:
+    return current_arch().is_sm(9)
+
+
+@functools.cache
+def _has_fp8_mqa_logits() -> bool:
+    if not _is_sm90():
+        return False
+    try:
+        import deep_gemm
+    except (ImportError, OSError, RuntimeError):
+        return False
+    return hasattr(deep_gemm, "fp8_mqa_logits")
+
+
+def use_fp8_prefill_logits(*, index_n_heads: int) -> bool:
+    """Hopper prefill index logits: DeepGEMM's fp4 kernels are SM100-only, so the
+    fp4 pool is read back to fp8 and scored by ``fp8_mqa_logits``, which takes 32
+    or 64 heads."""
+    return _has_fp8_mqa_logits() and index_n_heads in (32, 64)
+
+
 # Width alignment of the flat logits: covers block-wise reads of up to 64 columns, and 128 B of bf16, which
 # DeepSelect reads past a row's end (DeepGEMM pads the stride but its tensor's storage ends at the last row)
 FLAT_LOGITS_WIDTH_ALIGN = 64
@@ -87,6 +109,24 @@ def flat_index_logits_rows_per_tile(
     return rows_per_tile
 
 
+def _logits_width(context_lengths: list[int]) -> int:
+    """``max(context_lengths)`` aligned to ``FLAT_LOGITS_WIDTH_ALIGN``."""
+    return ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
+
+
+def _tile_slices(
+    *, rows: int, heads: int, width: int, budget_bytes: int
+) -> Iterator[slice]:
+    """Row tiles of a ``[rows, width]`` logits matrix within ``budget_bytes``."""
+    if rows == 0 or width == 0:
+        return
+    rows_per_tile = flat_index_logits_rows_per_tile(
+        rows, width, heads=heads, budget_bytes=budget_bytes
+    )
+    for offset in range(0, rows, rows_per_tile):
+        yield slice(offset, min(offset + rows_per_tile, rows))
+
+
 def flat_index_logits_tiles(
     *,
     q: tuple[torch.Tensor, torch.Tensor],
@@ -104,20 +144,16 @@ def flat_index_logits_tiles(
     from deep_gemm import fp8_fp4_mqa_logits
 
     rows = q[0].shape[0]
-    width = ceil_align(max(context_lengths, default=0), FLAT_LOGITS_WIDTH_ALIGN)
-    if rows == 0 or width == 0:
-        return
-    rows_per_chunk = flat_index_logits_rows_per_tile(
-        rows, width, heads=q[0].shape[1], budget_bytes=budget_bytes
-    )
+    width = _logits_width(context_lengths)
     weights = weights.to(index_weights_dtype())
     if weights.dtype == torch.bfloat16:
         logits_args, logits_kwargs = (width,), {}
     else:
         logits_args = (False, width)
         logits_kwargs = {"logits_dtype": index_logits_dtype()}
-    for offset in range(0, rows, rows_per_chunk):
-        tile = slice(offset, min(offset + rows_per_chunk, rows))
+    for tile in _tile_slices(
+        rows=rows, heads=q[0].shape[1], width=width, budget_bytes=budget_bytes
+    ):
         tile_starts = starts[tile]
         yield (
             tile,
@@ -129,6 +165,41 @@ def flat_index_logits_tiles(
                 tile_starts + lengths[tile],
                 *logits_args,
                 **logits_kwargs,
+            ),
+        )
+
+
+def flat_index_logits_tiles_fp8(
+    *,
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    starts: torch.Tensor,
+    lengths: torch.Tensor,
+    context_lengths: list[int],
+    budget_bytes: int,
+) -> Iterator[tuple[slice, torch.Tensor]]:
+    """``flat_index_logits_tiles`` over fp8 operands: ``q`` ``[rows, heads, 128]``
+    e4m3 with its per-row-head scale folded into the fp32 ``weights``, ``kv`` an
+    e4m3 ``[columns, 128]`` tensor with per-column fp32 scales."""
+    from deep_gemm import fp8_mqa_logits
+
+    rows, heads = q.shape[0], q.shape[1]
+    width = _logits_width(context_lengths)
+    for tile in _tile_slices(
+        rows=rows, heads=heads, width=width, budget_bytes=budget_bytes
+    ):
+        tile_starts = starts[tile]
+        yield (
+            tile,
+            fp8_mqa_logits(
+                q[tile],
+                kv,
+                weights[tile],
+                tile_starts,
+                tile_starts + lengths[tile],
+                clean_logits=False,
+                max_seqlen_k=width,
             ),
         )
 
