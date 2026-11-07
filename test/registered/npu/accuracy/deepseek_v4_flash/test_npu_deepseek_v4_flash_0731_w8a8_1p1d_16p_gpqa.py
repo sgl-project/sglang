@@ -48,16 +48,21 @@ METASERVICE_CONFIG = {
 
 # Local service config for the npu_memcache L3 backend; it must point at the
 # same MetaService/config-store endpoints as METASERVICE_CONFIG.
-# Following the HiCache L2/L3 test method: protocol is device_sdma on A3
-# (device_urma on A5), world_size is the prefill instance's tp_size*pp_size,
-# and dram_size is the per-rank DRAM contribution.
+# Protocol depends on the A3 interconnect: device_sdma needs an HCCS/LingQu
+# supernode (LingQu L1 >= 1.5.0 and firmware >= 7.8.0.6.201), while an A3
+# cluster built on NPU RDMA/RoCE uses device_rdma (A5 uses device_urma). This
+# CI cluster runs pods on A3 RoCE nodes whose driver exposes neither vmm nor
+# DCMI v2, so device_sdma fails with "dram segment does not support sdma in
+# current environment" and every rank aborts the MemCache store init.
+# world_size is the prefill instance's tp_size*pp_size, and dram_size is the
+# per-rank DRAM contribution.
 HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
     {
         "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
         "config_store_url": METASERVICE_CONFIG["config_store_url"],
         "log_level": "info",
         "world_size": 16,
-        "protocol": "device_sdma",
+        "protocol": "device_rdma",
         "dram_size": "10GB",
     }
 )
