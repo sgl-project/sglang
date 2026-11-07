@@ -7,6 +7,7 @@ contract accepts packed inference keyword arguments and returns packed logits.
 
 from __future__ import annotations
 
+import inspect
 import itertools
 import math
 import os
@@ -139,6 +140,28 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
     eager_on_graph,
     is_in_breakable_cuda_graph,
 )
+
+_xpu_indexed_scale_shift_bf16_ = None
+_xpu_indexed_gate_bf16_ = None
+_xpu_fused_qknorm_rope = None
+if current_platform.is_xpu():
+    from sgl_kernel import fused_inplace_qknorm_rope as _sgl_fused_qknorm_rope
+    from sgl_kernel import silu_and_mul as _xpu_silu_and_mul
+
+    # round_norm_before_rope reproduces the eager chain bit for bit; it ships with
+    # sgl-project/sgl-kernel-xpu#582, older wheels keep the eager chain.
+    if "round_norm_before_rope" in inspect.signature(_sgl_fused_qknorm_rope).parameters:
+        _xpu_fused_qknorm_rope = _sgl_fused_qknorm_rope
+
+    # Bit-exact and faster than the Triton kernels; ships in sgl-kernel-xpu with
+    # sgl-project/sgl-kernel-xpu#545, older wheels fall back to Triton.
+    try:
+        from sgl_kernel import indexed_gate_bf16_ as _xpu_indexed_gate_bf16_
+        from sgl_kernel import (
+            indexed_scale_shift_bf16_ as _xpu_indexed_scale_shift_bf16_,
+        )
+    except ImportError:
+        pass
 
 logger = init_logger(__name__)
 
@@ -459,10 +482,10 @@ def _modulate_scale_shift(
     *,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Apply indexed affine modulation, reusing disposable CUDA BF16 input."""
+    """Apply indexed affine modulation, reusing disposable CUDA/XPU BF16 input."""
     # Apply per-index affine modulation: x * (1 + scale[idx]) + shift[idx].
     if (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and shift.dtype == scale.dtype
@@ -471,8 +494,11 @@ def _modulate_scale_shift(
     ):
         # Serialized INT8 checkpoints keep the AdaLN tables in FP32.
         if shift.dtype == _BF16_DTYPE:
+            if x.is_xpu and _xpu_indexed_scale_shift_bf16_ is not None:
+                return _xpu_indexed_scale_shift_bf16_(x, shift, scale, indices)
             return indexed_scale_shift_bf16_(x, shift, scale, indices)
-        if shift.dtype == _FP32_DTYPE:
+        # the FP32-table kernel relies on PTX-only rounding helpers
+        if shift.dtype == _FP32_DTYPE and x.is_cuda:
             return indexed_scale_shift_fp32_(x, shift, scale, indices)
     return (
         x * (1.0 + scale.index_select(0, indices)) + shift.index_select(0, indices)
@@ -491,7 +517,7 @@ def _modulate_gate(
     """Apply an indexed gated residual, optionally reusing the input buffer."""
     # Apply the per-index gated residual: x + gate[idx] * other.
     if (
-        x.is_cuda
+        (x.is_cuda or x.is_xpu)
         and x.dtype == _BF16_DTYPE
         and dtype == _BF16_DTYPE
         and other.dtype == _BF16_DTYPE
@@ -500,10 +526,12 @@ def _modulate_gate(
         and gate.stride(-1) == 1
     ):
         if gate.dtype == _BF16_DTYPE:
+            if allow_inplace and x.is_xpu and _xpu_indexed_gate_bf16_ is not None:
+                return _xpu_indexed_gate_bf16_(x, gate, other, indices)
             if allow_inplace:
                 return indexed_gate_bf16_(x, gate, other, indices)
             return indexed_gate_bf16(x, gate, other, indices)
-        if gate.dtype == _FP32_DTYPE:
+        if gate.dtype == _FP32_DTYPE and x.is_cuda:
             if allow_inplace:
                 return indexed_gate_fp32_(x, gate, other, indices)
             return indexed_gate_fp32(x, gate, other, indices)
@@ -522,6 +550,9 @@ def _silu_mul(hidden: torch.Tensor, *, reuse_input: bool) -> torch.Tensor:
         # Quantized fc2 needs contiguous rows, so keep the fused result out of
         # the packed fc1 buffer while preserving the eager BF16 SiLU rounding.
         return silu_and_mul_with_activation_rounding(hidden)
+    if hidden.is_xpu and hidden.dtype == _BF16_DTYPE and hidden.is_contiguous():
+        # sgl-kernel-xpu rounds silu(gate) to bf16 before the multiply, as eager does
+        return _xpu_silu_and_mul(hidden)
     gate, up = hidden.chunk(2, dim=-1)
     return nn.functional.silu(gate) * up
 
@@ -1280,6 +1311,15 @@ class MiniMaxH3Attention(nn.Module):
                 round_norm_before_rope=True,
             )
         )
+        # The XPU kernel takes one eps for both norms, reproduces torch-xpu's RMSNorm
+        # summation order only for head_dim 64/128, and needs each rotary half to
+        # cover whole head_dim/16-wide lanes.
+        self._use_xpu_qknorm_rope = (
+            _xpu_fused_qknorm_rope is not None
+            and self.q_norm.eps == self.k_norm.eps
+            and self.head_dim in (64, 128)
+            and rope_dim % (self.head_dim // 8) == 0
+        )
         self.out_proj = RowParallelLinear(
             self.inner_dim,
             arch.hidden_size,
@@ -1627,6 +1667,20 @@ class MiniMaxH3Attention(nn.Module):
                     cos_sin_cache,
                     positions,
                     is_neox=True,
+                    eps=self.q_norm.eps,
+                    head_dim=self.head_dim,
+                    rope_dim=cos_sin_cache.shape[-1],
+                    round_norm_before_rope=True,
+                )
+            elif self._use_xpu_qknorm_rope and q.dtype == k.dtype == _BF16_DTYPE:
+                _xpu_fused_qknorm_rope(
+                    q,
+                    k,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    cos_sin_cache.float(),
+                    positions,
+                    True,
                     eps=self.q_norm.eps,
                     head_dim=self.head_dim,
                     rope_dim=cos_sin_cache.shape[-1],
