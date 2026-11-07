@@ -261,6 +261,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         self.assertEqual(group.num_layers, 3)
         self.assertTrue(group.rank_replicated)
+        self.assertTrue(group.cp_replicated)
         self.assertEqual(
             set(group.entry_map),
             {
@@ -760,6 +761,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         self.assertEqual(group.num_layers, 2)
         self.assertTrue(group.rank_replicated)
+        self.assertFalse(group.cp_replicated)
         self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.INDEXER})
         self.assertEqual(
             group.sources,
