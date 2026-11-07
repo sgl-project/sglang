@@ -6,8 +6,8 @@ from unittest.mock import Mock, call, patch
 
 import numpy as np
 
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
@@ -105,12 +105,13 @@ class TestMoriDCP(unittest.TestCase):
 
     def test_tp_mismatch_requires_matching_token_geometry(self):
         manager = object.__new__(mori_conn.MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
         manager.dcp_size = 1
         manager.dcp_rank = 0
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
         manager.kv_args = SimpleNamespace(
-            page_size=64, kv_item_lens=[4096], num_draft_entries=0
+            page_size=64, kv_item_lens=[4096], num_draft_entries=0, aux_data_ptrs=[]
         )
         manager.decode_kv_args_table = {}
         manager.engine = Mock()

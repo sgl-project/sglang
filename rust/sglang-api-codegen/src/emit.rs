@@ -273,28 +273,39 @@ fn emit_one_or_many(
     // Sequence handling. For a message-typed `one` whose JSON is ITSELF an
     // array (TokenIds), the outer array is ambiguous: dispatch on the first
     // element's shape (number => one flat id list, array/other => many).
-    let seq_visit = if let Some((one_ty, first_check)) = bare_scalar_list(&one.kind, models) {
+    let seq_visit = if let Some(list) = bare_scalar_list(&one.kind, models) {
+        let BareScalarList {
+            ty: one_ty,
+            field,
+            item_ty,
+            first_check,
+        } = list;
+        // A flat list streams its elements straight into the field: a prompt's
+        // `input_ids` can hold hundreds of thousands, and buffering each as a
+        // `Value` to parse it a second time costs as much as the body's own
+        // parse.
         format!(
             r#"            fn visit_seq<A: ::serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {{
                 let Some(first) = seq.next_element::<::serde_json::Value>()? else {{
                     // [] is one empty list (the untagged first-arm rule).
                     return Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}({one_ty}::default())) }});
                 }};
-                let is_number = {first_check};
+                if {first_check} {{
+                    let first = <{item_ty} as ::serde::Deserialize>::deserialize(first)
+                        .map_err(::serde::de::Error::custom)?;
+                    let mut {field} = vec![first];
+                    while let Some(v) = seq.next_element::<{item_ty}>()? {{
+                        {field}.push(v);
+                    }}
+                    return Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}({one_ty} {{ {field} }})) }});
+                }}
                 let mut rest = vec![first];
                 while let Some(v) = seq.next_element::<::serde_json::Value>()? {{
                     rest.push(v);
                 }}
-                let reparse = ::serde_json::Value::Array(rest);
-                if is_number {{
-                    let one: {one_ty} = ::serde_json::from_value(reparse)
-                        .map_err(::serde::de::Error::custom)?;
-                    Ok({name} {{ value: Some({oneof_mod}::Value::{one_v}(one)) }})
-                }} else {{
-                    let many: {many_ty} = ::serde_json::from_value(reparse)
-                        .map_err(::serde::de::Error::custom)?;
-                    Ok({name} {{ value: Some({oneof_mod}::Value::{many_v}(many)) }})
-                }}
+                let many: {many_ty} = ::serde_json::from_value(::serde_json::Value::Array(rest))
+                    .map_err(::serde::de::Error::custom)?;
+                Ok({name} {{ value: Some({oneof_mod}::Value::{many_v}(many)) }})
             }}
 "#
         )
@@ -439,12 +450,22 @@ fn element_shapes(name: &str, models: &HashMap<&str, &MessageModel>) -> Vec<Json
     }
 }
 
-/// A `one` arm that is a bare list of scalars: its Rust type and the
-/// `serde_json::Value` test that recognizes one of its elements.
+/// A `one` arm that is a bare list of scalars (`TokenIds`).
+struct BareScalarList {
+    /// The list message's Rust type.
+    ty: String,
+    /// Its one field, the `Vec` of scalars.
+    field: String,
+    /// The scalar's Rust type.
+    item_ty: &'static str,
+    /// The `serde_json::Value` test that recognizes one of its elements.
+    first_check: &'static str,
+}
+
 fn bare_scalar_list(
     kind: &FieldKind,
     models: &HashMap<&str, &MessageModel>,
-) -> Option<(String, &'static str)> {
+) -> Option<BareScalarList> {
     let FieldKind::Message { rust_path, .. } = kind else {
         return None;
     };
@@ -455,12 +476,17 @@ fn bare_scalar_list(
     let FieldKind::RepeatedScalar { ty } = &item.kind else {
         return None;
     };
-    let check = match ty {
+    let first_check = match ty {
         ScalarTy::Str => "first.is_string()",
         ScalarTy::Bool => "first.is_boolean()",
         _ => "first.is_number()",
     };
-    Some((rust_path.clone(), check))
+    Some(BareScalarList {
+        ty: rust_path.clone(),
+        field: item.rust_ident.clone(),
+        item_ty: ty.rust(),
+        first_check,
+    })
 }
 
 /// A message-typed arm built from a visited scalar `v`: the message's own

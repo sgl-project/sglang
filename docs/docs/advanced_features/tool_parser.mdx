@@ -30,6 +30,11 @@ Pass one of these names to `--tool-call-parser`, or pass `auto` to detect the pa
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted as a JSON list of single-key objects: `<|tools_prefix|>[{"tool": {...}}]<|tools_suffix|>`.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`beam`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Beam 1.0 (e.g. `reflection/Beam-1.0-501B-A23B`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Uses the `response_template` detector with Beam's built-in template.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`cohere_command4`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Cohere Command 4</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are a JSON array between `<|START_ACTION|>` and `<|END_ACTION|>`.</td>
@@ -63,6 +68,16 @@ Pass one of these names to `--tool-call-parser`, or pass `auto` to detect the pa
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`dots`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>dots3-note (e.g. `dots-studio/dots3-note-prev`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>XML `invoke` elements inside `<dots_function_call>`. A JSON object with `name` and `arguments` is accepted as a fallback.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`ernie55`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ERNIE-5.5-Flash (`baidu/ERNIE-5.5-Flash`, coming soon)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted as `<ernie:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></ernie:tool_call>`.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`flint`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Flint (e.g. `RecursiveSI/flint`)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Uses the same detector as `glm47`.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`gemma4`</td>
@@ -228,6 +243,11 @@ Pass one of these names to `--tool-call-parser`, or pass `auto` to detect the pa
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`trinity`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Arcee Trinity (e.g. `arcee-ai/Trinity-Mini`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Qwen-style `<tool_call>` JSON. Tool calls inside `<think>` sections are also parsed.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`xing4_0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Xing4_0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted inside blocks as either JSON (`{"name": ..., "arguments": {...}}`) or a tag-based form (`<param_key>...</param_key><param_value>...</param_value>`).</td>
     </tr>
   </tbody>
 </table>

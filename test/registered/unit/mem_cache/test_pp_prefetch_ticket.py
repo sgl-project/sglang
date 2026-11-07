@@ -38,7 +38,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
 
 class TestPPPrefetchTicket(unittest.TestCase):
@@ -70,7 +70,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
-        c.mem_pool_host = Mock(page_size=4)
+        c.mem_pool_host = Mock(page_size=4, entry_map={})
         c.mem_pool_host.available_size.return_value = 1 << 20
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
