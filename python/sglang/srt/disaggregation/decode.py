@@ -3570,7 +3570,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             )
 
     def resolve_deferred_releases(self) -> None:
-        """Release drained transfers; device destinations may also time out."""
+        """Release drained transfers; a Mooncake deadline is not a drain proof."""
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -3586,7 +3586,12 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 is_drained = decode_req.kv_receiver.kv_mgr.is_abort_release_safe(
                     decode_req.req.bootstrap_room, required_acks
                 )
-                is_ready = is_drained or now >= deadline
+                is_ready = is_drained or (
+                    now >= deadline
+                    and not getattr(
+                        decode_req.kv_receiver.kv_mgr, "requires_abort_drain", False
+                    )
+                )
             drained.append(is_drained)
             ready.append(is_ready)
         # Acks and deadlines are rank-local. Releasing only on some ranks would
@@ -3633,6 +3638,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def release_memory_occupation(self):
         """Clean up in-flight transfers before releasing GPU memory."""
+        if self.queue or self._deferred_releases:
+            raise RuntimeError("Decode destinations are still owned by transfers")
         self.queue.clear()
         # Pool is being torn down; drop held entries without per-request release.
         self._deferred_releases.clear()

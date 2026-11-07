@@ -152,6 +152,11 @@ class TestCommonSenderLifecycle(unittest.TestCase):
         trace.trace_slice_start.assert_called_once_with("mooncake_send", 1, ANY)
         trace.trace_slice_end.assert_called_once_with("mooncake_send", 1)
         manager.request_status[42] = KVPoll.Success
+        # Removing a chunk from the test queue did not drain its native write.
+        # The queued owner must delay both completion and its trace finish.
+        self.assertEqual(sender.poll(), KVPoll.Transferring)
+        trace.trace_req_finish.assert_not_called()
+        manager._staging_outstanding.pop(42)
         self.assertEqual(sender.poll(), KVPoll.Success)
         self.assertEqual(sender.poll(), KVPoll.Success)
         trace.trace_req_finish.assert_called_once()
