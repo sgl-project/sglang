@@ -1129,6 +1129,9 @@ class Envs:
     SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
     # Kimi-K3 FlyDSL operators: "auto" (in-tree, then aiter), "sglang" or "aiter".
     SGLANG_K3_FLYDSL_SOURCE = EnvStr("auto")
+    # Kimi-K3 MLA decode: write the identity-RoPE Q and latent KV cache in one launch,
+    # AITER on gfx950 and AITER Triton elsewhere, instead of the split chain.
+    SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION = EnvBool(False)
     # On gfx95x with SGLANG_USE_AITER=1, quantize the BF16 Qwen3.5/3.8 GDN
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
@@ -1166,6 +1169,12 @@ class Envs:
     SGLANG_AITER_MLA_VERIFY_BACKEND = EnvStr("asm")
     # Let aiter plan the KV splits for the asm persistent MLA decode.
     SGLANG_AITER_MLA_AUTO_KV_SPLITS = EnvBool(False)
+    # gfx950 h12 fp8 MLA: decode and short verify on the persistent fp8-Q asm kernel,
+    # this backend only; 2-4 token windows stay off until ROCm/aiter#7007 is fixed.
+    SGLANG_OPT_HIP_MLA_FP8_Q_ASM = EnvBool(False)
+    # Widest verify window (1-8) that SGLANG_OPT_HIP_MLA_FP8_Q_ASM takes; on MI355X,
+    # aiter's folded 5-8 token kernel beats Gluon only from about 128K context.
+    SGLANG_OPT_HIP_MLA_FP8_Q_ASM_MAX_QLEN = EnvInt(4)
     # Run gfx942 block-FP8 linears with the AITER CK blockscale GEMM instead of Triton.
     SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK = EnvBool(True)
 
