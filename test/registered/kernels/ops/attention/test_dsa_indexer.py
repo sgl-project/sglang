@@ -255,6 +255,7 @@ class MockModelRunner:
             index_head_dim=self.config["index_head_dim"],
             enable_memory_saver=False,
             kv_cache_dim=self.config["kv_lora_rank"] + self.config["qk_rope_head_dim"],
+            use_fp4_indexer=self.config.get("use_fp4_indexer", False),
         )
 
         # Required by backend with DSA-specific attributes
@@ -1393,6 +1394,9 @@ class TestDSAIndexer(CustomTestCase):
                 backend = object.__new__(DeepseekSparseAttnBackend)
                 backend.device = self.device
                 backend.physical_page_size = 64
+                backend.real_page_span = 64
+                backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
+                backend.dsa_shards_index_k = False
                 backend.hisparse_coordinator = None
                 backend.speculative_num_draft_tokens = 0
                 backend.use_fused_topk = True

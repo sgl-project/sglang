@@ -105,13 +105,14 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
@@ -141,7 +142,6 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
     rank0_log,
-    set_weight_attrs,
 )
 
 if TYPE_CHECKING:
@@ -943,7 +943,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers import get_config
+            from sglang.srt.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,

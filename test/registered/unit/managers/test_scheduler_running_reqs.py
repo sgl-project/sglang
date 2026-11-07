@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -22,6 +23,7 @@ from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
+    CheckPhase,
     SchedulerInvariantChecker,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -139,7 +141,7 @@ class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPhase.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
@@ -388,6 +390,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
@@ -399,6 +402,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()
