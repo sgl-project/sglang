@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import math
+from collections import deque
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -108,6 +109,10 @@ class ChebyshevForecaster(nn.Module):
     Keeps a sliding window of (step, flattened_feature) pairs from recent *real*
     DiT forwards. On predict(), fits ridge regression coefficients for Chebyshev
     bases T_0..T_M on normalized time, then evaluates at the requested step.
+
+    Features are stored in their own dtype and appended per real forward, so
+    memory is ``min(updates, K) * numel * itemsize``; a video DiT feature is
+    hundreds of MB, which rules out a preallocated fp32 ``(K, numel)`` buffer.
     """
 
     def __init__(
@@ -124,14 +129,11 @@ class ChebyshevForecaster(nn.Module):
         self.K = K
         self.lam = lam
         self.num_steps = num_steps
-        # Preallocated (K,) / (K, N) ring buffer, written in place by update().
-        self.register_buffer("t_buf", torch.empty(0))
-        self._H_buf: Optional[torch.Tensor] = None
-        self._write_idx = 0
-        self._count = 0
+        # Oldest first; deque(maxlen=K) evicts the oldest pair on overflow.
+        self._t: deque[float] = deque(maxlen=K)
+        self._h: deque[torch.Tensor] = deque(maxlen=K)
         self._shape: Optional[torch.Size] = feature_shape
         self._feature_dtype: Optional[torch.dtype] = None
-        self._coef: Optional[torch.Tensor] = None
         self.device_ref = device
         self._tau_scale = 2.0 / float(self.num_steps) if self.num_steps != 0 else 0.0
 
@@ -158,88 +160,68 @@ class ChebyshevForecaster(nn.Module):
             cols.append(2 * taus * cols[-1] - cols[-2])
         return torch.cat(cols[: self.M + 1], dim=1)
 
+    @property
+    def device(self) -> Optional[torch.device]:
+        return self._h[-1].device if self._h else self.device_ref
+
+    @torch.no_grad()
     def update(self, t: float | torch.Tensor, h: torch.Tensor) -> None:
         device = self.device_ref or h.device
-        t_tensor = torch.as_tensor(t, dtype=torch.float32, device=device)
         h_flat, shape = _flatten(h)
         if self._feature_dtype is None:
             self._feature_dtype = h_flat.dtype
-        h_flat = h_flat.to(device).to(torch.float32)
         if self._shape is None:
             self._shape = shape
         else:
             assert shape == self._shape, "Spectrum feature shape must remain constant"
 
-        if self._H_buf is None:
-            # Preallocate the ring buffer once the flattened feature size is known
-            self.t_buf = torch.zeros(self.K, dtype=torch.float32, device=device)
-            self._H_buf = torch.zeros(
-                self.K, h_flat.shape[1], dtype=torch.float32, device=device
-            )
+        self._t.append(float(t))
+        # Copy: the caller keeps using (and may overwrite) the block output.
+        self._h.append(h_flat[0].to(device=device, copy=True))
 
-        self.t_buf[self._write_idx] = t_tensor
-        self._H_buf[self._write_idx] = h_flat[0]
-        self._write_idx = (self._write_idx + 1) % self.K
-        self._count = min(self._count + 1, self.K)
-
-        # Invalidate cached ridge coefficients; will be refit on next predict()
-        self._coef = None
-
-    def _recent(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
-        """Return the last `min(n, count)` valid (t, h) entries in chronological
-        order (oldest first, most recent last).
-
-        Only used by the discrete Taylor blend, which needs true temporal
-        order for its finite differences (unlike the ridge fit, see
-        `_fit_if_needed`). `n` is small (<= taylor_order + 1), so even the
-        rare wraparound `cat` below is cheap.
+    def _recent(self, n: int) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        """Return the last `min(n, count)` (t, h) pairs, oldest first, with h
+        upcast to fp32 for the discrete Taylor blend's finite differences.
         """
-        count = min(self._count, n)
-        start = (self._write_idx - count) % self.K
-        if start + count <= self.K:
-            # Contiguous window -- cheap view, no copy.
-            return self.t_buf[start : start + count], self._H_buf[start : start + count]
-        # Wraps past the end of the physical buffer -- must reorder.
-        tail = self.K - start
-        t = torch.cat([self.t_buf[start:], self.t_buf[: count - tail]])
-        h = torch.cat([self._H_buf[start:], self._H_buf[: count - tail]])
+        count = min(len(self._h), n)
+        t = torch.tensor(
+            list(self._t)[-count:], dtype=torch.float32, device=self.device
+        )
+        h = [x.float() for x in list(self._h)[-count:]]
         return t, h
 
     def ready(self) -> bool:
-        return self._count >= 1
+        return len(self._h) >= 1
 
-    def _fit_if_needed(self) -> None:
-        """Fit ridge regression coefficients on cached (t, h) pairs if not cached."""
-        if self._coef is not None:
-            return
-        assert self.ready()
-        assert self._H_buf is not None
-        assert self._feature_dtype is not None
-        feature_dtype = self._feature_dtype
-        t, h = self.t_buf[: self._count], self._H_buf[: self._count]
-        taus = self._taus(t)
+    def _history_weights(self, t_star: torch.Tensor) -> torch.Tensor:
+        """Weights ``a`` (count,) such that the ridge prediction at ``t_star`` is
+        ``a @ H``: ``x* (X^T X + lam I)^-1 X^T H`` regrouped, so the (P, numel)
+        coefficient matrix is never materialized.
+        """
+        t = torch.tensor(list(self._t), dtype=torch.float32, device=t_star.device)
         # Ridge solve in fp32; autocast would keep matmuls in bf16 and break
         # torch.cholesky_solve dtype requirements.
-        with torch.autocast(device_type=self._H_buf.device.type, enabled=False):
-            x = self._build_design(taus).to(torch.float32)
+        with torch.autocast(device_type=t_star.device.type, enabled=False):
+            x = self._build_design(self._taus(t))
+            x_star = self._build_design(self._taus(t_star)[None])
             p = x.shape[1]
             lam_i = self.lam * torch.eye(p, device=x.device, dtype=x.dtype)
-            xt = x.transpose(0, 1)
-            xtx = xt @ x + lam_i
-            xth = xt @ h
-            self._coef = _ridge_cholesky_solve(xtx, xth).to(feature_dtype)
+            xtx = x.transpose(0, 1) @ x + lam_i
+            return (x @ _ridge_cholesky_solve(xtx, x_star.transpose(0, 1)))[:, 0]
 
     @torch.no_grad()
     def predict(self, t_star: float | torch.Tensor) -> torch.Tensor:
         assert self._shape is not None
-        device = self.t_buf.device
+        assert self.ready()
+        assert self._feature_dtype is not None
+        device = self.device
         t_star = torch.as_tensor(t_star, dtype=torch.float32, device=device)
-        self._fit_if_needed()
-        assert self._coef is not None
-        tau_star = self._taus(t_star)
-        x_star = self._build_design(tau_star[None]).to(self._coef.dtype)
-        h_flat = x_star @ self._coef
-        return _unflatten(h_flat, self._shape)
+        a = self._history_weights(t_star)
+        # fp32 accumulator, one history row at a time: no fp32 copy of history.
+        out = torch.zeros(self._h[0].shape, dtype=torch.float32, device=device)
+        for k, h_k in enumerate(self._h):
+            out.addcmul_(h_k, a[k : k + 1])
+        return _unflatten(out.to(self._feature_dtype), self._shape)
 
 
 class SpectrumForecaster(nn.Module):
@@ -264,7 +246,7 @@ class SpectrumForecaster(nn.Module):
     @torch.no_grad()
     def _local_taylor_discrete(self, t_star: torch.Tensor) -> torch.Tensor:
         """Predict hidden state at t_star using discrete Taylor expansion from recent real steps."""
-        assert self.cheb._H_buf is not None
+        assert self.cheb.ready()
         assert self.cheb._shape is not None
         assert self.cheb._feature_dtype is not None
         feature_dtype = self.cheb._feature_dtype
@@ -292,7 +274,7 @@ class SpectrumForecaster(nn.Module):
     @torch.no_grad()
     def predict(self, t_star: float | torch.Tensor) -> torch.Tensor:
         """Blend Chebyshev regression and local Taylor predictions."""
-        device = self.cheb.t_buf.device
+        device = self.cheb.device
         t_star = torch.as_tensor(t_star, dtype=torch.float32, device=device)
         if self.w >= 1.0:
             return self.cheb.predict(t_star)
