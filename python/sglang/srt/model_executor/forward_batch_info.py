@@ -55,6 +55,7 @@ from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
     ForwardBatchDeepSeekMHAMixin,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
+from sglang.srt.model_executor.sparse_query import SparseQueryMetadata
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -587,6 +588,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # dLLM committed positions are immutable, including literal mask-token IDs.
     # None when no request in the batch has a literal mask ID.
     dllm_prompt_mask: Optional[torch.Tensor] = None
+
+    # Selective prefill retains full KV lengths; query rows and writes are compacted.
+    sparse_query: Optional[SparseQueryMetadata] = None
 
     # For extend
     extend_num_tokens: Optional[int] = None
