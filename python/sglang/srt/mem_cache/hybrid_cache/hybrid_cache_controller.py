@@ -26,6 +26,9 @@ from sglang.srt.managers.cache_controller import (
 from sglang.srt.managers.cache_controller import (
     StorageOperation as BaseStorageOperation,
 )
+from sglang.srt.managers.cache_controller import (
+    check_dcp_l3_extra_pool,
+)
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.mem_cache.hicache_storage import (
@@ -503,10 +506,15 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        storage_attached = self.enable_storage and self.storage_backend is not None
+        if storage_attached and getattr(self.storage_host_pool, "dcp_size", 1) > 1:
+            # Sidecars added after attach (e.g. the DFLASH draft) miss the
+            # attach-time DCP check.
+            check_dcp_l3_extra_pool(entry, self.storage_host_pool)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
-        if self.enable_storage and self.storage_backend is not None:
+        if storage_attached:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
