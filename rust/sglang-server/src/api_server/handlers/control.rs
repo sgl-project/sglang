@@ -2,6 +2,7 @@
 //! fanned out to every DP rank, and the relay that serves another listener's
 //! request on the local scheduler.
 
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::message::ids::Rid;
@@ -185,19 +186,22 @@ impl CoreHandle {
 
     /// Relay an abort `/abort_request` served locally to every other DP
     /// rank's listener, as the scheduler's own `AbortReq` for the same public
-    /// `rid` (every request with `abort_all`). Only the listener of DP rank
-    /// 0, the one serving the deployment's base URL, relays: each listener
-    /// feeds only its own DP group and tracks only its own generations, so
-    /// an abort sent to the base URL reaches the rest only this way; each
-    /// serves it on its own registry ([`CoreHandle::forward_control_req`])
-    /// and never relays it again. A no-op abort (no rid, not `abort_all`) is
+    /// `rid` (every request with `abort_all`). The listener of DP rank 0, the
+    /// one serving the deployment's base URL, relays, and so does any other
+    /// listener while it has relayed a generation to another rank
+    /// (`http::dp_relay`): each listener feeds only its own DP group and
+    /// tracks only its own generations, so an abort sent to the base URL, or
+    /// to the listener a generation was relayed from, reaches the rest only
+    /// this way; each serves it on its own registry
+    /// ([`CoreHandle::forward_control_req`]) and never relays it again. A no-op abort (no rid, not `abort_all`) is
     /// not relayed, as it is not served. Best effort: the caller has already
     /// answered its client; each post is bounded by [`PEER_ABORT_TIMEOUT`],
     /// at most [`PEER_ABORT_MAX_IN_FLIGHT`] are in flight at once, and one
     /// line logs the ranks an abort did not reach.
     pub(crate) async fn abort_peers(&self, rid: String, abort_all: bool) {
         let peers = &self.inner.peer_endpoints;
-        if self.inner.dp_rank != 0 || peers.is_empty() || (rid.is_empty() && !abort_all) {
+        let relays = self.inner.dp_rank == 0 || self.inner.relayed.load(Ordering::SeqCst) > 0;
+        if !relays || peers.is_empty() || (rid.is_empty() && !abort_all) {
             return;
         }
         // `abort_all` names no request, but the relay routes its reply by the
@@ -566,7 +570,8 @@ mod tests {
         }
         assert!(intake_rx.try_recv().is_err() && abort_rx.try_recv().is_err());
 
-        // Another rank's listener serves its own abort and relays nothing.
+        // Another rank's listener serves its own abort and relays nothing,
+        // unless it relayed a generation to another rank meanwhile.
         let seen_by_rank_1 = Arc::new(Mutex::new(Vec::new()));
         let (handle, _intake_rx, _abort_rx) = handle_at(
             1,
@@ -575,6 +580,14 @@ mod tests {
         handle.abort_peers("client-rid".into(), false).await;
         handle.abort_peers(String::new(), true).await;
         assert!(seen_by_rank_1.lock().unwrap().is_empty());
+        let relayed = handle.track_relayed();
+        handle.abort_peers("relayed-rid".into(), false).await;
+        drop(relayed);
+        handle.abort_peers("client-rid".into(), false).await;
+        assert!(matches!(
+            seen_by_rank_1.lock().unwrap().as_slice(),
+            [ControlRequest::AbortReq(abort)] if abort.get_rid() == "relayed-rid"
+        ));
 
         // At most `PEER_ABORT_MAX_IN_FLIGHT` posts run at once: one more
         // peer than that, each answering after a second, takes two.

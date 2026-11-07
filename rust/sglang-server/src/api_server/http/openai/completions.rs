@@ -18,6 +18,7 @@ use sglang_processor::dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 
+use super::super::dp_relay::HintRoute;
 use super::pd_routing::PDRoutingFields;
 use super::{
     AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
@@ -155,10 +156,17 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::Completions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);

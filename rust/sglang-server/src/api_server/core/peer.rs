@@ -113,6 +113,9 @@ pub(crate) fn peer_endpoints(
         headers.insert(http::header::AUTHORIZATION, value);
     }
     let client = reqwest::Client::builder()
+        // Peers are this engine's own listeners: never relay through the
+        // HTTP proxy the process may inherit.
+        .no_proxy()
         .connect_timeout(CONNECT_TIMEOUT)
         .default_headers(headers)
         .build()
@@ -260,5 +263,68 @@ mod tests {
             .map(|status| status.message)
             .collect();
         assert_eq!(messages, ["from 0", "local", "from 2"]);
+    }
+
+    /// Peers are this engine's own listeners, so the relay must not go
+    /// through an HTTP proxy the process inherits: CI and some hosts set
+    /// `http_proxy`, and a proxy that refuses or cannot reach the peer turns
+    /// every DP control fan-out (`/server_info`, `/flush_cache`, ...) into its
+    /// error. reqwest reads the proxy variables when a client is built and they
+    /// are process-wide, so the check runs alone in a child test process.
+    #[test]
+    fn control_peers_bypass_an_inherited_http_proxy() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api_server::core::peer::tests::proxied_peer_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(PROXY_CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{log}");
+        assert!(
+            log.contains("1 passed"),
+            "the child test did not run: {log}"
+        );
+    }
+
+    const PROXY_CHILD_ENV: &str = "SGLANG_TEST_PEER_PROXY_CHILD";
+
+    #[tokio::test]
+    #[ignore = "run by control_peers_bypass_an_inherited_http_proxy in its own process"]
+    async fn proxied_peer_child() {
+        if std::env::var_os(PROXY_CHILD_ENV).is_none() {
+            return;
+        }
+        // A proxy that refuses everything, as a forward proxy refuses a
+        // destination outside its allowlist.
+        let proxy = Router::new().fallback(|| async { StatusCode::FORBIDDEN });
+        let proxy_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_url = format!("http://{}", proxy_listener.local_addr().unwrap());
+        tokio::spawn(axum::serve(proxy_listener, proxy).into_future());
+        // SAFETY: this test runs alone in its own process.
+        unsafe {
+            for name in ["no_proxy", "NO_PROXY"] {
+                std::env::remove_var(name);
+            }
+            for name in ["http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY"] {
+                std::env::set_var(name, &proxy_url);
+            }
+        }
+        let (url, seen) = peer_listener((StatusCode::OK, Bytes::from_static(b"reply"))).await;
+        let info = DeploymentInfo {
+            rust_server_endpoints: vec![RustServerEndpoint {
+                dp_rank: 1,
+                endpoint: url,
+            }],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0, &ApiKeys::default()).unwrap();
+        let reply = peers[0].control(&build).await.remove(0).outcome;
+        assert_eq!(reply.unwrap(), "reply");
+        assert_eq!(seen.lock().unwrap().len(), 1);
     }
 }
