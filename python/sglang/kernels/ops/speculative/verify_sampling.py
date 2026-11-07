@@ -3,7 +3,7 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
-from sglang.srt.utils import is_cuda, is_musa, is_npu
+from sglang.srt.utils import is_cuda, is_musa, is_npu, is_xpu
 
 if is_npu():
     try:
@@ -28,6 +28,11 @@ else:
             from sgl_kernel import tree_speculative_sampling_target_only
         except Exception:
             tree_speculative_sampling_target_only = None
+    elif is_xpu():
+        # Top-1 chains only; EAGLE verify keeps XPU tree drafts on greedy.
+        from sglang.kernels.ops.speculative.reject_sampling import (
+            chain_speculative_sampling_target_only_triton as tree_speculative_sampling_target_only,
+        )
     else:
         tree_speculative_sampling_target_only = None
 
