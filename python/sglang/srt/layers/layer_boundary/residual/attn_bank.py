@@ -42,8 +42,10 @@ class AttnBank:
     def __init__(self):
         self.current = None
 
-    def open(self, hidden_states, block_num, inherited=None) -> AttnResidual:
-        self.current = AttnResidual(hidden_states, block_num, inherited)
+    def open(
+        self, hidden_states, block_num, inherited=None, reuse=True
+    ) -> AttnResidual:
+        self.current = AttnResidual(hidden_states, block_num, inherited, reuse)
         return self.current
 
     def close(self) -> None:
