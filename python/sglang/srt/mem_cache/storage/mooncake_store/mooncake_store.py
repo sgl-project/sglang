@@ -1474,12 +1474,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        page_size = (
-            self.storage_config.logical_page_size
-            if self.dcp_size > 1
-            else self.mem_pool_host.page_size
-        )
-        assert len(keys) == len(host_indices) // page_size
+        assert len(keys) == len(host_indices) // self.mem_pool_host.logical_page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
