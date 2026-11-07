@@ -559,6 +559,47 @@ impl RouterTrait for RouterManager {
         }
     }
 
+    async fn route_chat_with_extensions(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        extensions: &serde_json::Map<String, Value>,
+    ) -> Response {
+        // Same model resolution and router selection as `route_chat`, but
+        // forwards the preserved extension fields to the selected router.
+        let effective_model_id = if self.enable_igw {
+            // Use provided model_id or fall back to body.model
+            let model = model_id.or(Some(&body.model));
+            match self.resolve_model_id(model) {
+                Ok(id) => Some(id),
+                Err(err_response) => return *err_response,
+            }
+        } else {
+            None
+        };
+
+        let router =
+            self.select_router_for_request(headers, effective_model_id.as_deref().or(model_id));
+
+        if let Some(router) = router {
+            router
+                .route_chat_with_extensions(
+                    headers,
+                    body,
+                    effective_model_id.as_deref().or(model_id),
+                    extensions,
+                )
+                .await
+        } else {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Model '{}' not found or no router available", body.model),
+            )
+                .into_response()
+        }
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,

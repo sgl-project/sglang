@@ -362,117 +362,13 @@ impl OpenAIRouter {
             }
         }
     }
-}
 
-#[async_trait::async_trait]
-impl crate::routers::RouterTrait for OpenAIRouter {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    async fn health_generate(&self, _req: Request<Body>) -> Response {
-        let external_workers = self.external_workers();
-        if external_workers.is_empty() {
-            return error_responses::service_unavailable("No external workers registered");
-        }
-
-        let (healthy, unhealthy): (Vec<_>, Vec<_>) =
-            external_workers.iter().partition(|w| w.is_healthy());
-
-        if unhealthy.is_empty() {
-            (
-                StatusCode::OK,
-                format!("OK - {} workers healthy", healthy.len()),
-            )
-                .into_response()
-        } else {
-            let unhealthy_info: Vec<_> = unhealthy
-                .iter()
-                .map(|w| format!("{} ({})", w.model_id(), w.url()))
-                .collect();
-            error_responses::service_unavailable(format!(
-                "{}/{} workers unhealthy: {}",
-                unhealthy.len(),
-                external_workers.len(),
-                unhealthy_info.join(", ")
-            ))
-        }
-    }
-
-    async fn get_server_info(&self, _req: Request<Body>) -> Response {
-        let stats = self.worker_registry.stats();
-        let external_workers = self.external_workers();
-        let worker_urls: Vec<_> = external_workers.iter().map(|w| w.url()).collect();
-
-        let info = json!({
-            "router_type": "openai",
-            "total_workers": stats.total_workers,
-            "external_workers": external_workers.len(),
-            "healthy_workers": stats.healthy_workers,
-            "total_models": stats.total_models,
-            "worker_urls": worker_urls
-        });
-        (StatusCode::OK, info.to_string()).into_response()
-    }
-
-    async fn get_models(&self, req: Request<Body>) -> Response {
-        let external_workers = self.external_workers();
-        if external_workers.is_empty() {
-            return error_responses::service_unavailable("No external workers registered");
-        }
-
-        let auth_header = extract_auth_header(Some(req.headers()), &None);
-        self.refresh_external_models(auth_header.as_ref()).await;
-
-        let mut all_models = Vec::new();
-        let mut seen_models = HashSet::new();
-
-        for worker in &external_workers {
-            for model_card in worker.models() {
-                let owned_by = model_card
-                    .provider
-                    .as_ref()
-                    .map(|p| format!("{:?}", p).to_lowercase())
-                    .unwrap_or_else(|| "unknown".to_string());
-
-                if seen_models.insert(model_card.id.clone()) {
-                    all_models.push(json!({
-                        "id": &model_card.id,
-                        "object": "model",
-                        "created": 0,
-                        "owned_by": &owned_by,
-                        "aliases": model_card.aliases,
-                        "model_type": format!("{:?}", model_card.model_type),
-                    }));
-                }
-
-                for alias in &model_card.aliases {
-                    if seen_models.insert(alias.clone()) {
-                        all_models.push(json!({
-                            "id": alias,
-                            "object": "model",
-                            "created": 0,
-                            "owned_by": &owned_by,
-                            "primary_model": &model_card.id,
-                        }));
-                    }
-                }
-            }
-        }
-
-        let response_json = json!({
-            "object": "list",
-            "data": all_models
-        });
-
-        (StatusCode::OK, Json(response_json)).into_response()
-    }
-
-    async fn route_chat(
+    async fn route_chat_inner(
         &self,
         headers: Option<&HeaderMap>,
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
+        extensions: &serde_json::Map<String, Value>,
     ) -> Response {
         let start = Instant::now();
         let model = model_id.unwrap_or(body.model.as_str());
@@ -522,6 +418,14 @@ impl crate::routers::RouterTrait for OpenAIRouter {
                 return error_responses::bad_request(format!("Failed to serialize request: {}", e));
             }
         };
+
+        // Merge preserved top-level extension fields (e.g. `cache_salt`)
+        // before the provider transform runs, so providers keep final say
+        // over the forwarded payload shape. See
+        // https://github.com/sgl-project/sglang/issues/48793
+        if !extensions.is_empty() {
+            payload = crate::routers::merge_unknown_request_fields(payload, extensions);
+        }
 
         let provider = self.get_provider_arc_for_worker(worker.as_ref(), model_id);
         if let Err(e) = provider.transform_request(&mut payload, Endpoint::Chat) {
@@ -690,6 +594,132 @@ impl crate::routers::RouterTrait for OpenAIRouter {
         }
 
         response
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::routers::RouterTrait for OpenAIRouter {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn health_generate(&self, _req: Request<Body>) -> Response {
+        let external_workers = self.external_workers();
+        if external_workers.is_empty() {
+            return error_responses::service_unavailable("No external workers registered");
+        }
+
+        let (healthy, unhealthy): (Vec<_>, Vec<_>) =
+            external_workers.iter().partition(|w| w.is_healthy());
+
+        if unhealthy.is_empty() {
+            (
+                StatusCode::OK,
+                format!("OK - {} workers healthy", healthy.len()),
+            )
+                .into_response()
+        } else {
+            let unhealthy_info: Vec<_> = unhealthy
+                .iter()
+                .map(|w| format!("{} ({})", w.model_id(), w.url()))
+                .collect();
+            error_responses::service_unavailable(format!(
+                "{}/{} workers unhealthy: {}",
+                unhealthy.len(),
+                external_workers.len(),
+                unhealthy_info.join(", ")
+            ))
+        }
+    }
+
+    async fn get_server_info(&self, _req: Request<Body>) -> Response {
+        let stats = self.worker_registry.stats();
+        let external_workers = self.external_workers();
+        let worker_urls: Vec<_> = external_workers.iter().map(|w| w.url()).collect();
+
+        let info = json!({
+            "router_type": "openai",
+            "total_workers": stats.total_workers,
+            "external_workers": external_workers.len(),
+            "healthy_workers": stats.healthy_workers,
+            "total_models": stats.total_models,
+            "worker_urls": worker_urls
+        });
+        (StatusCode::OK, info.to_string()).into_response()
+    }
+
+    async fn get_models(&self, req: Request<Body>) -> Response {
+        let external_workers = self.external_workers();
+        if external_workers.is_empty() {
+            return error_responses::service_unavailable("No external workers registered");
+        }
+
+        let auth_header = extract_auth_header(Some(req.headers()), &None);
+        self.refresh_external_models(auth_header.as_ref()).await;
+
+        let mut all_models = Vec::new();
+        let mut seen_models = HashSet::new();
+
+        for worker in &external_workers {
+            for model_card in worker.models() {
+                let owned_by = model_card
+                    .provider
+                    .as_ref()
+                    .map(|p| format!("{:?}", p).to_lowercase())
+                    .unwrap_or_else(|| "unknown".to_string());
+
+                if seen_models.insert(model_card.id.clone()) {
+                    all_models.push(json!({
+                        "id": &model_card.id,
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": &owned_by,
+                        "aliases": model_card.aliases,
+                        "model_type": format!("{:?}", model_card.model_type),
+                    }));
+                }
+
+                for alias in &model_card.aliases {
+                    if seen_models.insert(alias.clone()) {
+                        all_models.push(json!({
+                            "id": alias,
+                            "object": "model",
+                            "created": 0,
+                            "owned_by": &owned_by,
+                            "primary_model": &model_card.id,
+                        }));
+                    }
+                }
+            }
+        }
+
+        let response_json = json!({
+            "object": "list",
+            "data": all_models
+        });
+
+        (StatusCode::OK, Json(response_json)).into_response()
+    }
+
+    async fn route_chat(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_chat_inner(headers, body, model_id, &serde_json::Map::new())
+            .await
+    }
+
+    async fn route_chat_with_extensions(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        extensions: &serde_json::Map<String, Value>,
+    ) -> Response {
+        self.route_chat_inner(headers, body, model_id, extensions)
+            .await
     }
 
     async fn route_responses(

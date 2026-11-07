@@ -7,7 +7,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{rejection::JsonRejection, FromRequest, Path, Query, Request, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -21,6 +21,7 @@ use smg_mesh::{
 };
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use validator::Validate;
 use wfaas::LoggingSubscriber;
 
 use crate::{
@@ -49,7 +50,7 @@ use crate::{
         rerank::V1RerankReqInput,
         responses::{ResponsesGetParams, ResponsesRequest},
         tokenize::{AddTokenizerRequest, DetokenizeRequest, TokenizeRequest},
-        validated::ValidatedJson,
+        validated::{Normalizable, ValidatedJson},
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
@@ -184,11 +185,79 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    req: Request,
 ) -> Response {
+    // The gateway pins openai-protocol 1.0.0, whose `ChatCompletionRequest`
+    // drops unknown top-level fields (e.g. engine extensions like
+    // `cache_salt`) on deserialization. Parse the raw JSON first so those
+    // fields can be carried alongside the validated typed request and merged
+    // back when forwarding to the worker (see
+    // https://github.com/sgl-project/sglang/issues/48793). Error responses
+    // mirror `ValidatedJson` exactly.
+    let Json(raw) = match Json::<Value>::from_request(req, &state).await {
+        Ok(value) => value,
+        Err(err) => {
+            let error_message = match err {
+                JsonRejection::JsonDataError(e) => format!("Invalid JSON data: {}", e),
+                JsonRejection::JsonSyntaxError(e) => format!("JSON syntax error: {}", e),
+                JsonRejection::MissingJsonContentType(_) => {
+                    "Missing Content-Type: application/json header".to_string()
+                }
+                _ => format!("Failed to parse JSON: {}", err),
+            };
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": error_message,
+                        "type": "invalid_request_error",
+                        "code": "json_parse_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let mut body: ChatCompletionRequest = match serde_json::from_value(raw.clone()) {
+        Ok(body) => body,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": {
+                        "message": format!("Invalid JSON data: {}", e),
+                        "type": "invalid_request_error",
+                        "code": "json_parse_error"
+                    }
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Serialize before normalize(): known fields that normalize() drops
+    // (e.g. deprecated `max_tokens`, migrated to `max_completion_tokens`)
+    // must not be mistaken for extensions.
+    let pre_normalize = serde_json::to_value(&body).unwrap_or(Value::Null);
+    body.normalize();
+    if let Err(validation_errors) = body.validate() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": {
+                    "message": validation_errors.to_string(),
+                    "type": "invalid_request_error",
+                    "code": 400
+                }
+            })),
+        )
+            .into_response();
+    }
+
+    let extensions = crate::routers::extract_unknown_request_fields(&raw, &pre_normalize);
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_extensions(Some(&headers), &body, Some(&body.model), &extensions)
         .await
 }
 
