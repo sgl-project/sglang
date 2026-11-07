@@ -4591,17 +4591,12 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
-            if _is_npu:
-                # TODO check if npu can use cuda triton kernel; mhc_combine is
-                # CUDA-only and the premix collapse is a plain weighted sum.
-                hidden_states = mhc.combine_premix(hidden_states, last_pre)
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-                # The kernel widens each element to fp32 as it loads it.
-                hidden_states = mhc_combine(
-                    pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
-                )
+            # The kernel widens each element to fp32 as it loads it.
+            hidden_states = mhc_combine(
+                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+            )
         else:
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base

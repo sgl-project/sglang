@@ -426,15 +426,6 @@ class TestNpuMhcSeam(unittest.TestCase):
         # arch35's npu_hc_post is batched: a leading batch axis on every operand.
         self.assertEqual(shapes, [(1, 2, self.HIDDEN)])
 
-    def test_combine_premix_is_the_fp32_weighted_sum(self):
-        x = torch.arange(2 * 4 * 3, dtype=torch.float32).reshape(2, 4, 3)
-        pre = torch.tensor(
-            [[0.0, 0.5, 0.25, 0.25], [1.0, 0.0, 0.0, 0.0]], dtype=torch.float32
-        )
-        out = mhc.combine_premix(x, pre)
-        self.assertEqual(out.shape, (2, 3))
-        torch.testing.assert_close(out, (pre.unsqueeze(-1) * x).sum(1))
-
 
 if __name__ == "__main__":
     unittest.main()

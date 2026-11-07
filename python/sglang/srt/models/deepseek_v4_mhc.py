@@ -594,15 +594,6 @@ def _combine(
 # ---------------------------------------------------------------------------
 
 
-def combine_premix(x: torch.Tensor, pre: torch.Tensor) -> torch.Tensor:
-    """Collapse ``[T, mult, H]`` with a pre-mix ``[T, mult]``: ``sum_k pre[k]*x[k]``.
-
-    The device-agnostic counterpart of ``mhc_combine``'s Triton kernel, needed
-    where that kernel does not exist (NPU). Accumulates in fp32 like the kernel.
-    """
-    return (pre.unsqueeze(-1) * x.float()).sum(dim=1).to(x.dtype)
-
-
 def post(
     cfg: HcConfig,
     x: torch.Tensor,

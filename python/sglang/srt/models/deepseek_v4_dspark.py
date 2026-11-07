@@ -963,14 +963,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             if self.hc_pre_from_prev_sublayer:
                 pre, x = x.pre, x.residual
         if self.hc_pre_from_prev_sublayer:
-            if _is_npu:
-                # mhc_combine is CUDA-only; collapse the streams in eager fp32.
-                x = mhc.combine_premix(x, pre)
-            else:
-                from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-                # The kernel widens each element to fp32 as it loads it.
-                x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
+            # The kernel widens each element to fp32 as it loads it.
+            x = mhc_combine(x.flatten(1), pre, self.hc_mult, x.dtype)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
