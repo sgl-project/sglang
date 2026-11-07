@@ -57,6 +57,7 @@ def _make_options(**overrides):
     options = StartupWeightLoadOptions(
         device="cuda",
         is_cuda_platform=True,
+        is_npu=False,
         cuda_graph_enabled=True,
         prefill_cuda_graph_backend=Backend.FULL,
         is_draft_worker=False,
@@ -228,8 +229,12 @@ class TestStartupWeightLoadSelector(CustomTestCase):
         cases = (
             (
                 "non_cuda",
-                dict(options=_make_options(device="cpu", is_cuda_platform=False)),
-                "CUDA only",
+                dict(
+                    options=_make_options(
+                        device="cpu", is_cuda_platform=False, is_npu=False
+                    )
+                ),
+                "CUDA or NPU only",
             ),
             (
                 "graphs_disabled",
