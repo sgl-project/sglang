@@ -169,6 +169,16 @@ class HunyuanDetector(BaseFormatDetector):
         self._in_tool_calls: bool = False
         self._streaming_tool_name: Optional[str] = None
         self._completed_args: Dict[str, Any] = {}
+        self._completed_args_parts: List[str] = []
+        self._completed_args_prefix: str = ""
+        self._last_closed_end: int = 0
+        self._end_tok_scan_pos: int = 0
+        self._av_end_scan_pos: int = 0
+        self._open_av_val_start: int = -1
+        self._partial_key_cache: Optional[str] = None
+        self._partial_key_json: str = ""
+        self._partial_is_str: bool = False
+        self._partial_safe_len: int = 0
         self._streamed_json_len: int = 0
 
     # ------------------------------------------------------------------
@@ -349,6 +359,16 @@ class HunyuanDetector(BaseFormatDetector):
     def _reset_streaming_tool_state(self):
         self._streaming_tool_name = None
         self._completed_args = {}
+        self._completed_args_parts = []
+        self._completed_args_prefix = ""
+        self._last_closed_end = 0
+        self._end_tok_scan_pos = 0
+        self._av_end_scan_pos = 0
+        self._open_av_val_start = -1
+        self._partial_key_cache = None
+        self._partial_key_json = ""
+        self._partial_is_str = False
+        self._partial_safe_len = 0
         self._streamed_json_len = 0
 
     def parse_streaming_increment(
@@ -457,81 +477,82 @@ class HunyuanDetector(BaseFormatDetector):
 
     def _stream_args(self, tools: List[Tool]) -> List[ToolCallItem]:
         """Emit argument-JSON deltas for the currently-open tool call."""
-        is_complete = self.tool_call_end_token in self._buffer
+        search_from = max(0, self._end_tok_scan_pos - len(self.tool_call_end_token) + 1)
+        end_idx = self._buffer.find(self.tool_call_end_token, search_from)
+        is_complete = end_idx != -1
 
         if is_complete:
-            end_idx = self._buffer.find(self.tool_call_end_token)
             args_text = self._buffer[:end_idx]
         else:
+            self._end_tok_scan_pos = len(self._buffer)
             args_text = self._buffer
 
-        # 1. Absorb closed <arg_key>..<arg_value> pairs.
-        last_closed_end = 0
-        for m in self.func_args_regex.finditer(args_text):
-            key, value = m.groups()
-            key = key.strip()
-            if key not in self._completed_args:
-                self._completed_args[key] = self._parse_value(
-                    value, self._streaming_tool_name or "", key, tools
-                )
-            last_closed_end = m.end()
+        # 1. Absorb closed <arg_key>..<arg_value> pairs incrementally.
+        av_search_from = max(
+            self._last_closed_end,
+            self._av_end_scan_pos - len(self.arg_value_end_token) + 1,
+        )
+        new_closed = False
+        if args_text.find(self.arg_value_end_token, av_search_from) != -1:
+            for m in self.func_args_regex.finditer(args_text, self._last_closed_end):
+                key, value = m.groups()
+                key = key.strip()
+                if key not in self._completed_args:
+                    parsed_val = self._parse_value(
+                        value, self._streaming_tool_name or "", key, tools
+                    )
+                    self._completed_args[key] = parsed_val
+                    k_json = json.dumps(key, ensure_ascii=False)
+                    v_json = json.dumps(parsed_val, ensure_ascii=False)
+                    self._completed_args_parts.append(f"{k_json}: {v_json}")
+                self._last_closed_end = m.end()
+                new_closed = True
+        self._av_end_scan_pos = len(args_text)
+
+        if new_closed:
+            self._completed_args_prefix = ", ".join(self._completed_args_parts)
+            self._open_av_val_start = -1
+            self._partial_key_cache = None
+            self._partial_key_json = ""
+            self._partial_is_str = False
+            self._partial_safe_len = 0
 
         # 2. Detect a partial (unclosed) kv pair at the tail.
-        tail = args_text[last_closed_end:]
-        partial_key: Optional[str] = None
-        partial_value: Optional[str] = None
+        if self._open_av_val_start == -1:
+            ak_start = args_text.find(self.arg_key_start_token, self._last_closed_end)
+            if ak_start != -1:
+                ak_end = args_text.find(
+                    self.arg_key_end_token,
+                    ak_start + len(self.arg_key_start_token),
+                )
+                if ak_end != -1:
+                    partial_key = args_text[
+                        ak_start + len(self.arg_key_start_token) : ak_end
+                    ].strip()
+                    av_start = args_text.find(self.arg_value_start_token, ak_end)
+                    if av_start != -1:
+                        self._open_av_val_start = av_start + len(
+                            self.arg_value_start_token
+                        )
+                        self._partial_key_cache = partial_key
+                        self._partial_key_json = json.dumps(
+                            partial_key, ensure_ascii=False
+                        )
+                        self._partial_is_str = self._is_only_string_type(
+                            self._streaming_tool_name or "", partial_key, tools
+                        )
+                        self._partial_safe_len = 0
 
-        ak_start = tail.find(self.arg_key_start_token)
-        if ak_start != -1:
-            ak_end = tail.find(
-                self.arg_key_end_token, ak_start + len(self.arg_key_start_token)
-            )
-            if ak_end != -1:
-                partial_key = tail[
-                    ak_start + len(self.arg_key_start_token) : ak_end
-                ].strip()
-                av_start = tail.find(self.arg_value_start_token, ak_end)
-                if av_start != -1 and self._is_only_string_type(
-                    self._streaming_tool_name or "", partial_key, tools
-                ):
-                    partial_value = tail[av_start + len(self.arg_value_start_token) :]
+        has_partial_str = self._open_av_val_start != -1 and self._partial_is_str
 
         # Avoid emitting a lone "{" before any arg content is knowable.
-        if not is_complete and not self._completed_args and partial_value is None:
+        if not is_complete and not self._completed_args and not has_partial_str:
             return []
-
-        # 3. Build the JSON snapshot manually to control streaming boundaries.
-        snapshot_parts: List[str] = []
-        for k, v in self._completed_args.items():
-            k_json = json.dumps(k, ensure_ascii=False)
-            v_json = json.dumps(v, ensure_ascii=False)
-            snapshot_parts.append(f"{k_json}: {v_json}")
-
-        if partial_key is not None and partial_value is not None:
-            # Hold back chars that could be a partial </arg_value> marker so
-            # that a `<` starting the end-tag doesn't leak into the streamed
-            # JSON string value.
-            hold = self._ends_with_partial_token(
-                partial_value, self.arg_value_end_token
-            )
-            safe_value = partial_value[:-hold] if hold else partial_value
-            k_json = json.dumps(partial_key, ensure_ascii=False)
-            escaped = (
-                safe_value.replace("\\", "\\\\")
-                .replace('"', '\\"')
-                .replace("\n", "\\n")
-                .replace("\r", "\\r")
-                .replace("\t", "\\t")
-            )
-            # No closing `"` here — it's appended when the value closes.
-            snapshot_parts.append(f'{k_json}: "{escaped}')
-
-        snapshot = "{" + ", ".join(snapshot_parts) + "}"
 
         argument_diff: Optional[str] = None
 
         if is_complete:
-            final_json = json.dumps(self._completed_args, ensure_ascii=False)
+            final_json = "{" + self._completed_args_prefix + "}"
             if self._streamed_json_len < len(final_json):
                 argument_diff = final_json[self._streamed_json_len :]
             self._streamed_json_len = len(final_json)
@@ -543,15 +564,57 @@ class HunyuanDetector(BaseFormatDetector):
                 "arguments": dict(self._completed_args),
             }
 
-            end_idx = self._buffer.find(self.tool_call_end_token)
             self._buffer = self._buffer[end_idx + len(self.tool_call_end_token) :]
             self._reset_streaming_tool_state()
+        elif has_partial_str:
+            # Hold back chars that could be a partial </arg_value> marker so
+            # that a `<` starting the end-tag doesn't leak into the streamed
+            # JSON string value.
+            win_start = max(
+                self._open_av_val_start,
+                len(args_text) - len(self.arg_value_end_token),
+            )
+            hold = self._ends_with_partial_token(
+                args_text[win_start:], self.arg_value_end_token
+            )
+            safe_end = len(args_text) - hold
+            safe_start = self._open_av_val_start + self._partial_safe_len
+            new_safe = args_text[safe_start:safe_end] if safe_end > safe_start else ""
+            if safe_end > safe_start:
+                self._partial_safe_len = safe_end - self._open_av_val_start
+
+            open_prefix = (
+                "{"
+                + (
+                    f"{self._completed_args_prefix}, "
+                    if self._completed_args_prefix
+                    else ""
+                )
+                + f'{self._partial_key_json}: "'
+            )
+            new_escaped = (
+                new_safe.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+                .replace("\r", "\\r")
+                .replace("\t", "\\t")
+                if new_safe
+                else ""
+            )
+
+            if self._streamed_json_len < len(open_prefix):
+                combined = open_prefix + new_escaped
+                argument_diff = combined[self._streamed_json_len :]
+                self._streamed_json_len = len(combined)
+            elif new_escaped:
+                argument_diff = new_escaped
+                self._streamed_json_len += len(new_escaped)
         else:
             # Withhold the trailing "}" while the tool call is still open.
-            end = len(snapshot) - 1
-            if end > self._streamed_json_len:
-                argument_diff = snapshot[self._streamed_json_len : end]
-                self._streamed_json_len = end
+            open_snapshot = "{" + self._completed_args_prefix
+            if len(open_snapshot) > self._streamed_json_len:
+                argument_diff = open_snapshot[self._streamed_json_len :]
+                self._streamed_json_len = len(open_snapshot)
 
         if argument_diff:
             self.streamed_args_for_tool[self.current_tool_id] += argument_diff

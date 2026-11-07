@@ -57,6 +57,8 @@ class GigaChat35Detector(BaseFormatDetector):
         self.eot_token = _GCML_CLOSE
         self._tool_region_started: bool = False
         self._emitted_invokes: int = 0
+        self._scan_pos: int = 0
+        self._eot_pos: int = -1
 
     def has_tool_call(self, text: str) -> bool:
         """True if the text contains the GCML tool-call opening marker."""
@@ -104,6 +106,8 @@ class GigaChat35Detector(BaseFormatDetector):
             leading, _, rest = current_text.partition(self.bot_token)
             self._tool_region_started = True
             self._buffer = self.bot_token + rest
+            self._scan_pos = len(self.bot_token)
+            self._eot_pos = -1
             current_text = self._buffer
             if leading:
                 return StreamingParseResult(normal_text=leading)
@@ -111,12 +115,23 @@ class GigaChat35Detector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
-        _, _, after_open = current_text.partition(self.bot_token)
-        invokes_body, _, _ = after_open.partition(self.eot_token)
-        matches = list(_GCML_INVOKE_RE.finditer(invokes_body))
+        if self._eot_pos == -1:
+            eot_search = max(
+                len(self.bot_token), self._scan_pos - len(self.eot_token) + 1
+            )
+            found_eot = current_text.find(self.eot_token, eot_search)
+            if found_eot != -1:
+                self._eot_pos = found_eot
+
+        limit = self._eot_pos if self._eot_pos != -1 else len(current_text)
+        if "</｜GCML｜invoke>" not in current_text[self._scan_pos : limit]:
+            return StreamingParseResult(calls=[])
+
         calls: List[ToolCallItem] = []
-        for i in range(self._emitted_invokes, len(matches)):
-            m = matches[i]
+        for m in _GCML_INVOKE_RE.finditer(current_text, self._scan_pos, limit):
+            i = self._emitted_invokes
+            self._emitted_invokes += 1
+            self._scan_pos = m.end()
             name = m.group("name")
             if name not in self._tool_indices:
                 logger.warning(f"[GigaChat35] undefined function call: {name}")
@@ -131,7 +146,6 @@ class GigaChat35Detector(BaseFormatDetector):
                 self.streamed_args_for_tool.append("")
             self.streamed_args_for_tool[i] = args_json
 
-        self._emitted_invokes = len(matches)
         return StreamingParseResult(calls=calls)
 
     def finish(self, tools: List[Tool]) -> StreamingParseResult:
