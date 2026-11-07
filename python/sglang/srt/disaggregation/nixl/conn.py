@@ -8,7 +8,7 @@ import struct
 import threading
 import time
 import uuid
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple
 
 import msgspec
 import numpy as np
@@ -650,6 +650,14 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         self._num_slots_src: int = 0
         self._peer_reload_lock = threading.Lock()
         self._peer_reload_times: Dict[str, float] = {}
+        # peer_name -> a later registration from the same decode process; the
+        # transfer worker rebuilds the peer's endpoint from it before posting.
+        self._peer_refresh_pending: Dict[str, KVArgsRegisterInfo] = {}
+        # (decode ip, gpu, attention-tp rank, dcp rank) -> peer_name, to spot a
+        # decode process that restarted under a new agent name and port.
+        self._peer_by_endpoint: Dict[Tuple[str, int, int, int], str] = {}
+        # Peers whose decode process was replaced: never reloaded or posted to.
+        self._evicted_peers: Set[str] = set()
 
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             if self.kv_args.kv_item_lens:
@@ -1679,6 +1687,10 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         self._maybe_ack_drained_abort(room)
                     continue
 
+                # A peer that registered again gets a fresh endpoint before
+                # anything is posted through it.
+                self._refresh_reregistered_peers(room_transfer_infos)
+
                 # Lazily build a per-worker staging strategy bound to this
                 # worker's private staging buffer (matches mooncake).
                 if (
@@ -2000,7 +2012,9 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     self.poison_deferred_ack_room(room)
                 # Settle first; NIXL 1.3.0 undoes a reload when an old handle fails.
                 # room_transfer_infos survives the sender's clear() of this room.
-                self._reload_invalidated_peers(room_transfer_infos or {})
+                # A transport error means the endpoint is broken whether or not
+                # NIXL invalidated the peer's metadata: rebuild it either way.
+                self._reload_invalidated_peers(room_transfer_infos or {}, failure=e)
 
     def register_buffer_to_engine(self):
         self.kv_descs = []
@@ -2060,17 +2074,60 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             if not self.state_descs:
                 raise Exception("NIXL memory registration failed for state tensors")
 
+    def _peer_registry(self) -> None:
+        """Lazily create the peer bookkeeping: unit-test rigs build managers
+        without __init__."""
+        d = self.__dict__
+        d.setdefault("_peer_reload_lock", threading.Lock())
+        d.setdefault("_peer_reload_times", {})
+        d.setdefault("_peer_refresh_pending", {})
+        d.setdefault("_peer_by_endpoint", {})
+        d.setdefault("_evicted_peers", set())
+
+    @staticmethod
+    def _peer_identity(info: KVArgsRegisterInfo) -> Tuple[str, int, int, int]:
+        """What survives a decode restart: the decode's ip and the GPU rank it
+        serves. Its rank port is bound to a random port per process and its
+        agent name is a fresh uuid, so neither identifies the process."""
+        return (info.endpoint, info.gpu_id, info.decode_tp_rank, info.dst_dcp_rank)
+
     def _add_remote_peer(self, decode_kv_args: KVArgsRegisterInfo):
+        self._peer_registry()
         agent_name = decode_kv_args.agent_name
+        endpoint_key = self._peer_identity(decode_kv_args)
         if agent_name in self.decode_kv_args_table:
-            logger.info(f"Peer {agent_name} was already registered, ignoring.")
+            if agent_name in self._evicted_peers:
+                logger.info(f"Peer {agent_name} was evicted, ignoring.")
+                return
+            # A decode registers once per prefill rank and again only after it
+            # gave up on this rank: its waiting timeout drops the cached
+            # bootstrap info. The pair is broken from its point of view even
+            # when NIXL never reported a transport error, so rebuild the
+            # endpoint rather than keep the one it timed out on. The transfer
+            # worker applies it, being the only thread posting through the
+            # peer's dlists.
+            logger.warning(
+                "Peer %s registered again; rebuilding its endpoint before the "
+                "next transfer",
+                agent_name,
+            )
+            with self._peer_reload_lock:
+                self._peer_refresh_pending[agent_name] = decode_kv_args
             return
+        old_name = self._peer_by_endpoint.get(endpoint_key)
+        if (
+            old_name is not None
+            and old_name != agent_name
+            and old_name in self.decode_kv_args_table
+        ):
+            self._evict_replaced_peer(old_name, decode_kv_args)
         decode_kv_args.requires_dcp_relayout = self.requires_dcp_relayout(
             decode_kv_args.dst_dcp_size, decode_kv_args.dst_dcp_rank
         )
         if decode_kv_args.requires_dcp_relayout:
             self._init_dcp_pack_buffers_once(decode_kv_args.dst_dcp_size)
         self.decode_kv_args_table[agent_name] = decode_kv_args
+        self._peer_by_endpoint[endpoint_key] = agent_name
         self.agent.add_remote_agent(decode_kv_args.agent_metadata)
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.check_peer_aux_buffer_count(
@@ -2079,18 +2136,145 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self._prepare_payload_xfer(decode_kv_args)
             self._prepare_state_xfer(decode_kv_args)
 
-    def _reload_invalidated_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+    def _evict_replaced_peer(
+        self, old_name: str, decode_kv_args: KVArgsRegisterInfo
+    ) -> None:
+        """The decode process behind ``old_name`` restarted: a new agent
+        registered from the same ip for the same GPU rank. Nothing promised to the old
+        process can land, so fail its rooms now instead of leaving them to the
+        decode's waiting timeout, and drop its NIXL metadata so no further
+        WRITE or notification is posted to it. The registration stays in the
+        table (flagged evicted) so a late chunk still referencing it fails through the normal not-found path instead of a KeyError."""
+        logger.warning(
+            "NIXL peer %s at %s gpu %s was replaced by %s; evicting it and "
+            "failing its rooms",
+            old_name,
+            decode_kv_args.endpoint,
+            decode_kv_args.gpu_id,
+            decode_kv_args.agent_name,
+        )
+        with self._peer_reload_lock:
+            self._evicted_peers.add(old_name)
+            self._peer_refresh_pending.pop(old_name, None)
+            self.prep_handles.pop(old_name, None)
+            self.prep_handles_slice_dst.pop(old_name, None)
+            self._prepared_state_plans.pop(old_name, None)
+            try:
+                self.agent.remove_remote_agent(old_name)
+            except Exception:
+                # NIXL may have dropped it already on a transport error.
+                logger.info("NIXL peer %s was already unloaded", old_name)
+        if self.disaggregation_mode != DisaggregationMode.PREFILL:
+            return
+        # Snapshot: the transfer workers pop concluded rooms concurrently.
+        for room, infos in list(self.transfer_infos.items()):
+            if old_name not in infos or room not in self.request_status:
+                continue
+            if self.check_status(room) in (KVPoll.Success, KVPoll.Failed):
+                continue
+            self.record_failure(
+                room,
+                f"NIXL peer {old_name} was replaced by a restarted decode "
+                f"({decode_kv_args.agent_name})",
+            )
+            self.update_status(room, KVPoll.Failed)
+
+    @staticmethod
+    def _is_transport_failure(exc: BaseException) -> bool:
+        if isinstance(exc, _NIXL_TRANSPORT_ERRORS):
+            return True
+        text = str(exc)
+        return any(
+            marker in text
+            for marker in (
+                "NIXL_ERR_REMOTE_DISCONNECT",
+                "NIXL_ERR_NOT_FOUND",
+                "disconnected",
+            )
+        )
+
+    def _rebuild_peer(self, peer_info: KVArgsRegisterInfo) -> None:
+        """Drop the peer's NIXL metadata, and with it the transport endpoint,
+        then reload it and rebuild the dlists. Caller holds _peer_reload_lock
+        and runs on the transfer worker: no other thread holds these dlists,
+        since every room with this peer has the same peer set and so shards to
+        this worker."""
+        agent_name = peer_info.agent_name
+        self.prep_handles.pop(agent_name, None)
+        self.prep_handles_slice_dst.pop(agent_name, None)
+        self._prepared_state_plans.pop(agent_name, None)
+        peer_info.kv_xfer_segments = None
+        try:
+            self.agent.remove_remote_agent(agent_name)
+        except Exception:
+            # Already unloaded by NIXL (invalidated on a transport error).
+            pass
+        self.agent.add_remote_agent(peer_info.agent_metadata)
+        try:
+            self._prepare_payload_xfer(peer_info)
+            self._prepare_state_xfer(peer_info)
+        except Exception:
+            # Leave the peer invalid so a later failure retries.
+            self.agent.remove_remote_agent(agent_name)
+            raise
+
+    def _refresh_reregistered_peers(self, room_transfer_infos: Dict[str, Any]) -> None:
+        """Rebuild the endpoint of every peer of this room that registered
+        again since its last rebuild (see _add_remote_peer)."""
+        self._peer_registry()
+        pending = self._peer_refresh_pending
+        if not pending:
+            return
+        for agent_name in list(room_transfer_infos):
+            with self._peer_reload_lock:
+                fresh = pending.pop(agent_name, None)
+                if fresh is None:
+                    continue
+                peer_info = self.decode_kv_args_table.get(agent_name)
+                if peer_info is None or agent_name in self._evicted_peers:
+                    continue
+                now = time.monotonic()
+                last = self._peer_reload_times.get(agent_name)
+                if last is not None and now - last < _PEER_RELOAD_MIN_INTERVAL_S:
+                    continue
+                self._peer_reload_times[agent_name] = now
+                logger.warning(
+                    "NIXL peer %s registered again; rebuilding its endpoint",
+                    agent_name,
+                )
+                # Same process, so the same buffers; only the transport
+                # address can have changed.
+                peer_info.agent_metadata = fresh.agent_metadata
+                try:
+                    self._rebuild_peer(peer_info)
+                except Exception:
+                    logger.exception("Failed to rebuild NIXL peer %s", agent_name)
+
+    def _reload_invalidated_peers(
+        self,
+        room_transfer_infos: Dict[str, Any],
+        failure: Optional[BaseException] = None,
+    ) -> None:
         # NIXL drops a peer's metadata after a remote-disconnect error and never
-        # restores it; reload it from the registration we already hold.
+        # restores it; reload it from the registration we already hold. A peer
+        # a transport error names is rebuilt even while NIXL still considers
+        # its metadata valid: the error does not always invalidate it, and the
+        # dead endpoint then outlives every retry.
+        self._peer_registry()
+        forced: Set[str] = set()
+        if failure is not None and self._is_transport_failure(failure):
+            text = str(failure)
+            forced = {name for name in room_transfer_infos if name and name in text}
         for agent_name in list(room_transfer_infos):
             peer_info = self.decode_kv_args_table.get(agent_name)
-            if peer_info is None:
+            if peer_info is None or agent_name in self._evicted_peers:
                 continue
+            force = agent_name in forced
             try:
-                if self.agent.check_remote_metadata(agent_name):
+                if not force and self.agent.check_remote_metadata(agent_name):
                     continue
                 with self._peer_reload_lock:
-                    if self.agent.check_remote_metadata(agent_name):
+                    if not force and self.agent.check_remote_metadata(agent_name):
                         continue
                     now = time.monotonic()
                     last = self._peer_reload_times.get(agent_name)
@@ -2098,23 +2282,11 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                         continue
                     self._peer_reload_times[agent_name] = now
                     logger.warning(
-                        "NIXL invalidated remote agent %s; reloading its metadata",
+                        "NIXL %s remote agent %s; reloading its metadata",
+                        "transport error on" if force else "invalidated",
                         agent_name,
                     )
-                    # No other thread holds these dlists: every room with this
-                    # peer has the same peer set, so all shard to this worker.
-                    self.prep_handles.pop(agent_name, None)
-                    self.prep_handles_slice_dst.pop(agent_name, None)
-                    self._prepared_state_plans.pop(agent_name, None)
-                    peer_info.kv_xfer_segments = None
-                    self.agent.add_remote_agent(peer_info.agent_metadata)
-                    try:
-                        self._prepare_payload_xfer(peer_info)
-                        self._prepare_state_xfer(peer_info)
-                    except Exception:
-                        # Leave the peer invalid so a later failure retries.
-                        self.agent.remove_remote_agent(agent_name)
-                        raise
+                    self._rebuild_peer(peer_info)
             except Exception:
                 logger.exception(
                     "Failed to reload NIXL metadata for remote agent %s", agent_name

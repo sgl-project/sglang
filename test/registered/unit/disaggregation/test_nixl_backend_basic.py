@@ -1406,6 +1406,168 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
         )
         self.assertEqual(handle, ("dropped", mgr.agent.sections["dropped"]))
 
+    def _peer_info(self, name, endpoint="127.0.0.1", port=5555, gpu_id=0):
+        return KVArgsRegisterInfo(
+            room="None",
+            endpoint=endpoint,
+            dst_port=port,
+            agent_name=name,
+            agent_metadata=name.encode("ascii"),
+            dst_kv_ptrs=[0x3000, 0x4000],
+            dst_kv_mem_kinds=["VRAM", "VRAM"],
+            dst_aux_ptrs=[0],
+            dst_state_data_ptrs=[],
+            gpu_id=gpu_id,
+            decode_tp_size=1,
+            decode_tp_rank=0,
+            dst_kv_item_len=16,
+            dst_kv_item_lens=[16, 16],
+            dst_num_slots=4,
+        )
+
+    def _make_registering_manager(self):
+        mgr = self._make_manager([])
+        mgr.dcp_size = 1
+        mgr.requires_dcp_relayout = lambda size, rank: False
+        mgr.request_status = {}
+        mgr.transfer_infos = {}
+        mgr.failure_lock = threading.Lock()
+        mgr.failure_records = {}
+        return mgr
+
+    def _room(self, mgr, room, peers, port=5555):
+        mgr.request_status[room] = KVPoll.WaitingForInput
+        mgr.transfer_infos[room] = {
+            name: TransferInfo(
+                room=room,
+                endpoint="127.0.0.1",
+                dst_port=port,
+                agent_name=name,
+                dst_kv_indices=np.array([2], dtype=np.int32),
+                dst_aux_index=0,
+                required_dst_info_num=len(peers),
+                dst_state_indices=[],
+            )
+            for name in peers
+        }
+
+    def test_restarted_decode_evicts_the_old_peer_and_fails_its_rooms(self):
+        """A new agent from the same decode ip and GPU rank, under a new
+        agent name and rank port, means the old decode process is gone: its
+        rooms fail now, its metadata is dropped, and the new peer serves
+        later rooms."""
+        mgr = self._make_registering_manager()
+        mgr._add_remote_peer(self._peer_info("old"))
+        self._room(mgr, 41, ["old"])
+        self._room(mgr, 42, ["old"])
+        mgr.request_status[42] = KVPoll.Success
+
+        mgr._add_remote_peer(self._peer_info("new", port=5556))
+
+        self.assertIn("old", mgr._evicted_peers)
+        self.assertFalse(mgr.agent.check_remote_metadata("old"))
+        self.assertTrue(mgr.agent.check_remote_metadata("new"))
+        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 0, 0, 0)], "new")
+        self.assertEqual(mgr.request_status[41], KVPoll.Failed)
+        self.assertIn("replaced", mgr.failure_records[41])
+        # A concluded room is left alone.
+        self.assertEqual(mgr.request_status[42], KVPoll.Success)
+        self.assertNotIn(42, mgr.failure_records)
+        # The old registration stays addressable but is never reloaded.
+        self.assertIn("old", mgr.decode_kv_args_table)
+        mgr._reload_invalidated_peers(
+            dict.fromkeys(["old"]), failure=RuntimeError("old: NIXL_ERR_NOT_FOUND")
+        )
+        self.assertFalse(mgr.agent.check_remote_metadata("old"))
+        # A late registration from the old process is ignored.
+        mgr._add_remote_peer(self._peer_info("old"))
+        self.assertFalse(mgr.agent.check_remote_metadata("old"))
+        self.assertEqual(mgr._peer_by_endpoint[("127.0.0.1", 0, 0, 0)], "new")
+
+    def test_distinct_endpoints_do_not_evict_each_other(self):
+        mgr = self._make_registering_manager()
+        mgr._add_remote_peer(self._peer_info("a", port=5555))
+        mgr._add_remote_peer(self._peer_info("b", gpu_id=1))
+        mgr._add_remote_peer(self._peer_info("c", endpoint="10.0.0.2"))
+        self.assertEqual(mgr._evicted_peers, set())
+        for name in ("a", "b", "c"):
+            self.assertTrue(mgr.agent.check_remote_metadata(name))
+
+    def test_reregistered_peer_is_rebuilt_by_the_worker_before_posting(self):
+        """A decode registers again only after timing out on this rank: the
+        bootstrap thread records it, and the transfer worker rebuilds the
+        endpoint (a new NIXL generation) before the next room posts."""
+        mgr = self._make_registering_manager()
+        mgr._add_remote_peer(self._peer_info("peer"))
+        first_generation = mgr.agent.sections["peer"]
+        first_dlist = mgr.prep_handles["peer"]
+
+        mgr._add_remote_peer(self._peer_info("peer"))
+        self.assertIn("peer", mgr._peer_refresh_pending)
+        # Nothing is rebuilt on the bootstrap thread.
+        self.assertEqual(mgr.agent.sections["peer"], first_generation)
+
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.time.monotonic", return_value=200.0
+        ):
+            mgr._refresh_reregistered_peers(dict.fromkeys(["peer"]))
+        self.assertNotIn("peer", mgr._peer_refresh_pending)
+        self.assertNotEqual(mgr.agent.sections["peer"], first_generation)
+        self.assertIsNot(mgr.prep_handles["peer"], first_dlist)
+        # Rooms with other peers do not touch the pending entry.
+        mgr._add_remote_peer(self._peer_info("peer"))
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.time.monotonic", return_value=200.5
+        ):
+            mgr._refresh_reregistered_peers(dict.fromkeys(["other"]))
+        self.assertIn("peer", mgr._peer_refresh_pending)
+        handle = mgr.send_kvcache(
+            "peer",
+            np.array([1], dtype=np.int32),
+            mgr.decode_kv_args_table["peer"].dst_kv_ptrs,
+            np.array([2], dtype=np.int32),
+            0,
+            "notif",
+        )
+        self.assertEqual(handle, ("peer", mgr.agent.sections["peer"]))
+
+    def test_transport_error_forces_a_rebuild_of_the_peer_it_names(self):
+        """NIXL may keep a peer's metadata valid after a transport error on a
+        posted handle; the peer the error names is rebuilt anyway, its
+        siblings in the room are not."""
+        mgr = self._make_manager(["peer", "other"])
+        generation = mgr.agent.sections["peer"]
+        other_generation = mgr.agent.sections["other"]
+        room = dict.fromkeys(["peer", "other"])
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.time.monotonic", return_value=300.0
+        ):
+            mgr._reload_invalidated_peers(room)
+            mgr._reload_invalidated_peers(room, failure=ValueError("peer geometry"))
+        self.assertEqual(mgr.agent.sections["peer"], generation)
+        disconnect = RuntimeError(
+            "postXferReq: remote agent 'peer' was disconnected after transfer "
+            "request creation"
+        )
+        with patch(
+            "sglang.srt.disaggregation.nixl.conn.time.monotonic", return_value=301.5
+        ):
+            mgr._reload_invalidated_peers(room, failure=disconnect)
+        self.assertNotEqual(mgr.agent.sections["peer"], generation)
+        self.assertEqual(mgr.agent.sections["other"], other_generation)
+        self.assertTrue(mgr.agent.check_remote_metadata("peer"))
+        self.assertTrue(
+            NixlKVManager._is_transport_failure(RuntimeError("NIXL_ERR_NOT_FOUND"))
+        )
+        self.assertTrue(
+            NixlKVManager._is_transport_failure(
+                RuntimeError(
+                    "remote agent x was disconnected after transfer request creation"
+                )
+            )
+        )
+        self.assertFalse(NixlKVManager._is_transport_failure(ValueError("geometry")))
+
 
 if __name__ == "__main__":
     unittest.main()
