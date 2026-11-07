@@ -36,7 +36,12 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_fused_func,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
-from sglang.srt.runtime_context import get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_context,
+    get_exec,
+    get_forward,
+    get_parallel,
+)
 from sglang.srt.utils.device import is_flashinfer_available
 from sglang.srt.utils.triton_utils import next_power_of_2
 
@@ -129,6 +134,24 @@ def _make_deferred_finalize_output(
         expert_weights=expert_weights,
         expanded_idx_to_permuted_idx=expanded_idx_to_permuted_idx,
         top_k=top_k,
+    )
+
+
+def _finalize_in_order(result, *, top_k: int, out: torch.Tensor) -> torch.Tensor:
+    """Sum FlashInfer's ``do_finalize=False`` outputs into ``out``, adding the
+    top-k terms in the same order whatever the batch size."""
+    from sglang.kernels.ops.moe.moe_finalize_fuse_shared import moe_finalize_fuse_shared
+
+    deferred = _make_deferred_finalize_output(result, top_k=top_k)
+    num_tokens = out.shape[0]
+    return moe_finalize_fuse_shared(
+        deferred.gemm2_out.view(-1, deferred.gemm2_out.shape[-1]),
+        deferred.expanded_idx_to_permuted_idx.view(-1)[: num_tokens * top_k],
+        deferred.expert_weights.view(-1, top_k)[:num_tokens],
+        None,
+        top_k,
+        enable_pdl=trtllm_moe_enable_pdl(num_tokens),
+        out=out,
     )
 
 
@@ -1847,6 +1870,22 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             symmetric=hidden_pad == 0,
         )
 
+    # FlashInfer's small-batch finalize sums the top-k outputs in a different order
+    # from its large-batch finalize (flashinfer-ai/flashinfer#8831), so a token's
+    # output would depend on its batch size. In deterministic mode, take the
+    # unsummed outputs and sum them in one fixed order at every batch size. Only
+    # the pre-routed call: its routing weights already carry any routed scaling.
+    finalize_in_order = (
+        use_routed_topk
+        and not defer_finalize
+        and hidden_pad == 0
+        and symm_output.dtype == torch.bfloat16
+        # Kernel tests call this runner without a published server config.
+        and get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
+    flashinfer_finalize = not (defer_finalize or finalize_in_order)
+
     if use_routed_topk:
         routing = _get_routing_for_flashinfer_routed(topk_output)
         moe_kwargs = dict(
@@ -1876,7 +1915,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             local_num_experts=quant_info.local_num_experts,
             routed_scaling_factor=None,
             routing_method_type=1,  # Unused, but must be 1 to pass validation.
-            do_finalize=not defer_finalize,
+            do_finalize=flashinfer_finalize,
             activation_type=activation_type,
             tune_max_num_tokens=next_power_of_2(hs_fp4.shape[0]),
             enable_pdl=trtllm_moe_enable_pdl(hs_fp4.shape[0]),
@@ -1888,6 +1927,10 @@ def fused_experts_none_to_flashinfer_trtllm_fp4(
             result = _make_deferred_finalize_output(
                 result,
                 top_k=_routing_top_k(routing),
+            )
+        elif finalize_in_order:
+            result = _finalize_in_order(
+                result, top_k=_routing_top_k(routing), out=symm_output
             )
         else:
             result = result[0]

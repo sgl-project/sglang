@@ -552,6 +552,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=get_parallel().attn_tp_size
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_size
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler._deferred_input_requests = []
