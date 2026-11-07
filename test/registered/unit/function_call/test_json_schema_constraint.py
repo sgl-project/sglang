@@ -154,6 +154,24 @@ class TestJsonSchemaConstraint(unittest.TestCase):
         validator.validate(single_call)
         validator.validate(multi_call)
 
+    def test_specific_tool_choice_rejects_non_object_items(self):
+        """Every call in a specific tool choice array must be an object.
+
+        Grammar backends that follow JSON Schema strictly (llguidance) let the
+        model emit `[0]` when the item schema has no "type", and the parser
+        then finds no tool call.
+        """
+        tool_choice = ToolChoice(
+            type="function", function=ToolChoiceFuncName(name="get_weather")
+        )
+        schema = get_json_schema_constraint(self.tools, tool_choice)
+        validator = jsonschema.Draft202012Validator(schema)
+
+        for output in ([0], ["x"], [None], [[]]):
+            with self.subTest(output=output):
+                self.assertFalse(validator.is_valid(output))
+        validator.validate([{"name": "get_weather", "parameters": {"location": "NYC"}}])
+
     def test_specific_tool_choice_no_parallel(self):
         """Test that parallel_tool_calls=False sets maxItems=1"""
         tool_choice = ToolChoice(
