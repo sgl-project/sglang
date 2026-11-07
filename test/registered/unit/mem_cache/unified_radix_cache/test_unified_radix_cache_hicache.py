@@ -1043,6 +1043,31 @@ class UnifiedRadixCacheHiCacheSuite(UnifiedRadixCacheHiCacheFixtures):
 
         cache.sanity_check()
 
+    @requires_full_mamba_ps1
+    def test_component_backup_waits_for_split_fragment_ack(self):
+        cache, allocator, req_pool = build_fixture(self.cfg)
+        self._init_hicache(cache, write_policy="write_back")
+        tail = self._insert(cache, allocator, req_pool, [1, 2, 3, 4]).last_device_node
+        cache._execute_and_commit_kv_backup(BackupKV(node_ids=[tail]))
+
+        prefix = self._insert(cache, allocator, req_pool, [1, 2, 3]).last_device_node
+        self.assertNotEqual(prefix, tail)
+        self.assertNotIn(prefix, cache.ongoing_write_through)
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(prefix), tail)
+        device, transfers = cache.tree_core.build_backup_spec(prefix)
+        self.assertEqual(device.numel(), 0)
+        self.assertIn(ComponentType.MAMBA, transfers)
+
+        cache._execute_and_commit_kv_backup(BackupKV(node_ids=[prefix]))
+        self.assertNotIn(tail, cache.ongoing_write_through)
+        self.assertEqual(cache.tree_core.get_write_through_pending_id(prefix), prefix)
+        cache.writing_check(write_back=True)
+        self.assertFalse(cache.ongoing_write_through)
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(prefix))
+        self.assertIsNone(cache.tree_core.get_write_through_pending_id(tail))
+        self.assertIsNotNone(node_host_value(cache, prefix, ComponentType.MAMBA))
+        cache.sanity_check()
+
     def _count_blocking_waits(self, cache):
         """Record how many queued copies each blocking write-back wait drains."""
         waits = []
