@@ -123,14 +123,17 @@ class RowBucketGraphRunner:
         bucket_from: Optional[int] = None,
         out_rows: Optional[int] = None,
         global_num_rows: Optional[int] = None,
-    ) -> List[Optional[torch.Tensor]]:
+        may_capture: bool = True,
+    ) -> Optional[List[Optional[torch.Tensor]]]:
         """Run ``body`` on the ``live`` rows from their bucket's graph, capturing
         it on first use. ``key`` names what besides row count and input shapes
         changes the recording; ``context`` and ``batch_scope`` wrap capture and
         replay with the breaks' and the body's batch; ``bucket_from`` picks the
         bucket from another row count. Returns views valid until the next replay,
         cut to ``out_rows`` rows. ``global_num_rows`` opts into a separate GLOBAL
-        device count and localizes the LOCAL count for the bucket's TP shards."""
+        device count and localizes the LOCAL count for the bucket's TP shards.
+        Returns None, running nothing, when the graph is missing and
+        ``may_capture`` is false: capturing waits for every TP rank."""
         num_rows = live[0].shape[0]
         out_rows = num_rows if out_rows is None else out_rows
         rows = self.bucket_rows(num_rows if bucket_from is None else bucket_from)
@@ -139,15 +142,17 @@ class RowBucketGraphRunner:
             assert 0 <= global_num_rows <= rows, (global_num_rows, rows)
         # Inputs of one shape share their static buffers across keys.
         input_key = tuple((t.dtype, t.shape[1:]) for t in live)
-        static = self._static_inputs(input_key, live)
-        for buf, t in zip(static, live):
-            buf[:num_rows].copy_(t)
         count_key = (
             forward_batch.num_token_non_padded is not None,
             global_num_rows is not None,
             forward_batch.attn_tp_sequence_sharded,
         )
         graph_key = (key, input_key, count_key)
+        if not may_capture and (rows, graph_key) not in self._graphs:
+            return None
+        static = self._static_inputs(input_key, live)
+        for buf, t in zip(static, live):
+            buf[:num_rows].copy_(t)
         # The eager breaks read the step's real row count off this view.
         step_batch = copy.copy(forward_batch)
         step_batch.global_num_token_non_padded_cpu = num_rows

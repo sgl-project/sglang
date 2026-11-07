@@ -1,10 +1,12 @@
 import unittest
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
 import torch
 
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
+from sglang.srt.layers.dp_attention import note_rank_barrier_in_prefill_graph
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
@@ -20,6 +22,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -218,6 +221,28 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
                 )
             )
 
+    def test_megamoe_idle_rank_replays_after_rank_barrier_capture(self):
+        """An idle DP rank must not force every rank eager once the graphs hold
+        rank-barrier breaks; those breaks capture only on steps every rank reaches."""
+        runner = self._make_runner()
+        flags, a2a, dsa_cp, mla_cp = self._megamoe_no_prefill_cp()
+        with (
+            flags,
+            a2a,
+            dsa_cp,
+            mla_cp,
+            get_flags().dp.override(
+                capturing_prefill_graph=True,
+                prefill_graph_shape_has_rank_barrier=False,
+            ),
+        ):
+            note_rank_barrier_in_prefill_graph()
+            self.assertFalse(
+                runner._has_inactive_dp_rank(
+                    SimpleNamespace(global_num_tokens_cpu=[8, 0])
+                )
+            )
+
     def test_megamoe_graph_with_dp_gather_forces_shared_bucket(self):
         # A DP gather captured in the graph has fixed MAX_LEN geometry; per-rank
         # buckets or an eager idle rank would deadlock its all_gather.
@@ -305,6 +330,86 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
 
         self.assertIsNone(runner.max_context_size)
         self.assertIn("fixed metadata extent", "\n".join(logs.output))
+
+
+class TestPrefillGraphRankBarrierBreaks(CustomTestCase):
+    """Breaks that capture behind TP-group barriers live only in shapes at or
+    above a token threshold; under MegaMoE each DP rank replays its own bucket."""
+
+    _SHAPES = [512, 1024, 2048, 4096, 8192, 16384]
+    _BARRIER_SHAPES = frozenset({2048, 4096, 8192, 16384})
+
+    def _make_runner(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner.capture_num_tokens = self._SHAPES
+        runner.enable_cp_bcg_capture = False
+        runner._capture_chunked_prefix = False
+        runner._rank_barrier_shapes = frozenset()
+        return runner
+
+    def test_step_lets_breaks_capture_only_when_every_rank_reaches_them(self):
+        """A rank whose bucket is below the threshold keeps those breaks inline and
+        never reaches their barriers; letting the others capture hung the step."""
+        runner = self._make_runner()
+        runner._rank_barrier_shapes = self._BARRIER_SHAPES
+        for counts, expected in (
+            ([8000, 50, 3000, 16384], False),
+            ([8000, 2000, 3000, 16384], True),
+            ([8000, 0, 3000, 4096], False),
+            ([8000, 1024, 3000, 4096], False),
+        ):
+            with self.subTest(counts=counts):
+                batch = SimpleNamespace(global_num_tokens_cpu=counts, input_ids=[])
+                self.assertIs(runner._every_rank_reaches_rank_barrier(batch), expected)
+        runner._rank_barrier_shapes = frozenset()
+        batch = SimpleNamespace(global_num_tokens_cpu=[8000] * 4, input_ids=[])
+        self.assertFalse(runner._every_rank_reaches_rank_barrier(batch))
+
+    def test_capture_notes_rank_barriers_per_shape(self):
+        """Shapes capture largest first, so a barrier noted by a large shape must
+        not mark the smaller shapes captured after it."""
+        runner = self._make_runner()
+
+        def capture_one_shape(num_tokens, prefix_num_chunks=0):
+            if num_tokens >= 2048:
+                note_rank_barrier_in_prefill_graph()
+
+        runner.capture_one_shape = capture_one_shape
+        with get_flags().dp.override(
+            capturing_prefill_graph=True,
+            prefill_graph_shape_has_rank_barrier=False,
+        ):
+            for num_tokens in reversed(self._SHAPES):
+                runner._capture_shape(num_tokens)
+        self.assertEqual(runner._rank_barrier_shapes, self._BARRIER_SHAPES)
+
+    def test_startup_prime_runs_with_every_rank_reaching_the_breaks(self):
+        """The prime is the startup step on which every rank's breaks capture
+        together; without the flag they would skip capture and leave it to serving."""
+        runner = self._make_runner()
+        runner.use_captured_attn_metadata = True
+        runner.device_module = mock.Mock()
+        runner.backend = SimpleNamespace(replay_session=nullcontext)
+        runner.model_runner = SimpleNamespace(model=SimpleNamespace())
+        forward_batch = SimpleNamespace(
+            lora_ids=None, moe_num_token_non_padded=lambda: None
+        )
+        runner.capture_prepare = mock.Mock(return_value=(forward_batch, mock.Mock()))
+        seen = []
+        runner._run_forward = mock.Mock(
+            side_effect=lambda batch, num_tokens: seen.append(
+                get_flags().dp.every_rank_reaches_rank_barrier
+            )
+        )
+        parallel = SimpleNamespace(tp_group=mock.Mock(), tp_rank=1)
+        with mock.patch.object(runner_module, "get_parallel", return_value=parallel):
+            runner._prime_rank_barrier_breaks()
+            runner._run_forward.assert_not_called()
+            runner._rank_barrier_shapes = self._BARRIER_SHAPES
+            runner._prime_rank_barrier_breaks()
+        self.assertEqual(seen, [True])
+        self.assertIn(runner.capture_prepare.call_args.args[0], self._BARRIER_SHAPES)
+        self.assertFalse(get_flags().dp.every_rank_reaches_rank_barrier)
 
 
 if __name__ == "__main__":

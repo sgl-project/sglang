@@ -610,9 +610,12 @@ class DpFlags(_FlagGroupBase):
     # gather/scatter helpers, whose captured geometry needs one shared bucket.
     capturing_prefill_graph: bool = False
     prefill_graph_has_dp_gather: bool = False
-    # Set during prefill-graph capture by breaks that capture graphs of their own
-    # behind TP-group barriers; every DP rank must then take the same path.
-    prefill_graph_has_rank_barrier: bool = False
+    # Set during prefill-graph capture, for the shape being captured, by breaks
+    # that capture graphs of their own behind TP-group barriers.
+    prefill_graph_shape_has_rank_barrier: bool = False
+    # Set while every DP rank's prefill graph reaches those breaks this step,
+    # the only time they may capture: a rank that skips them never arrives.
+    every_rank_reaches_rank_barrier: bool = False
     # This process's slot in the target's DP sync while a draft scope narrows
     # attention; dp_gather_width() also reads it as the in-scope marker.
     scoped_gather_slot: Optional[int] = None
