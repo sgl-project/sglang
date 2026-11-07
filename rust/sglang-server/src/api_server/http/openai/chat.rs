@@ -327,7 +327,7 @@ async fn chat_completions(
             }),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(&state, &headers, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -1746,6 +1746,7 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
+                    request_log: None,
                 },
             );
             let state = Arc::new(super::super::AppState {

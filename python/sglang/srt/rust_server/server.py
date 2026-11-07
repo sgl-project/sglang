@@ -28,7 +28,7 @@ import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import ShutdownReq
+from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
@@ -170,6 +170,18 @@ class RustServer:
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
+
+    @classmethod
+    def _request_input_class(cls) -> type:
+        """The request class Python's ``/generate`` admits: the object the
+        request log prints for each request."""
+        return GenerateReqInput
+
+    @classmethod
+    def _server_added_custom_params(cls) -> Tuple[str, ...]:
+        """``sampling_params.custom_params`` keys this server adds to a request
+        itself, which the request log leaves out."""
+        return ()
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -420,6 +432,8 @@ class RustServer:
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(scheduler),
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
+                request_class=cls._request_input_class(),
+                omit_custom_params=cls._server_added_custom_params(),
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,

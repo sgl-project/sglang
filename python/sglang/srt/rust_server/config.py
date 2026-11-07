@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
@@ -23,6 +24,11 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.request_logger import (
+    WHITELISTED_HEADERS,
+    RequestLogger,
+    _dataclass_to_string_truncated,
+)
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
@@ -55,6 +61,8 @@ def _build_server_args(
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
+    request_class: Optional[type] = None,
+    omit_custom_params: Tuple[str, ...] = (),
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -218,7 +226,85 @@ def _build_server_args(
         metrics=(
             _build_metrics_config(ext) if get_observability().enable_metrics else None
         ),
+        request_log=(
+            ext.RequestLogConfig(
+                **request_log_settings(
+                    get_observability().log_requests_level, request_class
+                ),
+                omit_custom_params=list(omit_custom_params),
+            )
+            if get_observability().log_requests
+            else None
+        ),
     )
+
+
+def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str, Any]:
+    """``RequestLogger``'s settings for ``--log-requests-level`` ``level``, for
+    the Rust server to render the lines ``TokenizerManager`` logs: the level's
+    metadata, and ``request_class``'s fields in declaration order with each
+    default rendered as ``_dataclass_to_string_truncated`` renders a value."""
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    request_class = request_class or GenerateReqInput
+    logger = RequestLogger(
+        log_requests=True,
+        log_requests_level=level,
+        log_requests_format="text",
+        log_requests_target=None,
+    )
+    max_length, skip_names, out_skip_names = logger.metadata
+
+    def default(field: dataclasses.Field) -> Any:
+        if field.default is not dataclasses.MISSING:
+            return field.default
+        return field.default_factory()
+
+    batch_item_fields, batch_shared_fields = _batch_item_fields(request_class)
+    return dict(
+        max_length=max_length,
+        skip_names=sorted(skip_names or ()),
+        out_skip_names=sorted(out_skip_names or ()),
+        class_name=request_class.__name__,
+        fields=[
+            (field.name, _dataclass_to_string_truncated(default(field), max_length))
+            for field in dataclasses.fields(request_class)
+        ],
+        batch_item_fields=batch_item_fields,
+        batch_shared_fields=batch_shared_fields,
+        headers=list(WHITELISTED_HEADERS),
+        exceeded_ms=logger.log_exceeded_ms,
+    )
+
+
+def _batch_item_fields(request_class: type) -> Tuple[List[str], List[str]]:
+    """The fields a batch item's object (``obj[i]``) takes from a normalized
+    batch: its own entry of a per-item field, or a shared field's value; the
+    rest keep their defaults. Read off ``request_class.__getitem__`` itself by
+    giving each field a marker per item."""
+    item_fields, shared_fields = [], []
+    for field in dataclasses.fields(request_class):
+        if not field.init:
+            continue
+        batch = request_class(text=["", ""])
+        try:
+            batch.normalize_batch_and_arguments()
+        except Exception as e:
+            raise RuntimeError(
+                f"cannot read which fields a batch item of {request_class.__name__} "
+                "keeps: normalizing a two-prompt batch failed"
+            ) from e
+        markers = [object(), object()]
+        setattr(batch, field.name, markers)
+        try:
+            value = getattr(batch[0], field.name)
+        except Exception:  # an item helper that cannot take the marker
+            continue
+        if value is markers[0]:
+            item_fields.append(field.name)
+        elif value is markers:
+            shared_fields.append(field.name)
+    return item_fields, shared_fields
 
 
 def _build_metrics_config(ext: ModuleType):

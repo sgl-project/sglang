@@ -486,6 +486,7 @@ mod tests {
                 peer_endpoints,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
+                request_log: None,
             },
         );
         (
@@ -967,10 +968,13 @@ mod tests {
             let case = format!("{uri} {}", String::from_utf8_lossy(&body));
             // A live generation each abort but the no-op one names.
             let call = core
-                .generate(GenerateRequest {
-                    rid: Rid::from_client("client-rid"),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
@@ -1483,10 +1487,13 @@ mod tests {
             let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
             let mut call = state
                 .core
-                .generate(GenerateRequest {
-                    rid: Rid::from_client("client-rid"),
-                    ..Default::default()
-                })
+                .generate(
+                    GenerateRequest {
+                        rid: Rid::from_client("client-rid"),
+                        ..Default::default()
+                    },
+                    crate::api_server::core::ReceivedAs::without_headers(),
+                )
                 .await
                 .unwrap();
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()

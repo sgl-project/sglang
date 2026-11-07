@@ -11,7 +11,7 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::HealthStatus;
+use crate::api_server::core::{HealthStatus, ReceivedAs};
 use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
@@ -135,7 +135,7 @@ impl SglangService for GrpcService {
         let created_at = Instant::now();
         let calls = self
             .core
-            .generate_batch(payloads)
+            .generate_batch(payloads, ReceivedAs::without_headers())
             .await
             .map_err(native_api::status)?;
         Ok(Response::new(native_api::generate_stream(
@@ -347,6 +347,7 @@ mod tests {
                         ..Default::default()
                     }),
                     metrics: None,
+                    request_log: None,
                 },
             );
             Self {
@@ -726,6 +727,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));

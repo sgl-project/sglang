@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{
         IntoResponse, Response,
         sse::{Event, Sse},
@@ -72,6 +72,7 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     body: Result<Json<CompletionRequest>, JsonRejection>,
 ) -> Response {
     let CompletionRequest {
@@ -209,7 +210,7 @@ async fn completions(
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
             };
-            let call = match submit_generation(&state, native, stream).await {
+            let call = match submit_generation(&state, &headers, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
             };

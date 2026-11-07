@@ -103,6 +103,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: (&args).into(),
                 metrics: None,
+                request_log: None,
             },
         );
         (

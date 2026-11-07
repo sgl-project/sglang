@@ -295,6 +295,7 @@ pub(crate) struct CheckWeightsOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api_server::core::ReceivedAs;
     use crate::api_server::handlers::test_utils::*;
     use crate::api_server::handlers::{CoreConfig, CoreMetadata};
     use crate::message::io_struct::GetInternalStateReq;
@@ -373,6 +374,7 @@ mod tests {
                         status_bytes(true, "")
                     })
                 })],
+                request_log: None,
             },
         );
 
@@ -399,10 +401,13 @@ mod tests {
         let harness = Harness::unbounded(8);
         let call = harness
             .handle
-            .generate(GenerateRequest {
-                rid: Rid::from_client("client-rid"),
-                ..Default::default()
-            })
+            .generate(
+                GenerateRequest {
+                    rid: Rid::from_client("client-rid"),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
             .await
             .unwrap();
         let request = accept_intake(harness.intake_rx.recv_async().await.unwrap());
@@ -492,6 +497,7 @@ mod tests {
                         ..Default::default()
                     },
                     peer_endpoints,
+                    request_log: None,
                 },
             );
             (handle, intake_rx, abort_rx)

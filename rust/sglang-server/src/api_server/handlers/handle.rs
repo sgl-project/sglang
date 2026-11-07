@@ -25,7 +25,7 @@ use crate::utils::fsm::RequestState;
 use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
-use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics};
+use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics, RequestLog};
 
 /// How long the listeners keep open connections after a drain's requests
 /// finished: enough to flush the last responses and close idle connections.
@@ -43,6 +43,8 @@ pub(crate) struct CoreConfig {
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
+    /// Request logging, when `--log-requests` is on.
+    pub(crate) request_log: Option<Arc<RequestLog>>,
     /// The targets answering for the DP ranks this process does not host,
     /// which every multi-rank control operation fans out to alongside the
     /// local scheduler (see [`fanout`]). Empty means this process answers
@@ -129,6 +131,7 @@ pub(super) struct CoreInner {
     pub(super) metadata: CoreMetadata,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
+    pub(super) request_log: Option<Arc<RequestLog>>,
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
@@ -163,6 +166,7 @@ impl CoreHandle {
                 metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
+                request_log: config.request_log,
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
                 drain: Arc::default(),
