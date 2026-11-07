@@ -217,6 +217,11 @@ def _to_2d_context_lens(seqlens_32: torch.Tensor, batch_size: int) -> torch.Tens
     return seqlens_32.contiguous().view(-1, 1)
 
 
+def _trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65–127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
+
+
 @dataclass(frozen=True)
 class _RowPlan:
     """How the query rows of a sparse DSA kernel line up with its metadata rows.
@@ -305,11 +310,6 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
             dim=0,
         )
     return output
-
-
-def _trtllm_padded_heads(num_heads: int) -> int:
-    """trtllm-gen MLA rejects 64 < heads < 128 (Kimi-K3.1 DCP8: 96); pad to 128."""
-    return 128 if 64 < num_heads < 128 else num_heads
 
 
 def _adjacent_absorbed_q(

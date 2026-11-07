@@ -77,8 +77,9 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
     def allows_replay(self, batch_size, num_tokens, prefix_lens, contains_mm_inputs):
         return batch_size > 0 and not contains_mm_inputs and prefix_lens is not None
 
-    # GLM-5.3 Flash (KDA hybrid), the dense-DSA GLM MoE family (GLM-5.2 /
-    # GLM-5.3 and their fine-tunes) and Kimi-K3.1 share the interleave BCG path.
+    # GLM-5.3 Flash and Kimi-K3.1 (KDA hybrids) and the dense-DSA GLM MoE
+    # family (GLM-5.2 / GLM-5.3 and their fine-tunes) share the interleave BCG
+    # path.
     _SUPPORTED_ARCHITECTURES = (
         "Glm5NextForConditionalGeneration",
         "GlmMoeDsaForCausalLM",
@@ -90,18 +91,20 @@ class InterleaveCPBCGInput(PrefillCPBCGInput):
         cfg = resolving_view(server_args)
         view = resolved_view(server_args)
         architectures = model_config_of(server_args).hf_config.architectures
+        if "KimiK31ForConditionalGeneration" in architectures and view.ep_size > 1:
+            # MegaMoE EP over the CP group: each rank owns its CP shard's rows.
+            if not (
+                view.ep_size == cfg.tp_size == view.attn_cp_size
+                and view.moe_a2a_backend == "megamoe"
+                and cfg.moe_dp_size == 1
+            ):
+                return False
+        # Pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg);
+        # only Kimi-K3.1 replays them so far.
         is_kimi_k31 = "KimiK31ForConditionalGeneration" in architectures
-        # MegaMoE EP over the CP group: each rank owns its CP shard's rows.
-        # Pipeline stages exchange CP-local rows (see execute_prefill_cp_bcg).
-        kimi_ep = (
-            view.ep_size == cfg.tp_size == view.attn_cp_size
-            and view.moe_a2a_backend == "megamoe"
-            and cfg.moe_dp_size == 1
-        )
         return (
             cfg.dp_size == 1
             and (cfg.pp_size == 1 or is_kimi_k31)
-            and (not is_kimi_k31 or view.ep_size == 1 or kimi_ep)
             and view.attn_cp_size > 1
             and any(
                 arch in architectures

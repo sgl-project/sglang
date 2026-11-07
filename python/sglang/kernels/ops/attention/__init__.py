@@ -612,16 +612,6 @@ register_kernel(
     )
 )
 
-
-register_kernel(
-    KernelSpec(
-        op="attention.indexer_q_quant_head_gate",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
-        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
-    )
-)
-
 register_kernel(
     KernelSpec(
         op="attention.append_window_to_topk",
@@ -637,5 +627,13 @@ register_kernel(
         target="sglang.kernels.ops.attention.postmix_fp8_wo_a:postmix_fp8_wo_a_quant",
         # The UE8M0 packed scales are an SM100 layout.
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="attention.indexer_q_quant_head_gate",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.attention.dsa.head_gate:indexer_q_quant_head_gate",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
