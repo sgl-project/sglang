@@ -27,11 +27,17 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.decode_attention import _extract_kv_strides
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx115_supported,
+    is_gfx1250_supported,
+    is_hip,
+)
 
 _is_hip = is_hip()
 _is_gfx95 = _is_hip and is_gfx95_supported()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_gfx115 = _is_hip and is_gfx115_supported()
 
 try:
     _triton_version_parts = tuple(
@@ -153,6 +159,17 @@ def _get_num_stages_for_extend_attention(
     ):
         return 2
     return 1
+
+
+# (BLOCK_M, num_warps) at head_dim 256 on RDNA3.5, where the 4-warp default spills ~390 VGPRs.
+# Measured on gfx1151: the prefix loop is fastest at BLOCK_M 64, the causal extend loop at 128.
+def _gfx115_head_dim_256_tiles(
+    prefix_tokens: int, extend_tokens: int
+) -> tuple[int, int]:
+    # Crossover measured between 1/8 and 1/2; both configs are ~1.1x faster at 1/4.
+    if 4 * prefix_tokens >= extend_tokens:
+        return 64, 8
+    return 128, 8
 
 
 def _compact_extend_q_tiles_per_head(
@@ -1014,6 +1031,21 @@ def extend_attention_fwd(
     BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
+    if (
+        _is_gfx115
+        and Lq == 256
+        and Lv == 256
+        and q_extend.dtype in (torch.bfloat16, torch.float16)
+        and is_causal
+        and custom_mask is None
+        and sliding_window_size <= 0
+        and sinks is None
+        and score_mod is None
+    ):
+        # One kv_indices slot per cached prefix token (an upper bound in gpu_only mode); no sync.
+        BLOCK_M, num_warps = _gfx115_head_dim_256_tiles(
+            prefix_tokens=kv_indices.shape[0], extend_tokens=q_extend.shape[0]
+        )
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
