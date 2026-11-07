@@ -182,6 +182,9 @@ Several norms look interchangeable and are not. Start here.
 These contracts differ: `residual_gate_fp32` does not round the product to
 BF16/FP16, and disables FMA to preserve the eager FP32 rounding boundary.
 
+Anima uses `residual_gate_add` during BCG warmup and capture. Its eager and
+compiled paths keep the original expression to avoid fusion dispatch overhead.
+
 The transposed-dense path tiles along the physical stride-1 token dimension
 for coalesced residual reads and output writes. The contiguous layouts use
 JIT CUDA. Do not insert a `.contiguous()` to reach that path: it adds a full
