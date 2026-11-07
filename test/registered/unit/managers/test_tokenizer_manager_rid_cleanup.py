@@ -1240,6 +1240,35 @@ class TestGenerateRequestCleanupOnDispatchFailure(CustomTestCase):
         tm._send_one_request.assert_not_called()
         self.assertNotIn(obj.rid, tm.rid_to_state)
 
+    def test_embedding_over_context_failure_cleans_up_rid_state(self):
+        """Multimodal embedding validation failures must not retain image requests.
+
+        Qwen3-VL-Embedding can exceed the configured context length after image
+        token expansion.  The tokenizer/validation exception occurs before the
+        request is dispatched, so the state created by ``_init_req_state`` must
+        be removed locally.  This is the concrete multimodal regression case
+        covered by the abort/cleanup design in #35255.
+        """
+        tm = _make_tm_for_generate(self)
+        obj = EmbeddingReqInput(
+            text="describe this image",
+            image_data="data:image/png;base64,AA==",
+            rid="embedding_over_context",
+        )
+        tm._tokenize_one_request = AsyncMock(
+            side_effect=ValueError("input length exceeds context length")
+        )
+        tm._send_one_request = Mock()
+
+        async def drive():
+            with self.assertRaisesRegex(ValueError, "context length"):
+                await tm.generate_request(obj).__anext__()
+
+        asyncio.run(drive())
+        tm._tokenize_one_request.assert_awaited_once()
+        tm._send_one_request.assert_not_called()
+        self.assertNotIn(obj.rid, tm.rid_to_state)
+
     def test_batch_failure_before_dispatch_cleans_up_all(self):
         tm = _make_tm_for_generate(self)
         rids = ["b0", "b1", "b2"]
