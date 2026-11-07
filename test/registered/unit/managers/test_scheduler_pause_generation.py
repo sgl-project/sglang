@@ -13,6 +13,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.beam_search.batch_tail import append_beam_tail
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeTransferQueue
 from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
     DecodeKVCacheOffloadManager,
@@ -42,6 +43,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -145,6 +147,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         # pause_generation zeros gen_throughput and flushes KV events.
         scheduler.metrics_reporter = MagicMock()
         scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
+        scheduler.invariant_checker = MagicMock()
         scheduler.kv_events_publisher = MagicMock()
         scheduler.beam_coordinator = MagicMock()
         scheduler.send_abort_output = MagicMock()
@@ -823,6 +826,37 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                     requeued = [entry["req"] for entry in requeue_log]
                     self.assertEqual((aborted, requeued), ([sent], [plain, unsent]))
 
+    def test_retract_aborts_beam_groups_and_drops_the_beam_tail(self):
+        scheduler = self._new_scheduler()
+        requeue_log = self._spy_requeue(scheduler)
+        plain, leader = self._make_req("plain"), self._make_req("leader")
+        member_rows = torch.tensor([10, 11])
+        group = SimpleNamespace(
+            leader=leader,
+            prompt_len=3,
+            member_rows=member_rows,
+            member_rows_cpu=member_rows,
+            all_rows=torch.tensor([1, 10, 11]),
+            num_member_rows=2,
+            retired=False,
+        )
+        leader.beam_group = group
+        batch = self._make_batch(scheduler, reqs=[plain, leader], with_tensors=True)
+        append_beam_tail(batch)
+        scheduler.running_batch = batch
+
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+
+        aborted = [c.args[1] for c in scheduler.send_abort_output.call_args_list]
+        self.assertEqual(aborted, [leader])
+        self.assertEqual([entry["req"] for entry in requeue_log], [plain])
+        storage = scheduler.tree_cache.token_to_kv_pool_allocator.storage
+        storage.release_rows.assert_called_once_with([10, 11])
+        self.assertIsNone(group.member_rows)
+        self.assertIsNone(batch.beam_tail)
+        # The first filter after resume finds no tail to strip.
+        batch.filter_batch()
+
     def test_pd_decode_retract_completes_offload_before_free(self):
         """PD decode retract must not free KV an offload copy is still reading, and
         must not leave offload acks that keep the paused engine from going idle."""
@@ -978,6 +1012,107 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         self.assertIsNone(req.kv.retraction_backup)
         scheduler.send_abort_output.assert_called_once()
+
+    def test_pp_retract_waits_for_in_flight_then_retracts_every_micro_batch(self):
+        class StopLoop(Exception):
+            pass
+
+        scheduler = self._new_scheduler()
+        req_a = self._make_req("a")
+        req_b = self._make_req("b")
+        mb_a = self._make_batch(
+            scheduler, [req_a], forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        mb_b = self._make_batch(
+            scheduler, [req_b], forward_mode=ForwardMode.DECODE, with_tensors=True
+        )
+        scheduler.running_reqs.join([req_a, req_b])
+        requeue_log = self._spy_requeue(scheduler)
+        # Micro-batch a's result is processed; b's is still in flight.
+        scheduler.pp_loop_size = 2
+        scheduler.running_mbs = [mb_a, mb_b]
+        scheduler.mbs = [mb_a, mb_b]
+        scheduler.last_mbs = [mb_a, None]
+        scheduler.mb_metadata = [None, None]
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler._deferred_input_requests = []
+        # A pause, then a later input, arrive while b is in flight.
+        pause = PauseGenerationReqInput(mode="retract")
+        later = MagicMock()
+        inputs = iter([[pause, later]])
+        scheduler.request_receiver = SimpleNamespace(
+            recv_requests=lambda local_reqs=None: next(inputs, [])
+        )
+        scheduler._poll_timeout_aborts = MagicMock(return_value=[])
+        events = []
+
+        def process_input_requests(reqs):
+            for req in reqs:
+                if isinstance(req, PauseGenerationReqInput):
+                    scheduler.pause_generation(req)
+                events.append(
+                    (
+                        "pause" if req is pause else "later",
+                        any(mb is not None for mb in scheduler.mbs),
+                        [entry["req"] for entry in requeue_log],
+                    )
+                )
+
+        scheduler.process_input_requests = process_input_requests
+        scheduler.init_pp_loop_state = MagicMock()
+        scheduler.get_next_batch_to_run = MagicMock(
+            side_effect=lambda running_batch, last_batch: SimpleNamespace(
+                running_batch=running_batch, batch_to_run=None
+            )
+        )
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = MagicMock(
+            return_value=(None, None, MagicMock())
+        )
+        scheduler._pp_commit_proxy_send_work = MagicMock()
+        scheduler._pp_process_batch_result = MagicMock(
+            side_effect=lambda batch, result: events.append(("result", batch))
+        )
+        scheduler.on_idle = MagicMock()
+        # Three passes over the two slots, then leave the endless loop.
+        scheduler.increment_scheduler_iterations = MagicMock(
+            side_effect=[None, None, None, StopLoop]
+        )
+        pp_view = MagicMock(
+            pp_size=2,
+            pp_async_batch_depth=0,
+            pp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+        )
+        with (
+            patch("sglang.srt.managers.scheduler.get_parallel", return_value=pp_view),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=pp_view,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin._pp_exchange_outputs_before_forward",
+                return_value=False,
+            ),
+            self.assertRaises(StopLoop),
+        ):
+            SchedulerPPMixin.event_loop_pp.__wrapped__(scheduler)
+
+        # b's result drains first; the pause then sees no micro-batch in flight
+        # and retracts both micro-batches; the later input runs after it.
+        self.assertEqual(
+            events,
+            [
+                ("result", mb_b),
+                ("pause", False, [req_a, req_b]),
+                ("later", False, [req_a, req_b]),
+            ],
+        )
+        scheduler.get_next_batch_to_run.assert_not_called()
+        self.assertTrue(scheduler._engine_paused)
+        self.assertEqual(scheduler.last_mbs, [None, None])
+        self.assertEqual([mb.reqs for mb in scheduler.running_mbs], [[], []])
+        self.assertEqual(len(scheduler.running_reqs), 0)
 
 
 if __name__ == "__main__":
