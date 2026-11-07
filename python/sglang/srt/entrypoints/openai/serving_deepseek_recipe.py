@@ -8,6 +8,8 @@ import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+import msgspec
+
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
     ADAPTER_OUTPUT_PARSERS,
     select_new_output_ids,
@@ -41,6 +43,14 @@ if TYPE_CHECKING:
         ResponsesRequest,
         Tool,
     )
+
+
+class RecipePrompt(msgspec.Struct, frozen=True):
+    """What recipe reports about a prompt it rendered, recorded on the request."""
+
+    parse_start: Any
+    reasoning_open: bool
+
 
 DEFAULT_EFFORT_ENVS = {
     "dsv4": envs.SGLANG_DSV4_REASONING_EFFORT,
@@ -161,9 +171,9 @@ class DeepSeekRecipeChatEncodingAdapter:
         if task_prefix:
             prompt_ids += self.deepseek_recipe.encode_text(task_prefix)
         if _recipe_reports_start(request):
-            request._recipe_prompt = (
-                *parse_start,
-                self.deepseek_recipe.reasoning_open(prompt_ids),
+            request._recipe_prompt = RecipePrompt(
+                parse_start=parse_start[0],
+                reasoning_open=self.deepseek_recipe.reasoning_open(prompt_ids),
             )
         return prompt_ids
 
@@ -355,7 +365,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=(
-                recipe_prompt[0]
+                recipe_prompt.parse_start
                 if recipe_prompt is not None
                 else self.deepseek_recipe.parse_start(
                     thinking=self._hooks.thinking_requested(request),
@@ -370,7 +380,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
             reasoning_must_close=recipe_prompt is not None
-            and recipe_prompt[1]
+            and recipe_prompt.reasoning_open
             and self._reasoning_must_close(request),
             stop=_stop_strings(request.stop),
             stop_regex=_stop_strings(request.stop_regex),
@@ -399,7 +409,7 @@ class DeepSeekRecipeChatEncodingAdapter:
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=(
-                recipe_prompt[0]
+                recipe_prompt.parse_start
                 if recipe_prompt is not None
                 else self.deepseek_recipe.parse_start(thinking=require_reasoning)
             ),
@@ -407,7 +417,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
             reasoning_must_close=recipe_prompt is not None
-            and recipe_prompt[1]
+            and recipe_prompt.reasoning_open
             and not _forces_nonempty_content(request.chat_template_kwargs),
         )
 
