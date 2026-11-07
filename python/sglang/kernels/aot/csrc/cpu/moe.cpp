@@ -424,14 +424,14 @@ void fused_experts_kernel_impl(
   constexpr int64_t BLOCK_M = block_size_m();
   constexpr int64_t BLOCK_N = block_size_n();
 
-  // stage 1: intermediate_cache1 = silu(hidden_states @ w1)
+  // stage 1: intermediate_cache1 = activation(hidden_states @ w1)
   const int64_t MB = div_up(num_tokens_post_pad, BLOCK_M);
   const int64_t NB = div_up(N, BLOCK_N);
 
-  // strides for w1: [E, 2N, K]
   TORCH_CHECK(N % BLOCK_N == 0, "Fixme when N is not multiples of ", BLOCK_N);
 
-  const int64_t stride_e = 2 * N * K;
+  const bool is_relu2 = act_func == CPUActMethod::relu2;
+  const int64_t stride_e = (is_relu2 ? N : 2 * N) * K;
   const int64_t stride_n = K;
 
   int64_t avg_M = std::max(int64_t(1), M * topk / E);
@@ -445,119 +445,134 @@ void fused_experts_kernel_impl(
     float* __restrict__ C0 = C_tmp + tid * 2 * BLOCK_M * BLOCK_N;
     float* __restrict__ C1 = C0 + BLOCK_M * BLOCK_N;
 
-    loop_2d<scalar_t>(mb0, mb1, nb0, nb1, BLOCK_N * K * 2, [&](int64_t mb, int64_t nb, int64_t nb_offset) {
-      // nb_upper from top half and nb_lower from bottom half
-      int64_t nb_upper = nb, nb_lower = nb + NB;
-      int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
+    loop_2d<scalar_t>(
+        mb0, mb1, nb0, nb1, BLOCK_N * K * (is_relu2 ? 1 : 2), [&](int64_t mb, int64_t nb, int64_t nb_offset) {
+          // nb_upper from top half and nb_lower from bottom half
+          int64_t nb_upper = nb, nb_lower = nb + NB;
+          int64_t n_size = std::min(N - nb * BLOCK_N, BLOCK_N);
 
-      // B shape [K, n_size] in vnni format
-      int32_t expert_id = expert_ids[mb];
-      const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
-      const scalar_t* __restrict__ B1 = packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n;
-      const float* __restrict__ B0_bias = w1_bias + expert_id * 2 * N + nb_upper * BLOCK_N;
-      const float* __restrict__ B1_bias = w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N;
+          // B shape [K, n_size] in vnni format
+          int32_t expert_id = expert_ids[mb];
+          const scalar_t* __restrict__ B0 = packed_w1 + expert_id * stride_e + nb_upper * BLOCK_N * stride_n;
+          const scalar_t* __restrict__ B1 =
+              is_relu2 ? nullptr : (packed_w1 + expert_id * stride_e + nb_lower * BLOCK_N * stride_n);
+          const float* __restrict__ B0_bias =
+              with_bias ? (w1_bias + expert_id * (is_relu2 ? N : 2 * N) + nb_upper * BLOCK_N) : nullptr;
+          const float* __restrict__ B1_bias =
+              (with_bias && !is_relu2) ? (w1_bias + expert_id * 2 * N + nb_lower * BLOCK_N) : nullptr;
 
-      int64_t m_size = offsets[mb + 1] - offsets[mb];
+          int64_t m_size = offsets[mb + 1] - offsets[mb];
 
-      if (nb_offset == 0) {
-        // 1.a load A
-        const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
-        for (int64_t m = 0; m < m_size; ++m) {
-          int32_t index = A_ids[m] / topk;
-          copy_stub(A + m * K, input + index * K, K);
-        }
-      }
+          if (nb_offset == 0) {
+            // 1.a load A
+            const int32_t* A_ids = sorted_ids + mb * BLOCK_M;
+            for (int64_t m = 0; m < m_size; ++m) {
+              int32_t index = A_ids[m] / topk;
+              copy_stub(A + m * K, input + index * K, K);
+            }
+          }
 
-      if (use_brgemm) {
-        // 1.b gemm: C0 = A @ B0
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ K,
-            /* lda   */ K,
-            /* ldb   */ n_size,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ A,
-            /* B     */ B0,
-            /* C     */ C0);
+          if (use_brgemm) {
+            // 1.b gemm: C0 = A @ B0
+            at::native::cpublas::brgemm(
+                /* M     */ m_size,
+                /* N     */ n_size,
+                /* K     */ K,
+                /* lda   */ K,
+                /* ldb   */ n_size,
+                /* ldc   */ BLOCK_N,
+                /* add_C */ false,
+                /* A     */ A,
+                /* B     */ B0,
+                /* C     */ C0);
 
-        // 1.c gemm: C1 = A @ B1
-        at::native::cpublas::brgemm(
-            /* M     */ m_size,
-            /* N     */ n_size,
-            /* K     */ K,
-            /* lda   */ K,
-            /* ldb   */ n_size,
-            /* ldc   */ BLOCK_N,
-            /* add_C */ false,
-            /* A     */ A,
-            /* B     */ B1,
-            /* C     */ C1);
+            if (!is_relu2) {
+              // 1.c gemm: C1 = A @ B1
+              at::native::cpublas::brgemm(
+                  /* M     */ m_size,
+                  /* N     */ n_size,
+                  /* K     */ K,
+                  /* lda   */ K,
+                  /* ldb   */ n_size,
+                  /* ldc   */ BLOCK_N,
+                  /* add_C */ false,
+                  /* A     */ A,
+                  /* B     */ B1,
+                  /* C     */ C1);
+            }
 
-      } else {
-        const int64_t offset = offsets[mb];
-        // the fused path below hardcodes SiLU in its store step
-        if (act_func != CPUActMethod::silu_and_mul) {
-          tinygemm_kernel(
-              /* A     */ A,
-              /* B     */ B0,
-              /* C     */ C0,
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N);
-          tinygemm_kernel(
-              /* A     */ A,
-              /* B     */ B1,
-              /* C     */ C1,
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ BLOCK_N);
-        } else {
-          // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
-          tinygemm_kernel(
-              /* A     */ A,
-              /* B0    */ B0,
-              /* B1    */ B1,
-              /* C     */ ic1 + offset * N + nb * BLOCK_N,
-              /* M     */ m_size,
-              /* N     */ n_size,
-              /* K     */ K,
-              /* lda   */ K,
-              /* ldb   */ n_size,
-              /* ldc   */ N);
-        }
-      }
-      if (with_bias) {
-        for (int64_t m = 0; m < m_size; ++m) {
-          add_bias_stub(C0 + m * BLOCK_N, B0_bias, n_size);
-          add_bias_stub(C1 + m * BLOCK_N, B1_bias, n_size);
-        }
-      }
-      // 1.d activation and mul
-      const int64_t offset = offsets[mb];
-      if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
-        for (int64_t m = 0; m < m_size; ++m) {
-          silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
-        }
-      } else if (act_func == CPUActMethod::gelu_and_mul) {
-        for (int64_t m = 0; m < m_size; ++m) {
-          gelu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
-        }
-      } else if (act_func == CPUActMethod::swiglu) {
-        for (int64_t m = 0; m < m_size; ++m) {
-          scalar_t* __restrict__ ic1_row = ic1 + (offset + m) * N;
-          clamp_sigmoid_and_mul_stub(ic1_row + nb * BLOCK_N / 2, C0 + m * BLOCK_N, BLOCK_N / 2, alpha, limit);
-          clamp_sigmoid_and_mul_stub(ic1_row + N / 2 + nb * BLOCK_N / 2, C1 + m * BLOCK_N, BLOCK_N / 2, alpha, limit);
-        }
-      }
-    });
+          } else {
+            const int64_t offset = offsets[mb];
+            // the fused path below hardcodes SiLU in its store step
+            if (act_func != CPUActMethod::silu_and_mul) {
+              tinygemm_kernel(
+                  /* A     */ A,
+                  /* B     */ B0,
+                  /* C     */ C0,
+                  /* M     */ m_size,
+                  /* N     */ n_size,
+                  /* K     */ K,
+                  /* lda   */ K,
+                  /* ldb   */ n_size,
+                  /* ldc   */ BLOCK_N);
+              if (!is_relu2) {
+                tinygemm_kernel(
+                    /* A     */ A,
+                    /* B     */ B1,
+                    /* C     */ C1,
+                    /* M     */ m_size,
+                    /* N     */ n_size,
+                    /* K     */ K,
+                    /* lda   */ K,
+                    /* ldb   */ n_size,
+                    /* ldc   */ BLOCK_N);
+              }
+            } else {
+              // fused 1.bcd: silu_and_mul(A @ B0, A @ B1)
+              tinygemm_kernel(
+                  /* A     */ A,
+                  /* B0    */ B0,
+                  /* B1    */ B1,
+                  /* C     */ ic1 + offset * N + nb * BLOCK_N,
+                  /* M     */ m_size,
+                  /* N     */ n_size,
+                  /* K     */ K,
+                  /* lda   */ K,
+                  /* ldb   */ n_size,
+                  /* ldc   */ N);
+            }
+          }
+          if (with_bias) {
+            for (int64_t m = 0; m < m_size; ++m) {
+              add_bias_stub(C0 + m * BLOCK_N, B0_bias, n_size);
+              if (!is_relu2) {
+                add_bias_stub(C1 + m * BLOCK_N, B1_bias, n_size);
+              }
+            }
+          }
+          // 1.d activation and mul
+          const int64_t offset = offsets[mb];
+          if (act_func == CPUActMethod::silu_and_mul && use_brgemm) {
+            for (int64_t m = 0; m < m_size; ++m) {
+              silu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+            }
+          } else if (act_func == CPUActMethod::gelu_and_mul) {
+            for (int64_t m = 0; m < m_size; ++m) {
+              gelu_and_mul_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, C1 + m * BLOCK_N, BLOCK_N);
+            }
+          } else if (act_func == CPUActMethod::relu2) {
+            for (int64_t m = 0; m < m_size; ++m) {
+              relu2_stub(ic1 + (offset + m) * N + nb * BLOCK_N, C0 + m * BLOCK_N, BLOCK_N);
+            }
+          } else if (act_func == CPUActMethod::swiglu) {
+            for (int64_t m = 0; m < m_size; ++m) {
+              scalar_t* __restrict__ ic1_row = ic1 + (offset + m) * N;
+              clamp_sigmoid_and_mul_stub(ic1_row + nb * BLOCK_N / 2, C0 + m * BLOCK_N, BLOCK_N / 2, alpha, limit);
+              clamp_sigmoid_and_mul_stub(
+                  ic1_row + N / 2 + nb * BLOCK_N / 2, C1 + m * BLOCK_N, BLOCK_N / 2, alpha, limit);
+            }
+          }
+        });
 
     if (use_brgemm) {
       at::native::cpublas::brgemm_release();
@@ -891,6 +906,7 @@ at::Tensor fused_experts_cpu(
     bool is_vnni,
     const std::optional<std::string>& activation) {
   const CPUActMethod act_func = act_method_from_string(activation, alpha.has_value() && limit.has_value());
+  const bool is_relu2 = act_func == CPUActMethod::relu2;
   // the int8 and int4 kernels hardcode silu in their fused store step
   const bool is_int_quant =
       moe_comp_method == CPUQuantMethod::INT8_W8A8 || moe_comp_method == CPUQuantMethod::INT4_W4A8;
@@ -898,6 +914,9 @@ at::Tensor fused_experts_cpu(
       !is_int_quant || act_func == CPUActMethod::silu_and_mul,
       "fused_experts_cpu: INT8_W8A8 and INT4_W4A8 support activation='silu' only, got: ",
       activation.value_or("silu"));
+  TORCH_CHECK(
+      !is_relu2 || moe_comp_method == CPUQuantMethod::BF16,
+      "fused_experts_cpu: activation='relu2' currently supports only unquantized BF16 path");
 
   auto packed_w1 = is_vnni ? w1 : convert_weight_packed(w1);
   auto packed_w2 = is_vnni ? w2 : convert_weight_packed(w2);
@@ -936,7 +955,7 @@ at::Tensor fused_experts_cpu(
   int64_t M = hidden_states.size(0);
   int64_t K = hidden_states.size(1);
   int64_t N = moe_comp_method == CPUQuantMethod::INT4_W4A8 ? w1_scale.value().size(1) * w1_scale.value().size(3) / 2
-                                                           : w1.size(1) / 2;
+                                                           : (is_relu2 ? w1.size(1) : w1.size(1) / 2);
   int64_t E = w1.size(0);
   int64_t topk = topk_weights_.size(1);
 

@@ -201,6 +201,45 @@ class TestFusedExperts:
         atol = rtol = precision[torch_output.dtype]
         torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
 
+    @pytest.mark.parametrize("m", [2, 96])
+    @pytest.mark.parametrize("n", [32])
+    @pytest.mark.parametrize("k", [32])
+    @pytest.mark.parametrize("e", [4])
+    @pytest.mark.parametrize("topk", [2])
+    @pytest.mark.parametrize("renormalize", [False, True])
+    def test_bf16_moe_relu2(self, m, n, k, e, topk, renormalize):
+        a = torch.randn((m, k), dtype=dtype) / 10
+        w1 = make_bf16_weights(e, n, k)
+        w2 = make_bf16_weights(e, k, n)
+        topk_weights, topk_ids, score = make_routing(
+            m,
+            e,
+            topk,
+            dtype=dtype,
+            renormalize=renormalize,
+            return_score=True,
+        )
+        torch_output = torch_naive_fused_moe(
+            a, w1, w2, score, topk, renormalize, activation="relu2"
+        )
+
+        packed_w1 = kernel.convert_weight_packed(w1) if prepack else w1
+        packed_w2 = kernel.convert_weight_packed(w2) if prepack else w2
+        fused_output = run_fused_experts(
+            a,
+            packed_w1,
+            packed_w2,
+            topk_weights,
+            topk_ids,
+            quant=CPUQuantMethod.UNQUANT,
+            is_vnni=prepack,
+            activation="relu2",
+            inplace=True,
+        )
+
+        atol = rtol = precision[torch_output.dtype]
+        torch.testing.assert_close(torch_output, fused_output, atol=atol, rtol=rtol)
+
     @pytest.mark.parametrize("m", [1, 32])
     @pytest.mark.parametrize("n", [128, 64])
     @pytest.mark.parametrize("k", [128, 64])

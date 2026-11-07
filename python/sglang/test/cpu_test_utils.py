@@ -206,6 +206,8 @@ def _activation_fn(activation):
     if activation == "gelu":
         # matches the erf gelu the kernel computes
         return functools.partial(GeluAndMul, approximate="none")
+    if activation == "relu2":
+        return lambda x: F.relu(x).square()
     raise ValueError(f"Unsupported activation: {activation}")
 
 

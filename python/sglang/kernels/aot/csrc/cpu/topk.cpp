@@ -409,81 +409,107 @@ void biased_grouped_topk_kernel_impl(
 
     using elem_t = std::pair<float, int32_t>;
     std::vector<elem_t> queue(num_groups);
-    std::vector<elem_t> queue2(topk_group * num_experts_per_group);
 
     for (int64_t i = begin; i < end; ++i) {
-      // do sigmoid to get scores
-      sigmoid<scalar_t, NUM_EXPERTS>(scores, gating_output + i * NUM_EXPERTS);
+      // Compute sigmoid in scalar float to match the torch reference path
+      // used by biased_grouped_topk_impl (gating_output.float().sigmoid()).
+      const scalar_t* token_logits = gating_output + i * NUM_EXPERTS;
+      for (int64_t expert = 0; expert < NUM_EXPERTS; ++expert) {
+        float x = static_cast<float>(token_logits[expert]);
+        scores[expert] = 1.f / (1.f + std::exp(-x));
+      }
       apply_bias<param_t, NUM_EXPERTS>(scores2, scores, bias);
 
       for (int64_t g = 0; g < num_groups; ++g) {
-        // find the max
-        float gmax = at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
-            scores2 + g * num_experts_per_group,
-            num_experts_per_group);
+        float top1 = -std::numeric_limits<float>::infinity();
+        float top2 = -std::numeric_limits<float>::infinity();
+        int32_t top1_idx = -1;
+        int32_t top2_idx = -1;
 
-        // find position of first max,
-        // note that we may have multiple max values.
-        int first_max_idx = -1;
         for (int64_t e = 0; e < num_experts_per_group; ++e) {
-          if (scores2[g * num_experts_per_group + e] == gmax) {
-            first_max_idx = g * num_experts_per_group + e;
-            break;
+          int32_t expert_idx = g * num_experts_per_group + e;
+          float v = scores2[expert_idx];
+
+          if (v > top1 || (v == top1 && (top1_idx < 0 || expert_idx < top1_idx))) {
+            top2 = top1;
+            top2_idx = top1_idx;
+            top1 = v;
+            top1_idx = expert_idx;
+          } else if (v > top2 || (v == top2 && (top2_idx < 0 || expert_idx < top2_idx))) {
+            top2 = v;
+            top2_idx = expert_idx;
           }
         }
 
-        // find the 2nd max
-        scores2[first_max_idx] = -std::numeric_limits<float>::infinity();
-        float gmax2 = at::vec::reduce_all<float>(
-            [](Vec& x, Vec& y) { return at::vec::maximum(x, y); },
-            scores2 + g * num_experts_per_group,
-            num_experts_per_group);
-        // restore scores for choice
-        scores2[first_max_idx] = gmax;
-
-        queue[g] = {gmax + gmax2, g};
+        queue[g] = {top1 + top2, g};
       }
 
       // find group topk
       std::partial_sort(
           queue.begin(), queue.begin() + topk_group, queue.end(), [](const elem_t& x, const elem_t& y) -> bool {
-            return x.first > y.first;
+            if (x.first != y.first) {
+              return x.first > y.first;
+            }
+            return x.second < y.second;
           });
+
+      alignas(64) float tmp_scores[NUM_EXPERTS];
+      for (int64_t e = 0; e < NUM_EXPERTS; ++e) {
+        tmp_scores[e] = -std::numeric_limits<float>::infinity();
+      }
 
       for (int64_t g = 0; g < topk_group; ++g) {
         int32_t group_idx = queue[g].second;
         for (int64_t e = 0; e < num_experts_per_group; ++e) {
           int32_t expert_idx = group_idx * num_experts_per_group + e;
-          queue2[g * num_experts_per_group + e] = {scores2[expert_idx], expert_idx};
+          tmp_scores[expert_idx] = scores2[expert_idx];
         }
       }
 
-      // find global topk
-      std::partial_sort(
-          queue2.begin(), queue2.begin() + TOPK, queue2.end(), [](const elem_t& x, const elem_t& y) -> bool {
-            return x.first > y.first;
-          });
+      // Use ATen topk(sorted=False) so tie behavior matches
+      // biased_grouped_topk_impl exactly.
+      auto tmp_scores_tensor =
+          at::from_blob(tmp_scores, {NUM_EXPERTS}, at::TensorOptions().dtype(at::kFloat).device(at::kCPU));
+      auto topk_result = at::topk(tmp_scores_tensor, TOPK, -1, true, false);
+      auto topk_idx_tensor = std::get<1>(topk_result);
+      const int64_t* topk_idx_ptr = topk_idx_tensor.template data_ptr<int64_t>();
 
       for (int j = 0; j < TOPK; ++j) {
-        int32_t index = queue2[j].second;
+        int32_t index = static_cast<int32_t>(topk_idx_ptr[j]);
         topk_ids[i * TOPK + j] = index;
         topk_weights[i * TOPK + j] = scores[index];
       }
 
 #if defined(CPU_CAPABILITY_AVX512)
       if (renormalize || apply_scaling_factor) {
-        __mmask16 mask = (1ULL << TOPK) - 1;
-        __m512 x = _mm512_maskz_loadu_ps(mask, topk_weights + i * TOPK);
-        if (renormalize) {
-          float sum = _mm512_reduce_add_ps(x);
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+        if constexpr (TOPK <= 16) {
+          __mmask16 mask = (1ULL << TOPK) - 1;
+          __m512 x = _mm512_maskz_loadu_ps(mask, topk_weights + i * TOPK);
+          if (renormalize) {
+            float sum = _mm512_reduce_add_ps(x);
+            __m512 vscale = _mm512_set1_ps(scaling_factor_value / sum);
+            __m512 y = _mm512_mul_ps(x, vscale);
+            _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          } else {
+            __m512 vscale = _mm512_set1_ps(scaling_factor_value);
+            __m512 y = _mm512_mul_ps(x, vscale);
+            _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          }
         } else {
-          __m512 vscale = _mm512_set1_ps(scaling_factor_value);
-          __m512 y = _mm512_mul_ps(x, vscale);
-          _mm512_mask_storeu_ps(topk_weights + i * TOPK, mask, y);
+          if (renormalize) {
+            float sum = 0.f;
+            for (int64_t j = 0; j < TOPK; ++j) {
+              sum += topk_weights[i * TOPK + j];
+            }
+            float scale = scaling_factor_value / sum;
+            for (int64_t j = 0; j < TOPK; ++j) {
+              topk_weights[i * TOPK + j] *= scale;
+            }
+          } else {
+            for (int64_t j = 0; j < TOPK; ++j) {
+              topk_weights[i * TOPK + j] *= scaling_factor_value;
+            }
+          }
         }
       }
 #else
@@ -851,22 +877,66 @@ std::tuple<at::Tensor, at::Tensor> biased_grouped_topk_cpu(
   float scaling_factor_value = routed_scaling_factor.has_value() ? routed_scaling_factor.value() : 1.0f;
 
   CPU_DISPATCH_FLOATING_TYPES_EXT(st, correction_bias.scalar_type(), "biased_grouped_topk_kernel", [&] {
-    TORCH_CHECK(topk == 8, "Unexpected topk: ", topk);
-    switch (num_experts) {
-      case 128:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 8);
+    switch (topk) {
+      case 6:
+        switch (num_experts) {
+          case 128:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 6);
+            break;
+          case 192:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 6);
+            break;
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 6);
+            break;
+          case 384:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 6);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
         break;
-      case 192:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 8);
+      case 8:
+        switch (num_experts) {
+          case 128:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 8);
+            break;
+          case 192:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 8);
+            break;
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
+            break;
+          case 384:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
         break;
-      case 256:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 8);
-        break;
-      case 384:
-        LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 8);
+      case 22:
+        switch (num_experts) {
+          case 128:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(128, 22);
+            break;
+          case 192:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(192, 22);
+            break;
+          case 256:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(256, 22);
+            break;
+          case 384:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(384, 22);
+            break;
+          case 512:
+            LAUNCH_BIASED_GROUPED_TOPK_KERNEL(512, 22);
+            break;
+          default:
+            TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        }
         break;
       default:
-        TORCH_CHECK(false, "Unexpected num_experts: ", num_experts);
+        TORCH_CHECK(false, "Unexpected topk: ", topk, ". Supported values: 6, 8, 22");
     }
   });
   return std::make_tuple(topk_weights, topk_ids);

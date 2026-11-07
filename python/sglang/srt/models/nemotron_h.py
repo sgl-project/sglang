@@ -384,9 +384,7 @@ class NemotronHMoE(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         # router_scores: [num_tokens, num_experts]
         # bf16 gemm on tensor cores with fp32 accumulation/output for sigmoid/topk.
-        router_logits = torch.mm(
-            hidden_states, self.gate.weight.t(), out_dtype=torch.float32
-        )
+        router_logits = self._compute_router_logits(hidden_states)
         if self.shared_experts is not None:
             shared_output = self.shared_experts(hidden_states)
         else:
@@ -479,6 +477,23 @@ class NemotronHMoE(nn.Module):
         if shared_output is not None:
             final_hidden_states += shared_output
         return final_hidden_states
+
+    def _compute_router_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # aten::mm.dtype is not implemented by the CPU backend in some PyTorch
+        # builds. CPU inference still needs fp32 router logits for sigmoid/topk.
+        if hidden_states.device.type == "cpu":
+            # On CPU+AMX, gate weights are VNNI-packed at load time. Route
+            # through the packed linear kernel so bytes are interpreted with
+            # the correct layout; raw torch.mm on packed weights yields bad
+            # routing logits.
+            from sglang.srt.utils import use_intel_amx_backend
+
+            if use_intel_amx_backend(self.gate):
+                return torch.ops.sgl_kernel.weight_packed_linear(
+                    hidden_states.contiguous(), self.gate.weight, None, True
+                ).float()
+            return torch.mm(hidden_states.float(), self.gate.weight.t().float())
+        return torch.mm(hidden_states, self.gate.weight.t(), out_dtype=torch.float32)
 
     def forward(
         self,
