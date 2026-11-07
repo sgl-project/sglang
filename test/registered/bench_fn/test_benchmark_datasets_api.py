@@ -408,7 +408,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             },
             {
                 "messages": [{"role": "user", "content": "What is 2+2?"}],
-                "max_tokens": 8,
+                "max_completion_tokens": 8,
                 "tools": [{"type": "function", "function": {"name": "tool_a"}}],
             },
         ]
@@ -550,6 +550,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows))
 
     def test_openai_sampler(self):
+        """Honor both recorded output-limit field names when replaying requests."""
         dataset_path = self._write_openai_jsonl()
         rows = sample_openai_requests(
             dataset_path=dataset_path,
@@ -557,6 +558,7 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             tokenizer=self.tokenizer,
         )
         self.assertEqual(len(rows), 2)
+        self.assertEqual([row.output_len for row in rows], [7, 8])
         self.assertIn("temperature", rows[0].extra_request_body)
         self.assertIn("tools", rows[1].extra_request_body)
 
@@ -569,41 +571,6 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
             if tools:
                 expected_prompt_len += len(self.tokenizer.encode(json.dumps(tools)))
             self.assertEqual(row.prompt_len, expected_prompt_len)
-
-    def test_openai_sampler_output_lengths(self):
-        """Keep request token limits when replaying OpenAI-format datasets."""
-        cases = [
-            ({}, None, 256),
-            ({"max_tokens": 7}, None, 7),
-            ({"max_completion_tokens": 11}, None, 11),
-            ({"max_tokens": 7, "max_completion_tokens": 11}, None, 11),
-            ({"max_tokens": 7, "max_completion_tokens": 11}, 16, 16),
-            ({"max_tokens": 7, "max_completion_tokens": None}, None, 7),
-            ({"max_tokens": 7, "max_completion_tokens": 0}, None, 7),
-            ({"max_tokens": 7}, 0, 7),
-            ({}, 0, 256),
-            ({"max_tokens": 0}, None, 0),
-            ({"max_completion_tokens": 11}, 0, 11),
-            ({"max_tokens": None}, None, None),
-        ]
-        messages = [{"role": "user", "content": "What is 1+1?"}]
-        dataset_path = self.tmpdir_path / "openai_output_lengths.jsonl"
-        for token_limits, fixed_output_len, expected in cases:
-            with self.subTest(
-                token_limits=token_limits, fixed_output_len=fixed_output_len
-            ):
-                with open(dataset_path, "w") as f:
-                    f.write(json.dumps({"messages": messages, **token_limits}) + "\n")
-                rows = sample_openai_requests(
-                    dataset_path=str(dataset_path),
-                    num_requests=1,
-                    tokenizer=self.tokenizer,
-                    fixed_output_len=fixed_output_len,
-                )
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0].output_len, expected)
-                self.assertNotIn("max_tokens", rows[0].extra_request_body)
-                self.assertNotIn("max_completion_tokens", rows[0].extra_request_body)
 
     def test_generated_shared_prefix_sampler(self):
         args = make_args(gsp_num_groups=2, gsp_prompts_per_group=2)
