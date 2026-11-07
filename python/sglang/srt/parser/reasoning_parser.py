@@ -4,15 +4,10 @@ from typing import Dict, List, Optional, Tuple, Type
 
 from transformers import PreTrainedTokenizerBase
 
-from sglang.srt.entrypoints.openai.encoding_dsv4 import dsml_token as dsv4_dsml_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import eos_token as dsv4_eos_token
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_end_token as dsv4_thinking_end_token,
+from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    ResponsesRequest,
 )
-from sglang.srt.entrypoints.openai.encoding_dsv4 import (
-    thinking_start_token as dsv4_thinking_start_token,
-)
-from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
 from sglang.srt.function_call.hunyuan_detector import resolve_hunyuan_tokens
 from sglang.srt.function_call.kimik3_format import (
     MESSAGE_CLOSE,
@@ -37,6 +32,7 @@ from sglang.srt.function_call.muse_glimmer_format import (
     partial_marker_len,
 )
 from sglang.srt.parser.answer_frame import AnswerFrame, InklingAnswerFrame
+from sglang.srt.parser.beam import BeamReasoningDetector
 from sglang.srt.parser.harmony_parser import HarmonyParser
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_INVOKE_TOOL_JSON,
@@ -48,6 +44,10 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_CONTROL_TOKENS,
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
+)
+from sglang.srt.parser.response_template import (
+    ResponseTemplateReasoningDetector,
+    grammar_holds_calls,
 )
 
 
@@ -117,6 +117,12 @@ class BaseReasoningFormatDetector:
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
+
+    def get_self_opened_think_start_token_ids(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[List[int]]:
+        """Start tag the model emits itself when it chooses to think unforced; None if it never does."""
+        return None
 
     def get_answer_frame(self) -> Optional[AnswerFrame]:
         return None
@@ -471,6 +477,40 @@ class Qwen3Detector(BaseReasoningFormatDetector):
             # Qwen3.5 sometimes opens ``<tool_call>`` without closing
             # ``</think>``; treat it as an implicit reasoning close.
             tool_start_token="<tool_call>",
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            thinks_internally=True,
+            reasoning_default="enable_thinking",
+            force_nonempty_content=force_nonempty_content,
+        )
+
+
+class Ernie5_5ReasoningDetector(BaseReasoningFormatDetector):
+    """Reasoning of ERNIE 5.5 Flash: ``<ernie:think> ... </ernie:think>``.
+
+    A tool-call start inside the think block closes it implicitly.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = False,
+    ):
+        super().__init__(
+            "<ernie:think>",
+            "</ernie:think>",
+            think_excluded_tokens=[
+                "<ernie:tool_call>",
+                "</ernie:tool_call>",
+                "<|ernie:im_end|>",
+                "<|ERNIE_MASK|>",
+            ],
+            force_reasoning=force_reasoning,
+            stream_reasoning=stream_reasoning,
+            tool_start_token="<ernie:tool_call>",
             continue_final_message=continue_final_message,
             previous_content=previous_content,
             thinks_internally=True,
@@ -1215,6 +1255,13 @@ class MiniMaxM3Detector(BaseReasoningFormatDetector):
         self._checked_leading_close = False
         self._force_nonempty_content = force_nonempty_content
 
+    def get_self_opened_think_start_token_ids(
+        self, tokenizer: PreTrainedTokenizerBase
+    ) -> Optional[List[int]]:
+        # Without thinking_mode=enabled the template does not prefill <mm:think>,
+        # so an adaptive reply that thinks opens with it.
+        return tokenizer.encode(self.think_start_token, add_special_tokens=False)
+
     def detect_and_parse(self, text: str) -> StreamingParseResult:
         if not self._in_reasoning and text.lstrip().startswith(self.think_end_token):
             text = text.lstrip()[len(self.think_end_token) :]
@@ -1521,6 +1568,18 @@ class _DeepSeekV3Detector(Qwen3Detector):
         self.reasoning_default = "explicit_thinking"
 
 
+class _FlintDetector(Qwen3Detector):
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.reasoning_default = None
+
+
+DSV4_EOS_TOKEN = "<｜end▁of▁sentence｜>"
+DSV4_THINK_START_TOKEN = "<think>"
+DSV4_THINK_END_TOKEN = "</think>"
+DSV4_DSML_TOKEN = "｜DSML｜"
+
+
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
     def __init__(
         self,
@@ -1531,14 +1590,9 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         force_nonempty_content: bool = False,
     ):
         super().__init__(
-            dsv4_thinking_start_token,
-            dsv4_thinking_end_token,
-            think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # The reference parser splits reasoning at `\n\n<｜DSML｜tool_calls`;
-            # anchoring on the full tag at a line start keeps a mid-sentence
-            # mention of the tag inside reasoning from ending the block.
-            tool_start_token=f"<{dsv4_dsml_token}tool_calls>",
-            tool_start_at_line_start=True,
+            DSV4_THINK_START_TOKEN,
+            DSV4_THINK_END_TOKEN,
+            think_excluded_tokens=[DSV4_EOS_TOKEN, DSV4_DSML_TOKEN],
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1547,15 +1601,6 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
-
-
-class DeepSeekV41ReasoningDetector(DeepSeekV4Detector):
-    """V4.1 emits the calls block with a spaced tag name (`<｜DSML｜ calls>`),
-    so the unspaced V4 tool-start anchor never interrupts its reasoning."""
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.tool_start_token = f"<{dsv4_dsml_token} calls>"
 
 
 class _MimoDetector(Qwen3Detector):
@@ -1573,6 +1618,42 @@ class _PoolsideV1Detector(Qwen3Detector):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.reasoning_default = "explicit_enable_thinking"
+
+
+class Xing4_0Detector(Qwen3Detector):
+    """Detector for Xing4_0 models.
+
+    Xing4_0 reuses Qwen3's reasoning markers, injected into the prompt via
+    the template's ``enable_thinking`` parameter, and emits Qwen3-compatible
+    tool-call tokens, so Qwen3Detector's parsing rules apply unchanged.
+
+    When ``enable_thinking=True``:
+      The model generates reasoning content followed by the close marker and
+      then the answer.
+
+    When ``enable_thinking=False``:
+      The model generates the answer directly without any markers.
+
+    ``force_nonempty_content=True`` acts as a safety net: if the model omits
+    the close tag, the accumulated reasoning is reclassified as normal text
+    so the answer is never lost in the text field.
+    """
+
+    def __init__(
+        self,
+        stream_reasoning: bool = True,
+        force_reasoning: bool = False,
+        continue_final_message: bool = False,
+        previous_content: str = "",
+        force_nonempty_content: bool = True,
+    ):
+        super().__init__(
+            stream_reasoning=stream_reasoning,
+            force_reasoning=force_reasoning,
+            continue_final_message=continue_final_message,
+            previous_content=previous_content,
+            force_nonempty_content=force_nonempty_content,
+        )
 
 
 class Apertus2509Detector(BaseReasoningFormatDetector):
@@ -2266,10 +2347,11 @@ class ReasoningParser:
 
     DetectorMap: Dict[str, Type[BaseReasoningFormatDetector]] = {
         "apertus2509": Apertus2509Detector,
+        "beam": BeamReasoningDetector,
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
-        "deepseek-v41": DeepSeekV41ReasoningDetector,
+        "deepseek-v41": DeepSeekV4Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
@@ -2284,6 +2366,7 @@ class ReasoningParser:
         "poolside_v1": _PoolsideV1Detector,
         "qwen3": Qwen3Detector,
         "qwen3-thinking": Qwen3Detector,
+        "ernie55": Ernie5_5ReasoningDetector,
         "minimax": Qwen3Detector,
         "minimax-append-think": MiniMaxAppendThinkDetector,
         "minimax-m3": MiniMaxM3Detector,
@@ -2298,7 +2381,10 @@ class ReasoningParser:
         "gigachat35": DeepSeekR1Detector,
         "inkling": InklingDetector,
         "iquest_q1": IQuestQ1ReasoningDetector,
+        "flint": _FlintDetector,
         "cohere_command4": CohereCommand4Detector,
+        "response_template": ResponseTemplateReasoningDetector,
+        "xing4_0": Xing4_0Detector,
     }
 
     def __init__(
@@ -2309,6 +2395,7 @@ class ReasoningParser:
         request: ChatCompletionRequest = None,
         tokenizer=None,
         tool_call_parser_active: bool = False,
+        prefix: str | None = None,
     ):
         if not model_type:
             raise ValueError("Model type must be specified")
@@ -2385,6 +2472,19 @@ class ReasoningParser:
             sig = inspect.signature(detector_class)
             if "tool_call_parser_active" in sig.parameters:
                 kwargs["tool_call_parser_active"] = True
+
+        if prefix is None:
+            prefix = getattr(request, "_response_parser_prefix", "")
+        if issubclass(detector_class, ResponseTemplateReasoningDetector):
+            if prefix:
+                kwargs["prefix"] = prefix
+            if isinstance(request, (ChatCompletionRequest, ResponsesRequest)):
+                kwargs["grammar_start"] = request._response_parser_grammar_start
+                kwargs["tools"] = request.tools
+                kwargs["constrained"] = grammar_holds_calls(
+                    request._response_parser_tool_grammar,
+                    request._response_parser_grammar_start,
+                )
 
         self.detector = detector_class(**kwargs)
 

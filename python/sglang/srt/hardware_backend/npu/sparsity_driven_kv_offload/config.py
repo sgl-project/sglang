@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Optional, Sequence
 import torch
 
 from sglang.srt.configs.model_config import (
+    dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_topk,
     is_deepseek_dsa,
@@ -27,8 +28,8 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils.common import (
     get_cuda_graph_max_batch_size,
     get_eager_max_batch_size,
-    is_npu,
 )
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -126,6 +127,7 @@ def get_sparsity_driven_kv_offload_cell_size(
     use_mla_backend: bool,
     num_layers: int,
     element_size: int,
+    start_layer: int = 0,
     is_draft_worker: bool = False,
     indexer_layer_ids: Optional[Sequence[int]] = None,
     kv_cache_dtype: Optional[torch.dtype] = None,
@@ -140,9 +142,20 @@ def get_sparsity_driven_kv_offload_cell_size(
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    num_indexer_layers = (
-        num_layers if indexer_layer_ids is None else len(indexer_layer_ids)
-    )
+    if indexer_layer_ids is not None:
+        num_indexer_layers = len(indexer_layer_ids)
+    else:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
+            num_indexer_layers = sum(
+                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+                for layer_id in range(start_layer, start_layer + num_layers)
+            )
+        else:
+            num_indexer_layers = num_layers
     layer_bytes = index_head_dim * element_size
     if kv_cache_dtype == torch.float8_e4m3fn:
         # NPU FP8 index keys have one FP32 scale per token and indexer layer.

@@ -18,6 +18,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     fake_quant_fp8_activation,
     fp8_grid_quantize,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import fp8_hip
 from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
@@ -158,6 +159,14 @@ def _aiter_mxfp8_gemm_available() -> bool:
     return True
 
 
+def _aiter_has_preshuffled_mxfp8() -> bool:
+    if not _aiter_mxfp8_gemm_available():
+        return False
+    from sglang.kernels.ops.gemm import mxfp8_aiter_gfx95
+
+    return mxfp8_aiter_gfx95._aiter_has_preshuffled_mxfp8()
+
+
 # decode / verify rows and the dot_scaled buckets the native test covers
 AITER_MS = (1, 6, 33, 1025)
 
@@ -180,16 +189,30 @@ class TestMxfp8AiterRouteGfx95(CustomTestCase):
             w8a8_mxfp8_linear=dispatch_block_fp8_mxfp8_linear(backend),
         )
         fp8_hip.process_dense_weights(method, layer, None)
-        return lambda x: fp8_hip.apply_dense(method, layer, x, None)
+        route = lambda x: fp8_hip.apply_dense(method, layer, x, None)
+        route.layer = layer
+        return route
 
     def test_within_one_bf16_ulp_of_the_bf16_route(self):
+        self._check_route(AITER_MS)
+
+    @unittest.skipUnless(
+        _aiter_has_preshuffled_mxfp8(), "aiter FlyDSL MXFP8 GEMM (ROCm/aiter#5896)"
+    )
+    def test_preshuffled_weight_within_one_bf16_ulp_of_the_bf16_route(self):
+        # 2049: a prefill row count, which the preshuffled weight also serves
+        with envs.SGLANG_ROCM_MXFP8_AITER_PRESHUFFLE.override(True):
+            self._check_route(AITER_MS + (2049,), preshuffled=True)
+
+    def _check_route(self, ms, preshuffled=False):
         for n, k in ROUTE_SHAPES:
             torch.manual_seed(0)
             w = torch.randn(n, k, device="cuda", dtype=torch.bfloat16)
             wq, ws = _quant_weight_block32(w)
             w_bf16 = dequant_block_fp8_weight_to_bf16(wq, ws, [32, 32])
             route = self._route(wq, ws)
-            for m in AITER_MS:
+            self.assertEqual(route.layer.mxfp8_aiter_preshuffled, preshuffled, (n, k))
+            for m in ms:
                 x = torch.randn(m, k, device="cuda", dtype=torch.bfloat16)
                 ref = bf16_dequant_blockscaled_linear(x, w_bf16)
                 out = route(x)
