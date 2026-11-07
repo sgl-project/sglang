@@ -61,6 +61,7 @@ def _server_args(ext, port: int):
         tool_call_parser=None,
         reasoning_parser=None,
         stream_response_default_include_usage=False,
+        enable_cache_report=False,
         tokenizer_worker_num=1,
         detokenizer_worker_num=1,
         skip_tokenizer_init=True,
