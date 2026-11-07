@@ -2057,7 +2057,6 @@ def resolve_rgb_conversion(mm_process_config: dict, default: str) -> str:
     return mode
 
 
-
 def smart_to_rgb(
     image: Union[torch.Tensor, Image.Image],
 ) -> Union[torch.Tensor, Image.Image]:
