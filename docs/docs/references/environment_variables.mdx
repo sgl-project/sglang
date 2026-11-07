@@ -830,6 +830,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_SM120_NVFP4_FUSED_MOE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On SM120 GPUs, run NVFP4 SwiGLU MoE layers of up to 512 tokens with a fused two-launch kernel instead of FlashInfer's CUTLASS MoE (<code>--moe-runner-backend flashinfer_cutlass</code>, EP and MoE TP of 1). The output is bitwise identical to the CUTLASS path with the default unfused finalize; the kernel is not used when <code>SGLANG_FLASHINFER_MOE_FUSED_FINALIZE</code> is set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_NVFP4_4OVER6</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable FlashInfer NVFP4 4over6 scaling for NVFP4 per-token activation and online NVFP4 MoE weight quantization paths</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
