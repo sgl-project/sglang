@@ -13,7 +13,6 @@ import torch_npu
 from sgl_kernel_npu.operators import attention as npu_attention_ops
 from sgl_kernel_npu.operators import indexer as npu_indexer_ops
 from sgl_kernel_npu.operators import mem_cache as npu_cache_ops
-from sgl_kernel_npu.operators.utils import transformer_compat as npu_transformer_compat
 
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
@@ -1315,18 +1314,16 @@ class DeepseekV4AscendAttnBackend(
 
         # Allocation uses the kernel-owned ABI; do not execute metadata kernels
         # on temporary synthetic inputs merely to discover their output shapes.
-        attention_metadata_size = npu_transformer_compat.get_transformer_metadata_size(
-            "mixed_quant_sparse_flash_mla_metadata"
+        attention_metadata_size = (
+            npu_attention_ops.get_mixed_quant_sparse_flash_mla_metadata_size()
             if is_npu_arch35()
-            else "sparse_flash_mla_metadata"
+            else npu_attention_ops.get_sparse_flash_mla_metadata_size()
         )
         metadata_sizes = {"kernel_metadata_c1a": attention_metadata_size}
         if self._dsv4_has_c4:
             metadata_sizes["kernel_metadata_c4a"] = attention_metadata_size
             metadata_sizes["kernel_metadata_li_quant"] = (
-                npu_transformer_compat.get_transformer_metadata_size(
-                    "quant_lightning_indexer_metadata"
-                )
+                npu_indexer_ops.get_quant_lightning_indexer_metadata_size()
             )
         if self._dsv4_has_c128:
             metadata_sizes["kernel_metadata_c128a"] = attention_metadata_size
