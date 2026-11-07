@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 from .scoring import (
     DeepGEMMDecodeData,
@@ -280,7 +280,7 @@ class SparseTableBackend:
         seq_lens = metadata.compressed_seq_lens.reshape(-1)
         if isinstance(metadata.deep_gemm_metadata, list):
             return self._publish_decode_chunked(inputs, data, seq_lens)
-        q, lens, table = data.paged_logits_args(metadata)
+        q, lens, table, indices = data.paged_logits_args(metadata)
         logits = deep_gemm_fp4_paged_mqa_logits(
             q,
             data.k_cache,
@@ -289,6 +289,7 @@ class SparseTableBackend:
             table,
             metadata.deep_gemm_metadata,
             metadata.max_compressed_seq_len,
+            indices=indices,
         )
         main_stream = torch.cuda.current_stream()
         self.alt_stream.wait_stream(main_stream)
@@ -358,7 +359,7 @@ class SparseTableBackend:
         topk_plans = metadata.topk_metadata_chunks
         assert not metadata.use_topk_v2 or topk_plans is not None
         for chunk_idx, (rows, plan) in enumerate(metadata.row_chunks()):
-            q, lens, table = data.paged_logits_args(metadata, rows)
+            q, lens, table, indices = data.paged_logits_args(metadata, rows)
             logits = deep_gemm_fp4_paged_mqa_logits(
                 q,
                 data.k_cache,
@@ -367,6 +368,7 @@ class SparseTableBackend:
                 table,
                 plan,
                 metadata.max_compressed_seq_len,
+                indices=indices,
             )
             topk_transform_paged_from_metadata(
                 logits,

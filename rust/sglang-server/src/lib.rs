@@ -17,6 +17,7 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::core::{ExtensionCounter, ExtensionHistogram};
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
@@ -30,7 +31,7 @@ pub use message::config::{
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::{GenerateRequest, MmData};
+pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFetch};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
@@ -303,7 +304,7 @@ impl Server {
     /// Begin the graceful drain, the Rust side of Python's SIGTERM handling:
     /// health answers 503 at once, requests are still admitted, and the
     /// listeners close once none is left in flight (see [`Server::drain_complete`]).
-    /// `force` (Python's `SGL_FORCE_SHUTDOWN`) closes them without waiting, as
+    /// `force` (Python's `SGLANG_FORCE_SHUTDOWN`) closes them without waiting, as
     /// does a failed last health probe. Idempotent.
     #[pyo3(signature = (force = false))]
     pub fn begin_drain(&self, force: bool) {

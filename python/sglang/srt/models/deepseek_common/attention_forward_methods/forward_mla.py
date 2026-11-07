@@ -26,6 +26,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.layout import dsa_shards_index_k
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.lora.utils import kv_b_lora_correction
@@ -91,6 +92,8 @@ def _select_local_dcp_heads_for_autotune(
 
 
 def is_mla_dcp_lse_base_on_e(attention_backend: Optional[str]) -> bool:
+    if attention_backend == "dsa":
+        return dsa_shards_index_k()
     return attention_backend in {"flashmla", "cutedsl_mla", "aiter"}
 
 
@@ -171,6 +174,7 @@ class DeepseekMLAForwardMixin:
                 # ROCm only: the draft shards its KV like the target, so its
                 # extend merges per-rank partials the same way the target does.
                 and mode.is_extend(include_draft_extend_v2=_is_hip)
+                and not dsa_shards_index_k()
             )
         )
 
@@ -724,7 +728,7 @@ class DeepseekMLAForwardMixin:
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
             born_q_backend.q8kv8_stash_born_q(
-                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
                 self.attn_mqa.layer_id,
             )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(
@@ -759,14 +763,15 @@ class DeepseekMLAForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # for extend, gather kv
-                bcg_dcp_extend_kv_gather(
-                    get_token_to_kv_pool(),
-                    self.attn_mqa,
-                    forward_batch,
-                    self.kv_lora_rank,
-                    k_nope,
-                    k_pe,
-                )
+                if not self.use_dsa:
+                    bcg_dcp_extend_kv_gather(
+                        get_token_to_kv_pool(),
+                        self.attn_mqa,
+                        forward_batch,
+                        self.kv_lora_rank,
+                        k_nope,
+                        k_pe,
+                    )
             else:
                 logger.warning(
                     f"not supported forward_mode {forward_batch.forward_mode}"
