@@ -253,7 +253,7 @@ class TestFoundryAdapter(CustomTestCase):
                 names = [name for name, _, _ in api.calls]
                 self.assertEqual(
                     [kw for name, _, kw in api.calls if name == "deactivate"],
-                    [{"step": step, "reason": "fake reason"}],
+                    [{"step": step, "reason": "fake reason", "quiet": False}],
                 )
                 after = names[names.index("deactivate") + 1 :]
                 self.assertNotIn("capture_one", after)

@@ -149,8 +149,8 @@ class _FoundryAdapterReal(FoundryAdapter):
             )
         else:
             logger.warning(
-                f"[Foundry] rank {rank}: unsupported at {unsupported.step} (reason "
-                "on rank 0); continuing natively"
+                f"[Foundry] rank {rank}: unsupported at {unsupported.step} (see rank "
+                "0's log); continuing natively"
             )
 
     def pin_server_args(self, server_args):
