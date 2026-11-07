@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from typing import TYPE_CHECKING
 
 from sglang.srt.arg_groups.engram_config import (
@@ -119,6 +120,27 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
         config = EngramConfig.from_dict(raw)
     if config.lookup == EngramLookup.PEER_READ and not get_platform().is_cuda:
         raise ValueError("--engram-config: lookup 'peer_read' needs CUDA.")
+    if config.placement == EngramPlacement.EXTERNAL:
+        if not get_platform().is_cuda:
+            raise ValueError("--engram-config: external placement needs CUDA.")
+        if str(cfg.load_format) not in ("auto", "safetensors"):
+            raise ValueError(
+                "--engram-config: external placement requires ordinary "
+                "safetensors loading."
+            )
+        if cfg.weight_loader_disable_mmap:
+            raise ValueError(
+                "--engram-config: external placement requires safetensors mmap."
+            )
+        if cfg.attn_dp_size != 1 or cfg.attn_cp_size != 1:
+            raise ValueError(
+                "--engram-config: external placement currently needs attention "
+                "DP=1 and CP=1."
+            )
+        if not os.path.isdir(model_config_of(server_args).model_path):
+            raise ValueError(
+                "--engram-config: external placement needs a local checkpoint."
+            )
     if config.lookup in (EngramLookup.REDUCE_SCATTER, EngramLookup.ALL_TO_ALL) and (
         cfg.attn_dp_size <= 1 or not get_platform().is_cuda
     ):
