@@ -427,6 +427,7 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         self.assertIs(kwargs["rollout_return_generated_output"], False)
         sp = SamplingParams(
             prompt="x",
+            rollout=True,
             rollout_return_generated_output=kwargs["rollout_return_generated_output"],
         )
         self.assertIs(Req(sampling_params=sp).rollout_return_generated_output, False)
@@ -516,6 +517,34 @@ class TestStagesHeader(unittest.TestCase):
         self.assertEqual(stages_header(types.SimpleNamespace(stages={})), "")
 
 
+# Every module that defines a DecodingStage subclass; the completeness test
+# walks the subclass tree after importing them.
+_DECODING_STAGE_MODULES = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo.memory",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.base",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae",
+    "sglang.multimodal_gen.runtime.pipelines.glm_image",
+)
+
+
+def _all_subclasses(cls: type) -> set[type]:
+    found = set()
+    for sub in cls.__subclasses__():
+        found.add(sub)
+        found |= _all_subclasses(sub)
+    return found
+
+
 class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
     """rollout_return_generated_output=False: the decoders return the trajectory without running the VAE."""
 
@@ -569,6 +598,128 @@ class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
         self.assertTrue(stage.verify_output(trajectory_only, None).is_valid())
         # An empty output that is not a rollout trajectory still fails.
         self.assertFalse(stage.verify_output(OutputBatch(), None).is_valid())
+
+    def test_every_decoding_stage_skips_or_declares_it_cannot(self):
+        """A subclass whose forward is not wrapped reaches its VAE (or indexes output) and fails here,
+        unless it declares skip_decode_supported = False, which admission turns into a rejection."""
+        import importlib
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            DecodingStage,
+        )
+
+        for module in _DECODING_STAGE_MODULES:
+            importlib.import_module(module)
+        # test-local subclasses elsewhere in the suite are not stages a server runs
+        stages = {
+            cls
+            for cls in _all_subclasses(DecodingStage)
+            if cls.__module__.startswith("sglang.multimodal_gen.runtime")
+        }
+        self.assertGreaterEqual(len(stages), 14)
+        stateful = {cls.__name__ for cls in stages if not cls.skip_decode_supported}
+        # the forwards that also advance state; a new entry needs its own reason
+        self.assertEqual(
+            stateful,
+            {"JoyEchoAVDecodingStage", "NomasDecodingStage", "CausalVaeDecodingStage"},
+        )
+        for stage_cls in (DecodingStage, *sorted(stages, key=lambda c: c.__name__)):
+            if not stage_cls.skip_decode_supported:
+                continue
+            req = self._request()
+            output = stage_cls.forward(object.__new__(stage_cls), req, None)
+            self.assertTrue(output.generated_output_skipped, stage_cls.__name__)
+            self.assertIsNone(output.output, stage_cls.__name__)
+            self.assertIs(output.rollout_trajectory_data, req.rollout_trajectory_data)
+
+    def test_h3_verification_accepts_a_skipped_decode_without_a_trajectory(self):
+        """The skip signal alone must satisfy verification; a rule that infers the skip from a trajectory misses this."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        stage = object.__new__(MiniMaxH3DecodingStage)
+        skipped = OutputBatch(generated_output_skipped=True)
+        self.assertTrue(stage.verify_output(skipped, None).is_valid())
+
+    def test_skipped_decode_does_not_release_the_allocator_cache(self):
+        """Cache release means the decoded tensor left output; a skip never produced one."""
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            _releases_cache_after,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+
+        req = self._request()
+        self.assertFalse(_releases_cache_after(rollout_output_without_decode(req), req))
+        self.assertTrue(
+            _releases_cache_after(OutputBatch(output_file_paths=["out.mp4"]), req)
+        )
+
+    def test_skip_request_is_rejected_before_the_forward_unless_the_last_stage_decodes(
+        self,
+    ):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _engine_error,
+        )
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            _skip_decode_error,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+            DecodingStage,
+        )
+
+        class _StatefulDecode(DecodingStage):
+            skip_decode_supported = False
+
+        decode = object.__new__(DecodingStage)
+        stateful = object.__new__(_StatefulDecode)
+        other = types.SimpleNamespace()
+        skip = [self._request()]
+        wants_output = [Req(sampling_params=SamplingParams(prompt="x"))]
+        self.assertIsNone(_skip_decode_error([other, decode], skip, disagg_mode=False))
+        self.assertEqual(
+            _skip_decode_error([decode, other], skip, disagg_mode=False),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        self.assertEqual(
+            _skip_decode_error([other, stateful], skip, disagg_mode=False),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        # the skip signal does not cross the disaggregated role boundary
+        self.assertEqual(
+            _skip_decode_error([other, decode], skip, disagg_mode=True),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        self.assertIsNone(
+            _skip_decode_error([decode, other], wants_output, disagg_mode=True)
+        )
+        self.assertEqual(_engine_error(SKIP_DECODE_UNSUPPORTED_ERROR).status_code, 400)
+        self.assertEqual(_engine_error("forward failed").status_code, 500)
+
+    def test_rollout_requests_never_share_a_dynamic_batch(self):
+        """The batched split carries no rollout trajectory, so a rollout request must get no batch signature."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                supports_sequential_dit_inference=lambda: False
+            )
+        )
+        self.assertIsNone(scheduler._build_dynamic_batch_signature(self._request()))
+        plain = Req(sampling_params=SamplingParams(prompt="x"))
+        self.assertIsInstance(scheduler._build_dynamic_batch_signature(plain), tuple)
 
     def test_response_has_one_entry_per_output_and_no_media(self):
         from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
