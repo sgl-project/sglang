@@ -34,7 +34,7 @@ sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence save
 sglang serve --model-path Qwen/Qwen3-1.7B --cuda-graph-persistence load
 ```
 
-**Engines with `--cuda-graph-persistence` run with `TORCHDYNAMO_DISABLE=1`.** Foundry pins it for the scheduler processes and rejects a contrary value: with TorchDynamo on, `save` fails at the first `@torch.compile` helper inside the capture window on torch 2.14 and later. On the validated models outputs are identical; a model whose MoE activation is a `torch.compile` fusion (gpt-oss) decodes up to ~9% slower under the pin.
+**Engines with `--cuda-graph-persistence` run with `TORCHDYNAMO_DISABLE=1`.** Foundry pins it for the scheduler processes (a contrary value disables persistence, see below): with TorchDynamo on, `save` fails at the first `@torch.compile` helper inside the capture window on torch 2.14 and later. On the validated models outputs are identical; a model whose MoE activation is a `torch.compile` fusion (gpt-oss) decodes up to ~9% slower under the pin.
 
 `--cuda-graph-persistence-config` names an optional Foundry TOML (`workspace_root` for the archive directory, `base_addr` / `region_size` for the address region, `scratch_space_size`); its `mode` key is ignored, the flag's mode wins:
 
@@ -56,6 +56,16 @@ Run engines with and without `--cuda-graph-persistence` in separate processes.
 
 ## What it changes
 
-- Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are rejected.
-- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value stops the launch with the reason.
-- Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE); other speculative algorithms, LoRA, elastic-EP graph recapture and post-capture KV sizing are not supported.
+- Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are not supported.
+- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph, the DCP push-combine all-reduce) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value is not supported.
+- Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE); other speculative algorithms, LoRA, elastic-EP graph recapture, post-capture KV sizing and graph variants (attention variants, sharded-verify logits variants) are not supported.
+
+## Unsupported configurations
+
+A configuration Foundry does not support still runs: Foundry logs the step and the reason, persistence is disabled and the server initialises natively (normal graph capture).
+
+```text
+[Foundry] unsupported at capture state: DeepEPv3Dispatcher has no prebuild; cuda-graph persistence disabled, continuing natively
+```
+
+Foundry detects this while resolving the server args, at the first capture (a MoE dispatcher without `prebuild()`, or with its state still pending) and on `save` at each capture (state created inside the graph capture). A `save` that falls back marks its archive invalid, and a `load` of it also runs natively. Once `load` starts restoring graphs, a Foundry failure is an error.
