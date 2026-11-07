@@ -19,6 +19,7 @@ use sglang_processor::openai::{
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
+use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
@@ -175,6 +176,16 @@ pub(super) async fn chat(
     {
         // `apply_header_overrides` raises `HTTPException(400)`, typed by its status.
         return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+    }
+    // Below the override header, `X-Data-Parallel-Rank` names the DP rank.
+    match HintRoute::ChatCompletions
+        .header_rank(headers, state.server_args.enable_request_header_overrides)
+    {
+        Ok(Some(rank)) => generate["routed_dp_rank"] = rank.into(),
+        Ok(None) => {}
+        Err(error) => {
+            return Some(typed_error_response(StatusCode::BAD_REQUEST, "400", &error));
+        }
     }
     // Failures before the first frame answer unary even for a stream: Python
     // awaits the first chunk before it starts the stream.

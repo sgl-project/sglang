@@ -302,9 +302,13 @@ impl CoreHandle {
         Some(metrics.start_request(request, created_at))
     }
 
-    /// The launch's [`crate::GenerateValidator`] on each of a client's requests,
-    /// before any media prefetch; the first refusal is the error.
+    /// Each of a client's requests, before any media prefetch: the DP rank it
+    /// names ([`Self::check_routed_dp_rank`]), then the launch's
+    /// [`crate::GenerateValidator`]; the first refusal is the error.
     fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
+        requests
+            .iter()
+            .try_for_each(|request| self.check_routed_dp_rank(request.routed_dp_rank))?;
         let Some(validator) = &self.inner.generate_validator else {
             return Ok(());
         };
@@ -312,6 +316,37 @@ impl CoreHandle {
             .iter()
             .try_for_each(|request| validator.validate(request))
             .map_err(CoreError::InvalidArgument)
+    }
+
+    /// Python `TokenizerManager.generate_request`'s `routed_dp_rank` check:
+    /// rank 0 of a single-rank deployment is ignored, a rank outside the
+    /// deployment's `[0, dp_size)` is refused. Then this listener's own: it
+    /// feeds only its own DP rank's scheduler, so it refuses a request naming
+    /// another. The HTTP generation routes hand such a request to that rank's
+    /// listener before it gets here (`http::dp_relay`); one that still
+    /// arrives (over gRPC, or with no listener known for the rank) fails
+    /// rather than run on the wrong rank.
+    fn check_routed_dp_rank(&self, rank: Option<i64>) -> Result<(), CoreError> {
+        let Some(rank) = rank else {
+            return Ok(());
+        };
+        let dp_size = i64::from(self.inner.metadata.deployment_info.dp_size.max(1));
+        if dp_size == 1 && rank == 0 {
+            return Ok(());
+        }
+        if !(0..dp_size).contains(&rank) {
+            return Err(CoreError::InvalidArgument(format!(
+                "routed_dp_rank={rank} out of range [0, {dp_size})"
+            )));
+        }
+        let own = self.inner.dp_rank;
+        if rank != i64::from(own) {
+            return Err(CoreError::InvalidArgument(format!(
+                "routed_dp_rank={rank} names DP rank {rank}, which this listener (DP rank \
+                 {own}) does not serve; send the request to DP rank {rank}'s listener"
+            )));
+        }
+        Ok(())
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
@@ -1888,5 +1923,104 @@ mod tests {
         }
         assert!(harness.intake_rx.try_recv().is_err());
         assert!(harness.abort_rx.try_recv().is_err());
+    }
+
+    /// Python's `routed_dp_rank` check, then the listener's own: under DP a
+    /// listener admits its own rank and refuses the others, single requests
+    /// and batches alike; without DP rank 0 is ignored and the rest refused.
+    #[tokio::test]
+    async fn routed_dp_rank_admits_only_the_listener_rank() {
+        let handle = |dp_size, dp_rank| {
+            let (intake_tx, intake_rx) = flume::unbounded();
+            let handle = CoreHandle::new(
+                intake_tx,
+                flume::unbounded().0,
+                CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Vec::new(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: CoreMetadata {
+                        deployment_info: crate::message::config::DeploymentInfo {
+                            dp_size,
+                            dp_rank,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                },
+            );
+            (handle, intake_rx)
+        };
+        let request = |rank: Option<i64>| GenerateRequest {
+            routed_dp_rank: rank,
+            ..Default::default()
+        };
+        fn refusal<T>(result: Result<T, CoreError>) -> String {
+            let error = result.err().expect("refused");
+            assert_eq!(error.kind(), CoreErrorKind::InvalidArgument);
+            error.to_string()
+        }
+        for (dp_size, dp_rank, admitted, refused) in [
+            // No DP: Python ignores rank 0.
+            (
+                0,
+                None,
+                vec![None, Some(0)],
+                vec![(1, "out of range [0, 1)")],
+            ),
+            (1, Some(0), vec![Some(0)], vec![(-1, "out of range [0, 1)")]),
+            (
+                2,
+                Some(1),
+                vec![None, Some(1)],
+                vec![
+                    (2, "routed_dp_rank=2 out of range [0, 2)"),
+                    (-1, "out of range [0, 2)"),
+                    (
+                        0,
+                        "names DP rank 0, which this listener (DP rank 1) does not serve",
+                    ),
+                ],
+            ),
+        ] {
+            let (handle, intake_rx) = handle(dp_size, dp_rank);
+            for rank in admitted {
+                let call = handle
+                    .generate(request(rank), ReceivedAs::without_headers())
+                    .await;
+                assert!(call.is_ok(), "dp_size {dp_size}: {rank:?} admitted");
+                accept_intake(intake_rx.recv_async().await.unwrap());
+            }
+            for (rank, message) in refused {
+                let single = handle
+                    .generate(request(Some(rank)), ReceivedAs::without_headers())
+                    .await;
+                assert!(
+                    refusal(single).contains(message),
+                    "dp_size {dp_size}: {rank}"
+                );
+                let batch = handle
+                    .generate_batch(
+                        vec![request(Some(rank)), request(Some(rank))],
+                        ReceivedAs::without_headers(),
+                    )
+                    .await;
+                assert!(
+                    refusal(batch).contains(message),
+                    "dp_size {dp_size}: {rank}"
+                );
+            }
+            assert!(
+                intake_rx.try_recv().is_err(),
+                "nothing refused was submitted"
+            );
+        }
     }
 }
