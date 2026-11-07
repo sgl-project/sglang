@@ -642,9 +642,8 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req, *, abort_sender: bool
     ) -> None:
         """Release a retiring request's KV send: its pending chunk entry and
-        metadata buffer. ``abort_sender`` aborts a live sender and then clears
-        its room state; a failed one already concluded (and cleared) through
-        ``failure_exception``."""
+        metadata buffer. ``abort_sender`` aborts a live sender and clears its
+        room; a failed one already concluded through ``failure_exception``."""
         self.clear_pending_chunk_send(req)
         if abort_sender and req.disagg_kv_sender is not None:
             try:
@@ -654,8 +653,6 @@ class SchedulerDisaggregationPrefillMixin:
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
             try:
-                # Nothing polls a retired request again, so its room state
-                # is released here, after the abort notification.
                 req.disagg_kv_sender.clear()
             except Exception:
                 logger.exception("Failed to clear KV sender for %s", req.rid)

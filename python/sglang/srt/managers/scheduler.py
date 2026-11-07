@@ -2257,13 +2257,9 @@ class Scheduler(
         until the caller reaches a scheduling boundary. Receiving and broadcasting
         continue each pass; all ranks retain the same suffix.
 
-        The one place a new per-iteration input source belongs. The return
-        value is every request received this pass, held ones included, for the
-        pipeline stages that relay requests onward: each stage then holds the
-        same suffix. Under PP this returns the held inputs too, so rank 0 relays
-        a held pause to every stage; the PD prefill loop's `received_inputs`
-        therefore counts them as well (its launch gate still checks
-        `_deferred_input_requests`).
+        The one place a new per-iteration input source belongs; the return
+        value, held requests included, exists for the pipeline stages that
+        relay requests onward.
         """
         if self.uocr_runtime is not None:
             # Document windows released while their predecessor's KV was freed.
@@ -3744,11 +3740,8 @@ class Scheduler(
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _release_rejected_session(self, req: Req) -> None:
-        """Unmark a streaming session whose request was rejected before queuing.
-
-        `create_req` marked the session in flight; no queue or retirer will
-        clear it for a request that never enters one.
-        """
+        """`create_req` marked the streaming session in flight; release it for a
+        request rejected before it was queued."""
         if req.session is not None and req.session.streaming:
             req.session.abort_req()
 

@@ -412,9 +412,7 @@ class SchedulerPPMixin:
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
 
-                # Like the non-PP decode loop, open no new queue consensus while
-                # paused. Every stage evaluates this after the same ingest, so
-                # all skip together; a round already open still drains below.
+                # Paused: open no new queue consensus; every stage skips together.
                 may_launch = self._pp_may_launch()
                 retract_rids = prealloc_rids = transferred_rids = None
                 if may_launch:
@@ -581,19 +579,13 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     def _pp_ingest_requests(self: Scheduler) -> List:
-        """Ingest input under the PP pause rule.
-
-        A pause holds its input and stops launching until no micro-batch is
-        unprocessed, then every micro-batch is retracted. Here the pause and the
-        inputs after it stay in `_deferred_input_requests` while a micro-batch is
-        unprocessed, so later inputs run after it, in order.
-        """
+        """Hold a pause, and the inputs after it, until no micro-batch is
+        unprocessed."""
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
 
     def _pp_may_launch(self: Scheduler) -> bool:
-        """Whether a micro-batch (or a decode queue consensus) may start: not
-        once a pause is held or applied. Launched results still drain."""
+        """No new micro-batch once a pause is held or applied."""
         return not (self._engine_paused or self._deferred_input_requests)
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
