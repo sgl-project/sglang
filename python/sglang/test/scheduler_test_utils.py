@@ -27,7 +27,7 @@ class FakeReq(SimpleNamespace):
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
-    # Req's defaults for the exit ledger (CI only).
+    # Req's exit_ledger fields.
     exit_via = None
     send_via = None
 
