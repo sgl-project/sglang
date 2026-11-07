@@ -937,7 +937,10 @@ class OpenAIServingChat(OpenAIServingBase):
     def _continuous_usage_cached_details(
         self, content: dict[str, Any]
     ) -> PromptTokensDetails | None:
-        if not get_serving().enable_cache_report:
+        if (
+            not get_serving().enable_cache_report
+            and self.chat_encoding_spec != "kimi_k3"
+        ):
             return None
         return PromptTokensDetails(
             cached_tokens=content["meta_info"].get("cached_tokens", 0)
@@ -2741,7 +2744,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 get_serving().stream_response_default_include_usage,
             )
             # K3 allows top-level usage only in the final choices=[] summary.
-            if self.chat_encoding_spec == "kimi_k3":
+            if (
+                self.chat_encoding_spec == "kimi_k3"
+                and not request._keep_continuous_usage
+            ):
                 continuous_usage_stats = False
 
             return_input_ids = self._should_return_input_ids(request)

@@ -1064,6 +1064,7 @@ class ChatCompletionRequest(PDRoutingFields):
     stop: Optional[Union[str, List[str]]] = None
     stream: bool = False
     stream_options: Optional[StreamOptions] = None
+    _keep_continuous_usage: bool = PrivateAttr(default=False)
     temperature: Optional[float] = None
     top_p: Optional[float] = None
     user: Optional[str] = None

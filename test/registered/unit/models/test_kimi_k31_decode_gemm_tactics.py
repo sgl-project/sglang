@@ -59,3 +59,7 @@ def test_overlapping_ranges_are_rejected(registry):
     cg.register_tgv_m_ranges({(2112, 7168): ((1, 64, None),)})
     with pytest.raises(ValueError):
         cg.register_tgv_m_ranges({(2112, 7168): ((64, 96, 21),)})
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
