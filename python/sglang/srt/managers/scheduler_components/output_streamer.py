@@ -72,12 +72,15 @@ class OutputSink(Enum):
 
 def _scheduler_decode_latency(time_stats: SchedulerReqTimeStats) -> Optional[float]:
     """A finished non-streaming request's decode latency as Python's
-    TokenizerManager measures it: from the scheduler's prefill-finished stamp
+    TokenizerManager measures it: from the scheduler's first-token stamp
     (`_get_scheduler_first_token_time`, which has the stamp only when metrics
     are on) to now, its terminal output (`get_decode_latency`). None where it
     falls back to its own first-output time, which the Rust frontend
     measures the same way."""
-    stamp = time_stats.prefill_finished_time
+    stamp = (
+        getattr(time_stats, "decode_first_token_time", 0.0)
+        or time_stats.prefill_finished_time
+    )
     now = time.perf_counter()
     if time_stats.enable_metrics and 0.0 < stamp <= now:
         return now - stamp
