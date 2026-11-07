@@ -211,10 +211,9 @@ def init_npu_backend():
     assert _is_npu, "NPU backend initialization called on non-NPU device."
 
     try:
-        import custom_ops  # noqa: F401
         import sgl_kernel_npu  # noqa: F401
     except ImportError as e:
-        logger.warning("NPU custom kernel packages unavailable: %s", e)
+        logger.warning("NPU sgl-kernel-npu package unavailable: %s", e)
 
     import torch_npu
 
@@ -226,6 +225,7 @@ def init_npu_backend():
         # Re-mock torch.cuda.is_available cuz transfer_to_npu mocks it True
         torch.cuda.is_available = lambda: False
         torch_npu.npu.config.allow_internal_format = True
+        torch.cuda.get_device_capability = lambda device=None: (0, 0)
     torch_npu.npu.set_compile_mode(jit_compile=False)
 
 

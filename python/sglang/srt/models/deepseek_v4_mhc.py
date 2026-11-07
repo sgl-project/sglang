@@ -42,7 +42,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
@@ -62,6 +61,7 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
+
 
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
@@ -563,16 +563,9 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
-        if not is_npu_arch35():
-            return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
-        # The Ascend 950 build of npu_hc_post is batched -- it requires a leading
-        # batch axis on every operand.
-        return torch.ops.custom.npu_hc_post(
-            x.unsqueeze(0),
-            residual.unsqueeze(0),
-            post_mix.unsqueeze(0),
-            comb.unsqueeze(0),
-        ).squeeze(0)
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post_dpskv4
+
+        return mhc_post_dpskv4(x, residual, post_mix, comb)
 
     if _is_xpu:
         from sglang.srt.models.deepseek_v4 import get_mhc_ops
