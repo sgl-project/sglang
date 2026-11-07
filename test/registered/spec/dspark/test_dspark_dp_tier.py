@@ -13,7 +13,7 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestDpGlobalVerifyTierNumTokens(CustomTestCase):
@@ -47,7 +47,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
             device="cpu",
             attn_backend=object.__new__(TRTLLMHAAttnBackend),
             decode_cuda_graph_runner=None,
-            kv_index_translator=None,
+            runner_ids=None,
             forward=forward,
         )
         proposer = DraftBlockProposer(
@@ -72,7 +72,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         window = SimpleNamespace(
             positions_2d=torch.tensor([[10, 11, 12]]),
             verify_cache_loc_2d=torch.tensor([[10, 11, 12]]),
-            kv_loc_plan=SimpleNamespace(bind=Mock()),
+            iteration_ids=SimpleNamespace(bind=Mock()),
         )
         for reserved_cpu in (None, torch.tensor([100])):
             result = proposer._run_forward(

@@ -20,7 +20,7 @@ from flashinfer import trtllm_fp4_block_scale_moe
 from sglang.srt.utils import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 if not is_sm100_supported():
     pytest.skip(
@@ -241,7 +241,7 @@ def _ref_trtllm(x, layer, method, precision, top_k, router_logits):
     from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
         trtllm_moe_enable_pdl,
     )
-    from sglang.srt.utils.common import next_power_of_2
+    from sglang.srt.utils.triton_utils import next_power_of_2
 
     x_quant, x_scale = _quant_input(x, precision, method.hidden_size)
     # zeros, not empty: the output is compared bit-exact, so any row the kernel

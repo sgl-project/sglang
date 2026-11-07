@@ -30,17 +30,6 @@ _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
 }
 
 
-def allow_target_draft_different_cache_dtype(
-    *, is_dflash: bool, speculative_draft_attention_backend: Optional[str]
-) -> bool:
-    """Whether fused draft KV may use a different dtype from the target.
-
-    DFLASH-family FA4 drafts use their compute dtype for KV, even when the
-    target's KV is quantized. Their fused region has its own typed views.
-    """
-    return is_dflash and speculative_draft_attention_backend == "fa4"
-
-
 def configure_kv_cache_dtype(
     *,
     server_args_kv_cache_dtype: str,

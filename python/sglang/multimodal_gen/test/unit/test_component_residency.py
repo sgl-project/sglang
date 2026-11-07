@@ -146,7 +146,10 @@ def test_snapshot_offload_refit_and_lora_context_refresh_weights():
     strategy.prepare_for_use(module, use, state)
     torch.testing.assert_close(module.weight, torch.full((4, 4), 2.0, device="cuda"))
 
-    pipeline = SimpleNamespace(modules={"transformer": module})
+    modules = {"transformer": module}
+    pipeline = SimpleNamespace(
+        modules=modules, _lora_module=lambda name: modules.get(name)
+    )
     with LoRAPipeline._temporarily_disable_offload(
         pipeline, target="transformer", use_module_names_only=True
     ):

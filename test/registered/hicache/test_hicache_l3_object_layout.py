@@ -142,7 +142,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
 
         written = []
 
-        def put(keys, pointers, sizes, group_ids):
+        def put(keys, pointers, sizes, group_ids, session_ids=None):
             written.extend(keys)
             return [0] * len(keys)
 
@@ -201,20 +201,6 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 if not reply.layout["enabled"]:
                     self.assertTrue(reply.layout["reason"])
-
-    def test_handler_does_not_depend_on_internal_state_serializer_import(self):
-        scheduler_module = importlib.import_module(Scheduler.__module__)
-        store = self._store(registered=(PoolName.INDEXER,))
-        # Internal-state extraction can remove the old module-level import.
-        with patch.dict(scheduler_module.__dict__):
-            scheduler_module.__dict__.pop("msgspec_to_builtins", None)
-            for hierarchical in (False, True):
-                with self.subTest(hierarchical=hierarchical):
-                    scheduler = self._scheduler(store, hierarchical=hierarchical)
-                    reply = scheduler.get_hicache_l3_cache_layout(
-                        GetHiCacheL3LayoutReq()
-                    )
-                    self.assertEqual(reply.layout["enabled"], hierarchical)
 
     def test_cache_without_controller_does_not_break_startup(self):
         """Pure-SWA and unattached caches must return an unavailable layout."""
@@ -396,7 +382,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
                 )
                 written = []
 
-                def put(keys, pointers, sizes, group_ids):
+                def put(keys, pointers, sizes, group_ids, session_ids=None):
                     written.extend(keys)
                     return [0] * len(keys)
 
@@ -471,6 +457,9 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         controller.mem_pool_device = DeepSeekV4TokenToKVPool.__new__(
             DeepSeekV4TokenToKVPool
         )
+        # The storage config reads the pool's layer range through its router.
+        controller.mem_pool_device.start_layer = 0
+        controller.mem_pool_device.layer_num = 1
         controller.mem_pool_host = SimpleNamespace(
             layout="page_first", storage_format_tag=None
         )

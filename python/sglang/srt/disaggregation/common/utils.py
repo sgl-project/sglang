@@ -37,6 +37,26 @@ class TransferKVChunk:
     indices_event: Optional[object] = None
 
 
+def bind_thread_to_device(gpu_id: int) -> None:
+    """Make ``gpu_id`` the calling thread's current device.
+
+    New threads default to device 0; binding keeps a transfer worker's device
+    calls on this rank's GPU instead of opening a context on device 0.
+    """
+    from sglang.srt.platforms import current_platform
+
+    try:
+        current_platform.set_device(current_platform.get_device(gpu_id))
+    except NotImplementedError:
+        pass
+
+
+def run_on_device(gpu_id: int, fn, *args) -> None:
+    """Thread target: bind the thread to ``gpu_id``, then run ``fn(*args)``."""
+    bind_thread_to_device(gpu_id)
+    fn(*args)
+
+
 def pack_list_of_buffers(buffers: List[bytes]) -> bytes:
     if not buffers:
         return b""

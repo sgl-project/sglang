@@ -8,7 +8,8 @@ import msgspec.msgpack
 import numpy as np
 import pytest
 import torch
-from fastapi import WebSocket
+from fastapi import FastAPI, WebSocket
+from fastapi.testclient import TestClient
 
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
@@ -708,6 +709,65 @@ def test_wait_for_active_session_slot_observes_release(monkeypatch):
     assert asyncio.run(run())
 
 
+@pytest.mark.parametrize("invalid_init", [False, True])
+def test_uninitialized_connections_do_not_reserve_realtime_slot(
+    monkeypatch, invalid_init
+):
+    """idle or invalid connections must not exclude valid sessions from the GPU"""
+    released = []
+
+    class _Adapter(realtime_adapter.BaseRealtimeModelAdapter):
+        def create_state(self):
+            return None
+
+        async def on_init(self, session, request):
+            pass
+
+    async def generate_frames(ws, session):
+        await ws.send_bytes(msgspec.msgpack.encode({"session_id": session.id}))
+        await asyncio.Future()
+
+    async def release(req):
+        released.append(req.session_id)
+
+    monkeypatch.setattr(realtime_video_api, "_ACTIVE_SESSION_IDS", set())
+    monkeypatch.setattr(realtime_video_api, "get_global_server_args", lambda: None)
+    monkeypatch.setattr(
+        realtime_video_api, "get_realtime_model_adapter", lambda _: _Adapter()
+    )
+    monkeypatch.setattr(realtime_video_api, "_generate_loop", generate_frames)
+    monkeypatch.setattr(realtime_video_api.async_scheduler_client, "forward", release)
+    app = FastAPI()
+    app.include_router(realtime_video_api.router)
+    endpoint = "/v1/realtime_video/generate"
+    init = msgspec.msgpack.encode({"type": "init", "prompt": "A quiet village"})
+
+    with TestClient(app) as client, client.websocket_connect(endpoint) as idle:
+        if invalid_init:
+            idle.send_bytes(msgspec.msgpack.encode([]))
+            assert (
+                msgspec.msgpack.decode(idle.receive_bytes())["content"]
+                == "invalid generate request"
+            )
+        with client.websocket_connect(endpoint) as active:
+            active.send_bytes(init)
+            response = msgspec.msgpack.decode(active.receive_bytes())
+            assert "session_id" in response, response
+            session_id = response["session_id"]
+            with client.websocket_connect(endpoint) as rejected:
+                rejected.send_bytes(init)
+                assert (
+                    msgspec.msgpack.decode(rejected.receive_bytes())["content"]
+                    == "another realtime session is already active"
+                )
+                assert rejected.receive()["code"] == 1008
+            assert released == []
+            assert realtime_video_api._ACTIVE_SESSION_IDS == {session_id}
+        assert released == [session_id]
+        assert not realtime_video_api._ACTIVE_SESSION_IDS
+    assert released == [session_id]
+
+
 def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
     monkeypatch,
 ):
@@ -728,7 +788,10 @@ def test_cleanup_realtime_session_keeps_active_slot_during_scheduler_release(
             fake_forward,
         )
         try:
-            await realtime_video_api._cleanup_realtime_session(session, None, None)
+            generate_task = asyncio.create_task(asyncio.sleep(0))
+            await realtime_video_api._cleanup_realtime_session(
+                session, generate_task, None
+            )
             still_active_after_cleanup = (
                 session.id in realtime_video_api._ACTIVE_SESSION_IDS
             )
