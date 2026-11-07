@@ -2646,6 +2646,15 @@ class KVCacheConfigurator:
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            if _is_npu:
+                # The in-tree DSA leaf stores fp8+scale index keys in a uint8
+                # facade sized for 64-token pages; the Ascend indexer kernels
+                # need the NPU DSA buffer layout instead.
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUDSATokenToKVPool,
+                )
+
+                return NPUDSATokenToKVPool
             return dsa_pool_class
         if _is_npu:
             if self.use_mla_backend:
