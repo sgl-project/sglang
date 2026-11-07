@@ -2267,6 +2267,13 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # DCP MLA decode: push each peer's head partials straight into its
+    # CustomAllReduceV2 push slot and combine by LSE in one kernel, in place of
+    # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).
+    # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
+    # kernels/ops/attention/dcp_push_combine.py.
+    SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
+    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
