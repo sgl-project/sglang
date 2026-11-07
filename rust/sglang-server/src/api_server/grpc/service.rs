@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::core::{HealthStatus, ReceivedAs};
-use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheError, HiCacheManager};
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
@@ -74,8 +74,13 @@ impl GrpcService {
         incremental_streaming_output: bool,
         response_timeout: Duration,
     ) -> Self {
+        // With an admin key, so the HiCache tests reach the scheduler.
+        let args = ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(None, Some("sk-admin".into())),
+            ..Default::default()
+        };
         Self {
-            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &ServerArgs::default())),
+            hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
             core,
             config: AdapterConfig {
                 preferred_sampling_params,
@@ -205,7 +210,7 @@ impl SglangService for GrpcService {
             .hicache_manager
             .attach(request.into_inner())
             .await
-            .map_err(native_api::status)?;
+            .map_err(hicache_status)?;
         Ok(Response::new(output))
     }
 
@@ -217,7 +222,7 @@ impl SglangService for GrpcService {
             .hicache_manager
             .detach()
             .await
-            .map_err(native_api::status)?;
+            .map_err(hicache_status)?;
         Ok(Response::new(output))
     }
 
@@ -281,8 +286,22 @@ impl SglangService for GrpcService {
     }
 }
 
+/// `--grpc-port` refuses `--admin-api-key` at startup, so a gRPC server never
+/// has the admin key attach and detach require; HTTP's Python message, which
+/// says to restart with one, would point gRPC callers at a refused flag.
+const HICACHE_GRPC_UNAVAILABLE: &str =
+    "HiCache attach/detach is not available over gRPC; use the HTTP endpoint with --admin-api-key.";
+
+fn hicache_status(error: HiCacheError) -> Status {
+    match error {
+        HiCacheError::AdminKeyMissing => Status::failed_precondition(HICACHE_GRPC_UNAVAILABLE),
+        HiCacheError::Core(error) => native_api::status(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
     use std::time::Duration;
 
     use futures::StreamExt;
@@ -292,7 +311,7 @@ mod tests {
     use tonic::{Code, Request};
 
     use super::GrpcService;
-    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
+    use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata, HiCacheManager};
     use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
     use crate::message::finish_reason::FinishReason;
     use crate::message::ids::Rid;
@@ -925,6 +944,34 @@ mod tests {
             .unwrap()
             .into_inner();
         assert_eq!(initial, api::HiCacheStatus::default());
+
+        // Without an admin key, attach and detach are refused before any rank
+        // sees them, as on HTTP.
+        let refusing = GrpcService {
+            core: service.core.clone(),
+            config: service.config.clone(),
+            hicache_manager: Arc::new(HiCacheManager::new(
+                service.core.clone(),
+                &ServerArgs::default(),
+            )),
+        };
+        let attach = refusing
+            .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
+                hicache_storage_backend: Some("file".into()),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        let detach = refusing
+            .detach_hi_cache_storage(Request::new(api::DetachHiCacheStorageRequest {}))
+            .await
+            .unwrap_err();
+        for error in [attach, detach] {
+            assert_eq!(error.code(), Code::FailedPrecondition);
+            assert_eq!(error.message(), super::HICACHE_GRPC_UNAVAILABLE);
+        }
+        assert!(h.intake_rx.is_empty());
+
         let error = service
             .attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest::default()))
             .await

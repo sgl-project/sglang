@@ -8,6 +8,11 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from sglang.srt.arg_groups.arg_utils import (
+    _field_default,
+    _field_to_cli_name,
+    record_fields,
+)
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
 from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
@@ -103,6 +108,72 @@ def check_watermark_server_args(server_args: Any) -> None:
         )
     if envs.SGLANG_RUST_SERVER.get():
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+
+
+# Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
+# honors only in part: the Rust server reads only what
+# `rust_server/config.py::_build_server_args` passes, and these act in the
+# Python frontend (with `--enable-trace`, its request spans; the scheduler's
+# own spans alone would be an incomplete trace).
+RUST_SERVER_UNSUPPORTED_ARGS = (
+    "ssl_keyfile",
+    "ssl_certfile",
+    "ssl_ca_certs",
+    "ssl_keyfile_password",
+    "enable_ssl_refresh",
+    "allowed_media_domains",
+    # The Rust media fetcher caps a download at this field's default, 64 MiB.
+    "media_url_max_file_size_mb",
+    "enable_cache_report",
+    "enable_trace",
+    "warmups",
+    "completion_template",
+    "hf_chat_template_name",
+    "enable_custom_logit_processor",
+    "enable_return_routed_experts",
+    "enable_lora",
+    "lora_paths",
+    "tokenizer_mode",
+    "tokenizer_backend",
+    # Python warns on long GCs only when this is positive.
+    "gc_warning_threshold_secs",
+    "tokenizer_metrics_allowed_custom_labels",
+    # Chat responses would lack the server-default sglext token ids.
+    "return_input_ids",
+    "return_output_ids",
+)
+
+
+def validate_rust_server_unsupported_args(server_args: Any) -> None:
+    """Refuse, in Rust-server mode, every argument the Rust server would ignore.
+
+    An argument counts as set when it differs from its default; where the
+    default is off (``None``, ``False`` or empty), any falsy value is off too.
+    A threshold Python disables when not positive is set only when positive.
+    """
+    if not envs.SGLANG_RUST_SERVER.get():
+        return
+    cfg = resolving_view(server_args)
+    defaults = {
+        field.name: _field_default(field) for field in record_fields(type(server_args))
+    }
+    offending = []
+    for name in RUST_SERVER_UNSUPPORTED_ARGS:
+        value, default = getattr(cfg, name), defaults[name]
+        if name == "gc_warning_threshold_secs":
+            is_set = value > 0
+        elif default is None or default is False or default == []:
+            is_set = bool(value)
+        else:
+            is_set = value != default
+        if is_set:
+            offending.append(_field_to_cli_name(name))
+    if offending:
+        raise ValueError(
+            "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+            f"{', '.join(offending)}: the Rust server would silently ignore "
+            "these settings. Remove them or unset SGLANG_RUST_SERVER."
+        )
 
 
 def validate_response_store(server_args: Any) -> None:

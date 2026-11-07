@@ -1,4 +1,5 @@
 pub(crate) mod app;
+mod auth;
 pub(crate) mod generate_hook;
 mod hicache;
 mod info;

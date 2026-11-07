@@ -9,7 +9,7 @@ use http::StatusCode;
 
 use super::CoreError;
 use super::fanout::{ControlTarget, RankId, RankReply, RequestBuilder};
-use crate::message::config::DeploymentInfo;
+use crate::message::config::{ApiKeys, DeploymentInfo};
 
 /// The route a listener serves forwarded control requests on.
 pub(crate) const FORWARD_PEER_PATH: &str = "/internal/peer";
@@ -89,10 +89,13 @@ impl ControlTarget for Peer {
     }
 }
 
-/// The target endpoints for every DP rank other than `own`.
+/// The target endpoints for every DP rank other than `own`. Peers check the
+/// relay against the same keys as clients, at the admin-optional level, so it
+/// presents the admin key when one is configured, else the API key.
 pub(crate) fn peer_endpoints(
     deployment_info: &DeploymentInfo,
     own: RankId,
+    keys: &ApiKeys,
 ) -> Result<Vec<Arc<dyn ControlTarget>>, String> {
     let endpoints: Vec<_> = deployment_info
         .rust_server_endpoints
@@ -102,8 +105,16 @@ pub(crate) fn peer_endpoints(
     if endpoints.is_empty() {
         return Ok(Vec::new());
     }
+    let mut headers = http::HeaderMap::new();
+    if let Some(key) = keys.admin_api_key.as_deref().or(keys.api_key.as_deref()) {
+        let mut value = http::HeaderValue::from_str(&format!("Bearer {key}"))
+            .map_err(|_| "control peer client: the API key is not a valid header value")?;
+        value.set_sensitive(true);
+        headers.insert(http::header::AUTHORIZATION, value);
+    }
     let client = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
+        .default_headers(headers)
         .build()
         .map_err(|error| format!("control peer client: {error}"))?;
     Ok(endpoints
@@ -235,11 +246,11 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            peer_endpoints(&DeploymentInfo::default(), 0)
+            peer_endpoints(&DeploymentInfo::default(), 0, &ApiKeys::default())
                 .unwrap()
                 .is_empty()
         );
-        let peers = peer_endpoints(&info, 1).unwrap();
+        let peers = peer_endpoints(&info, 1, &ApiKeys::default()).unwrap();
         assert_eq!(peers.len(), 2);
         let replies = fan_out(1, async { Ok(status_bytes(true, "local")) }, &peers, &build).await;
         let messages: Vec<String> = replies

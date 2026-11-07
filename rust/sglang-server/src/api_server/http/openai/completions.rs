@@ -8,10 +8,7 @@ use axum::{
     Json, Router,
     extract::{State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -34,6 +31,7 @@ use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
@@ -245,7 +243,7 @@ async fn completions(
             continuous_usage,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         unary_completion(
             submitted,

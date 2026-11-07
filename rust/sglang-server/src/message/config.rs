@@ -141,6 +141,9 @@ pub struct ServerArgs {
     /// next response event before ending with DEADLINE_EXCEEDED. `0` keeps
     /// the default, as the legacy gRPC bridge does.
     pub grpc_response_timeout_secs: u64,
+    /// `--api-key` / `--admin-api-key`, enforced on the HTTP routes as
+    /// Python's `add_api_key_middleware` enforces them.
+    pub api_keys: ApiKeys,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -268,6 +271,8 @@ impl ServerArgs {
         port,
         grpc_port,
         grpc_response_timeout_secs,
+        api_key,
+        admin_api_key,
         log_level,
         log_level_http,
         chat_template,
@@ -327,6 +332,8 @@ impl ServerArgs {
         port: u16,
         grpc_port: Option<u16>,
         grpc_response_timeout_secs: u64,
+        api_key: Option<String>,
+        admin_api_key: Option<String>,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -384,6 +391,7 @@ impl ServerArgs {
             port,
             grpc_port,
             grpc_response_timeout_secs,
+            api_keys: ApiKeys::new(api_key, admin_api_key),
             log_level,
             log_level_http,
             chat_template,
@@ -450,6 +458,7 @@ impl Default for ServerArgs {
             port: 30000,
             grpc_port: None,
             grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
+            api_keys: ApiKeys::default(),
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -491,6 +500,36 @@ impl Default for ServerArgs {
             crash_dump: false,
             server_added_custom_params: Vec::new(),
         }
+    }
+}
+
+/// The server's API keys. An empty key is no key, as in Python, whose checks
+/// test the keys' truthiness. `Debug` does not print them.
+#[derive(Clone, Default)]
+pub struct ApiKeys {
+    pub api_key: Option<String>,
+    pub admin_api_key: Option<String>,
+}
+
+impl ApiKeys {
+    pub fn new(api_key: Option<String>, admin_api_key: Option<String>) -> Self {
+        let non_empty = |key: Option<String>| key.filter(|key| !key.is_empty());
+        Self {
+            api_key: non_empty(api_key),
+            admin_api_key: non_empty(admin_api_key),
+        }
+    }
+}
+
+impl std::fmt::Debug for ApiKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ApiKeys")
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field(
+                "admin_api_key",
+                &self.admin_api_key.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
     }
 }
 

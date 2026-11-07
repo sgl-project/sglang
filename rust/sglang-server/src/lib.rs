@@ -301,6 +301,13 @@ impl Server {
             .map_err(|e| value_error("mm spec", e))
     }
 
+    /// Block, without the GIL, until the startup warmup fails (its error) or
+    /// the server shuts down (`None`, whether the warmup succeeded, was
+    /// skipped, or never finished).
+    pub fn wait_startup_failure(&self, py: Python<'_>) -> Option<String> {
+        py.detach(|| self.rt.wait_startup_failure())
+    }
+
     /// The requests a crash dump writes, as JSON: the finished requests of the
     /// last five minutes and every unfinished one (see
     /// `RustServer.dump_requests_before_crash`). `None` without

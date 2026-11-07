@@ -52,6 +52,10 @@ pub struct Runtime {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
+    /// Disconnects with `shutdown_tx`, ending a [`Runtime::wait_startup_failure`].
+    shutdown_rx: flume::Receiver<()>,
+    /// The error of a failed startup warmup, sent at most once.
+    startup_failure_rx: flume::Receiver<String>,
     /// Set once the API listeners have closed and the drain's end is no
     /// longer held (see [`Runtime::hold_drain_end`]).
     listeners_closed: Arc<AtomicBool>,
@@ -162,6 +166,17 @@ impl Runtime {
                 ctx.clone(),
             )
         });
+    }
+
+    /// Block until the startup warmup fails, returning its error, or until
+    /// the runtime shuts down (`None`, whether the warmup succeeded, was
+    /// skipped, or never finished). The launching process takes the server
+    /// down on a failure, as Python's server does.
+    pub fn wait_startup_failure(&self) -> Option<String> {
+        flume::Selector::new()
+            .recv(&self.startup_failure_rx, |failure| failure.ok())
+            .recv(&self.shutdown_rx, |_| None)
+            .wait()
     }
 
     /// Begin the graceful drain (see `CoreHandle::begin_drain`): health
@@ -316,6 +331,7 @@ fn notify_drained(name: &str) {
 /// `Err` on a startup misconfiguration (e.g. no tokenizer for a non-skip server).
 pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtime, String> {
     let (shutdown_tx, shutdown_rx) = flume::unbounded::<()>();
+    let (startup_failure_tx, startup_failure_rx) = flume::bounded::<String>(1);
     let mut threads = Vec::new();
     let cpus = frontend_cpu_set(&cfg);
     // Validated before anything is spawned, so a bad bucket list fails startup
@@ -509,6 +525,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             peer_endpoints: crate::api_server::core::peer_endpoints(
                 &cfg.server_args.deployment_info,
                 cfg.server_args.deployment_info.dp_rank.unwrap_or(0),
+                &cfg.server_args.api_keys,
             )?,
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
@@ -566,6 +583,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         http_layer,
                         cfg.generate_hook.clone(),
                         shutdown_rx.clone(),
+                        startup_failure_tx,
                         hicache_manager,
                         tokenizer.clone(),
                     );
@@ -623,6 +641,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        shutdown_rx,
+        startup_failure_rx,
         listeners_closed,
         own_listeners_closed,
         drain_end_gate,
@@ -1488,7 +1508,10 @@ mod tests {
     }
 
     /// An embedding package's `http_layer` wraps the served app: its own route
-    /// serves, and its middleware sees the built-in routes' responses.
+    /// serves, and its middleware sees the built-in routes' responses. With an
+    /// API key, its route needs the key as the built-in ones do, and so does
+    /// an unknown path; the PD bootstrap registry of a prefill server stays
+    /// open, as Python serves it on its own server.
     #[test]
     fn http_layer_wraps_the_served_app() {
         use std::io::{Read, Write};
@@ -1507,24 +1530,43 @@ mod tests {
                     },
                 ))
         });
-        let rt = start(test_config(addr, None), Some(layer)).expect("start runtime");
-        let get = |path: &str| {
+        let mut cfg = test_config(addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(Some("sk-test".into()), None),
+            disaggregation_mode: crate::message::config::DisaggregationMode::Prefill,
+            ..test_server_args()
+        });
+        let rt = start(cfg, Some(layer)).expect("start runtime");
+        let get = |path: &str, key: Option<&str>| {
             let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+            let authorization = key.map_or(String::new(), |key| {
+                format!("Authorization: Bearer {key}\r\n")
+            });
             write!(
                 conn,
-                "GET {path} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+                "GET {path} HTTP/1.1\r\nHost: t\r\n{authorization}Connection: close\r\n\r\n"
             )
             .unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();
             response
         };
-        let model_info = get("/model_info");
+        let key = Some("sk-test");
+        let model_info = get("/model_info", key);
         assert!(model_info.starts_with("HTTP/1.1 200"), "{model_info}");
         assert!(model_info.contains("x-embedder: 1"), "{model_info}");
-        let embedded = get("/embedder");
+        let embedded = get("/embedder", key);
         assert!(embedded.starts_with("HTTP/1.1 200"), "{embedded}");
         assert!(embedded.ends_with("\r\n\r\nembedded"), "{embedded}");
+
+        for path in ["/model_info", "/embedder", "/no_such_route"] {
+            let response = get(path, None);
+            assert!(response.starts_with("HTTP/1.1 401"), "{path}: {response}");
+        }
+        let unknown = get("/no_such_route", key);
+        assert!(unknown.starts_with("HTTP/1.1 404"), "{unknown}");
+        let bootstrap = get("/route", None);
+        assert!(!bootstrap.starts_with("HTTP/1.1 401"), "{bootstrap}");
 
         rt.request_shutdown();
     }
@@ -1577,6 +1619,71 @@ mod tests {
         let rebound = std::net::TcpListener::bind(http_addr)
             .expect("failed startup must release its pre-bound HTTP listener");
         drop(rebound);
+    }
+
+    /// Answer the startup warmup request with a scheduler error.
+    fn fail_warmup(rt: &Runtime) {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "the startup warmup did not reach the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        let rid = scheduler_rid(&requests[0].header);
+        assert!(
+            rt.from_scheduler_tx
+                .push(crate::message::response::frame_error(&rid, "warmup boom"))
+        );
+    }
+
+    /// A startup warmup the scheduler fails reaches `wait_startup_failure`,
+    /// which the launching process turns into Python's teardown; the health
+    /// endpoint never reports the server ready.
+    #[test]
+    fn failed_startup_warmup_is_reported() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let failure = std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| rt.wait_startup_failure());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !waiter.is_finished() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            // Unblocks the wait if nothing was reported.
+            rt.request_shutdown();
+            waiter.join().unwrap()
+        });
+        let failure = failure.expect("a reported failure");
+        assert!(failure.contains("warmup boom"), "{failure}");
+        assert!(!rt.core.is_ready());
+    }
+
+    /// In PD mode a warmup the scheduler answers with an error leaves the
+    /// server up for the health probe to judge, as Python's does for a
+    /// non-200 warmup; nothing is reported, and shutdown ends the wait.
+    #[test]
+    fn failed_pd_startup_warmup_leaves_health_to_the_probe() {
+        let (http_addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(http_addr, None);
+        cfg.server_args = Arc::new(ServerArgs {
+            skip_server_warmup: false,
+            disaggregation_mode: crate::message::config::DisaggregationMode::Decode,
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
+        fail_warmup(&rt);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.core.is_ready() {
+            assert!(std::time::Instant::now() < deadline, "warmup never settled");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        rt.request_shutdown();
+        assert_eq!(rt.wait_startup_failure(), None);
     }
 
     /// End to end over the configured socket: the generated api.v1 client
@@ -1654,14 +1761,20 @@ mod tests {
         use std::time::Duration;
 
         let (http_addr, grpc_addr) = free_loopback_addrs();
-        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        // Attach needs a configured admin key.
+        let mut cfg = test_config(http_addr, Some(grpc_addr));
+        cfg.server_args = Arc::new(ServerArgs {
+            api_keys: crate::message::config::ApiKeys::new(None, Some("sk-admin".into())),
+            ..test_server_args()
+        });
+        let rt = start(cfg, None).expect("start runtime");
         let request = std::thread::spawn(move || {
             let mut conn = std::net::TcpStream::connect(http_addr).unwrap();
             conn.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let body =
                 r#"{"hicache_storage_backend":"file","hicache_write_policy":"write_through"}"#;
             write!(conn,
-                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
+                "PUT /hicache/storage-backend HTTP/1.1\r\nHost: t\r\nAuthorization: Bearer sk-admin\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()
             ).unwrap();
             let mut response = String::new();
             conn.read_to_string(&mut response).unwrap();

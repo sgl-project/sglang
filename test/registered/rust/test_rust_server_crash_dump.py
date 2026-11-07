@@ -52,6 +52,8 @@ def _server_args(ext, port: int):
         port=port,
         grpc_port=None,
         grpc_response_timeout_secs=300,
+        api_key=None,
+        admin_api_key=None,
         log_level="warning",
         log_level_http=None,
         chat_template=None,
