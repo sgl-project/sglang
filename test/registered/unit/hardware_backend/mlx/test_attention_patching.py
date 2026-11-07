@@ -1228,7 +1228,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
                 hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             ),
             abort_request=lambda req: None,
-            is_live=lambda req: True,
+            still_in_batch=lambda req: True,
             leave_running_and_prefill_launched=lambda reqs: None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that

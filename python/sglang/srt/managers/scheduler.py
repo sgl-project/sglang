@@ -2934,7 +2934,7 @@ class Scheduler(
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
             leave_prefill_launched=self.prefill_launched_reqs.leave,
-            is_live=self.is_live,
+            still_in_batch=self.still_in_batch,
             leave_running_and_prefill_launched=self.leave_running_and_prefill_launched,
         )
 
@@ -4092,9 +4092,9 @@ class Scheduler(
         the result lands a step later; its batch still names the request as its
         ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` as a dead row (the aborted req left the
-        chunked slot, so it commits and streams nothing, and its logprob offset is
-        still accounted).
+        ``process_batch_result_prefill`` as a row no longer in the batch (the
+        aborted req left the chunked slot, so it commits and streams nothing, and
+        its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
         req = self._pending_chunked_abort_req
@@ -4842,8 +4842,8 @@ class Scheduler(
     def _check_admitted_not_in_flight(
         self, admitted: List[Req], resumed_req: Optional[Req]
     ) -> None:
-        """A request never re-enters the step-carrying lists while an older step
-        still carries it, which is what lets `is_live` look at those lists alone.
+        """A request never re-enters the batch while an older step still carries
+        it, which is what lets `still_in_batch` look at the batch lists alone.
         So no step carries a request admitted to a prefill batch, except the one
         resuming its chunked prefill, whose earlier chunks may still be in flight.
         Gated like the request-list check."""
@@ -4854,11 +4854,11 @@ class Scheduler(
                     f"{req.inflight_steps} older steps still carry it"
                 )
 
-    def is_live(self, req: Req) -> bool:
-        """Whether `req` is in a step-carrying list: running, prefill_launched or
-        chunked. A step's result commits only on the rows of live requests; a request
-        that left them (finished, retracted, aborted) since the step launched is dead
-        to it."""
+    def still_in_batch(self, req: Req) -> bool:
+        """Whether `req` is still in the batch: in running, prefill_launched or
+        chunked. A step's result commits only on the rows still in the batch; a
+        request that left (finished, retracted, aborted) since the step launched is
+        skipped."""
         return (
             req in self.running_reqs
             or req in self.prefill_launched_reqs
@@ -4867,7 +4867,8 @@ class Scheduler(
 
     def leave_running_and_prefill_launched(self, reqs: List[Req]) -> None:
         """A request that finishes in a step's processing leaves the running and
-        prefill_launched lists at once: its in-flight steps then find it dead."""
+        prefill_launched lists at once: its in-flight steps then find it no longer
+        in the batch."""
         self.running_reqs.leave(reqs)
         self.prefill_launched_reqs.leave(reqs)
 

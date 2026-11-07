@@ -58,7 +58,7 @@ def _make_processor(case, server_mode: str = "full") -> SchedulerBatchResultProc
         beam_coordinator=Mock(),
         request_retirer=release_only_retirer(),
         abort_request=lambda *args, **kwargs: None,
-        is_live=lambda req: True,
+        still_in_batch=lambda req: True,
         leave_running_and_prefill_launched=lambda reqs: None,
     )
 
@@ -397,7 +397,7 @@ class TestDeadRows(CustomTestCase):
                 )
                 processor = replace(
                     _make_processor(self, server_mode),
-                    is_live=lambda req, live=live: req is live,
+                    still_in_batch=lambda req, live=live: req is live,
                 )
 
                 with (
@@ -442,7 +442,7 @@ class TestDeadRows(CustomTestCase):
         )
         processor = replace(
             _make_processor(self),
-            is_live=lambda req: req is live,
+            still_in_batch=lambda req: req is live,
             logprob_result_processor=Mock(),
         )
 

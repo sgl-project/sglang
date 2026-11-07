@@ -94,7 +94,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         beam_coordinator=SimpleNamespace(),
         request_retirer=release_only_retirer(),
         abort_request=lambda *a, **k: None,
-        is_live=lambda req: True,
+        still_in_batch=lambda req: True,
         leave_running_and_prefill_launched=lambda reqs: None,
     )
 

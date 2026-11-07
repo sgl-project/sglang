@@ -142,7 +142,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             beam_coordinator=MagicMock(),
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
-            is_live=lambda req: True,
+            still_in_batch=lambda req: True,
             leave_running_and_prefill_launched=lambda reqs: None,
         )
         for name, value in (

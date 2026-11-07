@@ -36,9 +36,9 @@ PROMPT = 12
 class _StreamFirst(SchedulerBatchResultProcessor):
     __slots__ = ()
 
-    def _flush_prefill(self, batch, live_reqs, kv_ops, skip_stream_req):
+    def _flush_prefill(self, batch, reqs_in_batch, kv_ops, skip_stream_req):
         self.output_streamer.stream_output(
-            live_reqs, batch.return_logprob, skip_stream_req
+            reqs_in_batch, batch.return_logprob, skip_stream_req
         )
         for op in kv_ops:
             op()
@@ -106,7 +106,7 @@ def _run(cls, *, hisparse=False):
             tree_cache=Mock(), hisparse_coordinator=hisparse_coordinator
         ),
         output_streamer=streamer,
-        is_live=lambda req: True,
+        still_in_batch=lambda req: True,
         leave_running_and_prefill_launched=lambda reqs: None,
     )
     batch = _batch()

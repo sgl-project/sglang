@@ -376,12 +376,12 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
-    def commit_decode(self, batch: ScheduleBatch, live_reqs: List[Req]) -> None:
+    def commit_decode(self, batch: ScheduleBatch, reqs_in_batch: List[Req]) -> None:
         """Deferred half: fold staged selections into the DAG and apply
-        finish/abort, on the step's live requests only."""
+        finish/abort, on the requests still in the batch only."""
         if self._num_live_groups == 0:
             return
-        for req in live_reqs:
+        for req in reqs_in_batch:
             group = req.beam_group
             if group is None:
                 continue

@@ -88,7 +88,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
-        is_live=lambda req: True,
+        still_in_batch=lambda req: True,
         leave_running_and_prefill_launched=lambda reqs: None,
     )
 

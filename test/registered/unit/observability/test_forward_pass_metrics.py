@@ -323,7 +323,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     speculative_output_stride=8,
                 )
 
-                def settle_grammar(result, batch, live):
+                def settle_grammar(result, batch, in_batch):
                     # Mutating request state must not affect the earlier snapshot.
                     for req in batch.reqs:
                         req.seqlen += 20
