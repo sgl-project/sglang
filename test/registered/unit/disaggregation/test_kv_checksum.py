@@ -8,10 +8,13 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
     KvChecksumComputer,
     is_health_check_req,
+    page_indices_for_request,
+    state_indices_for_request,
 )
 from sglang.srt.disaggregation.decode import (
     DecodeTransferQueue,
@@ -25,10 +28,17 @@ from sglang.srt.managers.scheduler_components.request_list import (
     KeyedReqList,
     ListKind,
 )
+from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
+from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import setup_allocator_context
 
 register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
@@ -622,6 +632,373 @@ class TestKvChecksumMismatchHiSparse(unittest.TestCase):
         ):
             sched._handle_kv_checksum_mismatch(req, "KV checksum mismatch")
         self.assertEqual(calls, [("hisparse", req), ("kv", req)])
+
+
+def _row_of_pages(pages, page_size):
+    """A request-table row holding the given pages' tokens in order."""
+    return [page * page_size + offset for page in pages for offset in range(page_size)]
+
+
+def _owner_from_top(page_size, num_pages=100):
+    """Token ids as an owner band growing down from the top hands them out."""
+    return lambda ids: (num_pages - ids // page_size) * page_size + ids % page_size
+
+
+def _window_router():
+    """A pool with a window sub-pool beside its full one."""
+    return SimpleNamespace(
+        wrapped_view=lambda: None,
+        sub_pool=lambda kind: (
+            SimpleNamespace(name="swa") if kind == IdSpaceKind.SLIDING_WINDOW else None
+        ),
+    )
+
+
+def _wrapping_router():
+    """A pool wrapping one token KV view beside its recurrent state."""
+    return SimpleNamespace(wrapped_view=lambda: object(), sub_pool=lambda kind: None)
+
+
+def _index_sched(
+    *,
+    page_size,
+    row,
+    owner=lambda ids: ids,
+    window=lambda ids: ids,
+    slots=lambda ids: ids,
+    mamba_slot=0,
+    window_size=8,
+    router=None,
+    entries=(StateType.SWA,),
+):
+    """Scheduler fields the index selection reads: each id space's
+    virtual-to-physical translation as a function, and a storage whose entries
+    are no sub-pools (a static pool's) registering ``entries`` in order."""
+    storage = SimpleNamespace(
+        entry_sub_pools=lambda: (),
+        retained_window_lengths=lambda: {"swa": window_size},
+        wire_entries=lambda: tuple(SimpleNamespace(state_type=t) for t in entries),
+    )
+    allocator = SimpleNamespace(
+        page_size=page_size,
+        storage=storage,
+        translate_kv_indices_for_transfer=owner,
+        state_ids={"mamba": SimpleNamespace(ids=slots)}.__getitem__,
+        id_spaces=lambda: {"swa": SimpleNamespace(ids=window)},
+        get_kvcache=lambda: SimpleNamespace(layer_router=router or _window_router()),
+    )
+    table = SimpleNamespace(
+        req_to_token=torch.tensor([row], dtype=torch.int64),
+        req_index_to_mamba_index_mapping=torch.tensor([[mamba_slot]]),
+        state_sub_pool="mamba",
+    )
+    return SimpleNamespace(
+        token_to_kv_pool_allocator=allocator, req_to_token_pool=table
+    )
+
+
+_ROW0 = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=0))
+
+
+class TestChecksumIndexSelection(CustomTestCase):
+    """The units each role digests are the ones the transfer addresses: a
+    unified pool registers physical ids, the request table holds virtual ones."""
+
+    page_size = 4
+
+    def _sched(self, **kw):
+        row = _row_of_pages([2, 5, 9], self.page_size)
+        return _index_sched(page_size=self.page_size, row=row, **kw)
+
+    def _units(self, sched, start_idx=0):
+        rows = state_indices_for_request(sched, _ROW0, 12, start_idx=start_idx)
+        if isinstance(rows, torch.Tensor):
+            return rows.tolist()
+        return [entry.tolist() for entry in rows]
+
+    def test_owner_pages_are_translated(self):
+        sched = self._sched(owner=_owner_from_top(self.page_size))
+        pages = page_indices_for_request(sched, _ROW0, 12)
+        self.assertEqual(pages.tolist(), [98, 95, 91])
+
+    def test_static_pool_selects_the_table_pages(self):
+        self.assertEqual(
+            page_indices_for_request(self._sched(), _ROW0, 12).tolist(), [2, 5, 9]
+        )
+
+    def test_suffix_after_cached_prefix_selects_its_translated_pages(self):
+        # One cached page, then a suffix ending inside its last page.
+        sched = self._sched(owner=_owner_from_top(self.page_size))
+        pages = page_indices_for_request(sched, _ROW0, 10, start_idx=4)
+        self.assertEqual(pages.tolist(), [95, 91])
+
+    def test_mamba_slot_is_translated(self):
+        sched = self._sched(
+            slots=lambda ids: 3 * ids + 1,
+            mamba_slot=6,
+            router=_wrapping_router(),
+            entries=(StateType.MAMBA,),
+        )
+        self.assertEqual(self._units(sched), [19])
+
+    def test_a_window_beside_state_reads_each_entry_at_its_own_units(self):
+        # The window [6, 12) widens to its first page: table pages 5 and 9.
+        window, slot = [12, 16], [19]
+        for entries, expected in (
+            ((StateType.SWA, StateType.MAMBA), [window, slot]),
+            ((StateType.MAMBA, StateType.SWA), [slot, window]),
+            ((StateType.BLOCK_SCALE_SWA, StateType.MAMBA), [window, slot]),
+        ):
+            with self.subTest(entries=entries):
+                sched = self._sched(
+                    window=lambda ids: ids + 7 * self.page_size,
+                    slots=lambda ids: 3 * ids + 1,
+                    mamba_slot=6,
+                    window_size=6,
+                    entries=entries,
+                )
+                self.assertEqual(self._units(sched), expected)
+
+    def test_entries_without_their_own_rule_keep_the_window_pages(self):
+        sched = self._sched(
+            window=lambda ids: ids + 7 * self.page_size,
+            slots=lambda ids: 3 * ids + 1,
+            mamba_slot=6,
+            window_size=6,
+            entries=(StateType.SWA, StateType.BLOCK_SCALE, StateType.MAMBA),
+        )
+        rows = state_indices_for_request(sched, _ROW0, 12)
+        self.assertEqual([entry.tolist() for entry in rows], [[12, 16], [12, 16], [19]])
+        self.assertIs(rows[0], rows[1])
+
+    def test_a_window_pool_without_state_shares_one_vector(self):
+        sched = self._sched(
+            window=lambda ids: ids + 7 * self.page_size,
+            window_size=6,
+            entries=(StateType.SWA, StateType.BLOCK_SCALE_SWA),
+        )
+        self.assertEqual(self._units(sched), [12, 16])
+
+    def test_window_starts_after_cached_prefix(self):
+        sched = self._sched(window_size=6)
+        self.assertEqual(self._units(sched, start_idx=8), [9])
+
+
+class TestStaticWindowAndMambaChecksumUnits(CustomTestCase):
+    """BUG REGRESSION: on real static pools, a window pool beside a Mamba state
+    pool digests the Mamba entry at the request's slot, not at window pages."""
+
+    def setUp(self):
+        setup_allocator_context()
+
+    def tearDown(self):
+        reset_context()
+
+    def test_each_registered_entry_is_digested_at_its_own_units(self):
+        shape = Mamba2StateShape.create(
+            tp_world_size=1,
+            intermediate_size=256,
+            n_groups=1,
+            num_heads=2,
+            head_dim=16,
+            state_size=16,
+            conv_kernel=4,
+        )
+        table = HybridReqToTokenPool(
+            size=4,
+            mamba_size=16,
+            mamba_spec_state_size=4,
+            max_context_len=64,
+            device="cpu",
+            enable_memory_saver=False,
+            cache_params=Mamba2CacheParams(shape=shape, layers=[2]),
+            mamba_layer_ids=[2],
+            enable_mamba_extra_buffer=False,
+            speculative_num_draft_tokens=3,
+        )
+        pool = SWAKVPool(
+            size=64,
+            size_swa=64,
+            page_size=1,
+            dtype=torch.bfloat16,
+            head_num=1,
+            head_dim=8,
+            swa_attention_layer_ids=[1],
+            full_attention_layer_ids=[0],
+            device="cpu",
+        )
+        allocator = SWATokenToKVPoolAllocator(
+            size=64,
+            size_swa=64,
+            page_size=1,
+            dtype=torch.bfloat16,
+            device="cpu",
+            kvcache=pool,
+            need_sort=False,
+        )
+        allocator.state = table.state
+        storage = kv_storage_of(table, allocator)
+        storage.bind_window_retention(2, None)
+        tokens = allocator.alloc(4)
+        table.req_to_token[0, :4] = tokens
+        slot = allocator.state_slots.alloc(1)
+        table.req_index_to_mamba_index_mapping[0] = slot
+        sched = SimpleNamespace(
+            req_to_token_pool=table, token_to_kv_pool_allocator=allocator
+        )
+        self.assertEqual(
+            [entry.state_type for entry in storage.wire_entries()],
+            [StateType.SWA, StateType.MAMBA],
+        )
+
+        rows = state_indices_for_request(sched, _ROW0, 4)
+
+        self.assertIsInstance(rows, list, "one window vector serves both entries")
+        window_space = allocator.id_spaces()[
+            pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW).name
+        ]
+        self.assertEqual(
+            [entry.tolist() for entry in rows],
+            [window_space.ids(tokens[-2:]).tolist(), slot.reshape(-1).tolist()],
+        )
+        self.assertNotEqual(rows[0].tolist(), rows[1].tolist())
+
+
+class _UnitDigest:
+    """Digests the values stored at the selected physical units, as the real
+    computer digests the registered bytes there."""
+
+    def __init__(self, units, entries):
+        self.units = units
+        self.entries = entries
+
+    def _value(self, part, unit):
+        return self.units[part].get(unit, ("unrelated", self.units["side"], unit))
+
+    def compute(self, kv_pages, state_indices):
+        if not isinstance(state_indices, list):
+            state_indices = [state_indices] * len(self.entries)
+        values = [self._value("kv", unit) for unit in kv_pages.tolist()]
+        for entry, indices in zip(self.entries, state_indices, strict=True):
+            values += [self._value(entry, unit) for unit in indices.tolist()]
+        return zlib.adler32(repr(values).encode())
+
+
+def _side(
+    side, entries, router, *, owner_base, window_base, slot_base, table_base, mamba_slot
+):
+    """One role's tables and stored units for a 4-token request whose last two
+    tokens are its window. Each role gives the request different virtual ids
+    and maps them to different physical units; the transfer copied the values."""
+    row = [table_base + token for token in range(4)]
+    sched = _index_sched(
+        page_size=1,
+        row=row,
+        owner=lambda ids: owner_base - ids,
+        window=lambda ids: ids + window_base,
+        slots=lambda ids: ids + slot_base,
+        mamba_slot=mamba_slot,
+        window_size=2,
+        router=router,
+        entries=entries,
+    )
+    units = {
+        "side": side,
+        "kv": {
+            owner_base - virtual: ("kv", token) for token, virtual in enumerate(row)
+        },
+        StateType.SWA: {
+            virtual + window_base: ("swa", token)
+            for token, virtual in enumerate(row)
+            if token >= 2
+        },
+        StateType.MAMBA: {mamba_slot + slot_base: ("mamba", "final state")},
+    }
+    return sched, units
+
+
+class TestChecksumAgreesAcrossRoles(CustomTestCase):
+    """Prefill's send and decode's verify digest the same request data when
+    the two roles hold it at different virtual and physical ids."""
+
+    LAYOUTS = {
+        "window beside state": ((StateType.SWA, StateType.MAMBA), _window_router),
+        "token KV beside state": ((StateType.MAMBA,), _wrapping_router),
+    }
+
+    def _prefill_digest(self, layout, start_idx):
+        entries, router = self.LAYOUTS[layout]
+        sched, units = _side(
+            "prefill",
+            entries,
+            router(),
+            owner_base=50,
+            window_base=20,
+            slot_base=100,
+            table_base=0,
+            mamba_slot=3,
+        )
+        prefill = _FakePrefillScheduler(_UnitDigest(units, entries))
+        prefill.token_to_kv_pool_allocator = sched.token_to_kv_pool_allocator
+        prefill.req_to_token_pool = sched.req_to_token_pool
+        req = _make_req(0, 4, start_idx=start_idx)
+        with patch.object(
+            SchedulerDisaggregationPrefillMixin,
+            "_send_kv_chunk",
+            lambda *args, **kwargs: None,
+        ):
+            prefill.send_kv_chunk(req, last_chunk=True)
+        (_, digest, _), _ = prefill.disagg_metadata_buffers.set_kv_checksum.call_args
+        return digest
+
+    def _decode_verdict(self, layout, expected, start_idx, corrupt=None):
+        entries, router = self.LAYOUTS[layout]
+        sched, units = _side(
+            "decode",
+            entries,
+            router(),
+            owner_base=90,
+            window_base=40,
+            slot_base=200,
+            table_base=10,
+            mamba_slot=5,
+        )
+        if corrupt == "kv":
+            # The last token's KV, at decode's physical unit for virtual id 13.
+            units["kv"][90 - 13] = ("kv", "flipped")
+        elif corrupt == "state":
+            units[StateType.MAMBA][5 + 200] = ("mamba", "flipped")
+        decode = _FakeScheduler(_UnitDigest(units, entries), None)
+        decode.token_to_kv_pool_allocator = sched.token_to_kv_pool_allocator
+        decode.req_to_token_pool = sched.req_to_token_pool
+        req = _make_req(expected, 4, start_idx=start_idx)
+        batch = SimpleNamespace(reqs=[req], filter_batch=Mock())
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                lambda flags, group, op: flags,
+            ),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+        ):
+            decode._verify_kv_checksums(batch)
+        return decode.streamed_aborts
+
+    def test_intact_transfer_verifies(self):
+        for layout in self.LAYOUTS:
+            for start_idx in (0, 2):
+                with self.subTest(layout=layout, start_idx=start_idx):
+                    digest = self._prefill_digest(layout, start_idx)
+                    verdict = self._decode_verdict(layout, digest, start_idx)
+                    self.assertEqual(verdict, [])
+
+    def test_changed_unit_is_dropped(self):
+        for layout in self.LAYOUTS:
+            for corrupt in ("kv", "state"):
+                with self.subTest(layout=layout, corrupt=corrupt):
+                    digest = self._prefill_digest(layout, 0)
+                    verdict = self._decode_verdict(layout, digest, 0, corrupt=corrupt)
+                    self.assertEqual(len(verdict), 1)
 
 
 _SENTINEL = object()
