@@ -468,15 +468,8 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         layer: Any = None,
         k: Any = None,
         v: Any = None,
-        swa_loc: Optional[Any] = None,
+        window_locs: Optional[Any] = None,
     ) -> Any:
-        cache_loc = (
-            forward_batch.out_cache_loc
-            if not layer.is_cross_attention
-            else forward_batch.encoder_out_cache_loc
-        )
-        if swa_loc is not None:
-            swa_loc = swa_loc[: cache_loc.shape[0]]
         k_dim = k.shape[-1]
         v_dim = v.shape[-1]
         kv_cache = torch.cat([k, v], dim=-1).contiguous()
@@ -487,7 +480,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         value_cache_full = value_cache_full.contiguous()
         get_kv_layers().layer(layer.layer_id).store(
             layer,
-            KVWriteLoc.for_layer(forward_batch, layer, swa_loc=swa_loc),
+            KVWriteLoc.for_layer(forward_batch, layer, window_locs=window_locs),
             key_cache_full,
             value_cache_full,
             layer.k_scale,

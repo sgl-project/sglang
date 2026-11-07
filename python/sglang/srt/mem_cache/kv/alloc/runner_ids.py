@@ -62,7 +62,7 @@ DCP index kernels select them.
 from __future__ import annotations
 
 import functools
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 import msgspec
 import torch
@@ -95,6 +95,26 @@ def _localized(name: str, space: IdSpace, localize) -> IdSpace:
         return IdSpace(key=(IdSpaceKind.FULL, "dcp-rank-local"), write=localize)
     to_space = space.write
     return msgspec.structs.replace(space, write=lambda ids: to_space(localize(ids)))
+
+
+def _window_metadata_builders(backend) -> list:
+    """The attention backends that build window metadata for `backend`'s
+    forwards, so the ones whose window capability binds.
+
+    A multi-step draft wrapper is not an attention backend: it builds no
+    metadata of its own and delegates every step to one backend per step
+    (`attn_backends`), so those answer for it. A wrapper that is itself an
+    attention backend answers for itself as well.
+    """
+    from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+
+    steps = getattr(backend, "attn_backends", None)
+    if steps is None:
+        return [backend]
+    builders = list(steps)
+    if isinstance(backend, AttentionBackend):
+        builders.append(backend)
+    return builders
 
 
 class ReadTable(msgspec.Struct, frozen=True):
@@ -151,6 +171,7 @@ class RunnerIds:
         # the pool does (`_call_spaces`): only an NPU DCP target's plan
         # localizes its writes.
         self._spaces: Dict[str, IdSpace] = {}
+        self.window_sub_pools: Tuple[str, ...] = ()
         # The sub-pool playing each attention role this runner's pool names
         # by role: the one place a role becomes a sub-pool name. Id spaces are
         # keyed by sub-pool name only.
@@ -163,9 +184,22 @@ class RunnerIds:
                     "A sharded --cp-kv-layout does not support --enable-unified-memory."
                 )
             alloc = token_to_kv_pool_allocator
+            plan = alloc.plan
+            drafts = (
+                set()
+                if plan is None or plan.fused_draft is None
+                else set(plan.fused_draft.new_bands)
+            )
+            # The window sub-pools this runner's layers read, each through its
+            # own id space; a backend bound to the runner must serve them all
+            # (`bind_and_verify_backends`).
+            if is_unified_target and plan is not None:
+                self.window_sub_pools = tuple(
+                    sorted({s.name for s in plan.windows()} - drafts)
+                )
             # A target's and a fused draft's pool both name the sub-pool
-            # playing the sliding-window role: the target's window, or the
-            # sub-pool a draft's window layers live in.
+            # playing the sliding-window role: the target's primary window, or
+            # the window host a draft's backend rail reads.
             window = token_to_kv_pool.layer_router.sub_pool(IdSpaceKind.SLIDING_WINDOW)
             if window is not None:
                 self._role_sub_pools[IdSpaceKind.SLIDING_WINDOW] = window.name
@@ -186,11 +220,11 @@ class RunnerIds:
             if is_unified_target:
                 self._spaces = alloc_spaces
             else:
+                router = token_to_kv_pool.layer_router
                 self._spaces = {IdSpaceKind.FULL: alloc_spaces[IdSpaceKind.FULL]}
-                for sub_pool in token_to_kv_pool.layer_router.sub_pools():
-                    view = token_to_kv_pool.layer_router.view(sub_pool.name)
+                for sub_pool in router.sub_pools():
                     self._spaces[sub_pool.name] = alloc_spaces[
-                        token_to_kv_pool.layer_router.storage_name(sub_pool.name)
+                        router.storage_name(sub_pool.name)
                     ]
             if self.is_fused_draft:
                 from sglang.srt.mem_cache.kv.alloc.id_space import ReplicatedTokenIds
@@ -222,6 +256,16 @@ class RunnerIds:
                         replicated = ReplicatedTokenIds(band.ids, view.token_replicas)
                         self._spaces[name] = replicated.space(self._spaces[name].key)
                         self.defer_read_translate = False
+            if not is_unified_target:
+                # The window sub-pools this runner's layers read: a backend
+                # bound to it must serve them all, as for the target.
+                self.window_sub_pools = tuple(
+                    sorted(
+                        p.name
+                        for p in token_to_kv_pool.layer_router.sub_pools()
+                        if p.window is not None
+                    )
+                )
             self._full_v2p_table = self._spaces[IdSpaceKind.FULL].table
         else:
             self._capture_page_size = page_size
@@ -307,17 +351,16 @@ class RunnerIds:
         return state_id_space(self._state_spaces, sub_pool)
 
     @property
-    def window_kv_kind(self) -> IdSpaceKind:
-        """Storage used by window attention, independent of its attention mask.
-
-        A fused window draft may live in FULL when SWA cannot host its window.
-        Such a draft still clips its reads, but uses FULL physical addresses.
-        """
-        return (
-            IdSpaceKind.SLIDING_WINDOW
-            if self.space(IdSpaceKind.SLIDING_WINDOW) is not None
-            else IdSpaceKind.FULL
-        )
+    def window_storage(self) -> str:
+        """The sub-pool a backend with one window rail reads and writes its
+        window layers through, by name: the sub-pool playing the sliding-window
+        role, or the full sub-pool when the window layers store there (a
+        fused window draft the window sub-pools cannot host still clips its
+        reads, but uses full physical addresses). A backend with a rail per
+        window sub-pool reads `window_sub_pools` instead."""
+        if self.space(IdSpaceKind.SLIDING_WINDOW) is not None:
+            return self.sub_pool_name(IdSpaceKind.SLIDING_WINDOW)
+        return IdSpaceKind.FULL.value
 
     def write_ids(
         self, forward_batch, kind: IdSpaceKind = IdSpaceKind.FULL
@@ -747,6 +790,17 @@ class RunnerIds:
         for backend in backends:
             if backend is None:
                 continue
+            for builder in _window_metadata_builders(backend):
+                if len(self.window_sub_pools) > builder.max_window_sub_pools:
+                    # Layers of another window would take the bound window's ids.
+                    raise NotImplementedError(
+                        f"this runner's layers attend through window sub-pools "
+                        f"{list(self.window_sub_pools)}, but "
+                        f"{type(builder).__name__} reads at most "
+                        f"{builder.max_window_sub_pools} per runner; layers with "
+                        "windows of different lengths need a backend that builds "
+                        "window metadata per window sub-pool"
+                    )
             if backend.runner_ids is None:
                 backend.runner_ids = self
                 continue

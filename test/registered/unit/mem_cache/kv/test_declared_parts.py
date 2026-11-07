@@ -1869,7 +1869,7 @@ class TestDeclaredParts(CustomTestCase):
                             host_names=("full", "window_16", "mamba")
                             if target_state
                             else ("full", "window_16"),
-                            target_window=16,
+                            target_windows=(16,),
                         ),
                         store_dtype=torch.bfloat16,
                     ).placement
@@ -2726,7 +2726,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
             num_runners=1,
             ctx=PlacementContext(
-                host_names=("full", "window_16", "mamba"), target_window=16
+                host_names=("full", "window_16", "mamba"), target_windows=(16,)
             ),
             store_dtype=torch.bfloat16,
         ).placement
