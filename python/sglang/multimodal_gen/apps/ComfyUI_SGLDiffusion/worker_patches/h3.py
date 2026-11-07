@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 
 # A changed upstream implementation must be reviewed, never best-effort patched.
-SOURCE_SHA256 = "ced7b679ee05f75045646cb81a436088557b90f23d3be980aba13f816ac23f0d"
+SOURCE_SHA256 = "485ebf2f68fd333bba0be4d9f081a05ec5c7da605d222090a76d7ec08d9bfa68"
 
 
 def bind_with_globals(instance, name, overrides):
@@ -162,7 +162,9 @@ def install(pipeline):
             "forward",
             {
                 "_modulate_gate": comfy_gate,
-                "minimax_h3_norm_modulate_active": lambda _: False,
+                "MINIMAX_H3_NORM_MODULATE": types.SimpleNamespace(
+                    is_enabled=lambda _: False
+                ),
             },
         )
         bind_with_globals(
