@@ -111,6 +111,7 @@ from sglang.srt.model_executor.forward_context import (
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     _load_fused_indexer_wk,
+    skip_mla_kv_cache_scale,
 )
 from sglang.srt.models.deepseek_common.utils import tiny_router_gemm_max_tokens
 from sglang.srt.models.dots3_common.fp8 import per_token_group_quant_einsum_fp8
@@ -2255,20 +2256,11 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                 cat_dim,
                             )
                         else:
-                            if (
-                                "k_scale" in name or "v_scale" in name
-                            ) and name not in params_dict:
-                                # modelopt attn kv scale is named differently
-                                for scale in ["k_scale", "v_scale"]:
-                                    if scale in name:
-                                        name = name.replace(
-                                            f"{scale[0]}_proj", "attn_mqa"
-                                        )
-                                        break
+                            if name not in params_dict and skip_mla_kv_cache_scale(
+                                name, loaded_weight
+                            ):
+                                continue
                             if name not in params_dict:
-                                # modelopt ckpt contains not needed weights for MTP module:
-                                # model.decoder.self_attn.attn_mqa.v_scale and
-                                # model.decoder.self_attn.attn_mqa.k_scale
                                 logger.warning(f"{name} not found in params_dict.")
                                 continue
                             param = params_dict[name]

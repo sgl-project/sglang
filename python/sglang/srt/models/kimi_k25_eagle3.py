@@ -31,6 +31,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ColumnParallelLinear, ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import add_kv_cache_quant_methods
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -332,18 +333,23 @@ class Eagle3DeepseekV2ForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         # Match deepseek_nextn behavior: modelopt_fp4 is target-only and the
-        # bf16 draft must not inherit the FP4 quant method.
+        # bf16 draft must not inherit the FP4 quant method. Its attention keeps
+        # the checkpoint's KV-cache method, as the target's attention does.
+        kv_cache_quant_config = None
         if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
             logger.warning(
                 "Overriding Eagle3DeepseekV2ForCausalLM quant config for "
                 "modelopt_fp4 target; draft weights are bf16."
             )
-            quant_config = None
+            kv_cache_quant_config, quant_config = quant_config, None
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
         self.model = Eagle3MLAModel(
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
+        )
+        add_kv_cache_quant_methods(
+            self.model, kv_cache_quant_config, add_prefix("model", prefix)
         )
 
         # llama_eagle3 sets a load-from-target flag when draft_vocab_size is

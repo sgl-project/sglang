@@ -81,6 +81,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
     DeepseekV2WeightLoaderMixin,
+    skip_mla_kv_cache_scale,
 )
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
@@ -846,11 +847,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        # No q/k/v entries: the MLA attention has no qkv_proj;
+        # they would only rewrite ModelOpt's k_proj.k_scale / v_proj.v_scale names.
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
             ("gate_up_proj", "gate_proj", 0),
             ("gate_up_proj", "up_proj", 1),
         ]
@@ -1043,17 +1043,10 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                             weight_loader(param, fused_weight)
                             cached_a_proj.pop(q_a_proj_name)
                             cached_a_proj.pop(kv_a_proj_name)
-                    else:
-                        if (
-                            "k_scale" in name or "v_scale" in name
-                        ) and name not in params_dict:
-                            # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
+                    elif name not in params_dict and skip_mla_kv_cache_scale(
+                        name, loaded_weight
+                    ):
+                        continue
 
                     if name not in params_dict:
                         continue
