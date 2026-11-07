@@ -32,6 +32,10 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
+from sglang.srt.speculative.ragged_verify import (
+    build_ragged_target_verify_geometry,
+)
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -201,6 +205,12 @@ class XPUAttentionBackend(AttentionBackend):
             )
         )
         self.topk = get_spec().speculative_eagle_topk or 0
+        # DSpark's overlapped steps reach this backend only as TARGET_VERIFY, which
+        # bounds the key span without host seq_lens; other algorithms' draft-extend
+        # metadata still reads them.
+        self.needs_cpu_seq_lens = not SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        ).is_dspark()
         self.speculative_num_steps = speculative_num_steps
         self.speculative_num_draft_tokens = get_spec().speculative_num_draft_tokens
         self.speculative_step_id = speculative_step_id
@@ -382,6 +392,14 @@ class XPUAttentionBackend(AttentionBackend):
         self.forward_metadata = metadata
         self.dcp_metadata = dcp_metadata
 
+    def _host_max_seq_len(self, forward_batch: ForwardBatch) -> int:
+        # Without a host mirror (needs_cpu_seq_lens=False), bound by the context
+        # length: an over-wide page table, but no D2H sync (as FA3 does).
+        seq_lens_cpu = forward_batch.seq_lens_cpu
+        if seq_lens_cpu is None or seq_lens_cpu.numel() == 0:
+            return self.max_context_len
+        return seq_lens_cpu.max().item()
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
         self.bidirectional_block_ids = None
@@ -402,7 +420,7 @@ class XPUAttentionBackend(AttentionBackend):
                     metadata.cache_seqlens_int32 = (
                         seqlens_in_batch + (self.speculative_step_id + 1)
                     ).to(torch.int32)
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item() + (
+                    metadata.max_seq_len_k = self._host_max_seq_len(forward_batch) + (
                         self.speculative_step_id + 1
                     )
                     metadata.cu_seqlens_q = torch.arange(
@@ -420,7 +438,7 @@ class XPUAttentionBackend(AttentionBackend):
                 else:
                     metadata.cache_seqlens_int32 = (seqlens_in_batch).to(torch.int32)
                     metadata.max_seq_len_q = self.topk
-                    metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                    metadata.max_seq_len_k = self._host_max_seq_len(forward_batch)
                     metadata.cu_seqlens_q = torch.arange(
                         0,
                         batch_size * self.topk + 1,
@@ -471,7 +489,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 # Normal Decode
                 metadata.cache_seqlens_int32 = seqlens_in_batch.to(torch.int32)
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._host_max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0, batch_size + 1, dtype=torch.int32, device=device
                 )
@@ -492,25 +510,44 @@ class XPUAttentionBackend(AttentionBackend):
                 # verify. Segment queries/keys by the per-request width the
                 # spec_info carries, not the global (mirrors the triton backend).
                 num_tokens_per_req = forward_batch.spec_info.num_tokens_per_req
-                metadata.cache_seqlens_int32 = (
-                    forward_batch.seq_lens + num_tokens_per_req
-                ).to(torch.int32)
-                metadata.max_seq_len_q = num_tokens_per_req
+                ragged_layout = forward_batch.ragged_verify_layout
+                if ragged_layout is not None:
+                    # DSpark compact verify packs per-request verify lengths.
+                    geometry = build_ragged_target_verify_geometry(
+                        seq_lens=forward_batch.seq_lens, layout=ragged_layout
+                    )
+                    metadata.cache_seqlens_int32 = geometry.cache_seqlens_int32
+                    # Device-only layouts carry no host lens; the verify
+                    # window is a valid varlen upper bound.
+                    metadata.max_seq_len_q = (
+                        geometry.max_seq_len_q
+                        if geometry.max_seq_len_q is not None
+                        else num_tokens_per_req
+                    )
+                    metadata.cu_seqlens_q = geometry.cu_seqlens_q
+                    metadata.cu_seqlens_k = geometry.cu_seqlens_k
+                else:
+                    metadata.cache_seqlens_int32 = (
+                        forward_batch.seq_lens + num_tokens_per_req
+                    ).to(torch.int32)
+                    metadata.max_seq_len_q = num_tokens_per_req
+                    metadata.cu_seqlens_q = torch.arange(
+                        0,
+                        batch_size * num_tokens_per_req + 1,
+                        num_tokens_per_req,
+                        dtype=torch.int32,
+                        device=device,
+                    )
+                    metadata.cu_seqlens_k = torch.nn.functional.pad(
+                        torch.cumsum(
+                            metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
+                        ),
+                        (1, 0),
+                    )
+                # Upper bound on the key span; the page table only needs to be
+                # wide enough.
                 metadata.max_seq_len_k = (
-                    forward_batch.seq_lens_cpu.max().item() + num_tokens_per_req
-                )
-                metadata.cu_seqlens_q = torch.arange(
-                    0,
-                    batch_size * num_tokens_per_req + 1,
-                    num_tokens_per_req,
-                    dtype=torch.int32,
-                    device=device,
-                )
-                metadata.cu_seqlens_k = torch.nn.functional.pad(
-                    torch.cumsum(
-                        metadata.cache_seqlens_int32, dim=0, dtype=torch.int32
-                    ),
-                    (1, 0),
+                    self._host_max_seq_len(forward_batch) + num_tokens_per_req
                 )
                 metadata.page_table = self.req_to_token_pool.req_to_token[
                     forward_batch.req_pool_indices, : metadata.max_seq_len_k
@@ -520,7 +557,7 @@ class XPUAttentionBackend(AttentionBackend):
             else:
                 metadata.cache_seqlens_int32 = forward_batch.seq_lens.to(torch.int32)
                 metadata.max_seq_len_q = self.speculative_num_draft_tokens
-                metadata.max_seq_len_k = forward_batch.seq_lens_cpu.max().item()
+                metadata.max_seq_len_k = self._host_max_seq_len(forward_batch)
                 metadata.cu_seqlens_q = torch.arange(
                     0,
                     batch_size * self.speculative_num_draft_tokens + 1,

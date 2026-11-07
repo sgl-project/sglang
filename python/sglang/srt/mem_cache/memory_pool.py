@@ -189,7 +189,7 @@ def _set_kv_buffer_impl(
             size_limit=size_limit,
         )
 
-    if _is_xpu and v_row_dim == row_dim:
+    if _is_xpu and k_cache.is_xpu and v_row_dim == row_dim:
         return store_cache_xpu(
             k.view(-1, row_dim),
             v.view(-1, row_dim),

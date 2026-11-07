@@ -9,10 +9,12 @@ from sglang.srt.hardware_backend.xpu.graph_runner.xpu_full_graph_backend import 
 )
 from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -261,6 +263,62 @@ class TestXPUGraphMetadata(CustomTestCase):
                     ),
                 ):
                     PrefillCudaGraphRunner(_FakeModelRunner())
+
+    def test_eager_target_verify_follows_ragged_layout(self):
+        """A compact (ragged) DSpark verify packs only each request's verify_len
+        queries; uniform-width metadata would misalign every request after the
+        first and read past the packed query buffer."""
+        backend = XPUAttentionBackend.__new__(XPUAttentionBackend)
+        backend.dcp_size = 1
+        backend.topk = 1
+        backend.page_size = 1
+        backend.attention_chunk_size = None
+        backend.use_sliding_window_kv_pool = False
+        backend.use_mla = False
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(2 * 64, dtype=torch.int32).view(2, 64)
+        )
+        verify_lens = [3, 7]
+        seq_lens = torch.tensor([32, 33], dtype=torch.int64)
+        layout = RaggedVerifyLayout(
+            verify_lens=torch.tensor(verify_lens, dtype=torch.int32),
+            graph_num_tokens=sum(verify_lens),
+            extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+            qo_indptr_device=torch.tensor([0, 3, 10], dtype=torch.int32),
+            verify_lens_cpu=verify_lens,
+            total_verify_tokens=sum(verify_lens),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=2,
+            forward_mode=ForwardMode.TARGET_VERIFY,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            req_pool_indices=torch.tensor([0, 1], dtype=torch.int64),
+            spec_info=SimpleNamespace(num_tokens_per_req=8),
+            ragged_verify_layout=layout,
+            encoder_lens=None,
+            out_cache_loc=None,
+        )
+
+        backend.init_forward_metadata(forward_batch)
+
+        metadata = backend.forward_metadata
+        self.assertTrue(
+            torch.equal(
+                metadata.cu_seqlens_q, torch.tensor([0, 3, 10], dtype=torch.int32)
+            )
+        )
+        self.assertEqual(metadata.max_seq_len_q, 7)
+        self.assertTrue(
+            torch.equal(
+                metadata.cache_seqlens_int32, torch.tensor([35, 40], dtype=torch.int32)
+            )
+        )
+        self.assertTrue(
+            torch.equal(
+                metadata.cu_seqlens_k, torch.tensor([0, 35, 75], dtype=torch.int32)
+            )
+        )
 
 
 if __name__ == "__main__":

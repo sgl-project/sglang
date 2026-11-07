@@ -1,15 +1,17 @@
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_xpu_ci(est_time=20, suite="stage-b-test-1-gpu-xpu")
 
 import unittest
 
 import torch
 
 from sglang.kernels.ops.speculative.dspark.markov_sample import MarkovSampleStep
+from sglang.srt.utils import get_device
 from sglang.test.test_utils import CustomTestCase
 
-DEVICE = torch.device("cuda")
+DEVICE = torch.device(get_device())
 
 
 def _offset(value: int) -> torch.Tensor:

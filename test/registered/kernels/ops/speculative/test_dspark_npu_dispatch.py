@@ -8,7 +8,7 @@ import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
 from sglang.kernels.ops.sampling import argmax as sampling_argmax
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     SoftmaxTemp,
@@ -72,10 +72,10 @@ class TestDSparkNpuDispatch(CustomTestCase):
     def test_placement_uses_first_tensor(self):
         cpu = torch.zeros(1)
         npu = cpu.npu()
-        self.assertFalse(inputs_on_cuda(None, cpu, npu))
-        self.assertTrue(inputs_on_cuda(None, npu, cpu))
+        self.assertFalse(inputs_on_triton_device(None, cpu, npu))
+        self.assertTrue(inputs_on_triton_device(None, npu, cpu))
         with self.assertRaises(AssertionError):
-            inputs_on_cuda(1, flag=True)
+            inputs_on_triton_device(1, flag=True)
 
     def test_markov_greedy_matches_native_rounding(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):
