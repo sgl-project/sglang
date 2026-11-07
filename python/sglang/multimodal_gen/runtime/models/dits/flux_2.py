@@ -120,6 +120,44 @@ _FLUX2_STRIDED_QK_ROPE = BitExactFusionGate(
 )
 
 
+def _flux2_reference_attention(
+    attn, query, key, value, num_ref_tokens, reference_kv_cache, cache_index, **kwargs
+):
+    """Reference suffixes self-attend at t=0; other tokens attend to all K/V.
+
+    The cache belongs to one request and stores post-RoPE reference K/V.
+    Adapted from the reference-token isolation in SGLang PR #20879.
+    """
+    cached = (
+        reference_kv_cache.get(cache_index) if reference_kv_cache is not None else None
+    )
+    if cached is not None:
+        return attn(
+            query,
+            torch.cat([key, cached[0]], dim=1),
+            torch.cat([value, cached[1]], dim=1),
+            **kwargs,
+        )
+    if not num_ref_tokens:
+        return attn(query, key, value, **kwargs)
+
+    ref_key, ref_value = key[:, -num_ref_tokens:], value[:, -num_ref_tokens:]
+    if reference_kv_cache is not None:
+        reference_kv_cache[cache_index] = (ref_key.clone(), ref_value.clone())
+    main = attn(query[:, :-num_ref_tokens], key, value, **kwargs)
+    reference = attn(query[:, -num_ref_tokens:], ref_key, ref_value)
+    return torch.cat([main, reference], dim=1)
+
+
+def _flux2_reference_modulation(params, reference, num_current, num_ref):
+    return tuple(
+        torch.cat(
+            [current.expand(-1, num_current, -1), ref.expand(-1, num_ref, -1)], dim=1
+        )
+        for current, ref in zip(params, reference)
+    )
+
+
 def _flux2_single_qk_rope(q, k, q_norm, k_norm, head_dim, cache, complex_freqs):
     def reference():
         return apply_qk_norm_with_optional_rope(
@@ -405,7 +443,7 @@ def _flux2_norm_modulate(
     """Bit-exact single-kernel ``LN(x) * (1 + scale) + shift``."""
     # Preserve the original expression for Dynamo/Inductor.  This direct
     # Triton dispatch is intentionally an eager fast path.
-    if torch.compiler.is_compiling():
+    if torch.compiler.is_compiling() or (scale.ndim == 3 and scale.shape[1] != 1):
         return norm(x) * (1 + scale) + shift
 
     scale_row = scale.squeeze(1) if scale.dim() == 3 and scale.shape[1] == 1 else scale
@@ -760,6 +798,9 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
         num_replicated_prefix: int = 0,
         attn_mask: Optional[torch.Tensor] = None,
         attn_mask_meta: Optional[Dict[str, int]] = None,
+        num_ref_tokens: int = 0,
+        reference_kv_cache: Optional[dict] = None,
+        cache_index: int = 0,
     ) -> torch.Tensor:
         (
             query,
@@ -882,10 +923,14 @@ class Flux2Attention(torch.nn.Module, AttentionModuleMixin):
                 allow_inplace=True,
             )
 
-        hidden_states = self.attn(
+        hidden_states = _flux2_reference_attention(
+            self.attn,
             query,
             key,
             value,
+            num_ref_tokens,
+            reference_kv_cache,
+            cache_index,
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=num_replicated_prefix,
@@ -1073,10 +1118,14 @@ class Flux2ParallelSelfAttention(torch.nn.Module, AttentionModuleMixin):
             cos_sin_cache,
             complex_freqs,
         )
-        hidden_states = self.attn(
+        hidden_states = _flux2_reference_attention(
+            self.attn,
             query,
             key,
             value,
+            kwargs.get("num_ref_tokens", 0),
+            kwargs.get("reference_kv_cache"),
+            kwargs.get("cache_index", 0),
             attn_mask=attn_mask,
             attn_mask_meta=attn_mask_meta,
             num_replicated_prefix=num_replicated_prefix,
@@ -1746,6 +1795,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         guidance: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+        num_ref_tokens: int = 0,
+        reference_kv_cache: Optional[dict] = None,
     ) -> torch.Tensor:
         """
         The [`FluxTransformer2DModel`] forward method.
@@ -1769,6 +1820,16 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             joint_attention_kwargs.pop("scale", 1.0)
 
         num_txt_tokens = encoder_hidden_states.shape[1]
+        cached_reference = bool(reference_kv_cache)
+        if cached_reference:
+            hidden_states = hidden_states[:, :-num_ref_tokens]
+            freqs_cis = tuple(freqs[:-num_ref_tokens] for freqs in freqs_cis)
+        if num_ref_tokens:
+            joint_attention_kwargs = dict(joint_attention_kwargs or {})
+            joint_attention_kwargs.update(
+                num_ref_tokens=0 if cached_reference else num_ref_tokens,
+                reference_kv_cache=reference_kv_cache,
+            )
 
         # 1. Calculate timestep embedding and modulation parameters
         timestep = timestep.to(hidden_states.dtype)
@@ -1780,6 +1841,20 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         double_stream_mod_img = self.double_stream_modulation_img(temb)
         double_stream_mod_txt = self.double_stream_modulation_txt(temb)
         single_stream_mod = self.single_stream_modulation(temb)[0]
+        if num_ref_tokens and not cached_reference:
+            ref_temb = self.time_guidance_embed(torch.zeros_like(timestep), guidance)
+            ref_double = self.double_stream_modulation_img(ref_temb)
+            num_current = hidden_states.shape[1] - num_ref_tokens
+            double_stream_mod_img = tuple(
+                _flux2_reference_modulation(current, ref, num_current, num_ref_tokens)
+                for current, ref in zip(double_stream_mod_img, ref_double)
+            )
+            single_stream_mod = _flux2_reference_modulation(
+                single_stream_mod,
+                self.single_stream_modulation(ref_temb)[0],
+                num_current + num_txt_tokens,
+                num_ref_tokens,
+            )
 
         # 2. Input projection for image (hidden_states) and conditioning text (encoder_hidden_states)
         hidden_states, _ = self.x_embedder(hidden_states)
@@ -1833,6 +1908,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # 4. Double Stream Transformer Blocks
         for index_block, block in enumerate(self.transformer_blocks):
+            if num_ref_tokens:
+                joint_attention_kwargs["cache_index"] = index_block
             encoder_hidden_states, hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=encoder_hidden_states,
@@ -1855,6 +1932,10 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         # 5. Single Stream Transformer Blocks
         for index_block, block in enumerate(self.single_transformer_blocks):
+            if num_ref_tokens:
+                joint_attention_kwargs["cache_index"] = (
+                    len(self.transformer_blocks) + index_block
+                )
             hidden_states = block(
                 hidden_states=hidden_states,
                 encoder_hidden_states=None,
@@ -1869,6 +1950,8 @@ class Flux2Transformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             hidden_states = _materialize_gated_residual(hidden_states)
         # Remove text (and any tail pad) from the concatenated stream
         img_end = hidden_states.shape[1] - sp_txt_pad
+        if num_ref_tokens and not cached_reference:
+            img_end -= num_ref_tokens
         hidden_states = hidden_states[:, txt_real:img_end, ...]
 
         # 6. Output layers
