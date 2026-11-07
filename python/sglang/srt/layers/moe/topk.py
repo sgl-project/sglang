@@ -3084,6 +3084,16 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            route_quant_handoff.bind_select_experts(
+                num_token_non_padded,
+                fused_routing_ok=(
+                    expert_location_dispatch_info is None
+                    and not routing_overridden
+                    and num_shared_topk_slots == 0
+                ),
+            )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3096,6 +3106,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(

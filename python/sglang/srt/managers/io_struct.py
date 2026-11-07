@@ -2245,7 +2245,8 @@ class ReleaseMemoryOccupationReqInput(BaseReq, kw_only=True):
 
 
 class ReleaseMemoryOccupationReqOutput(BaseReq, kw_only=True):
-    pass
+    success: bool
+    message: str
 
 
 class ResumeMemoryOccupationReqInput(BaseReq, kw_only=True):

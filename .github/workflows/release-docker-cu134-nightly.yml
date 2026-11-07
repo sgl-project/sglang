@@ -13,10 +13,6 @@ on:
         description: "Docker Hub repo to push to. Use lmsysorg/sglang-staging for testing."
         required: false
         default: "lmsysorg/sglang"
-      docker_target:
-        description: "Dockerfile stage to build and publish."
-        required: false
-        default: "runtime"
       build_only:
         description: "Build and validate without logging in or pushing."
         required: false
@@ -74,7 +70,7 @@ jobs:
             --builder default \
             --progress=plain \
             --platform linux/arm64 \
-            --target "${{ inputs.docker_target || 'runtime' }}" \
+            --target framework_final \
             --build-arg BRANCH_TYPE=local \
             --build-arg BUILD_TYPE=all \
             --build-arg BUILD_JOBS="$(nproc)" \

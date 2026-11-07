@@ -65,6 +65,7 @@ from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
 from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -74,6 +75,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.graph_utils import (
+    pad_with_zero_rows,
+    real_rows_scope,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
@@ -2634,6 +2639,28 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_real_rows(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        real_num_tokens: int,
+        defer_all_reduce: bool,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        # x_quant is laid out for every row (MXFP8 scales are swizzled), so the
+        # real rows are quantized again inside attention.
+        with real_rows_scope(forward_batch, real_num_tokens):
+            out = self.forward(
+                x[:real_num_tokens],
+                positions[:real_num_tokens],
+                forward_batch,
+                defer_all_reduce=defer_all_reduce,
+            )
+        if isinstance(out, mhc.AttnOutput):
+            return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
+        return pad_with_zero_rows(out, x.shape[0])
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2650,6 +2677,19 @@ class MQALayer(MqaAttentionBase):
             assert isinstance(
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
+        metadata = attn_backend.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and metadata.real_num_tokens is not None
+            and x.shape[0] > metadata.real_num_tokens
+        ):
+            return self._forward_real_rows(
+                x,
+                positions,
+                forward_batch,
+                real_num_tokens=metadata.real_num_tokens,
+                defer_all_reduce=defer_all_reduce,
             )
 
         enable_multi_stream = (
@@ -3600,7 +3640,7 @@ def _scatter_tail_rows(
         return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full

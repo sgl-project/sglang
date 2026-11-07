@@ -372,6 +372,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
             page_size=1,
             state=None,
             translate_kv_indices_for_transfer=lambda indices: indices,
+            reuse_fences=lambda: [],
         )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
         queue.transfer_queue = SimpleNamespace(

@@ -263,6 +263,7 @@ class BaseRunner(ABC):
 
         self._pre_initialize_flashinfer_allreduce_workspace()
         self._pre_initialize_fi_a2a_workspace()
+        self._pre_initialize_dcp_push_combine()
         self._pre_initialize_pcie_ipc_workspace()
 
         # Model-owned communication resources may depend on the resolved
@@ -344,6 +345,23 @@ class BaseRunner(ABC):
         from sglang.srt.layers.dcp import init_fi_a2a_workspace
 
         init_fi_a2a_workspace(get_parallel().dcp_group)
+
+    def _pre_initialize_dcp_push_combine(self):
+        """Allocate the push plane of the DCP push-combine reduce; must run
+        before CG capture (IPC handle exchange across the DCP group)."""
+        parallel = get_parallel()
+        if (
+            not parallel.dcp_enabled
+            or parallel.dcp_comm_backend not in ("a2a", "fi_a2a")
+            or not parallel.dcp_replicate_q_proj
+        ):
+            return
+
+        from sglang.srt.layers.dcp import init_dcp_push_combine
+
+        init_dcp_push_combine(
+            parallel.dcp_group, self.model_runner.model_config.num_attention_heads
+        )
 
     def _pre_initialize_pcie_ipc_workspace(self):
         """Build the PCIe-IPC all-reduce workspace before graph capture.

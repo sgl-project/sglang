@@ -11,6 +11,10 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
     PdRoleSwitchReqOutput,
 )
 from sglang.srt.managers.scheduler import Scheduler  # noqa: E402
+from sglang.srt.managers.scheduler_components.request_list import (  # noqa: E402
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.server_args import ServerArgs  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -42,6 +46,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         rc.get_context().set_server_args(sa)
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
+        s.request_lists = MagicMock(return_value={})
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
@@ -150,6 +155,19 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         self.assertFalse(out.success)
         self.assertTrue(out.safe_to_restore)
         self.assertIn("not idle", out.message)
+        s.teardown_disaggregation.assert_not_called()
+
+    def test_rejected_while_a_retract_pause_holds_requests(self):
+        s = self._scheduler(DisaggregationMode.DECODE)
+        # is_fully_idle skips held requests, so it still reports idle.
+        held = IndexedReqList(ListKind.PD_HELD)
+        held.join([MagicMock()])
+        s.request_lists.return_value = {ListKind.PD_HELD: held}
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="prefill")
+        )
+        self.assertFalse(out.success)
+        self.assertTrue(out.safe_to_restore)
         s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_decode_graph_headroom_is_missing(self):

@@ -374,7 +374,7 @@ __global__ __launch_bounds__(kNumWarps * 32) void route_warp_kernel(const __grid
     }
   }
   if (!kMuseSpark && p.renormalize) {
-    const auto sum = warp::reduce_sum<std::bit_ceil(K)>(w);
+    const auto sum = warp::reduce_sum<1, std::bit_ceil(K)>(w);
     const auto norm = p.renorm_eps > 0.0f ? sum + p.renorm_eps : (sum > 0.0f ? sum : 1.0f);
     w = ptx::div_full(w, norm);
   }

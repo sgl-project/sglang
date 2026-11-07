@@ -36,6 +36,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
 from sglang.kernels.ops.attention.dsa.dcp_topk_merge import (
     dcp_topk_merge,
     dcp_topk_merge_buffer_numel,
@@ -51,7 +52,7 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import print_info_once
 
 _ZEROS: dict[torch.device, torch.Tensor] = {}
@@ -74,11 +75,17 @@ class DcpCandidateAllGather:
         self.topk = topk
         self.merge_buffer: Optional[torch.Tensor] = None
         self.out: Optional[torch.Tensor] = None
+        self.prefix_handle = None
         self.group_name = group.device_group.group_name
         if not all(in_the_same_node_as(group.cpu_group)) and not is_one_nvlink_clique(
             group.cpu_group, group.device
         ):
             return
+        prefix = group.world_size == 8 and topk == 2048 and get_platform().is_sm100
+        if prefix:
+            symm_mem.set_signal_pad_size(
+                max(symm_mem.get_signal_pad_size(), 32 * group.world_size * 4)
+            )
         per_rank = max_rows * topk * 2  # int32 (score bits, position) pairs
         out = symm_mem.empty(
             group.world_size * per_rank, dtype=torch.int32, device=group.device
@@ -86,8 +93,16 @@ class DcpCandidateAllGather:
         handle = symm_mem.rendezvous(out, self.group_name)
         if handle.multicast_ptr != 0:
             self.out = out
+            if prefix:
+                self.prefix_handle = handle
 
-    def __call__(self, t: torch.Tensor) -> torch.Tensor:
+    def __call__(
+        self,
+        t: torch.Tensor,
+        *,
+        local_lens: torch.Tensor,
+        compact_prefix: bool = False,
+    ) -> torch.Tensor:
         n = t.numel()
         if (
             self.out is None
@@ -96,7 +111,23 @@ class DcpCandidateAllGather:
         ):
             return self.group.all_gather(t, dim=0)
         out = self.out[: self.group.world_size * n]
-        torch.ops.symm_mem.multimem_all_gather_out(t.view(-1), self.group_name, out)
+        if self.prefix_handle is None:
+            torch.ops.symm_mem.multimem_all_gather_out(t.view(-1), self.group_name, out)
+        else:
+            handle = self.prefix_handle
+            _gather_candidate_prefix_kernel[(8 if t.shape[0] <= 512 else 32,)](
+                t,
+                local_lens,
+                handle.multicast_ptr,
+                handle.signal_pad_ptrs_dev,
+                t.shape[0],
+                COMPACT_PREFIX=compact_prefix,
+                TOPK=t.shape[1],
+                RANK=handle.rank,
+                WORLD=handle.world_size,
+                BLOCK=512,
+                num_warps=16,
+            )
         return out.view(self.group.world_size * t.shape[0], *t.shape[1:])
 
     def merge_scores(self, rows: int, width: int) -> torch.Tensor:
@@ -279,16 +310,24 @@ def _scatter_candidates_kernel(
     WORLD: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK: tl.constexpr,
+    COMPACT_PREFIX: tl.constexpr = False,
 ):
     src_row = tl.program_id(0)
     row = src_row % num_rows
     offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    # a rank holds ceil((len - rank) / WORLD) keys of the row
+    # Prefix-only gathers leave the padding undefined, including on graph
+    # replays with shorter lengths. Never read it or scatter stale positions.
     n = (tl.load(global_lens + row) + WORLD - 1 - src_row // num_rows) // WORLD
     mask = offs < tl.minimum(n, TOPK)
     base = gathered + src_row.to(tl.int64) * TOPK * 2
-    score = tl.load(base + offs * 2, mask=mask, other=0).to(tl.float32, bitcast=True)
-    pos = tl.load(base + offs * 2 + 1, mask=mask, other=-1)
+    if COMPACT_PREFIX and n <= TOPK:
+        score = tl.load(base + offs, mask=mask, other=0).to(tl.float32, bitcast=True)
+        pos = offs * WORLD + src_row // num_rows
+    else:
+        score = tl.load(base + offs * 2, mask=mask, other=0).to(
+            tl.float32, bitcast=True
+        )
+        pos = tl.load(base + offs * 2 + 1, mask=mask, other=-1)
     tl.store(
         dense + row.to(tl.int64) * dense_stride + pos,
         score,
@@ -403,8 +442,14 @@ def dcp_global_topk(
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
     workspace = _CANDIDATE_ALL_GATHER
+    compact_prefix = (
+        workspace is not None
+        and workspace.prefix_handle is not None
+        and rows <= workspace.max_rows
+        and topk == workspace.topk
+    )
     all_gather = (
-        workspace
+        partial(workspace, local_lens=local_lens, compact_prefix=compact_prefix)
         if workspace is not None
         else partial(parallel.dcp_group.all_gather, dim=0)
     )
@@ -435,6 +480,7 @@ def dcp_global_topk(
         dense,
         dense.stride(0),
         WORLD=parallel.attn_dcp_size,
+        COMPACT_PREFIX=compact_prefix,
         TOPK=topk,
         BLOCK=block,
     )

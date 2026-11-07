@@ -591,10 +591,13 @@ def capture_prefill_graph(
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     parallel = get_parallel()
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
     if (
         prefill_backend == Backend.BREAKABLE
         and parallel.enable_prefill_cp
         and parallel.pp_size > 1
+        and not supports_prefill_cp_bcg(model_runner.server_args)
     ):
         logger.warning(
             "Disable prefill CUDA graph because pipeline parallelism combined "

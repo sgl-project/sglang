@@ -390,6 +390,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         batch.return_logprob = False
         batch.forward_mode.is_extend.return_value = False
         batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
+        batch.filter_batch.side_effect = lambda keep_indices: setattr(
+            batch, "reqs", [batch.reqs[i] for i in keep_indices]
+        )
         scheduler.running_batch = batch
 
         def get_next_batch_to_run(running_batch, last_batch):

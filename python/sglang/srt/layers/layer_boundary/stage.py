@@ -229,6 +229,13 @@ class StageBoundary:
             hidden_states
         )
 
+    def outputs_on_cp_shards(self, forward_batch) -> bool:
+        """Whether this batch's compute must return only this rank's CP rows,
+        its sum complete (``StageDeclaration.output_on_cp_shards``)."""
+        return self.declaration.output_on_cp_shards and self.plan.outputs_on_cp_shards(
+            self.plan.variant_for(forward_batch)
+        )
+
     def transport_context(self, forward_batch):
         """Borrow this prepared compute's operand transport until finish()."""
         stream = stream_of(forward_batch)

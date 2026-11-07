@@ -241,6 +241,7 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
     sender.should_send_kv_chunk.return_value = True
     sender.get_max_transfer_tokens.return_value = None
     scheduler = SimpleNamespace(
+        tree_cache=SimpleNamespace(supports_prefix_sharing=lambda: True),
         token_to_kv_pool_allocator=SimpleNamespace(
             page_size=128, translate_kv_indices_for_transfer=lambda x: x
         ),
@@ -257,7 +258,8 @@ def test_final_chunk_skips_decode_hit_but_sends_aux_on_full_hit(length, prefix):
         disagg_prefill_pending_chunk_rids=set(),
     )
     req = SimpleNamespace(
-        kv=SimpleNamespace(req_pool_idx=0),
+        kv=SimpleNamespace(req_pool_idx=0, cache_protected_len=length),
+        skip_radix_cache_insert=False,
         origin_input_ids=list(range(length)),
         rid="prefix-hit",
         start_send_idx=prefix,

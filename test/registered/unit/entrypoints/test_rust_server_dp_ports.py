@@ -679,6 +679,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     server_class.gather_frontend_cpu_share.return_value = (1, 2)
     scheduler = SimpleNamespace(
         _hosts_rust_server=lambda: hosts,
+        _holds_rust_drain_end=lambda: False,
         get_rust_server_class=lambda: server_class,
         _engine_paused=False,
     )
@@ -698,7 +699,8 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
             scheduler, frontend_cpu_share=(1, 2)
         )
         server.install_sigterm_drain.assert_called_once_with(
-            notify=rust_server.drain_notify_name("dp-ports-test")
+            notify=rust_server.drain_notify_name("dp-ports-test"),
+            hold_drain_end=False,
         )
     assert scheduler.rust_server is (server if hosts else None)
 

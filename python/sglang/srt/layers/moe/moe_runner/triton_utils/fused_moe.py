@@ -492,7 +492,12 @@ def _prepare_fused_moe_run(
     # existing up config files do not contain this key, so existing users are
     # unaffected unless they re-tune with the updated script.
     up_tma_requested = config.pop("USE_TMA", False)
-    up_moe_use_tma = _moe_support_tma() and up_tma_requested
+    # Config lookup does not include hidden size; TMA needs aligned outer strides.
+    up_moe_use_tma = (
+        _moe_support_tma()
+        and up_tma_requested
+        and all(stride * w1.element_size() % 16 == 0 for stride in w1.stride()[:-1])
+    )
     if up_moe_use_tma:
         logger.warning_once(
             "Up MoE TMA is enabled (USE_TMA=true in the up-projection config). "

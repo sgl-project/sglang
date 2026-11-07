@@ -307,6 +307,10 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    # FlashInfer's plan() clears this on every call and may set it again for its
+    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
+    # here too rather than let run() launch it with a previous plan's state.
+    self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
         self._float_workspace_buffer,
@@ -329,6 +333,7 @@ def fast_prefill_plan(
         False,  # disable_split_kv
         0,  # num_colocated_ctas
         0,  # uniform_q_len
+        False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 

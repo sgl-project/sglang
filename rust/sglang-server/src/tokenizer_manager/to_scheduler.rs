@@ -267,6 +267,11 @@ impl Intake {
                 // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    if let RequestKind::Generate(g) = &mut req.kind
+                        && let Some(mm) = g.mm.as_mut()
+                    {
+                        mm.admission.queued_at = Some(std::time::Instant::now());
+                    }
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.

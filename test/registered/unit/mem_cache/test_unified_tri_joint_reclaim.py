@@ -252,7 +252,7 @@ class TestTriJointReclaim(CustomTestCase):
 
         class CPUReferenceKernel:
             def __getitem__(self, grid):
-                def launch(prefix, seq, last, free, out, batch_size, page_size):
+                def launch(prefix, seq, last, free, out, page_size):
                     next_page = offset = 0
                     for i in range(len(prefix)):
                         for pos in range(int(prefix[i]), int(seq[i])):
