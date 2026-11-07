@@ -868,7 +868,8 @@ class SchedulerMetricsReporter:
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
-            self.num_retracted_reqs = self.num_paused_reqs = 0
+            # num_paused_reqs is a level gauge held until continue_generation.
+            self.num_retracted_reqs = 0
 
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -1085,7 +1086,8 @@ class SchedulerMetricsReporter:
             # Retract
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
-            self.num_retracted_reqs = self.num_paused_reqs = 0
+            # num_paused_reqs is a level gauge held until continue_generation.
+            self.num_retracted_reqs = 0
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = (
@@ -1500,6 +1502,9 @@ class SchedulerMetricsReporter:
         self.stats.num_running_reqs = QueueCount.from_reqs(
             self.scheduler.running_batch.reqs, priority_enabled
         )
+        # While the engine is paused the normal stats reports never run, so
+        # mirror the live paused count here for the forced idle publish.
+        self.stats.num_paused_reqs = self.num_paused_reqs
         self.stats.gen_throughput = 0
         self._update_queue_stats(priority_enabled)
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
