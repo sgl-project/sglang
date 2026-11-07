@@ -566,7 +566,11 @@ class TestHandlerRequestSemantics(CustomTestCase):
         ):
             with (
                 self.subTest(text=text, fields=fields),
-                self.assertRaises(UnclosedReasoningError),
+                self.assertRaisesRegex(
+                    UnclosedReasoningError,
+                    r"^The output stopped inside its reasoning, "
+                    r"before any answer or tool call\.$",
+                ),
             ):
                 self._parse(chat, text, **thinking, **fields)
         # A preferred grammar waits for </think> too, once reasoning is required.
@@ -578,7 +582,9 @@ class TestHandlerRequestSemantics(CustomTestCase):
         with self.assertRaises(UnclosedReasoningError):
             self._parse(preferred, "Still thinking.", **thinking)
         # A stop that is not the model's says so: its turn fails all the same.
-        with self.assertRaisesRegex(UnclosedReasoningError, "NaN happened"):
+        with self.assertRaisesRegex(
+            UnclosedReasoningError, r"tool call \(NaN happened\)\.$"
+        ):
             self._parse(
                 chat,
                 "Still thinking.",

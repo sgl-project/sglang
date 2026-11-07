@@ -220,8 +220,8 @@ class DeepSeekRecipeOutputParser:
         )
 
     def check_reasoning_closed(self, finish_reason: dict[str, Any]) -> None:
-        """After `finish`: raise if the output stopped on its own inside its
-        reasoning. Length, abort and client stops cut it on purpose."""
+        """After `finish`: raise if a stop the client did not ask for ends the output
+        inside its reasoning. Length and abort cut it on purpose."""
         matched = finish_reason.get("matched")
         if (
             self._reasoning_open

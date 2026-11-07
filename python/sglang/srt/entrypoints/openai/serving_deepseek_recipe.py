@@ -363,6 +363,20 @@ class DeepSeekRecipeChatEncodingAdapter:
         self, request: ChatCompletionRequest
     ) -> DeepSeekRecipeOutputParser:
         response_format = request.response_format
+        continued = (
+            _trailing_assistant_turn(
+                _null_content_as_empty(
+                    [
+                        message.model_dump(
+                            exclude_unset=True, by_alias=True, mode="json"
+                        )
+                        for message in request.messages[-1:]
+                    ]
+                )
+            )
+            if request.continue_final_message
+            else None
+        )
         # Only the renderer of a prompt reports where its output begins, so only
         # recipe's own prompts are checked; a client's input_ids, a conversation
         # template, a task and a prompt the engine may cut record nothing,
@@ -376,7 +390,7 @@ class DeepSeekRecipeChatEncodingAdapter:
                 else self.deepseek_recipe.parse_start(
                     thinking=self._hooks.thinking_requested(request),
                     task=request.task,
-                    continued=_requested_continuation(request),
+                    continued=continued,
                 )
             ),
             parse_tool_calls=request.task is None
@@ -485,23 +499,6 @@ def _recipe_reports_start(request: ChatCompletionRequest) -> bool:
     """Whether recipe's report describes where the rendered prompt ends: a task
     changes that tail, as `action` follows it and the other tasks replace it."""
     return request.task is None
-
-
-def _requested_continuation(
-    request: ChatCompletionRequest,
-) -> Optional[dict[str, Any]]:
-    """The turn SGLang continues, from the request's fields alone, for a prompt
-    recipe did not report on."""
-    if not request.continue_final_message:
-        return None
-    return _trailing_assistant_turn(
-        _null_content_as_empty(
-            [
-                message.model_dump(exclude_unset=True, by_alias=True, mode="json")
-                for message in request.messages[-1:]
-            ]
-        )
-    )
 
 
 def _forces_nonempty_content(chat_template_kwargs: Optional[dict[str, Any]]) -> bool:
