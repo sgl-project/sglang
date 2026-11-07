@@ -1,10 +1,12 @@
 """Opt-in, decode-only context partitioning of MiniMax's replicated index K.
 
 This first implementation gathers the existing post-RoPE index queries rather
-than changing checkpoint loading or fused projections. The query gather goes through
-SGLang's communicator so AITER registration and graph capture remain owned by
-the runtime; the candidates return through a second gather, or on the NVFP4 index cache
-through an IPC exchange. Communication cost must be included in performance comparisons.
+than changing checkpoint loading or fused projections. On NVLink hosts with
+multicast, the query and candidate gathers are symmetric-memory multimem stores.
+Otherwise the query gather goes through SGLang's communicator so AITER registration
+and graph capture remain owned by the runtime, and the candidates return through a
+second gather, or on the NVFP4 index cache through an IPC exchange. Communication
+cost must be included in performance comparisons.
 """
 
 import logging
@@ -16,6 +18,10 @@ logger = logging.getLogger(__name__)
 # NVFP4 verify batches below this many requests keep the native indexer: there the Q
 # gather and candidate exchange cost more than the index-K reads CP saves (TP4, graphs)
 CP_MIN_VERIFY_REQS = 12
+
+# Arbitrary cap on decode rows for the multimem buffers (2 MB + 8 MB at W=8);
+# larger batches gather through the communicator.
+MULTIMEM_MAX_ROWS = 1024
 
 
 def unsupported_reason(
@@ -155,9 +161,11 @@ class MiniMaxIndexerCP:
         self.world = group.world_size
         self.rank = group.rank_in_group
         self.exchange = None
+        # (query, candidate) multimem states; None keeps both gathers on the communicator.
+        self.multimem = None
 
     def warmup(self):
-        """Initialize both runtime and PyNCCL gather paths before graph capture."""
+        """Initialize the runtime, PyNCCL and multimem gather paths before graph capture."""
         probe = torch.zeros((1, 128), dtype=torch.bfloat16, device=self.group.device)
         output = torch.empty((self.world, 128), dtype=probe.dtype, device=probe.device)
         self.group.all_gather_into_tensor(output, probe)
@@ -167,7 +175,43 @@ class MiniMaxIndexerCP:
             # graph replay uses PyNCCL. Warm the latter explicitly as well.
             with comm.change_state(enable=True):
                 comm.all_gather(output, probe)
+        self.multimem = self._build_multimem()
         torch.cuda.synchronize(probe.device)
+
+    def _build_multimem(self):
+        """Collective, with inputs identical on every rank, so all ranks agree."""
+        from sglang.srt.runtime_context import get_parallel
+        from sglang.srt.utils import is_hip
+
+        if is_hip():
+            return None
+        if get_parallel().nnodes > 1:
+            from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+            if not all(in_the_same_node_as(self.group.cpu_group, source_rank=0)):
+                return None
+        from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
+
+        try:
+            states = tuple(
+                triton_symm_mem_ag.create_state(
+                    group=self.group.device_group,
+                    rank_in_group=self.rank,
+                    max_tokens=1,
+                    hidden_size=self.world * MULTIMEM_MAX_ROWS * row_width,
+                    device=self.group.device,
+                )
+                # bf16 per decode row: a 128-dim query, and world x 16 int64 candidates.
+                for row_width in (128, self.world * 64)
+            )
+        except Exception as e:  # rendezvous refused: every rank sees the same failure
+            logger.warning("MiniMax indexer CP multimem setup failed: %s", e)
+            return None
+        if any(state.symm_mem_hdl.multicast_ptr == 0 for state in states):
+            logger.warning("MiniMax indexer CP multimem disabled: no multicast mapping")
+            return None
+        logger.info("MiniMax indexer CP gathers use multimem stores")
+        return states
 
     def supports(
         self, q, k_cache, max_seqlen, req_to_token, packed_queries=1, local_blocks=1
@@ -245,8 +289,15 @@ class MiniMaxIndexerCP:
             return torch.empty((1, 0, 16), dtype=torch.int32, device=q.device)
         local_q = q[:, 0].contiguous()
         world = self.world
-        gathered_q = torch.empty((world * batch, 128), dtype=q.dtype, device=q.device)
-        self.group.all_gather_into_tensor(gathered_q, local_q)
+        multimem = self.multimem is not None and batch <= MULTIMEM_MAX_ROWS
+        # The offset of q in its allocation is shape-determined, so this agrees across ranks.
+        if multimem and local_q.data_ptr() % 16 == 0:
+            gathered_q = _multimem_all_gather(self.multimem[0], local_q)
+        else:
+            gathered_q = torch.empty(
+                (world * batch, 128), dtype=q.dtype, device=q.device
+            )
+            self.group.all_gather_into_tensor(gathered_q, local_q)
         q_heads = gathered_q.view(world, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
         if isinstance(k_cache, Nvfp4Cache):
@@ -282,13 +333,28 @@ class MiniMaxIndexerCP:
             packed_queries=packed_queries,
         )
         keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
-        received = torch.empty(
-            (world, world, batch, 16), dtype=torch.int64, device=q.device
-        )
-        # Pure byte copies: numeric conversion would destroy the score/ID keys.
-        # Float32 views also qualify for the runtime's AITER custom gather.
-        self.group.all_gather_into_tensor(
-            received.view(torch.float32).view(world * world * batch, 32),
-            keys.view(torch.float32).view(world * batch, 32),
-        )
-        return merge_candidates(received, self.rank)
+        if multimem:
+            received = _multimem_all_gather(self.multimem[1], keys)
+        else:
+            received = torch.empty(
+                (world, world, batch, 16), dtype=torch.int64, device=q.device
+            )
+            # Pure byte copies: numeric conversion would destroy the score/ID keys.
+            # Float32 views also qualify for the runtime's AITER custom gather.
+            self.group.all_gather_into_tensor(
+                received.view(torch.float32).view(world * world * batch, 32),
+                keys.view(torch.float32).view(world * batch, 32),
+            )
+        return merge_candidates(received.view(world, world, batch, 16), self.rank)
+
+
+def _multimem_all_gather(state, local):
+    """Every rank's ``local`` bytes in rank order, flat; a view of the symmetric
+    buffer, which the next gather overwrites only after every rank enters it."""
+    from sglang.srt.distributed.device_communicators.triton_symm_mem_ag import (
+        all_gather_inner,
+    )
+
+    flat = local.view(torch.bfloat16).view(1, -1)
+    out = all_gather_inner(state, flat, state.world_size * flat.shape[1], safe=False)
+    return out.view(local.dtype)
