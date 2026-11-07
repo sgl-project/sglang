@@ -113,7 +113,8 @@ def remap_kv_mapping(
     # Rows are length-synchronized, so a survivor's history is exactly its
     # parent's window, including the token just computed at seq_len-1.
     window = req_to_token[rows, prefix_len:seq_len]
-    old_mapping = window.clone()
+    # Advanced indexing above already owns storage independent of req_to_token.
+    old_mapping = window
     new_mapping = old_mapping[parent_idx]
     req_to_token[rows, prefix_len:seq_len] = new_mapping
     return old_mapping, new_mapping
@@ -124,4 +125,4 @@ def collect_orphan_slots(old_mapping: torch.Tensor, new_mapping: torch.Tensor):
     shape (unique/isin), so it synchronizes -- keep it off the launch path."""
     old_slots = old_mapping.flatten().unique()
     new_slots = new_mapping.flatten().unique()
-    return old_slots[~torch.isin(old_slots, new_slots)]
+    return old_slots[~torch.isin(old_slots, new_slots, assume_unique=True)]
