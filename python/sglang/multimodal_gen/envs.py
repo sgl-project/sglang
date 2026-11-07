@@ -67,6 +67,10 @@ if TYPE_CHECKING:
     # the buffers do not fit; 0 or 1 keeps the sequential exchange; N >= 2 forces
     # N groups
     SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS: int = -1
+    # fp8_fa_sm120 under Ulysses: quantize each shard with the cross-rank per-head
+    # scales and exchange E4M3 instead of BF16 (half the input bytes, same output
+    # bytes); set 0 to exchange BF16
+    SGLANG_DIFFUSION_FP8_ULYSSES_EXCHANGE: bool = True
     # a deadlock backstop, not a per-step budget: a rank can legitimately stall
     # for seconds (layerwise offload, wan2.2 expert-tower swaps), and expiry now
     # retires the transport on every rank and fails the request
@@ -404,6 +408,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS": _lazy_int(
         "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS", -1
+    ),
+    "SGLANG_DIFFUSION_FP8_ULYSSES_EXCHANGE": _lazy_bool(
+        "SGLANG_DIFFUSION_FP8_ULYSSES_EXCHANGE", "true"
     ),
     "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS": _lazy_float(
         "SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS", 10000.0
