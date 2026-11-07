@@ -247,7 +247,10 @@ class Gfx950FusedIndexer:
         row_ends_int32: torch.Tensor,
         page_table_64: torch.Tensor,
         rows: int,
+        rows_per_request: int = 1,
     ) -> torch.Tensor:
+        """``rows_per_request``: consecutive rows that belong to one request and
+        share its page table (the MTP verify rows), 1 otherwise."""
         gemv, qk, logits_mod, topk_mod = loader.modules()
         w_q_b, w_kw, norm_w, norm_b, cos2d, sin2d = self._constants()
         ws = self.workspace
@@ -308,7 +311,7 @@ class Gfx950FusedIndexer:
             page_table_64,
             logits,
             ws.ghist[:rows],
-            loader.LOGITS_BLOCKS_PER_ROW,
+            *loader.logits_launch(rows, page_table_64.shape[1], rows_per_request),
         )
 
         # --- node 4: top-k(2048) + page transform, fused refinement ---------
