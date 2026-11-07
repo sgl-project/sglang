@@ -15,10 +15,17 @@ register_cpu_ci(est_time=1, suite="base-a-test-cpu")
 
 
 @pytest.mark.parametrize(
-    "pinned,registration_failure", [(False, False), (True, False), (True, True)]
+    "pinned,registration_failure,pin_later",
+    [
+        (False, False, False),
+        (True, False, False),
+        (True, True, False),
+        (False, False, True),
+        (False, True, True),
+    ],
 )
 def test_shared_host_registration_owns_mapping_until_close(
-    monkeypatch, pinned, registration_failure
+    monkeypatch, pinned, registration_failure, pin_later
 ):
     mapping = mmap.mmap(-1, 4096)
     calls = []
@@ -56,16 +63,29 @@ def test_shared_host_registration_owns_mapping_until_close(
         ),
     )
     if registration_failure:
-        with pytest.raises(RuntimeError, match="cuMemHostRegister"):
-            memory.HostMapping(mapping, pinned)
+        if pin_later:
+            allocation = memory.HostMapping(mapping, pinned=False)
+            with pytest.raises(RuntimeError, match="cuMemHostRegister"):
+                allocation.pin()
+            allocation.close()
+        else:
+            with pytest.raises(RuntimeError, match="cuMemHostRegister"):
+                memory.HostMapping(mapping, pinned)
         assert len(calls) == 1
     else:
         allocation = memory.HostMapping(mapping, pinned)
         allocation.view[:4] = b"test"
         escaped = allocation.view[:4]
         assert allocation.registered is pinned
+        if pin_later:
+            allocation.pin()
+        registered = pinned or pin_later
+        if registered:
+            allocation.pin()  # Reusing a warm mapping must not register again.
+            assert allocation.registered
+        assert allocation.mapping is mapping and bytes(escaped) == b"test"
         assert mapping[:4] == b"test"
-        if pinned:
+        if registered:
             assert ctypes.string_at(allocation.address, 4) == b"test"
         assert allocation.capacity == 4096 and allocation.mapping is mapping
         contexts[-1] = 29  # Explicit clear can run on a different caller thread.
@@ -82,7 +102,7 @@ def test_shared_host_registration_owns_mapping_until_close(
                 ("unregister", allocation.address),
                 ("pop", 13),
             ]
-            if pinned
+            if registered
             else []
         )
     assert not mapping.closed  # This local owner outlives the allocation wrapper.

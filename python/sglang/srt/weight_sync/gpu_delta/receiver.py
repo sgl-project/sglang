@@ -9,17 +9,14 @@
 
 from __future__ import annotations
 
-import hashlib
 import math
 import os
 import time
 from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from itertools import chain
 
 import numpy as np
-import orjson
 import torch
 
 from sglang.srt.weight_sync.gpu_delta import profiling
@@ -41,6 +38,8 @@ class GpuDeltaBackend:
         )
 
         self._canonical_plan_digest = None
+        self._canonical_tensors = None
+        self._canonical_tensor_ids = None
         self.batch_plan = None
         self.layers_per_batch = int(os.environ.get("GPU_DELTA_LAYERS_PER_BATCH", "1"))
         if self.layers_per_batch < 1:
@@ -73,8 +72,13 @@ class GpuDeltaBackend:
                 )
                 return prepared
             except BaseException:
-                prepared.close()
+                self.discard(prepared)
                 raise
+
+    def discard(self, prepared):
+        # A failed GPU drain must retain every host mapping its readers may use.
+        prepared.close()
+        self.close()
 
     def close(self):
         self.host_arena.close()
@@ -89,7 +93,7 @@ class _PreparedBatch:
 
 
 @profiling.annotate("gpu_delta.prepare.layer_plan")
-def _plan_layers(backend, bindings, entries, layers_per_batch=1):
+def _plan_layers(backend, bindings, canonical_tensors, layers_per_batch=1):
     """Cache membership, canonical offsets and apply geometry, never wire frames."""
     key = layers_per_batch, tuple(binding.name for binding in bindings)
     if backend.batch_plan is None or backend.batch_plan[0] != key:
@@ -121,7 +125,7 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
             outputs, size = [], 0
             for binding in group:
                 offset = (size + 15) // 16 * 16
-                nbytes = entries[binding.name]["nbytes"]
+                _, nbytes = canonical_tensors[binding.name]
                 outputs.append((binding, offset, nbytes))
                 size = offset + nbytes
             # Segment views share one decoded canonical payload. Only the apply
@@ -131,55 +135,64 @@ def _plan_layers(backend, bindings, entries, layers_per_batch=1):
                 for binding, offset, nbytes in outputs
                 for view in binding.apply_bindings()
             ]
-            plans.append((outputs, size, plan_apply(apply_outputs)))
+            tensor_offsets = np.asarray(
+                [
+                    (canonical_tensors[binding.name][0], offset)
+                    for binding, offset, _ in outputs
+                ],
+                dtype=np.int64,
+            ).T.copy()
+            plans.append((tensor_offsets, size, plan_apply(apply_outputs)))
         backend.batch_plan = (key, plans)
     return backend.batch_plan[1]
 
 
 @profiling.annotate("gpu_delta.prepare.frame_plan")
-def _plan_decode(plans, entries, records):
-    """Pack fresh frame rows and omitted ranges for every cached layer batch."""
-    counts = [
-        sum(len(entries[binding.name]["frames"]) for binding, _, _ in outputs)
-        for outputs, _, _ in plans
-    ]
-    gaps = [[] for _ in plans]
+def _plan_decode(plans, publication, offsets):
+    """Rebase shared numeric frame and gap slices into this rank's layer batches."""
+    batches = [publication.tensors[outputs[0]] for outputs, _, _ in plans]
+    counts = [int(tensors["frame_count"].sum()) for tensors in batches]
+    table = np.empty((4, sum(counts)), dtype=np.int64)
+    gaps, position = [], 0
+    for (outputs, _, _), tensors, count in zip(plans, batches, counts):
+        tensor_ids, output_offsets = outputs
+        frame_counts = tensors["frame_count"]
+        starts = tensors["frame_start"] - (np.cumsum(frame_counts) - frame_counts)
+        indices = np.repeat(starts, frame_counts) + np.arange(count, dtype=np.int64)
+        destination = table[:, position : position + count]
+        destination[:] = publication.frames[:, indices]
+        destination[0] += np.repeat(offsets[tensor_ids], frame_counts)
+        destination[3] += np.repeat(output_offsets, frame_counts)
+        position += count
 
-    def rows():
-        for batch, (outputs, _, _) in enumerate(plans):
-            for binding, output_offset, size in outputs:
-                input_offset = records[binding.name]["offset"]
-                cursor = 0
-                for frame in entries[binding.name]["frames"]:
-                    start, decoded = frame["decoded_offset"], frame["decoded_bytes"]
-                    if cursor < start:
-                        gaps[batch].append((output_offset + cursor, start - cursor))
-                    yield (
-                        input_offset + frame["encoded_offset"],
-                        frame["encoded_bytes"],
-                        decoded,
-                        output_offset + start,
-                    )
-                    cursor = start + decoded
-                if cursor < size:
-                    gaps[batch].append((output_offset + cursor, size - cursor))
-
-    # Exhaust the iterator: its final yield can precede trailing gaps and fully
-    # omitted tensors. Contiguous rows match nvCOMP's pointer/size arrays.
-    table = np.fromiter(chain.from_iterable(rows()), dtype=np.int64)
-    return table.reshape(sum(counts), 4).T.copy(order="C"), counts, gaps
+        gap_counts = tensors["gap_count"]
+        starts = tensors["gap_start"] - (np.cumsum(gap_counts) - gap_counts)
+        indices = np.repeat(starts, gap_counts) + np.arange(
+            int(gap_counts.sum()), dtype=np.int64
+        )
+        batch_gaps = publication.gaps[indices]
+        batch_gaps[:, 0] += np.repeat(output_offsets, gap_counts)
+        gaps.append(batch_gaps)
+    return table, counts, gaps
 
 
 @profiling.annotate("gpu_delta.prepare.canonical_plan")
-def _qualify_canonical_plan(backend, manifest):
-    """Admit static bindings once; Miles preserves them for the negotiated digest."""
-    entries = {entry["name"]: entry for entry in manifest["tensors"]}
+def _qualify_canonical_plan(backend, publication):
+    """Admit the shared static catalog once; retain only local ordinals and sizes."""
+    digest = publication.header["plan_digest"]
     if backend._canonical_plan_digest is not None:
-        if manifest["plan_digest"] != backend._canonical_plan_digest:
+        if digest != backend._canonical_plan_digest:
             raise ValueError("negotiated canonical delta plan changed")
-        return entries, True
+        return backend._canonical_tensors, True
+    catalog = publication.read_catalog()
+    if catalog["plan_digest"] != digest:
+        raise ValueError("shared canonical catalog plan changed")
+    entries = {
+        entry["name"]: (ordinal, entry)
+        for ordinal, entry in enumerate(catalog["tensors"])
+    }
     definitions = []
-    for name, entry in entries.items():
+    for name, (_, entry) in entries.items():
         if name not in backend.layout.inventory or backend.layout.excluded.get(
             name
         ) not in {None, "expert projection owned by another EP/TP rank"}:
@@ -209,20 +222,23 @@ def _qualify_canonical_plan(backend, manifest):
                 definition[key] = canonical[key]
         definitions.append(definition)
     for binding in backend.layout.bindings:
-        views = entries[binding.name]["views"]
+        views = entries[binding.name][1]["views"]
         matching = [view for view in views if view["id"] == binding.view_id]
         if len(matching) != 1 or matching[0]["slices"] != binding.slices:
             raise ValueError(f"missing or conflicting rank view for {binding.name}")
-    if (
-        _digest(sorted(definitions, key=lambda entry: entry["name"]))
-        != manifest["plan_digest"]
-    ):
+    if _digest(sorted(definitions, key=lambda entry: entry["name"])) != digest:
         raise ValueError(
             "publication does not match its negotiated canonical view plan"
         )
-    # Do not retain a manifest or repeat static schema checks on fitting updates.
-    backend._canonical_plan_digest = manifest["plan_digest"]
-    return entries, False
+    # No catalog graph or per-publication frame objects survive cold admission.
+    local = {
+        binding.name: (entries[binding.name][0], entries[binding.name][1]["nbytes"])
+        for binding in backend.layout.bindings
+    }
+    backend._canonical_tensors = local
+    backend._canonical_tensor_ids = tuple(ordinal for ordinal, _ in local.values())
+    backend._canonical_plan_digest = digest
+    return local, False
 
 
 class PreparedDelta:
@@ -230,9 +246,7 @@ class PreparedDelta:
     def __init__(
         self, backend, manifest_path, manifest_sha256, metadata, cancelled=None
     ):
-        from pathlib import Path
-
-        from sglang.srt.weight_sync.gpu_delta.host import copy_bytes, validate_codec
+        from sglang.srt.weight_sync.gpu_delta.host import copy_bytes
 
         self.stream = None
         self.io_stream = None
@@ -246,18 +260,11 @@ class PreparedDelta:
         self.backend, self.device = backend, backend.device
         preparation_started = time.perf_counter()
         layers_per_batch = backend.layers_per_batch
-        manifest_started = time.perf_counter()
-        path = Path(manifest_path).resolve(strict=True)
-        content = path.read_bytes()
-        if hashlib.sha256(content).hexdigest() != manifest_sha256:
-            raise ValueError("immutable delta manifest SHA256 mismatch")
-        manifest = orjson.loads(content)
-        self.timings["host_manifest_read_parse_s"] = (
-            time.perf_counter() - manifest_started
+        payload_started = time.perf_counter()
+        publication = backend.host_arena.prepare_publication(
+            manifest_path, manifest_sha256, metadata, self.timings, cancelled
         )
-        plan_started = time.perf_counter()
-        validate_codec(manifest)
-        self.codec = manifest["codec"]
+        self.codec = publication.header["codec"]
         from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
 
         inner_codec = self.codec.removesuffix("-zstd")
@@ -265,32 +272,14 @@ class PreparedDelta:
             backend.decoders[inner_codec] = NvcompDecoder(self.device, inner_codec)
         self.decoder = backend.decoders[inner_codec]
         self.hardware = self.decoder.backend == "hardware"
-        self.target_version = manifest["target_version"]
-        entries, reused_plan = _qualify_canonical_plan(backend, manifest)
+        self.target_version = publication.header["target_version"]
+        plan_started = time.perf_counter()
+        canonical_tensors, reused_plan = _qualify_canonical_plan(backend, publication)
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
-        payload_started = time.perf_counter()
-        index = backend.host_arena.prepare_encoded(
-            path,
-            manifest_sha256,
-            manifest,
-            self.timings,
-            metadata,
-            self.hardware,
-            cancelled,
-        )
-        release_started = time.perf_counter()
-        # READY includes shared inputs; retain only this rank's metadata.
-        entries = {
-            binding.name: entries[binding.name] for binding in backend.layout.bindings
-        }
-        del manifest, content
-        self.timings["host_rank_metadata_release_s"] = (
-            time.perf_counter() - release_started
-        )
         self.host_snapshot = backend.host_arena.prepare_local(
-            index,
-            list(entries.values()),
+            publication,
+            backend._canonical_tensor_ids,
             self.timings,
             self.hardware,
         )
@@ -300,23 +289,28 @@ class PreparedDelta:
         tensors_started = time.perf_counter()
         compressed, raw_entries, ue8m0_entries = [], [], []
         for binding in backend.layout.bindings:
-            entry = entries[binding.name]
+            tensor_id, nbytes = canonical_tensors[binding.name]
+            tensor = publication.tensors[tensor_id]
             if binding.encoding == "raw_bytes":
-                if entry["changed_bytes"]:
+                if tensor["changed_bytes"]:
                     group = ue8m0_entries if binding.raw_ue8m0 else raw_entries
-                    group.append((binding, entry))
-            elif entry["frames"]:
+                    group.append((binding, nbytes))
+            elif tensor["frame_count"]:
                 compressed.append(binding)
         # Compact scales form one prefix for validation and native GPU expansion.
         raw_entries = ue8m0_entries + raw_entries
-        self.raw_ue8m0_bytes = sum(entry["nbytes"] for _, entry in ue8m0_entries)
+        self.raw_ue8m0_bytes = sum(nbytes for _, nbytes in ue8m0_entries)
         previous_plan = backend.batch_plan
-        self.static_plans = _plan_layers(backend, compressed, entries, layers_per_batch)
+        self.static_plans = _plan_layers(
+            backend, compressed, canonical_tensors, layers_per_batch
+        )
         self.timings["host_batch_plan_reused"] = int(
             previous_plan is not None and backend.batch_plan is previous_plan
         )
         frame_table, frame_counts, self.gaps = _plan_decode(
-            self.static_plans, entries, self.host_snapshot.records
+            self.static_plans,
+            publication,
+            self.host_snapshot.offsets,
         )
         self.max_decoded = max((plan[1] for plan in self.static_plans), default=0)
         self.matrix_tensor_count = len(compressed)
@@ -327,11 +321,10 @@ class PreparedDelta:
         # storage waits for the actual serving pause; kernel warmup is below.
         raw_started = time.perf_counter()
         raw_targets, raw_h2d_bytes = [], 0
-        for binding, entry in raw_entries:
+        for binding, size in raw_entries:
             position = (
                 raw_h2d_bytes if binding.raw_ue8m0 else (raw_h2d_bytes + 7) // 8 * 8
             )
-            size = entry["nbytes"]
             raw_targets.append((binding, position, size))
             raw_h2d_bytes = position + size
         self.raw_pinned = torch.empty(
@@ -341,7 +334,7 @@ class PreparedDelta:
         for binding, position, size in raw_targets:
             copy_bytes(
                 raw_view[position : position + size],
-                self.host_snapshot.get(binding.name),
+                self.host_snapshot.get(canonical_tensors[binding.name][0]),
             )
         if self.raw_ue8m0_bytes:
             validate_ue8m0_payload(self.raw_pinned[: self.raw_ue8m0_bytes])
@@ -358,7 +351,7 @@ class PreparedDelta:
         self.timings.update(
             host_raw_pack_s=time.perf_counter() - raw_started,
             raw_tensors=len(raw_entries),
-            raw_bytes=sum(entry["nbytes"] for _, entry in raw_entries),
+            raw_bytes=sum(nbytes for _, nbytes in raw_entries),
             raw_h2d_bytes=raw_h2d_bytes,
             compressed_batches=len(self.static_plans),
             decode_stages=2,
@@ -366,7 +359,7 @@ class PreparedDelta:
             compressed_tensors=self.matrix_tensor_count,
             de_host_input_bytes=int(frame_table[1].sum()) if self.hardware else 0,
             decoded_zero_ranges=sum(map(len, self.gaps)),
-            decoded_zero_bytes=sum(size for gaps in self.gaps for _, size in gaps),
+            decoded_zero_bytes=sum(int(gaps[:, 1].sum()) for gaps in self.gaps),
         )
         self._prepare_gpu_metadata(frame_table, frame_counts, raw_targets)
         self.timings["host_prepare_s"] = time.perf_counter() - preparation_started

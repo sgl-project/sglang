@@ -27,7 +27,7 @@ class GpuDeltaLayout:
     """Frozen canonical bindings with generic backend and consumer admission."""
 
     def __init__(self, model, inventory):
-        from sglang.srt.weight_sync.gpu_delta.host import _natural_key
+        from sglang.srt.weight_sync.gpu_delta.host_worker import _natural_key
 
         if not inventory:
             raise ValueError("canonical checkpoint metadata is unavailable")

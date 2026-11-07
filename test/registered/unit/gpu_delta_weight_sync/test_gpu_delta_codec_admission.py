@@ -13,7 +13,7 @@ import pytest
 import torch
 import zstandard as zstd
 
-from sglang.srt.weight_sync.gpu_delta.host import HostPayloadPool, validate_codec
+from sglang.srt.weight_sync.gpu_delta.host_worker import HostPayloadPool, validate_codec
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -48,6 +48,7 @@ def _frame_table(batches):
 @pytest.mark.parametrize("sorting", ["0", "1"])
 def test_codec_abi_and_frozen_hardware_options(
     monkeypatch,
+    request,
     name,
     algorithm,
     options_type,
@@ -56,6 +57,8 @@ def test_codec_abi_and_frozen_hardware_options(
     hardware,
     sorting,
 ):
+    codec.decoder_backend.cache_clear()
+    request.addfinalizer(codec.decoder_backend.cache_clear)
     # Match nvCOMP 6 shared_types.h, snappy.h and lz4.h. In particular, LZ4
     # inserts two enums before reserved bytes despite both structs being 64B.
     assert ctypes.sizeof(options_type) == 64
@@ -125,7 +128,12 @@ def test_codec_abi_and_frozen_hardware_options(
     monkeypatch.setattr(codec.ctypes, "CDLL", load_library)
     monkeypatch.setattr(torch.version, "cuda", "13.0")
     monkeypatch.setattr(torch.cuda, "device", lambda _: nullcontext())
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _: capability)
+    capability_queries = []
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda device: capability_queries.append(device) or capability,
+    )
     for allocator_api in (
         "get_allocator_backend",
         "_snapshot",
@@ -139,6 +147,9 @@ def test_codec_abi_and_frozen_hardware_options(
     decoder = codec.NvcompDecoder(torch.device("cuda", 0), name)
     assert decoder.inner_codec == name
     assert decoder.backend == ("hardware" if hardware else "cuda")
+    assert codec.decoder_backend(decoder.device, name) == decoder.backend
+    assert codec.decoder_backend(decoder.device, name) == decoder.backend
+    assert capability_queries == ([decoder.device] if name != "bitcomp" else [])
     assert decoder.maximum_chunk_bytes == ((4 << 20) if hardware else codec._INT64_MAX)
     assert decoder._options.backend == (1 if hardware else 2)
     if name != "bitcomp":

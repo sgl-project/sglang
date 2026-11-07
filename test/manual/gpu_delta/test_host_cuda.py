@@ -333,8 +333,21 @@ def _publication(directory, version, repeat, codec):
             }
         entries.append(entry)
     (directory / "owner.bin").write_bytes(blob)
+    for entry in entries:
+        size = len(expected["raw"]) if entry["name"] == "raw" else 1 << 20
+        shape = [size] if entry["encoding"] == "raw_bytes" else [1, size]
+        entry.update(
+            dtype="U8",
+            shape=shape,
+            nbytes=size,
+            byte_order="little",
+            views=[{"id": entry["name"], "slices": [[0, n] for n in shape]}],
+        )
     manifest = {
         "codec": codec,
+        "base_version": version - 1,
+        "target_version": version,
+        "plan_digest": "native-host-plan",
         "frame_bytes": (1 << 19) if version < 3 else (1 << 20),
         "files": [
             {
@@ -389,44 +402,42 @@ def _consumer(rank, engine, workers, publications, cache, barrier, output):
                 session_id=f"update-{version}",
                 base_version=version - 1,
                 target_version=version,
+                plan_digest="native-host-plan",
                 validate_payload_hash=True,
                 participants=participants,
             )
             barrier.wait(timeout=90)
             metrics = {}
-            manifest = json.loads(Path(path).read_text())
-            codec = manifest["codec"]
-            index = arena.prepare_encoded(
-                path,
-                digest,
-                manifest,
-                metrics,
-                metadata,
-            )
-            entries = [entry for entry in manifest["tensors"] if entry["name"] in names]
-            del manifest
-            snapshot = arena.prepare_local(index, entries, metrics)
-            assert set(snapshot.records) == names
-            assert metrics["host_rank_staging_copy_bytes"] == sum(
-                item["nbytes"] for item in snapshot.records.values()
+            publication = arena.prepare_publication(path, digest, metadata, metrics)
+            codec = publication.header["codec"]
+            if version == 1:
+                ordinals = {
+                    entry["name"]: i
+                    for i, entry in enumerate(publication.read_catalog()["tensors"])
+                }
+            selected = [ordinals[name] for name in sorted(names)]
+            snapshot = arena.prepare_local(publication, selected, metrics)
+            assert metrics["host_rank_staging_copy_bytes"] == int(
+                publication.tensors["prepared_nbytes"][selected].sum()
             )
             source = arena.tensor
             frames, offsets, size = [], {}, 0
-            for entry in entries:
-                name = entry["name"]
-                if name not in names:
-                    continue
+            for name in sorted(names):
+                ordinal = ordinals[name]
                 if name == "raw":
-                    assert bytes(snapshot.get(name)) == expected[name]
+                    assert bytes(snapshot.get(ordinal)) == expected[name]
                     continue
                 size = (size + 15) // 16 * 16
                 offsets[name] = size
+                row = publication.tensors[ordinal]
+                assert row["frame_count"] == 1
+                frame = publication.frames[:, row["frame_start"]]
                 frames.append(
                     (
-                        snapshot.records[name]["offset"],
-                        entry["frames"][0]["encoded_bytes"],
-                        len(expected[name]),
-                        size,
+                        int(snapshot.offsets[ordinal] + frame[0]),
+                        int(frame[1]),
+                        int(frame[2]),
+                        size + int(frame[3]),
                     )
                 )
                 size += len(expected[name])

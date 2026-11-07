@@ -13,6 +13,7 @@ import pytest
 
 from sglang.srt.weight_sync.gpu_delta import io as delta_io
 from sglang.srt.weight_sync.gpu_delta import session as delta_runtime
+from sglang.srt.weight_sync.gpu_delta.receiver import GpuDeltaBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -50,6 +51,8 @@ class Payload:
 
 
 class Backend:
+    discard = GpuDeltaBackend.discard
+
     def __init__(self, payload=None):
         self.payload = payload or Payload()
         self.started = threading.Event()
@@ -130,7 +133,13 @@ def applied(session, backend, req=None):
     return session.apply(lambda: None, lambda: None, lambda: True)
 
 
-def test_prepare_and_status_do_not_wait_for_file_io(make_session):
+@pytest.mark.parametrize(
+    "abort_state,drain_failure",
+    [("PREPARING", False), ("PREPARED", False), ("PREPARING", True)],
+)
+def test_prepare_and_status_do_not_wait_for_file_io(
+    make_session, abort_state, drain_failure
+):
     session, backend = make_session()
     req = request([session.identity])
     control = GpuDeltaSchedulerControl(SimpleNamespace(_engine_paused=False))
@@ -163,11 +172,42 @@ def test_prepare_and_status_do_not_wait_for_file_io(make_session):
         for key in req.keys() - {"manifest_path", "participants"}:
             assert receipt[key] == req[key]
     assert session.status()["state"] == "PREPARING"
+    if abort_state == "PREPARED":
+        backend.ready.set()
+        wait_state(session, "PREPARED")
+    cleanup = []
+    close_payload, close_backend = backend.payload.close, backend.close
+
+    def drain():
+        assert not backend.closed
+        cleanup.append("drain")
+        if drain_failure:
+            raise RuntimeError("GPU drain failed")
+        close_payload()
+
+    def close():
+        assert backend.payload.closed.is_set()
+        cleanup.append("close")
+        close_backend()
+
+    backend.payload.close, backend.close = drain, close
     session.abort("publication-1")
     backend.ready.set()
-    assert backend.payload.closed.wait(2)
+    session._executor.submit(lambda: None).result(timeout=2)
+    if drain_failure:
+        with pytest.raises(RuntimeError, match="GPU drain failed"):
+            session._prepare_future.result()
+        assert cleanup == ["drain"]
+        assert not backend.closed and not backend.payload.closed.is_set()
+    else:
+        assert cleanup == ["drain", "close"]
+        assert backend.closed and backend.payload.closed.is_set()
     assert session.status()["state"] == "ABORTED"
     assert not backend.payload.released.is_set()
+    backend.started.clear()
+    with pytest.raises(ValueError, match="requires restart"):
+        session.prepare(req)
+    assert not backend.started.is_set()
 
 
 def test_abort_unblocks_rank_waiting_for_shared_preparation_owner(
@@ -191,9 +231,7 @@ def test_abort_unblocks_rank_waiting_for_shared_preparation_owner(
     class WaitingBackend(Backend):
         def prepare(self, path, digest, metadata, cancelled):
             self.started.set()
-            return arena.prepare_encoded(
-                path, digest, manifest, {}, metadata, False, cancelled
-            )
+            return arena.prepare_publication(path, digest, metadata, {}, cancelled)
 
     backend = WaitingBackend()
     backend.host_arena = arena
@@ -207,7 +245,7 @@ def test_abort_unblocks_rank_waiting_for_shared_preparation_owner(
         session.prepare(req)
         assert backend.started.wait(2)
         assert session.status()["state"] == "PREPARING"
-        assert arena._pool is None
+        assert arena._worker is None
     finally:
         session.abort(req["session_id"])
         # A queued callback proves the blocked prepare actually exited.

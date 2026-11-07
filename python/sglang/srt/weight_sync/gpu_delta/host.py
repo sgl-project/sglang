@@ -13,7 +13,7 @@
 
 """Verified engine-host encoded cache and persistent pinned input arenas.
 
-Each engine host shares one prepared tmpfs image and one original rank's workers.
+Each engine host shares a prepared tmpfs image built by its persistent CPU child.
 CUDA decoders consume it directly; DE decoders stage only their local spans into
 rank-private hardware-decompression-capable input storage.
 """
@@ -23,83 +23,32 @@ import hashlib
 import json
 import mmap
 import os
-import re
+import socket
 import stat
-import threading
+import subprocess
+import sys
 import time
 import uuid
-from array import array
-from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property
+from multiprocessing.connection import Connection
 from pathlib import Path
 
 import numpy as np
 import orjson
 
 from sglang.srt.weight_sync.gpu_delta import profiling
+from sglang.srt.weight_sync.gpu_delta.codec import decoder_backend
+from sglang.srt.weight_sync.gpu_delta.host_worker import (
+    _CAPACITY_ALIGNMENT,
+    _PREPARE_METRICS,
+    _identity,
+    _metadata_views,
+    configured_cpu_workers,
+    copy_bytes,
+    new_metrics,
+    publication_token,
+)
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, HostMapping
-
-
-def validate_codec(manifest):
-    """Admit the authenticated publication codec before examining any tensor payload."""
-    if (
-        manifest.get("codec")
-        not in {"snappy-zstd", "lz4-zstd", "lz4", "bitcomp", "bitcomp-zstd"}
-        or type(manifest.get("frame_bytes")) is not int
-        or not 0 < manifest["frame_bytes"] <= 4 << 20
-    ):
-        raise ValueError(
-            "GPU delta requires snappy-zstd, lz4-zstd, lz4, bitcomp or bitcomp-zstd "
-            "and an integer frame size in (0, 4 MiB]"
-        )
-
-
-def configured_cpu_workers():
-    value = int(os.environ.get("GPU_DELTA_CPU_WORKERS", "32"))
-    if not 1 <= value <= 64:
-        raise ValueError("GPU_DELTA_CPU_WORKERS must be between 1 and 64")
-    return value
-
-
-def copy_bytes(destination, source):
-    """Copy between retained byte buffers without holding the GIL for large spans."""
-    if len(source) < 64 << 10:
-        destination[:] = source
-    else:
-        np.copyto(
-            np.frombuffer(destination, dtype=np.uint8),
-            np.frombuffer(source, dtype=np.uint8),
-        )
-
-
-class HostPayloadPool:
-    """Reusable bounded CPU workers; no CUDA work or shared decoder contexts."""
-
-    def __init__(self, workers):
-        self.workers = workers
-        self.executor = ThreadPoolExecutor(
-            max_workers=workers, thread_name_prefix="gpu-delta-payload"
-        )
-        self.local = threading.local()
-
-    def decode_zstd(self, payloads, sizes, offsets, destination):
-        if not hasattr(self.local, "decoder"):
-            import zstandard as zstd
-
-            self.local.decoder = zstd.ZstdDecompressor()
-        decoded_sizes = np.asarray(sizes, dtype=np.uint64)
-        started = time.perf_counter()
-        # The existing pool supplies concurrency; native decode stays single-threaded.
-        decoded = self.local.decoder.multi_decompress_to_buffer(
-            payloads, decompressed_sizes=decoded_sizes, threads=0
-        )
-        # Native decode verifies every declared output size before copying any result.
-        for segment, offset, size in zip(decoded, offsets, sizes, strict=True):
-            copy_bytes(destination[offset : offset + size], memoryview(segment))
-        return time.perf_counter() - started
-
-    def close(self):
-        self.executor.shutdown(wait=True)
 
 
 def _cache_base():
@@ -149,283 +98,137 @@ def host_cache_id(engine_id):
         return value
 
 
-def _identity(info):
-    # RW mapping metadata timestamps can change on attachment. The feature owns
-    # immutable contents after READY; bind the exact retained inode and extent.
-    return [info.st_dev, info.st_ino, info.st_size]
+class CpuWorker:
+    """One clean interpreter per owner, with descriptor-only request/reply IPC."""
 
-
-# Cold capacity fits the required extent; growth reserves twice the new extent.
-# This is not a publication-format parameter or a tuning surface.
-_CAPACITY_ALIGNMENT = 64 << 20
-
-
-def _reserve_cache(directory, previous, size, metrics, kind):
-    if previous is not None and size <= previous["capacity"]:
-        return previous
-    capacity = size if previous is None else 2 * size
-    capacity = (
-        (capacity + _CAPACITY_ALIGNMENT - 1)
-        // _CAPACITY_ALIGNMENT
-        * _CAPACITY_ALIGNMENT
-    )
-    generation = previous["generation"] + 1 if previous else 1
-    path = directory / f"{kind}-{generation}.bin"
-    started = time.perf_counter()
-    with path.open("xb+") as target:
-        if capacity:
-            # Reserve pages once per capacity generation; fitting updates never
-            # truncate or resize the retained cache inode.
-            os.posix_fallocate(target.fileno(), 0, capacity)
-        identity = _identity(os.fstat(target.fileno()))
-    metrics[f"host_{kind}_cache_allocation_s"] += time.perf_counter() - started
-    metrics[f"host_{kind}_cache_allocation_calls"] += 1
-    metrics[f"host_{kind}_cache_allocation_bytes"] += capacity
-    return {
-        "file": path.name,
-        "generation": generation,
-        "capacity": capacity,
-        "identity": identity,
-    }
-
-
-def _write_record(directory, name, record):
-    temporary = directory / (name + ".pending")
-    temporary.write_bytes(orjson.dumps(record))
-    temporary.replace(directory / (name + ".json"))
-
-
-@profiling.annotate("gpu_delta.host.read_verify_worker")
-def _read_verify_payload(source, destination, expected, skip_payload_hash):
-    started = time.perf_counter()
-    with source.open("rb", buffering=0) as incoming:
-        before = os.fstat(incoming.fileno())
-        if before.st_size != expected["nbytes"]:
-            raise ValueError("delta payload size mismatch")
-        position = 0
-        while position < len(destination):
-            count = incoming.readinto(destination[position:])
-            if not count:
-                raise ValueError("truncated delta payload")
-            position += count
-        after = os.fstat(incoming.fileno())
-        if incoming.read(1) or (
-            before.st_ino,
-            before.st_size,
-            before.st_mtime_ns,
-            before.st_ctime_ns,
-        ) != (after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
-            raise ValueError("delta payload size mismatch or source changed")
-    read_s = time.perf_counter() - started
-    if skip_payload_hash:
-        return read_s, 0.0
-    started = time.perf_counter()
-    # Authenticate the retained copy, never reread the publication file.
-    if hashlib.sha256(destination).hexdigest() != expected["sha256"]:
-        raise ValueError("delta payload SHA256 mismatch")
-    return read_s, time.perf_counter() - started
-
-
-@profiling.annotate("gpu_delta.host.read_verify")
-def _read_verify_payloads(
-    publication, backing, file_spans, definitions, pool, metrics, skip_payload_hash
-):
-    started = time.perf_counter()
-    futures, error = [], None
-    try:
-        for name, record in definitions.items():
-            source = (publication.parent / name).resolve(strict=True)
-            if source.parent != publication.parent:
-                raise ValueError("delta payload escapes immutable publication")
-            start, size = file_spans[name]
-            futures.append(
-                pool.executor.submit(
-                    _read_verify_payload,
-                    source,
-                    backing[start : start + size],
-                    record,
-                    skip_payload_hash,
-                )
-            )
-    except BaseException as exc:  # noqa: BLE001 - drain submitted file tasks
-        error = exc
-    for future in futures:
-        try:
-            read_s, hash_s = future.result()
-            metrics["host_encoded_cache_read_worker_sum_s"] += read_s
-            metrics["host_encoded_cache_sha256_worker_sum_s"] += hash_s
-        except BaseException as exc:  # noqa: BLE001 - retain mappings until peers drain
-            if error is None:
-                error = exc
-    metrics["host_encoded_cache_read_hash_s"] = time.perf_counter() - started
-    if error is not None:
-        raise error
-
-
-def _natural_key(name):
-    return tuple(
-        int(piece) if piece.isdigit() else piece for piece in re.split(r"(\d+)", name)
-    )
-
-
-@profiling.annotate("gpu_delta.host.tensor_layout")
-def _tensor_layout(entries, previous=None):
-    layout, size = {}, 0
-    for entry in entries:
-        count = (
-            (entry["nbytes"] if entry["changed_bytes"] else 0)
-            if entry["encoding"] == "raw_bytes"
-            else (entry["outer"]["decoded_bytes"] if entry["frames"] else 0)
-        )
-        if count:
-            size = (size + 15) // 16 * 16
-            name = entry["name"]
-            record = previous.get(name) if previous is not None else None
-            if record is None:
-                record = {}
-            record["offset"] = size
-            record["nbytes"] = count
-            layout[name] = record
-            size += count
-    return layout, size
-
-
-_PREPARE_METRICS = (
-    "host_rank_outer_zstd_worker_decode_sum_s",
-    "host_rank_outer_zstd_encoded_bytes",
-    "host_rank_outer_zstd_decoded_bytes",
-    "host_rank_outer_zstd_tensors",
-    "host_rank_outer_zstd_frames",
-    "host_rank_encoded_copy_worker_sum_s",
-    "host_rank_encoded_copy_bytes",
-    "host_rank_encoded_copy_tensors",
-)
-
-
-@profiling.annotate("gpu_delta.host.outer_zstd_worker")
-def _decode_zstd_group(jobs, destination, backing, file_spans, layout, pool):
-    from zstandard import BufferWithSegments
-
-    metrics = {name: 0 for name in _PREPARE_METRICS}
-    segments, sizes, offsets = array("Q"), [], []
-    for entry in jobs:
-        record = layout[entry["name"]]
-        outer = entry["outer"]
-        file_start, file_size = file_spans[outer["file"]]
-        for chunk in outer["frames"]:
-            start = outer["encoded_offset"] + chunk["encoded_offset"]
-            size = chunk["encoded_bytes"]
-            if not 0 <= start <= start + size <= file_size:
-                raise ValueError("delta payload span escapes declared file")
-            segments.append(file_start + start)
-            segments.append(size)
-            sizes.append(chunk["decoded_bytes"])
-            offsets.append(record["offset"] + chunk["decoded_offset"])
-        metrics["host_rank_outer_zstd_encoded_bytes"] += outer["encoded_bytes"]
-        metrics["host_rank_outer_zstd_decoded_bytes"] += outer["decoded_bytes"]
-        metrics["host_rank_outer_zstd_tensors"] += 1
-        metrics["host_rank_outer_zstd_frames"] += len(outer["frames"])
-    metrics["host_rank_outer_zstd_worker_decode_sum_s"] = pool.decode_zstd(
-        BufferWithSegments(backing, segments), sizes, offsets, destination
-    )
-    return metrics
-
-
-@profiling.annotate("gpu_delta.host.copy_worker")
-def _copy_group(jobs, destination, backing, file_spans, layout, pool):
-    metrics = {name: 0 for name in _PREPARE_METRICS}
-    for entry in jobs:
-        record = layout[entry["name"]]
-        outer = entry["outer"]
-        length = outer["encoded_bytes"]
+    def __init__(self, directory, device):
+        self.configuration = {
+            "directory": str(directory),
+            "workers": configured_cpu_workers(),
+            "backends": {
+                name: decoder_backend(device, name)
+                for name in ("snappy", "lz4", "bitcomp")
+            },
+        }
+        local, child = socket.socketpair()
+        parent_fd = None
         started = time.perf_counter()
-        file_start, file_size = file_spans[outer["file"]]
-        start = outer["encoded_offset"]
-        if not 0 <= start <= start + length <= file_size:
-            raise ValueError("delta payload span escapes declared file")
-        start += file_start
-        offset = record["offset"]
-        copy_bytes(
-            destination[offset : offset + length],
-            backing[start : start + length],
-        )
-        metrics["host_rank_encoded_copy_worker_sum_s"] += time.perf_counter() - started
-        metrics["host_rank_encoded_copy_bytes"] += length
-        metrics["host_rank_encoded_copy_tensors"] += 1
-    return metrics
-
-
-@profiling.annotate("gpu_delta.host.prepare_arena")
-def _prepare_arena(
-    destination, layout, backing, file_spans, entries, pool, metrics, codec
-):
-    started = time.perf_counter()
-    jobs, futures, error = [], [], None
-    if not codec.endswith("-zstd"):
-        worker, phase = _copy_group, "host_rank_encoded_copy_s"
-    else:
-        worker, phase = _decode_zstd_group, "host_rank_outer_zstd_decode_s"
-    try:
-        for entry in entries:
-            record = layout.get(entry["name"])
-            if record is None:
-                continue
-            if entry["encoding"] == "raw_bytes":
-                raw = entry["raw"]
-                offset, count = record["offset"], record["nbytes"]
-                file_start, file_size = file_spans[raw["file"]]
-                start = raw["encoded_offset"]
-                if not 0 <= start <= start + count <= file_size:
-                    raise ValueError("delta payload span escapes declared file")
-                start += file_start
-                copy_bytes(
-                    destination[offset : offset + count],
-                    backing[start : start + count],
-                )
-            else:
-                jobs.append(entry)
-        count = min(4 * pool.workers, len(jobs))
-        for index in range(count):
-            futures.append(
-                pool.executor.submit(
-                    worker,
-                    jobs[index::count],
-                    destination,
-                    backing,
-                    file_spans,
-                    layout,
-                    pool,
-                )
-            )
-    except BaseException as exc:  # noqa: BLE001 - drain submitted jobs before re-raise
-        error = exc
-    for future in futures:
         try:
-            partial = future.result()
-            for key in _PREPARE_METRICS:
-                metrics[key] += partial[key]
-        except BaseException as exc:  # noqa: BLE001 - drain peers before re-raise
-            if error is None:
-                error = exc
-    metrics["host_rank_outer_zstd_decode_s"] = 0.0
-    metrics["host_rank_encoded_copy_s"] = 0.0
-    metrics[phase] = time.perf_counter() - started
-    if error is not None:
-        raise error
+            parent_fd = os.pidfd_open(os.getpid())
+            self.process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-I",
+                    "-B",
+                    str(Path(__file__).with_name("host_worker.py")),
+                    "--socket-fd",
+                    str(child.fileno()),
+                    "--parent-fd",
+                    str(parent_fd),
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                pass_fds=(child.fileno(), parent_fd),
+                start_new_session=True,
+                env=os.environ
+                | {
+                    "SGLANG_ENABLE_NVTX_OPERATIONS": "1" if profiling.ENABLED else "0",
+                    # Array construction/copies need no BLAS pool in this CPU child.
+                    "OPENBLAS_NUM_THREADS": "1",
+                    "MKL_NUM_THREADS": "1",
+                    "OMP_NUM_THREADS": "1",
+                },
+            )
+        except BaseException:
+            local.close()
+            raise
+        finally:
+            child.close()
+            if parent_fd is not None:
+                os.close(parent_fd)
+        self.connection = Connection(local.detach())
+        self.spawn_s = time.perf_counter() - started
 
+    def _request(self, request, cancelled=None):
+        if self.connection is None:
+            raise RuntimeError(
+                "GPU-delta CPU worker is closed; preparation cannot restart"
+            )
+        try:
+            if cancelled is not None and cancelled.is_set():
+                raise RuntimeError("GPU-delta host preparation aborted")
+            self.connection.send_bytes(orjson.dumps(request))
+            while not self.connection.poll(0.05):
+                if cancelled is not None and cancelled.is_set():
+                    raise RuntimeError("GPU-delta host preparation aborted")
+            response = orjson.loads(self.connection.recv_bytes(1 << 20))
+            if cancelled is not None and cancelled.is_set():
+                raise RuntimeError("GPU-delta host preparation aborted")
+            if response["token"] != request["token"]:
+                raise RuntimeError(
+                    "GPU-delta CPU worker returned a different publication"
+                )
+            if response["status"] != "OK":
+                error = (
+                    ValueError
+                    if response["error_type"] == "ValueError"
+                    else RuntimeError
+                )
+                raise error(response["error"])
+            return response
+        except (EOFError, BrokenPipeError) as error:
+            self.close(terminate=True)
+            raise RuntimeError(
+                "GPU-delta CPU worker exited during preparation"
+            ) from error
+        except BaseException:
+            self.close(terminate=True)
+            raise
 
-def _map_encoded(directory, encoded, definitions):
-    with (directory / encoded["file"]).open("r+b") as source:
-        if _identity(os.fstat(source.fileno())) != encoded["identity"]:
-            raise ValueError("encoded cache inode or extent changed")
-        mapping = mmap.mmap(source.fileno(), 0) if encoded["capacity"] else None
-    file_spans, position = {}, 0
-    for name, record in definitions.items():
-        file_spans[name] = (position, record["nbytes"])
-        position += record["nbytes"]
-    # The view owns its mmap, including while drained failure tracebacks retain it.
-    backing = memoryview(mapping) if mapping is not None else memoryview(b"")
-    return backing, file_spans
+    @profiling.annotate("gpu_delta.host.cpu_worker_wait")
+    def prepare(self, expected, namespace, metrics, cancelled):
+        started = time.perf_counter()
+        response = self._request(
+            {
+                "command": "prepare",
+                "token": publication_token(expected),
+                "configuration": self.configuration,
+                "expected": expected,
+                "namespace": namespace,
+            },
+            cancelled,
+        )
+        metrics.update(response["metrics"])
+        metrics["host_cpu_worker_spawn_s"] = self.spawn_s
+        metrics["host_cpu_worker_wait_s"] = time.perf_counter() - started
+        self.spawn_s = 0.0
+        return response["index"]
+
+    def release(self, ready_state):
+        if self.connection is None:
+            return
+        self._request(
+            {
+                "command": "release",
+                "token": ready_state["token"],
+                "ready_state": ready_state,
+            }
+        )
+
+    def close(self, terminate=False):
+        try:
+            if terminate:
+                self.process.kill()
+            elif self.connection is not None:
+                self.connection.send_bytes(b"null")
+        except OSError:
+            self.process.kill()
+        finally:
+            # Both paths reap before releasing the publication lock or mappings.
+            self.process.wait()
+            if self.connection is not None:
+                self.connection.close()
+                self.connection = None
 
 
 class HostArena:
@@ -444,16 +247,10 @@ class HostArena:
         self.hardware = None
         self.shared_allocation = self.shared_capacity = None
         self.directory = None
-        self.tensor_order = None
-        self.shared_tensor_order = None
-        self._pool = None
-        self._index = None
-
-    @property
-    def payload_pool(self):
-        if self._pool is None:
-            self._pool = HostPayloadPool(configured_cpu_workers())
-        return self._pool
+        self._namespace = None
+        self.owner = False
+        self._metadata_mapping = self._metadata_capacity = None
+        self._worker = None
 
     @cached_property
     def root(self):
@@ -500,343 +297,172 @@ class HostArena:
         metrics["host_rank_allocation_bytes"] = self.capacity["capacity"]
 
     def _attach_shared_arena(self, prepared, metrics, hardware):
-        if self.shared_capacity == prepared and (
-            not prepared["capacity"]
-            or self.shared_allocation.registered == (not hardware)
-        ):
-            if not hardware:
-                metrics["host_rank_mapping_reused"] = int(
-                    not metrics["host_rank_allocation_calls"]
-                )
-            return
+        replace = self.shared_capacity != prepared or (
+            hardware
+            and self.shared_allocation is not None
+            and self.shared_allocation.registered
+        )
         started = time.perf_counter()
-        self._close_shared()
-        if prepared["capacity"]:
-            with (self.directory / prepared["file"]).open("r+b") as source:
-                if _identity(os.fstat(source.fileno())) != prepared["identity"]:
-                    raise ValueError("prepared cache inode or extent changed")
-                mapping = mmap.mmap(
-                    source.fileno(),
-                    prepared["capacity"],
-                    flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
-                )
-            if not hardware:
+        if replace:
+            self._close_shared()
+            if prepared["capacity"]:
+                with (self.directory / prepared["file"]).open("r+b") as source:
+                    if _identity(os.fstat(source.fileno())) != prepared["identity"]:
+                        raise ValueError("prepared cache inode or extent changed")
+                    mapping = mmap.mmap(
+                        source.fileno(),
+                        prepared["capacity"],
+                        flags=mmap.MAP_SHARED | mmap.MAP_POPULATE,
+                    )
+                self.shared_allocation = HostMapping(mapping, pinned=False)
+            self.shared_capacity = prepared
+        if not hardware:
+            if (
+                self.shared_allocation is not None
+                and not self.shared_allocation.registered
+            ):
                 import torch
 
                 # A fresh preparation thread may have no current CUDA context.
                 torch.cuda.set_device(self.device)
-            self.shared_allocation = HostMapping(mapping, pinned=not hardware)
-        self.shared_capacity = prepared
-        if not hardware:
-            metrics["host_rank_allocation_s"] = time.perf_counter() - started
-            metrics["host_rank_allocation_calls"] = int(
-                self.shared_allocation is not None
-            )
-            metrics["host_rank_allocation_bytes"] = prepared["capacity"]
+                self.shared_allocation.pin()
+                metrics["host_rank_allocation_calls"] = 1
+                metrics["host_rank_allocation_bytes"] = prepared["capacity"]
+                metrics["host_rank_allocation_s"] += time.perf_counter() - started
+            else:
+                metrics["host_rank_mapping_reused"] = 1
 
-    @profiling.annotate("gpu_delta.host.prepare_shared")
-    def _prepare_shared_arena(
-        self, index, previous, backing, file_spans, entries, metrics
-    ):
-        layout_started = time.perf_counter()
-        if self.shared_tensor_order is None:
-            self.shared_tensor_order = sorted(
-                range(len(entries)),
-                key=lambda i: (
-                    entries[i]["encoding"] == "raw_bytes",
-                    _natural_key(entries[i]["name"]),
-                ),
-            )
-        ordered = [entries[i] for i in self.shared_tensor_order]
-        # Prior readers have released before BUILDING; retain small host records,
-        # but recompute offsets and membership for this publication's payloads.
-        layout, size = _tensor_layout(
-            ordered, previous["prepared_records"] if previous else None
-        )
-        metrics["host_prepared_cache_layout_s"] = time.perf_counter() - layout_started
-        prepared = _reserve_cache(
-            self.directory,
-            previous["prepared"] if previous else None,
-            size,
-            metrics,
-            "prepared",
-        )
-        self._attach_shared_arena(prepared, metrics, index["publication"]["hardware"])
-        _prepare_arena(
-            self.shared_allocation.view
-            if self.shared_allocation is not None
-            else memoryview(b""),
-            layout,
-            backing,
-            file_spans,
-            ordered,
-            self.payload_pool,
-            metrics,
-            index["publication"]["codec"],
-        )
-        index.update(
-            prepared=prepared,
-            prepared_records=layout,
-            prepared_size=size,
-            prepared_build_s=time.perf_counter() - layout_started,
-        )
+    def _attach_metadata(self, allocation):
+        if self._metadata_capacity != allocation:
+            with (self.directory / allocation["file"]).open("r+b") as source:
+                if _identity(os.fstat(source.fileno())) != allocation["identity"]:
+                    raise ValueError("metadata cache inode or extent changed")
+                self._metadata_mapping = mmap.mmap(
+                    source.fileno(), allocation["capacity"]
+                )
+            self._metadata_capacity = allocation
 
     @profiling.annotate("gpu_delta.host.prepare_encoded")
-    def prepare_encoded(
-        self,
-        manifest_path,
-        manifest_sha256,
-        manifest,
-        timings,
-        metadata,
-        hardware=True,
-        cancelled=None,
+    def prepare_publication(
+        self, manifest_path, manifest_sha256, metadata, timings, cancelled=None
     ):
-        """Admit the complete verified and prepared engine-host image."""
+        """The original owner authenticates and prepares one shared publication."""
         started = time.perf_counter()
-        skip_payload_hash = not metadata["validate_payload_hash"]
-        publication = Path(manifest_path).resolve(strict=True)
-        namespace = {
-            "stream_id": metadata["stream_id"],
-            "participants": sorted(
-                metadata["participants"],
-                key=lambda value: json.dumps(value, sort_keys=True),
-            ),
-        }
-        key = hashlib.sha256(json.dumps(namespace, sort_keys=True).encode()).hexdigest()
-        directory = self.root / key
-        if self.directory is not None and self.directory != directory:
+        participants = sorted(
+            metadata["participants"], key=lambda value: value["rank_id"]
+        )
+        namespace = {"stream_id": metadata["stream_id"], "participants": participants}
+        if self._namespace is None:
+            self._namespace = namespace
+            key = hashlib.sha256(
+                json.dumps(namespace, sort_keys=True).encode()
+            ).hexdigest()
+            self.directory = self.root / key
+            self.directory.mkdir(mode=0o700, exist_ok=True)
+            owner = min(
+                (
+                    p
+                    for p in participants
+                    if p["engine_id"] == self.engine_id
+                    and p["host_cache_id"] == self.identity["host_cache_id"]
+                ),
+                key=lambda p: (p["tp_rank"], p["dp_rank"], p["pid"], p["rank_id"]),
+            )
+            self.owner = self.identity == owner
+        elif namespace != self._namespace:
             raise ValueError("host cache original cohort or stream changed")
-        definitions = {}
-        for record in manifest["files"]:
-            name, size = record["name"], record["nbytes"]
-            if size < 0:
-                raise ValueError("negative delta payload size")
-            if record["sha256"] is None and not skip_payload_hash:
-                raise ValueError(
-                    "payload checksum omitted; request validate_payload_hash=False "
-                    "to accept an unchecked publication"
-                )
-            definitions[name] = {"nbytes": size, "sha256": record["sha256"]}
+        publication = Path(manifest_path).resolve(strict=True)
         expected = {
             "manifest_path": str(publication),
             "manifest_sha256": manifest_sha256,
-            "codec": manifest["codec"],
-            "session_id": metadata["session_id"],
-            "base_version": metadata["base_version"],
-            "target_version": metadata["target_version"],
-            "files": definitions,
-            "skip_payload_hash": skip_payload_hash,
-            "hardware": hardware,
+            **{
+                key: metadata[key]
+                for key in (
+                    "session_id",
+                    "base_version",
+                    "target_version",
+                    "plan_digest",
+                )
+            },
+            "skip_payload_hash": not metadata["validate_payload_hash"],
         }
-        token = hashlib.sha256(
-            json.dumps(expected, sort_keys=True).encode()
-        ).hexdigest()
-        metrics = {
-            name: 0
-            for name in (
-                "host_encoded_cache_read_hash_s",
-                "host_encoded_cache_read_worker_sum_s",
-                "host_encoded_cache_sha256_worker_sum_s",
-                "host_encoded_cache_hash_bytes",
-                "host_encoded_cache_hash_files",
-                "host_encoded_cache_created",
-                "host_encoded_cache_reused",
-                "host_encoded_cache_allocation_s",
-                "host_encoded_cache_allocation_calls",
-                "host_encoded_cache_allocation_bytes",
-                "host_prepared_cache_created",
-                "host_prepared_cache_reused",
-                "host_prepared_cache_wait_s",
-                "host_prepared_cache_layout_s",
-                "host_prepared_cache_allocation_s",
-                "host_prepared_cache_allocation_calls",
-                "host_prepared_cache_allocation_bytes",
-                "host_rank_allocation_s",
-                "host_rank_allocation_calls",
-                "host_rank_allocation_bytes",
-                "host_rank_mapping_reused",
-            )
-        }
-        metrics.update((name, 0) for name in _PREPARE_METRICS)
-        metrics["host_rank_outer_zstd_decode_s"] = 0.0
-        metrics["host_rank_encoded_copy_s"] = 0.0
-        owner_identity = min(
-            (
-                participant
-                for participant in namespace["participants"]
-                if participant["engine_id"] == self.engine_id
-                and participant["host_cache_id"] == self.identity["host_cache_id"]
-            ),
-            key=lambda participant: (
-                participant["tp_rank"],
-                participant["dp_rank"],
-                participant["pid"],
-                participant["rank_id"],
-            ),
-        )
-        owner = self.identity == owner_identity
-        waiting = time.perf_counter()
-        directory.mkdir(mode=0o700, exist_ok=True)
-        self.directory = directory
-        # The original owner publishes READY only after preparing the shared
-        # image. Followers inspect the small state before reading the full index,
-        # then share the read lock while attaching the same immutable publication.
-        # The control-plane abort event also ends a wait when the owner failed
-        # before reaching host preparation while its process is still alive.
-        with (directory / ".lock").open("a+b") as lock:
-            while True:
-                if cancelled is not None and cancelled.is_set():
-                    raise RuntimeError("GPU-delta host preparation aborted")
-                try:
-                    mode = fcntl.LOCK_EX if owner else fcntl.LOCK_SH
-                    fcntl.flock(lock, mode | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    pass
-                else:
-                    state_path = directory / "state.json"
-                    state = (
-                        orjson.loads(state_path.read_bytes())
-                        if state_path.exists()
-                        else None
-                    )
-                    if owner or (state is not None and state["token"] == token):
-                        if not owner and state["state"] != "READY":
-                            raise ValueError(
-                                "encoded publication is failed or already released"
+        token = publication_token(expected)
+        metrics = new_metrics()
+        if self.owner:
+            if self._worker is None:
+                self._worker = CpuWorker(self.directory, self.device)
+            index = self._worker.prepare(expected, namespace, metrics, cancelled)
+        else:
+            waiting = time.perf_counter()
+            with (self.directory / ".lock").open("a+b") as lock:
+                while True:
+                    if cancelled is not None and cancelled.is_set():
+                        raise RuntimeError("GPU-delta host preparation aborted")
+                    try:
+                        fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        pass
+                    else:
+                        state_path = self.directory / "state.json"
+                        state = (
+                            orjson.loads(state_path.read_bytes())
+                            if state_path.exists()
+                            else None
+                        )
+                        if state is not None and state["token"] == token:
+                            if state["state"] != "READY":
+                                raise ValueError(
+                                    "encoded publication is failed or already released"
+                                )
+                            index = orjson.loads(
+                                (self.directory / "index.json").read_bytes()
                             )
-                        index_path = directory / "index.json"
-                        if owner:
-                            if self._index is None and index_path.exists():
-                                self._index = orjson.loads(index_path.read_bytes())
-                            previous = self._index
-                        else:
-                            previous = orjson.loads(index_path.read_bytes())
-                        break
-                    fcntl.flock(lock, fcntl.LOCK_UN)
-                if cancelled is None:
-                    time.sleep(0.01)
-                else:
-                    cancelled.wait(0.01)
-            metrics["host_encoded_cache_wait_s"] = time.perf_counter() - waiting
+                            if (
+                                index["namespace"] != namespace
+                                or index["token"] != token
+                            ):
+                                raise ValueError("encoded cache publication differs")
+                            break
+                        fcntl.flock(lock, fcntl.LOCK_UN)
+                    if cancelled is None:
+                        time.sleep(0.01)
+                    else:
+                        cancelled.wait(0.01)
+            metrics.update(
+                host_encoded_cache_wait_s=time.perf_counter() - waiting,
+                host_encoded_cache_reused=1,
+                host_prepared_cache_reused=1,
+            )
             metrics["host_prepared_cache_wait_s"] = metrics["host_encoded_cache_wait_s"]
-            if previous and previous["namespace"] != namespace:
-                raise ValueError("encoded cache namespace differs")
-            if previous and previous["publication"] == expected:
-                if state != {
-                    "token": token,
-                    "state": "READY",
-                    "generation": previous["encoded"]["generation"],
-                }:
-                    raise ValueError(
-                        "encoded publication is failed or already released"
-                    )
-                index = previous
-                metrics["host_encoded_cache_reused"] = 1
-                metrics["host_prepared_cache_reused"] = 1
-            else:
-                if not owner:
-                    raise ValueError("encoded cache publication differs")
-                if previous and (
-                    state["state"] != "REUSABLE"
-                    or state["token"] != previous["token"]
-                    or previous["publication"]["target_version"]
-                    != expected["base_version"]
-                ):
-                    raise ValueError(
-                        "encoded cache requires prior engine APPLIED release before overwrite"
-                    )
-                build_started = time.perf_counter()
-                encoded_size = sum(record["nbytes"] for record in definitions.values())
-                encoded = _reserve_cache(
-                    directory,
-                    previous["encoded"] if previous else None,
-                    encoded_size,
-                    metrics,
-                    "encoded",
-                )
-                index = {
-                    "namespace": namespace,
-                    "publication": expected,
-                    "token": token,
-                    "encoded": encoded,
-                    "prepared": previous["prepared"] if previous else None,
-                }
-                # Failed read/hash or shared preparation leaves BUILDING and
-                # cannot authorize release or reuse of either cache.
-                _write_record(directory, "index", index)
-                self._index = index
-                _write_record(
-                    directory,
-                    "state",
-                    {
-                        "token": token,
-                        "state": "BUILDING",
-                        "generation": encoded["generation"],
-                    },
-                )
-                backing, file_spans = _map_encoded(directory, encoded, definitions)
-                _read_verify_payloads(
-                    publication,
-                    backing,
-                    file_spans,
-                    definitions,
-                    self.payload_pool,
-                    metrics,
-                    skip_payload_hash,
-                )
-                if not skip_payload_hash:
-                    metrics["host_encoded_cache_hash_bytes"] = encoded_size
-                    metrics["host_encoded_cache_hash_files"] = len(definitions)
-                index["build_s"] = time.perf_counter() - build_started
-                self._prepare_shared_arena(
-                    index,
-                    previous,
-                    backing,
-                    file_spans,
-                    manifest["tensors"],
-                    metrics,
-                )
-                del backing  # All readers have drained; READY retains prepared bytes.
-                metrics["host_prepared_cache_created"] = 1
-                _write_record(directory, "index", index)
-                _write_record(
-                    directory,
-                    "state",
-                    {
-                        "token": token,
-                        "state": "READY",
-                        "generation": encoded["generation"],
-                    },
-                )
-                if previous and previous["encoded"]["file"] != encoded["file"]:
-                    (directory / previous["encoded"]["file"]).unlink()
-                if (
-                    previous
-                    and previous["prepared"] is not None
-                    and previous["prepared"]["file"] != index["prepared"]["file"]
-                ):
-                    (directory / previous["prepared"]["file"]).unlink()
-                metrics["host_encoded_cache_created"] = 1
+        self._attach_metadata(index["metadata"])
+        result = HostPublication(self, index)
         metrics["host_encoded_cache_access_s"] = time.perf_counter() - started
         metrics.update(
             host_encoded_cache_capacity_bytes=index["encoded"]["capacity"],
             host_encoded_cache_capacity_generation=index["encoded"]["generation"],
             host_encoded_cache_build_s=index["build_s"],
-            host_encoded_cache_skip_payload_hash=int(skip_payload_hash),
+            host_encoded_cache_skip_payload_hash=int(expected["skip_payload_hash"]),
             host_prepared_cache_capacity_bytes=index["prepared"]["capacity"],
             host_prepared_cache_capacity_generation=index["prepared"]["generation"],
             host_prepared_cache_arena_bytes=index["prepared_size"],
             host_prepared_cache_build_s=index["prepared_build_s"],
+            host_metadata_cache_capacity_bytes=index["metadata"]["capacity"],
+            host_metadata_cache_arena_bytes=index["metadata_size"],
+            host_cpu_worker_pid=index["cpu_worker"]["pid"],
+            host_cpu_worker_start_ticks=index["cpu_worker"]["start_ticks"],
+            host_rank_cpu_workers=index["cpu_worker"]["workers"] if self.owner else 0,
         )
         timings.update(metrics)
-        return index
+        return result
 
     @profiling.annotate("gpu_delta.host.prepare_local")
-    def prepare_local(self, index, local_entries, timings, hardware=True):
-        """Stage local DE spans or directly bind the shared CUDA prepared image."""
+    def prepare_local(self, publication, tensor_ids, timings, hardware=True):
+        """Bind rank inputs using canonical ordinals, with DE-local rebasing."""
+        if publication.header["backend"] != ("hardware" if hardware else "cuda"):
+            raise ValueError("engine-host decoder backends differ")
+        index, tensors = publication.index, publication.tensors
         metrics = {
-            name: timings.get(name, 0)
+            name: timings[name]
             for name in (
                 "host_rank_allocation_s",
                 "host_rank_allocation_calls",
@@ -849,41 +475,33 @@ class HostArena:
         }
         self._attach_shared_arena(index["prepared"], metrics, hardware)
         layout_started = time.perf_counter()
-        if hardware:
-            if self.tensor_order is None:
-                # Local binding order is immutable; retain indices, not old entries.
-                self.tensor_order = sorted(
-                    range(len(local_entries)),
-                    key=lambda i: (
-                        local_entries[i]["encoding"] == "raw_bytes",
-                        _natural_key(local_entries[i]["name"]),
-                    ),
-                )
-            entries = [local_entries[i] for i in self.tensor_order]
-            layout, size = _tensor_layout(entries)
-        else:
-            # GPU plans already select this rank's bindings and H2D spans; keep
-            # the shared records directly rather than rebuilding a local map.
-            layout = index["prepared_records"]
-            size = sum(
-                layout[entry["name"]]["nbytes"]
-                for entry in local_entries
-                if entry["name"] in layout
-            )
-        metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
+        selected = np.asarray(tensor_ids, dtype=np.int64)
+        sizes = tensors["prepared_nbytes"][selected]
+        size = int(sizes.sum())
         staging_bytes = 0
+        offsets = tensors["prepared_offset"]
+        if hardware:
+            selected = selected[np.argsort(offsets[selected], kind="stable")]
+            sizes = tensors["prepared_nbytes"][selected]
+            aligned = (sizes + 15) // 16 * 16
+            positions = np.cumsum(aligned) - aligned
+            offsets = np.zeros(len(tensors), dtype=np.int64)
+            offsets[selected] = positions
+            size = int(np.max((positions + sizes)[sizes != 0], initial=0))
+        metrics["host_rank_layout_s"] = time.perf_counter() - layout_started
         if hardware:
             self._reserve_rank_arena(size, metrics)
             prepare_started = time.perf_counter()
-            records = index["prepared_records"]
-            for name, record in layout.items():
-                source = records[name]["offset"]
-                target, count = record["offset"], record["nbytes"]
-                copy_bytes(
-                    self.mapping[target : target + count],
-                    self.shared_allocation.view[source : source + count],
-                )
-                staging_bytes += count
+            for tensor_id in selected:
+                count = int(tensors["prepared_nbytes"][tensor_id])
+                if count:
+                    source = int(tensors["prepared_offset"][tensor_id])
+                    target = int(offsets[tensor_id])
+                    copy_bytes(
+                        self.mapping[target : target + count],
+                        self.shared_allocation.view[source : source + count],
+                    )
+                    staging_bytes += count
             staging_s = time.perf_counter() - prepare_started
         else:
             import torch
@@ -908,7 +526,7 @@ class HostArena:
             host_rank_arena_bytes=size,
             host_rank_capacity_bytes=self.capacity["capacity"],
             host_rank_capacity_generation=self.capacity["generation"],
-            host_rank_cpu_workers=self._pool.workers if self._pool is not None else 0,
+            host_rank_cpu_workers=timings["host_rank_cpu_workers"],
             host_rank_private_capacity_bytes=self.capacity["capacity"]
             if hardware
             else 0,
@@ -916,7 +534,7 @@ class HostArena:
             host_rank_staging_copy_bytes=staging_bytes,
         )
         timings.update(metrics)
-        return HostPreparedSnapshot(self, index, layout)
+        return HostPreparedSnapshot(self, publication, offsets)
 
     def _close_private(self):
         if self.hardware:
@@ -934,42 +552,61 @@ class HostArena:
         self.shared_capacity = None
 
     def close(self):
-        if self._pool is not None:
-            self._pool.close()
-            self._pool = None
+        if self._worker is not None:
+            # Retain the closed client so a poisoned backend cannot respawn it.
+            self._worker.close()
         self._close_private()
         self._close_shared()
-        self._index = None
+        self._metadata_mapping = self._metadata_capacity = None
+
+
+class HostPublication:
+    """Immutable numeric views, protected by the payload's READY/release lease."""
+
+    def __init__(self, arena, index):
+        self.directory, self.index = arena.directory, index
+        self.header = index["publication"]
+        self.tensors, self.frames, self.gaps = _metadata_views(
+            arena._metadata_mapping, index["metadata_counts"]
+        )
+        for array in (self.tensors, self.frames, self.gaps):
+            array.flags.writeable = False
+
+    def read_catalog(self):
+        """Cold local admission only; never retain the parsed static graph."""
+        descriptor = self.index["catalog"]
+        raw = (self.directory / descriptor["file"]).read_bytes()
+        if hashlib.sha256(raw).hexdigest() != descriptor["sha256"]:
+            raise ValueError("shared canonical catalog changed")
+        return orjson.loads(raw)
 
 
 class HostPreparedSnapshot:
     """One publication's local views into backend-retained pinned host storage."""
 
-    def __init__(self, arena, index, records):
-        self.arena, self.records = arena, records
+    def __init__(self, arena, publication, offsets):
+        self.arena, self.publication, self.offsets = arena, publication, offsets
         self.directory = arena.directory
+        self.worker = arena._worker if arena.owner else None
+        index = publication.index
         self.ready_state = {
             "token": index["token"],
             "state": "READY",
             "generation": index["encoded"]["generation"],
         }
 
-    def get(self, name):
-        record = self.records[name]
-        return self.arena.mapping[
-            record["offset"] : record["offset"] + record["nbytes"]
-        ]
+    def get(self, ordinal):
+        start = int(self.offsets[ordinal])
+        count = int(self.publication.tensors["prepared_nbytes"][ordinal])
+        return self.arena.mapping[start : start + count]
 
     def mark_reusable(self):
-        # The tokenizer resumes only after every original engine rank applied. A
-        # stale callback cannot release a newer encoded/prepared publication.
-        with (self.directory / ".lock").open("a+b") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            state = orjson.loads((self.directory / "state.json").read_bytes())
-            if state == self.ready_state:
-                state["state"] = "REUSABLE"
-                _write_record(self.directory, "state", state)
+        # Resume follows all original engine ranks applying successfully. The
+        # child's exact-state check prevents stale callbacks releasing newer data.
+        if self.worker is not None:
+            self.worker.release(self.ready_state)
 
     def close(self):
         # Backend retains its mapping after all DE or H2D readers drain.
         self.arena = None
+        self.publication = self.offsets = None

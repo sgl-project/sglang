@@ -52,7 +52,8 @@ class DeltaSession:
         self.version = initial_version
         self._session: _Session | None = None
         self._provenance = {}
-        self._release_future = None
+        self._cleanup_future = None
+        self._prepare_future = None
         self._closed_cache = None
         self._lock = threading.RLock()
         self._executor = ThreadPoolExecutor(
@@ -93,6 +94,14 @@ class DeltaSession:
 
     def prepare(self, request: dict) -> dict:
         with self._lock:
+            if self._session is not None and self._session.state in {
+                "ABORTED",
+                "FAILED",
+                "POISONED",
+            }:
+                raise ValueError("failed or aborted delta session requires restart")
+            if self._prepare_future is not None and self._prepare_future.done():
+                self._prepare_future.result()
             if (
                 request["base_version"] != self.version
                 or request["target_version"] <= self.version
@@ -112,17 +121,17 @@ class DeltaSession:
                 )
             }
             session = self._session = _Session(request=request)
-            self._executor.submit(self._prepare, session)
+            self._prepare_future = self._executor.submit(self._prepare, session)
             return self.status()
 
     @profiling.annotate("gpu_delta.prepare")
     def _prepare(self, session: _Session) -> None:
         prepared = None
         try:
-            # The FIFO worker has finished the previous release. Propagate its
+            # The FIFO worker has finished the previous cleanup. Propagate its
             # failure before reusing buffers or replacing its completion future.
-            if self._release_future is not None:
-                self._release_future.result()
+            if self._cleanup_future is not None:
+                self._cleanup_future.result()
             req = session.request
             prepared = self.backend.prepare(
                 req["manifest_path"], req["manifest_sha256"], req, session.cancelled
@@ -139,7 +148,7 @@ class DeltaSession:
                     session.message = f"preparation failed: {exc}"
         finally:
             if prepared is not None:
-                prepared.close()
+                self.backend.discard(prepared)
 
     @profiling.annotate("gpu_delta.scheduler.apply")
     def apply(
@@ -212,7 +221,7 @@ class DeltaSession:
             prepared, session.prepared = session.prepared, None
             # Keep host release I/O off the scheduler; this FIFO executor runs
             # it before the next prepare. Resume follows the all-rank apply barrier.
-            self._release_future = self._executor.submit(prepared.release_and_close)
+            self._cleanup_future = self._executor.submit(prepared.release_and_close)
             return self.status()
 
     def abort(self, session_id: str) -> dict:
@@ -230,7 +239,9 @@ class DeltaSession:
             session.cancelled.set()
             if session.prepared is not None:
                 prepared, session.prepared = session.prepared, None
-                self._executor.submit(prepared.close)
+                self._cleanup_future = self._executor.submit(
+                    self.backend.discard, prepared
+                )
             return self.status()
 
     def clear(self) -> dict:
@@ -241,15 +252,17 @@ class DeltaSession:
         # queued resume release must finish before closing the arena or unlinking
         # the shared READY state that other ranks' releases still need.
         self._executor.shutdown(wait=True)
-        if self._release_future is not None:
-            self._release_future.result()
+        if self._prepare_future is not None:
+            self._prepare_future.result()
+        if self._cleanup_future is not None:
+            self._cleanup_future.result()
         if self.backend is not None:
             self._closed_cache = self.backend.host_arena.directory
             self.backend.close()
             self.backend = None
         with self._lock:
             self._session = None
-            self._release_future = None
+            self._cleanup_future = self._prepare_future = None
             return self.status()
 
     def release_cache(self, owner: bool) -> dict:

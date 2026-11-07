@@ -1,13 +1,10 @@
 """Receiver preparation, plan reuse and decode/apply lifecycle contracts."""
 
 import copy
-import json
 import sys
-import tempfile
 import unittest
 import weakref
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,9 +13,17 @@ import torch
 
 from sglang.srt.weight_sync.gpu_delta import bindings as byte_layout
 from sglang.srt.weight_sync.gpu_delta import layout, models, receiver
+from sglang.srt.weight_sync.gpu_delta.host_worker import TENSOR_DTYPE
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+
+
+def publication_view(catalog):
+    return SimpleNamespace(
+        header={"plan_digest": catalog["plan_digest"]},
+        read_catalog=lambda: catalog,
+    )
 
 
 class TestCanonicalPlanCache(unittest.TestCase):
@@ -82,6 +87,8 @@ class TestCanonicalPlanCache(unittest.TestCase):
         ]
         backend = SimpleNamespace(
             _canonical_plan_digest=None,
+            _canonical_tensors=None,
+            _canonical_tensor_ids=(),
             batch_plan=None,
             layers_per_batch=1,
             layout=SimpleNamespace(
@@ -101,25 +108,32 @@ class TestCanonicalPlanCache(unittest.TestCase):
             for entry in sorted(entries, key=lambda entry: entry["name"])
         ]
         return backend, {
-            "tensors": entries,
+            "tensors": sorted(entries, key=lambda entry: entry["name"]),
             "plan_digest": receiver._digest(definitions),
         }
 
     def test_warm_plan_reuses_admitted_digest_with_fresh_payloads(self):
         backend, publication = self.publication()
-        _, reused = receiver._qualify_canonical_plan(backend, publication)
+        admitted, reused = receiver._qualify_canonical_plan(
+            backend, publication_view(publication)
+        )
         self.assertFalse(reused)
-        updated = copy.deepcopy(publication)
-        for entry in updated["tensors"]:
-            entry["frames"] = [{"new": "per-publication payload geometry"}]
-        with patch.object(receiver, "_digest", side_effect=AssertionError("cold only")):
+        self.assertEqual(admitted, {"local": (1, 8)})
+        self.assertEqual(backend._canonical_tensor_ids, (1,))
+        updated = publication_view(publication)
+        with (
+            patch.object(receiver, "_digest", side_effect=AssertionError("cold only")),
+            patch.object(
+                updated, "read_catalog", side_effect=AssertionError("cold only")
+            ),
+        ):
             entries, reused = receiver._qualify_canonical_plan(backend, updated)
         self.assertTrue(reused)
-        self.assertIs(entries["local"], updated["tensors"][0])
+        self.assertIs(entries, admitted)
         self.assertEqual(backend._canonical_plan_digest, publication["plan_digest"])
         with self.assertRaisesRegex(ValueError, "plan changed"):
             receiver._qualify_canonical_plan(
-                backend, updated | {"plan_digest": "changed"}
+                backend, publication_view(publication | {"plan_digest": "changed"})
             )
 
     def test_compact_scale_format_is_negotiated_without_duplicate_wire_fields(self):
@@ -142,30 +156,34 @@ class TestCanonicalPlanCache(unittest.TestCase):
         publication["plan_digest"] = receiver._digest(
             sorted(definitions, key=lambda x: x["name"])
         )
-        receiver._qualify_canonical_plan(backend, publication)
+        receiver._qualify_canonical_plan(backend, publication_view(publication))
         backend._canonical_plan_digest = None
         backend.layout.inventory["local"]["checkpoint_dtype"] = "U8"
         with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
-            receiver._qualify_canonical_plan(backend, publication)
+            receiver._qualify_canonical_plan(backend, publication_view(publication))
 
     def test_failed_cold_qualification_does_not_admit_a_cache(self):
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
         invalid["plan_digest"] = "invalid"
         with self.assertRaisesRegex(ValueError, "negotiated canonical view plan"):
-            receiver._qualify_canonical_plan(backend, invalid)
-        self.assertFalse(receiver._qualify_canonical_plan(backend, publication)[1])
+            receiver._qualify_canonical_plan(backend, publication_view(invalid))
+        self.assertFalse(
+            receiver._qualify_canonical_plan(backend, publication_view(publication))[1]
+        )
         backend, publication = self.publication()
         invalid = copy.deepcopy(publication)
-        invalid["tensors"][0]["views"][0]["slices"][0][1] = 1
+        invalid["tensors"][1]["views"][0]["slices"][0][1] = 1
         with self.assertRaisesRegex(ValueError, "conflicting rank view"):
-            receiver._qualify_canonical_plan(backend, invalid)
+            receiver._qualify_canonical_plan(backend, publication_view(invalid))
         self.assertIsNone(backend._canonical_plan_digest)
-        self.assertFalse(receiver._qualify_canonical_plan(backend, publication)[1])
+        self.assertFalse(
+            receiver._qualify_canonical_plan(backend, publication_view(publication))[1]
+        )
         backend, publication = self.publication()
         backend.layout.excluded["local"] = "static activation calibration"
         with self.assertRaisesRegex(ValueError, "unadmitted tensor"):
-            receiver._qualify_canonical_plan(backend, publication)
+            receiver._qualify_canonical_plan(backend, publication_view(publication))
 
 
 class TestReceiverPreparation(unittest.TestCase):
@@ -317,127 +335,107 @@ class TestReceiverPreparation(unittest.TestCase):
                 self.assertLess(wait, events.index(("copy", i)))
 
     def test_decode_table_preserves_sparse_rows_and_natural_zero_ranges(self):
-        sparse = SimpleNamespace(name="sparse")
-        tail = SimpleNamespace(name="tail")
-        omitted = SimpleNamespace(name="omitted")
         plans = [
-            ([(sparse, 0, 48), (omitted, 64, 16)], 80, None),
-            ([], 0, None),
-            ([(tail, 0, 32)], 32, None),
-            ([(omitted, 0, 24)], 24, None),
+            (np.array([[0, 1], [0, 64]], dtype="<i8"), 80, None),
+            (np.empty((2, 0), dtype="<i8"), 0, None),
+            (np.array([[2], [0]], dtype="<i8"), 32, None),
+            (np.array([[3], [0]], dtype="<i8"), 24, None),
         ]
-        entries = {
-            "sparse": {
-                "frames": [
-                    dict(
-                        encoded_offset=0,
-                        encoded_bytes=3,
-                        decoded_offset=8,
-                        decoded_bytes=8,
-                    ),
-                    dict(
-                        encoded_offset=16,
-                        encoded_bytes=5,
-                        decoded_offset=24,
-                        decoded_bytes=8,
-                    ),
-                ]
-            },
-            "tail": {
-                "frames": [
-                    dict(
-                        encoded_offset=8,
-                        encoded_bytes=7,
-                        decoded_offset=16,
-                        decoded_bytes=8,
-                    )
-                ]
-            },
-            "omitted": {"frames": []},
-        }
-        records = {
-            "sparse": {"offset": 64},
-            "tail": {"offset": 128},
-            "omitted": {"offset": 192},
-        }
-        table, counts, gaps = receiver._plan_decode(plans, entries, records)
-        self.assertEqual(table.dtype, np.int64)
-        self.assertTrue(table.flags.c_contiguous)
-        # Native rows are input, encoded size, decoded size, output; batches
-        # retain their index even when empty and output offsets restart at zero.
-        np.testing.assert_array_equal(
-            table,
-            [[64, 80, 136], [3, 5, 7], [8, 8, 8], [8, 24, 16]],
+        tensors = np.zeros(4, dtype=TENSOR_DTYPE)
+        tensors["frame_start"] = [0, 2, 2, 3]
+        tensors["frame_count"] = [2, 0, 1, 0]
+        tensors["gap_start"] = [0, 3, 4, 6]
+        tensors["gap_count"] = [3, 1, 2, 1]
+        publication = SimpleNamespace(
+            tensors=tensors,
+            frames=np.array(
+                [[0, 16, 8], [3, 5, 7], [8, 8, 8], [8, 24, 16]], dtype="<i8"
+            ),
+            gaps=np.array(
+                [[0, 8], [16, 8], [32, 16], [0, 16], [0, 16], [24, 8], [0, 24]],
+                dtype="<i8",
+            ),
         )
-        self.assertEqual(counts, [2, 0, 1, 0])
-        self.assertEqual(
-            gaps,
-            [
-                [(0, 8), (16, 8), (32, 16), (64, 16)],
-                [],
-                [(0, 16), (24, 8)],
-                [(0, 24)],
-            ],
-        )  # Tensor alignment padding at [48,64) is deliberately excluded.
-        # Exhausting the iterator is required to emit the last trailing gap
-        # and the later fully omitted batch, even with no frame yields at all.
-        empty, counts, gaps = receiver._plan_decode(plans[-1:], entries, records)
+        # DE offsets differ from the shared prepared image; both must produce
+        # the same decoded geometry without changing the shared metadata.
+        original_frames, original_gaps = (
+            publication.frames.copy(),
+            publication.gaps.copy(),
+        )
+        for offsets in (np.array([64, 192, 128, 256]), np.array([0, 64, 80, 112])):
+            table, counts, gaps = receiver._plan_decode(plans, publication, offsets)
+            self.assertEqual(table.dtype, np.int64)
+            self.assertTrue(table.flags.c_contiguous)
+            np.testing.assert_array_equal(
+                table,
+                [
+                    [offsets[0], offsets[0] + 16, offsets[2] + 8],
+                    [3, 5, 7],
+                    [8, 8, 8],
+                    [8, 24, 16],
+                ],
+            )
+            self.assertEqual(counts, [2, 0, 1, 0])
+            for actual, expected in zip(
+                gaps,
+                (
+                    [[0, 8], [16, 8], [32, 16], [64, 16]],
+                    [],
+                    [[0, 16], [24, 8]],
+                    [[0, 24]],
+                ),
+            ):
+                np.testing.assert_array_equal(
+                    actual, np.asarray(expected, dtype="<i8").reshape(-1, 2)
+                )
+        np.testing.assert_array_equal(publication.frames, original_frames)
+        np.testing.assert_array_equal(publication.gaps, original_gaps)
+        empty, counts, gaps = receiver._plan_decode(plans[-1:], publication, offsets)
         self.assertEqual(empty.shape, (4, 0))
         self.assertEqual(counts, [0])
-        self.assertEqual(gaps, [[(0, 24)]])
-        empty, counts, gaps = receiver._plan_decode([], entries, records)
+        np.testing.assert_array_equal(gaps[0], [[0, 24]])
+        empty, counts, gaps = receiver._plan_decode([], publication, offsets)
         self.assertEqual(empty.shape, (4, 0))
         self.assertEqual((counts, gaps), ([], []))
 
-    def test_prepare_releases_foreign_metadata_before_local_work(self):
-        backend, manifest = TestCanonicalPlanCache().publication()
+    def test_prepare_uses_shared_publication_and_only_local_ordinals(self):
+        backend, catalog = TestCanonicalPlanCache().publication()
         backend.device = torch.device("cpu")
         backend.decoders = {"lz4": SimpleNamespace(backend="hardware")}
-        manifest.update(
-            codec="lz4-zstd",
-            frame_bytes=1 << 20,
-            base_version=0,
-            target_version=7,
-        )
-        # A saved HF-base delta may jump directly to a later committed version.
         refs = []
-        parse = receiver.orjson.loads
 
         class TrackedEntry(dict):
             pass
 
-        def tracked_parse(content):
-            value = parse(content)
-            foreign = TrackedEntry(value["tensors"][1])
-            value["tensors"][1] = foreign
+        def read_catalog():
+            value = copy.deepcopy(catalog)
+            foreign = TrackedEntry(value["tensors"][0])
+            value["tensors"][0] = foreign
             refs.append(weakref.ref(foreign))
             return value
 
-        def admit(*args):
-            self.assertIsNotNone(refs[-1]())
-            return {}
+        publication = SimpleNamespace(
+            header={
+                "codec": "lz4-zstd",
+                "backend": "hardware",
+                "target_version": 7,
+                "plan_digest": catalog["plan_digest"],
+            },
+            read_catalog=read_catalog,
+        )
 
-        def prepare_local(index, entries, timings, hardware):
+        def prepare_local(actual, tensor_ids, timings, hardware):
+            self.assertIs(actual, publication)
             self.assertTrue(hardware)
             self.assertIsNone(refs[-1]())
-            self.assertEqual([entry["name"] for entry in entries], ["local"])
+            self.assertEqual(tuple(tensor_ids), (1,))
             raise RuntimeError("stop at local preparation boundary")
 
         backend.host_arena = SimpleNamespace(
-            prepare_encoded=admit, prepare_local=prepare_local
+            prepare_publication=lambda *args: publication, prepare_local=prepare_local
         )
-        with tempfile.TemporaryDirectory() as directory:
-            path = Path(directory) / "manifest.json"
-            content = json.dumps(manifest).encode()
-            path.write_bytes(content)
-            with patch.object(receiver.orjson, "loads", side_effect=tracked_parse):
-                with self.assertRaisesRegex(RuntimeError, "local preparation boundary"):
-                    receiver.PreparedDelta(
-                        backend,
-                        path,
-                        receiver.hashlib.sha256(content).hexdigest(),
-                        {},
-                    )
+        with self.assertRaisesRegex(RuntimeError, "local preparation boundary"):
+            receiver.PreparedDelta(backend, "manifest.json", "digest", {})
 
     def test_layer_batch_cache_tracks_active_names_and_grouping(self):
         names = [
@@ -458,7 +456,7 @@ class TestReceiverPreparation(unittest.TestCase):
             )
             for name in names
         ]
-        entries = {b.name: {"nbytes": 8} for b in bindings}
+        entries = {b.name: (i, 8) for i, b in enumerate(bindings)}
         backend = SimpleNamespace(batch_plan=None)
         # This test checks grouping/cache ownership, not Triton launch plans.
         with patch.dict(
@@ -473,12 +471,12 @@ class TestReceiverPreparation(unittest.TestCase):
             self.assertIs(receiver._plan_layers(backend, bindings, entries), previous)
             reduced = receiver._plan_layers(backend, bindings[1:], entries)
             self.assertIsNot(reduced, previous)
-            self.assertEqual(reduced[3][0][0][0].name, names[1])
+            self.assertEqual(reduced[3][0][0, 0], 1)
             for count, expected in ((1, [[0], [1], [2], [3]]), (2, [[0, 1], [2, 3]])):
                 grouped = receiver._plan_layers(backend, bindings, entries, count)
                 self.assertEqual(
                     [
-                        list(dict.fromkeys(b.layer for b, _, _ in plan[0]))
+                        list(dict.fromkeys(bindings[i].layer for i in plan[0][0]))
                         for plan in grouped
                     ],
                     [[None], [None], [None], *expected],
@@ -523,9 +521,17 @@ class TestReceiverPreparation(unittest.TestCase):
                         SimpleNamespace(model=fake_model), {"engine_id": "invalid"}
                     )
             read_inventory.assert_called_once()
-            backend.close()
+            backend.host_arena.prepare_publication.side_effect = ValueError(
+                "bad manifest"
+            )
+            with patch.object(torch.cuda, "device", return_value=nullcontext()):
+                with self.assertRaisesRegex(ValueError, "bad manifest"):
+                    backend.prepare("manifest.json", "digest", {})
+            backend.host_arena.close.assert_called_once()
 
         drains = []
+        backend = receiver.GpuDeltaBackend.__new__(receiver.GpuDeltaBackend)
+        backend.host_arena = SimpleNamespace(close=lambda: drains.append("backend"))
 
         def decode_failure():
             drains.append("decode")
@@ -534,9 +540,25 @@ class TestReceiverPreparation(unittest.TestCase):
         prepared = receiver.PreparedDelta.__new__(receiver.PreparedDelta)
         prepared.io_stream = SimpleNamespace(synchronize=decode_failure)
         prepared.stream = SimpleNamespace(synchronize=lambda: drains.append("compute"))
+        prepared._release_gpu = lambda: drains.append("release-gpu")
+        prepared.host_snapshot = SimpleNamespace(
+            close=lambda: drains.append("snapshot")
+        )
+        prepared.raw_pinned = object()
         with self.assertRaisesRegex(RuntimeError, "decode stream failed"):
-            prepared.close()
+            backend.discard(prepared)
         self.assertEqual(drains, ["decode", "compute"])
+        self.assertIsNotNone(prepared.raw_pinned)
+        self.assertIsNotNone(prepared.host_snapshot)
+
+        drains.clear()
+        prepared.io_stream.synchronize = lambda: drains.append("decode")
+        backend.discard(prepared)
+        self.assertEqual(
+            drains, ["decode", "compute", "release-gpu", "snapshot", "backend"]
+        )
+        self.assertIsNone(prepared.raw_pinned)
+        self.assertIsNone(prepared.host_snapshot)
 
 
 if __name__ == "__main__":

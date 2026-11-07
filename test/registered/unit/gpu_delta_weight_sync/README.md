@@ -10,8 +10,9 @@ for the end-to-end design and performance motivation.
 
 Implementation ownership is explicit: `layout.py` admits immutable canonical
 bindings and consumer identities; `receiver.py` prepares publications and runs
-the fixed decode/apply pipeline. `host.py` owns payload workers, the shared encoded
-cache, shared prepared images and DE's rank-local input arenas. `tokenizer.py`
+the fixed decode/apply pipeline. `host.py` owns publication control and rank-local
+CUDA mappings; `host_worker.py` builds the shared encoded, prepared and metadata
+images in one persistent CPU-only process per engine-host. `tokenizer.py`
 coordinates the public update and
 correlates internal replies; `session.py` owns scheduler integration and each
 rank's state. HTTP routes and IPC schemas stay in `http.py` and `io.py`.
@@ -102,9 +103,10 @@ HF-base recovery use the same request shape;
 the tokenizer does not reread the manifest or repeat admission. Each engine's
 tokenizer owns the following internal phases:
 
-1. **Prepare:** background work authenticates the manifest, qualifies the canonical
-   plan, admits the encoded cache and prepares local host payloads, small GPU
-   metadata, raw targets and derived calibration. It takes no model-update writer
+1. **Prepare:** the CPU process authenticates the manifest and builds shared
+   payloads and numeric metadata. Rank-local background work qualifies the canonical
+   plan and prepares small GPU metadata, raw targets and derived calibration.
+   It takes no model-update writer
    lock and neither writes model/KV storage nor pauses generation.
 2. **Apply:** close generation admission, pause scheduling, fence readers, retract
    requests and optionally flush caches. Allocate two decoded-mask slots, bind
@@ -116,7 +118,8 @@ tokenizer owns the following internal phases:
    Independent engines need not pause together.
 
 Preparation failure aborts that engine's preparation while old-version serving
-continues. Internal apply/resume failures leave admission closed. A lost HTTP
+continues. Failed or aborted delta sessions require restart before another update.
+Internal apply/resume failures leave admission closed. A lost HTTP
 response may instead mean the server has already completed and resumed; Miles
 does not abort or replay the update on transport failure. The session ID permits
 inspection of that outcome. There is no separate global quiesce/commit round.
@@ -177,8 +180,16 @@ all tasks drain before READY or failure. Namespace/publication records bind the
 original cohort, stream, path, digest, session, versions and hash policy. Mapped
 encoded bytes remain owned until every submitted worker drains.
 
-For every codec, one fixed original rank per engine-host owns the reusable CPU
-pool and prepares the complete canonical image before publishing READY. Wrapped
+For every codec, one fixed original rank per engine-host owns a persistent CPU
+child that parses the manifest and prepares the complete canonical image. The
+child owns its reusable payload pool, publication lock, current index and buffer
+growth. It uses a separate Python interpreter/GIL, imports no Torch and performs
+no CUDA work. Small IPC records describe the shared files; payloads and numeric
+metadata do not cross the IPC channel. The child publishes READY after building
+the image and accepts REUSABLE only for the exact released publication.
+Cancellation terminates and reaps the child, ending its write lease. A late abort
+may retain a complete READY image but never makes it reusable. Clear drains and
+closes the child; parent death also terminates it. Wrapped
 codecs use one native Zstd `BufferWithSegments` per bounded worker group over the
 encoded mapping, without per-frame input views or payload copies. Segment spans
 remain bounded by their logical files. `multi_decompress_to_buffer(threads=0)`
@@ -275,6 +286,10 @@ preparation pools on either decoder path. Engine IDs and
 `host_cache_id`, not hostname alone, define cache
 sharing. Independent engines share no cache locks or release lifecycle.
 
+Profiling the CPU child requires the optional NVIDIA `nvtx` Python package:
+`python -m pip install --no-deps nvtx==0.2.17`. It is imported only when
+`SGLANG_ENABLE_NVTX_OPERATIONS=1`; ordinary execution does not require it.
+
 Payload verification is selected per update by `validate_payload_hash=True` on
 `update_weights_from_gpu_delta`. Miles passes its configured policy explicitly;
 SGLang does not read a hash-policy environment variable. Every rank sharing a
@@ -300,7 +315,9 @@ device bandwidth from host durations.
 | `host_manifest_read_parse_s`, `host_plan_validate_s`, `host_tensor_prepare_s` | Manifest, canonical-plan qualification, local tensor planning |
 | `host_plan_cache_reused`, `host_batch_plan_reused` | Admitted digest / current active-geometry cache reused; no old frames retained |
 | `host_rank_prepare_s` | Encoded admission, global metadata release, local allocation/fill and final encoded-view release |
-| `host_rank_metadata_release_s` | Narrow entries and drop global manifest/content, before tensor planning |
+| `host_rank_metadata_release_s` | CPU child drops the parsed manifest and encoded view after shared preparation |
+| `host_cpu_worker_spawn_s`, `host_cpu_worker_wait_s` | Owner's process-launch call / complete preparation IPC wait; wait includes child work and is not additive with its phases |
+| `host_cpu_worker_pid`, `host_cpu_worker_start_ticks` | Shared child identity, repeated on the engine's ranks; followers do not own another child |
 | `host_rank_prepare_body_s`, `host_rank_prepare_call_s` | Through local snapshot return / local fill and job cleanup; caller-minus-body includes view release/bookkeeping |
 | `host_rank_layout_s`, `host_rank_allocation_s` | Local ordering/offset planning / arena growth |
 | `host_raw_pack_s`, `raw_bytes`, `raw_h2d_bytes` | CPU raw packing, direct bytes, aligned arena upload bytes |

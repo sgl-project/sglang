@@ -16,6 +16,7 @@ import importlib.metadata
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import cache
 
 import numpy as np
 import torch
@@ -97,6 +98,15 @@ class DecodeWorkspace:
     statuses: torch.Tensor
 
 
+@cache
+def decoder_backend(device, inner_codec):
+    """One backend choice for the decoder and its engine-host publication."""
+    hardware = inner_codec in {"snappy", "lz4"} and torch.cuda.get_device_capability(
+        device
+    ) in {(10, 0), (10, 3)}
+    return "hardware" if hardware else "cuda"
+
+
 class NvcompDecoder:
     """DE for Snappy/LZ4 on SM100/103; CUDA decoding for other combinations."""
 
@@ -117,11 +127,8 @@ class NvcompDecoder:
         major_version = int(distribution.version.split(".")[0])
         if major_version != 6 or ctypes.sizeof(ctypes.c_size_t) != 8:
             raise RuntimeError("Direct GPU deltas require the 64-bit nvCOMP 6 ABI")
-        hardware = inner_codec in {
-            "snappy",
-            "lz4",
-        } and torch.cuda.get_device_capability(self.device) in {(10, 0), (10, 3)}
-        self.backend = "hardware" if hardware else "cuda"
+        self.backend = decoder_backend(self.device, inner_codec)
+        hardware = self.backend == "hardware"
         self._options = options_type()
         self._options.backend = 1 if hardware else 2
         if inner_codec in {"snappy", "lz4"}:

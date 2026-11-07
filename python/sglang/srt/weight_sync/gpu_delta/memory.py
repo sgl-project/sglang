@@ -183,17 +183,22 @@ class HostMapping:
         self.registered = False
         try:
             if pinned:
-                self.driver = driver = _driver()
-                self.context = _check(driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
-                self.address = ctypes.addressof(ctypes.c_ubyte.from_buffer(mapping))
-                _check(
-                    driver.cuMemHostRegister(self.address, self.capacity, 0),
-                    "cuMemHostRegister",
-                )
-                self.registered = True
+                self.pin()
         except BaseException:
             self.close()
             raise
+
+    def pin(self):
+        """Register the existing CPU mapping once, without replacing its views."""
+        if not self.registered:
+            self.driver = driver = _driver()
+            self.context = _check(driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
+            self.address = ctypes.addressof(ctypes.c_ubyte.from_buffer(self.mapping))
+            _check(
+                driver.cuMemHostRegister(self.address, self.capacity, 0),
+                "cuMemHostRegister",
+            )
+            self.registered = True
 
     def close(self):
         if self.registered:

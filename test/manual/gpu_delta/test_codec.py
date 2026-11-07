@@ -16,6 +16,7 @@ import torch
 
 from sglang.srt.weight_sync.gpu_delta.apply import prepare_status_check
 from sglang.srt.weight_sync.gpu_delta.codec import NvcompDecoder
+from sglang.srt.weight_sync.gpu_delta.host_worker import TENSOR_DTYPE
 from sglang.srt.weight_sync.gpu_delta.memory import HostAllocation, device_empty
 from sglang.srt.weight_sync.gpu_delta.receiver import (
     PreparedDelta,
@@ -151,23 +152,25 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
     with torch.cuda.device(device), torch.cuda.stream(stream):
         prepared.error = torch.zeros(1, dtype=torch.int32, device=device)
         for index, (plan, frames, size) in enumerate(zip(plans, batches, output_sizes)):
-            binding = SimpleNamespace(name="tensor")
+            tensors = np.zeros(1, dtype=TENSOR_DTYPE)
+            tensors["frame_count"] = len(frames)
+            holes, cursor = [], 0
+            for _, _, count, offset in frames:
+                if offset > cursor:
+                    holes.append((cursor, offset - cursor))
+                cursor = offset + count
+            if cursor < size:
+                holes.append((cursor, size - cursor))
+            tensors["gap_count"] = len(holes)
+            publication = SimpleNamespace(
+                tensors=tensors,
+                frames=_frame_table([frames])[0],
+                gaps=np.asarray(holes, dtype="<i8").reshape(-1, 2),
+            )
             mapped, mapped_counts, gaps = _plan_decode(
-                [([(binding, 0, size)], size, None)],
-                {
-                    "tensor": {
-                        "frames": [
-                            {
-                                "encoded_offset": f[0],
-                                "encoded_bytes": f[1],
-                                "decoded_offset": f[3],
-                                "decoded_bytes": f[2],
-                            }
-                            for f in frames
-                        ]
-                    }
-                },
-                {"tensor": {"offset": 0}},
+                [(np.array([[0], [0]], dtype="<i8"), size, None)],
+                publication,
+                np.zeros(1, dtype=np.int64),
             )
             np.testing.assert_array_equal(mapped, _frame_table([frames])[0])
             assert mapped_counts == [len(frames)]
@@ -310,8 +313,10 @@ def test_batched_plans_share_metadata_and_reuse_tensor_scratch(
 def test_cuda_decode_overlaps_h2d_and_reuses_double_buffer(algorithm, monkeypatch):
     from miles.utils.gpu_delta.nvcomp import NvcompCompressor
 
+    from sglang.srt.weight_sync.gpu_delta import codec
+
     # Force the CUDA path for Snappy/LZ4 even on the Blackwell validation node.
-    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (9, 0))
+    monkeypatch.setattr(codec, "decoder_backend", lambda device, inner_codec: "cuda")
     device = torch.device("cuda", 0)
     compute, h2d = [torch.cuda.Stream(device=device) for _ in range(2)]
     values = [bytes(1 << 20), bytes(range(251)) * 3, bytes([17]) * (64 << 10)]
