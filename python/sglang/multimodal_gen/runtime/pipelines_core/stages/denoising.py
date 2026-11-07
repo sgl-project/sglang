@@ -2451,7 +2451,7 @@ class DenoisingStage(PipelineStage):
 
             current_timestep = i
             skip_first_steps = sparse_config.get("skip_first_steps", 10)
-            sparsity = sparse_config.get("sparsity", 0.2)
+            sparsity = sparse_config.get("sparsity", 0.7)
 
             raw_latent_shape = batch.raw_latent_shape
             patch_size = server_args.pipeline_config.dit_config.patch_size
