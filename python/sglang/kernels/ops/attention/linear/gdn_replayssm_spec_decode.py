@@ -1121,17 +1121,19 @@ def gdn_replayssm_spec_decode(
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
     batch_size = query_start_loc.shape[0] - 1
-    # At the Qwen3.5 MTP shape, one wide V tile avoids duplicating q/k and gate
-    # work across two programs on gfx950.
+    # At the Qwen3.5 MTP shape on gfx950, one pipeline stage is faster at every
+    # batch size, and one wide V tile avoids duplicating q/k and gate work across
+    # two programs once the grid has enough (request, value head) programs.
     if (
         _IS_GFX95
-        and batch_size >= 32
         and max_cache_len == 16
         and max_spec_len == 4
         and q.shape[-1] == 128
         and v.shape[-1] == 128
     ):
-        block_v, num_stages = 128, 1
+        num_stages = 1
+        if batch_size * v.shape[-2] >= 768:
+            block_v = 128
     if is_flush.dtype != torch.int8:
         is_flush = is_flush.to(torch.int8)
 
