@@ -120,6 +120,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
                 "ProfileReq",
+                "FreezeGCReq",
             },
         )
         for name, body in messages:

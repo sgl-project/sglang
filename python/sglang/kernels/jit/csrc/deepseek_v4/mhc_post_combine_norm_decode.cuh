@@ -6,10 +6,11 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
