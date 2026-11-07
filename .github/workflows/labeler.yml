@@ -1,18 +1,24 @@
-name: Auto Label PRs
+name: Auto Label PRs and Issues
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, edited, synchronize, reopened]
+  issues:
+    types: [opened, edited, reopened]
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
   label:
+    # Body-only edits cannot change any label.
+    if: github.event.action != 'edited' || github.event.changes.title
     runs-on: ubuntu-latest
     steps:
-      - name: Ensure Beam label exists
+      # Read metadata only; never check out or execute code from the PR.
+      - name: Label Beam titles
         uses: actions/github-script@v8
         with:
           script: |
@@ -36,7 +42,35 @@ jobs:
               }
             }
 
+            // Check titles only when they are new or edited, so pushes do not
+            // re-add a title label that a maintainer removed.
+            if (context.payload.action === 'synchronize') return;
+            const { number, title } = context.payload.pull_request ?? context.payload.issue;
+            // Bare "beam" also names beam search, so require a Beam model identifier.
+            const modelName = new RegExp([
+              String.raw`\bbeam[ _-]?v?\d+[._]\d+`,
+              String.raw`\breflection(?:[\s_/-]*ai)?[\s_/-]*beam\b`,
+              String.raw`\bBeam(?:ForCausalLM|Config|Model|DecoderLayer|MoE|Detector|ReasoningDetector|ToolAdapter)\b`,
+            ].join('|'), 'i');
+            // These hints also fit beam search wording, so they need a title without it.
+            const modelHints = [
+              /^(?:(?:Revert|Reapply) ")*(?:\[[^\]]*\]\s*)*(?:[\w.-]+\/)*beam(?:\/[\w.-]+)*\s*:/i,
+              /\[beam\]/i,
+              /\bbeam\s+(?:models?|images?|docker|checkpoints?|cookbook|recipes?|serving|deployment|reasoning|parsers?|tool[\s_-]?(?:calls?|parsers?)|lora|moe|bf16|fp8|nvfp4)\b/i,
+              /\b(?:for|in|of|on|to|with)\s+(?:the\s+)?Beam\b/,
+            ];
+            const beamSearch = /beam[\s_-]*search|\bbeams\b|num[\s_-]*beams|\bbeam[\s_-]*(?:width|size|group|leader|candidate|hypothes|score|decoding)/i;
+            if (modelName.test(title) ||
+                (!beamSearch.test(title) && modelHints.some(hint => hint.test(title)))) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: number,
+                labels: [label],
+              });
+            }
+
       - name: Auto-label by file changes
+        if: github.event_name == 'pull_request_target' && github.event.action != 'edited'
         uses: actions/labeler@v5
         with:
           repo-token: "${{ secrets.GITHUB_TOKEN }}"
