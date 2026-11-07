@@ -53,6 +53,7 @@ from sglang.srt.model_executor.runner_utils.shared_read_event import (
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
+    get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
@@ -111,19 +112,37 @@ class EagerRunner(BaseRunner):
             max_bs *= get_spec().speculative_eagle_topk
         # Mirror prepare_mlp_sync_batch padding so the registry holds what load_batch copies.
         max_bs = get_eager_max_batch_size(max_bs)
-        prefill_ceiling = max(mr.max_total_num_tokens, max_prefill_buffer_tokens())
-        max_num_token = max(prefill_ceiling, max_bs * num_tokens_per_req)
+        self._eager_max_bs = max_bs
+        self._eager_num_tokens_per_req = num_tokens_per_req
+        # An eager pass carries one prefill batch or a decode-shaped batch, not
+        # the whole KV pool; load_batch regrows the token-axis slots on demand.
+        prefill_ceiling = max(
+            max_prefill_buffer_tokens(),
+            min(mr.max_total_num_tokens, get_schedule().max_prefill_tokens or 0),
+        )
+        decode_tokens = max_bs * num_tokens_per_req
+        # A regrown registry never exceeds the pool-based size it replaces.
+        self._eager_regrow_ceiling = max(
+            mr.max_total_num_tokens, max_prefill_buffer_tokens(), decode_tokens
+        )
+        self._eager_registry = self._build_eager_registry(
+            max(prefill_ceiling, decode_tokens)
+        )
+        # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
+        if run_warmup:
+            self.warmup()
+
+    def _build_eager_registry(self, max_num_token: int, share_pool: bool = True):
+        mr = self.model_runner
         if require_mlp_sync():
             from sglang.srt.layers.cp.padding import get_cp_padding_align_size
 
             max_num_token = ceil_align(max_num_token, self.attn_tp_size)
             max_num_token = ceil_align(max_num_token, get_cp_padding_align_size())
-        self._eager_max_bs = max_bs
-        self._eager_num_tokens_per_req = num_tokens_per_req
         is_encoder_decoder = mr.model_config.is_encoder_decoder
-        self._eager_registry = build_eager_registry(
+        return build_eager_registry(
             device=mr.device,
-            max_bs=max_bs,
+            max_bs=self._eager_max_bs,
             max_num_token=max_num_token,
             cache_loc_dtype=torch.int64,
             enable_mamba_track=(
@@ -139,10 +158,8 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
+            share_pool=share_pool,
         )
-        # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        if run_warmup:
-            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
@@ -185,6 +202,22 @@ class EagerRunner(BaseRunner):
         else:
             raw_num_tokens = 0
         registry = self._eager_registry
+        if raw_num_tokens > registry.max_num_tokens:
+            max_num_token = max(
+                raw_num_tokens,
+                min(1 << (raw_num_tokens - 1).bit_length(), self._eager_regrow_ceiling),
+            )
+            logger.info(
+                "Eager input registry: %d tokens > %d; regrowing to %d.",
+                raw_num_tokens,
+                registry.max_num_tokens,
+                max_num_token,
+            )
+            # Not pooled, so the next regrow frees it. The startup registry
+            # stays pooled: the cuda-graph runners share its slots.
+            registry = self._eager_registry = self._build_eager_registry(
+                max_num_token, share_pool=False
+            )
         registry.fill_from(
             forward_batch,
             raw_bs=raw_bs,
