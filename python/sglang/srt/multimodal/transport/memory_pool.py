@@ -233,6 +233,8 @@ class StreamOrderedMmFeaturePool:
         self._available_slots = list(reversed(range(max_inflight_slices)))
         self._slot_generations = [0] * max_inflight_slices
         self._occupied: dict[int, PoolLease] = {}
+        # native/DLPack owners must survive the asynchronous producer copy too
+        self._copy_sources: dict[int, torch.Tensor] = {}
         self._cancelling: set[int] = set()
         self._lock = threading.Lock()
         self.on_capacity_change = None
@@ -340,10 +342,14 @@ class StreamOrderedMmFeaturePool:
 
     def release_reserved_batch(self, leases: list[PoolLease]) -> None:
         """Release reservations only before copy starts or after stream completion."""
+        sources = []
         with self._lock:
             for lease in leases:
                 self._release_locked(lease)
+                sources.append(self._copy_sources.pop(lease.slot, None))
             self._merge_ranges_locked()
+        # dropping a native owner can call CUDA; never do that under the pool lock
+        sources.clear()
         if self.on_capacity_change is not None:
             self.on_capacity_change()
 
@@ -355,7 +361,7 @@ class StreamOrderedMmFeaturePool:
             for tensor, lease in zip(tensors, leases, strict=True):
                 _, destination = self.copy_tensor(tensor, lease=lease)
                 destinations.append(destination)
-            torch.cuda.current_stream(self.device_id).synchronize()
+            # consumers wait on the ready word; no host synchronization is needed
             return destinations
         except BaseException:
             # cancellation/failure cannot make bytes reusable while an enqueued
@@ -405,14 +411,13 @@ class StreamOrderedMmFeaturePool:
             dtype=torch.int32,
             device=f"cuda:{self.device_id}",
         ).unsqueeze(1)
-        completed = (
-            (self._control_words.index_select(0, slot_indices) == expected)
-            .all(dim=1)
-            .cpu()
-            .tolist()
-        )
+        ready = self._control_words.index_select(0, slot_indices) == expected
+        completed = torch.stack((ready[:, 0], ready.all(dim=1)), dim=1).cpu().tolist()
+        sources = []
         with self._lock:
-            for lease, is_complete in zip(leases, completed):
+            for lease, (copy_complete, is_complete) in zip(leases, completed):
+                if copy_complete and self._occupied.get(lease.slot) is lease:
+                    sources.append(self._copy_sources.pop(lease.slot, None))
                 if (
                     is_complete
                     and self._occupied.get(lease.slot) is lease
@@ -420,6 +425,7 @@ class StreamOrderedMmFeaturePool:
                 ):
                     self._release_locked(lease)
             self._merge_ranges_locked()
+        sources.clear()
         if self.on_capacity_change is not None:
             self.on_capacity_change()
 
@@ -454,6 +460,8 @@ class StreamOrderedMmFeaturePool:
             return None, None
 
         try:
+            with self._lock:
+                self._copy_sources[lease.slot] = source
             with torch.cuda.device(self.device_id):
                 destination = self.byte_tensor[lease.start : lease.start + lease.nbytes]
                 destination.copy_(
@@ -536,3 +544,8 @@ class StreamOrderedMmFeaturePool:
         self._recycler_stop_event.set()
         if self._recycle_thread.is_alive():
             self._recycle_thread.join()
+        # publishers have stopped; drain only this process's copies before
+        # dropping owners that the recycler has not observed yet
+        if self._copy_sources:
+            torch.cuda.synchronize(self.device_id)
+            self._copy_sources.clear()

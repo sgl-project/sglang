@@ -54,6 +54,7 @@ class TestAtomicPoolReservation(CustomTestCase):
         pool._available_slots = list(reversed(range(slots)))
         pool._slot_generations = [0] * slots
         pool._occupied = {}
+        pool._copy_sources = {}
         pool._cancelling = set()
         pool._lock = threading.Lock()
         pool._pool_error = None

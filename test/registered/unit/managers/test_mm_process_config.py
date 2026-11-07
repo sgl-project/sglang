@@ -504,6 +504,7 @@ class TestStreamOrderedMmFeaturePool(CustomTestCase):
 
         pool = object.__new__(StreamOrderedMmFeaturePool)
         pool._recycler_stop_event = threading.Event()
+        pool._copy_sources = {}
         pool._recycle_thread = threading.Thread(
             target=pool._recycler_stop_event.wait,
             args=(60,),

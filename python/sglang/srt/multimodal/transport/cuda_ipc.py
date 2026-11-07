@@ -184,8 +184,13 @@ class MmItemMemoryPool:
                 )
             ]
         except BaseException:
-            # copies have completed, but no proxy has escaped to a consumer
-            self._pool.release_reserved_batch(leases)
+            # copies may still be running, but no proxy escaped to a consumer
+            for lease in leases:
+                self._pool.cancel_lease(
+                    ready_byte_offset=lease.ready_byte_offset,
+                    ack_byte_offset=lease.ack_byte_offset,
+                    generation=lease.generation,
+                )
             raise
 
     def wrap_tensor(

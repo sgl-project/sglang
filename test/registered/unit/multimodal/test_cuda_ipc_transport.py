@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 import unittest
+import weakref
 from unittest.mock import Mock, patch
 
 import torch
@@ -27,6 +28,10 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     _pool_handle_cache_clear,
+)
+from sglang.srt.multimodal.transport.memory_pool import (
+    stream_wait_value32,
+    stream_write_value32,
 )
 from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -109,6 +114,66 @@ class TestCudaIpcTransport(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is required")
 
+    def test_publication_retains_source_without_waiting_for_copy(self):
+        """A blocked producer copy must not block publication or lose its source."""
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        source = torch.from_dlpack(
+            torch.arange(1024, device="cuda", dtype=torch.float32)
+        )
+        source_ref = weakref.ref(source)
+        expected = source.cpu()
+        gate = torch.zeros(1, device="cuda", dtype=torch.int32)
+        copy_stream, release_stream = torch.cuda.Stream(), torch.cuda.Stream()
+        torch.cuda.synchronize()
+        leases = pool.try_reserve_batch([source.numel() * source.element_size()])
+        published = threading.Event()
+        proxies, failures = [], []
+
+        def publish(tensor):
+            try:
+                with torch.cuda.stream(copy_stream):
+                    stream_wait_value32(0, gate.data_ptr(), 1, "test")
+                    proxies.extend(pool.publish_reserved_batch([[tensor]], leases))
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                published.set()
+
+        worker = threading.Thread(target=publish, args=(source,))
+        del source
+        worker.start()
+        try:
+            try:
+                self.assertTrue(
+                    published.wait(5), "publication waited for the GPU copy"
+                )
+                worker.join(5)
+                self.assertFalse(worker.is_alive())
+                self.assertEqual(failures, [])
+                self.assertIsNotNone(
+                    source_ref(), "source was released before its copy"
+                )
+            finally:
+                # release on another stream even if old code blocks publication
+                with torch.cuda.stream(release_stream):
+                    stream_write_value32(0, gate.data_ptr(), 1, "test")
+                worker.join(10)
+                copy_stream.synchronize()
+            lease = leases[0]
+            actual = pool.memory_pool[lease.start : lease.start + lease.nbytes].view(
+                torch.float32
+            )
+            torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+            deadline = time.monotonic() + 5
+            while source_ref() is not None and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertIsNone(source_ref(), "finished copies retained their sources")
+            self.assertEqual(pool.active_lease_count, 1)
+        finally:
+            for proxy in proxies:
+                pool.cancel_proxy(proxy)
+            pool.shutdown()
+
     def test_guarded_batch_never_spills_and_recovers_after_ack(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
         publisher = BoundedFeaturePublisher(pool, 0, cpu_tensors=False)
@@ -170,6 +235,28 @@ class TestCudaIpcTransport(CustomTestCase):
             publisher.shutdown()
             pool.shutdown()
             _pool_handle_cache_clear()
+
+    def test_proxy_construction_failure_reclaims_only_after_copy(self):
+        pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
+        source = (
+            torch.arange(1024, dtype=torch.float32, device="cuda").reshape(32, 32).T
+        )
+        leases = pool.try_reserve_batch([source.numel() * source.element_size()])
+        try:
+            with patch(
+                "sglang.srt.multimodal.transport.cuda_ipc.CudaIpcTensorTransportProxy",
+                side_effect=RuntimeError("proxy construction failed"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "proxy construction failed"):
+                    pool.publish_reserved_batch([[source]], leases)
+            deadline = time.monotonic() + 5
+            while pool.active_lease_count and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(pool.active_lease_count, 0)
+            self.assertEqual(pool._pool._copy_sources, {})
+            self.assertEqual(pool.capacity_snapshot()["cpu_spills"], 0)
+        finally:
+            pool.shutdown()
 
     def test_cancelled_native_publication_retains_charge_until_completion(self):
         pool = MmItemMemoryPool(1 << 20, 0.01, 0, 1)
