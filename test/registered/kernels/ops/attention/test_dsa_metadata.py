@@ -3,6 +3,9 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention.dsa.metadata import (
+    _fused_dsa_decode_metadata_kernel,
+    _fused_dsa_draft_extend_metadata_kernel,
+    _fused_dsa_target_verify_metadata_kernel,
     fused_dsa_decode_metadata,
     fused_dsa_draft_extend_metadata,
     fused_dsa_target_verify_metadata,
@@ -498,6 +501,43 @@ class TestDSAMetadataKernels(CustomTestCase):
             max_total_len=4,
             static_extend_len=True,
         )
+
+    def test_batch_sizes_in_one_bucket_reuse_compiled_kernels(self):
+        # Batch sizes with the same tile sizes must reuse one compiled kernel. 16 catches
+        # Triton's specialization on divisibility by 16.
+        common = dict(dsa_index_topk=64, physical_page_size=1)
+
+        def decode(seqs):
+            self._check_decode(seqs, max_len=97, **common)
+
+        def verify(seqs):
+            self._check_target_verify(
+                seqs, max_seqlen_k=97, next_n=4, fill_ctx_lens=True, **common
+            )
+
+        def draft(seqs):
+            self._check_draft_extend(
+                seqs,
+                [4] * len(seqs),
+                max_seqlen_k=97,
+                max_extend_len=4,
+                max_total_len=4 * len(seqs),
+                static_extend_len=True,
+                **common,
+            )
+
+        for kernel, check in (
+            (_fused_dsa_decode_metadata_kernel, decode),
+            (_fused_dsa_target_verify_metadata_kernel, verify),
+            (_fused_dsa_draft_extend_metadata_kernel, draft),
+        ):
+            with self.subTest(kernel=check.__name__):
+                kernel_cache = kernel.device_caches[self.device.index or 0][0]
+                for bs in (9, 12, 16):
+                    check(list(range(9, 9 + bs)))
+                    if bs == 9:
+                        compiled_after_first = len(kernel_cache)
+                self.assertEqual(len(kernel_cache), compiled_after_first)
 
     def test_large_batch_coverage(self):
         bs = 16 * 1024
