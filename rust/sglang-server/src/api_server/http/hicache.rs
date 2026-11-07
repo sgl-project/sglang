@@ -155,6 +155,7 @@ mod tests {
                 metadata: (&args).into(),
                 metrics: None,
                 request_log: None,
+                generate_validator: None,
             },
         );
         (

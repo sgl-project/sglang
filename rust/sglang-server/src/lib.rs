@@ -17,6 +17,7 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::core::GenerateValidator;
 pub use api_server::core::{ExtensionCounter, ExtensionHistogram};
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
@@ -217,6 +218,7 @@ impl Server {
             cores,
             None,
             None,
+            None,
         )
     }
 
@@ -396,8 +398,9 @@ impl Server {
 impl Server {
     /// [`Server::start`] with a model package's extensions, the boot of the
     /// package's own server class: `http_layer` wraps the HTTP app (see
-    /// [`HttpLayer`]), and `generate_hook` adds the package's keys to native
-    /// `/generate` frames (see [`GenerateHook`]).
+    /// [`HttpLayer`]), `generate_hook` adds the package's keys to native
+    /// `/generate` frames (see [`GenerateHook`]), and `generate_validator`
+    /// refuses generations from every ingress (see [`GenerateValidator`]).
     #[allow(clippy::too_many_arguments)]
     pub fn start_with_extensions(
         server_args: ServerArgs,
@@ -408,6 +411,7 @@ impl Server {
         cores: Option<Vec<usize>>,
         http_layer: Option<HttpLayer>,
         generate_hook: Option<Arc<dyn GenerateHook>>,
+        generate_validator: Option<Arc<dyn GenerateValidator>>,
     ) -> PyResult<Self> {
         // `server_args` already arrived typed (pyo3 rejected any missing/extra/
         // mistyped field when Python constructed it); only value checks remain.
@@ -436,6 +440,7 @@ impl Server {
             },
             server_args: std::sync::Arc::new(server_args),
             generate_hook,
+            generate_validator,
         };
         let rt =
             runtime::start(cfg, http_layer).map_err(|e| value_error("runtime start failed", e))?;

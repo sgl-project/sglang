@@ -106,6 +106,7 @@ pub mod test_support {
                 metrics: None,
                 request_log: None,
                 peer_endpoints: Vec::new(),
+                generate_validator: None,
             },
         );
         let app = app.layer(Extension(PreGenerateCore(core.clone())));
@@ -181,6 +182,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 peer_endpoints: Vec::new(),
+                generate_validator: None,
             },
         );
         let state = Arc::new(AppState {

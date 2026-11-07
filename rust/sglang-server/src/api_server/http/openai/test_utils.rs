@@ -62,6 +62,7 @@ pub(super) fn core_handle() -> CoreHandle {
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
             metrics: None,
             request_log: None,
+            generate_validator: None,
         },
     )
 }
@@ -165,6 +166,7 @@ pub(super) fn frontend_closed() -> CoreHandle {
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args().as_ref()),
             metrics: None,
             request_log: None,
+            generate_validator: None,
         },
     )
 }
@@ -243,6 +245,7 @@ fn answering_app_state_built(
             metadata: crate::api_server::handlers::CoreMetadata::from(server_args.as_ref()),
             metrics: None,
             request_log,
+            generate_validator: None,
         },
     );
     // The test tokenizers add no specials, so one handle serves both modes.

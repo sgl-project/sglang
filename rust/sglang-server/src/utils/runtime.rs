@@ -530,6 +530,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
             request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args),
+            generate_validator: cfg.generate_validator.clone(),
         },
     );
     core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
@@ -681,6 +682,7 @@ mod tests {
             },
             server_args: Arc::new(test_server_args()),
             generate_hook: None,
+            generate_validator: None,
         }
     }
 
@@ -1193,6 +1195,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
         };
         // Bind is synchronous in `start`, so the port is already accepting.
         let rt = start(cfg, None).expect("start runtime");
@@ -1341,6 +1344,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1416,6 +1420,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
         };
         let rt = start(cfg, None).expect("start runtime");
 
@@ -1822,6 +1827,7 @@ mod tests {
             },
             server_args: Arc::new(server_args),
             generate_hook: None,
+            generate_validator: None,
         };
         let err = match start(cfg, None) {
             Ok(_) => panic!("bind conflict must fail startup, got Ok"),

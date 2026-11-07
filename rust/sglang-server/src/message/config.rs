@@ -78,6 +78,8 @@ pub struct RuntimeConfig {
     pub server_args: Arc<ServerArgs>,
     /// A model package's keys for native `/generate` frames.
     pub generate_hook: Option<Arc<dyn crate::GenerateHook>>,
+    /// A model package's admission check on every client generation.
+    pub generate_validator: Option<Arc<dyn crate::GenerateValidator>>,
 }
 
 impl Default for RuntimeConfig {
@@ -86,6 +88,7 @@ impl Default for RuntimeConfig {
             rust_server_args: RustServerServerArgs::default(),
             server_args: Arc::new(ServerArgs::default()),
             generate_hook: None,
+            generate_validator: None,
         }
     }
 }

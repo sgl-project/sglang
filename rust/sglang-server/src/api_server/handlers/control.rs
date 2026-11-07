@@ -399,6 +399,7 @@ mod tests {
                     })
                 })],
                 request_log: None,
+                generate_validator: None,
             },
         );
 
@@ -522,6 +523,7 @@ mod tests {
                     },
                     peer_endpoints,
                     request_log: None,
+                    generate_validator: None,
                 },
             );
             (handle, intake_rx, abort_rx)

@@ -112,6 +112,7 @@ impl CoreHandle {
         let record = self
             .receive(std::slice::from_ref(&request), received, false, true)
             .pop();
+        self.validate(std::slice::from_ref(&request))?;
         tokio::select! {
             biased;
             cancellation = generation.cancelled() => {
@@ -198,6 +199,8 @@ impl CoreHandle {
             .map(Some)
             .collect::<Vec<_>>();
         records.resize_with(requests.len(), || None);
+        // One refused item refuses the batch before any item is prepared.
+        self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
         let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
         let mut generations: Vec<_> = requests
@@ -297,6 +300,18 @@ impl CoreHandle {
     ) -> Option<RequestMetrics> {
         let metrics = self.inner.metrics.as_ref()?;
         Some(metrics.start_request(request, created_at))
+    }
+
+    /// The launch's [`crate::GenerateValidator`] on each of a client's requests,
+    /// before any media prefetch; the first refusal is the error.
+    fn validate(&self, requests: &[GenerateRequest]) -> Result<(), CoreError> {
+        let Some(validator) = &self.inner.generate_validator else {
+            return Ok(());
+        };
+        requests
+            .iter()
+            .try_for_each(|request| validator.validate(request))
+            .map_err(CoreError::InvalidArgument)
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
@@ -932,6 +947,7 @@ mod tests {
                 },
                 metrics: Some(metrics.clone()),
                 request_log: None,
+                generate_validator: None,
             },
         );
         let mut call = handle
@@ -1172,6 +1188,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: None,
                 request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
+                generate_validator: None,
             },
         );
         let call = handle
@@ -1630,6 +1647,7 @@ mod tests {
                 metadata: CoreMetadata::default(),
                 metrics: Some(metrics.clone()),
                 request_log: None,
+                generate_validator: None,
             },
         );
         let mut submit =

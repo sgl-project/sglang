@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
 from sglang.srt.arg_groups.arg_utils import (
     _field_default,
@@ -138,27 +138,41 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Python warns on long GCs only when this is positive.
     "gc_warning_threshold_secs",
     "tokenizer_metrics_allowed_custom_labels",
+    # The Rust listener speaks HTTP/1 only.
+    "enable_http2",
+    # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
+    # Python's changes the pad values of the items it serves. A model package
+    # whose Rust server caches honors it (`rust_server_unsupported_args`).
+    "mm_preprocess_cache_size_mb",
+    # The Rust server has no encoder dispatch.
+    "language_only",
+    # The Rust listener reports ready without waiting for weight updates.
+    "checkpoint_engine_wait_weights_before_ready",
+    "delete_ckpt_after_loading",
     # Chat responses would lack the server-default sglext token ids.
     "return_input_ids",
     "return_output_ids",
 )
 
 
-def validate_rust_server_unsupported_args(server_args: Any) -> None:
-    """Refuse, in Rust-server mode, every argument the Rust server would ignore.
+def rust_server_unsupported_args(
+    server_args: Any, honored: Collection[str] = ()
+) -> List[str]:
+    """The CLI names of the ``RUST_SERVER_UNSUPPORTED_ARGS`` that are set,
+    except those a model package's Rust server ``honored`` itself.
 
     An argument counts as set when it differs from its default; where the
     default is off (``None``, ``False`` or empty), any falsy value is off too.
     A threshold Python disables when not positive is set only when positive.
     """
-    if not envs.SGLANG_RUST_SERVER.get():
-        return
     cfg = resolving_view(server_args)
     defaults = {
         field.name: _field_default(field) for field in record_fields(type(server_args))
     }
     offending = []
     for name in RUST_SERVER_UNSUPPORTED_ARGS:
+        if name in honored:
+            continue
         value, default = getattr(cfg, name), defaults[name]
         if name == "gc_warning_threshold_secs":
             is_set = value > 0
@@ -168,12 +182,32 @@ def validate_rust_server_unsupported_args(server_args: Any) -> None:
             is_set = value != default
         if is_set:
             offending.append(_field_to_cli_name(name))
+    # The Rust chat route applies only each tool's own `strict`.
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
+        offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    return offending
+
+
+def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueError:
+    """The startup error refusing the ``offending`` settings in Rust-server
+    mode."""
+    many = len(offending) > 1
+    return ValueError(
+        "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+        f"{separator.join(offending)}: the Rust server would silently ignore "
+        f"{'these settings' if many else 'this setting'}. "
+        f"Remove {'them' if many else 'it'} or unset SGLANG_RUST_SERVER."
+    )
+
+
+def validate_rust_server_unsupported_args(server_args: Any) -> None:
+    """Refuse, in Rust-server mode, every argument the Rust server would ignore
+    (``rust_server_unsupported_args``)."""
+    if not envs.SGLANG_RUST_SERVER.get():
+        return
+    offending = rust_server_unsupported_args(server_args)
     if offending:
-        raise ValueError(
-            "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
-            f"{', '.join(offending)}: the Rust server would silently ignore "
-            "these settings. Remove them or unset SGLANG_RUST_SERVER."
-        )
+        raise rust_server_refusal(offending)
 
 
 def validate_response_store(server_args: Any) -> None:

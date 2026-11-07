@@ -25,7 +25,9 @@ use crate::utils::fsm::RequestState;
 use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
-use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics, RequestLog};
+use crate::api_server::core::{
+    CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, RequestLog,
+};
 
 /// How long the listeners keep open connections after a drain's requests
 /// finished: enough to flush the last responses and close idle connections.
@@ -50,6 +52,9 @@ pub(crate) struct CoreConfig {
     /// local scheduler (see [`fanout`]). Empty means this process answers
     /// for its own rank only.
     pub(crate) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    /// A model package's admission check, run on every client generation
+    /// before media prefetch.
+    pub(crate) generate_validator: Option<Arc<dyn GenerateValidator>>,
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -135,6 +140,7 @@ pub(super) struct CoreInner {
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
     pub(super) drain: Arc<DrainState>,
     /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
@@ -169,6 +175,7 @@ impl CoreHandle {
                 request_log: config.request_log,
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
+                generate_validator: config.generate_validator,
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
