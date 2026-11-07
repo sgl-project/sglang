@@ -1,7 +1,13 @@
 import unittest
 from unittest.mock import MagicMock
 
+import torch
+
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.layers.linear import LinearBase
+from sglang.srt.layers.quantization.gptq.gptq import CPUGPTQConfig, GPTQLinearMethod
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -71,6 +77,73 @@ class TestQuantLogString(CustomTestCase):
         result = model_config.get_quantization_config_log_str()
         print(f"\n[Test No Quant] Result: {result}")
         self.assertIsNone(result)
+
+
+class TestCPUGPTQDynamicConfig(CustomTestCase):
+    def test_parallel_lm_head_is_not_selected(self):
+        """CPU GPTQ must not assign a LinearBase-only method to ParallelLMHead."""
+        layer = ParallelLMHead.__new__(ParallelLMHead)
+        torch.nn.Module.__init__(layer)
+        for lm_head_quantized in (False, True):
+            with self.subTest(lm_head_quantized=lm_head_quantized):
+                config = CPUGPTQConfig.from_config(
+                    {
+                        "bits": 4,
+                        "group_size": 128,
+                        "desc_act": False,
+                        "lm_head": lm_head_quantized,
+                    }
+                )
+                self.assertIsNone(config.get_quant_method(layer, prefix="lm_head"))
+
+    def test_regular_linear_selects_gptq(self):
+        config = CPUGPTQConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "desc_act": False,
+                "lm_head": True,
+                "dynamic": {"-:.*attn.*": {}},
+            }
+        )
+        layer = LinearBase(
+            input_size=128,
+            output_size=32,
+            quant_config=config,
+            prefix="model.layers.0.mlp.gate_proj",
+        )
+        self.assertIsInstance(layer.quant_method, GPTQLinearMethod)
+
+    def test_excluded_tp3_attention_projection(self):
+        """Excluded attention projections must not require INT4 block alignment."""
+        config = CPUGPTQConfig.from_config(
+            {
+                "bits": 4,
+                "group_size": 128,
+                "desc_act": False,
+                "sym": True,
+                "dynamic": {"-:.*attn.*": {}},
+            }
+        )
+        self.assertTrue(config.is_sym)
+        layer = LinearBase(
+            input_size=2048,
+            output_size=72,
+            params_dtype=torch.bfloat16,
+            quant_config=config,
+            prefix="model.layers.0.linear_attn.in_proj_ba",
+        )
+        self.assertIsInstance(layer.quant_method, UnquantizedLinearMethod)
+        layer.quant_method.create_weights(
+            layer=layer,
+            input_size_per_partition=2048,
+            output_partition_sizes=[12, 12],
+            input_size=2048,
+            output_size=72,
+            params_dtype=torch.bfloat16,
+        )
+        self.assertEqual(layer.weight.shape, (24, 2048))
+        self.assertNotIn("qweight", layer._parameters)
 
 
 if __name__ == "__main__":
