@@ -180,6 +180,7 @@ FP8_GEMM_RUNNER_BACKEND_CHOICES = [
     "triton",
     "aiter",
     "halops",
+    "xpu_scaled_mm",
 ]
 
 FP4_GEMM_RUNNER_BACKEND_CHOICES = [

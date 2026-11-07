@@ -1283,6 +1283,16 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         with self.model_context():
             self._capture()
 
+    def _capture_profile_options(self) -> CaptureProfileOptions:
+        per_shape = self._graph_batch_capture_active()
+        if per_shape:
+            self._profile_trace_tag = None
+        return CaptureProfileOptions(
+            runner_name=self._profile_runner_name(),
+            per_shape=per_shape,
+            get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
+        )
+
     def _capture(self) -> None:
         # Warm up + autotune kernels once before capture (run-once across the
         # decode + prefill runners; see BaseRunner.warmup).
@@ -1303,16 +1313,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # the original unscheduled pass leaves this None.
         self._profiler = None
         if self.enable_profile_cuda_graph:
-            per_shape = self._graph_batch_capture_active()
-            if per_shape:
-                self._profile_trace_tag = None
-            profile_options = CaptureProfileOptions(
-                runner_name=self._profile_runner_name(),
-                per_shape=per_shape,
-                get_trace_tag=lambda: getattr(self, "_profile_trace_tag", None),
-            )
+            profile_options = self._capture_profile_options()
             profile_context = self.backend.capture_profile_context(profile_options)
-            if per_shape:
+            if profile_options.per_shape:
                 self._profiler = profile_context
 
         # share_buffers() coalesces seq_lens / seq_lens_cpu through the process-

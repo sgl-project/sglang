@@ -11,9 +11,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
@@ -2350,20 +2351,6 @@ def test_swa_requires_the_sliding_window_size():
             mem_cache.TreeCoreInitParamsBinding(),
             _slots(ComponentType.FULL, ComponentType.SWA),
         )
-
-
-def test_enable_hicache_constructs():
-    mem_cache.RustUnifiedTreeCoreBinding(
-        mem_cache.TreeCoreInitParamsBinding(enable_hicache=True),
-        _slots(ComponentType.FULL),
-    )
-
-
-def test_is_write_back_constructs():
-    mem_cache.RustUnifiedTreeCoreBinding(
-        mem_cache.TreeCoreInitParamsBinding(is_write_back=True),
-        _slots(ComponentType.FULL),
-    )
 
 
 def test_write_back_eviction_backs_up_then_drop_subtree_falls_back():

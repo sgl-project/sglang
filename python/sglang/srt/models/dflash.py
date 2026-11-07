@@ -21,6 +21,7 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
@@ -63,7 +64,6 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
 from sglang.srt.utils.common import get_compiler_backend
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_npu = is_npu()
 if _is_npu:

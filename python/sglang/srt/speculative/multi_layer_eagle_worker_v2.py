@@ -40,6 +40,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.observability.profile_utils import build_step_span_name
 from sglang.srt.runtime_context import (
     get_device,
     get_schedule,
@@ -100,7 +101,6 @@ from sglang.srt.utils.async_probe import (
 )
 from sglang.srt.utils.common import fast_topk
 from sglang.srt.utils.nvtx_utils import profile_range
-from sglang.srt.utils.profile_utils import build_step_span_name
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()

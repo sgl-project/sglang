@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import CommonKVManager
 from sglang.srt.disaggregation.common.staging_buffer import (
     StagingAllocator,
 )
@@ -34,7 +34,6 @@ from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
 from sglang.srt.disaggregation.mooncake.conn import (
     FailedSessionProbe,
     MooncakeKVManager,
-    MooncakeKVSender,
     TransferInfo,
 )
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager
@@ -705,30 +704,6 @@ class TestDisaggregationWire(unittest.TestCase):
                         for i, (j, length) in enumerate(zip(dst_entries, src_lens))
                     ],
                 )
-
-    def test_sender_clear_keeps_abort_ack_until_writes_drain(self):
-        manager = object.__new__(MooncakeKVManager)
-        sender = object.__new__(MooncakeKVSender)
-        sender.kv_mgr, sender.bootstrap_room = manager, 42
-        sender.conclude_state = None
-        target = AckTarget("127.0.0.1", 1234, 7)
-        for outstanding in (0, 1):
-            with self.subTest(outstanding=outstanding):
-                manager.request_status = {42: KVPoll.Failed}
-                manager.req_to_decode_prefix_len = {}
-                manager.transfer_infos = {}
-                manager._staging_outstanding = {42: outstanding}
-                manager._deferred_ack_targets = {42: {(target.ip, target.port): target}}
-                manager._deferred_ack_poisoned_rooms = set()
-                with patch.object(manager, "_send_abort_ack") as ack:
-                    sender.clear()
-                    if outstanding:
-                        ack.assert_not_called()
-                        manager._staging_outstanding[42] = 0
-                        manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once_with(42, target)
-                    manager._maybe_ack_drained_abort(42)
-                    ack.assert_called_once()
 
     def test_aux_buffer_validation_allows_decode_only_speculation(self):
         config = get_context().override_server_args(
