@@ -42,6 +42,7 @@ from sglang.srt.layers.communication import k3_ar_fusion, k3_sp_collective
 from sglang.srt.layers.cp.interleave import (
     cp_interleave_to_sequence_order,
     cp_sequence_to_interleave_order,
+    is_interleave_extend,
 )
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
@@ -801,8 +802,30 @@ class KimiK3MoE(nn.Module):
             and self._front_w.dtype == torch.bfloat16
         )
 
+    def _mega_moe_buffer(self):
+        from sglang.srt.layers.moe.mega_moe import (
+            _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
+        )
+
+        return _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+            ),
+            num_topk=self._mega_top_k,
+            hidden=self.moe_hidden_size,
+            intermediate_hidden=self._mega_intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+        )
+
     def _forward_mega_experts(
-        self, routed_input: torch.Tensor, topk_output
+        self,
+        routed_input: torch.Tensor,
+        topk_output,
+        *,
+        valid_token_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Routed experts via deep_gemm MegaMoE: fused a2a dispatch + grouped
         GEMMs + SiTU + combine over the EP-group symmetric buffer. Semantically
@@ -815,10 +838,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
-            _get_mega_moe_symm_buffer,
-            _mega_moe_mma_type,
         )
-        from sglang.srt.runtime_context import get_parallel
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
         # batch stays on every row.
@@ -832,15 +852,7 @@ class KimiK3MoE(nn.Module):
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
             f"the env var to cover the per-rank rows"
         )
-        buf = _get_mega_moe_symm_buffer(
-            get_parallel().moe_ep_group.device_group,
-            num_experts=self.experts.num_experts,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_topk=self._mega_top_k,
-            hidden=self.moe_hidden_size,
-            intermediate_hidden=self._mega_intermediate_size,
-            mma_type=_mega_moe_mma_type(self.experts),
-        )
+        buf = self._mega_moe_buffer()
 
         if num_tokens > 0:
             topk_ids_in = topk_output.topk_ids.to(torch.int32)
@@ -852,6 +864,16 @@ class KimiK3MoE(nn.Module):
             topk_weights_in = routed_input.new_empty(
                 (0, self._mega_top_k), dtype=torch.float32
             )
+        valid_rows = None
+        if valid_token_count is not None:
+            # The graph bucket is static; its live CP prefix changes on replay.
+            # Mask NaNs as well as routes before quantization/dispatch.
+            valid_rows = (
+                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+            )
+            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
 
         mega_moe_pre_dispatch(
             routed_input,
@@ -880,6 +902,8 @@ class KimiK3MoE(nn.Module):
                 fast_math=True,
             )
         y = y[:num_tokens]
+        if valid_rows is not None:
+            y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
                 self.routed_scaling_factor is not None
@@ -1113,6 +1137,7 @@ class KimiK3MoE(nn.Module):
         hidden_states: torch.Tensor,
         *,
         prefix_sum: Optional[torch.Tensor],
+        valid_token_count: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Front section with three separate GEMMs, each reading
         hidden_states: shared-expert MLP, router gate, latent down-proj."""
@@ -1160,7 +1185,9 @@ class KimiK3MoE(nn.Module):
         def run_experts(expert_input, topk_output):
             if not fine_grained_overlap:
                 return (
-                    self._forward_mega_experts(expert_input, topk_output)
+                    self._forward_mega_experts(
+                        expert_input, topk_output, valid_token_count=valid_token_count
+                    )
                     if self._use_mega_moe
                     else self.experts(expert_input, topk_output)
                 )
@@ -2886,7 +2913,24 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        if self._ffn_writes_stream:
+        if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
+            valid_token_count = None
+            if is_interleave_extend(forward_batch):
+                from sglang.srt.layers.cp.base import get_cp_strategy
+
+                valid_token_count = get_cp_strategy().moe_num_token_non_padded(
+                    forward_batch
+                )
+            hidden_states = self.mlp(
+                hidden_states,
+                prefix_sum=(
+                    residual_batch.written_residual(forward_batch)
+                    if self._ffn_writes_stream
+                    else None
+                ),
+                valid_token_count=valid_token_count,
+            )
+        elif self._ffn_writes_stream:
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=residual_batch.written_residual(forward_batch),
@@ -3622,6 +3666,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                 continue
             if isinstance(layer.mlp, KimiK3MoE):
                 layer.mlp._merge_front_weights()
+                if layer.mlp._use_mega_moe and get_parallel().attn_cp_size > 1:
+                    # Under prefill CP the shared EP workspace must count
+                    # against the KV budget, not first appear during warmup or
+                    # graph capture. Other MegaMoE recipes are sized with the
+                    # workspace taken from the non-static slack, as on main.
+                    layer.mlp._mega_moe_buffer()
                 # Convert the correction bias to fp32 once so the per-call
                 # .to(float32) in topk is a no-op, not one upcast kernel per
                 # MoE layer per step.
