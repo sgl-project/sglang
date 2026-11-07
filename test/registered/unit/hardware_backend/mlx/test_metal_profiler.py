@@ -234,5 +234,80 @@ class TestSchedulerProfilerManagerMPS(unittest.TestCase):
                 capture_ctx.__exit__.assert_called_once()
 
 
+@unittest.skipUnless(_IS_APPLE_SILICON and _HAS_MLX, _SKIP_REASON)
+class TestMetalTorchProfilerContext(unittest.TestCase):
+    def _profiler(self, *, torch_profiler=None, capture_success=True):
+        from unittest.mock import MagicMock
+
+        from sglang.srt.hardware_backend.mlx.profiler import MetalTorchProfiler
+        from sglang.srt.managers.io_struct import ProfileReqOutput
+
+        metal_profiler = MagicMock()
+        start_capture = MagicMock(
+            return_value=(
+                metal_profiler if capture_success else None,
+                ProfileReqOutput(success=capture_success, message="capture failed"),
+            )
+        )
+        profiler = MetalTorchProfiler(
+            start_metal_capture=start_capture, torch_profiler=torch_profiler
+        )
+        return profiler, metal_profiler, start_capture
+
+    def test_context_starts_and_stops_capture(self):
+        from unittest.mock import MagicMock
+
+        for torch_profiler in (None, MagicMock()):
+            with self.subTest(with_cpu_profiler=torch_profiler is not None):
+                profiler, metal, start_capture = self._profiler(
+                    torch_profiler=torch_profiler
+                )
+                with profiler as entered:
+                    self.assertIs(entered, profiler)
+                    start_capture.assert_called_once()
+                    metal.stop.assert_not_called()
+                metal.stop.assert_called_once()
+                if torch_profiler is not None:
+                    torch_profiler.start.assert_called_once()
+                    torch_profiler.stop.assert_called_once()
+
+    def test_context_propagates_body_error_and_stops_capture(self):
+        profiler, metal, _ = self._profiler()
+        with self.assertRaisesRegex(ValueError, "body failed"):
+            with profiler:
+                raise ValueError("body failed")
+        metal.stop.assert_called_once()
+
+    def test_failed_capture_does_not_enter_body(self):
+        profiler, metal, _ = self._profiler(capture_success=False)
+        with self.assertRaisesRegex(RuntimeError, "capture failed"):
+            with profiler:
+                self.fail("failed capture must not enter the context body")
+        metal.stop.assert_not_called()
+
+    def test_failed_torch_start_stops_metal_capture(self):
+        from unittest.mock import MagicMock
+
+        cpu = MagicMock()
+        cpu.start.side_effect = RuntimeError("CPU start failed")
+        profiler, metal, _ = self._profiler(torch_profiler=cpu)
+        with self.assertRaisesRegex(RuntimeError, "CPU start failed"):
+            with profiler:
+                self.fail("failed start must not enter the context body")
+        metal.stop.assert_called_once()
+        cpu.stop.assert_not_called()
+
+    def test_failed_torch_stop_still_stops_metal_capture(self):
+        from unittest.mock import MagicMock
+
+        cpu = MagicMock()
+        cpu.stop.side_effect = RuntimeError("CPU stop failed")
+        profiler, metal, _ = self._profiler(torch_profiler=cpu)
+        with self.assertRaisesRegex(RuntimeError, "CPU stop failed"):
+            with profiler:
+                pass
+        metal.stop.assert_called_once()
+
+
 if __name__ == "__main__":
     unittest.main()
