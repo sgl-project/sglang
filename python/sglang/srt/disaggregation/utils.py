@@ -1638,13 +1638,28 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def is_draft_kv_on_target_swa(draft_token_to_kv_pool) -> bool:
+    from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
+
+    return (
+        isinstance(draft_token_to_kv_pool, SWAKVPool)
+        and draft_token_to_kv_pool.full_layer_nums == 0
+        and draft_token_to_kv_pool.swa_layer_nums > 0
+    )
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    layout = None
     if isinstance(token_to_kv_pool, DeepSeekV4TokenToKVPool):
-        return token_to_kv_pool.pd_kv_layout()
-    return None
+        layout = token_to_kv_pool.pd_kv_layout()
+    window = get_spec().speculative_dflash_draft_window_transfer
+    if window is not None:
+        marker = f"dflash_draft_window={window}"
+        layout = marker if layout is None else f"{layout};{marker}"
+    return layout
 
 
 def prepare_abort(req: Req, error_message: str, status_code=None):

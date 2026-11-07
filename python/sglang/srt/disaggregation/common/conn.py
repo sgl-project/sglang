@@ -1394,6 +1394,14 @@ class CommonKVManager(BaseKVManager):
                 f"but decode server has kv_layout={self.kv_layout}. Both servers "
                 f"must use the same --dsv4-attn-backend and SGLANG_DSV4_KV_LAYOUT."
             )
+        if ("dflash_draft_window=" in (info.kv_layout or "")) != (
+            "dflash_draft_window=" in (self.kv_layout or "")
+        ):
+            raise RuntimeError(
+                "DFLASH draft transfer mismatch: prefill kv_layout="
+                f"{info.kv_layout}, decode kv_layout={self.kv_layout}. The draft "
+                "window transfer needs PP, CP and DCP size 1 on both servers."
+            )
 
         local_layout = self.dsv41_spec_layout
         if local_layout is not None or info.dsv41_spec_layout is not None:

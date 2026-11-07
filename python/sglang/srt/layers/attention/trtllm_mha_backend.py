@@ -51,7 +51,7 @@ from sglang.srt.layers.cp.utils import is_cp_active
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
-from sglang.srt.layers.radix_attention import AttentionType
+from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.layout.paged_view import paged_kv_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -76,7 +76,6 @@ if is_flashinfer_available():
     import flashinfer
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput
@@ -394,6 +393,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
         else:
             self._swa_full_to_swa_mapping = None
+        self._encoder_only_reads_swa = self._resolve_encoder_only_reads_swa(
+            model_runner
+        )
 
         # Static page-table width (upper bound). The CUDA-graph path builds the
         # page table on-device sized to this constant, so it never reads a runtime
@@ -648,6 +650,32 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             model_output.copy_(output)
             return model_output
         return output.to(self.q_data_type)
+
+    def _resolve_encoder_only_reads_swa(self, model_runner: ModelRunner) -> bool:
+        if not (
+            model_runner.is_draft_worker
+            and model_runner.model_config.dflash_draft_kv_on_swa
+            and self.expand_encoder_only_verify
+            and self._swa_kv_pool is not None
+        ):
+            return False
+        in_swa_pool = {
+            self._is_window_layer(module)
+            for module in model_runner.model.modules()
+            if isinstance(module, RadixAttention)
+            and module.attn_type == AttentionType.ENCODER_ONLY
+        }
+        if in_swa_pool != {True}:
+            raise NotImplementedError(
+                "The expanded ENCODER_ONLY verify rows read one page table, but "
+                "these layers are not all in the SWA sub-pool."
+            )
+        return True
+
+    def _encoder_only_page_table(self, metadata: TRTLLMMHAMetadata) -> torch.Tensor:
+        if self._encoder_only_reads_swa:
+            return metadata.swa_page_table
+        return metadata.page_table
 
     def _alloc_swa_page_table(
         self, max_bs: int, max_num_pages: int
@@ -1159,7 +1187,7 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
                 metadata.cache_seqlens_int32[metadata.encoder_row_map]
             )
             metadata.encoder_page_table.copy_(
-                metadata.page_table[metadata.encoder_row_map]
+                self._encoder_only_page_table(metadata)[metadata.encoder_row_map]
             )
 
         self.forward_metadata = metadata
@@ -1515,7 +1543,9 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
             )
             metadata.encoder_row_map = row_map
             metadata.encoder_cache_seqlens = metadata.cache_seqlens_int32[row_map]
-            metadata.encoder_page_table = metadata.page_table[row_map]
+            metadata.encoder_page_table = self._encoder_only_page_table(metadata)[
+                row_map
+            ]
 
         # int64 scatter index (unlike the int32 read page table above).
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:

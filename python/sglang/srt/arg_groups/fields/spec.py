@@ -141,6 +141,25 @@ class Spec(msgspec.Struct):
             resolvable=True,
         ),
     ] = None
+    speculative_dflash_draft_kv_on_swa: A[
+        bool,
+        Arg(
+            help="Resolved: an all-sliding-window DFLASH draft keeps its KV on "
+            "the hybrid-SWA target's SWA slots.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
+    speculative_dflash_draft_window_transfer: A[
+        Optional[int],
+        Arg(
+            help="Resolved: the window (tokens) PD peers ship for an "
+            "all-sliding-window DFLASH draft as its own state entry, whatever "
+            "each side's draft KV placement; None ships the per-token draft KV.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = None
     speculative_dsa_topk_backend: A[
         str,
         Arg(
