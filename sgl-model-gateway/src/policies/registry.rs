@@ -329,6 +329,28 @@ impl PolicyRegistry {
         }
     }
 
+    /// Clear the cache-aware trees of workers whose KV cache was flushed, so requests
+    /// are not routed for prefixes those workers no longer hold.
+    pub fn clear_cache_aware_worker_caches(&self, worker_urls: &[String]) {
+        let mut policies: Vec<Arc<dyn LoadBalancingPolicy>> =
+            vec![Arc::clone(&self.default_policy)];
+        policies.extend(self.prefill_policy.get().cloned());
+        policies.extend(self.decode_policy.get().cloned());
+        policies.extend(self.model_policies.iter().map(|e| Arc::clone(e.value())));
+        let mut seen: Vec<&Arc<dyn LoadBalancingPolicy>> = Vec::new();
+        for policy in &policies {
+            if seen.iter().any(|p| Arc::ptr_eq(p, policy)) {
+                continue;
+            }
+            seen.push(policy);
+            if let Some(cache_aware) = policy.as_any().downcast_ref::<CacheAwarePolicy>() {
+                for url in worker_urls {
+                    cache_aware.clear_worker_cache(url);
+                }
+            }
+        }
+    }
+
     /// Initialize cache-aware policies for PD mode (prefill and decode) - lock-free
     pub fn init_pd_cache_aware_policies(
         &self,
