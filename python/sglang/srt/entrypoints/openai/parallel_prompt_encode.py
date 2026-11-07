@@ -9,14 +9,25 @@ tokenizers (rayon) thread pool.
 
 A single message is often most of the prompt, so long gaps between added
 tokens are also cut at pre-token boundaries, but only for the exact
-Split-regex + ByteLevel + BPE pipeline of GLM / Llama-3 style tokenizers
-(``_INTRA_SPLIT_REGEX``). For that regex, a match containing a letter ends at
-the last letter of a run (only the ``'s``-style and ``?\p{L}+`` alternatives
-contain letters) and a match containing ``\n`` never continues into a letter,
-so "letter|space letter" and "\n|letter" are always pre-token boundaries.
+Split-regex + ByteLevel + BPE pipelines of GLM / Llama-3 and Qwen3.5 style
+tokenizers (``_INTRA_SPLIT_REGEXES``). For these regexes, a match containing a
+letter ends at the last letter (or combining mark) of a run (only the
+``'s``-style and ``?\p{L}+`` / ``?[\p{L}\p{M}]+`` alternatives contain
+letters) and a match containing ``\n`` never continues into a letter, so
+"letter|space letter" and "\n|letter" are always pre-token boundaries.
 Truncating a chunk after a letter cannot change any match; after ``\n`` the
 only lookahead that could flip (``\s+(?!\S)``) is shadowed by the earlier
-``\s*[\r\n]+`` alternative. BPE never merges across pre-tokens.
+``\s*[\r\n]+`` alternative. BPE never merges across pre-tokens. An NFC
+normalizer (Qwen3.5) keeps these cuts: NFC only composes a character with
+ones before it, and neither the space nor an ASCII letter ever composes with a
+preceding character, so normalizing the two sides of a cut separately gives
+the normalized whole. Added tokens matched on normalized text could still
+straddle a cut, so a normalizer with such tokens gets no intra-gap cuts.
+
+When tokenizers may not use its thread pool in this process (SGLang sets
+TOKENIZERS_PARALLELISM=false for multimodal models, whose preprocess pool
+forks), the pieces are encoded one per call from a small thread pool instead:
+``encode_batch`` releases the GIL while it encodes.
 
 Any configuration where that argument does not hold falls back to the original
 encode: slow or wrapped tokenizers, specials added by the post-processor,
@@ -77,18 +88,32 @@ _ID_PRESERVING_POST_PROCESSORS = {
     "RobertaProcessing",
 }
 
-# Pre-token regex for which the intra-gap cut points below were verified.
+# Pre-token regexes for which the intra-gap cut points below were verified.
+# GLM / Llama-3:
 _INTRA_SPLIT_REGEX = (
     r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}|"
     r" ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
 )
+# Qwen3.5: letter runs take combining marks, digits are split one by one.
+_QWEN35_SPLIT_REGEX = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}|"
+    r" ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
+_INTRA_SPLIT_REGEXES = (_INTRA_SPLIT_REGEX, _QWEN35_SPLIT_REGEX)
+# Normalizers that keep the intra-gap cut points (see the module docstring).
+_INTRA_SAFE_NORMALIZERS = (None, {"type": "NFC"})
+# Threads that encode the pieces when tokenizers' own pool is off.
+_MAX_ENCODE_THREADS = 16
+_TOKENIZERS_PARALLELISM_OFF = ("", "off", "false", "f", "no", "n", "0")
 # ASCII letters only: Python and Oniguruma agree on them for \p{L}.
 _INTRA_CUT = re.compile(r"(?<=[A-Za-z])(?= [A-Za-z])|(?<=\n)(?=[A-Za-z])")
 
 _plans = weakref.WeakKeyDictionary()
+_encode_pool = None
+_encode_pool_pid = None
 _segment_encoders = weakref.WeakKeyDictionary()
-# None: not yet checked; False: encode_batch consumed only one CPU (rayon
-# disabled, e.g. after a fork). The PID prevents inheriting the parent's result.
+# None: not yet checked; False: encoding the pieces consumed only one CPU (no
+# spare CPU). The PID prevents inheriting the parent's result.
 _parallel_pid = os.getpid()
 _parallel_ok = None
 
@@ -134,9 +159,9 @@ def _intra_cut_safe(cfg):
     split, bl = subs
     model = cfg.get("model") or {}
     return (
-        cfg.get("normalizer") is None
+        cfg.get("normalizer") in _INTRA_SAFE_NORMALIZERS
         and split.get("type") == "Split"
-        and split.get("pattern") == {"Regex": _INTRA_SPLIT_REGEX}
+        and split.get("pattern") in [{"Regex": r} for r in _INTRA_SPLIT_REGEXES]
         and split.get("behavior") == "Isolated"
         and not split.get("invert")
         and bl.get("type") == "ByteLevel"
@@ -196,7 +221,10 @@ def _build_plan(tokenizer):
     # Without a normalizer that text is the original, so their ends are cut
     # points too; with one, only the first-pass (raw) tokens are used.
     npattern = _alternation(normed) if backend.normalizer is None else None
-    intra = _INTRA_CUT if _intra_cut_safe(cfg) else None
+    # Under a normalizer the second-pass tokens are no cut points (npattern is
+    # None), so an intra-gap cut could split one of them.
+    intra_ok = _intra_cut_safe(cfg) and not (normed and backend.normalizer is not None)
+    intra = _INTRA_CUT if intra_ok else None
     if pattern is None and npattern is None and intra is None:
         return None
     pp = backend.post_processor
@@ -256,6 +284,35 @@ def split_prompt(text, pattern, npattern, intra=None, max_chunks=_MAX_CHUNKS):
     return chunks
 
 
+def _rayon_disabled():
+    # tokenizers' own reading of the variable: unset means on. It also sets
+    # the variable to false in a child forked after the pool was used.
+    value = os.environ.get("TOKENIZERS_PARALLELISM")
+    return value is not None and value.lower() in _TOKENIZERS_PARALLELISM_OFF
+
+
+def _encode_chunks(backend, chunks):
+    """``backend.encode_batch(chunks)``: on tokenizers' pool when it may use it,
+    else one chunk per call from a thread pool."""
+    global _encode_pool, _encode_pool_pid
+    if len(chunks) < 2 or not _rayon_disabled():
+        return backend.encode_batch(chunks, add_special_tokens=False)
+    if _encode_pool is None or _encode_pool_pid != os.getpid():
+        from concurrent.futures import ThreadPoolExecutor
+
+        _encode_pool = ThreadPoolExecutor(
+            max_workers=min(_MAX_ENCODE_THREADS, os.cpu_count() or 1),
+            thread_name_prefix="sglang-prompt-encode",
+        )
+        _encode_pool_pid = os.getpid()
+    return list(
+        _encode_pool.map(
+            lambda chunk: backend.encode_batch([chunk], add_special_tokens=False)[0],
+            chunks,
+        )
+    )
+
+
 def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     """Drop-in for ``tokenizer.encode(text, **encode_kwargs)``."""
     global _parallel_ok, _parallel_pid
@@ -291,17 +348,17 @@ def parallel_prompt_encode(tokenizer, text, encode_kwargs=None):
     check = _parallel_ok is None
     if check:
         w0, c0 = time.perf_counter(), time.process_time()
-    encodings = backend.encode_batch(chunks, add_special_tokens=False)
+    encodings = _encode_chunks(backend, chunks)
     if check:
         wall, cpu = time.perf_counter() - w0, time.process_time() - c0
-        # Rayon worker CPU adds up well beyond wall time. Serial stays near 1.0;
-        # 1.5 leaves headroom for scheduler and measurement noise.
+        # Worker CPU (rayon or the thread pool) adds up well beyond wall time.
+        # Serial stays near 1.0; 1.5 leaves headroom for scheduler and
+        # measurement noise.
         _parallel_ok = not (wall > 0.005 and cpu < 1.5 * wall)
         if not _parallel_ok:
             logger.warning(
-                "parallel_prompt_encode: tokenizers encode_batch runs serially in "
-                "this process (TOKENIZERS_PARALLELISM off or process forked after "
-                "tokenizers used its pool); using the original encode."
+                "parallel_prompt_encode: encoding the pieces used only one CPU in "
+                "this process; using the original encode."
             )
     return list(chain.from_iterable(e.ids for e in encodings))
 
@@ -393,7 +450,7 @@ class _SegmentEncoder:
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        encodings = _encode_chunks(self.backend, chunks)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
             encoded[text] = tuple(
