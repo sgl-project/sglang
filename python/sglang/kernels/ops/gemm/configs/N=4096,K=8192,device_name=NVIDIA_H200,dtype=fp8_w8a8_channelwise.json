@@ -1,0 +1,66 @@
+{
+    "1": null,
+    "2": null,
+    "4": null,
+    "8": null,
+    "16": null,
+    "32": null,
+    "48": null,
+    "64": null,
+    "96": null,
+    "128": null,
+    "160": null,
+    "161": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "192": {
+        "BLOCK_SIZE_M": 64,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "193": null,
+    "248": null,
+    "249": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "256": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 64,
+        "BLOCK_SIZE_K": 256,
+        "num_warps": 4,
+        "num_stages": 4
+    },
+    "257": null,
+    "382": null,
+    "383": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 8,
+        "num_stages": 5
+    },
+    "384": {
+        "BLOCK_SIZE_M": 128,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "num_warps": 8,
+        "num_stages": 5
+    },
+    "385": null,
+    "512": null,
+    "768": null,
+    "1024": null,
+    "2048": null,
+    "4096": null,
+    "8192": null
+}
