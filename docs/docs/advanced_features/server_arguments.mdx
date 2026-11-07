@@ -2107,6 +2107,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>flashinfer</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mamba-prefill-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Mamba2 prefill backend. FlashInfer SSD requires FlashInfer 0.7.2 or newer, SM100, BF16 activations, head dimension 64, state dimension 128, and contiguous static state pools. Decode and verify use <code>--mamba-backend</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>triton</code>, <code>flashinfer</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--linear-attn-backend`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The default kernel backend for linear attention (GDN/KDA). Can be overridden per-mode by --linear-attn-decode-backend and --linear-attn-prefill-backend.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`triton`</td>
