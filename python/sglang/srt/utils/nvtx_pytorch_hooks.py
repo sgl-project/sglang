@@ -211,6 +211,8 @@ class PytHooks(object):
         Raises:
             None:
         """
+        if torch.compiler.is_compiling():
+            return
         nvtx.range_pop()
         return
 
@@ -229,6 +231,8 @@ class PytHooks(object):
         Raises:
             None
         """
+        if torch.compiler.is_compiling():
+            return
         marker_dict = {}
         module_name = self.module_to_name_map.get(module_obj, "unknown")
         marker_dict["Module"] = module_name
