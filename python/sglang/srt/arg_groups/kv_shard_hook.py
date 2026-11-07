@@ -22,7 +22,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of
-from sglang.srt.utils.common import get_device_memory_capacity
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
 

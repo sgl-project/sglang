@@ -1054,8 +1054,8 @@ def extend_attention_fwd(
     stride_lse_bs = lse_extend.stride(0) if STORE_LSE else 0
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
-    # Compact grid: AMD/HIP-only optimization (parity with flash-attn's ragged-aware
-    # launch). Explicitly check _is_hip and allow env var override.
+    # Compact grid: HIP only (parity with flash-attn's ragged-aware launch);
+    # SGLANG_TRITON_COMPACT_EXTEND_ATTENTION=0 turns it off.
     use_compact_tile_grid = (
         _is_hip and envs.SGLANG_TRITON_COMPACT_EXTEND_ATTENTION.get()
     )

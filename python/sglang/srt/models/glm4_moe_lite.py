@@ -70,6 +70,8 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,13 +85,7 @@ from sglang.srt.models.deepseek_common.deepseek_weight_loader import (
 from sglang.srt.models.deepseek_common.utils import _is_cuda, _use_aiter
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    BumpAllocator,
-    LazyValue,
-    add_prefix,
-    is_npu,
-    make_pp_layers,
-)
+from sglang.srt.utils import BumpAllocator, LazyValue, is_npu
 
 logger = logging.getLogger(__name__)
 _is_npu = is_npu()
