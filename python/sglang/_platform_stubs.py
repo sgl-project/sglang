@@ -10,7 +10,8 @@ just work. Triton is also stubbed because it is unavailable on macOS.
 from __future__ import annotations
 
 import functools
-import importlib
+import importlib.machinery
+import importlib.util
 import platform
 import sys
 import types
