@@ -18,16 +18,21 @@ async fn try_http_health_check(
     url: &str,
     timeout_secs: u64,
     client: &Client,
+    api_key: Option<&str>,
 ) -> Result<(), String> {
     let is_https = url.starts_with("https://");
     let protocol = if is_https { "https" } else { "http" };
     let clean_url = strip_protocol(url);
     let health_url = format!("{}://{}/health", protocol, clean_url);
 
-    client
+    let mut req = client
         .get(&health_url)
-        .timeout(Duration::from_secs(timeout_secs))
-        .send()
+        .timeout(Duration::from_secs(timeout_secs));
+    if let Some(key) = api_key {
+        req = req.bearer_auth(key);
+    }
+
+    req.send()
         .await
         .and_then(reqwest::Response::error_for_status)
         .map_err(|e| format!("Health check failed: {}", e))?;
@@ -110,7 +115,7 @@ impl StepExecutor<LocalWorkerWorkflowData> for DetectConnectionModeStep {
         let runtime_type = config.runtime.as_deref();
 
         let (http_result, grpc_result) = tokio::join!(
-            try_http_health_check(&url, timeout, client),
+            try_http_health_check(&url, timeout, client, config.api_key.as_deref()),
             try_grpc_health_check(&url, timeout, runtime_type)
         );
 
