@@ -344,7 +344,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # DSA sets use_mha=False inside piecewise/breakable graphs, so the MHA
         # companion never runs there and any prefix goes through sparse MLA.
-        return isinstance(self.model_runner.attn_backend, DeepseekSparseAttnBackend)
+        backend = self.model_runner.attn_backend
+        backend = getattr(backend, "full_attn_backend", backend)
+        return isinstance(backend, DeepseekSparseAttnBackend)
 
     def __init__(self, model_runner: ModelRunner):
         if get_schedule().enable_mixed_chunk:

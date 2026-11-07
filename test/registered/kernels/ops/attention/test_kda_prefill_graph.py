@@ -338,6 +338,60 @@ class TestKDAPrefillGraph(CustomTestCase):
         self.assertLessEqual(chunks, meta.max_chunks)
 
 
+class TestBreakableHipKDAPrefillGraph(TestKDAPrefillGraph):
+    """gfx950: the HIP extend runs as an eager break between captured segments."""
+
+    @classmethod
+    def setUpClass(cls):
+        from sglang.kernels.ops.attention.linear import kda_gfx950_prefill
+
+        if not kda_gfx950_prefill.available():
+            raise unittest.SkipTest("the HIP KDA prefill kernel requires gfx950")
+
+    def _capture(self, *, track=True, num_tokens=BUCKET, max_seqs=MAX_SEQS):
+        from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+            BreakableCUDAGraph,
+            BreakableCUDAGraphCapture,
+            enable_breakable_cuda_graph,
+        )
+        from sglang.srt.runtime_context import get_context
+
+        capture_batch = _batch([num_tokens], [0])
+        capture_batch.extend_num_tokens = num_tokens
+        capture_batch.positions = torch.arange(num_tokens, device="cuda")
+        self.backend.prefill_graph_max_seqs = max_seqs
+        with get_context().override_server_args(
+            disable_radix_cache=not track, mamba_radix_cache_strategy="extra_buffer"
+        ):
+            meta = self.backend.init_prefill_graph_metadata(capture_batch)
+        snapshot = (self.conv_pool.clone(), self.ssm_pool.clone())
+
+        def run():
+            return self.backend.forward_extend(
+                self.layer,
+                capture_batch,
+                self.mixed[:num_tokens],
+                self._gate(num_tokens),
+                self.b[:, :num_tokens],
+            )
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            run()
+        torch.cuda.current_stream().wait_stream(stream)
+        graph = BreakableCUDAGraph()
+        with (
+            enable_breakable_cuda_graph(),
+            BreakableCUDAGraphCapture(graph, stream=stream),
+        ):
+            out = run()
+        self.assertEqual(len(graph._break_fns), 1, "the HIP extend did not break")
+        self.conv_pool.copy_(snapshot[0])
+        self.ssm_pool.copy_(snapshot[1])
+        return meta, graph, out
+
+
 class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
     prefill_backend = LinearAttnKernelBackend.FLASHINFER
 
