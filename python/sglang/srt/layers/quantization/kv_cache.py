@@ -81,3 +81,45 @@ class BaseKVCacheMethod(QuantizeMethodBase):
         layer.v_scale.copy_(v_scale)
         layer.k_scale_float = k_scale
         layer.v_scale_float = v_scale
+
+
+class SharedKVCacheScaleMethod(BaseKVCacheMethod):
+    """KV-cache method of an attention layer whose KV cache later layers read.
+
+    KV-shared layers (Gemma 3n, Gemma 4) write no KV cache: they read the cache
+    of an earlier layer, the owner, which holds K/V divided by the owner's
+    k_scale/v_scale. The owner and its readers share this method. Processing
+    the owner gives the readers its processed scales, and processing a reader
+    does nothing, so the layers may be processed in any order.
+    """
+
+    def __init__(self, method: BaseKVCacheMethod, owner: torch.nn.Module):
+        super().__init__(method.quant_config)
+        self.method = method
+        self.owner = owner
+        self.readers: list = []
+
+    def process_weights_after_loading(self, layer) -> None:
+        if layer is not self.owner:
+            return
+        self.method.process_weights_after_loading(layer)
+        for reader in self.readers:
+            reader.k_scale.copy_(layer.k_scale)
+            reader.v_scale.copy_(layer.v_scale)
+            reader.k_scale_float = layer.k_scale_float
+            reader.v_scale_float = layer.v_scale_float
+
+
+def share_kv_cache_scales(owner: torch.nn.Module, reader: torch.nn.Module) -> None:
+    """Make `reader`, an attention layer that reads the KV cache of the
+    attention layer `owner`, use the owner's k/v scales after loading."""
+    if not isinstance(reader.quant_method, BaseKVCacheMethod):
+        return
+    method = owner.quant_method
+    if not isinstance(method, SharedKVCacheScaleMethod):
+        if not isinstance(method, BaseKVCacheMethod):
+            return
+        method = SharedKVCacheScaleMethod(method, owner)
+        owner.quant_method = method
+    method.readers.append(reader)
+    reader.quant_method = method

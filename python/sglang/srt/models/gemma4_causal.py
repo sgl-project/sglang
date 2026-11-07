@@ -57,6 +57,7 @@ from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.kv_cache import share_kv_cache_scales
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
@@ -962,6 +963,15 @@ class Gemma4TextModel(PreTrainedModel):
             prefix=add_prefix("layers", prefix),
             stage_facts=lambda idx: Gemma4DecoderLayer.stage_facts(config, idx),
         )
+        # KV-shared layers read the KV cache of an earlier layer, so they use
+        # that layer's KV-cache scales.
+        for layer in self.layers:
+            attn = getattr(layer, "self_attn", None)
+            if attn is None or attn.kv_shared_layer_index is None:
+                continue
+            owner = self.layers[attn.kv_shared_layer_index]
+            if not isinstance(owner, PPMissingLayer):
+                share_kv_cache_scales(owner.self_attn.attn, attn.attn)
 
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
