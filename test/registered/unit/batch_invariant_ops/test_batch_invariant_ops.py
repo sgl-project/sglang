@@ -274,6 +274,30 @@ class TestBatchInvariantOps(CustomTestCase):
                             )
                             self._assert_batch_invariant_results(difflist, dtype, name)
 
+    def test_fp32_matches_fp64_reference(self):
+        """fp32 mm and bmm must keep fp32 precision, not round operands to TF32."""
+        torch.manual_seed(0)
+        a = torch.randn(4, 96, 1536, dtype=torch.float32)
+        b = torch.randn(4, 1536, 160, dtype=torch.float32)
+        ref = (a.double() @ b.double()).float()
+        with set_batch_invariant_mode(True):
+            mm = torch.mm(a[0], b[0])
+            bmm = torch.bmm(a, b)
+        torch.testing.assert_close(mm, ref[0], rtol=0, atol=1e-2)
+        torch.testing.assert_close(bmm, ref, rtol=0, atol=1e-2)
+
+    def test_fp32_rope_angles_are_exact(self):
+        """Gemma 3 computes RoPE angles as inv_freq @ positions in fp32;
+        positions past 2048 must not be rounded to 11 significant bits."""
+        inv_freq = 1.0 / (10000 ** (torch.arange(0, 256, 2).float() / 256))
+        positions = torch.arange(8192).float()
+        expected = (inv_freq.double()[:, None] * positions.double()).float()
+        with set_batch_invariant_mode(True):
+            bmm = inv_freq[None, :, None] @ positions[None, None, :]
+            mm = inv_freq[:, None] @ positions[None, :]
+        torch.testing.assert_close(bmm[0], expected, rtol=0, atol=0)
+        torch.testing.assert_close(mm, expected, rtol=0, atol=0)
+
 
 if __name__ == "__main__":
     unittest.main()
