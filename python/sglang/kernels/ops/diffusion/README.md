@@ -75,6 +75,10 @@ and FP8/NVFP4 producers can belong to the selected model or deployment path.
 The request `quality` tier neither selects nor disables those independent
 choices.
 
+Sana image LN+modulation fusion is limited to CUDA-graph streams. SANA-Video
+also enables it for default-stream inference, retaining the same per-signature
+bit-exact verification and fallback.
+
 SANA-Video's depthwise convolution/GLU fusion reuses input rows and avoids
 materializing the convolution output. It is enabled for large (`numel >= 2**24`)
 channels-last BF16 inputs with cuDNN enabled on SM120, after an exact comparison with the existing
