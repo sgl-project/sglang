@@ -1,3 +1,5 @@
+import asyncio
+import gc
 import pickle
 import unittest
 from array import array
@@ -27,11 +29,13 @@ from sglang.srt.managers.io_struct import (
     BatchTokenIDOutput,
     BeamSearchOutput,
     ConfigureLoggingReq,
+    FreezeGCReq,
     RequestOutputStats,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiDetokenizerRouter,
     MultiHttpWorkerDetokenizerMixin,
+    MultiTokenizerRouter,
     _cached_output_fields,
     _handle_output_by_index,
     _handle_output_by_indices,
@@ -187,6 +191,57 @@ def _make_router(targets_by_rid=None) -> MultiDetokenizerRouter:
 
 
 class TestMultiTokenizerMixin(CustomTestCase):
+    def test_routers_freeze_locally_and_forward_freeze_request(self):
+        original_threshold = gc.get_threshold()
+        self.addCleanup(gc.set_threshold, *original_threshold)
+        for threshold in (None, [701, 11, 1001]):
+            with self.subTest(threshold=threshold):
+                message = FreezeGCReq(gc_threshold=threshold)
+                expected_threshold = tuple(threshold or original_threshold)
+
+                # Freeze the detokenizer router, then broadcast to every worker.
+                gc.set_threshold(*original_threshold)
+                detok_router = _make_router()
+                detok_router.recv_from_scheduler = object()
+                sent = []
+                detok_router._send = lambda target, obj: sent.append((target, obj))
+                with (
+                    patch.object(gc, "freeze") as detok_freeze,
+                    patch.object(
+                        multi_tokenizer_mixin,
+                        "sock_recv",
+                        side_effect=[message, EOFError("end of input")],
+                    ),
+                    self.assertRaisesRegex(EOFError, "end of input"),
+                ):
+                    detok_router.event_loop()
+                detok_freeze.assert_called_once_with()
+                self.assertEqual(gc.get_threshold(), expected_threshold)
+                self.assertEqual(
+                    sent, [(ipc, message) for ipc in detok_router.ipc_name_list]
+                )
+
+                # Reset the process-wide threshold so the tokenizer router
+                # cannot inherit the value set by the detokenizer test.
+                gc.set_threshold(*original_threshold)
+                token_router = MultiTokenizerRouter.__new__(MultiTokenizerRouter)
+                token_router.receive_from_worker = object()
+                token_router.send_to_scheduler = object()
+                with (
+                    patch.object(gc, "freeze") as token_freeze,
+                    patch.object(
+                        multi_tokenizer_mixin,
+                        "async_sock_recv",
+                        side_effect=[message, EOFError("end of input")],
+                    ),
+                    patch.object(multi_tokenizer_mixin, "async_sock_send") as send,
+                    self.assertRaisesRegex(EOFError, "end of input"),
+                ):
+                    asyncio.run(token_router.router_worker_obj())
+                token_freeze.assert_called_once_with()
+                self.assertEqual(gc.get_threshold(), expected_threshold)
+                send.assert_awaited_once_with(token_router.send_to_scheduler, message)
+
     def test_each_tokenizer_worker_freezes_locally(self):
         threshold = [700, 10, 1000]
         server_args = mock.Mock(gc_threshold=threshold)
