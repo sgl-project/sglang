@@ -60,6 +60,7 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_STATIC_SKIP_ELEMS,
     MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
+    mqa_logits_cap_by_host_memory,
     mqa_logits_free_mem_fraction,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
@@ -1615,7 +1616,11 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
         cached_budget = self._mqa_logits_budget_bytes.get(device_index)
         if cached_budget is not None:
-            return cached_budget
+            # Host memory on an integrated GPU keeps changing after the cached
+            # measurement, so that cap is re-read on every call.
+            return mqa_logits_cap_by_host_memory(
+                cached_budget, device_index=device_index
+            )
 
         # Graph capture cannot sync the host; use the static guard and do not
         # cache it, so the first eager prefill still measures the real budget.
