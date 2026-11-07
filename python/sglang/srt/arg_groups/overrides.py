@@ -527,11 +527,24 @@ def _dsa_kv_cache_dtype_default(view: Any) -> dict:
             f"got kv_cache_dtype={kv_cache_dtype}."
         )
     if kv_cache_dtype == "auto":
+        # gfx950 reports capability 9.x, but its triton/tilelang DSA kernels
+        # take fp8 KV and the gfx950-tuned sparse-MLA path requires it. The raw
+        # fp8 MLA layout is only read back on the aiter path (forward_mha.py).
+        hip_gfx95_fp8 = (
+            get_platform().is_hip
+            and is_gfx95_supported()
+            and envs.SGLANG_USE_AITER.get()
+            and view.dsa_prefill_backend in (None, "triton", "tilelang")
+            and view.dsa_decode_backend in (None, "triton", "tilelang")
+        )
         kv_cache_dtype = (
-            "fp8_e4m3" if major >= 10 and not has_attention_sinks else "bfloat16"
+            "fp8_e4m3"
+            if (major >= 10 or hip_gfx95_fp8) and not has_attention_sinks
+            else "bfloat16"
         )
         logger.warning(
-            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA on SM{major} device."
+            f"Setting KV cache dtype to {kv_cache_dtype} for DeepSeek DSA "
+            f"(device capability major {major})."
         )
     if kv_cache_dtype == "bf16":
         kv_cache_dtype = "bfloat16"
