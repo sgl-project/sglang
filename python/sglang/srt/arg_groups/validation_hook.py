@@ -6,15 +6,21 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
+from sglang.srt.arg_groups.arg_utils import (
+    _field_default,
+    _field_to_cli_name,
+    record_fields,
+)
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
-    resolved_view,
-    resolving_view,
+    declare_resolution,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -24,7 +30,6 @@ from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
 )
-from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -86,10 +91,10 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with diffusion LLM")
     if cfg.disaggregation_mode != "null":
         raise ValueError("--enable-watermark is not supported with PD disaggregation")
-    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3"}:
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3", "DSPARK"}:
         raise ValueError(
             "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
-            f"and EAGLE3, got {cfg.speculative_algorithm!r}"
+            f"EAGLE3, and DSPARK, got {cfg.speculative_algorithm!r}"
         )
     if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
         raise ValueError(
@@ -105,6 +110,106 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+# Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
+# honors only in part: the Rust server reads only what
+# `rust_server/config.py::_build_server_args` passes, and these act in the
+# Python frontend (with `--enable-trace`, its request spans; the scheduler's
+# own spans alone would be an incomplete trace).
+RUST_SERVER_UNSUPPORTED_ARGS = (
+    "ssl_keyfile",
+    "ssl_certfile",
+    "ssl_ca_certs",
+    "ssl_keyfile_password",
+    "enable_ssl_refresh",
+    "allowed_media_domains",
+    # The Rust media fetcher caps a download at this field's default, 64 MiB.
+    "media_url_max_file_size_mb",
+    "enable_cache_report",
+    "enable_trace",
+    "warmups",
+    "completion_template",
+    "hf_chat_template_name",
+    "enable_custom_logit_processor",
+    "enable_return_routed_experts",
+    "enable_lora",
+    "lora_paths",
+    "tokenizer_mode",
+    "tokenizer_backend",
+    # Python warns on long GCs only when this is positive.
+    "gc_warning_threshold_secs",
+    "tokenizer_metrics_allowed_custom_labels",
+    # The Rust listener speaks HTTP/1 only.
+    "enable_http2",
+    # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
+    # Python's changes the pad values of the items it serves. A model package
+    # whose Rust server caches honors it (`rust_server_unsupported_args`).
+    "mm_preprocess_cache_size_mb",
+    # The Rust server has no encoder dispatch.
+    "language_only",
+    # The Rust listener reports ready without waiting for weight updates.
+    "checkpoint_engine_wait_weights_before_ready",
+    "delete_ckpt_after_loading",
+    # Chat responses would lack the server-default sglext token ids.
+    "return_input_ids",
+    "return_output_ids",
+)
+
+
+def rust_server_unsupported_args(
+    server_args: Any, honored: Collection[str] = ()
+) -> List[str]:
+    """The CLI names of the ``RUST_SERVER_UNSUPPORTED_ARGS`` that are set,
+    except those a model package's Rust server ``honored`` itself.
+
+    An argument counts as set when it differs from its default; where the
+    default is off (``None``, ``False`` or empty), any falsy value is off too.
+    A threshold Python disables when not positive is set only when positive.
+    """
+    cfg = resolving_view(server_args)
+    defaults = {
+        field.name: _field_default(field) for field in record_fields(type(server_args))
+    }
+    offending = []
+    for name in RUST_SERVER_UNSUPPORTED_ARGS:
+        if name in honored:
+            continue
+        value, default = getattr(cfg, name), defaults[name]
+        if name == "gc_warning_threshold_secs":
+            is_set = value > 0
+        elif default is None or default is False or default == []:
+            is_set = bool(value)
+        else:
+            is_set = value != default
+        if is_set:
+            offending.append(_field_to_cli_name(name))
+    # The Rust chat route applies only each tool's own `strict`.
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
+        offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    return offending
+
+
+def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueError:
+    """The startup error refusing the ``offending`` settings in Rust-server
+    mode."""
+    many = len(offending) > 1
+    return ValueError(
+        "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+        f"{separator.join(offending)}: the Rust server would silently ignore "
+        f"{'these settings' if many else 'this setting'}. "
+        f"Remove {'them' if many else 'it'} or unset SGLANG_RUST_SERVER."
+    )
+
+
+def validate_rust_server_unsupported_args(server_args: Any) -> None:
+    """Refuse, in Rust-server mode, every argument the Rust server would ignore
+    (``rust_server_unsupported_args``)."""
+    if not envs.SGLANG_RUST_SERVER.get():
+        return
+    offending = rust_server_unsupported_args(server_args)
+    if offending:
+        raise rust_server_refusal(offending)
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -113,6 +218,10 @@ def validate_response_store(server_args: Any) -> None:
             "--disaggregation-mode=prefill or decode; response storage must "
             "remain disabled in PD mode."
         )
+
+
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
 
 
 def check_pipeline_parallel_compat(cfg: Any) -> None:
@@ -168,6 +277,21 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def check_rust_server_request_logging(cfg: Any) -> None:
+    """The Rust server logs requests as text to stdout only."""
+    if cfg.log_requests_format != "text":
+        raise ValueError(
+            f"--log-requests-format {cfg.log_requests_format} is not supported "
+            "with SGLANG_RUST_SERVER; it logs requests in the text format"
+        )
+    # `stdout` is the default target, matched as `create_log_targets` does.
+    if any(target.lower() != "stdout" for target in cfg.log_requests_target or ()):
+        raise ValueError(
+            f"--log-requests-target {' '.join(cfg.log_requests_target)} is not "
+            "supported with SGLANG_RUST_SERVER; it logs requests to stdout"
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -195,10 +319,29 @@ def check_server_args(server_args: Any):
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
 
+    if envs.SGLANG_RUST_SERVER.get() and cfg.log_requests:
+        check_rust_server_request_logging(cfg)
+
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
         "(--attn-dp-size) across nodes"
     )
+
+    # Rust-mode prefill registers per-listener bootstrap rows only under attention DP;
+    # plain DP replicas all register with the --port listener.
+    if (
+        envs.SGLANG_RUST_SERVER.get()
+        and cfg.disaggregation_mode == "prefill"
+        and cfg.dp_size > 1
+        and not attn_dp_enabled_of(cfg)
+    ):
+        raise ValueError(
+            f"SGLANG_RUST_SERVER prefill does not support --dp-size {cfg.dp_size} "
+            "replicas: every replica registers its KV bootstrap rows with the "
+            "--port listener, so the other replicas' listeners advertise "
+            "registries that never become ready. Launch one prefill server per "
+            "replica, or unset SGLANG_RUST_SERVER."
+        )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
@@ -243,31 +386,6 @@ def check_server_args(server_args: Any):
         assert cfg.chunked_prefill_size % cfg.page_size == 0, (
             "chunked_prefill_size must be divisible by page_size"
         )
-
-    # Check pdmux
-    if cfg.enable_pdmux:
-        assert cfg.pp_size == 1, (
-            "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-        )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
-        )
-        assert cfg.disaggregation_mode == "null", (
-            "PD-Multiplexing is not compatible with disaggregation mode."
-        )
-        assert cfg.disable_overlap_schedule, (
-            "PD-Multiplexing is not compatible with overlap schedule."
-        )
-
-        # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-        import torch
-
-        if torch_release >= (2, 7):
-            logger.warning(
-                "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                f"  Current torch version is {torch.__version__}.\n"
-                "  Please manually install torch 2.6.x."
-            )
 
     assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
@@ -325,6 +443,19 @@ def check_server_args(server_args: Any):
             "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
             f"got {cfg.device!r}."
         )
+
+    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK) use CUDA
+    # allocators, which XPU lacks; MUSA and Ascend NPU have their own paths.
+    if cfg.device == "xpu":
+        from sglang.srt.disaggregation.mooncake.utils import (
+            check_mooncake_custom_mem_pool_enabled,
+        )
+
+        if check_mooncake_custom_mem_pool_enabled()[0]:
+            raise ValueError(
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported on --device xpu; "
+                "unset it."
+            )
 
     # Check metrics labels
     if (
@@ -688,6 +819,68 @@ def validate_sampling_mask_max_tokens(server_args: Any):
             "--sampling-mask-max-tokens must be positive "
             f"(got {cfg.sampling_mask_max_tokens})."
         )
+
+
+_AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
+
+
+def handle_aux_hidden_state_capture(server_args: Any):
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    Must run before anything reads speculative_algorithm: with the flag, that
+    argument only names the capture convention and is reset to None here, so
+    the speculative stack stays off.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_return_aux_hidden_states:
+        if cfg.return_aux_hidden_state_layer_ids is not None:
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids requires "
+                "--enable-return-aux-hidden-states."
+            )
+        return
+    method = (cfg.speculative_algorithm or "").upper()
+    if method not in _AUX_HIDDEN_STATE_CAPTURE_METHODS:
+        raise ValueError(
+            "--enable-return-aux-hidden-states needs --speculative-algorithm "
+            "EAGLE3, DFLASH or DSPARK to name the capture convention, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "--enable-return-aux-hidden-states captures without a draft; drop "
+            "--speculative-draft-model-path."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--enable-return-aux-hidden-states only supports pp_size == 1: the "
+            "capture hooks only see the layers on the last pipeline rank."
+        )
+    layer_ids = cfg.return_aux_hidden_state_layer_ids
+    if method != "EAGLE3" and not layer_ids:
+        raise ValueError(
+            f"--enable-return-aux-hidden-states with {method} requires "
+            "--return-aux-hidden-state-layer-ids."
+        )
+    if layer_ids is not None:
+        if len(layer_ids) == 0:
+            raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+        if any(layer_id < 0 for layer_id in layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must be non-negative, got "
+                f"{list(layer_ids)}."
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+                f"{list(layer_ids)}."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_aux_hidden_state_capture",
+        speculative_algorithm=None,
+        aux_hidden_state_capture=method.lower(),
+    )
 
 
 def check_two_batch_overlap(server_args: Any):

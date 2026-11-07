@@ -21,9 +21,9 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     UpdatePendingBackupOnNodeSplit,
 )
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -38,17 +38,15 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
 
 
 class FullComponent(TreeComponent):
     component_type = ComponentType.FULL
 
-    def __init__(self, cache, params):
-        super().__init__(cache, params)
+    def __init__(self, cache, params, slot):
+        super().__init__(cache, params, slot)
         # HiCache state: set to host KV pool when HiCache enabled
         self._full_kv_pool_host = None
         # Lazy bind eviction strategy since tree core is initialized after component init.
@@ -227,7 +225,7 @@ class FullComponent(TreeComponent):
         if (
             lv is not None
             and lv.parent is not None
-            and lv.parent in self.tree_core.evictable_device_leaves
+            and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
             heapq.heappush(
                 self._evict_device_heap,
@@ -236,7 +234,7 @@ class FullComponent(TreeComponent):
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
             _, x = heapq.heappop(self._evict_device_heap)
-            if x not in self.tree_core.evictable_device_leaves:
+            if not self.tree_core._is_device_walk_candidate(x):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -480,9 +478,16 @@ class FullComponent(TreeComponent):
 
             xfer = transfers[0]
             device_indices = xfer.device_indices
+            loaded = [
+                self.tree_core.node_by_id(nid) for nid in xfer.nodes_to_load or []
+            ]
+            chain_len = sum(len(n.component_data[ct].host_value) for n in loaded)
+            assert len(device_indices) == chain_len, (
+                f"load-back filled {len(device_indices)} device slots for a chain "
+                f"of {chain_len} host tokens"
+            )
             offset = 0
-            for nid in xfer.nodes_to_load or []:
-                n = self.tree_core.node_by_id(nid)
+            for n in loaded:
                 cd = n.component_data[ct]
                 n_len = len(cd.host_value)
                 cd.value = device_indices[offset : offset + n_len].clone()
@@ -497,11 +502,6 @@ class FullComponent(TreeComponent):
                 self.tree_core._update_evictable_leaf_sets(n)
 
             self.tree_core._update_evictable_leaf_sets(node)
-
-    def _full_allocator(self):
-        """The allocator that owns the full-attention pool alone."""
-        allocator = self.cache.token_to_kv_pool_allocator
-        return allocator.full_attn_allocator if self.cache.is_swa_enabled else allocator
 
     def build_external_linker_transfer(
         self,
@@ -528,12 +528,12 @@ class FullComponent(TreeComponent):
             return PoolTransfer(name=PoolName.KV, keys=list(keys))
 
         if phase == LinkerTransferPhase.LOAD:
-            allocator = self._full_allocator()
+            storage, sub_pool = self.storage_and_sub_pool()
             num_tokens = len(keys) * self.cache.page_size
-            shortfall = max(0, num_tokens - allocator.available_size())
+            shortfall = max(0, num_tokens - storage.available_units(sub_pool))
             if shortfall:
                 self.cache.evict(EvictParams(num_tokens=shortfall))
-            slots = allocator.alloc(num_tokens)
+            slots = storage.take_units(sub_pool, num_tokens)
             if slots is None:
                 return None
 
@@ -552,7 +552,8 @@ class FullComponent(TreeComponent):
         prefix_len: int,
     ) -> Optional[PoolTransfer]:
         if phase == ExternalLinkerLoadPhase.ABORT:
-            self._full_allocator().free(transfer.device_indices)
+            storage, sub_pool = self.storage_and_sub_pool()
+            storage.release_taken(sub_pool, transfer.device_indices)
             return None
         return transfer
 
@@ -567,13 +568,10 @@ class FullComponent(TreeComponent):
             # Custom FULL components track buffer-write dependencies.
             pass
         elif isinstance(action, FreeComponentDeviceSlot):
-            alloc = self.cache.token_to_kv_pool_allocator
+            storage, sub_pool = self.storage_and_sub_pool()
             for indices in action.indices:
                 # tree values are page-aligned copies of a kv row: page-exact segments
-                if self.cache.is_swa_enabled:
-                    alloc.full_attn_allocator.free_segment(indices, start_pos=0)
-                else:
-                    alloc.free_segment(indices, start_pos=0)
+                storage.free_units(sub_pool, indices)
         else:
             raise AssertionError(
                 f"FullComponent: unhandled ComponentAction {type(action).__name__}"

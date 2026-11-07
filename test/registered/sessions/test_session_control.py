@@ -17,8 +17,8 @@ import aiohttp
 import requests
 from PIL import Image
 
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.utils import is_hip, kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=137, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=149, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=87, suite="extra-a-test-1-gpu-large-amd")
 
 

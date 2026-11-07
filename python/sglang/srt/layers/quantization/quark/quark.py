@@ -28,6 +28,7 @@ from sglang.srt.layers.quantization.quark.schemes import (
     QuarkW4A4MXFP4,
     QuarkW4A4MXFp4MoE,
     QuarkW4A8MXFp4MoE,
+    QuarkW4A16Int4,
     QuarkW8A8Fp8,
     QuarkW8A8FP8MoE,
 )
@@ -297,6 +298,10 @@ _SHARED_EXPERT_BODY_PROJ_SUFFIXES: tuple[str, ...] = (
     "up_proj",
     "gate_up_proj",
     "down_proj",
+)
+
+_NAMED_MOE_LAYER = re.compile(
+    r"((?:.+\.)?layers\.\d+)\.mlp\.(?:experts|shared_experts?)(?:\..+)?"
 )
 
 # Model types the online shared-expert MXFP4 conversion is offered on. Qwen3.5
@@ -827,6 +832,32 @@ class QuarkConfig(QuantizationConfig):
         is_per_tensor_activation = input_quant.get("qscheme") == "per_tensor"
         return is_per_tensor_activation
 
+    def _is_int4_w4a16(
+        self,
+        weight_quant: Optional[dict[str, Any]],
+        input_quant: Optional[dict[str, Any]],
+    ) -> bool:
+        # Weight-only int4 runs on ROCm only (Triton skinny GEMM); activations stay
+        # fp16/bf16.
+        if not is_hip() or weight_quant is None or input_quant is not None:
+            return False
+        if weight_quant.get("dtype") != "int4":
+            return False
+        if weight_quant.get("qscheme") != "per_group":
+            return False
+        if weight_quant.get("group_size") not in (32, 64, 128):
+            logger.debug(
+                "Quark INT4 W4A16 has unsupported group_size %s",
+                weight_quant.get("group_size"),
+            )
+            return False
+        if weight_quant.get("symmetric") is not True:
+            # asymmetric zero points are neither repacked for nor loaded through the fused
+            # GDN projection loader
+            logger.debug("Quark INT4 W4A16 supports symmetric weights only")
+            return False
+        return weight_quant.get("is_dynamic") is not True
+
     def _is_mx_fp4(
         self,
         weight_quant: Optional[dict[str, Any]],
@@ -1011,6 +1042,8 @@ class QuarkConfig(QuantizationConfig):
                 is_checkpoint_mxfp4_serialized=self.is_prequantized,
                 dequantization_config=self.dequantization_config,
             )
+        if self._is_int4_w4a16(weight_config, input_config):
+            return QuarkW4A16Int4(weight_config, input_config)
         if self._is_fp8_w8a8(weight_config, input_config):
             is_fp8_w8a8_supported = self._check_scheme_supported(
                 QuarkW8A8Fp8.get_min_capability(), error=False
@@ -1276,14 +1309,17 @@ class QuarkConfig(QuantizationConfig):
             else "shared_expert"
         )
 
-        # Compare routed vs shared specs at layer 0 and the draft block (stub module
-        # needed by _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
+        probe_bases = (
+            *_MOE_SHARED_EXPERT_QUANT_LAYER0_BASES,
+            *_MOE_SHARED_EXPERT_QUANT_DRAFT_BASES,
+            *self._named_moe_layers(layer_quant_config),
+        )
+
+        # Compare routed vs shared specs at each probe base (stub module needed by
+        # _find_matched_config; an unmatched name -> ValueError -> cannot fuse).
         lookup_stub = torch.nn.Module()
         try:
-            for base in (
-                _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES
-                + _MOE_SHARED_EXPERT_QUANT_DRAFT_BASES
-            ):
+            for base in probe_bases:
                 moe_name = f"{base}.mlp.experts"
                 moe_cfg = self._find_matched_config(moe_name, lookup_stub)
                 for suffix in _SHARED_EXPERT_BODY_PROJ_SUFFIXES:
@@ -1295,6 +1331,23 @@ class QuarkConfig(QuantizationConfig):
             return False
 
         return True
+
+    def _named_moe_layers(self, layer_quant_config: dict[str, Any]) -> list[str]:
+        """Target decoder layers whose routed or shared experts are named.
+
+        Layer 0 is a dense MLP in some architectures (DeepSeek-V3, MiniMax-M3),
+        where both of its lookups fall back to the global spec and agree whatever
+        the MoE layers hold. Each named layer can carry its own spec, so all of
+        them are probed. Draft-stack entries say nothing about the target.
+        """
+        return sorted(
+            {
+                match.group(1)
+                for name in layer_quant_config
+                if (match := _NAMED_MOE_LAYER.fullmatch(name))
+                and not self._is_draft_layer(name)
+            }
+        )
 
 
 class QuarkLinearMethod(LinearMethodBase):

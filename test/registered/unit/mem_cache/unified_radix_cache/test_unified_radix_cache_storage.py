@@ -19,7 +19,7 @@ from sglang.srt.disaggregation.kv_events import (
     StorageMedium,
 )
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -38,14 +38,14 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
+from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentHostSlot,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    CacheTransferPhase,
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import CacheTransferPhase
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import (
     UnifiedRadixCache,
@@ -90,6 +90,7 @@ from sglang.test.kits.unified_radix_cache.storage import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, tree_slots_of
 
 register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=28, suite="stage-b-test-1-gpu-small-amd")
@@ -219,7 +220,7 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(
             origin_input_ids=stored + array("q", range(100, 104)),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        pool.alloc([req])
+        acquire_rows(pool, pool.state, [req])
         first = match_kv_cache(req, cache, req.origin_input_ids, cow_mamba=False)
         self.assertEqual((first.device_prefix_len, first.host_hit_length), (0, 16))
         req.lock = cache.lock(first.last_device_node)
@@ -416,7 +417,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             req_to_token_pool=None,
             token_to_kv_pool_allocator=None,
             page_size=self.cfg.page_size,
-            tree_components=(ComponentType.FULL,),
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
             # Exclusive tiering is Python-core only; the env default resolves to rust
             # wherever the toolchain is present, so pin it instead of skipping there.
             tree_core_backend="python",
@@ -740,8 +741,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_in_progress(self):
-        """release_aborted_request while a prefetch IO is still in progress; the IO
+    def test_abandon_attempt_l3_prefetch_io_in_progress(self):
+        """_abandon_attempt while a prefetch IO is still in progress; the IO
         thread owns the buffers until it finishes."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
@@ -857,8 +858,8 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         lambda cfg: cfg.has_swa and not cfg.has_mamba,
         "SWA-only fixture required to exercise extra pool",
     )
-    def test_release_aborted_request_l3_prefetch_io_done(self):
-        """release_aborted_request after the prefetch IO completed releases the
+    def test_abandon_attempt_l3_prefetch_io_done(self):
+        """_abandon_attempt after the prefetch IO completed releases the
         buffers."""
 
         # SWA prefetch is all-or-nothing over one full sliding window: size the
@@ -1387,7 +1388,9 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         # Component buffer-mode hooks are Python-core only.
         cache, allocator, req_to_token_pool = build_fixture(
             self.cfg,
-            component_registry_override={ComponentType.FULL: ExtraPoolFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
             tree_core_backend="python",
         )
         self._init_buffer_hicache(cache, storage_dir)
@@ -1514,6 +1517,95 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
         cache.request_buffer_backup(leaf)
         self.assertNotIn(leaf, pipeline.inflight_backup_node_ids)
         cache.sanity_check()
+
+    @requires_hicache
+    def test_buffer_only_split_pool_sidecar_storage_roundtrip(self):
+        """A sidecar of a pool staged in several transfers copies and
+        persists every transfer's pages, not only the first one's."""
+        storage_dir = self._make_storage_dir()
+        # Component buffer-mode hooks are Python-core only.
+        cache, allocator, req_pool = build_fixture(
+            self.cfg,
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: ExtraPoolFullComponent
+            },
+            tree_core_backend="python",
+        )
+        self._init_buffer_hicache(cache, storage_dir)
+        controller = cache.cache_controller
+        source = controller.mem_pool_host.entry_map[ExtraPoolFullComponent.EXTRA_POOL]
+        sidecar_host = MHATokenToKVPoolHost(
+            buffer_info=source.device_pool.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=source.host_pool.size / source.device_pool.size,
+            host_size=0,
+            page_size=self.cfg.page_size,
+            layout=source.host_pool.layout,
+            device_capacity_tokens=source.device_pool.size,
+            start_layer=source.device_pool.start_layer,
+            end_layer=source.device_pool.end_layer,
+        )
+        controller.register_host_pool_entry(
+            PoolEntry(
+                name=PoolName.DRAFT_SWA,
+                host_pool=sidecar_host,
+                device_pool=source.device_pool,
+                layer_mapper=source.layer_mapper,
+            )
+        )
+        cache.sidecar_pool_specs.append(
+            SidecarPoolSpec(PoolName.DRAFT_SWA, ExtraPoolFullComponent.EXTRA_POOL)
+        )
+        sidecar_host.kv_buffer.fill_(-1000)
+        tokens = self._make_seq(1, 8)
+        self._insert(cache, allocator, req_pool, tokens)
+        leaf = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        ).last_device_node
+        # SWA may split the leaf at the window boundary; check a node whose
+        # pool is staged in two transfers.
+        node = next(
+            n
+            for n in self._path_chain(cache, leaf)
+            if len(cache.tree_core.get_hash_values(n)) >= 2
+        )
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.FULL, node, CacheTransferPhase.BACKUP_HOST
+        )
+        self.assertEqual(len(transfers), 2)
+        for segment, transfer in enumerate(transfers):
+            for layer in range(source.device_pool.layer_num):
+                source.device_pool.k_buffer[layer][transfer.device_indices] = (
+                    segment + 7
+                )
+                source.device_pool.v_buffer[layer][transfer.device_indices] = (
+                    segment + 17
+                )
+        torch.cuda.synchronize()
+        self._buffer_backup_and_wait(cache, leaf)
+
+        keys = list(cache.tree_core.get_hash_values(node))
+        indices = source.host_pool.alloc(len(keys) * self.cfg.page_size)
+        self.assertIsNotNone(indices)
+        try:
+            source.host_pool.kv_buffer.zero_()
+            sidecar_host.kv_buffer.zero_()
+            reads = [
+                PoolTransfer(name=name, keys=keys, host_indices=indices)
+                for name in (ExtraPoolFullComponent.EXTRA_POOL, PoolName.DRAFT_SWA)
+            ]
+            results = controller.storage_backend.batch_get_v2(reads)
+            self.assertTrue(all(results[ExtraPoolFullComponent.EXTRA_POOL]))
+            self.assertTrue(all(results[PoolName.DRAFT_SWA]))
+            for index in indices[:: self.cfg.page_size].tolist():
+                self.assertTrue(
+                    torch.equal(
+                        source.host_pool.get_data_page(index),
+                        sidecar_host.get_data_page(index),
+                    ),
+                    "Every persisted sidecar page must contain its source's GPU data",
+                )
+        finally:
+            source.host_pool.free(indices)
 
     @requires_hicache
     def test_buffer_only_read_path_roundtrip(self):
@@ -1992,7 +2084,7 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
             rid=req_id.rid,
             cache_request_handle=req_id,
             prefix_len=cons.tree_core.empty_match_result.device_prefix_len,
-            kv=SimpleNamespace(cache_protected_len=0),
+            kv=ReqKvInfo(cache_protected_len=0),
         )
         self.assertTrue(cons.buffer_pipeline.prepare_staged_prefetch(req))
         surfaced_swa_hit = req.swa_host_hit_length
@@ -2790,6 +2882,81 @@ class TestUnifiedTreeCoreSWAPrefetchBackends(UnifiedRadixCacheFixtures, CustomTe
 
 class TestPrefetchCommitOrdering(CustomTestCase):
     """The prefetch commit's action ordering (mock-based)."""
+
+    def test_hybrid_prefetch_rejects_partial_host_allocation(self):
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
+            HybridCacheController,
+        )
+
+        for component, pool in (
+            (ComponentType.SWA, PoolName.SWA),
+            (ComponentType.MAMBA, PoolName.MAMBA),
+        ):
+            with self.subTest(component=component):
+                cache = mock.MagicMock()
+                cache.host_memory_mode = "cache"
+                cache.page_size = 4
+                cache.prefetch_threshold = 4
+                cc = cache.cache_controller
+                cc.page_size = cache.page_size
+                cc.mem_pool_host.anchor_entry.host_pool = object()
+                cc.mem_pool_host.available_size.return_value = 4
+                cc.prefetch_hit_queue = Queue()
+                cc.prefetch_buffer = Queue()
+                cc.allocate_storage_hit = (
+                    HybridCacheController.allocate_storage_hit.__get__(cc)
+                )
+
+                # A full hit cannot fit, but a page-sized partial allocation can.
+                def allocate_host_buffers(operation, num_tokens):
+                    return list(range(num_tokens)) if num_tokens <= 4 else None
+
+                cc.alloc_prefetch_host_buffers.side_effect = allocate_host_buffers
+                operation = mock.Mock()
+                operation.handle = CacheRequestHandle("hybrid-capacity", 0)
+                operation.storage_start = 4
+                operation.storage_hit_count = 8
+                operation.hash_value = ["h1", "h2"]
+                operation.host_indices = None
+                operation.is_terminated.return_value = False
+                cache.ongoing_prefetch = {
+                    operation.handle: _OngoingPrefetch(
+                        anchor_node_id=0,
+                        prefetch_key=RadixKey(array("q", range(8))),
+                        host_indices=None,
+                        operation=operation,
+                        anchor_lock_params=None,
+                        comp_xfers={component: [PoolTransfer(name=pool)]},
+                    )
+                }
+                cc.prefetch_hit_queue.put(operation)
+
+                UnifiedRadixCache._drain_storage_control_queues_impl(
+                    cache,
+                    n_storage_hit=1,
+                    n_ack_prefetch=0,
+                    n_backup=0,
+                    n_release=0,
+                    extra_release_counts=None,
+                    log_metrics=False,
+                )
+
+                self.assertEqual(
+                    cc.alloc_prefetch_host_buffers.call_args_list,
+                    [mock.call(operation, 8), mock.call(operation, 8)],
+                )
+                self.assertTrue(cc.prefetch_buffer.empty())
+                self.assertIsNone(operation.host_indices)
+                self.assertEqual(operation.storage_hit_count, 8)
+                self.assertEqual(operation.hash_value, ["h1", "h2"])
+                cache._alloc_prefetch_aux_staging.assert_not_called()
+                cache._finish_storage_prefetch.assert_called_once_with(
+                    operation.handle, fulfilled_tokens=0, reason="host_capacity"
+                )
+                cache.revoke_pending_prefetch.assert_called_once_with(operation.handle)
+                cache.storage_prefetch_retries.poll_miss.assert_called_once_with(
+                    operation.handle.rid, 12
+                )
 
     def test_prefetch_commit_applies_host_insert_actions_before_transfers(self):
         """The prefetch commit applies the host-insert walk's actions before
