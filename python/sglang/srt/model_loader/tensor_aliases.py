@@ -82,7 +82,8 @@ class TensorAlias:
     # follow a target whose shape changed but whose elements did not.
     whole: bool
     # Other tensors over exactly the same bytes, when nothing shows which one
-    # the alias was made from.
+    # the alias was made from. One as small as the target over other bytes
+    # makes the choice a ``problem`` instead.
     alternates: Tuple[str, ...]
     # Why the alias cannot be rebuilt, if it cannot.
     problem: Optional[str]
@@ -195,7 +196,9 @@ def _make_alias(
 def _choose_target(tensor, first_name, by_storage):
     """The registered tensor that ``tensor`` aliases: itself if it is one,
     else the one it is a view of, else the smallest one whose bytes contain
-    its bytes. Returns (name, target, alternates, problem), or None."""
+    its bytes. Others as small over the same bytes are alternates; if one
+    covers other bytes, the choice is a problem. Returns (name, target,
+    alternates, problem), or None."""
     if id(tensor) in first_name:
         return first_name[id(tensor)], tensor, (), None
     if _storage_key(tensor) is None:
@@ -220,6 +223,14 @@ def _choose_target(tensor, first_name, by_storage):
     smallest = min(span(t) for _, t in containing)
     same = [(n, t) for n, t in containing if span(t) == smallest]
     (name, target), others = same[0], same[1:]
+    if any(_byte_span(t) != _byte_span(target) for _, t in others):
+        # Following one or the other could give different bytes.
+        names = ", ".join(n for n, _ in others)
+        problem = (
+            f"it could have been made from {name} or {names}, which do not "
+            "cover the same bytes"
+        )
+        return name, target, (), problem
     return name, target, tuple(n for n, _ in others), None
 
 
@@ -438,7 +449,7 @@ def _rebase_one(
     elif any(_moved_apart(registered.get(n), target) for n in alias.alternates):
         return 0, (
             f"{alias.where}: it could have been made from {alias.target} or "
-            f"{', '.join(alias.alternates)}, which no longer share memory"
+            f"{', '.join(alias.alternates)}, which no longer cover the same bytes"
         )
     elif target.is_meta:
         return 0, f"{alias.where}: {alias.target} is still on the meta device"

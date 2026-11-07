@@ -414,6 +414,48 @@ class TestRebaseTensorAliases(unittest.TestCase):
         self.assertEqual(rebuilt, 0)
         self.assertIn("view: it could have been made from", problems[0])
 
+    def test_a_view_follows_tensors_over_the_same_bytes_replaced_together(self):
+        model = nn.Module()
+        model.weight = nn.Parameter(torch.arange(8.0))
+        model.right = nn.Parameter(model.weight.data)
+        model.view = model.right.detach()[:4]
+        aliases = find_tensor_aliases(model)
+        new = torch.full((8,), 2.0)
+        replace(model, "weight", new)
+        replace(model, "right", new)
+
+        self.assertEqual([a.alternates for a in aliases], [("right",)])
+        self.assertEqual(rebase_tensor_aliases(model, aliases), (1, []))
+        torch.testing.assert_close(model.view, torch.full((4,), 2.0))
+
+    def test_a_choice_between_tensors_over_different_bytes_is_reported(self):
+        # [0, 16) and [4, 20) both hold [8, 12), and nothing shows which one
+        # the view was made from. It is reported however they were replaced:
+        # on one tensor that replaced both, it would be element 2 or 1.
+        new = torch.arange(5.0) + 10
+        for case, new_right in (("as before", new[1:]), ("same bytes", new[:4])):
+            with self.subTest(case=case):
+                model = nn.Module()
+                storage = torch.arange(5.0)
+                model.left = nn.Parameter(storage[:4])
+                model.right = nn.Parameter(storage[1:])
+                model.view = storage[2:3]
+                aliases = find_tensor_aliases(model)
+                replace(model, "left", new[:4])
+                replace(model, "right", new_right)
+
+                rebuilt, problems = rebase_tensor_aliases(model, aliases)
+
+                self.assertEqual([a.alternates for a in aliases], [()])
+                self.assertEqual(rebuilt, 0)
+                self.assertEqual(
+                    problems,
+                    [
+                        "view: it could have been made from left or right, "
+                        "which do not cover the same bytes"
+                    ],
+                )
+
     def test_a_dtype_view_aligned_in_its_storage_is_rebuilt(self):
         model = nn.Module()
         base = torch.arange(16, dtype=torch.uint8)
