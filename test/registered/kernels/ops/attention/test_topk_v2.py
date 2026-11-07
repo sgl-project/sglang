@@ -25,6 +25,10 @@ page tables.
 
 ``test_topk_v2_packed_rows`` covers the DSA extend layout on top of that: all
 requests packed into one score buffer, sharing a table row per request.
+``test_topk_v2_packed_exact`` pins that layout to the exact top-k contract
+(ties at the k-th score interchangeable), and
+``test_topk_v2_packed_dsa_dispatch`` checks that the DSA PAGED extend dispatch
+reaches it and agrees with the legacy kernel.
 """
 
 from __future__ import annotations
@@ -836,6 +840,223 @@ def test_topk_v2_packed_level_boundary(boundary: int, residue: int) -> None:
             continue
         ref = torch.topk(window, k, sorted=False).indices.tolist()
         _assert_topk_close(window.unsqueeze(0), [ref], [our], 1, [L], k)
+
+
+# (prefix_len, extend_len) per request, packed in this order. Row r of request i
+# sees prefix_len + j + 1 keys (j = its position in the extend), as in DSA extend.
+PACKED_EXACT_REQUESTS = [
+    (0, 301),  # every row shorter than k: trivial path, -1 padding
+    (1900, 300),  # rows cross k = 2048 inside one request
+    (5003, 9),  # register<2>
+    (8185, 12),  # crosses the 8192 register<2>/<4> boundary
+    (16380, 7),  # crosses the 16384 register<4>/streaming boundary
+    (40001, 5),  # streaming
+]
+
+
+def _packed_exact_case(dist, lead, device):
+    """Scores, row metadata and a scattered page table for PACKED_EXACT_REQUESTS.
+
+    Request windows sit back to back from column ``lead``, so most row starts
+    are off the 16-byte boundary; columns outside every window hold
+    OUTSIDE_SCORE, which a read outside the window would select. Each request
+    gets a random, disjoint set of physical pages.
+    """
+    kv_lens = [p + e for p, e in PACKED_EXACT_REQUESTS]
+    k_offsets, col = [], lead
+    for kv in kv_lens:
+        k_offsets.append(col)
+        col += kv
+    width = (col + 3) & ~3
+    starts, lengths, row_to_batch = [], [], []
+    for i, (prefix, extend) in enumerate(PACKED_EXACT_REQUESTS):
+        for j in range(extend):
+            starts.append(k_offsets[i])
+            lengths.append(prefix + j + 1)
+            row_to_batch.append(i)
+    rows = len(lengths)
+    scores = torch.full((rows, width), OUTSIDE_SCORE, dtype=torch.float32)
+    for r in range(rows):
+        n = lengths[r]
+        if dist == "randn":
+            vals = torch.randn(n)
+        elif dist == "ties":  # 64 distinct values: hundreds tie at the k-th score
+            vals = torch.randint(-32, 32, (n,)).float()
+        else:  # "bf16": randn rounded to bf16, scattered duplicates
+            vals = torch.randn(n).bfloat16().float()
+        scores[r, starts[r] : starts[r] + n] = vals
+
+    pages = [(kv + PAGE_SIZE - 1) // PAGE_SIZE for kv in kv_lens]
+    num_phys = sum(pages) + 97  # a few pages owned by no request
+    perm = torch.randperm(num_phys)[: sum(pages)].to(torch.int32)
+    page_table = torch.zeros((len(kv_lens), max(pages)), dtype=torch.int32)
+    # physical page -> (owning request, logical page); -1 for unowned pages
+    owner = torch.full((2, num_phys), -1, dtype=torch.int64)
+    used = 0
+    for i, n in enumerate(pages):
+        page_table[i, :n] = perm[used : used + n]
+        owner[0, perm[used : used + n].long()] = i
+        owner[1, perm[used : used + n].long()] = torch.arange(n)
+        used += n
+    as_i32 = lambda xs: torch.tensor(xs, dtype=torch.int32, device=device)
+    return (
+        scores.to(device),
+        as_i32(starts),
+        as_i32(lengths),
+        as_i32(row_to_batch),
+        page_table.to(device),
+        owner,
+    )
+
+
+def _check_packed_exact(scores_cpu, starts, lengths, row_to_batch, out, owner, k):
+    """Exact top-k: min(k, L) distinct in-window positions of the row's own
+    request whose values are the k largest; ties at the k-th score may differ
+    from torch.topk. Short rows list every position and pad with -1."""
+    out = out.cpu().long()
+    starts, lengths, req = starts.cpu(), lengths.cpu().long(), row_to_batch.cpu()
+    n = lengths.clamp(max=k)
+    valid = torch.arange(k)[None, :] < n[:, None]
+    assert (out[~valid] == -1).all(), "bad -1 padding"
+    assert (out[valid] >= 0).all(), "missing slot"
+    slots = out.clamp(min=0)
+    page = slots >> PAGE_BITS
+    assert (page < owner.shape[1]).all(), "slot beyond the page pool"
+    page_req, page_lp = owner[0][page], owner[1][page]
+    pos = (page_lp << PAGE_BITS) | (slots & PAGE_MASK)
+    assert (page_req == req[:, None].long())[valid].all(), "slot of another request"
+    assert ((pos >= 0) & (pos < lengths[:, None]))[valid].all(), "slot out of window"
+    for r in range(out.shape[0]):
+        nr, L, st = int(n[r]), int(lengths[r]), int(starts[r])
+        p = pos[r, :nr]
+        assert p.unique().numel() == nr, f"row {r} (L={L}): duplicate positions"
+        if nr < L:
+            window = scores_cpu[r, st : st + L]
+            assert torch.equal(
+                window[p].sort().values, window.topk(nr).values.sort().values
+            ), f"row {r} (L={L}): selected values are not the top-{nr}"
+
+
+@pytest.mark.parametrize("k", [512, 2048])
+@pytest.mark.parametrize("lead", [0, 4097])
+@pytest.mark.parametrize("dist", ["randn", "ties", "bf16"])
+@pytest.mark.parametrize("chunks", [1, 3])
+@torch.inference_mode()
+def test_topk_v2_packed_exact(dist: str, lead: int, k: int, chunks: int) -> None:
+    """Packed DSA extend top-k is exact against torch.topk.
+
+    Random scattered page tables, unaligned row starts, coarse ties and bf16
+    duplicates, rows shorter than k and rows on every implementation band.
+    ``chunks > 1`` runs the indexer's row-chunk loop: consecutive row slices of
+    the score buffer with the matching slice of ``row_to_batch``.
+    """
+    torch.manual_seed(len(dist) * 100003 + lead * 7 + k + chunks)
+    device = "cuda"
+    scores, starts, lengths, row_to_batch, page_table, owner = _packed_exact_case(
+        dist, lead, device
+    )
+    scores_cpu = scores.cpu()  # the kernel masks the window heads in place
+    rows = scores.shape[0]
+    out = torch.full((rows, k), -2, dtype=torch.int32, device=device)
+    bounds = [rows * c // chunks for c in range(chunks + 1)]
+    for lo, hi in zip(bounds[:-1], bounds[1:]):
+        topk_transform_packed_v2(
+            scores[lo:hi],
+            lengths[lo:hi],
+            page_table,
+            out[lo:hi],
+            PAGE_SIZE,
+            row_starts=starts[lo:hi],
+            row_to_batch=row_to_batch[lo:hi],
+        )
+    torch.cuda.synchronize()
+    _check_packed_exact(scores_cpu, starts, lengths, row_to_batch, out, owner, k)
+
+
+@pytest.mark.skipif(is_hip(), reason="compares against the CUDA legacy sgl_kernel")
+@pytest.mark.parametrize("chunked", [False, True])
+@torch.inference_mode()
+def test_topk_v2_packed_dsa_dispatch(chunked: bool) -> None:
+    """DSA PAGED extend (trtllm prefill, FP8 KV) reaches the packed kernel.
+
+    Calls DSATopKBackend.topk_transform the way DSAIndexer._get_topk_ragged
+    does: whole forward (row map from ``token_to_batch_idx``) or one row chunk
+    (row map passed as ``batch_idx_list``). ``page_table_1`` is absent, so a
+    fall-through to the legacy kernel would fail. The result must be the slots
+    the legacy kernel selects through the page_size=1 table.
+    """
+    from types import SimpleNamespace
+    from unittest.mock import patch
+
+    from sgl_kernel import fast_topk_transform_fused
+
+    import sglang.kernels.ops.attention.dsv4.topk as topk_ops
+    from sglang.srt.layers.attention.dsa.dsa_topk_backend import (
+        DSATopKBackend,
+        TopkTransformMethod,
+    )
+
+    torch.manual_seed(1234 + chunked)
+    device = "cuda"
+    k = 2048
+    scores, starts, lengths, row_to_batch, page_table, _ = _packed_exact_case(
+        "randn", 0, device
+    )
+    rows = scores.shape[0]
+    lo, hi = (rows // 3, rows) if chunked else (0, rows)
+    # page_size=1 view of the same table, for the legacy reference
+    cols = page_table.shape[1] * PAGE_SIZE
+    page_table_1 = (
+        page_table.repeat_interleave(PAGE_SIZE, dim=1) * PAGE_SIZE
+        + torch.arange(cols, device=device, dtype=torch.int32) % PAGE_SIZE
+    )
+    cu_q = torch.zeros(page_table.shape[0] + 1, dtype=torch.int32, device=device)
+    cu_q[1:] = torch.bincount(row_to_batch.long(), minlength=cu_q.shape[0] - 1).cumsum(
+        0
+    )
+    if chunked:  # the indexer's chunk loop: one row per "sequence"
+        legacy = fast_topk_transform_fused(
+            scores[lo:hi].clone(),
+            lengths[lo:hi],
+            page_table_1[row_to_batch[lo:hi].long()],
+            # DSAIndexerMetadata.topk_transform turns the chunk's per-row ones
+            # into cumulative offsets
+            torch.arange(hi - lo + 1, dtype=torch.int32, device=device),
+            k,
+            row_starts=starts[lo:hi],
+        )
+    else:
+        legacy = fast_topk_transform_fused(
+            scores.clone(), lengths, page_table_1, cu_q, k, row_starts=starts
+        )
+
+    attn_metadata = SimpleNamespace(
+        real_page_table=page_table,
+        page_size=PAGE_SIZE,
+        token_to_batch_idx=row_to_batch,
+        page_table_1=None,
+    )
+    with patch.object(
+        topk_ops,
+        "topk_transform_packed_v2",
+        wraps=topk_ops.topk_transform_packed_v2,
+    ) as packed:
+        out = DSATopKBackend.SGL_KERNEL.topk_transform(
+            scores[lo:hi],
+            lengths[lo:hi],
+            k,
+            TopkTransformMethod.PAGED,
+            attn_metadata,
+            cu_seqlens_q_topk=None if chunked else cu_q,
+            row_starts=starts[lo:hi],
+            batch_idx_list=row_to_batch[lo:hi] if chunked else None,
+            packed_extend_topk=True,
+        )
+    packed.assert_called_once()
+    torch.cuda.synchronize()
+    assert torch.equal(
+        out.sort(dim=-1).values.cpu(), legacy.sort(dim=-1).values.cpu()
+    ), "packed and legacy PAGED top-k disagree"
 
 
 @pytest.mark.skipif(is_hip(), reason="ROCm split path keeps its own tie merge")

@@ -149,7 +149,7 @@ class DSATopKBackend(Enum):
                 logits, lengths, topk, topk_indices_offset, row_starts
             )
 
-        # Packed PAGED extend (DSA prefill on ROCm and Kimi-K3.1): exact, where the
+        # Packed PAGED extend (DSA prefill on CUDA and ROCm): exact, where the
         # legacy fused transform truncates the threshold bin. Unsupported shapes
         # fall back, not raise.
         # The row -> request map is `token_to_batch_idx` for a whole-forward call

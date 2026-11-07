@@ -19,7 +19,6 @@ from sglang.srt.configs.model_config import (
     dsa_draft_shards_under_dcp,
     get_dsa_index_topk,
     is_deepseek_dsa,
-    is_kimi_k31,
 )
 from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.runtime_context import (
@@ -630,7 +629,9 @@ class DeepseekSparseAttnBackend(
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
-        self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
+        # Exact packed PAGED extend top-k (see DSATopKBackend.topk_transform);
+        # XPU has no packed op.
+        self.dsa_packed_extend_topk = not _is_xpu
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
         self.dsa_shards_index_k = dsa_shards_index_k()
