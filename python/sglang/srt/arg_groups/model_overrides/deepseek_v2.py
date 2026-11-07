@@ -15,6 +15,14 @@ from sglang.srt.runtime_context import get_platform
 logger = logging.getLogger(__name__)
 
 
+def _deterministic_inference_requested(cfg: Any) -> bool:
+    # rl_on_policy_target turns deterministic inference on later, in
+    # handle_deterministic_inference, so check both.
+    return bool(cfg.enable_deterministic_inference) or (
+        cfg.rl_on_policy_target is not None
+    )
+
+
 def _dsa_dcp_overrides(cfg: Any) -> dict:
     if cfg.dcp_size <= 1:
         return {}
@@ -187,6 +195,10 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                 cfg.attention_backend is None
                 and cfg.prefill_attention_backend is None
                 and cfg.decode_attention_backend is None
+                # trtllm_mla is not batch invariant. Leave the backend unset so
+                # that the deterministic pass picks one instead of rejecting
+                # this default as a user choice.
+                and not _deterministic_inference_requested(cfg)
             ):
                 overrides["attention_backend"] = "trtllm_mla"
                 logger.info(

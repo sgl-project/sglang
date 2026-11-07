@@ -1127,8 +1127,24 @@ def _deterministic_sampling_backend(view: Any) -> dict:
     return {}
 
 
+# Absorbed-MLA architectures for deterministic backend selection. Includes
+# every DeepSeek-family arch: on SM100 they would otherwise default to
+# trtllm_mla, and the generic deterministic fallback (flashinfer) plans MLA
+# split-KV per batch, so it is not batch invariant for them.
+_DETERMINISTIC_ABSORBED_MLA_ARCHS = _DEEPSEEK_FAMILY_ARCHS | frozenset(
+    {
+        "DeepseekV2ForCausalLM",
+        "Glm4MoeLiteForCausalLM",
+    }
+)
+
+
 def _deterministic_is_deepseek_model(view: Any) -> bool:
-    """Check the model architecture for deterministic DeepSeek backend selection."""
+    """Check the model architecture for deterministic DeepSeek backend selection.
+
+    Shared by _deterministic_attention_backend (default fill) and
+    handle_deterministic_inference (validation) so that both agree.
+    """
     from sglang.srt.connector import ConnectorType
     from sglang.srt.utils.common import parse_connector_type
 
@@ -1136,16 +1152,7 @@ def _deterministic_is_deepseek_model(view: Any) -> bool:
         return False
     try:
         hf_config = model_config_of(view).hf_config
-        return hf_config.architectures[0] in [
-            "DeepseekV2ForCausalLM",
-            "DeepseekV3ForCausalLM",
-            "DeepseekV32ForCausalLM",
-            "MistralLarge3ForCausalLM",
-            "PixtralForConditionalGeneration",
-            "GlmMoeDsaForCausalLM",
-            "Glm4MoeLiteForCausalLM",
-            "Xing4_0ForCausalLM",
-        ]
+        return hf_config.architectures[0] in _DETERMINISTIC_ABSORBED_MLA_ARCHS
     except Exception:
         return False
 

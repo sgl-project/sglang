@@ -2200,6 +2200,75 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 else:
                     self.assertEqual(_deterministic_rocm_rccl_check(view), {})
 
+    def test_deterministic_deepseek_v3_on_sm100_resolves(self):
+        # Regression: the SM100 trtllm_mla model default was declared before
+        # the deterministic pass, which then rejected it as if the user had
+        # chosen it, so startup failed without --attention-backend.
+        deepseek_v3 = ("DeepseekV3ForCausalLM", "deepseek_v3")
+        # Pin every platform fact the resolution reads (fa4's absorbed-MLA
+        # check, trtllm_mla's Blackwell check) so the result does not depend on
+        # the CI host.
+        with override_platform(
+            is_cuda=True, is_sm100=True, is_sm100_or_sm110=True, is_blackwell=True
+        ):
+            sa = self._construct(*deepseek_v3, enable_deterministic_inference=True)
+            self.assertEqual(self._resolved(sa, "attention_backend"), "triton")
+            sa = self._construct(
+                *deepseek_v3,
+                enable_deterministic_inference=True,
+                attention_backend="fa4",
+            )
+            self.assertEqual(self._resolved(sa, "attention_backend"), "fa4")
+            # An explicit non-deterministic backend is still rejected.
+            with self.assertRaisesRegex(ValueError, "trtllm_mla"):
+                self._construct(
+                    *deepseek_v3,
+                    enable_deterministic_inference=True,
+                    attention_backend="trtllm_mla",
+                )
+            # Without deterministic inference the default is unchanged.
+            sa = self._construct(*deepseek_v3)
+            self.assertEqual(self._resolved(sa, "attention_backend"), "trtllm_mla")
+
+    def test_deterministic_absorbed_mla_arches_cover_deepseek_family(self):
+        # Every arch that may default to trtllm_mla on SM100 must get the
+        # absorbed-MLA deterministic default, not the generic flashinfer one
+        # (its MLA split-KV plan depends on the batch).
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import (
+            _DEEPSEEK_FAMILY_ARCHS,
+            _DETERMINISTIC_ABSORBED_MLA_ARCHS,
+            _deterministic_attention_backend,
+        )
+
+        self.assertLessEqual(_DEEPSEEK_FAMILY_ARCHS, _DETERMINISTIC_ABSORBED_MLA_ARCHS)
+        for arch, expected in (
+            ("KimiK25ForConditionalGeneration", "triton"),
+            ("Glm5NextForConditionalGeneration", "triton"),
+            ("LlamaForCausalLM", "flashinfer"),
+        ):
+            model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=[arch])
+            )
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=True,
+                    attention_backend=None,
+                    model_path="/models/unused",
+                )
+            )
+            with (
+                self.subTest(arch=arch),
+                override_platform(is_sm100=True),
+                patch.object(
+                    overrides_module, "model_config_of", return_value=model_config
+                ),
+            ):
+                self.assertEqual(
+                    _deterministic_attention_backend(view),
+                    {"attention_backend": expected},
+                )
+
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
         # A real dllm arch: the page pass now runs regardless of the radix
@@ -4030,6 +4099,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 dcp_size=1,
                 attn_cp_size=1,
                 moe_dense_tp_size=None,
+                enable_deterministic_inference=False,
+                rl_on_policy_target=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -4149,6 +4220,16 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     ),
                     {},
                 )
+                # trtllm_mla is not batch invariant: deterministic inference
+                # leaves the backend to _deterministic_attention_backend.
+                for kw in (
+                    {"enable_deterministic_inference": True},
+                    {"rl_on_policy_target": "fsdp"},
+                ):
+                    with self.subTest(**kw):
+                        self.assertEqual(
+                            _deepseek_family_overrides(_args(**kw), None), {}
+                        )
             with override_platform(is_sm100=False):
                 self.assertEqual(_deepseek_family_overrides(_args(), None), {})
 

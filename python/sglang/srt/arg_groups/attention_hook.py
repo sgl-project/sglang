@@ -23,6 +23,7 @@ from sglang.srt.arg_groups.overrides import (
     _deterministic_aiter_prefill_page_size,
     _deterministic_allreduce_fusion_disable,
     _deterministic_attention_backend,
+    _deterministic_is_deepseek_model,
     _deterministic_rocm_rccl_check,
     _deterministic_sampling_backend,
     _fa4_page_constraint,
@@ -37,14 +38,10 @@ from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
 )
 from sglang.srt.configs.model_config import uses_kda_attention
-from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    parse_connector_type,
-)
 
 logger = logging.getLogger(__name__)
 
@@ -632,23 +629,9 @@ def handle_deterministic_inference(server_args: Any):
         # (arg_groups/overrides.py), invoked at their legacy slots.
 
         run_post_process_pass(server_args, _deterministic_sampling_backend)
-        is_deepseek_model = False
-        if parse_connector_type(cfg.model_path) != ConnectorType.INSTANCE:
-            try:
-                hf_config = model_config_of(server_args).hf_config
-                model_arch = hf_config.architectures[0]
-                is_deepseek_model = model_arch in [
-                    "DeepseekV2ForCausalLM",
-                    "DeepseekV3ForCausalLM",
-                    "DeepseekV32ForCausalLM",
-                    "MistralLarge3ForCausalLM",
-                    "PixtralForConditionalGeneration",
-                    "GlmMoeDsaForCausalLM",
-                    "Glm4MoeLiteForCausalLM",
-                    "Glm5NextForConditionalGeneration",
-                ]
-            except Exception:
-                pass
+        # Same architecture set as the default fill in
+        # _deterministic_attention_backend.
+        is_deepseek_model = _deterministic_is_deepseek_model(cfg)
 
         # Check attention backend
         run_post_process_pass(server_args, _deterministic_attention_backend)
