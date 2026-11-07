@@ -48,6 +48,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_hip,
     print_info_once,
+    is_host_cpu_x86,
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -555,9 +556,27 @@ def _reshape_for_qk_norm(x: torch.Tensor, head_dim: int) -> torch.Tensor:
     return x.reshape(-1, head_dim)
 
 
-@lru_cache(maxsize=1)
-def _has_cpu_fused_qk_norm() -> bool:
-    return hasattr(torch.ops.sgl_kernel, "fused_qk_norm_cpu")
+@lru_cache(maxsize=2)
+def cpu_has_fused_qk_norm_isa(dtype: torch.dtype) -> bool:
+    """Check ISA requirements shared by fused CPU QK norm and QK norm + RoPE."""
+    if is_host_cpu_x86():
+        capabilities = torch.cpu.get_capabilities()
+        if not all(
+            capabilities.get(isa, False)
+            for isa in ("avx512_f", "avx512_bw", "avx512_dq", "avx512_vl")
+        ):
+            return False
+        # The x86 BF16 conversion uses AVX512-BF16, not AMX.
+        if dtype == torch.bfloat16 and not capabilities.get("avx512_bf16", False):
+            return False
+    return True
+
+
+@lru_cache(maxsize=2)
+def _has_cpu_fused_qk_norm(dtype: torch.dtype) -> bool:
+    return cpu_has_fused_qk_norm_isa(dtype) and hasattr(
+        torch.ops.sgl_kernel, "fused_qk_norm_cpu"
+    )
 
 
 def can_use_fused_qk_norm_cpu(
@@ -575,7 +594,7 @@ def can_use_fused_qk_norm_cpu(
         and k.stride(-1) == 1
         and q.size(-1) % head_dim == 0
         and k.size(-1) % head_dim == 0
-        and _has_cpu_fused_qk_norm()
+        and _has_cpu_fused_qk_norm(q.dtype)
     )
 
 
