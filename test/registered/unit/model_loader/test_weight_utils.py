@@ -10,10 +10,14 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
+from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.model_loader.weight_utils import (
     _load_pt_file,
+    default_weight_loader,
     filter_duplicate_safetensors_files,
     initialize_dummy_weights,
     maybe_add_mtp_safetensors,
@@ -307,6 +311,93 @@ class TestInitializeDummyWeights(CustomTestCase):
                 model.w13_weight_scale_inv, torch.full((4, 2), 127, dtype=torch.uint8)
             )
         )
+
+
+class TestNpCacheBfloat16(CustomTestCase):
+    def test_bfloat16_checkpoint_and_cache_preserve_bits(self):
+        """BF16 checkpoints must load on both a cold cache and a cache hit."""
+        weights = {
+            "all_bits": torch.arange(65536, dtype=torch.int32)
+            .to(torch.int16)
+            .view(torch.bfloat16)
+            .reshape(256, 256),
+            "scalar": torch.tensor(-0.0, dtype=torch.bfloat16),
+            "empty": torch.empty((0, 3), dtype=torch.bfloat16),
+            "transposed": torch.arange(12, dtype=torch.bfloat16).reshape(3, 4).t(),
+            "float": torch.tensor([1.25, -2.5]),
+            "uint16": torch.tensor([0, 32768, 65535], dtype=torch.uint16),
+        }
+        with tempfile.TemporaryDirectory() as folder:
+            paths = []
+            for shard_id, names in enumerate((list(weights)[:3], list(weights)[3:])):
+                path = os.path.join(folder, f"model-{shard_id}.bin")
+                torch.save({name: weights[name] for name in names}, path)
+                paths.append(path)
+            loader = DefaultModelLoader(
+                LoadConfig(load_format="npcache", download_dir=folder)
+            )
+            source = loader.Source(folder, revision=None, prefix="model.")
+            resolved = loader.ResolvedSource(source, folder, tuple(paths), False)
+
+            for cached in (False, True):
+                if cached:
+                    # A cache hit must not reopen the source checkpoints.
+                    for path in paths:
+                        os.remove(path)
+                loaded = dict(
+                    loader._get_weights_iterator(source, resolved_source=resolved)
+                )
+                self.assertEqual(set(loaded), {"model." + n for n in weights})
+                for name, expected in weights.items():
+                    actual = loaded["model." + name]
+                    self.assertEqual(actual.dtype, expected.dtype)
+                    self.assertEqual(actual.shape, expected.shape)
+                    if expected.dtype == torch.bfloat16:
+                        self.assertTrue(
+                            torch.equal(
+                                actual.view(torch.int16),
+                                expected.view(torch.int16),
+                            ),
+                            name,
+                        )
+                    else:
+                        self.assertTrue(torch.equal(actual, expected), name)
+                    destination = torch.empty_like(expected)
+                    default_weight_loader(destination, actual)
+                    self.assertTrue(
+                        torch.equal(
+                            destination.view(torch.int16),
+                            expected.view(torch.int16),
+                        ),
+                        name,
+                    )
+
+    def test_legacy_numpy_cache_remains_readable(self):
+        """Adding a BF16 representation must not reinterpret native uint16."""
+        with tempfile.TemporaryDirectory() as folder:
+            cache = os.path.join(folder, "np")
+            os.mkdir(cache)
+            arrays = {
+                "float": np.array([1.25, -2.5], dtype=np.float32),
+                "uint16": np.array([0, 32768, 65535], dtype=np.uint16),
+            }
+            with open(os.path.join(cache, "weight_names.json"), "w") as f:
+                json.dump(list(arrays), f)
+            for name, array in arrays.items():
+                with open(os.path.join(cache, name), "wb") as f:
+                    np.save(f, array)
+            loader = DefaultModelLoader(
+                LoadConfig(load_format="npcache", download_dir=folder)
+            )
+            source = loader.Source(folder, revision=None)
+            resolved = loader.ResolvedSource(source, folder, (), False)
+            loaded = dict(
+                loader._get_weights_iterator(source, resolved_source=resolved)
+            )
+            for name, array in arrays.items():
+                expected = torch.from_numpy(array)
+                self.assertEqual(loaded[name].dtype, expected.dtype)
+                self.assertTrue(torch.equal(loaded[name], expected))
 
 
 if __name__ == "__main__":

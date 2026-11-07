@@ -885,6 +885,9 @@ def filter_files_not_needed_for_inference(hf_weights_files: List[str]) -> List[s
     return hf_weights_files
 
 
+_NP_CACHE_BFLOAT16_DTYPE = np.dtype([("bfloat16", np.uint16)])
+
+
 def np_cache_weights_iterator(
     model_name_or_path: str,
     cache_dir: Optional[str],
@@ -918,8 +921,19 @@ def np_cache_weights_iterator(
                 state = torch.load(bin_file, map_location="cpu", weights_only=True)
                 for name, param in state.items():
                     param_path = os.path.join(np_folder, name)
+                    param = param.cpu().detach()
+                    if param.dtype == torch.bfloat16:
+                        # NumPy has no native BF16. Tag the raw bits in the dtype
+                        # so cache hits distinguish them from ordinary uint16.
+                        array = (
+                            param.view(torch.uint16)
+                            .numpy()
+                            .view(_NP_CACHE_BFLOAT16_DTYPE)
+                        )
+                    else:
+                        array = param.numpy()
                     with open(param_path, "wb") as f:
-                        np.save(f, param.cpu().detach().numpy())
+                        np.save(f, array)
                     weight_names.append(name)
             with open(weight_names_file, "w") as f:
                 json.dump(weight_names, f)
@@ -931,7 +945,10 @@ def np_cache_weights_iterator(
         param_path = os.path.join(np_folder, name)
         with open(param_path, "rb") as f:
             param = np.load(f)
-        yield name, torch.from_numpy(param)
+        if param.dtype == _NP_CACHE_BFLOAT16_DTYPE:
+            yield name, torch.from_numpy(param.view(np.uint16)).view(torch.bfloat16)
+        else:
+            yield name, torch.from_numpy(param)
 
 
 def _prefetch_checkpoint_file(
