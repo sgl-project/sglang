@@ -82,15 +82,13 @@ class TestRequestHoldersAreLists(CustomTestCase):
 
 class TestKeyedReqList(CustomTestCase):
     def test_join_keeps_order_and_leave_ignores_outsiders(self):
-        a, b, c, outsider = (FakeReq(rid=rid, finished=lambda: False) for rid in "abcx")
+        a, b, c, outsider = (FakeReq(rid=rid) for rid in "abcx")
         running = KeyedReqList(ListKind.DECODING)
         running.join([a, b])
         running.join([c, b])
         self.assertEqual(list(running), [a, b, c])
 
-        b.finished = lambda: True
-        running.leave_finished()
-        running.leave([a, outsider])
+        running.leave([b, a, outsider])
 
         self.assertEqual(list(running), [c])
         self.assertNotIn(a, running)

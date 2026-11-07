@@ -91,9 +91,6 @@ class KeyedReqList(ReqList):
         for req in reqs:
             self._reqs.pop(req, None)
 
-    def leave_finished(self) -> None:
-        self.leave([req for req in self._reqs if req.finished()])
-
     def clear(self) -> None:
         self._reqs.clear()
 

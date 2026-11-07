@@ -89,6 +89,9 @@ def _scheduler():
     empty_request_lists(s)
     s.dllm_manager = SimpleNamespace(waiting_queue=[])
     s.running_batch = ScheduleBatch(reqs=[])
+    s.last_batch = None
+    s.result_queue = []
+    s.enable_continuous_input_polling = False
     s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
     s.enable_hisparse = False
@@ -329,6 +332,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
+            s.leave_running_and_prefill_launched([done])
             s._on_step_processed(batch)
 
         s.run_batch = run_batch
