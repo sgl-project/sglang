@@ -47,7 +47,12 @@ class MiniMaxH3VisualEncodingStage(ConditionEncodingStage):
         self, server_args: ServerArgs, stage_name: str | None = None
     ) -> list[ComponentUse]:
         stage_name = self._component_stage_name(stage_name)
-        return [ComponentUse(stage_name, "video_vae")]
+        # The video VAE is only touched when the resolved plan routes reference
+        # images/videos to this stage; a text-to-video+audio request returns
+        # before the encode block. Loading it at stage entry therefore pays a
+        # full H2D/D2H cycle (5.2 GiB) for nothing, on top of the one the
+        # decoding stage needs later.
+        return [ComponentUse(stage_name, "video_vae", start_at_stage_entry=False)]
 
     def build_dedup_fingerprint(self, batch: Req, server_args: ServerArgs):
         parent_request_id = batch.extra.get("parent_request_id")
