@@ -117,6 +117,8 @@ def _make_prefill_manager():
     mgr._deferred_ack_targets = {}
     mgr._deferred_ack_poisoned_rooms = set()
     mgr._staging_outstanding = {}
+    mgr.failure_lock = threading.Lock()
+    mgr.failure_records = {}
     mgr._sent = []
     mgr._send_abort_ack = lambda *args: mgr._sent.append(args)
     return mgr
