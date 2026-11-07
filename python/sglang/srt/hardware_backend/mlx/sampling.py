@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import mlx.core as mx
+import msgspec
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,32 @@ DEFAULT_SAMPLING_SEED = 42
 MAX_BOUNDED_TOP_K = 1024
 
 _warned_ignored_penalties = False
+
+
+class MlxMinNewTokens(msgspec.Struct, frozen=True):
+    """Absolute cache position at which a request may first select a stop token."""
+
+    min_total_tokens: int
+    stop_token_ids: tuple[int, ...]
+
+    @classmethod
+    def from_req(cls, req: Any | None) -> MlxMinNewTokens | None:
+        if req is None or req.sampling_params.min_new_tokens == 0:
+            return None
+        stop_ids = (req.sampling_params.stop_token_ids or set()) | (
+            req.eos_token_ids or set()
+        )
+        if req.tokenizer is not None:
+            stop_ids |= req.tokenizer.additional_stop_token_ids or set()
+            stop_ids |= {req.tokenizer.eos_token_id}
+        return cls(
+            min_total_tokens=(
+                len(req.origin_input_ids) + req.sampling_params.min_new_tokens
+            ),
+            stop_token_ids=tuple(
+                sorted(token for token in stop_ids if token is not None)
+            ),
+        )
 
 
 @dataclass(frozen=True)
