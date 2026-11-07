@@ -783,9 +783,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             if chat_request.chat_template_kwargs is not None
             else None
         )
-        request._final_chat_message = (
-            chat_request.messages[-1] if chat_request.messages else None
-        )
+        request._chat_messages = chat_request.messages
 
         _, engine_prompt = self._engine_prompt(processed_messages, is_multimodal)
         request_prompts = [engine_prompt]

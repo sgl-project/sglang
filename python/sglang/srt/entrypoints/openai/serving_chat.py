@@ -3603,7 +3603,9 @@ class OpenAIServingChat(OpenAIServingBase):
         chat_template_kwargs[toggle_param] = enabled
         request.chat_template_kwargs = chat_template_kwargs
 
-    def _thinking_requested(self, request: ChatCompletionRequest) -> bool:
+    def _thinking_requested(
+        self, request: ChatCompletionRequest | ResponsesRequest
+    ) -> bool:
         return (request.chat_template_kwargs or {}).get(
             "thinking", envs.SGLANG_DEFAULT_THINKING.get()
         )

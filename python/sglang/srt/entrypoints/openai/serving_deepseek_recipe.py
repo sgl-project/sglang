@@ -351,7 +351,8 @@ class DeepSeekRecipeChatEncodingAdapter:
                 continued=_continued_turn(
                     request.messages[-1] if request.messages else None,
                     continue_final_message=request.continue_final_message,
-                    recipe_rendered=recipe_rendered,
+                    # Under a task, recipe keeps no non-text final turn.
+                    recipe_rendered=recipe_rendered and request.task is None,
                 ),
             ),
             parse_tool_calls=request.task is None
@@ -361,6 +362,7 @@ class DeepSeekRecipeChatEncodingAdapter:
             separate_reasoning=self._separate_reasoning and request.separate_reasoning,
             stream_reasoning=request.stream_reasoning,
             reasoning_must_close=recipe_rendered
+            and _parse_start_placed(request.messages)
             and self._reasoning_must_close(request),
             stop=_stop_strings(request.stop),
             stop_regex=_stop_strings(request.stop_regex),
@@ -387,12 +389,13 @@ class DeepSeekRecipeChatEncodingAdapter:
         separate_reasoning: bool,
         parse_tool_calls: bool,
     ) -> DeepSeekRecipeOutputParser:
+        messages = request._chat_messages
         return DeepSeekRecipeOutputParser(
             self.deepseek_recipe,
             thinking_stage=self.deepseek_recipe.parse_start(
                 thinking=require_reasoning,
                 continued=_continued_turn(
-                    request._final_chat_message,
+                    messages[-1] if messages else None,
                     continue_final_message=False,
                     recipe_rendered=self._renders_prompts,
                 ),
@@ -400,7 +403,12 @@ class DeepSeekRecipeChatEncodingAdapter:
             parse_tool_calls=parse_tool_calls,
             separate_reasoning=separate_reasoning,
             stop=_stop_strings(request.stop),
+            # The parse start follows require_reasoning, which a template's
+            # reasoning toggle can set for a request that asked for no thinking,
+            # and such a prompt has closed its reasoning already.
             reasoning_must_close=self._renders_prompts
+            and self._hooks.thinking_requested(request)
+            and _parse_start_placed(messages)
             and not _forces_nonempty_content(request.chat_template_kwargs),
         )
 
@@ -452,6 +460,25 @@ def _trailing_assistant_turn(
     if last and last["role"] == "assistant" and isinstance(last.get("content"), str):
         return {key: value for key, value in last.items() if key != "tool_calls"}
     return None
+
+
+def _parse_start_placed(
+    messages: Optional[list[ChatCompletionMessageParam]],
+) -> bool:
+    """Whether recipe's prompt leaves its reasoning where `parse_start` reports
+    it. recipe hoists a trailing system or developer turn over a `prefix` turn
+    before it, and opens no reasoning for a first message, so either prompt
+    continues an answer where the parse start reports a fresh reasoning block."""
+    if not messages:
+        return True
+    if len(messages) == 1:
+        return messages[0].role != "assistant"
+    before, last = messages[-2:]
+    return not (
+        last.role in ("system", "developer")
+        and before.role == "assistant"
+        and bool(before.prefix)
+    )
 
 
 def _continued_turn(

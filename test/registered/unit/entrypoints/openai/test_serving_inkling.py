@@ -26,6 +26,7 @@ def _inkling_serving() -> OpenAIServingChat:
     serving.reasoning_parser = "inkling"
     serving.tool_call_parser = "inkling"
     serving.tokenizer_manager = Mock(tokenizer=None)
+    serving.template_manager = SimpleNamespace(chat_template_name=None)
     serving._encoding_adapter = serving._build_chat_encoding_adapter()
     return serving
 
