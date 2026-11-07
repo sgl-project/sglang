@@ -120,11 +120,12 @@ class TestDcpTargetVerifyBackend(CustomTestCase):
             algorithm="DSPARK",
         )
 
-    def test_kimi_k3_dflash_keeps_prefill_mode_and_is_refused(self):
-        mode = _kimi_k3_mode("DFLASH")
-        self.assertEqual(mode, "prefill")
-        with self.assertRaisesRegex(ValueError, "TRTLLMMLABackend"):
-            _require(_hybrid(TRTLLMMLABackend, CuteDslMLABackend, mode), mode=mode)
+    def test_kimi_k3_dflash_override_verifies_on_the_decode_backend(self):
+        self.assertEqual(_kimi_k3_mode("DFLASH"), "decode")
+        _require(
+            _hybrid(TRTLLMMLABackend, CuteDslMLABackend, _kimi_k3_mode("DFLASH")),
+            mode="decode",
+        )
 
     def test_only_unified_dcp_speculative_runs_are_checked(self):
         hybrid = _hybrid(TRTLLMMLABackend, CuteDslMLABackend, "prefill")
