@@ -427,14 +427,14 @@ Streaming is supported in a similar manner as [above](#streaming).
 
 Detailed example in [OpenAI API Vision](./openai_api_vision).
 
-### Structured Outputs (JSON, Regex, EBNF)
+### Structured Outputs (JSON, Regex, EBNF, Lark)
 
-You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request.
+You can specify a JSON schema, regular expression or [EBNF](https://en.wikipedia.org/wiki/Extended_Backus%E2%80%93Naur_form) to constrain the model output. The model output will be guaranteed to follow the given constraints. Only one constraint parameter (`json_schema`, `regex`, or `ebnf`) can be specified for a request. With XGrammar, `ebnf` also accepts Lark grammars; see [Structured Outputs](../advanced_features/structured_outputs) for the supported syntax.
 
 SGLang supports two grammar backends:
 
-- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, and EBNF constraints.
-  - XGrammar currently uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md).
+- [XGrammar](https://github.com/mlc-ai/xgrammar) (default): Supports JSON schema, regular expression, EBNF, and Lark grammar constraints.
+  - For EBNF, XGrammar uses the [GGML BNF format](https://github.com/ggml-org/llama.cpp/blob/master/grammars/README.md).
 - [Outlines](https://github.com/dottxt-ai/outlines): Supports JSON schema and regular expression constraints.
 
 If instead you want to initialize the Outlines backend, you can use `--grammar-backend outlines` flag:
@@ -471,7 +471,7 @@ response = requests.post(
 )
 print(response.json())
 
-# Regular expression (Outlines backend only)
+# Regular expression
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -485,7 +485,7 @@ response = requests.post(
 )
 print(response.json())
 
-# EBNF (XGrammar backend only)
+# EBNF
 response = requests.post(
     "http://localhost:30000/generate",
     json={
@@ -494,6 +494,20 @@ response = requests.post(
             "temperature": 0,
             "max_new_tokens": 64,
             "ebnf": 'root ::= "Hello" | "Hi" | "Hey"',
+        },
+    },
+)
+print(response.json())
+
+# Lark grammar with XGrammar
+response = requests.post(
+    "http://localhost:30000/generate",
+    json={
+        "text": "Write a greeting.",
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 64,
+            "ebnf": 'start: "Hello" | "Hi" | "Hey"',
         },
     },
 )
