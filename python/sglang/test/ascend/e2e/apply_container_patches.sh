@@ -17,6 +17,9 @@ set -euo pipefail
 #     /tmp by default) instead of the shared disk, so the four pods never race
 #     on the same file. Each pod downloads once and reuses it for re-runs.
 #   * A per-set marker keyed by the file checksum makes re-runs idempotent.
+#   * Patch sets download packages from the public internet, which is slow from
+#     the cluster; pip defaults to the domestic mirror (override with
+#     PIP_INDEX_URL) while apt mirrors are handled per set.
 #   * Any failure aborts the caller: a half patched cluster produces results
 #     that cannot be trusted.
 
@@ -25,6 +28,10 @@ PATCH_DIR="${SCRIPT_DIR}/container_patches"
 PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache}"
 PATCH_STATE_FILE="${PATCH_STATE_FILE:-/tmp/sglang_npu_patches_applied.json}"
 REQUESTED="${1:-${SGLANG_NPU_CONTAINER_PATCHES:-}}"
+
+# Pods reach PyPI over a slow international link; every patch set downloads
+# wheels, so default to the domestic mirror unless the caller configured one.
+export PIP_INDEX_URL="${PIP_INDEX_URL:-https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple}"
 
 if [ -z "${REQUESTED}" ]; then
     echo "No container patch set requested, skip."

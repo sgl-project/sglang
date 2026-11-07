@@ -19,6 +19,25 @@ set -euo pipefail
 PATCH_CACHE_DIR="${PATCH_CACHE_DIR:-/tmp/sglang_npu_patch_cache/mooncake_memfabric_1.3.1}"
 mkdir -p "${PATCH_CACHE_DIR}"
 
+UBUNTU_MIRROR="${UBUNTU_MIRROR:-https://mirrors.tuna.tsinghua.edu.cn/ubuntu-ports}"
+
+use_apt_mirror() {
+    # Fetching the ~48 MB index from ports.ubuntu.com takes ~90s per pod and the
+    # cluster wait times out. Rewrite only the ubuntu-ports entries instead of
+    # replacing the whole source list, so image specific repos keep working.
+    local files=()
+    local f
+    for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+        [ -f "${f}" ] || continue
+        grep -q 'ports.ubuntu.com' "${f}" || continue
+        sed -i "s|https\?://ports.ubuntu.com/ubuntu-ports|${UBUNTU_MIRROR}|g" "${f}"
+        files+=("${f}")
+    done
+    if [ "${#files[@]}" -gt 0 ]; then
+        echo "APT mirror: ${UBUNTU_MIRROR} (${files[*]})"
+    fi
+}
+
 MEMFABRIC_WHEEL_NAME="memfabric_hybrid-1.3.1-cp312-cp312-manylinux_2_26_aarch64.manylinux_2_28_aarch64.whl"
 MEMFABRIC_WHEEL_URL="https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/memfabric/1.3.1/${MEMFABRIC_WHEEL_NAME}"
 MOONCAKE_WHEEL_NAME="mooncake_transfer_engine_memfabric-0.3.14-cp312-cp312-manylinux_2_35_aarch64.whl"
@@ -47,6 +66,7 @@ if dpkg -s libibverbs-dev >/dev/null 2>&1; then
     echo "libibverbs-dev already installed, skip apt."
 else
     echo "Install libibverbs-dev"
+    use_apt_mirror
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y libibverbs-dev
 fi
