@@ -1,4 +1,4 @@
-"""CPU-only tests for Quark MXFP4 AITER ASM layout helpers."""
+"""CPU-only tests for Quark MXFP4 AITER layout and kernel-selection helpers."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -11,6 +11,7 @@ import torch
 
 from sglang.srt.layers.quantization.quark.schemes import quark_w4a4_mxfp4
 from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+    _afp4wfp4_k_tail_safe_tiling,
     _asm_fp4_prequantized_input,
     _asm_fp4_scale_swizzle_supported,
     _shuffle_asm_fp4_act_scale,
@@ -115,6 +116,99 @@ class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
 
         self.assertFalse(layer.use_aiter_asm_fp4_gemm)
         self.assertIs(layer.weight, weight)
+
+
+class TestAfp4wfp4KTailSafeTiling(CustomTestCase):
+    def test_narrows_a_tail_in_an_unfilled_stage(self):
+        # Two K blocks in three stages: the tail lands in a never-filled stage.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=1536, num_stages=3), (512, 3)
+        )
+        # No power of two >= 128 divides 2880; six blocks of 512 put the tail in a filled stage.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=2880, num_stages=3), (512, 3)
+        )
+        # A block wider than K is shrunk to K's next power of two first, as the kernel wrapper does.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(2048, k=768, num_stages=3), (256, 3)
+        )
+
+    def test_keeps_a_tail_in_a_filled_stage(self):
+        # Kimi-K3 TP8 dense down_proj: five blocks in three stages keep AITER's block (128 is 1.7x slower).
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=4224, num_stages=3), (1024, 3)
+        )
+        # The boundary: one block more than stages.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(1024, k=3136, num_stages=3), (1024, 3)
+        )
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(512, k=1088, num_stages=2), (512, 2)
+        )
+
+    def test_drops_stages_when_the_minimum_block_is_not_enough(self):
+        # Three blocks of the minimum 128 in three stages.
+        self.assertEqual(
+            _afp4wfp4_k_tail_safe_tiling(256, k=320, num_stages=3), (128, 2)
+        )
+        # One masked block cannot share a stage with a full one.
+        self.assertIsNone(_afp4wfp4_k_tail_safe_tiling(256, k=96, num_stages=3))
+
+
+class TestAfp4wfp4KTailConfig(CustomTestCase):
+    def _config(self, get_config, m=16, n=7168, k_packed=768):
+        quark_w4a4_mxfp4._afp4wfp4_k_tail_config.cache_clear()
+        try:
+            with (
+                mock.patch.object(
+                    quark_w4a4_mxfp4, "_aiter_afp4wfp4_get_config", get_config
+                ),
+                mock.patch.object(
+                    quark_w4a4_mxfp4, "is_gfx95_supported", return_value=True
+                ),
+            ):
+                return quark_w4a4_mxfp4._afp4wfp4_k_tail_config(
+                    m=m, n=n, k_packed=k_packed
+                )
+        finally:
+            quark_w4a4_mxfp4._afp4wfp4_k_tail_config.cache_clear()
+
+    # AITER's untuned decode config for 8 < M <= 32.
+    _DECODE_CONFIG = {
+        "BLOCK_SIZE_M": 32,
+        "BLOCK_SIZE_K": 1024,
+        "num_stages": 3,
+        "NUM_KSPLIT": 1,
+    }
+
+    def test_narrows_the_kernels_own_config(self):
+        get_config = mock.Mock(return_value=(dict(self._DECODE_CONFIG), False))
+
+        config = self._config(get_config, k_packed=768)
+
+        # gemm_afp4wfp4's _get_config takes packed K, as gemm_afp4wfp4 passes it.
+        get_config.assert_called_once_with(16, 7168, 768)
+        self.assertEqual(config, {**self._DECODE_CONFIG, "BLOCK_SIZE_K": 512})
+
+    def test_tail_in_a_filled_stage_keeps_aiters_config(self):
+        # Kimi-K3 TP8 dense down_proj, K=4224.
+        get_config = mock.Mock(return_value=(dict(self._DECODE_CONFIG), False))
+        self.assertIsNone(self._config(get_config, k_packed=2112))
+
+    def test_failed_lookup_keeps_the_default_path(self):
+        for error in (
+            KeyError("no M bucket"),
+            AssertionError("no DEFAULT.json"),
+            # The private AITER getter changed its signature.
+            TypeError("changed signature"),
+        ):
+            with self.subTest(error=type(error).__name__):
+                self.assertIsNone(self._config(mock.Mock(side_effect=error)))
+        self.assertIsNone(self._config(None))
+
+    def test_split_k_config_is_left_to_aiter(self):
+        split_k = {"BLOCK_SIZE_K": 512, "num_stages": 2, "NUM_KSPLIT": 4}
+        self.assertIsNone(self._config(mock.Mock(return_value=(split_k, False))))
 
 
 if __name__ == "__main__":
