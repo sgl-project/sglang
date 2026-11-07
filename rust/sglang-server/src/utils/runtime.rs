@@ -56,11 +56,54 @@ pub struct Runtime {
     shutdown_rx: flume::Receiver<()>,
     /// The error of a failed startup warmup, sent at most once.
     startup_failure_rx: flume::Receiver<String>,
-    /// Set once the API listeners have stopped serving and closed.
+    /// Set once the API listeners have closed and the drain's end is no
+    /// longer held (see [`Runtime::hold_drain_end`]).
     listeners_closed: Arc<AtomicBool>,
+    /// Set once the API listeners have stopped serving and closed, held or not.
+    own_listeners_closed: Arc<AtomicBool>,
+    drain_end_gate: Arc<DrainEndGate>,
     /// Where to report a drain's listeners closing (see
     /// [`Runtime::drain_signal_fd`]).
     drain_notify: Arc<std::sync::OnceLock<String>>,
+}
+
+/// [`Runtime::drain_state`] bit: a drain has begun.
+pub const DRAIN_DRAINING: u8 = 1;
+/// [`Runtime::drain_state`] bit: the drain was begun forced
+/// (`SGLANG_FORCE_SHUTDOWN`); a failed health probe does not set it.
+pub const DRAIN_FORCE_REQUESTED: u8 = 2;
+/// [`Runtime::drain_state`] bit: this runtime's own listeners have closed,
+/// whether or not the drain's end is held.
+pub const DRAIN_CLOSED: u8 = 4;
+
+/// Holds a drain's end past the listeners' close until released (see
+/// [`Runtime::hold_drain_end`]).
+#[derive(Default)]
+struct DrainEndGate {
+    held: AtomicBool,
+    released: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl DrainEndGate {
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    async fn released(&self) {
+        loop {
+            // Register before checking, so a release between the check and
+            // the await still wakes this waiter.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Deadline for joining worker threads on shutdown. Past it we abandon the join
@@ -143,11 +186,57 @@ impl Runtime {
         self.core.begin_drain(force);
     }
 
-    /// Whether a drain has begun and every listener has since closed: the
-    /// scheduler may stop. The other stages keep running until
-    /// [`Runtime::request_shutdown`].
+    /// Whether a drain has begun and every listener has since closed, its
+    /// end released if held: the scheduler may stop. The other stages keep
+    /// running until [`Runtime::request_shutdown`].
     pub fn drain_complete(&self) -> bool {
         self.core.is_draining() && self.listeners_closed.load(Ordering::SeqCst)
+    }
+
+    /// The drain's progress as `DRAIN_*` bits, for the caller to share with
+    /// the runtimes of the other attention-DP ranks.
+    pub fn drain_state(&self) -> u8 {
+        let mut state = 0;
+        if self.core.is_draining() {
+            state |= DRAIN_DRAINING;
+        }
+        if self.core.is_drain_forced() {
+            state |= DRAIN_FORCE_REQUESTED;
+        }
+        if self.own_listeners_closed.load(Ordering::SeqCst) {
+            state |= DRAIN_CLOSED;
+        }
+        state
+    }
+
+    /// Hold the end of every later graceful drain until
+    /// [`Runtime::release_drain_end`]: the listeners still close once their
+    /// requests drained, but [`Runtime::drain_complete`], the scheduler
+    /// wake-up and the drain-ended datagram wait for the release. For DP rank
+    /// 0, whose drain end stops the schedulers of every DP rank, so that the
+    /// other DP ranks' listeners finish their requests first. A forced drain
+    /// (or a failed health probe), even one forced mid-hold, does not wait,
+    /// as Python's does not. While held, connections left open past the
+    /// graceful-close timeout stay open until the release. Must be called
+    /// before any drain begins.
+    pub fn hold_drain_end(&self) -> Result<(), String> {
+        if self.core.is_draining() {
+            return Err("a drain has already begun".into());
+        }
+        self.drain_end_gate.held.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Release a held drain end (see [`Runtime::hold_drain_end`]); latched,
+    /// so a release before the listeners closed ends the drain as they close.
+    /// Ignored, returning `false`, unless a drain has begun, so it can never
+    /// pre-release a later drain.
+    pub fn release_drain_end(&self) -> bool {
+        if !self.core.is_draining() {
+            return false;
+        }
+        self.drain_end_gate.release();
+        true
     }
 
     /// A pipe whose write end the caller installs as its signal wakeup fd
@@ -447,12 +536,17 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
     let listeners_closed = Arc::new(AtomicBool::new(false));
+    let own_listeners_closed = Arc::new(AtomicBool::new(false));
+    let drain_end_gate = Arc::new(DrainEndGate::default());
     let drain_notify = Arc::new(std::sync::OnceLock::<String>::new());
     {
         let cfg = cfg.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let shutdown_for_gate = shutdown_rx.clone();
         let core = core.clone();
         let listeners_closed = listeners_closed.clone();
+        let own_listeners_closed = own_listeners_closed.clone();
+        let drain_end_gate = drain_end_gate.clone();
         let drain_notify = drain_notify.clone();
         let waker = to_scheduler_rx.waker();
         let core_for_close = core.clone();
@@ -502,6 +596,22 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                         http.await;
                     }
                 });
+                own_listeners_closed.store(true, Ordering::SeqCst);
+                if drain_end_gate.held.load(Ordering::SeqCst)
+                    && core_for_close.is_draining()
+                    && core_for_close.drain_force_reason().is_none()
+                {
+                    tracing::info!(
+                        "drain: listeners closed; holding the drain's end until released"
+                    );
+                    rt.block_on(async {
+                        tokio::select! {
+                            () = drain_end_gate.released() => {}
+                            () = core_for_close.drain_forced() => {}
+                            _ = shutdown_for_gate.recv_async() => {}
+                        }
+                    });
+                }
                 // Every listener is closed: report it before dropping the
                 // runtime, whose drop waits for blocking tasks (media fetches)
                 // and ends the connections still open.
@@ -534,6 +644,8 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         shutdown_rx,
         startup_failure_rx,
         listeners_closed,
+        own_listeners_closed,
+        drain_end_gate,
         drain_notify,
     })
 }
@@ -836,6 +948,119 @@ mod tests {
         let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
         assert_eq!(&buf[..n], b"drained");
         rt.request_shutdown();
+    }
+
+    fn wait_drain_state(rt: &Runtime, state: u8) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rt.drain_state() != state {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain state {} never became {state}",
+                rt.drain_state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A held drain end: the listener closes once its requests drained, but
+    /// the drain completes, and the launching process hears of it, only on
+    /// the release. A release before any drain began is ignored, and the
+    /// hold cannot be taken once a drain began.
+    #[test]
+    fn held_drain_end_waits_for_the_release() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-hold-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher.set_nonblocking(true).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        drop(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        rt.hold_drain_end().unwrap();
+        assert!(!rt.release_drain_end(), "released with no drain under way");
+        assert_eq!(rt.drain_state(), 0);
+
+        rt.begin_drain(false);
+        wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!rt.drain_complete(), "the early release was latched");
+        let mut buf = [0u8; 16];
+        assert!(launcher.recv(&mut buf).is_err(), "drain end reported early");
+        assert!(rt.hold_drain_end().is_err());
+
+        assert!(rt.release_drain_end());
+        wait_drain_complete(&rt);
+        launcher.set_nonblocking(false).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    /// A release that arrives while the listener is still finishing a
+    /// request is latched: the drain completes as the listener closes.
+    #[test]
+    fn drain_end_release_is_latched() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        rt.hold_drain_end().unwrap();
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let rid = next_scheduler_rid(&rt);
+        rt.begin_drain(false);
+        assert!(rt.release_drain_end());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(rt.drain_state(), DRAIN_DRAINING);
+        assert!(rt.from_scheduler_tx.push(terminal_token_frame(rid, &[8])));
+        assert!(read_response(streaming).contains("data: [DONE]"));
+        wait_drain_complete(&rt);
+        rt.request_shutdown();
+    }
+
+    /// A forced drain does not wait for the release, whether forced from the
+    /// start or mid-hold, and a shutdown mid-hold still stops the runtime.
+    #[test]
+    fn forced_drain_or_shutdown_ends_a_held_drain() {
+        use std::time::{Duration, Instant};
+
+        for case in ["forced", "forced mid-hold", "shutdown mid-hold"] {
+            let (addr, _) = free_loopback_addrs();
+            let rt = start(test_config(addr, None), None).expect("start runtime");
+            rt.hold_drain_end().unwrap();
+            if case == "forced" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                assert_eq!(
+                    rt.drain_state(),
+                    DRAIN_DRAINING | DRAIN_FORCE_REQUESTED | DRAIN_CLOSED
+                );
+                rt.request_shutdown();
+                continue;
+            }
+            rt.begin_drain(false);
+            wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+            if case == "forced mid-hold" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                rt.request_shutdown();
+            } else {
+                let started = Instant::now();
+                rt.request_shutdown();
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "the held drain kept the runtime from stopping"
+                );
+            }
+        }
     }
 
     /// A response that never finishes (here a control request no scheduler

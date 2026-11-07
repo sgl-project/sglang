@@ -220,6 +220,11 @@ impl CoreHandle {
         self.inner.drain.is_draining()
     }
 
+    /// Whether the drain was begun forced (see [`DrainState::is_forced`]).
+    pub(crate) fn is_drain_forced(&self) -> bool {
+        self.inner.drain.is_forced()
+    }
+
     /// Resolve once the drain has ended (see [`DrainState::ended`]); the
     /// listeners then close.
     pub(crate) async fn drain_ended(&self) -> DrainEnd {

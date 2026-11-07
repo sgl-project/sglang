@@ -100,7 +100,8 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
             tm = SimpleNamespace(
                 crash_dump_folder=folder,
                 crash_dump_performed=False,
-                crash_dump_request_list=deque([finished]),
+                # The finished history is kept pickled: (finish time, bytes).
+                crash_dump_request_list=deque([(finished[3], pickle.dumps(finished))]),
                 rid_to_state={"running": unfinished_state},
                 server_args=SimpleNamespace(watermark_config=None),
                 _server_args_for_dump=lambda: {"model_path": "m"},

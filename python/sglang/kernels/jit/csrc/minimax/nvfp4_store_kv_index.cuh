@@ -63,7 +63,8 @@ SGL_DEVICE uint32_t f32x8_to_e2m1x8(const float (&x)[8]) {
 ///
 /// Reproduces the reference operation order exactly:
 ///   `sf  = rcp(gs) * (amax * rcp(6))`, rounded to E4M3 and read back,
-///   `osc = amax != 0 ? rcp(sf * gs) : 0`,
+///   `osc = sf != 0 ? rcp(sf * gs) : 0`, so a block whose scale underflows
+///   to zero stores an all-zero payload,
 ///   each value scaled by `osc` then `cvt.rn.satfinite.e2m1x2.f32`.
 /// `amax` is exact regardless of reduction order because `fabsf` of a BF16
 /// value is representable in BF16.
@@ -86,7 +87,7 @@ SGL_DEVICE uint64_t quantize_block(const bf16_t* __restrict__ src, float global_
   const __nv_fp8_e4m3 sf_e4m3 = __nv_fp8_e4m3(sf);
   *scale_out = sf_e4m3.__x;
   sf = static_cast<float>(sf_e4m3);
-  const float osc = amax != 0.0f ? rcp_approx(sf * global_scale) : 0.0f;
+  const float osc = sf != 0.0f ? rcp_approx(sf * global_scale) : 0.0f;
 
   float lo[8], hi[8];
 #pragma unroll
