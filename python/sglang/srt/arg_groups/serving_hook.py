@@ -442,6 +442,7 @@ def handle_environment_variables(server_args: Any):
     )
     if cfg.enable_deterministic_inference:
         envs.SGLANG_FLASHINFER_MOE_FUSED_FINALIZE.set("0")
+        envs.SGLANG_ENABLE_MOE_DEFERRED_FINALIZE.set("0")
     if cfg.debug_cuda_graph:
         if not (get_platform().is_cuda or get_platform().is_hip):
             logger.warning(

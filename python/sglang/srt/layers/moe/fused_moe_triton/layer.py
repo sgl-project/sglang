@@ -627,15 +627,24 @@ class FusedMoE(torch.nn.Module):
         self.runner_backend = self.quant_method.get_moe_runner_backend(self)
         self.moe_runner_config.runner_backend = self.runner_backend
         self._set_runner_flags()
-        self.supports_deferred_finalize = (
-            self.runner_backend is not None
-            and self.runner_backend.is_flashinfer_trtllm()
-            and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
-        ) or packed_nvfp4_routed_deferred
+        deterministic_inference = (
+            get_exec().deterministic.enable_deterministic_inference
+        )
+        # Deferred finalize switches the BF16 reduction order across token-count
+        # thresholds (e.g. M <= 192 vs. M > 192), breaking batch invariance.
+        self.supports_deferred_finalize = not deterministic_inference and (
+            (
+                self.runner_backend is not None
+                and self.runner_backend.is_flashinfer_trtllm()
+                and (nvfp4_deferred or qwen35_fp8_deferred or qwen4_bf16_deferred)
+            )
+            or packed_nvfp4_routed_deferred
+        )
         # The routed kernel defers the same way; the standard dispatcher passes
         # the deferred triple through, an A2A combine cannot.
         self.supports_routed_deferred_finalize = (
-            self.runner_backend is not None
+            not deterministic_inference
+            and self.runner_backend is not None
             and self.runner_backend.is_flashinfer_trtllm_routed()
             and nvfp4_deferred
             and get_moe_a2a_backend().is_none()
