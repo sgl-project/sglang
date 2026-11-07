@@ -467,6 +467,55 @@ class TestMegakernelRuntime(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
             lm.context.binding.assert_live()
 
+    def test_prefill_step_uses_prefill_view_not_forward_view(self):
+        """A prefill step must call prefill_view(), not forward_view(forward_batch),
+        and must not seal graph-static tensors (prefill runs eagerly, never captured)."""
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        prefill_step = Step(mode="prefill", rows=8)
+        prefill_built = SimpleNamespace(
+            widths=(4,),
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            speculative_runtime_hooks=None,
+            summary=lambda: "prefill-fake",
+            plan=lambda ids, fb, *a, **kw: prefill_step,
+            forward=lambda step, orig, *a, **kw: ("megakernel", step),
+        )
+        with patch.object(binding, "find_spec", return_value=(SPEC, "")):
+            with patch.object(
+                SPEC.__class__, "build", create=True, return_value=prefill_built
+            ):
+                lm = self._install_spec(
+                    replace(SPEC, build=lambda m, hf, ctx: prefill_built), tokens=1
+                )
+        with (
+            patch.object(MegakernelBinding, "prefill_view", return_value="pview"),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            result = lm(batch(4).input_ids, None, batch(4))
+        tag, ran_step = result
+        self.assertEqual(tag, "megakernel")
+        self.assertEqual(ran_step.mode, "prefill")
+        self.assertEqual(ran_step.view, "pview")
+        MegakernelBinding.forward_view.assert_not_called()
+        MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_decode_step_does_not_call_prefill_view(self):
+        """A decode step must call forward_view(forward_batch) and not prefill_view."""
+        with patch.object(MegakernelBinding, "prefill_view", return_value="pview"):
+            lm = install(tokens=1)
+            forward_batch = batch(4)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ):
+                lm(forward_batch.input_ids, None, forward_batch)
+            MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+            MegakernelBinding.prefill_view.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
