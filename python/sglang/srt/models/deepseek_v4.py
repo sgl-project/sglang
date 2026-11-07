@@ -1223,6 +1223,14 @@ class MqaAttentionBase(nn.Module):
         if self.attn_tp_size == 1:
             return self.n_local_heads
 
+        if _is_npu and self.is_dsv41:
+            from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+            # A3 BF16 SMLA accepts the per-rank width (e.g. TP16/DP8: 32).
+            # The A5 mixed-quant kernel retains its existing 64-head padding.
+            if not is_npu_arch35():
+                return self.n_local_heads
+
         if get_platform().is_sm120:
             # Prefill already accepts the native per-rank query width.
             if num_tokens > SM120_DECODE_MAX_TOKENS:
@@ -2104,7 +2112,9 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 only (see _forward_prepare); V4.1 keeps Q un-normed.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
@@ -2472,7 +2482,12 @@ class MQALayer(MqaAttentionBase):
             q_lora = self.q_norm(q_lora)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            # V4 normalizes each query head (weightless rmsnorm) before RoPE;
+            # V4.1 (q_head_norm False) does not -- its only q norm is the q_lora
+            # one above, matching the reference model's prepare_query. The
+            # ds41-dev port has this line commented out for that reason.
+            if self.q_head_norm:
+                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
 
             if qkv_a is not None:
                 kv = qkv_a[..., self.q_lora_rank :]
@@ -2709,6 +2724,10 @@ class MQALayer(MqaAttentionBase):
             and self.alt_streams is not None
             and x.shape[0] <= self._multi_stream_bs_limit
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
+            # DeepSeek-V4.1 runs the compressor + indexer as one ordered call
+            # (see LowRatioCompressAscendBackendMixin.forward_low_ratio_sources),
+            # which the NPU multi-stream split does not model.
+            and not self.is_dsv41
         )
 
         low_ratio_multi_stream = (
@@ -4291,6 +4310,9 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     input_ids=input_ids,
                     cp_all_tokens=cp_extend,
+                    gate_basis=(
+                        getattr(self, "engram_gate_basis", None) if _is_npu else None
+                    ),
                 )
                 state = state.with_residual(hidden_states)
                 if _is_cuda:
@@ -4683,12 +4705,17 @@ class DeepseekV4Model(nn.Module):
         pre_hc_head = hidden_states.flatten(1)
 
         if self.hc_pre_from_prev_sublayer:
-            from sglang.kernels.ops.layernorm.mhc import mhc_combine
+            if _is_npu:
+                # mhc_combine's Triton kernel is CUDA-only; the premix collapse
+                # is a plain weighted sum, so the NPU path runs it directly.
+                hidden_states = mhc.combine_premix(hidden_states, last_pre)
+            else:
+                from sglang.kernels.ops.layernorm.mhc import mhc_combine
 
-            # The kernel widens each element to fp32 as it loads it.
-            hidden_states = mhc_combine(
-                pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
-            )
+                # The kernel widens each element to fp32 as it loads it.
+                hidden_states = mhc_combine(
+                    pre_hc_head, last_pre, self.hc_mult, hidden_states.dtype
+                )
         else:
             hidden_states = self.hc_head(
                 hidden_states, self.hc_head_fn, self.hc_head_scale, self.hc_head_base
@@ -5154,6 +5181,71 @@ class DeepseekV4ForCausalLM(nn.Module):
                 attn.wo_a.weight_scale_inv.data = raw_scale.contiguous()
                 attn.wo_a.weight_scale_inv.format_ue8m0 = False
 
+    def _load_npu_engram_gate_basis(self) -> None:
+        """Load the ModelSlim sidecar once, shared by this rank's Engram layers."""
+        if (
+            not _is_npu
+            or self.quant_config is None
+            or self.quant_config.get_name() != "modelslim"
+        ):
+            return
+        rotation = getattr(self.config, "engram_rotation_config", None)
+        if not rotation:
+            return
+        expected = {
+            "value_projection_rotated": True,
+            "value_basis": "quarot_global",
+            "key_and_gate_basis": "original",
+            "runtime_delta_rotation": False,
+        }
+        if not isinstance(rotation, dict) or any(
+            rotation.get(key) != value for key, value in expected.items()
+        ):
+            raise ValueError(f"Unsupported ModelSlim Engram rotation: {rotation}")
+        if getattr(self.model, "engram_gate_basis", None) is not None:
+            return
+        engram = next(
+            (
+                layer.engram
+                for layer in self.model.layers
+                if getattr(layer, "engram", None) is not None
+            ),
+            None,
+        )
+        if engram is None:
+            return
+        if engram.q_weight.is_meta:
+            raise ValueError("Load Engram weights before loading the gate rotation")
+
+        from pathlib import Path
+
+        from safetensors import safe_open
+
+        model_path = getattr(self.config, "_name_or_path", None)
+        if not model_path:
+            raise ValueError("ModelSlim Engram rotation requires the checkpoint path")
+        path = Path(model_path) / "optional" / "quarot.safetensors"
+        if not path.is_file():
+            raise FileNotFoundError(f"ModelSlim Engram rotation requires {path}")
+        with safe_open(str(path), framework="pt", device="cpu") as tensors:
+            if "global_rotation" not in tensors.keys():
+                raise ValueError(f"Missing global_rotation in {path}")
+            basis = tensors.get_tensor("global_rotation")
+        dim = self.config.hidden_size
+        if basis.shape != (dim, dim) or not basis.is_floating_point():
+            raise ValueError(
+                f"global_rotation must be a floating-point [{dim}, {dim}] tensor"
+            )
+        basis = basis.float()
+        if not torch.isfinite(basis).all():
+            raise ValueError("global_rotation contains non-finite values")
+        self.model.register_buffer(
+            "engram_gate_basis",
+            basis.to(device=engram.q_weight.device),
+            persistent=False,
+        )
+        logger.info("Loaded ModelSlim Engram gate rotation from %s", path)
+
     def post_load_weights(self, is_nextn=False, weight_names=None):
         if self.wo_a_fp8:
             self._setup_fp8_wo_a_scales(is_nextn)
@@ -5164,6 +5256,7 @@ class DeepseekV4ForCausalLM(nn.Module):
 
         if is_nextn:
             return
+        self._load_npu_engram_gate_basis()
         for layer_id in range(self.model.start_layer, self.model.end_layer):
             layer = self.model.layers[layer_id]
             self_attn = layer.self_attn

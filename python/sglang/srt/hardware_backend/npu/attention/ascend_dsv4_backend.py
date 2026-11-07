@@ -4,7 +4,7 @@ import logging
 import math
 from contextlib import contextmanager
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn.functional as F
@@ -195,24 +195,18 @@ class CompressorAscendBackendMixin:
         )
         # Retain the source object so a recycled Python id cannot collide with
         # a later layout. A new source or padded geometry replaces the cache.
-        setattr(
-            spec_info,
-            "_npu_ragged_verify_bucket_cache",
-            (layout, padded_bs, padded),
-        )
+        spec_info._npu_ragged_verify_bucket_cache = layout, padded_bs, padded
         return padded
 
     @staticmethod
-    def _to_cpu_int_list(values) -> Optional[list[int]]:
+    def _to_cpu_int_list(values) -> list[int] | None:
         if values is None:
             return None
         if isinstance(values, torch.Tensor):
             values = values.cpu().tolist()
         return [int(v) for v in values]
 
-    def _extend_prefix_lens_cpu(
-        self, forward_batch: ForwardBatch
-    ) -> Optional[list[int]]:
+    def _extend_prefix_lens_cpu(self, forward_batch: ForwardBatch) -> list[int] | None:
         prefix_lens = self._to_cpu_int_list(
             getattr(forward_batch, "extend_prefix_lens_cpu", None)
         )
@@ -234,7 +228,7 @@ class CompressorAscendBackendMixin:
         fm = self.forward_metadata
         fm.dsv4_cycle_state_block_table = (
             _build_cycle_state_block_table(forward_batch.req_pool_indices)
-            if is_npu_arch35()
+            if is_npu_arch35() or self._dsv4_has_low_ratio
             else None
         )
         is_decode = forward_batch.forward_mode.is_decode()
@@ -278,6 +272,13 @@ class CompressorAscendBackendMixin:
 
         if _verify_compress:
             self._build_npu_compress_metadata_verify(forward_batch)
+
+        # DeepSeek-V4.1 ratio 1/2 source layers reuse the same three-segment
+        # contract, but there is no allocator bundle to read slots from (see
+        # LowRatioCompressAscendBackendMixin._build_low_ratio_compress_metadata).
+        # V4-only deployments skip this entirely.
+        if getattr(self, "_dsv4_has_low_ratio", False):
+            self._build_low_ratio_compress_metadata(forward_batch)
 
     def _build_npu_compress_metadata_prefill(self, forward_batch: ForwardBatch) -> None:
         # eager-only: prefill is never graph-captured, host reads (cu_cpu) are safe here
@@ -382,7 +383,7 @@ class CompressorAscendBackendMixin:
         req_to_token_pool,
         out_cache_loc_dsv4,
         is_graph: bool = False,
-        seq_lens_max_override: Optional[int] = None,
+        seq_lens_max_override: int | None = None,
     ) -> dict:
         result: dict = {}
         req_pool = req_pool_indices
@@ -593,9 +594,9 @@ class CompressorAscendBackendMixin:
         compressor,
         kv: torch.Tensor,
         forward_batch: ForwardBatch,
-        override_loc: Optional[torch.Tensor] = None,
+        override_loc: torch.Tensor | None = None,
     ) -> None:
-        kv_scale: Optional[torch.Tensor] = None
+        kv_scale: torch.Tensor | None = None
         li_kv_dtype = getattr(compressor, "li_kv_dtype", "bf16")
         # Ascend 950 quantizes and scatters in one fused kernel, so the dequant scale is
         # produced inside indexer_compress_epilog rather than here.
@@ -802,7 +803,7 @@ class C4IndexerAscendBackendMixin:
             )
             if is_prefill:
                 start = 0 if i == 0 else int(end_pos[i - 1])
-                end = int(end_pos[i])
+                end = int(_end_token)
                 index_score = torch.einsum(
                     "shd,td->sht",
                     q[start:end, ...],
@@ -966,7 +967,9 @@ class C4IndexerAscendBackendMixin:
 
 
 class DeepseekV4AscendAttnBackend(
-    AscendAttnBackend, C4IndexerAscendBackendMixin, CompressorAscendBackendMixin
+    AscendAttnBackend,
+    C4IndexerAscendBackendMixin,
+    CompressorAscendBackendMixin,
 ):
     _DSV4_CP_LOCAL_FIELDS = (
         "actual_seq_lengths_q",
@@ -1014,6 +1017,11 @@ class DeepseekV4AscendAttnBackend(
             self._dsv4_compress_ratios = type(hf.compress_ratios)()
         self._dsv4_has_c4 = 4 in self._dsv4_compress_ratios
         self._dsv4_has_c128 = 128 in self._dsv4_compress_ratios
+        # DeepSeek-V4.1 generation signal. Both generations report KVLayout.V4
+        # on NPU, so the ratios themselves are the only discriminator.
+        self._dsv4_has_low_ratio = any(
+            ratio in (1, 2) for ratio in self._dsv4_compress_ratios
+        )
         self._dsv4_sliding_window_size = (
             cfg.sliding_window_size if cfg.sliding_window_size is not None else 128
         )
@@ -1224,9 +1232,9 @@ class DeepseekV4AscendAttnBackend(
         full_fields = {
             field: getattr(fm, field, None) for field in self._DSV4_CP_LOCAL_FIELDS
         }
-        setattr(fm, "dsv4_cp_full_fields", full_fields)
+        fm.dsv4_cp_full_fields = full_fields
 
-        def _select_rows(table: Optional[torch.Tensor]):
+        def _select_rows(table: torch.Tensor | None):
             if table is None:
                 return None
             if local_batch_ids.numel() == 0:
@@ -1424,23 +1432,29 @@ class DeepseekV4AscendAttnBackend(
         metadata.c4_loc = torch.zeros(c4_pad, dtype=torch.int64, device=device)
         metadata.c128_loc = torch.zeros(c128_pad, dtype=torch.int64, device=device)
         metadata.dsv4_max_input_capacity = tokens_per_req
-        metadata.dsv4_cycle_state_block_table = (
-            torch.zeros(bs, dtype=torch.int32, device=device)
-            if is_npu_arch35()
-            else None
-        )
-        metadata.dsv4_explicit_state_block_tables = {
-            ratio: torch.full(
-                (
-                    bs,
-                    (2 if ratio == 4 else 1) * ratio + tokens_per_req,
-                ),
-                state_pool.dummy_state_loc,
-                dtype=torch.int32,
-                device=device,
+        if is_npu_arch35() or self._dsv4_has_low_ratio:
+            metadata.dsv4_cycle_state_block_table = torch.zeros(
+                bs, dtype=torch.int32, device=device
             )
-            for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
-        }
+            # A5 addresses state by request bank (CYCLE), so the explicit
+            # per-ratio location tables are never read. Leave them empty: the
+            # DeepSeek-V4.1 ratio-2 pair pool is a plain CompressStatePool and
+            # has no ``dummy_state_loc`` sentinel to seed them with.
+            metadata.dsv4_explicit_state_block_tables = {}
+        else:
+            metadata.dsv4_cycle_state_block_table = None
+            metadata.dsv4_explicit_state_block_tables = {
+                ratio: torch.full(
+                    (
+                        bs,
+                        (2 if ratio == 4 else 1) * ratio + tokens_per_req,
+                    ),
+                    state_pool.dummy_state_loc,
+                    dtype=torch.int32,
+                    device=device,
+                )
+                for ratio, state_pool in self._dsv4_state_pools_by_ratio.items()
+            }
 
         metadata.positions_cmp_padding_c4 = torch.zeros(
             c4_pad, dtype=torch.int64, device=device
@@ -1457,6 +1471,13 @@ class DeepseekV4AscendAttnBackend(
             "c128a_metadata": self.graph_metadata["kernel_metadata_c128a"],
             "li_quant_metadata": self.graph_metadata["kernel_metadata_li_quant"],
         }
+
+        if self._dsv4_has_low_ratio:
+            # DeepSeek-V4.1: MQSMLA / QLI dispatch tables plus the window and
+            # topk-length tensors the attention and indexer ops consume.
+            self._init_dsv41_graph_metadata(
+                metadata, bs, tokens_per_req, device, forward_batch=forward_batch
+            )
 
         T = n_tok
         metadata.c4_topk_indices = self.graph_metadata["c4_topk_indices"][:T, :]
@@ -1487,7 +1508,7 @@ class DeepseekV4AscendAttnBackend(
             self._graph_table_high_water[key] = c
 
     @staticmethod
-    def _copy_1d_with_zero_tail(dst: torch.Tensor, src: Optional[torch.Tensor]) -> None:
+    def _copy_1d_with_zero_tail(dst: torch.Tensor, src: torch.Tensor | None) -> None:
         if src is None:
             dst.zero_()
             return
@@ -1772,6 +1793,9 @@ class DeepseekV4AscendAttnBackend(
         fm.start_pos.copy_(positions_last.to(torch.int32))
         fm.seqused.copy_(valid.to(torch.int32))
 
+        if self._dsv4_has_low_ratio:
+            self._refresh_graph_dsv41_1d(ctx)
+
     def _refresh_graph_target_verify_compress_1d_direct(self, ctx) -> None:
         fm = ctx.fm
         fm.start_pos.copy_(ctx.live_seq_lens.to(torch.int32))
@@ -1950,6 +1974,18 @@ class DeepseekV4AscendAttnBackend(
 
     def _refresh_graph_kernel_metadata(self, ctx) -> None:
         fm = ctx.fm
+        if self._dsv4_has_low_ratio:
+            # V4.1: the ds41 metadata ops are recomputed and copied into the
+            # graph buffers by the mixin helpers themselves (see their
+            # ``kernel_metadata.get(key)`` refresh).
+            previous = self.forward_metadata
+            self.forward_metadata = fm
+            try:
+                self._dsv41_attention_kernel_metadata(ctx.forward_batch)
+                self._dsv41_index_kernel_metadata(ctx.forward_batch)
+            finally:
+                self.forward_metadata = previous
+            return
         kernel_metadata_new = self._kernel_metadata_from_parts(
             bs=ctx.bs,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
@@ -2016,7 +2052,7 @@ class DeepseekV4AscendAttnBackend(
 
         ctx = self._build_dsv4_graph_replay_ctx(forward_batch)
 
-        if is_npu_arch35():
+        if is_npu_arch35() or self._dsv4_has_low_ratio:
             ctx.fm.dsv4_cycle_state_block_table.copy_(
                 ctx.forward_batch.req_pool_indices[: ctx.bs]
             )
@@ -2031,6 +2067,20 @@ class DeepseekV4AscendAttnBackend(
                 self._clear_graph_target_verify_metadata(ctx)
             elif ctx.active_target_verify:
                 self._refresh_graph_target_verify_compress_1d_direct(ctx)
+            elif self._dsv4_has_low_ratio and not ctx.is_idle_replay:
+                # DeepSeek-V4.1 has no low-ratio verify refresh: the branch above
+                # is gated on c4/c128 (`has_compress`), so `_refresh_graph_dsv41_1d`
+                # only ever runs from the decode arm.  A verify replay would then
+                # scatter the compressed rows of these tokens to the *previous*
+                # step's slots and silently corrupt the compressed / index pools
+                # (the eager path already fails loudly with a missing c{r}_loc).
+                # A5 DSV4.1 has no speculative decoding today; fail loudly rather
+                # than corrupt if one is ever enabled.
+                raise RuntimeError(
+                    "DeepSeek-V4.1 low-ratio graphs have no target-verify "
+                    "metadata refresh (that arm is gated on c4/c128); "
+                    "speculative decoding is not supported for DSV4.1 on NPU."
+                )
 
         self._refresh_graph_explicit_state_block_tables(ctx)
 
@@ -2154,6 +2204,19 @@ class DeepseekV4AscendAttnBackend(
 
     def _compute_kernel_metadata(self, forward_batch: ForwardBatch) -> dict:
         fm = self.forward_metadata
+        # The V4.1 builders below reuse the previous step's graph-allocated
+        # buffers, matched by key and shape, instead of rebinding them; the
+        # attribute therefore has to exist before they read it, while
+        # ``init_forward_metadata`` assigns the result only afterwards.
+        if getattr(fm, "kernel_metadata", None) is None:
+            fm.kernel_metadata = {}
+        if self._dsv4_has_low_ratio:
+            # V4.1 metadata comes from the ds41 operators only: MQSMLA drives the
+            # attention and QLI drives the indexer. The V4 entries (built from
+            # npu_kv_quant_sparse_attn_sharedkv metadata) do not apply.
+            return self._dsv41_attention_kernel_metadata(
+                forward_batch
+            ) | self._dsv41_index_kernel_metadata(forward_batch)
         return self._kernel_metadata_from_parts(
             bs=forward_batch.batch_size,
             actual_seq_lengths_q_pa=fm.actual_seq_lengths_q_pa,
@@ -2269,12 +2332,17 @@ class DeepseekV4AscendAttnBackend(
         forward_batch: ForwardBatch,
         *,
         compress_ratio: int = 0,
-        attn_sink: Optional[torch.Tensor] = None,
+        attn_sink: torch.Tensor | None = None,
         save_kv_cache: bool = True,
     ) -> torch.Tensor:
+        # Generation-exclusive: V4.1 only ever declares compress_ratios in
+        # (0, 1, 2) (recipes configuration_deepseek.py L218), V4 only in
+        # (0, 4, 128). Mixing the two would silently route a ratio to an
+        # operator that has no metadata for it.
         if compress_ratio not in (0, 4, 128):
             raise ValueError(
-                f"V4 attention expects compress_ratio in (0, 4, 128); got {compress_ratio}"
+                "V4 attention expects compress_ratio in (0, 4, 128); "
+                f"V4.1 in (0, 1, 2); got {compress_ratio}"
             )
         # idle ranks only feed the MoE collectives; skip attn + store_cache and return zeros
         if forward_batch.forward_mode.is_idle():
@@ -2295,7 +2363,7 @@ class DeepseekV4AscendAttnBackend(
         q: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        attn_sink: Optional[torch.Tensor],
+        attn_sink: torch.Tensor | None,
     ) -> torch.Tensor:
         fm = self.forward_metadata
         pool = self.token_to_kv_pool
@@ -2333,7 +2401,7 @@ class DeepseekV4AscendAttnBackend(
         q: torch.Tensor,
         layer: RadixAttention,
         forward_batch: ForwardBatch,
-        attn_sink: Optional[torch.Tensor],
+        attn_sink: torch.Tensor | None,
         compress_ratio: int,
     ) -> torch.Tensor:
         fm = self.forward_metadata
@@ -2589,7 +2657,7 @@ class DeepseekV4AscendAttnBackend(
         dst[: indices.numel()].copy_(compressed_positions)
 
     def update_verify_buffers_to_fill_after_draft(
-        self, spec_info, cuda_graph_bs: Optional[int]
+        self, spec_info, cuda_graph_bs: int | None
     ):
         fm = self.forward_metadata
         positions = spec_info.positions
@@ -2623,7 +2691,7 @@ def _get_kv_indices(
     page_table: torch.Tensor,
     req_idx: int,
     seqlen: int,
-    page_size: Optional[int] = None,
+    page_size: int | None = None,
 ) -> torch.Tensor:
     logic_start = max(0, seqlen - kv_len)
     logic_end = seqlen
@@ -2638,6 +2706,8 @@ def _get_kv_indices(
 
 
 class DeepseekV4AscendMultiStepDraftBackend:
+    backend_cls = DeepseekV4AscendAttnBackend
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -2647,7 +2717,7 @@ class DeepseekV4AscendMultiStepDraftBackend:
         self.topk = topk
         self.speculative_num_steps = speculative_num_steps
         self.attn_backends = [
-            DeepseekV4AscendAttnBackend(model_runner, speculative_step_id=step_id)
+            self.backend_cls(model_runner, speculative_step_id=step_id)
             for step_id in range(speculative_num_steps)
         ]
 

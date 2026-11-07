@@ -86,7 +86,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,25 @@ def _cuda_kernels(t: torch.Tensor) -> bool:
     """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
     take the torch paths."""
     return t.is_cuda and (is_cuda() or is_gfx95_supported())
+
+
+def _needs_fp8_byte_view() -> bool:
+    """True on Ascend A5, whose index kernel implements no fp8 dtype: the engram
+    tables there are gathered through a uint8 view; elsewhere they index directly."""
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    return is_npu_arch35()
+
+
+def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
+    """e8m0 bytes -> fp32 as 2**(e - 127), the arithmetic of torch's own cast.
+
+    A5 implements no cast for this dtype either, so the float bits are assembled
+    from the exponent byte -- the same shift the GPU gather kernel applies.
+    """
+    exps = raw.to(torch.int32)
+    # E == 0 is 2**-127, a subnormal, not what zero exponent bits bitcast to.
+    return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
 
 
 def _is_prime(n: int) -> bool:
@@ -1088,7 +1107,7 @@ def _engram_table_is_mxfp4(config) -> bool:
 class EngramEmbedding(nn.Module):
     """One layer's hash table with e8m0 block scales, dequantized on lookup: fp8
     e4m3 rows, or with `mxfp4` E2M1 pairs [rows, dim // 2] as the checkpoint
-    stores them, half the row bytes.
+    stores them, half the row bytes. ModelSlim int8 rows use byte-view scales.
 
     Rows are sharded over the TP group in device memory, aligned to the hash
     columns where they divide evenly (`shard_range`); --engram-config can read
@@ -1105,6 +1124,7 @@ class EngramEmbedding(nn.Module):
         column_bounds: tuple[int, ...],
         *,
         mxfp4: bool = False,
+        storage: dict | None = None,
     ):
         super().__init__()
         self.dim = dim
@@ -1121,6 +1141,28 @@ class EngramEmbedding(nn.Module):
         self.staged_by_scheduler = False
         self.peer: Optional[_PeerShards] = None
         config = resolve_engram_config(len(column_bounds) - 1)
+        int8_storage = storage is not None
+        if int8_storage:
+            if mxfp4:
+                raise ValueError("INT8 Engram storage cannot also use MXFP4 tables")
+            expected = {
+                "format": "int8_sym",
+                "weight_dtype": "I8",
+                "layout": "row_major",
+                "group_size": FP8_BLOCK_SIZE,
+                "axis": 1,
+                "scale_suffix": "scale",
+                "scale_dtype": "F8_E8M0",
+                "weight_shape": [num_embeddings, dim],
+                "scale_shape": [num_embeddings, dim // FP8_BLOCK_SIZE],
+            }
+            if any(storage.get(k) != v for k, v in expected.items()):
+                raise ValueError(f"Unsupported Engram embedding storage: {storage}")
+            if (
+                config.placement == EngramPlacement.CPU
+                or config.lookup == EngramLookup.PEER_READ
+            ):
+                raise ValueError("INT8 Engram requires device-local table shards")
         self.lookup = config.lookup
         self._cols_per_rank = cols_per_rank(len(column_bounds) - 1, self.tp_size)
         if config.lookup == EngramLookup.PEER_READ and self.tp_size > 1:
@@ -1134,12 +1176,19 @@ class EngramEmbedding(nn.Module):
             self._init_host_table(num_embeddings, dim, layer_id, config.replication)
         else:
             self.weight = nn.Parameter(
-                torch.empty(self.rows, self.row_bytes, dtype=_table_dtype(mxfp4)),
+                torch.empty(
+                    self.rows,
+                    self.row_bytes,
+                    dtype=torch.int8 if int8_storage else _table_dtype(mxfp4),
+                ),
                 requires_grad=False,
             )
             self.scale = nn.Parameter(
                 torch.empty(
-                    self.rows, dim // FP8_BLOCK_SIZE, dtype=torch.float8_e8m0fnu
+                    self.rows,
+                    dim // FP8_BLOCK_SIZE,
+                    # A3 has no E8M0 arithmetic; retain the checkpoint bytes.
+                    dtype=torch.uint8 if int8_storage else torch.float8_e8m0fnu,
                 ),
                 requires_grad=False,
             )
@@ -1190,10 +1239,17 @@ class EngramEmbedding(nn.Module):
         return self._host_table_ptrs
 
     def _load_rows(self, param: nn.Parameter, loaded_weight: torch.Tensor):
+        if self.weight.dtype == torch.int8:
+            if param is self.scale:
+                if loaded_weight.dtype not in (torch.float8_e8m0fnu, torch.uint8):
+                    raise ValueError("INT8 Engram scales must contain E8M0 bytes")
+                loaded_weight = loaded_weight.view(torch.uint8)
+            elif loaded_weight.dtype != torch.int8:
+                raise ValueError("INT8 Engram weights must have dtype torch.int8")
         rows = slice(self.row_start, self.row_start + self.rows)
         dst = param.data[rows] if self._shared else param.data
         src = loaded_weight[rows]
-        # uint8 on either side is an MXFP4 table.
+        # Outside ModelSlim INT8 scales, uint8 denotes a packed MXFP4 table.
         src_mxfp4, dst_mxfp4 = src.dtype == torch.uint8, dst.dtype == torch.uint8
         assert src.shape == dst.shape and src_mxfp4 == dst_mxfp4, (
             f"checkpoint engram tensor {src.dtype} {tuple(src.shape)} does not fit "
@@ -1316,11 +1372,26 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local]
+            weight, scale = self.weight, self.scale
+            if weight.dtype == torch.int8:
+                # Only the requested rows are dequantized, using graph-safe
+                # INT8/UINT8 gathers and FP32 arithmetic (no FP8 casts on A3).
+                weight = weight[local]
+                scale = _e8m0_to_float(scale[local])
+            elif _needs_fp8_byte_view():
+                # A5 has neither an fp8 index nor an e8m0 cast, so both tables are
+                # read as bytes and the scale's float bits are built directly.
+                weight = weight.view(torch.uint8)[local]
+                if not self.mxfp4:
+                    weight = weight.view(torch.float8_e4m3fn)
+                scale = _e8m0_to_float(scale.view(torch.uint8)[local])
+            else:
+                weight, scale = weight[local], scale[local].float()
             if self.mxfp4:
-                rows = unpack_mxfp4_rows(rows)
-            rows = rows.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-            values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
+                weight = unpack_mxfp4_rows(weight)
+            values = (
+                weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE)) * scale.unsqueeze(-1)
+            ).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self.new_rows(indices)
         engram_gather(
@@ -1475,6 +1546,7 @@ def engram_gate(
     clamp_value: float,
     input_ids: Optional[torch.Tensor] = None,
     image_token_id: Optional[int] = None,
+    gate_basis: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """x [T, hc_mult, dim]; kv [T, (hc_mult + 1) * dim] holds one key per hc copy
     followed by the shared value. Adds the gated value to every copy, except in rows
@@ -1482,7 +1554,8 @@ def engram_gate(
     # ``kv`` is the wkv projection of the same tokens, so a shape mismatch is a
     # caller bug that ``fused_engram_gate`` asserts on, not a reason to fall back.
     if (
-        _cuda_kernels(x)
+        gate_basis is None
+        and _cuda_kernels(x)
         and x.ndim == 3
         and x.dtype == kv.dtype
         and x.dtype in (torch.bfloat16, torch.float32)
@@ -1497,7 +1570,10 @@ def engram_gate(
     key, value = kv.split([hc_mult * dim, dim], dim=-1)
     key = key.float().unflatten(-1, (hc_mult, dim))
     weight = q_weight.float() * k_weight.float()
-    h = x.float()
+    residual = x.float()
+    # ModelSlim QuaRot exports keep key/gate in the original basis, but
+    # already rotate value. Undo the rotation only for the gate's query.
+    h = residual if gate_basis is None else residual @ gate_basis.T
     # Normalized per (token, hc copy) over dim, not jointly over the copies.
     rstd = torch.rsqrt(h.square().mean(-1) + eps) * torch.rsqrt(
         key.square().mean(-1) + eps
@@ -1505,7 +1581,7 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
-    out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
+    out = (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
     return out
@@ -1528,12 +1604,22 @@ class Engram(nn.Module):
         self.eps = config.rms_norm_eps
         self.clamp_value = 1e-6
         dim, hc_mult = config.hidden_size, config.hc_mult
+        storage = None
+        if is_npu() and quant_config is not None:
+            storage = (
+                getattr(quant_config, "quant_description", {})
+                .get("optional", {})
+                .get("embedding_storage", {})
+                .get("modules", {})
+                .get(f"layers.{layer_id}.engram.embed")
+            )
         self.embed = EngramEmbedding(
             layout.num_embeddings[self.layer_hash_index],
             layout.head_dim,
             layer_id,
             column_bounds=layout.column_bounds(self.layer_hash_index),
             mxfp4=_engram_table_is_mxfp4(config),
+            storage=storage,
         )
         n_hash_cols = (layout.max_ngram_size - 1) * layout.n_heads
         self.wkv = ReplicatedLinear(
@@ -1554,6 +1640,7 @@ class Engram(nn.Module):
         *,
         input_ids: torch.Tensor,
         cp_all_tokens: bool = False,
+        gate_basis: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """x [T, hc_mult, dim]; hash_ids [T, n_hash_cols] and input_ids [T] for this
         layer."""
@@ -1585,6 +1672,7 @@ class Engram(nn.Module):
             self.clamp_value,
             image_ids,
             self.image_token_id,
+            gate_basis,
         )
 
     def embed_rows(

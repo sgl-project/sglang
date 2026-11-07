@@ -73,6 +73,11 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
 
+if is_npu_arch35():
+    from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
+        npu_w8a8_mxfp8_linear,
+    )
+
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
@@ -749,6 +754,14 @@ def dispatch_w8a8_block_fp8_linear(
             deepgemm_w8a8_block_fp8_linear_with_fallback,
             act_scale_ue8m0=act_scale_ue8m0,
         )
+
+    if (
+        weight_block_size == [32, 32]
+        and is_npu_arch35()
+        # Match the load-time MXFP8 conversion gate in Fp8LinearMethod.
+        and (act_scale_ue8m0 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get())
+    ):
+        return npu_w8a8_mxfp8_linear
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
     if weight_block_size is not None and weight_block_size[1] != 128:

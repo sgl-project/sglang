@@ -157,7 +157,12 @@ class ModelSlimConfig(QuantizationConfig):
         super().__init__()
         self.requested_kv_cache_dtype = "auto"
         keys = [k for k in quant_config if isinstance(k, str)]
-        is_dsv4 = any(k.startswith("hc_head_") for k in keys)
+        # Some DSV4 ModelSlim exports omit unquantized hc_head_* entries.
+        is_dsv4 = any(
+            k.startswith("hc_head_")
+            or (k.startswith("layers.") and ".ffn.experts." in k)
+            for k in keys
+        )
         if is_dsv4:
             from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
 
