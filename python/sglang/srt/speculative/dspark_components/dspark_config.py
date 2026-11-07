@@ -31,8 +31,8 @@ def get_dspark_sample_from_anchor(draft_hf_config: Any) -> bool:
     return bool(_cfg_get(draft_hf_config, "sample_from_anchor", True))
 
 
-def draft_is_deepseek_v4() -> bool:
-    from sglang.srt.configs.model_config import is_deepseek_v4
+def draft_uses_compressed_kv_attention() -> bool:
+    from sglang.srt.configs.model_config import uses_compressed_kv_attention
     from sglang.srt.hf_transformers import get_config
 
     draft_model_path = get_spec().speculative_draft_model_path
@@ -45,7 +45,7 @@ def draft_is_deepseek_v4() -> bool:
         model_override_args=json.loads(get_model().json_model_override_args),
         model_config_parser=get_model().model_config_parser,
     )
-    return draft_hf_config is not None and is_deepseek_v4(draft_hf_config)
+    return draft_hf_config is not None and uses_compressed_kv_attention(draft_hf_config)
 
 
 def dspark_gamma_from_num_draft_tokens(num_draft_tokens: int) -> int:
