@@ -114,7 +114,7 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, Marlin W4A16 elsewhere."""
+    """MegaMoE and TRT-LLM experts on SM100, Marlin W4A16 elsewhere."""
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
@@ -123,7 +123,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         super().__init__()
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
-        self.use_marlin = not get_platform().is_blackwell
+        # MegaMoE and the TRT-LLM experts ship SM100-family kernels only, so
+        # SM120 (RTX 50 / RTX PRO Blackwell) takes Marlin as well.
+        self.use_marlin = not get_platform().is_sm100
         self.use_flashinfer_trtllm = (
             not self.use_marlin
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()

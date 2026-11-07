@@ -97,14 +97,14 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
 
 
 def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
-    """MXFP8 KV cache uses operands available only on SM100+ (Blackwell)."""
+    """MXFP8 KV cache runs FA4's FP8 attention, which is built for SM100 only."""
     cfg = resolving_view(server_args)
     if cfg.kv_cache_dtype != "mxfp8":
         return
-    if not get_platform().is_blackwell:
+    if not get_platform().is_sm100:
         raise ValueError(
-            "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
-            "block-scaled operands used by the FA4 MXFP8 attention path."
+            "--kv-cache-dtype mxfp8 requires an SM100-family GPU: the FA4 MXFP8 "
+            "attention path asserts SM10x (SM120 has no FP8 FA4 kernel)."
         )
 
 
