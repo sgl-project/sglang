@@ -180,6 +180,7 @@ class UnifiedRadixCacheStorageFixtures(UnifiedRadixCacheFixtures):
         req.cache_request_handle = req_id
         req.extra_key = extra_key
         req.cache_salt = cache_salt
+        req.storage_prefetch_last_match_len = None
         req.prefix_len = prefix_len
         req.last_node = cache.root_node_handle() if last_node is None else last_node
         joint = cache.match_prefix(
