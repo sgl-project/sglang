@@ -1292,7 +1292,7 @@ def bind_speculative_runtime_hooks(
     The caller's stock strategies are returned by identity when the runtime master
     switch is off or the built provider has no factory. Provider presence must agree
     across ranks before any rank can call it. The provider may change the local key
-    builder, but the runtime-owned verification runner cannot be replaced.
+    builder and checkpoint commit, but cannot replace the verification runner.
     """
     if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
         return defaults
@@ -1317,6 +1317,12 @@ def bind_speculative_runtime_hooks(
         raise ValueError("a provider cannot replace the runtime post-verify runner")
     if not callable(hooks.post_verify.local_keys):
         raise TypeError("post_verify.local_keys must be callable")
+    if hooks.checkpoint_commit is not None and not callable(hooks.checkpoint_commit):
+        raise TypeError("checkpoint_commit must be callable or None")
+    megakernel_agree(
+        hooks.checkpoint_commit is not None,
+        what="checkpoint commit callback presence",
+    )
     return hooks
 
 

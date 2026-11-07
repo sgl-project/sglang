@@ -355,10 +355,38 @@ class PostVerifyStrategy(msgspec.Struct, frozen=True):
         return self.run(io, self.local_keys)
 
 
+class CheckpointCommitView(msgspec.Struct, frozen=True):
+    """Borrowed recurrent checkpoint and history tensors, valid only for this call.
+
+    Returning False must precede all writes. After taking ownership, failures must
+    propagate; the runtime must not replay the stock commit over partial writes.
+    """
+
+    checkpoint: torch.Tensor
+    updates: torch.Tensor
+    keys: torch.Tensor
+    log_decays: torch.Tensor
+    update_residuals: Optional[torch.Tensor]
+    key_residuals: Optional[torch.Tensor]
+    state_indices: torch.Tensor
+    history_indices: torch.Tensor
+    history_lengths: torch.Tensor
+    history_offsets: torch.Tensor
+    fold_mask: torch.Tensor
+    accepted_lengths: torch.Tensor
+    track_state_indices: Optional[torch.Tensor]
+    track_steps: Optional[torch.Tensor]
+    null_index: int
+
+
+CheckpointCommit = Callable[[CheckpointCommitView], bool]
+
+
 class SpeculativeRuntimeHooks(msgspec.Struct, frozen=True):
     """The provider-adjustable strategy around speculative verification."""
 
     post_verify: PostVerifyStrategy
+    checkpoint_commit: Optional[CheckpointCommit] = None
 
 
 HooksFactory = Callable[[SpeculativeRuntimeHooks], SpeculativeRuntimeHooks]
