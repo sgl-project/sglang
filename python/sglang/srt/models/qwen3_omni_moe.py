@@ -41,7 +41,10 @@ from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem
-from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.model_loader.weight_utils import (
+    default_weight_loader,
+    maybe_remap_kv_scale_name,
+)
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from sglang.srt.models.qwen3_vl_moe import (
     Qwen3MoeLLMModel,
@@ -605,6 +608,11 @@ class Qwen3OmniMoeForConditionalGeneration(PreTrainedModel):
                 continue
 
             name = name.replace(".self_attn.out_proj", ".self_attn.proj")
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if "experts.gate_up_proj" in name or "experts.down_proj" in name:

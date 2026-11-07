@@ -340,8 +340,11 @@ def create_fused_set_kv_buffer_arg(
     k_buffer, v_buffer = kv.key(), kv.value()
 
     if not _is_hip:
-        # CUDA path.
-        assert layer.k_scale is None and layer.v_scale is None, "scale not supported"
+        # CUDA path. It stores K/V unscaled; KV-cache scales only matter for a
+        # quantized pool (enable_fused_set_kv_buffer allows bf16 pools only).
+        assert (layer.k_scale is None and layer.v_scale is None) or (
+            token_to_kv_pool.dtype == torch.bfloat16
+        ), "scale not supported"
         return FusedSetKVBufferArg(
             value=value,
             k_buffer=k_buffer.view(k_buffer.shape[0], -1),
