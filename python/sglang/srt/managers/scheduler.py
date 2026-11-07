@@ -2709,7 +2709,7 @@ class Scheduler(
         return {}
 
     def init_pool_stats_observer(self) -> None:
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         storage = kv_storage_of(
@@ -2810,13 +2810,13 @@ class Scheduler(
             maxlen=PAUSE_WINDOWS_MAX
         )
         self._pause_started_at: Optional[float] = None
-        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        global_tokens = self.max_total_num_tokens
         if is_cp_sharded_padded():
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
-            # The worker reports logical DCP capacity; add KV shard widening.
+            # The worker already reports logical DCP/page-interleave capacity.
             max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
@@ -2970,9 +2970,8 @@ class Scheduler(
         )
         # PrefillAdder reserves one page per shard; the allocator reserves one.
         # Subtract the other N - 1 pages to keep queue admission schedulable.
-        token_capacity = (
-            self.max_total_num_tokens * self.kv_shard_widening
-            - self.page_size * (self.kv_shard_widening - 1)
+        token_capacity = self.max_total_num_tokens - self.page_size * (
+            self.kv_shard_widening - 1
         )
         if is_cp_sharded_padded():
             token_capacity = from_cp_sharded(token_capacity)

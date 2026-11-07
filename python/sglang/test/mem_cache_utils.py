@@ -20,6 +20,7 @@ def routed(pool):
     that reads and writes through ``kv_layers`` reaches the stand-in's methods."""
     from unittest.mock import Mock
 
+    from sglang.srt.layers.attention.qsa import cache_sharding
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
     from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 
@@ -30,5 +31,6 @@ def routed(pool):
         pool, "layer_transfer_counter"
     ):
         pool.layer_transfer_counter = None
+    pool.cache_sharding_runtime = cache_sharding.QSACacheShardingRuntime(1, 0, None)
     pool.layer_router = PlainPoolRouter(pool, IdSpaceKind.FULL)
     return pool

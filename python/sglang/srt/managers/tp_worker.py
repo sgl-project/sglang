@@ -45,7 +45,6 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
@@ -548,10 +547,7 @@ class TpModelWorker(BaseTpWorker):
 
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
-        kv_capacity = (
-            self.model_runner.effective_logical_max_total_num_tokens
-            * page_interleave_shard_size(self.model_runner.token_to_kv_pool_allocator)
-        )
+        kv_capacity = self.model_runner.effective_logical_max_total_num_tokens
         if is_cp_sharded_padded():
             kv_capacity = from_cp_sharded(kv_capacity)
         # Not an error: a deployment that never sends max-length requests may
