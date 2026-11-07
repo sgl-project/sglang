@@ -20,13 +20,14 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 
 # trtllm_mha kernels are sm100-only; run this kernel-unit test on Blackwell.
@@ -95,6 +96,7 @@ def make_xqa_backend(monkeypatch):
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
             is_draft_worker=False,
+            server_args=SimpleNamespace(enable_nvidia_megakernel=False),
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -579,6 +581,7 @@ def test_cuda_graph_metadata_launch_runs_in_graph_hook(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64),
         out_cache_loc=torch.arange(2, dtype=torch.int64),
@@ -617,6 +620,7 @@ def test_draft_extend_in_graph_uses_captured_static_q_stride(monkeypatch):
         req_pool_indices=torch.arange(2, dtype=torch.int64),
         seq_lens=torch.ones(2, dtype=torch.int32),
         forward_mode=ForwardMode.DRAFT_EXTEND_V2,
+        ragged_verify_layout=None,
         spec_info=SimpleNamespace(
             num_tokens_per_req=4,
             num_accept_tokens=ExplodingAcceptTokens(),
@@ -683,7 +687,9 @@ def _assert_reads_only_current_pages(backend, v2p, bs=2):
         )
 
 
-def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
+def _graph_batch(
+    seq_lens, forward_mode, spec_info, tokens_per_req, ragged_verify_layout=None
+):
     seq_lens = torch.tensor(seq_lens, dtype=torch.int32)
     bs = seq_lens.numel()
     return SimpleNamespace(
@@ -693,6 +699,7 @@ def _graph_batch(seq_lens, forward_mode, spec_info, tokens_per_req):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=ragged_verify_layout,
         positions=torch.arange(bs * tokens_per_req, dtype=torch.int64),
         # The window it writes; the reads under test do not depend on its ids.
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
@@ -757,6 +764,7 @@ def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
         seq_lens_cpu=seq_lens.clone(),
         forward_mode=forward_mode,
         spec_info=spec_info,
+        ragged_verify_layout=None,
         input_ids=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         out_cache_loc=torch.zeros(bs * tokens_per_req, dtype=torch.int64),
         extend_seq_lens=seq_lens,
@@ -805,7 +813,7 @@ def _bind_iteration_plan(runner_ids, forward_batch, window=4):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
         (ForwardMode.DRAFT_EXTEND_V2, SimpleNamespace(num_tokens_per_req=4), 0, 4),
     ],
     ids=["draft_decode", "target_verify", "draft_extend"],
@@ -844,10 +852,16 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     backend = _make_backend_for_hook_test(speculative_num_draft_tokens=4)
     backend.is_xqa_impl = False
     monkeypatch.setattr(backend, "_write_ragged_verify_graph_metadata", write_ragged)
-    spec_info = SimpleNamespace(ragged_verify_layout=object())
+    spec_info = SimpleNamespace()
 
     def batch(seq_lens):
-        return _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, spec_info, 8)
+        return _graph_batch(
+            seq_lens,
+            ForwardMode.TARGET_VERIFY,
+            spec_info,
+            8,
+            ragged_verify_layout=object(),
+        )
 
     # 123 + 7 crosses a page boundary that 123 plus the uniform draft width does not.
     _replay_and_check_every_read(
@@ -863,7 +877,7 @@ def test_unified_ragged_verify_reads_only_this_replays_pages(monkeypatch):
     "forward_mode,spec_info,step_id,tokens_per_req",
     [
         (ForwardMode.DECODE, SimpleNamespace(), 1, 1),
-        (ForwardMode.TARGET_VERIFY, SimpleNamespace(ragged_verify_layout=None), 0, 4),
+        (ForwardMode.TARGET_VERIFY, SimpleNamespace(), 0, 4),
     ],
     ids=["draft_decode", "target_verify"],
 )
@@ -953,6 +967,7 @@ def test_metadata_update_records_inside_cuda_graph():
         req_pool_indices=torch.arange(2, dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([3, 4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.arange(2, dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.arange(2, dtype=torch.int64, device=DEVICE),
@@ -1000,6 +1015,7 @@ def test_graph_read_done_event_fences_slot_mutation():
         req_pool_indices=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         seq_lens=torch.tensor([4], dtype=torch.int32, device=DEVICE),
         forward_mode=ForwardMode.DECODE,
+        ragged_verify_layout=None,
         spec_info=None,
         positions=torch.tensor([0], dtype=torch.int64, device=DEVICE),
         out_cache_loc=torch.tensor([3], dtype=torch.int64, device=DEVICE),
@@ -1387,6 +1403,97 @@ def test_bs_zero_noop():
         max_seq_pages=0,
         page_size=PAGE_SIZE,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 16, 128])
+def test_shared_draft_metadata_reads_what_each_step_writes(bs):
+    """A shared last-step table and one lengths launch reproduce every step's metadata."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    steps, pool_size, max_num_pages = 5, 160, 16
+    req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
+        bs, pool_size, max_num_pages, None, (max_num_pages - 2) * PAGE_SIZE, 4321 + bs
+    )
+    seq_lens[0] = PAGE_SIZE - 2  # the later steps cross into the next page
+    common = dict(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        bs=bs,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+    )
+    want = []
+    for step in range(steps):
+        lens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        cu_lens = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+        update_trtllm_mha_graph_metadata(
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            page_table=table,
+            seqlen_offset=step + 1,
+            **common,
+        )
+        want.append((lens, cu_lens, table))
+
+    lens = torch.zeros(steps, bs, dtype=torch.int32, device=DEVICE)
+    cu_lens = torch.zeros(steps, bs + 1, dtype=torch.int32, device=DEVICE)
+    table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+    update_trtllm_mha_graph_metadata(
+        cache_seqlens=lens[-1],
+        cu_seqlens_k=cu_lens[-1],
+        page_table=table,
+        seqlen_offset=steps,
+        **common,
+    )
+    update_draft_step_seqlens(
+        seq_lens=seq_lens,
+        cache_seqlens=lens,
+        cu_seqlens_k=cu_lens,
+        bs=bs,
+        steps=steps - 1,
+        first_offset=1,
+    )
+    torch.cuda.synchronize()
+    for step, (want_lens, want_cu, want_table) in enumerate(want):
+        assert torch.equal(lens[step], want_lens)
+        assert torch.equal(cu_lens[step], want_cu)
+        for row in range(bs):
+            live = -(-int(want_lens[row]) // PAGE_SIZE)
+            assert torch.equal(table[row, :live], want_table[row, :live])
+
+
+@pytest.mark.parametrize(
+    "runtime_optimization,steps,swa,translating,expected",
+    [
+        (False, 3, False, False, False),
+        (True, 1, False, False, False),
+        (True, 3, True, False, False),
+        (True, 3, False, True, False),
+        (True, 3, False, False, True),
+    ],
+)
+def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
+    monkeypatch, runtime_optimization, steps, swa, translating, expected
+):
+    """The generic runtime switch, never plugin presence, owns metadata sharing."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+
+    backends = [
+        SimpleNamespace(
+            use_sliding_window_kv_pool=swa,
+            runner_ids=SimpleNamespace(is_translating=translating),
+        )
+        for _ in range(max(steps, 1))
+    ]
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(runtime_optimization):
+        assert (
+            TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(backends, steps)
+            is expected
+        )
 
 
 if __name__ == "__main__":

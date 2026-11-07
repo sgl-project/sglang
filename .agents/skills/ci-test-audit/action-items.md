@@ -70,7 +70,7 @@ un-skip them; skips older than the issue they were waiting on; registrations nam
 retired `runner_config`; registered files whose TestCase classes never execute. Not
 this pattern: a hardware-conditional skip (`skipUnless` on compute capability), which is
 a gate; or a `disabled=` whose linked issue is still open, which is doing its job.
-Examples: #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
+Examples: #47603, #32324, #39368, #38585, #34377, #33772, #34779, #33654, #34070.
 
 ---
 
@@ -86,9 +86,12 @@ Examples: #34074, #33654, #33605, #34913, #35220.
 Spot: a multi-GPU accuracy suite registered per-commit whose failures have never been
 PR-specific; a nightly job that has been green for weeks, occupies several GPUs per run,
 and whose coverage a weekly run would hold just as well; a retired platform still
-running daily. Demoting is not
-deleting -- the nightly and weekly grids exist to hold this coverage at the right cost.
-Examples: #38011, #37990, #33809, #36814, #37532, #34204, #37586, #31749.
+running daily; a model test on a per-commit or extra tier for a model that is old, little
+used (check its downloads), or superseded by a newer model in its family on the same model
+file. Demoting is not deleting -- the nightly and weekly grids exist to hold this coverage
+at the right cost. The tier policy is in
+[write-sglang-test, Choosing a Tier](../write-sglang-test/SKILL.md#choosing-a-tier).
+Examples: #47619, #38011, #37990, #33809, #36814, #37532, #34204, #37586, #31749.
 
 **B3. Declared cost matches measured cost; shard counts and timeouts derive from it.**
 Spot: an `est_time` off from the measured run by an order of magnitude (the partitioner
@@ -221,7 +224,9 @@ copy of the package under test taking precedence over the working tree. Examples
 **F3. Repeated work inside the test process is cut.**
 Spot: a checker that re-parses the whole package on every scan; a fixture that reloads a
 tokenizer or model per case; independent subprocesses run serially; lint environments
-rebuilt on every run. Examples: #36240, #36235, #36241, #37203, #34309.
+rebuilt on every run; a suite of short files where each file pays the same import
+(measure the common test import with `python -X importtime` before reading test content).
+Examples: #47592, #36240, #36235, #36241, #37203, #34309.
 
 **F4. Work whose precondition already holds is skipped: installs, disk reclamation, cache refreshes.**
 Spot: unconditional installs; a skip check whose matching is too strict to fire on real

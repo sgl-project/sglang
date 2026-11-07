@@ -19,6 +19,10 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
+
 # color
 CYAN = "\033[1;36m"
 RED = "\033[91m"
@@ -566,7 +570,9 @@ def log_generation_timer(
             timer.duration,
         )
     except Exception as e:
-        if request_idx is not None:
+        if isinstance(e, RequestCancelledError):
+            logger.info("Stopped generation: %s", e)
+        elif request_idx is not None:
             logger.error(
                 "Failed to generate output for prompt %d: %s",
                 request_idx,

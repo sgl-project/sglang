@@ -29,7 +29,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
-from sglang.srt.mem_cache.unified_radix_cache import NodeId, UnifiedRadixCache
+from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -261,7 +262,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
         super().on_release(req, checkpointed=checkpointed)
         if not checkpointed:
-            self.release_aborted_request(req.cache_request_handle)
+            self._abandon_attempt(req.cache_request_handle)
 
     def checkpoint(self, req: Req, *, up_to: int, **kwargs) -> None:
         self._publish_external_loaded_prefix(req, token_ids_len=up_to)
@@ -319,7 +320,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
     def has_pending_cache_operations(self) -> bool:
         return bool(self._external_flows or self._pending_stores)
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         rid = handle.rid
         self.prefetch_loaded_tokens_by_reqid.pop(handle, None)
         self.prefetch_loaded_storage_start_by_reqid.pop(handle, None)
@@ -761,7 +762,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         if flow is None or flow.load is None:
             return
         tree_owned_len = flow.load.local_hit_tokens + flow.loaded_skip_tokens
-        req.kv.cache_protected_len = min(req.kv.cache_protected_len, tree_owned_len)
+        req.kv.protect_prefix(min(req.kv.cache_protected_len, tree_owned_len))
         if self.is_swa_enabled:
             external_tokens = len(flow.load.device_indices)
             swa_missing_end = flow.load.local_hit_tokens + max(
@@ -809,7 +810,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
                 value=kv_indices[:total_hit].to(dtype=torch.int64, copy=True),
                 mamba_value=checkpoint,
                 prev_prefix_len=prev_prefix_len,
-                component_evicted_seqlens=req.kv.component_evicted_seqlens.copy(),
+                component_evicted_seqlens=req.kv.copy_evicted_seqlens(),
                 inserted_len=len(key),
                 priority=req.priority or 0,
             )
@@ -839,7 +840,7 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         # Move the request lock to the published boundary.
         self.unlock(req.lock)
         req.lock = self.lock(matched.last_device_node)
-        req.kv.cache_protected_len = total_hit
+        req.kv.protect_prefix(total_hit)
         req.last_node = matched.last_device_node
         flow.request_mamba_value = None
         flow.allocated_request_mamba_for_load = False
