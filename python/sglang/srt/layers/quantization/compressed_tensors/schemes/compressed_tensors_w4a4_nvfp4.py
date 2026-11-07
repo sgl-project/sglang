@@ -17,7 +17,9 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsLinearScheme,
 )
 from sglang.srt.layers.quantization.fp4_utils import (
+    apply_fused_global_scale_ratio,
     fp4_quantize,
+    fused_global_scale_ratio,
     get_fp4_gemm_runner_backend,
 )
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -97,9 +99,12 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
         global_input_scale = layer.input_global_scale.max().to(torch.float32)
         layer.input_global_scale = Parameter(global_input_scale, requires_grad=False)
 
-        layer.weight_global_scale = Parameter(
-            layer.weight_global_scale.max().to(torch.float32), requires_grad=False
+        # The GEMM takes one weight global scale per layer; fused projections
+        # (q/k/v, gate/up) whose scales differ get theirs back on the output.
+        global_scale, layer.fused_global_scale_ratio = fused_global_scale_ratio(
+            layer.weight_global_scale.data, layer.logical_widths, divisor=True
         )
+        layer.weight_global_scale = Parameter(global_scale, requires_grad=False)
 
         if get_fp4_gemm_runner_backend().is_flashinfer_trtllm():
             # FlashInfer TRTLLM FP4 GEMM requires a different weight layout.
@@ -165,6 +170,9 @@ class CompressedTensorsW4A4Fp4(CompressedTensorsLinearScheme):
             layer.alpha,
             output_dtype,
             w_n,
+        )
+        out = apply_fused_global_scale_ratio(
+            out, getattr(layer, "fused_global_scale_ratio", None)
         )
         if bias is not None:
             out = out + bias
