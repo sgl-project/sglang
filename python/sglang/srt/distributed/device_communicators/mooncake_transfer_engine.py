@@ -198,7 +198,8 @@ class MooncakeTransferEngine:
         device_name: Optional[str],
     ) -> None:
         """Initialize the mooncake instance."""
-        if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
+        use_ascend_transport = envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get()
+        if use_ascend_transport:
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
             suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
             hostname += f":{get_free_port()}:npu_{suffix}"
@@ -208,16 +209,34 @@ class MooncakeTransferEngine:
             # Default is "rdma"; set MOONCAKE_PROTOCOL=efa on AWS EFA hardware.
             protocol = envs.MOONCAKE_PROTOCOL.get()
 
-        ret_value = run_with_deadline(
-            lambda: self.engine.initialize(
+        if use_ascend_transport:
+            # The Ascend direct transport binds its device context on the sglang
+            # side via ``torch.npu.set_device``, and that selection is
+            # thread-local: a ``run_with_deadline`` worker thread would not
+            # inherit the device ``bootstrap.py`` set on this thread
+            # (https://github.com/pytorch/pytorch/issues/56588), and init would
+            # fail with "Mooncake Transfer Engine initialization failed.".
+            # Initialize on the current thread -- the same one bootstrap and the
+            # later register/transfer calls run on -- matching the
+            # memfabric-based ``AscendTransferEngine``. This trades the init
+            # timeout guard for correct device affinity on NPU.
+            ret_value = self.engine.initialize(
                 hostname,
                 "P2PHANDSHAKE",
                 protocol,
                 device_name if device_name is not None else "",
-            ),
-            timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
-            what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
-        )
+            )
+        else:
+            ret_value = run_with_deadline(
+                lambda: self.engine.initialize(
+                    hostname,
+                    "P2PHANDSHAKE",
+                    protocol,
+                    device_name if device_name is not None else "",
+                ),
+                timeout_s=envs.SGLANG_DISAGGREGATION_ENGINE_INIT_TIMEOUT.get(),
+                what=f"Mooncake TransferEngine.initialize({hostname!r}, {protocol!r}, {device_name!r})",
+            )
         if ret_value != 0:
             logger.error("Mooncake Transfer Engine initialization failed.")
             raise RuntimeError("Mooncake Transfer Engine initialization failed.")
