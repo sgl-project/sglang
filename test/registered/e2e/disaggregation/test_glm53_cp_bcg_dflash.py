@@ -1,4 +1,4 @@
-"""GLM CP4/BCG prefill -> TP4 DFlash2 decode, with padding and cached prefixes."""
+"""GLM CP4/BCG prefill -> TP4 decode with DFlash2 or MTP, with padding and cached prefixes."""
 
 import unittest
 
@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import popen_with_error_check, try_cached_model
 
-register_cuda_ci(est_time=900, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
 
 COMMON_ARGS = [
     "--dsa-prefill-backend",
@@ -23,10 +23,6 @@ COMMON_ARGS = [
     "fp8_e4m3",
     "--moe-runner-backend",
     "flashinfer_trtllm",
-    "--speculative-algorithm",
-    "DFLASH",
-    "--speculative-draft-attention-backend",
-    "fa4",
     "--reasoning-parser",
     "auto",
     "--tool-call-parser",
@@ -60,11 +56,21 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
     decode_base_gpu_id = 4
 
     @classmethod
+    def speculative_args(cls):
+        return [
+            "--speculative-algorithm",
+            "DFLASH",
+            "--speculative-draft-attention-backend",
+            "fa4",
+            "--speculative-draft-model-path",
+            try_cached_model("incoai/GLM-5.3-Flash-DFlash2"),
+        ]
+
+    @classmethod
     def setUpClass(cls):
         super().setUpClass()
         cls.model = try_cached_model("zai-org/GLM-5.3-Flash")
-        draft = try_cached_model("incoai/GLM-5.3-Flash-DFlash2")
-        common = COMMON_ARGS + ["--speculative-draft-model-path", draft]
+        common = COMMON_ARGS + cls.speculative_args()
         cls.extra_prefill_args = common + [
             "--attn-cp-size",
             str(cls.prefill_tp_size),
@@ -217,6 +223,49 @@ class TestGlm53CpBcgDflashPD(PDDisaggregationServerBase, GSM8KMixin):
             if line.startswith("sglang:cuda_graph_passes_total{")
             and 'mode="prefill_cuda_graph"' in line
         )
+
+
+class TestGlm53CpBcgMtpPD(TestGlm53CpBcgDflashPD):
+    """Native MTP: the CP prefill runs the draft extend and hands decode its seed."""
+
+    @classmethod
+    def speculative_args(cls):
+        return [
+            "--speculative-algorithm",
+            "EAGLE",
+            "--speculative-num-steps",
+            "5",
+            "--speculative-eagle-topk",
+            "1",
+            "--speculative-num-draft-tokens",
+            "6",
+        ]
+
+    def test_first_verify_uses_prefill_draft_seed(self):
+        # Two new tokens: one from prefill, then exactly one decode verify whose
+        # drafts start from the top-k, hidden state and DSA seed the CP prefill
+        # sent. A wrong handoff leaves the drafts of that verify unaccepted.
+        for url in (self.prefill_url, self.decode_url):
+            requests.post(
+                url + "/flush_cache", params={"timeout": 30}, timeout=60
+            ).raise_for_status()
+        lengths = [257, 1027, 4099, 16421]
+        response = requests.post(
+            self.lb_url + "/generate",
+            json={
+                "input_ids": [self._prompt(length) for length in lengths],
+                "sampling_params": {"temperature": 0, "max_new_tokens": 2},
+            },
+            timeout=600,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        for length, output in zip(lengths, response.json(), strict=True):
+            meta = output["meta_info"]
+            print(f"first verify: length={length}, meta={meta}")
+            self.assertEqual(meta["spec_verify_ct"], 1, f"length={length}")
+            self.assertGreaterEqual(
+                meta["spec_num_correct_drafts"], 3, f"length={length}"
+            )
 
 
 if __name__ == "__main__":

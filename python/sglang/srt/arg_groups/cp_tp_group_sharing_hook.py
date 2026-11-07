@@ -93,13 +93,13 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         }
     elif arch == "Glm5NextForConditionalGeneration":
         if cfg.disaggregation_mode != "null":
+            # Decode pairs with this prefill as plain TP whether it runs no
+            # speculation or one of the algorithms the check above admits.
             unsupported |= {
                 "disaggregation-mode decode": cfg.disaggregation_mode == "decode",
                 "disaggregation-transfer-backend != mooncake": (
                     cfg.disaggregation_transfer_backend != "mooncake"
                 ),
-                "speculative-algorithm != DFLASH": cfg.speculative_algorithm
-                != "DFLASH",
                 "pp-size > 1": cfg.pp_size > 1,
                 "dp-size > 1": cfg.dp_size > 1,
                 "ep-size > 1": view.ep_size > 1,
