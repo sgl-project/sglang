@@ -40,6 +40,7 @@ class TestDsaEagerMetadataNoHostSync(unittest.TestCase):
             use_mha=False,
             get_topk_transform_method=lambda _: TopkTransformMethod.PAGED,
             dsa_index_kpool=1,
+            dsa_shards_index_k=False,
             dsa_index_topk=4,
             physical_page_size=1,
             get_device_int32_arange=lambda n: torch.arange(n, dtype=torch.int32),
