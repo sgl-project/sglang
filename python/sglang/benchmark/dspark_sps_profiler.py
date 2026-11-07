@@ -115,7 +115,7 @@ class ServerContext(msgspec.Struct, frozen=True):
     base_url: str
     tokenizer_path: str
     tp_size: int
-    dp_size: int
+    num_dp_ranks: int
     verify_num_draft_tokens: int
     simulate_acc_len: float
     cuda_graph_max_bs: Optional[int]
@@ -482,11 +482,11 @@ def fetch_server_context(
         )
 
     internal_state = internal_states[0]
-    dp_size = int(internal_state.get("dp_size") or 1)
+    num_dp_ranks = num_dp_ranks_from_internal_state(internal_state)
     cuda_graph_max_bs = resolve_cuda_graph_max_bs(internal_state=internal_state)
     max_running_per_dp = internal_state.get("effective_max_running_requests_per_dp", -1)
     if max_running_per_dp and max_running_per_dp > 0:
-        skip_max_running = float(max_running_per_dp * dp_size)
+        skip_max_running = float(max_running_per_dp * num_dp_ranks)
     else:
         logger.warning(
             "Server did not report effective_max_running_requests_per_dp (%s); "
@@ -505,12 +505,25 @@ def fetch_server_context(
         base_url=base_url,
         tokenizer_path=tokenizer_path,
         tp_size=int(info.get("tp_size", 1) or 1),
-        dp_size=dp_size,
+        num_dp_ranks=num_dp_ranks,
         verify_num_draft_tokens=verify_num_draft_tokens.pop(),
         simulate_acc_len=REQUIRED_SIMULATE_ACC_LEN,
         cuda_graph_max_bs=cuda_graph_max_bs,
         skip_max_running_requests_threshold=skip_max_running,
         skip_token_capacity_threshold=skip_token_capacity,
+    )
+
+
+def num_dp_ranks_from_internal_state(internal_state: dict) -> int:
+    """Replicas times attention-DP groups, as in `num_dp_ranks_of`.
+
+    /server_info reports one internal state (one scheduler) per DP rank, and
+    `effective_max_running_requests_per_dp` is a single rank's cap, so every
+    server-wide total has to scale by this count. Plain `dp_size` misses the
+    attention-DP factor whenever `--attn-dp-size` splits a replica.
+    """
+    return (internal_state.get("dp_size", None) or 1) * (
+        internal_state.get("attn_dp_size", None) or 1
     )
 
 
@@ -625,7 +638,7 @@ def run_one_round(
     rng: random.Random,
     frac: Optional[float] = None,
 ) -> Optional[RoundOutcome]:
-    batch_size = batch_size_per_rank * context.dp_size
+    batch_size = batch_size_per_rank * context.num_dp_ranks
     max_new_tokens = round_max_new_tokens(settings=settings)
     if should_skip_due_to_max_running_requests(
         batch_size, context.skip_max_running_requests_threshold
@@ -696,7 +709,7 @@ def run_one_round(
     return postprocess_round(
         rank_rows=new_rank_rows,
         batch_size_per_rank=batch_size_per_rank,
-        dp_size=context.dp_size,
+        num_dp_ranks=context.num_dp_ranks,
         verify_num_draft_tokens=context.verify_num_draft_tokens,
         min_steady_steps=settings.min_steady_steps,
         load_info=LoadInfo(
@@ -877,19 +890,19 @@ def postprocess_round(
     *,
     rank_rows: list[list[SpsRow]],
     batch_size_per_rank: int,
-    dp_size: int,
+    num_dp_ranks: int,
     verify_num_draft_tokens: int,
     min_steady_steps: int,
     load_info: LoadInfo,
     frac: Optional[float] = None,
 ) -> RoundOutcome:
     offdiag = frac is not None
-    batch_size = batch_size_per_rank * dp_size
+    batch_size = batch_size_per_rank * num_dp_ranks
     expected_tokens = batch_size_per_rank * verify_num_draft_tokens
 
-    if len(rank_rows) != dp_size:
+    if len(rank_rows) != num_dp_ranks:
         raise RuntimeError(
-            f"Expected records from {dp_size} DP ranks, got {len(rank_rows)}."
+            f"Expected records from {num_dp_ranks} DP ranks, got {len(rank_rows)}."
         )
 
     by_ct_per_rank: list[dict[int, SpsRow]] = []
@@ -1272,7 +1285,7 @@ def write_manifest(
     manifest = {
         "base_url": context.base_url,
         "tp_size": context.tp_size,
-        "dp_size": context.dp_size,
+        "num_dp_ranks": context.num_dp_ranks,
         "verify_num_draft_tokens": context.verify_num_draft_tokens,
         "simulate_acc_len": context.simulate_acc_len,
         "batch_size_per_rank_sweep": batch_sizes,
@@ -1393,8 +1406,8 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=None,
         help="Explicit PER-DP-RANK running-request counts to sweep; the load "
-        "generator sends value * dp_size requests so every rank (GPU group) "
-        "sits at the given batch. Overrides --max-batch-size when given.",
+        "generator sends value * num_dp_ranks requests so every rank (GPU "
+        "group) sits at the given batch. Overrides --max-batch-size when given.",
     )
     parser.add_argument(
         "--max-batch-size",
@@ -1402,7 +1415,7 @@ def add_run_args(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_MAX_BATCH_SIZE,
         help="Upper bound of the auto-generated tapered PER-DP-RANK "
         "request-count sweep (used only when --batch-size is not given), so "
-        "per-rank token coverage is identical for any dp_size.",
+        "per-rank token coverage is identical for any num_dp_ranks.",
     )
     parser.add_argument(
         "--input-len",
