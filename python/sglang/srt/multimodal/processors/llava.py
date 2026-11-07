@@ -1,5 +1,6 @@
 import asyncio
 import os
+import traceback
 from concurrent.futures.process import BrokenProcessPool
 from typing import Dict, List, Optional, Union
 
@@ -20,6 +21,12 @@ from sglang.srt.models.llava import (
 )
 from sglang.srt.models.llavavid import LlavaVidForCausalLM
 from sglang.srt.models.mistral import Mistral3ForConditionalGeneration
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    get_image_bytes,
+    load_image,
+)
 from sglang.srt.multimodal.mm_utils import (
     ensure_numpy,
     expand2square,
@@ -27,14 +34,7 @@ from sglang.srt.multimodal.mm_utils import (
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    ImageData,
-    get_image_bytes,
-    load_image,
-    logger,
-)
-from sglang.utils import get_exception_traceback
+from sglang.srt.utils import logger
 
 
 class LlavaImageProcessor(BaseMultimodalProcessor):
@@ -101,7 +101,7 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
         except CLIENT_MEDIA_EXCEPTIONS as error:
             raise ValueError(f"Error while processing image: {error}") from error
         except Exception:
-            logger.error("Exception in TokenizerManager:\n" + get_exception_traceback())
+            logger.error("Exception in TokenizerManager:\n" + traceback.format_exc())
             raise
 
     async def _fetch_remote_image_bytes(self, url):

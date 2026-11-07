@@ -67,7 +67,7 @@ def _get_state() -> Optional[_State]:
     else:
         # Auto-probe: only SM100/SM103, and not under --enable-symm-mem or EP
         # a2a (their allocator contexts misroute the buffers the pull needs).
-        from sglang.srt.utils.common import get_device_sm
+        from sglang.srt.utils.device import get_device_sm
 
         if get_device_sm() not in (100, 103):
             return None

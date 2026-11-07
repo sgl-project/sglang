@@ -11,12 +11,8 @@ import triton.language as tl
 
 from sglang.srt.layers.deep_gemm_wrapper.configurer import ENABLE_JIT_DEEPGEMM
 from sglang.srt.utils import is_gfx95_supported, is_npu
-from sglang.srt.utils.common import (
-    calc_diff,
-    get_bool_env_var,
-    get_device_core_count,
-    get_dispatch_device_backend,
-)
+from sglang.srt.utils.common import calc_diff, get_bool_env_var
+from sglang.srt.utils.device import get_device_core_count, get_dispatch_device_backend
 
 _is_npu = is_npu()
 _is_gfx95 = is_gfx95_supported()
@@ -1240,30 +1236,22 @@ def disable_batch_invariant_mode():
 
 @contextlib.contextmanager
 def set_batch_invariant_mode(enabled: bool = True):
-    global _batch_invariant_MODE, _batch_invariant_LIB, _original_torch_bmm
-    # enable_batch_invariant_mode() also replaces torch.bmm; restore it on exit,
-    # or every later torch.bmm in the process stays batch-invariant.
-    old_data = (
-        _batch_invariant_MODE,
-        _batch_invariant_LIB,
-        _original_torch_bmm,
-        torch.bmm,
-    )
-    if enabled:
-        enable_batch_invariant_mode()
-    else:
-        disable_batch_invariant_mode()
+    previous_mode = _batch_invariant_MODE
+    previous_bmm_enabled = _original_torch_bmm is not None
     try:
+        if enabled:
+            enable_batch_invariant_mode()
+        else:
+            disable_batch_invariant_mode()
         yield
     finally:
-        if _batch_invariant_LIB is not None:
-            _batch_invariant_LIB._destroy()
-        (
-            _batch_invariant_MODE,
-            _batch_invariant_LIB,
-            _original_torch_bmm,
-            torch.bmm,
-        ) = old_data
+        if (_batch_invariant_MODE, _original_torch_bmm is not None) != (
+            previous_mode,
+            previous_bmm_enabled,
+        ):
+            disable_batch_invariant_mode()
+            if previous_mode:
+                enable_batch_invariant_mode(enable_bmm=previous_bmm_enabled)
 
 
 AttentionBlockSize = namedtuple("AttentionBlockSize", ["block_m", "block_n"])

@@ -1929,7 +1929,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_sampling_backend_default_pass(self):
-        from sglang.srt.utils.common import is_flashinfer_available
+        from sglang.srt.utils.device import is_flashinfer_available
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"

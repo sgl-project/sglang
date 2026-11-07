@@ -150,10 +150,10 @@ repos:
         language: system
         files: ^(python|test)/.*\.py$
       - id: check-srt-utils-imports
-        name: reject srt domain-package imports at module level in sglang.srt.utils
+        name: reject srt domain imports in sglang.srt.utils and sglang.utils imports in the runtime
         entry: python3 scripts/lint/check_srt_utils_imports.py
         language: system
-        files: ^(python/sglang/srt/utils/.*\.py|scripts/lint/check_srt_utils_imports\.py)$
+        files: ^(python/sglang/(srt|kernels)/.*\.py|scripts/lint/check_srt_utils_imports\.py)$
         pass_filenames: false
       - id: rustfmt-sgl-model-gateway
         name: rustfmt sgl-model-gateway (nightly)

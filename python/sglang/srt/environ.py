@@ -1630,7 +1630,6 @@ class Envs:
     SGLANG_MINICPM_DENSE_AS_SPARSE = EnvBool(False)
     SGLANG_MINICPM_FORCE_DENSE = EnvBool(False)
 
-    SGLANG_USE_SGL_FA3_KERNEL = EnvBool(True)
     # Force every sglang.kernels BaseFusedOp onto one backend (a KernelBackend
     # value, e.g. "torch" / "torch_compile" / "triton" / "helion" / "aot"); unset =
     # auto-select by priority. "torch" flips all fused ops to their pure-torch
@@ -2459,6 +2458,13 @@ class Envs:
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
     SGLANG_K31_FUSED_ROUTING = EnvBool(True)
+
+    # ===================================================================
+    # ERNIE 5.5
+    # ===================================================================
+    # Fusions not bit-exact with the eager ops: the input RMSNorm into mhc_pre,
+    # and the VHA postmix into the wo_a fp8 quant.
+    SGLANG_OPT_ERNIE5_5_FUSE_INEXACT = EnvBool(True)
 
     # ===================================================================
     # Symmetric memory

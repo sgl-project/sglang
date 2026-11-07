@@ -104,7 +104,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import is_npu, rank_consensus_checker
-from sglang.srt.utils.common import async_d2h
+from sglang.srt.utils.device import async_d2h
 
 if TYPE_CHECKING:
     from sglang.srt.managers.io_struct import AbortReq

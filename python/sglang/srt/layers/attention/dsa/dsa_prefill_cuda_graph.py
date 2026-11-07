@@ -120,7 +120,7 @@ def pcg_dsa_indexer_prefill_split(
         )
         return
 
-    # Fused path stores K (no-Hadamard) and computes q_fp8 + head gate in the
+    # Fused path stores K and computes q_fp8 + head gate in the
     # fused kernels, sliced to the unpadded count. Single stream: the split op is
     # captured, so the dual-stream overlap is disabled.
     if indexer.use_dsa_indexer_fusion and not in_cp:
@@ -165,7 +165,7 @@ def pcg_dsa_indexer_prefill_split(
             query, gate, indexer.softmax_scale, indexer.scale_fmt
         )
     else:
-        q_fp8, q_scale = act_quant(query, indexer.block_size, indexer.scale_fmt)
+        q_fp8, q_scale = indexer._quantize_query(query, act_quant)
         weights = (
             indexer._scale_head_gates(weights_raw, q_scale)
             if indexer.use_dsa_indexer_fusion

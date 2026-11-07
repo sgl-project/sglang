@@ -54,9 +54,10 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     snapshot_chain,
 )
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 from sglang.srt.utils.invariants import expect, resolve_level
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
 

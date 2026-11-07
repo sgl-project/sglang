@@ -50,6 +50,7 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -73,8 +74,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
-from sglang.utils import is_in_ci
+from sglang.srt.utils.device import is_cuda_alike
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -595,7 +595,7 @@ def _find_local_hf_snapshot_dir_unlocked(
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
+    if envs.SGLANG_IS_IN_CI.get() and local_weight_files:
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -691,7 +691,7 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        if not is_in_ci():
+        if not envs.SGLANG_IS_IN_CI.get():
             # Simple download without validation for non-CI environments
             hf_folder = snapshot_download(
                 model_name_or_path,
