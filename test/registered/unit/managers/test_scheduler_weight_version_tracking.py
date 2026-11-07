@@ -160,7 +160,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.metrics_reporter = MagicMock()
         scheduler.enable_fpm = False
         scheduler._maybe_clear_mm_inputs = MagicMock()
-        scheduler.maybe_send_health_check_signal = MagicMock()
+        scheduler.health_monitor = MagicMock()
         return scheduler
 
     def _batch(self) -> ScheduleBatch:

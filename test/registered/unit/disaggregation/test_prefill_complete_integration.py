@@ -535,7 +535,6 @@ class TestAllocationIntegration(CustomTestCase):
             optimistic_release_and_requeue=Mock(),
             prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
             metrics_reporter=SimpleNamespace(report_prefill_stats=Mock()),
-            maybe_send_health_check_signal=Mock(),
         )
 
         SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
