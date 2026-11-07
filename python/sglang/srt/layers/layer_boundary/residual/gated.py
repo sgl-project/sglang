@@ -47,6 +47,9 @@ class GatedResidualState:
         ffn_combine: Writes the FFN output back into the streams.
         attn_reads_every_row: Whether attn_mix needs every row of the
             attention's, as a contribution computed for all of them does.
+        ffn_combine_mix: Optional fused attention write-back + FFN read; returns
+            (ffn_input, (residual, normed, gate_partials)), or None to take
+            attn_combine then ffn_mix.
     """
 
     expand: Callable
@@ -55,6 +58,7 @@ class GatedResidualState:
     attn_combine: Callable
     ffn_combine: Callable
     attn_reads_every_row: bool = False
+    ffn_combine_mix: Optional[Callable] = None
     # Produced by a stage's read and consumed by that same stage's write-back.
     normed: Optional[torch.Tensor] = None
     gate_partials: Optional[torch.Tensor] = None
@@ -73,6 +77,13 @@ class GatedResidualState:
         return self._read(self.attn_mix, residual, out_norm)
 
     def update_and_read_ffn_input(self, hidden_states, residual, out_norm=None):
+        if out_norm is None and self.ffn_combine_mix is not None:
+            fused = self.ffn_combine_mix(
+                hidden_states, (residual, self.normed, self.gate_partials)
+            )
+            if fused is not None:
+                hidden_states, (residual, self.normed, self.gate_partials) = fused
+                return hidden_states, residual
         residual = self.apply_attn_combine(hidden_states, residual)
         return self._read(self.ffn_mix, residual, out_norm)
 
@@ -93,7 +104,10 @@ class GatedResidualState:
     def slice_residual_attn_tp(self, residual):
         parallel = get_parallel()
         rank, size = parallel.attn_tp_rank, parallel.attn_tp_size
-        self.normed = self.normed.tensor_split(size)[rank]
+        from sglang.srt.layers.hyperconnection import SEAM_NORMED
+
+        if self.normed is not SEAM_NORMED:
+            self.normed = self.normed.tensor_split(size)[rank]
         if self.gate_partials is not None:
             self.gate_partials = self.gate_partials.tensor_split(size)[rank]
         return residual.tensor_split(size)[rank]

@@ -1571,6 +1571,7 @@ class Qwen4ExpLayerExtensionMixin:
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         linear_attention: bool = False,
+        is_nextn: bool = False,
     ) -> None:
         self.hc_count = config.hc_count
         self.hidden_size = config.hidden_size
@@ -1609,15 +1610,19 @@ class Qwen4ExpLayerExtensionMixin:
             rms_norm_eps=config.rms_norm_eps,
             hc_per_branch_norm=True,
         )
+        # MTP draft layers keep the existing path until the HC seam is
+        # validated with speculative decoding.
         self.attn_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            seam=not is_nextn,
         )
         self.mlp_hyper_connection = GatedResidual(
             hc_config,
             use_mix=True,
             use_combine=True,
+            seam=not is_nextn,
         )
         self.attn_boundary, self.ffn_boundary = _build_qwen4_exp_stages(
             config,
@@ -1628,6 +1633,7 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_mix=self._ffn_mix,
                 attn_combine=self._attn_combine,
                 ffn_combine=self._ffn_combine,
+                ffn_combine_mix=self.mlp_hyper_connection.seam_combine_mix,
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
             ).residual_ops(),
@@ -1797,7 +1803,12 @@ class Qwen4ExpLinearDecoderLayer(
             build_stages=False,
         )
         self._init_qwen4_exp_layer_extensions(
-            config, layer_id, quant_config, prefix, linear_attention=True
+            config,
+            layer_id,
+            quant_config,
+            prefix,
+            linear_attention=True,
+            is_nextn=is_nextn,
         )
 
     def forward(
@@ -1854,7 +1865,9 @@ class Qwen4ExpAttentionDecoderLayer(
                 prefix=f"{prefix}.indexer" if prefix else "indexer",
                 rotary_emb=self.rotary_emb,
             )
-        self._init_qwen4_exp_layer_extensions(config, layer_id, quant_config, prefix)
+        self._init_qwen4_exp_layer_extensions(
+            config, layer_id, quant_config, prefix, is_nextn=is_nextn
+        )
 
     def _compute_qsa_topk_indices(
         self,
@@ -2072,7 +2085,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
             hc_per_branch_norm=True,
         )
         self.hyper_connection_mixer = (
-            GatedResidual(hc_config, use_combine=False)
+            GatedResidual(hc_config, use_combine=False, seam=not is_nextn)
             if self.pp_group.is_last_rank
             else PPMissingLayer()
         )
