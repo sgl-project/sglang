@@ -258,7 +258,12 @@ from sglang.srt.managers.scheduler_components.batch_result_processor import (
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    DRAIN_STATE_NO_LISTENER,
+    MLP_SYNC_CARRIES_DRAIN_STATE,
+    SchedulerDPAttnAdapter,
+    should_skip_scheduler_all_gather,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -271,7 +276,6 @@ from sglang.srt.managers.scheduler_components.internal_state import (
     SchedulerInternalStateController,
 )
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    CheckPhase,
     SchedulerInvariantChecker,
     create_scheduler_watchdog,
 )
@@ -319,6 +323,7 @@ from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -349,6 +354,7 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -766,6 +772,8 @@ class Scheduler(
         self.init_grammar_manager()
 
         self.maybe_init_scripted_scheduler_hook()
+
+        self.maybe_init_mm_feature_receive_budget()
 
         self.init_request_receiver()
 
@@ -2143,7 +2151,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            self.invariant_checker.run(CheckPhase.BUSY)
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2217,7 +2225,7 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            self.invariant_checker.run(CheckPhase.BUSY)
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
@@ -2410,7 +2418,7 @@ class Scheduler(
             local_error = None
             try:
                 if not isinstance(tokenized_req.mm_inputs, MultimodalInputs):
-                    tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
+                    tokenized_req.mm_inputs = self.mm_feature_receive_budget.materialize(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
@@ -2489,6 +2497,15 @@ class Scheduler(
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
 
+    def maybe_init_mm_feature_receive_budget(self) -> None:
+        self.mm_feature_receive_budget = None
+        if get_mm().mm_feature_transport == "cuda_vmm":
+            self.mm_feature_receive_budget = ReceiveFeatureBudget(
+                device_index=torch.cuda.current_device(),
+                # Reserved per rank out of the KV budget by mm_runtime_reservation_gb.
+                gpu_budget_bytes=envs.SGLANG_MM_FEATURE_CACHE_MB.get() << 20,
+            )
+
     def maybe_init_scripted_scheduler_hook(self) -> None:
         if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
             from sglang.test.scripted_runtime.scheduler_hook import (
@@ -2541,7 +2558,8 @@ class Scheduler(
             self, frontend_cpu_share=frontend_cpu_share
         )
         rust_server.install_sigterm_drain(
-            notify=drain_notify_name(port_args.instance_id)
+            notify=drain_notify_name(port_args.instance_id),
+            hold_drain_end=self._holds_rust_drain_end(),
         )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
@@ -2552,6 +2570,31 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
+
+    def _holds_rust_drain_end(self) -> bool:
+        """Whether this listener's drain ends only once every attention-DP
+        listener closed (``RustServer.on_drain_rows``): its ``ShutdownReq``
+        stops every rank. The DP groups share their drain state through the
+        MLP-sync gather of every step, which PP > 1 and
+        ``SGLANG_SCHEDULER_SKIP_ALL_GATHER`` do not run."""
+        parallel = get_parallel()
+        if parallel.attn_dp_size == 1 or parallel.tp_rank != 0:
+            return False
+        if (
+            parallel.dp_size == 1
+            and len(self.rust_server_endpoints) == parallel.attn_dp_size
+            and self.require_mlp_sync
+            and not should_skip_scheduler_all_gather(parallel.num_dp_ranks)
+            and parallel.pp_size == 1
+            and MLP_SYNC_CARRIES_DRAIN_STATE
+        ):
+            return True
+        logger.warning(
+            "rust server: no per-step MLP-sync gather between the attention-DP "
+            "listeners; DP rank 0's drain ends once its own listener closed, so "
+            "the other DP listeners' last requests may be cut"
+        )
+        return False
 
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
         return UocrPrefillAdder if self.uocr_runtime is not None else PrefillAdder
@@ -2637,7 +2680,20 @@ class Scheduler(
             get_require_mlp_sync=lambda: self.require_mlp_sync,
             get_shutting_down=lambda: self.gracefully_exit,
             on_peer_shutdown=self.handle_peer_shutdown,
+            **self._dp_drain_column_callbacks(),
         )
+
+    def _dp_drain_column_callbacks(self) -> dict:
+        """The listener drain state this rank gathers (``DPDrainColumn``), and
+        on a listener-hosting rank what to do with every DP group's."""
+        if self.rust_server is not None:
+            return dict(
+                get_drain_state=self.rust_server.drain_state,
+                on_drain_rows=self.rust_server.on_drain_rows,
+            )
+        if envs.SGLANG_RUST_SERVER.get():
+            return dict(get_drain_state=lambda: DRAIN_STATE_NO_LISTENER)
+        return {}
 
     def init_pool_stats_observer(self) -> None:
         global_tokens = self.max_total_num_tokens * self.kv_shard_widening
@@ -2672,7 +2728,6 @@ class Scheduler(
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_last_batch=lambda: self.last_batch,
             get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
             get_running_batches=lambda: (
@@ -5896,6 +5951,7 @@ class Scheduler(
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
+            self.invariant_checker.run(CheckPhase.FLUSH)
             success = True
         else:
             logging.warning(
