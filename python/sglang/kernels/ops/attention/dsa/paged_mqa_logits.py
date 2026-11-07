@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from __future__ import annotations
 
+import functools
 from collections.abc import Callable
 
 import torch
@@ -92,6 +93,16 @@ def deepgemm_paged_mqa_logits_split(
     return _restore_row_stride(logits)
 
 
+@functools.cache
+def _gluon_paged_mqa_logits():
+    """The in-tree gfx950 module, or None where Triton has no gluon AMD backend."""
+    try:
+        from sglang.kernels.ops.attention.dsa import gluon_paged_mqa_logits
+    except Exception:  # noqa: BLE001 - no gluon AMD backend / no ROCm device
+        return None
+    return gluon_paged_mqa_logits
+
+
 def aiter_paged_mqa_logits(
     q_fp8: torch.Tensor,
     kv_cache_fp8: torch.Tensor,
@@ -103,7 +114,15 @@ def aiter_paged_mqa_logits(
     preshuffle: bool,
     kv_block_size: int,
 ) -> torch.Tensor:
-    from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+    # gfx950 decode / MTP-verify rows: the in-tree re-tuned kernel (see
+    # gluon_paged_mqa_logits.py); everything else keeps aiter's.
+    gluon = _gluon_paged_mqa_logits()
+    if gluon is not None and gluon.supported(
+        q_fp8, kv_cache_fp8, preshuffle=preshuffle, kv_block_size=kv_block_size
+    ):
+        fn = gluon.gluon_fp8_paged_mqa_logits
+    else:
+        from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits as fn
 
     q_fp8 = q_fp8.unsqueeze(1)
     batch_size, next_n, _, _ = q_fp8.shape
@@ -112,7 +131,7 @@ def aiter_paged_mqa_logits(
         device=q_fp8.device,
         dtype=torch.float32,
     )
-    deepgemm_fp8_paged_mqa_logits(
+    fn(
         q_fp8,
         kv_cache_fp8,
         weights,
