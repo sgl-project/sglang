@@ -84,6 +84,16 @@ def _unsupported_derived_weight_cache_error(
     return None
 
 
+def _direct_weight_update_error(model: torch.nn.Module) -> Optional[str]:
+    """Direct updates skip the model's ``load_weights`` and ``post_load_weights``,
+    so buffers those hooks rebuild in place would keep serving the old weights."""
+    for module in model.modules():
+        reason = getattr(module, "_direct_weight_update_error", None)
+        if reason is not None:
+            return reason
+    return None
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class WeightUpdater:
     tp_rank: int
@@ -358,6 +368,8 @@ class WeightUpdater:
         load_format: Optional[str] = None,
     ):
         error = _unsupported_derived_weight_cache_error(self.get_model())
+        if error is None and load_format == "direct":
+            error = _direct_weight_update_error(self.get_model())
         if error is not None:
             return False, error
 
