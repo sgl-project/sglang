@@ -63,6 +63,7 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedEmbeddingMethod
+from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
@@ -122,7 +123,17 @@ def _ple_table_is_fp8(
     if quant_config is None:
         return False
     if quant_config.get_name() == "fp8":
-        return True
+        # Checkpoint shards share one table, so they must agree on precision.
+        return not is_layer_skipped(
+            prefix,
+            quant_config.ignored_layers,
+            fused_mapping={
+                "ngram_embedding": [
+                    f"ngram_embedding.shard_{i}"
+                    for i in range(int(getattr(config, "split_ngram_parts", 512)))
+                ]
+            },
+        )
     if isinstance(quant_config, ModelOptMixedPrecisionConfig):
         return quant_config.resolve_quant_algo(prefix) == "FP8"
     return False
