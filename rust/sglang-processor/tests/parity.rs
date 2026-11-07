@@ -58,6 +58,7 @@ fn check(fixture: &Value) {
             tokenizer.as_ref(),
             encoder.as_ref(),
             &fixture["bos_token_id"],
+            fixture["is_multimodal"].as_bool().unwrap_or(false),
             case,
         );
         // `known_gap` marks a divergence the processor cannot fix itself, such as one
@@ -76,8 +77,21 @@ fn check_case(
     tokenizer: Option<&Tokenizer>,
     encoder: Option<&ChatFormatter>,
     bos: &Value,
+    is_multimodal: bool,
     case: &Value,
 ) -> Result<(), String> {
+    // `_validate_media_content` rejects images on text-only servers before
+    // rendering. Formatter support alone does not make a loaded model multimodal.
+    if !is_multimodal
+        && sglang_processor::extract_images(&case["request"]["messages"])
+            .is_ok_and(|images| !images.is_empty())
+    {
+        return if case["error"].is_null() {
+            Err("text-only model rejects images".into())
+        } else {
+            Ok(())
+        };
+    }
     let defaults: HashMap<String, Value> = (case["default_chat_template_kwargs"].as_object())
         .map(|defaults| defaults.clone().into_iter().collect())
         .unwrap_or_default();
@@ -89,6 +103,12 @@ fn check_case(
         };
     }
     let (prompt, prefix) = rendered.map_err(|error| error.to_string())?;
+    if let Some(expected) = case.get("image_sources") {
+        let images = formatter.extract_images(&case["request"]["messages"])?;
+        if serde_json::json!(images) != *expected {
+            return Err(format!("image sources differ: {images:?}"));
+        }
+    }
     let text = prompt.as_str().to_owned() + &prefix;
     if text != case["prompt"] {
         return Err(format!("prompt differs: {text}"));

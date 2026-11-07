@@ -1,7 +1,7 @@
 //! GLM-5.3 prompts as SGLang's `serving_chat.py` renders them with the
 //! checkpoint's Jinja template, on Dynamo's template formatter.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
@@ -10,6 +10,7 @@ use super::pydantic_dump::{
     continues_final_message, engine_message, normalize_tools, split_continuation,
 };
 use crate::render::RenderError;
+use crate::render::media;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
 /// `apply_chat_template` arguments SGLang passes itself: as kwargs they fail the
@@ -50,9 +51,10 @@ pub(crate) fn render(
 ) -> Result<(String, String), RenderError> {
     let args = template_args(&request, defaults)?;
     let tools = template_tools(&request)?;
-    let Some(Value::Array(messages)) = request.get_mut("messages").map(Value::take) else {
+    let Some(Value::Array(mut messages)) = request.get_mut("messages").map(Value::take) else {
         return Err("messages must be an array".into());
     };
+    canonicalize_tool_message_order(&mut messages);
     let mut messages = messages
         .into_iter()
         .map(template_message)
@@ -180,7 +182,11 @@ fn template_message(message: Value) -> Result<Value, RenderError> {
             .iter()
             .filter(|part| !matches!(part["type"].as_str(), Some("thinking" | "reasoning")))
             .map(|part| match part["type"].as_str() {
-                Some("text") => Ok(json!({"type": "text", "text": part["text"]})),
+                Some("text" | "input_text") => Ok(json!({"type": "text", "text": part["text"]})),
+                Some("image_url" | "input_image") => {
+                    media::image_url(part).ok_or("image content part has no image_url url")?;
+                    Ok(json!({"type": "image"}))
+                }
                 Some("tool_reference") => {
                     Ok(json!({"type": "tool_reference", "name": part["name"]}))
                 }
@@ -200,6 +206,71 @@ fn template_message(message: Value) -> Result<Value, RenderError> {
             };
     }
     Ok(message)
+}
+
+/// GLM's template associates tool results by id. Collect their images after
+/// the same canonicalization used for rendering, as `_apply_jinja_template`
+/// does before `process_content_for_template_format`.
+pub(crate) fn extract_images(messages: &Value) -> Result<Vec<String>, String> {
+    let mut messages = messages.clone();
+    if let Some(messages) = messages.as_array_mut() {
+        canonicalize_tool_message_order(messages);
+    }
+    media::extract_images(&messages)
+}
+
+/// `serving_chat._canonicalize_tool_message_order`: only media-bearing runs
+/// with unambiguous ids are sorted, including partial runs and legacy
+/// `function` results. Text-only and malformed runs keep their order.
+fn canonicalize_tool_message_order(messages: &mut [Value]) {
+    let mut index = 0;
+    while index < messages.len() {
+        let assistant = index;
+        index += 1;
+        if messages[assistant]["role"] != "assistant" {
+            continue;
+        }
+        let Some(calls) = messages[assistant]["tool_calls"]
+            .as_array()
+            .filter(|calls| !calls.is_empty())
+        else {
+            continue;
+        };
+        let start = index;
+        while index < messages.len()
+            && matches!(messages[index]["role"].as_str(), Some("tool" | "function"))
+        {
+            index += 1;
+        }
+        let positions: Option<HashMap<String, usize>> = calls
+            .iter()
+            .enumerate()
+            .map(|(index, call)| Some((call["id"].as_str()?.to_owned(), index)))
+            .collect();
+        let Some(positions) = positions.filter(|positions| positions.len() == calls.len()) else {
+            continue;
+        };
+        let run = &mut messages[start..index];
+        let mut result_ids = HashSet::new();
+        let valid_ids = run.iter().all(|message| {
+            message["tool_call_id"]
+                .as_str()
+                .is_some_and(|id| positions.contains_key(id) && result_ids.insert(id))
+        });
+        let has_media = run.iter().any(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("image_url" | "input_image" | "video_url" | "audio_url")
+                    )
+                })
+            })
+        });
+        if valid_ids && has_media {
+            run.sort_by_key(|message| positions[message["tool_call_id"].as_str().unwrap()]);
+        }
+    }
 }
 
 /// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must

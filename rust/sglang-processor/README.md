@@ -63,13 +63,14 @@ select_chat_formatter(&ChatFormatterOptions) -> (Option<ChatFormatter>, Option<S
 load_chat_formatter(tokenizer_config, model_path, model_type, chat_template) -> Result<ChatFormatter, TemplateError>
 ChatFormatter::render_prompt(&dyn OAIChatLikeRequest) -> Result<RenderedPrompt, TemplateError>
 ChatFormatter::render_request(serde_json::Value, &default_kwargs) -> Result<(RenderedPrompt, String), TemplateError>  // DeepSeek-V4, V4.1, GLM-5.3, Kimi K3, Qwen3.8
+ChatFormatter::extract_images(&messages) -> Result<Vec<String>, String>  // source order matches the formatter's placeholders
 ChatFormatter::deepseek_v4(v41, tokenizer_json) -> Result<ChatFormatter, String>
 ChatFormatter::encode_request(serde_json::Value, &default_kwargs) -> Option<Result<Vec<u32>, TemplateError>>  // DeepSeek-V4, V4.1
 ChatFormatter::resolve_thinking(&mut kwargs, tools_enabled, named_tool_choice) -> Option<bool>
 ChatFormatter::stop_strs() -> Option<OneOrMany<String>>
 requested_effort(&body) -> Option<&Value>
 requested_thinking(&body) -> Option<bool>
-extract_images(&messages) -> Vec<String>
+extract_images(&messages) -> Result<Vec<String>, String>  // original message order
 ```
 
 `select_chat_formatter` (`selection.rs`) picks a formatter from
@@ -117,7 +118,7 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 | `legacy/` | `parser/conversation.py` | Replaces Dynamo: a native port of `Conversation.get_prompt()`, the built-in templates, and model-path inference. |
 | `models/deepseek_v4.rs` | `entrypoints/openai/serving_deepseek_recipe.py`, `parser/deepseek_recipe_renderer.py` | Replaces the OAI formatter. It applies SGLang's request semantics (thinking, request and default effort, the env effort, V4.1 numeric budgets, the final assistant turn, `task`, the handler's tool dumps) around deepseek-recipe's Chat Completions conversion and V4 / V4.1 encodings. Media is left to the engine. |
 | `models/pydantic_dump.rs` | `protocol.py` | The message, tool-call and tool dumps that GLM-5.3, Kimi K3, MiniMax-M3 and Qwen3.8 render from. |
-| `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
+| `models/glm53.rs` | `serving_chat.py` (`_process_messages`, `_apply_jinja_template`, `_canonicalize_tool_message_order`), `template_detection.py` | Picked by the template (`_is_glm53`). Builds the template context SGLang builds (message and tool dumps, parsed tool arguments, kwargs over the effort, server defaults), then renders it with Dynamo's Jinja formatter, text parts concatenated as the template does. Normalizes images and orders media-bearing tool results by call id before rendering and image collection. Other media, a `chat_template` kwarg, `-0` and U+001C..U+001F in assistant content are left to the engine. |
 | `models/kimi_k25.rs` | the Kimi K2.5 checkpoint's tool encoder | Adds `tools_ts_str` (TypeScript tool declarations) to the kwargs before the Jinja render. |
 | `models/kimi_k3.rs` | `serving_chat.py` (`_prepare_kimi_k3_messages`, `_encode_messages`), the checkpoint's `encoding_k3.py` | Replaces the OAI formatter's request handling. It prepares the messages, tools, thinking effort, `tool_choice` and `response_format` as SGLang does, then calls Dynamo's `KimiK3Formatter`. Shapes Dynamo renders differently are left to the engine. |
 | `models/minimax_m3.rs` | `serving_chat.py` (`_validate_minimax_m3_request`, `_normalize_minimax_m3_request`, `_canonicalize_tool_message_order`, `_apply_jinja_template`), `template_detection.py` | Picked by `model_type == "minimax_m3_vl"` (`is_minimax_m3`), or by the template (`_is_minimax_m3`) without a `config.json`, for M3 and M3.1. Rejects what SGLang's M3 contract rejects (the `thinking` type, a `reasoning_effort` outside low/medium/high/xhigh/max, a `root` message not first, unanswered or unmatched tool calls), maps `thinking` onto `thinking_mode` and settles the effort before and after the server defaults, sorts tool results into tool-call order, and renders with Dynamo's Jinja formatter, tool-argument floats printed as Python prints them. Media, `tool_reference` parts in tool results or alone in a turn, floats in tool schemas, `-0` in tool arguments, and a `chat_template` kwarg are left to the engine. |
@@ -125,8 +126,9 @@ once, for the renderer and DeepSeek-V4 and V4.1 alike. The SGLang additions hook
 
 `extract_images` (`media.rs`) lists a chat's image sources (`image_url` and
 `input_image` parts) in message then part order, any role, as Python's
-`process_content_for_template_format` collects `image_data`, so a host can hand
-them to `mm` in the order the rendered placeholders appear.
+`process_content_for_template_format` collects `image_data`. Hosts with a chat
+formatter use `ChatFormatter::extract_images` instead: it also applies GLM's
+tool-result canonicalization, so features follow the rendered placeholders.
 
 `stop_strs` returns the legacy template's stop strings; Jinja and native
 formatters have none, as in Python.
