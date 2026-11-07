@@ -46,6 +46,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -61,8 +63,8 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA as KimiMLAAtten
 from sglang.srt.models.llama import LlamaMLP as KimiMLP
 from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import is_xpu, make_pp_layers
-from sglang.srt.utils.common import BumpAllocator, add_prefix, set_weight_attrs
+from sglang.srt.utils import is_xpu
+from sglang.srt.utils.common import BumpAllocator
 
 
 def _get_kda_local_num_heads(num_heads: int, tp_size: int) -> int:

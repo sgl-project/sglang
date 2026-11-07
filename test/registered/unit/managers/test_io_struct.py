@@ -27,12 +27,12 @@ from sglang.srt.managers.kv_hints import (
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.multimodal.kimi_k3_image_processing import KimiK3DeferredPreprocessing
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
-from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils.cuda_vmm_transport_utils import (
+from sglang.srt.multimodal.transport.cuda_vmm import (
     CudaVmmPackedTensorTransportProxy,
     _CudaVmmPackedTensorLayout,
     _CudaVmmPackedTransportOwner,
 )
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
     register_amd_ci,
@@ -120,6 +120,7 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "DetachHiCacheStorageReqInput",
                 "AttachHiCacheStorageReqInput",
                 "ProfileReq",
+                "FreezeGCReq",
             },
         )
         for name, body in messages:
@@ -432,6 +433,70 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             sampling_params=[{}, {}],
             rid=["id1", "id2"],
         )
+
+    def test_sampling_params_are_owned_by_each_request(self):
+        """Adjusting one request's token budget must preserve peers and caller defaults."""
+        for n in (1, 2):
+            shared = {"max_new_tokens": 20, "n": n}
+            cases = (None,) if n == 1 else ()
+            cases += (
+                shared,
+                [shared, shared],
+                [shared.copy(), {"max_new_tokens": 30, "n": n}],
+            )
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(n=n, params=params):
+                    original = copy.deepcopy(params)
+                    req = GenerateReqInput(
+                        text=["Hello", "World"], sampling_params=params
+                    )
+                    req.normalize_batch_and_arguments()
+                    expected = [dict(item) for item in req.sampling_params]
+                    for i in range(len(req.sampling_params)):
+                        req[i].sampling_params["max_new_tokens"] = 5 + i
+                        expected[i]["max_new_tokens"] = 5 + i
+                        self.assertEqual(req.sampling_params, expected)
+                        self.assertEqual(
+                            req[i].sampling_params["max_new_tokens"], 5 + i
+                        )
+                        self.assertEqual(params, original)
+
+    def test_single_request_preserves_caller_sampling_params(self):
+        """Reusing defaults after a per-request adjustment must keep the original budget."""
+        params = {"max_new_tokens": 20}
+        req = GenerateReqInput(text="Hello", sampling_params=params)
+        req.normalize_batch_and_arguments()
+        req.sampling_params["max_new_tokens"] = 5
+
+        next_req = GenerateReqInput(text="World", sampling_params=params)
+        next_req.normalize_batch_and_arguments()
+        self.assertEqual(next_req.sampling_params["max_new_tokens"], 20)
+
+    def test_single_prompt_parallel_samples_preserve_caller_budget(self):
+        """Fan-out from one prompt must not share mutable completion budgets."""
+        for per_prompt in (False, True):
+            with self.subTest(per_prompt=per_prompt):
+                params = {"max_new_tokens": 20, "n": 2}
+                req = GenerateReqInput(
+                    text="Hello", sampling_params=[params] if per_prompt else params
+                )
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["max_new_tokens"] = 5
+                self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
+                self.assertEqual(params, {"max_new_tokens": 20, "n": 2})
+
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """A cached subrequest must use the batch's current token budget after normalization."""
+        req = GenerateReqInput(
+            text=["Hello", "World"], sampling_params={"max_new_tokens": 20}
+        )
+        req.normalize_batch_and_arguments()
+        req[0]
+        req.normalize_batch_and_arguments()
+        req[0].sampling_params["max_new_tokens"] = 5
+        self.assertEqual(req.sampling_params[0]["max_new_tokens"], 5)
+        self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
 
     def test_sampling_logprobs_mode_normalization(self):
         default_req = copy.deepcopy(self.base_req)
@@ -1368,6 +1433,56 @@ class TestKvHintsTransport(CustomTestCase):
 
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
+
+    def test_renormalization_refreshes_cached_sampling_params(self):
+        """Cached embeddings must use the batch's current sampling settings."""
+        cases = (
+            (["Hello", "World"], False),
+            ([["query 1", "doc 1"], ["query 2", "doc 2"]], True),
+        )
+        for text, is_cross_encoder in cases:
+            with self.subTest(cross_encoder=is_cross_encoder):
+                req = EmbeddingReqInput(
+                    text=text,
+                    is_cross_encoder_request=is_cross_encoder,
+                    sampling_params={"temperature": 0.7},
+                )
+                req.normalize_batch_and_arguments()
+                req[0]
+                req.normalize_batch_and_arguments()
+                req[0].sampling_params["temperature"] = 0.2
+                self.assertEqual(req.sampling_params[0]["temperature"], 0.2)
+                self.assertEqual(req[1].sampling_params["temperature"], 0.7)
+
+    def test_embedding_sampling_params_preserve_generation_defaults(self):
+        """Embedding normalization must not zero a caller's generation token budget."""
+        for text in ("Hello", ["Hello", "World"]):
+            shared = {"max_new_tokens": 20, "temperature": 0.7}
+            cases = (None, shared)
+            if isinstance(text, list):
+                cases += ([shared, shared], [shared.copy(), shared.copy()])
+            for params in cases:
+                params = copy.deepcopy(params)
+                with self.subTest(text=text, params=params):
+                    original = copy.deepcopy(params)
+                    req = EmbeddingReqInput(text=text, sampling_params=params)
+                    req.normalize_batch_and_arguments()
+                    self.assertEqual(params, original)
+                    if req.is_single:
+                        self.assertEqual(req.sampling_params["max_new_tokens"], 0)
+                    else:
+                        self.assertEqual(
+                            [
+                                req[i].sampling_params["max_new_tokens"]
+                                for i in range(2)
+                            ],
+                            [0, 0],
+                        )
+                        req[0].sampling_params["temperature"] = 0.2
+                        self.assertEqual(
+                            req[1].sampling_params.get("temperature"),
+                            None if params is None else 0.7,
+                        )
 
     def test_priority_is_preserved(self):
         """Priority must survive the batch split, in both __getitem__ branches."""
