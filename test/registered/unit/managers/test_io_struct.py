@@ -615,6 +615,60 @@ class TestGenerateReqInputNormalization(CustomTestCase):
         # Ensure that text items are properly duplicated too
         self.assertEqual(req.text, expected_text)
 
+    def test_parallel_sampling_with_empty_media(self):
+        """Empty media must yield one empty entry per sample, not a zero-size batch."""
+        for prompt in (
+            {"text": "hello"},
+            {"input_ids": [1, 2]},
+            {"input_embeds": [[0.1, 0.2]]},
+        ):
+            for n in (2, 3):
+                with self.subTest(prompt=prompt, n=n):
+                    req = GenerateReqInput(
+                        **prompt,
+                        image_data=[],
+                        video_data=[],
+                        audio_data=[],
+                        mm_hashes=[],
+                        mm_content_hashes=[],
+                        sampling_params={"n": n},
+                    )
+                    req.normalize_batch_and_arguments()
+                    for index in range(n):
+                        sample = req[index]
+                        self.assertEqual(sample.image_data, [])
+                        self.assertEqual(sample.video_data, [])
+                        self.assertEqual(sample.audio_data, [])
+                        self.assertEqual(sample.mm_hashes, [])
+                        self.assertEqual(sample.mm_content_hashes, [])
+
+    def test_batched_empty_video_and_audio(self):
+        """Absent video/audio lists must not raise IndexError when splitting a batch."""
+        for n in (1, 2):
+            with self.subTest(n=n):
+                req = GenerateReqInput(
+                    text=["first", "second"],
+                    video_data=[],
+                    audio_data=[],
+                    sampling_params={"n": n},
+                )
+                req.normalize_batch_and_arguments()
+                for index in range(2 * n):
+                    self.assertIsNone(req[index].video_data)
+                    self.assertIsNone(req[index].audio_data)
+
+    def test_parallel_sampling_empty_hashes_still_require_empty_images(self):
+        for hashes in ({"mm_hashes": []}, {"mm_content_hashes": []}):
+            with self.subTest(hashes=hashes):
+                req = GenerateReqInput(
+                    text="hello",
+                    image_data=["a.png", "b.png"],
+                    sampling_params={"n": 2},
+                    **hashes,
+                )
+                with self.assertRaisesRegex(ValueError, "0 entries for 2 images"):
+                    req.normalize_batch_and_arguments()
+
     def test_specific_parallel_n_per_sample(self):
         """Test parallel expansion when different samples have different n values."""
         req = copy.deepcopy(self.base_req)
