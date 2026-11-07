@@ -44,38 +44,35 @@ class TestMultimemAllGathererPrebuild(CustomTestCase):
             )
         )
 
-    def test_prebuild_sizes_the_gathered_width_once(self):
-        """The state is built once, for the gathered width (shard x TP size);
-        repeated prebuilds keep it, so nothing allocates again under capture."""
-        gatherer = _lazy_gatherer()
-        self.assertTrue(gatherer.prebuild_pending)
-        self.assertTrue(gatherer.prebuild(hidden_size=128, dtype=torch.bfloat16))
-        state = gatherer._state
-        gatherer.prebuild(hidden_size=128, dtype=torch.bfloat16)
-        self.assertFalse(gatherer.prebuild_pending)
-        self.assertIs(gatherer._state, state)
-        self.assertEqual(len(self.created), 1)
-        self.assertEqual(self.created[0]["hidden_size"], 256)
-        self.assertEqual(self.created[0]["max_tokens"], 16)
-
-    def test_unaligned_width_disables_like_the_first_call(self):
-        """A width the kernel cannot move disables the gatherer (NCCL fallback),
-        the same decision the first eager call makes, instead of staying pending."""
-        gatherer = _lazy_gatherer()
-        gatherer.prebuild(hidden_size=129, dtype=torch.bfloat16)
-        self.assertFalse(gatherer.prebuild_pending)
-        self.assertIsNone(gatherer._state)
-        self.assertEqual(self.created, [])
-
-    def test_non_bf16_logits_disable_like_the_first_call(self):
-        """Non-bf16 logits (fp32 lm_head, fp16 models) disable the gatherer without
-        allocating, as the first eager call does, instead of building a bf16 buffer."""
-        for dtype in (torch.float32, torch.float16):
+    def test_prebuild_decides_like_the_first_call(self):
+        """Without it a prebuild that sizes the buffer for the shard instead of
+        the gathered width, rebuilds under capture, or leaves an unsupported
+        width or dtype pending (a bf16 buffer for fp32 logits) escapes."""
+        with self.subTest(case="aligned bf16 builds once for the gathered width"):
             gatherer = _lazy_gatherer()
-            self.assertFalse(gatherer.prebuild(hidden_size=128, dtype=dtype))
+            self.assertTrue(gatherer.prebuild_pending)
+            self.assertTrue(gatherer.prebuild(hidden_size=128, dtype=torch.bfloat16))
+            state = gatherer._state
+            gatherer.prebuild(hidden_size=128, dtype=torch.bfloat16)
+            self.assertFalse(gatherer.prebuild_pending)
+            self.assertIs(gatherer._state, state)
+            self.assertEqual(len(self.created), 1)
+            self.assertEqual(self.created[0]["hidden_size"], 256)
+            self.assertEqual(self.created[0]["max_tokens"], 16)
+        self.created.clear()
+        with self.subTest(case="unaligned width disables without allocating"):
+            gatherer = _lazy_gatherer()
+            gatherer.prebuild(hidden_size=129, dtype=torch.bfloat16)
             self.assertFalse(gatherer.prebuild_pending)
             self.assertIsNone(gatherer._state)
-        self.assertEqual(self.created, [])
+            self.assertEqual(self.created, [])
+        for dtype in (torch.float32, torch.float16):
+            with self.subTest(case="non-bf16 disables without allocating", dtype=dtype):
+                gatherer = _lazy_gatherer()
+                self.assertFalse(gatherer.prebuild(hidden_size=128, dtype=dtype))
+                self.assertFalse(gatherer.prebuild_pending)
+                self.assertIsNone(gatherer._state)
+                self.assertEqual(self.created, [])
 
 
 if __name__ == "__main__":

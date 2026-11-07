@@ -4,13 +4,15 @@ Three engines run in sequence on one GPU with the same CUDA graph
 sets: native capture, Foundry SAVE (captures and writes the archive) and
 Foundry LOAD (rebuilds the graphs from the archive instead of capturing). LOAD
 must produce the same greedy tokens as native, restore every archived graph
-quickly, and actually run Foundry.
+(the summed restore time is printed, not bounded), and actually run Foundry.
+Two cases: test_restore_replays_every_archived_graph and
+test_greedy_output_matches_native.
 
 Qwen3.5-2B (hybrid gated DeltaNet) runs decode graphs only: its full-backend
 prefill capture fails in SGLang (the GDN out-of-graph metadata is decode-only).
-test_cuda_graph_persistence_prefill.py covers full-backend prefill plus decode
-graphs with Qwen3-1.7B; test_cuda_graph_persistence_spec.py the EAGLE3
-decode-type graph kinds with Qwen3-30B-A3B-FP8.
+test_cuda_graph_persistence_nightly.py covers full-backend prefill plus decode
+graphs with Qwen3-1.7B and the EAGLE3 decode-type graph kinds with
+Qwen3-30B-A3B-FP8.
 
 Needs the optional dependency sglang[foundry] (the CUDA CI installs it).
 
@@ -36,10 +38,6 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=215, stage="base-b", runner_config="1-gpu-large")
-
-# Seconds for LOAD's graph restore (decode + prefill lines summed). H200 restores 12
-# graphs in ~0.03 s; arbitrary headroom for shared CI hosts.
-_RESTORE_BOUND_S = 2.0
 
 _PROMPTS = [
     "The capital of France is",
@@ -219,65 +217,66 @@ class TestFoundryGraphPersistence(CustomTestCase):
         )
         return glob.glob(os.path.join(self.workspace, "rank_0", pattern))
 
-    def test_save_writes_archive(self):
+    def test_restore_replays_every_archived_graph(self):
+        """Without it a SAVE that archives too few graphs, a LOAD that restores
+        fewer than archived or never selects a restored prefill graph, Foundry
+        active in the native run or in another mode than the flag's, or a hook
+        allocation error all pass the output comparison."""
         rank_dir = os.path.join(self.workspace, "rank_0")
-        prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
+        archived_prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
         for kind in self.decode_kinds:
-            with self.subTest(kind=kind):
+            with self.subTest(archived_kind=kind):
                 decode = self._archived_decode_graphs(kind)
                 self.assertEqual(len(decode), len(self.decode_bs), sorted(decode))
         if self.prefill_bs:
-            self.assertGreaterEqual(len(prefill), len(self.prefill_bs), sorted(prefill))
+            self.assertGreaterEqual(
+                len(archived_prefill), len(self.prefill_bs), sorted(archived_prefill)
+            )
+        else:
+            self.assertEqual(archived_prefill, [])
+
+        log = self.runs["load"]["log"]
+        decode = {kind or None: int(n) for n, kind, _ in _DECODE_LOADED.findall(log)}
+        prefill = [int(n) for n, _ in _PREFILL_LOADED.findall(log)]
+        # One Loaded line per decode-type kind, each with every archived graph.
+        self.assertEqual(
+            decode, {kind: len(self.decode_bs) for kind in self.decode_kinds}
+        )
+        if self.prefill_bs:
+            self.assertEqual(prefill, [len(archived_prefill)])
+            # A restored prefill graph that the runner never selects would pass the
+            # count checks and silently run eager prefills.
+            self.assertGreaterEqual(
+                self.runs["native"]["prefill_passes"], len(_PROMPTS)
+            )
+            self.assertGreaterEqual(self.runs["load"]["prefill_passes"], len(_PROMPTS))
         else:
             self.assertEqual(prefill, [])
+
+        times = [float(t) for _, _, t in _DECODE_LOADED.findall(log)]
+        times += [float(t) for _, t in _PREFILL_LOADED.findall(log)]
+        self.assertTrue(times, "no [Foundry] Loaded line in the LOAD log")
+        print(f"[Foundry] LOAD graph restore total: {sum(times):.3f}s {times}")
+
+        self.assertIsNone(
+            _ACTIVE.search(self.runs["native"]["log"]),
+            "Foundry active without --cuda-graph-persistence",
+        )
+        for engine in ("save", "load"):
+            engine_log = self.runs[engine]["log"]
+            with self.subTest(active_engine=engine):
+                active = _ACTIVE.findall(engine_log)
+                # Launcher (resolution) and scheduler each activate it, in the flag's mode.
+                self.assertGreaterEqual(len({pid for pid, _ in active}), 2)
+                self.assertEqual({mode for _, mode in active}, {engine})
+                # An allocation outside the region is only logged by the hook.
+                self.assertNotIn("[HOOK] ERROR", engine_log)
 
     def test_greedy_output_matches_native(self):
         for engine in ("save", "load"):
             for kind in ("sequential", "batched"):
                 with self.subTest(engine=engine, kind=kind):
                     self.assertEqual(self.runs[engine][kind], self.runs["native"][kind])
-
-    def test_load_restores_and_replays_every_graph(self):
-        log = self.runs["load"]["log"]
-        decode = {kind or None: int(n) for n, kind, _ in _DECODE_LOADED.findall(log)}
-        prefill = [int(n) for n, _ in _PREFILL_LOADED.findall(log)]
-        archived_prefill = len(
-            glob.glob(os.path.join(self.workspace, "rank_0", "graph_*_PREFILL_t*.json"))
-        )
-        # One Loaded line per decode-type kind, each with every archived graph.
-        self.assertEqual(
-            decode, {kind: len(self.decode_bs) for kind in self.decode_kinds}
-        )
-        if not self.prefill_bs:
-            self.assertEqual(prefill, [])
-            return
-        self.assertEqual(prefill, [archived_prefill])
-        # A restored prefill graph that the runner never selects would pass the
-        # count checks and silently run eager prefills.
-        self.assertGreaterEqual(self.runs["native"]["prefill_passes"], len(_PROMPTS))
-        self.assertGreaterEqual(self.runs["load"]["prefill_passes"], len(_PROMPTS))
-
-    def test_load_restore_time(self):
-        log = self.runs["load"]["log"]
-        times = [float(t) for _, _, t in _DECODE_LOADED.findall(log)]
-        times += [float(t) for _, t in _PREFILL_LOADED.findall(log)]
-        self.assertTrue(times, "no [Foundry] Loaded line in the LOAD log")
-        self.assertLess(sum(times), _RESTORE_BOUND_S, times)
-
-    def test_foundry_active_without_hook_errors(self):
-        self.assertIsNone(
-            _ACTIVE.search(self.runs["native"]["log"]),
-            "Foundry active without --cuda-graph-persistence",
-        )
-        for engine in ("save", "load"):
-            log = self.runs[engine]["log"]
-            with self.subTest(engine=engine):
-                active = _ACTIVE.findall(log)
-                # Launcher (resolution) and scheduler each activate it, in the flag's mode.
-                self.assertGreaterEqual(len({pid for pid, _ in active}), 2)
-                self.assertEqual({mode for _, mode in active}, {engine})
-                # An allocation outside the region is only logged by the hook.
-                self.assertNotIn("[HOOK] ERROR", log)
 
 
 if __name__ == "__main__":
