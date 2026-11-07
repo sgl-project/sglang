@@ -89,17 +89,9 @@ def _swiglu_fp8_rowwise_tiled_kernel(
     tl.store(S + row, scale)
 
 
-def fused_packed_swiglu_fp8_rowwise(x: torch.Tensor, row_alignment: int = 16):
-    """Quantize ``F.silu(gate) * up`` from packed BF16 ``[B, T, 2*K]``.
-
-    Return contiguous E4M3 ``[ceil(B*T/alignment)*alignment, K]`` plus
-    FP32 row scales. Accept row-strided slices of a packed QKV/MLP projection
-    when the B/T dimensions can be flattened without a copy. Finite inputs
-    reproduce both intermediate BF16 rounds and the existing rowwise FP8
-    contract. Padding rows have zero payload and scale 1e-12. NVIDIA SM89+.
-    Used by the FLUX3 FP8r MLP output projection.
-    """
-    if not (
+def can_use_fused_packed_swiglu_fp8_rowwise(x: torch.Tensor) -> bool:
+    """Whether ``x`` is a row-strided packed BF16 ``[B, T, 2*K]`` on NVIDIA SM89+."""
+    return (
         x.is_cuda
         and torch.version.hip is None
         and x.dtype == torch.bfloat16
@@ -110,7 +102,20 @@ def fused_packed_swiglu_fp8_rowwise(x: torch.Tensor, row_alignment: int = 16):
         and x.stride(1) >= x.shape[-1]
         and (x.shape[0] <= 1 or x.stride(0) == x.shape[1] * x.stride(1))
         and current_arch().is_sm_at_least(8, 9)
-    ):
+    )
+
+
+def fused_packed_swiglu_fp8_rowwise(x: torch.Tensor, row_alignment: int = 16):
+    """Quantize ``F.silu(gate) * up`` from packed BF16 ``[B, T, 2*K]``.
+
+    Return contiguous E4M3 ``[ceil(B*T/alignment)*alignment, K]`` plus
+    FP32 row scales. Accept row-strided slices of a packed QKV/MLP projection
+    when the B/T dimensions can be flattened without a copy. Finite inputs
+    reproduce both intermediate BF16 rounds and the existing rowwise FP8
+    contract. Padding rows have zero payload and scale 1e-12. NVIDIA SM89+.
+    Used by the FLUX3 FP8r MLP output projection.
+    """
+    if not can_use_fused_packed_swiglu_fp8_rowwise(x):
         raise ValueError(
             "requires row-strided packed BF16 [B,T,2*K], K in [1,16384], on SM89+"
         )

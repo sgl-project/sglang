@@ -16,7 +16,7 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, List, Optional, Protocol
 
 import torch
 
@@ -55,6 +55,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     def state_slots(self):
         """The state slot allocator, or None without recurrent state."""
         return None if self.state is None else self.state.slots
+
+    # Whether freed pages can wait for in-flight KV writes before PD reuse.
+    supports_reuse_guard = False
 
     @abc.abstractmethod
     def __init__(
@@ -100,6 +103,12 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         from sglang.srt.mem_cache.kv.alloc.id_space import state_id_space
 
         return state_id_space(self.state_id_spaces(), sub_pool)
+
+    def reuse_fences(self) -> List[torch.cuda.Event]:
+        """Events a writer that follows no stream (e.g. an RDMA into a published
+        destination) waits for before writing the pages handed out so far. Empty
+        when handed-out pages may be written at once."""
+        return []
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches

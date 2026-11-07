@@ -64,6 +64,8 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
 from sglang.srt.hardware_backend.npu.utils import (
     use_npu_arch35_mxfp8_wo_a,
 )
+from sglang.srt.hf_transformers import get_rope_config
+from sglang.srt.layers.attention.deepseek_v4_backend import DSV4Metadata
 from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_enable_prefill_cp,
 )
@@ -73,6 +75,10 @@ from sglang.srt.layers.attention.dsv4.dsv41_sparse import (
     DeepseekV41Indexer,
 )
 from sglang.srt.layers.attention.dsv4.indexer import C4Indexer
+from sglang.srt.layers.attention.graph_utils import (
+    pad_with_zero_rows,
+    real_rows_scope,
+)
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
@@ -110,10 +116,17 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    deepgemm_mxfp8_linear_input,
+    deepgemm_pair_takes_flashinfer,
+    zero_deepgemm_mxfp8_scale_rows,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -202,17 +215,14 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     ceil_align,
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx942_supported,
     is_gfx1250_supported,
     log_info_on_rank0,
-    make_pp_layers,
 )
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers import get_rope_config
 
 # NPU-only: bind torch_npu here so _compute_q_b / _forward_prepare can call
 # torch_npu.npu_rms_norm directly (imports elsewhere aren't visible in this module).
@@ -411,26 +421,23 @@ if _use_aiter:
         from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
 
 
-def _wo_a_aiter_gemm_eligible(
-    flag: bool, use_aiter: bool, is_hip: bool, is_gfx95: bool
-) -> bool:
+def _wo_a_aiter_gemm_eligible(use_aiter: bool, is_hip: bool, is_gfx95: bool) -> bool:
     """Static eligibility for the aiter ``wo_a`` reroute.
 
-    Folds the opt-in flag, the global ``SGLANG_USE_AITER`` switch, and the
-    HIP/gfx95 platform gates into one predicate. Evaluated once at import (see
+    Folds the global ``SGLANG_USE_AITER`` switch and the HIP/gfx95 platform
+    gates into one predicate. Evaluated once at import (see
     ``_wo_a_aiter_batched_gemm_enabled``) so none of it runs on the per-token
     decode critical path.
     """
-    return bool(flag and use_aiter and is_hip and is_gfx95)
+    return bool(use_aiter and is_hip and is_gfx95)
 
 
-# Read the opt-in flag and import the aiter kernel ONCE at module import: the
+# Resolve eligibility and import the aiter kernel ONCE at module import: the
 # decode ``wo_a`` matmul runs per layer/token on the critical path, so it must
-# not pay an ``EnvBool.get()`` plus a function-local import on every call. If the
-# path is eligible but the kernel import fails, disable it here and fall back to
-# the einsum for the process (logged once) instead of retrying every step.
+# not pay a function-local import on every call. If the path is eligible but
+# the kernel import fails, disable it here and fall back to the einsum for the
+# process (logged once) instead of retrying every step.
 _wo_a_aiter_batched_gemm_enabled = _wo_a_aiter_gemm_eligible(
-    envs.SGLANG_OPT_USE_AITER_BATCHED_GEMM.get(),
     _use_aiter,
     _is_hip,
     _is_gfx95_supported,
@@ -477,12 +484,9 @@ if _is_hip:
     if is_wo_a_fp8_mxscale_supported():
         _wo_a_fp8_mxscale = apply_wo_a_fp8_mxscale
         _wo_a_weight_scale_to_e8m0 = wo_a_weight_scale_to_e8m0
-        # Opt-in fused inverse-RoPE + quant front end (env-gated for A/B). Only
-        # bind it when both the flatmm and the fused aiter op are available.
-        if (
-            envs.SGLANG_OPT_FP8_WO_A_FUSED_INVROPE.get()
-            and is_wo_a_fp8_fused_invrope_supported()
-        ):
+        # Fused inverse-RoPE + quant front end, bound when both the flatmm and
+        # the fused aiter op are available.
+        if is_wo_a_fp8_fused_invrope_supported():
             _wo_a_fp8_mxscale_fused_invrope = apply_wo_a_fp8_mxscale_fused_invrope
         _wo_a_fp8_mxscale_prequant = apply_wo_a_fp8_mxscale_prequant
 
@@ -869,14 +873,19 @@ def deepseek_v4_mega_attention_with_mxfp8_output(
     forward_batch = get_tc_piecewise_forward_context().forward_batch
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens:
-        # DeepGEMM writes the scales at the TMA-aligned stride of the live rows,
+        # DeepGEMM writes packed scales at the TMA-aligned stride of the live rows,
         # while the captured wo_b reads them at the stride of the padded rows.
-        restride = scale.stride(-1) != ceil_align(real_num_tokens, 4)
-        live_scale = (
-            mhc.empty_deepgemm_mxfp8_scales(real_num_tokens, data.shape[1], data.device)
-            if restride
-            else scale[:real_num_tokens]
-        )
+        # FlashInfer-layout scales of the live rows are a prefix of the padded ones.
+        swizzled = scale.dim() == 4
+        restride = not swizzled and scale.stride(-1) != ceil_align(real_num_tokens, 4)
+        if swizzled:
+            live_scale = scale[: -(-real_num_tokens // 128)]
+        elif restride:
+            live_scale = mhc.empty_deepgemm_mxfp8_scales(
+                real_num_tokens, data.shape[1], data.device
+            )
+        else:
+            live_scale = scale[:real_num_tokens]
         layer._mega_core(
             query[:real_num_tokens],
             attn_sink,
@@ -887,7 +896,7 @@ def deepseek_v4_mega_attention_with_mxfp8_output(
         if restride:
             scale[:real_num_tokens].copy_(live_scale)
     data[real_num_tokens:].zero_()
-    scale[real_num_tokens:].zero_()
+    zero_deepgemm_mxfp8_scale_rows(scale, real_num_tokens)
 
 
 bcg_deepseek_v4_mega_attention_with_mxfp8_output = eager_on_graph(True)(
@@ -1530,7 +1539,6 @@ class MQALayer(MqaAttentionBase):
         # in forward, after weights have loaded.
         self.use_fused_wo_a = (
             self.is_dsv41
-            and envs.SGLANG_DSV41_FUSED_WO_A.get()
             and _fused_wo_a_arch_supported()
             and not self.wo_a_fp8
             and not self.use_npu_arch35_mxfp8_wo_a
@@ -1632,12 +1640,15 @@ class MQALayer(MqaAttentionBase):
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
                 y, y_sf = mhc.empty_deepgemm_mxfp8_pair(
-                    rows, self.n_local_groups * self.o_lora_rank, q.device
+                    rows,
+                    self.n_local_groups * self.o_lora_rank,
+                    q.device,
+                    flashinfer=deepgemm_pair_takes_flashinfer(),
                 )
                 bcg_deepseek_v4_mega_attention_with_mxfp8_output(
                     self, q, y, y_sf, attn_sink
                 )
-                return y, y_sf
+                return deepgemm_mxfp8_linear_input(y, y_sf)
             o = q.new_empty((rows, self.n_local_groups, self.o_lora_rank))
             bcg_deepseek_v4_mega_attention_with_output(self, q, o, attn_sink)
             return o
@@ -1674,7 +1685,10 @@ class MQALayer(MqaAttentionBase):
         o_fp8, o_s = data[:, :groups], scale[:, :groups]
         if out is None and allow_mxfp8_output and self._mega_mxfp8_output(rows):
             out = mhc.empty_deepgemm_mxfp8_pair(
-                rows, groups * self.o_lora_rank, data.device
+                rows,
+                groups * self.o_lora_rank,
+                data.device,
+                flashinfer=deepgemm_pair_takes_flashinfer(),
             )
         if isinstance(out, tuple):
             y, y_sf = out
@@ -1685,7 +1699,7 @@ class MQALayer(MqaAttentionBase):
                 recipe=(1, 1, 32),
                 out=(y.view(rows, groups, -1), y_sf),
             )
-            return y, y_sf
+            return deepgemm_mxfp8_linear_input(y, y_sf)
         return _fp8_wo_a_einsum(o_fp8, o_s, *self.mega_wo_a, recipe=(1, 1, 32), out=out)
 
     def _get_npu_rope_position_cache(
@@ -2625,6 +2639,28 @@ class MQALayer(MqaAttentionBase):
 
         return q, kv
 
+    def _forward_real_rows(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        *,
+        real_num_tokens: int,
+        defer_all_reduce: bool,
+    ) -> Union[torch.Tensor, mhc.AttnOutput]:
+        # x_quant is laid out for every row (MXFP8 scales are swizzled), so the
+        # real rows are quantized again inside attention.
+        with real_rows_scope(forward_batch, real_num_tokens):
+            out = self.forward(
+                x[:real_num_tokens],
+                positions[:real_num_tokens],
+                forward_batch,
+                defer_all_reduce=defer_all_reduce,
+            )
+        if isinstance(out, mhc.AttnOutput):
+            return mhc.AttnOutput(pad_with_zero_rows(out.partial, x.shape[0]))
+        return pad_with_zero_rows(out, x.shape[0])
+
     def forward(
         self,
         x: torch.Tensor,
@@ -2641,6 +2677,19 @@ class MQALayer(MqaAttentionBase):
             assert isinstance(
                 attn_backend,
                 (DeepseekV4AttnBackend, DeepseekV4HipRadixBackend),
+            )
+        metadata = attn_backend.forward_metadata
+        if (
+            isinstance(metadata, DSV4Metadata)
+            and metadata.real_num_tokens is not None
+            and x.shape[0] > metadata.real_num_tokens
+        ):
+            return self._forward_real_rows(
+                x,
+                positions,
+                forward_batch,
+                real_num_tokens=metadata.real_num_tokens,
+                defer_all_reduce=defer_all_reduce,
             )
 
         enable_multi_stream = (
@@ -2923,6 +2972,16 @@ class MQALayer(MqaAttentionBase):
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
             o = o[:, tp_slice, :]
+        o = self._project_wo_a(
+            o,
+            positions=positions,
+            forward_batch=forward_batch,
+            inv_rope=inv_rope,
+            wo_a_quant_freqs=wo_a_quant_freqs,
+        )
+        return self._project_wo_b(o, defer_all_reduce)
+
+    def _project_wo_a(self, o, *, positions, forward_batch, inv_rope, wo_a_quant_freqs):
         if wo_a_quant_freqs is not None:
             # the decode already returned the wo_a mxfp8 (codes, scales)
             G = self.n_local_groups
@@ -3095,7 +3154,7 @@ class MQALayer(MqaAttentionBase):
                         self.o_lora_rank,
                     )
 
-        return self._project_wo_b(o, defer_all_reduce)
+        return o
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
         from sglang.srt.layers.moe.utils import should_skip_mlp_all_reduce
@@ -3496,6 +3555,7 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         # dispatch cost dominates at small M (decode): dispatch by token count.
         if (
             envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
+            and not _is_hip
             and x.shape[0] >= _HC_PRENORM_DEEPGEMM_MIN_TOKENS
         ):
             from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
@@ -3580,7 +3640,7 @@ def _scatter_tail_rows(
         return full[:num_tokens]
     full = rows.new_empty((num_tokens, rows.shape[1]))
     if tail.contiguous_start is not None:
-        full[tail.contiguous_start :].copy_(rows)
+        full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
@@ -5363,11 +5423,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                     and loaded_weight.dtype != torch.float8_e4m3fn
                 ):
                     raise ValueError(
-                        f"SGLANG_OPT_FP8_WO_A_GEMM is enabled but {name} has "
+                        f"FP8 wo_a is enabled but {name} has "
                         f"dtype {loaded_weight.dtype}, expected "
                         "torch.float8_e4m3fn. This checkpoint does not provide "
-                        "a supported fp8-quantized wo_a; rerun with "
-                        "SGLANG_OPT_FP8_WO_A_GEMM=0."
+                        "a supported fp8-quantized wo_a."
                     )
                 try:
                     use_async_loading = should_async_load(loaded_weight)
