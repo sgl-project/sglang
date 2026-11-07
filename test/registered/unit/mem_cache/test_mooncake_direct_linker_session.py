@@ -36,11 +36,11 @@ class TestLayerWiseLoadSessions(CustomTestCase):
             for row in (4, 0)
         ]
 
-    def test_batched_start_before_fence_and_ordered_ranges_after(self):
+    def test_batched_start_and_ordered_ranges_after_fence(self):
         fence = Mock()
 
         def start(keys):
-            fence.synchronize.assert_not_called()
+            fence.synchronize.assert_called_once_with()
             return [0] * len(keys)
 
         def locations(indices):

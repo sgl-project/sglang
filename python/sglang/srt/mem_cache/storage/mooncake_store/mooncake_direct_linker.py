@@ -375,7 +375,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         list(transfer.keys), transfer
                     )
                     keys.extend(self.storage._tag_keys(component_keys))
-            # Session setup needs only keys; batch all pools before the slot fence.
+            # Wait before opening sessions so the slot fence does not consume
+            # their leases. Key preparation above still overlaps the GPU work.
+            if ready_event is not None:
+                ready_event.synchronize()
             # Track every submitted key: a failed batch can still open some sessions.
             session_keys = [key for keys, _ in batches.values() for key in keys]
             if session_keys:
@@ -385,8 +388,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         f"Mooncake get session start failed: keys={len(session_keys)}, "
                         f"results={result}"
                     )
-            if ready_event is not None:
-                ready_event.synchronize()
             for transfers in request_transfers:
                 for transfer in transfers:
                     batches[transfer.name][1].extend(

@@ -2318,7 +2318,7 @@ class TestTransferReadyEvents(CustomTestCase):
                     self.assertEqual(linker.start_layer_wise_loading(), 3)
                 linker.load_queue.put(None)
                 linker.load_thread_func()
-                # Layer-wise loads defer the wait into `load_layer_wise`, after
+                # Layer-wise loads defer the wait into `load_layer_wise`, before
                 # their get sessions start.
                 self.assertEqual(
                     order.mock_calls,
