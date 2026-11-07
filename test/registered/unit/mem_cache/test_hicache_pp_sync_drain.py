@@ -110,6 +110,102 @@ class TestUnifiedPPSyncBatching(unittest.TestCase):
             log_metrics=True,
         )
 
+    def test_writing_and_loading_check_drain_prefix_fifo(self):
+        cache = object.__new__(UnifiedRadixCache)
+        cache.pp_rank = 0
+        cache.metrics_collector = None
+        cache.buffer_pipeline = None
+        cache.components = {}
+        finished_writes = []
+        finished_loads = []
+        cache._finish_write_through_ack = finished_writes.append
+        cache._log_write_ack_metrics = MagicMock()
+        cache.dec_lock_ref = MagicMock()
+        cache.dec_host_lock_ref = MagicMock()
+        cache.tree_core = SimpleNamespace(finish_load_back=finished_loads.append)
+        cache.ongoing_load_back = {
+            10: ("node10", "l10", "hl10"),
+            20: ("node20", "l20", "hl20"),
+            30: ("node30", "l30", "hl30"),
+        }
+        w_acks = [
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[1]),
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[2]),
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[3]),
+        ]
+        l_acks = [
+            SimpleNamespace(
+                finish_event=MagicMock(),
+                node_ids=[10],
+                num_tokens_by_pool=None,
+                num_bytes=0,
+                timing_enabled=False,
+            ),
+            SimpleNamespace(
+                finish_event=MagicMock(),
+                node_ids=[20],
+                num_tokens_by_pool=None,
+                num_bytes=0,
+                timing_enabled=False,
+            ),
+            SimpleNamespace(
+                finish_event=MagicMock(),
+                node_ids=[30],
+                num_tokens_by_pool=None,
+                num_bytes=0,
+                timing_enabled=False,
+            ),
+        ]
+        cache.cache_controller = SimpleNamespace(
+            ack_write_queue=list(w_acks),
+            ack_load_queue=list(l_acks),
+        )
+
+        cache.writing_check(finish_count=2)
+        self.assertEqual(finished_writes, [1, 2])
+        self.assertEqual(cache.cache_controller.ack_write_queue, [w_acks[2]])
+
+        cache.loading_check(finish_count=2)
+        self.assertEqual(finished_loads, ["node10", "node20"])
+        self.assertEqual(cache.cache_controller.ack_load_queue, [l_acks[2]])
+        self.assertEqual(list(cache.ongoing_load_back.keys()), [30])
+
+    def test_decode_offload_progress_drains_prefix_fifo(self):
+        from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+            DecodeKVCacheOffloadManager,
+            OffloadedState,
+        )
+
+        manager = object.__new__(DecodeKVCacheOffloadManager)
+        req1 = MagicMock()
+        req1.finished.return_value = False
+        req2 = MagicMock()
+        req2.finished.return_value = False
+        manager.offloaded_state = {req1: OffloadedState(inc_len=4), req2: OffloadedState(inc_len=4)}
+        manager.offload_inflight = {req1: 2, req2: 1}
+        manager.ongoing_offload = {
+            1: (req1, torch.arange(0, 4), [10, 11], 0.0, []),
+            2: (req1, torch.arange(4, 8), [12, 13], 0.0, []),
+            3: (req2, torch.arange(8, 12), [20, 21], 0.0, []),
+        }
+        acks = [
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[1]),
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[2]),
+            SimpleNamespace(finish_event=MagicMock(), node_ids=[3]),
+        ]
+        manager.cache_controller = SimpleNamespace(ack_write_queue=list(acks))
+        backed_up = []
+        manager._trigger_backup = lambda req, indices, tokens, *args: (
+            backed_up.append(tuple(tokens)) or f"hash_{tokens[0]}"
+        )
+
+        manager._check_offload_progress(2)
+        self.assertEqual(backed_up, [(10, 11), (12, 13)])
+        self.assertEqual(manager.cache_controller.ack_write_queue, [acks[2]])
+        self.assertNotIn(req1, manager.offload_inflight)
+        self.assertEqual(manager.offload_inflight[req2], 1)
+        self.assertEqual(list(manager.ongoing_offload.keys()), [3])
+
 
 if __name__ == "__main__":
     unittest.main()
