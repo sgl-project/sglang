@@ -581,23 +581,19 @@ class SchedulerPPMixin:
                     self.on_idle()
 
     def _pp_ingest_requests(self: Scheduler) -> List:
-        """Ingest input; half of the PP pause rule, with `_pp_may_launch`.
+        """Ingest input under the PP pause rule.
 
         A pause holds its input and stops launching until no micro-batch is
-        unprocessed, then every micro-batch is retracted. This half holds: a
-        pause and the inputs after it stay in `_deferred_input_requests` while a
-        micro-batch is unprocessed, so later inputs run after it, in order.
+        unprocessed, then every micro-batch is retracted. Here the pause and the
+        inputs after it stay in `_deferred_input_requests` while a micro-batch is
+        unprocessed, so later inputs run after it, in order.
         """
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
 
     def _pp_may_launch(self: Scheduler) -> bool:
-        """Half of the PP pause rule, with `_pp_ingest_requests`.
-
-        A pause holds input and stops launching until no micro-batch is
-        unprocessed. This half stops launching (and opening queue consensus)
-        once a pause is held or applied; launched results still drain.
-        """
+        """Whether a micro-batch (or a decode queue consensus) may start: not
+        once a pause is held or applied. Launched results still drain."""
         return not (self._engine_paused or self._deferred_input_requests)
 
     def _pp_retract_microbatches(self: Scheduler) -> None:

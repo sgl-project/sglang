@@ -6112,7 +6112,7 @@ class Scheduler(
             # The PP loops hold this pause until no micro-batch is in flight.
             self._pp_retract_microbatches()
         else:
-            # Nothing in flight: drain the overlapped result before retracting.
+            # Drain the overlapped result so nothing is in flight when retracting.
             if self.enable_overlap and self.last_batch:
                 if (
                     self.disaggregation_mode == DisaggregationMode.PREFILL

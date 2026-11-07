@@ -1113,6 +1113,86 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual([mb.reqs for mb in scheduler.running_mbs], [[], []])
         self.assertEqual(len(scheduler.running_reqs), 0)
 
+    def test_pp_decode_opens_no_queue_consensus_or_batch_while_paused(self):
+        class StopLoop(Exception):
+            pass
+
+        scheduler = self._new_scheduler()
+        scheduler.pp_loop_size = 2
+        scheduler.running_mbs = [
+            ScheduleBatch(reqs=[], batch_is_full=False) for _ in range(2)
+        ]
+        scheduler.mbs = [None, None]
+        scheduler.last_mbs = [None, None]
+        scheduler.mb_metadata = [None, None]
+        scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+        scheduler._deferred_input_requests = []
+        scheduler._engine_paused = True
+        scheduler.pp_comm_stream_ctx = MagicMock()
+        scheduler.request_receiver = SimpleNamespace(
+            recv_requests=lambda local_reqs=None: []
+        )
+        scheduler._poll_timeout_aborts = MagicMock(return_value=[])
+        scheduler.process_input_requests = MagicMock()
+        scheduler.init_pp_loop_state = MagicMock()
+        scheduler._flush_staging_scatters = MagicMock()
+        scheduler._pp_pd_get_retract_ids = MagicMock(return_value=None)
+        scheduler._pp_pd_get_prealloc_ids = MagicMock(return_value=None)
+        scheduler._pp_pd_get_decode_transferred_ids = MagicMock(return_value=None)
+        scheduler._pp_pd_send_consensus_bootstrapped_ids = MagicMock(
+            return_value=([], None)
+        )
+        scheduler._pp_pd_send_consensus_release_ids = MagicMock(return_value=([], None))
+        scheduler.get_next_disagg_decode_batch_to_run = MagicMock(
+            side_effect=lambda running_batch: SimpleNamespace(
+                running_batch=running_batch, batch_to_run=None
+            )
+        )
+        scheduler._pp_launch_batch = MagicMock()
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors = MagicMock(
+            return_value=(None, None, MagicMock())
+        )
+        scheduler._pp_commit_proxy_send_work = MagicMock()
+        scheduler.on_idle = MagicMock()
+        scheduler.disagg_decode_transfer_queue = SimpleNamespace(queue=[])
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(queue=[])
+        # Two passes over the two slots, then leave the endless loop.
+        scheduler.increment_scheduler_iterations = MagicMock(
+            side_effect=[None, None, None, None, StopLoop]
+        )
+        pp_view = MagicMock(
+            pp_size=2,
+            pp_async_batch_depth=0,
+            pp_rank=0,
+            attn_tp_rank=0,
+            attn_cp_rank=0,
+        )
+        disagg_view = MagicMock(disaggregation_decode_enable_offload_kvcache=False)
+        with (
+            patch("sglang.srt.managers.scheduler.get_parallel", return_value=pp_view),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_parallel",
+                return_value=pp_view,
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_pp_mixin.get_disagg",
+                return_value=disagg_view,
+            ),
+            self.assertRaises(StopLoop),
+        ):
+            SchedulerPPMixin.event_loop_pp_disagg_decode.__wrapped__(scheduler)
+
+        scheduler._pp_pd_get_retract_ids.assert_not_called()
+        scheduler._pp_pd_get_prealloc_ids.assert_not_called()
+        scheduler._pp_pd_get_decode_transferred_ids.assert_not_called()
+        scheduler.get_next_disagg_decode_batch_to_run.assert_not_called()
+        scheduler._pp_launch_batch.assert_not_called()
+        # The consensus relay still runs, with no new round opened.
+        for call in scheduler._pp_pd_send_consensus_bootstrapped_ids.call_args_list:
+            self.assertIsNone(call.args[3])
+        for call in scheduler._pp_pd_send_consensus_release_ids.call_args_list:
+            self.assertIsNone(call.args[3])
+
 
 if __name__ == "__main__":
     unittest.main()
