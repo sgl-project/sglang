@@ -75,8 +75,16 @@ def split_audio_energy_aware(
     """
     if not audio_data:
         raise ValueError("audio_data is empty")
-    audio = load_audio(audio_data, sr=sample_rate, mono=True)
+    if max_clip_s <= 0:
+        raise ValueError(f"max_clip_s must be positive, got {max_clip_s}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
     chunk_size = int(sample_rate * max_clip_s)
+    if chunk_size <= 0:
+        raise ValueError(
+            f"max_clip_s ({max_clip_s}) * sample_rate ({sample_rate}) must be at least 1 sample"
+        )
+    audio = load_audio(audio_data, sr=sample_rate, mono=True)
     search_size = int(sample_rate * SPLIT_SEARCH_WINDOW_S)
     total = audio.shape[-1]
 
@@ -88,7 +96,7 @@ def split_audio_energy_aware(
         if i + chunk_size >= total:
             raw_chunks.append(audio[i:])
             break
-        search_start = i + chunk_size - search_size
+        search_start = max(i + 1, i + chunk_size - search_size)
         search_end = min(i + chunk_size, total)
         split_point = find_split_point(audio, search_start, search_end)
         raw_chunks.append(audio[i:split_point])
