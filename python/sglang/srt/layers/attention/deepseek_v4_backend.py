@@ -3050,7 +3050,7 @@ class DeepseekV4AttnBackend(
         )
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         # Sparse prefill otherwise reads req_to_token/full_to_swa lazily in its
         # first layer. CP shards the query layout that this global snapshot
@@ -3064,10 +3064,11 @@ class DeepseekV4AttnBackend(
 
         metadata = self.forward_metadata
         assert isinstance(metadata, DSV4Metadata)
-        if metadata.real_num_tokens is not None:
-            # The runner passes the padded row count; attention queries only the
-            # rows the metadata covers.
-            num_qo_tokens = metadata.real_num_tokens
+        num_qo_tokens = (
+            metadata.real_num_tokens
+            if metadata.real_num_tokens is not None
+            else forward_batch.positions.shape[0]
+        )
         if self._use_sparse_prefill(forward_batch, num_qo_tokens=num_qo_tokens):
             metadata.sparse_prefill_cache = self._build_sparse_prefill_chunk_cache(
                 forward_batch, metadata.core_attn_metadata, num_qo_tokens=num_qo_tokens
@@ -3689,10 +3690,24 @@ class DeepseekV4AttnBackend(
             and x.shape[0]
             == forward_batch.batch_size * self.speculative_num_draft_tokens
         ):
-            # Static verify is request-major with consecutive positions; compact
-            # verify has variable block lengths and keeps the general path.
+            # Static verify is request-major with consecutive positions.
             self._low_ratio_compress_fused(
                 layer, x, req, pos, draft_len=self.speculative_num_draft_tokens
+            )
+        elif (
+            forward_batch.forward_mode.is_target_verify()
+            and not self.is_dspark_draft
+            and layer.compressor.use_fused_compress
+            and forward_batch.ragged_verify_layout is not None
+            and read_ragged_verify_mode() is RaggedVerifyMode.COMPACT
+        ):
+            layout = forward_batch.ragged_verify_layout
+            self._low_ratio_compress_fused(
+                layer,
+                x,
+                req,
+                pos,
+                extend_offsets=(layout.qo_indptr_device[:-1], layout.verify_lens),
             )
         elif (
             layer.compressor.use_fused_compress
