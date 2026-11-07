@@ -21,6 +21,11 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLVisionConfig,
 )
 
+try:
+    from torchcodec.decoders import AudioDecoder
+except (ImportError, OSError):
+    AudioDecoder = None
+
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
