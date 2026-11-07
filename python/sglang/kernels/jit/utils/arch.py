@@ -22,7 +22,7 @@ from sglang.kernels.jit.utils.common import (
     is_musa_runtime,
     is_sail_runtime,
 )
-from sglang.srt.utils.common import is_cuda
+from sglang.srt.utils.device import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,7 @@ def _jit_cuda_version() -> tuple[int, ...]:
         logger.warning("Cannot parse `%s --version` output: %s", nvcc, output)
     except (OSError, subprocess.SubprocessError) as error:
         logger.warning("Cannot run `%s --version`: %s", nvcc, error)
-    from sglang.srt.utils.common import get_cuda_version
+    from sglang.srt.utils.device import get_cuda_version
 
     return get_cuda_version()
 

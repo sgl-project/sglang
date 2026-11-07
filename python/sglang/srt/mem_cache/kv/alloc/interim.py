@@ -37,8 +37,8 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_reclaim_satisfied,
     float_token_id_capacity,
 )
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
-from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
 
 if TYPE_CHECKING:

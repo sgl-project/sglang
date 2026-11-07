@@ -6,13 +6,13 @@ from torch import nn
 
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput, Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.models.qwen3 import Qwen3Model as Qwen3TransformerModel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

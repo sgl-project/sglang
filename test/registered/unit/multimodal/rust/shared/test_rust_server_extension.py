@@ -15,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import GenerateReqInput  # noqa: E402
 from sglang.srt.managers.io_struct import flatten_output_ids  # noqa: E402
 from sglang.srt.managers.schedule_batch import Req  # noqa: E402
 from sglang.srt.rust_server import server as server_module  # noqa: E402
@@ -656,6 +657,8 @@ def launch_context(server_cls, cores=(None, None)):
             ),
         ),
         patch.object(server_cls, "_partition_cores", return_value=cores),
+        # A mock server would report a startup failure and signal the parent.
+        patch.object(server_cls, "_watch_startup_failure"),
         patch.object(
             server_module,
             "get_mm",
@@ -702,8 +705,12 @@ class TestRustServerExtension(CustomTestCase):
         scheduler = SimpleNamespace(
             processor=sentinel.processor,
             model_config=SimpleNamespace(
-                is_multimodal=True, hf_config=sentinel.config, model_path="test/model"
+                is_multimodal=True,
+                is_generation=True,
+                hf_config=sentinel.config,
+                model_path="test/model",
             ),
+            server_args=sentinel.server_args,
         )
         with launch_context(ModelServer) as build_args:
             instance = ModelServer.launch(scheduler)
@@ -713,7 +720,11 @@ class TestRustServerExtension(CustomTestCase):
             extension=extension,
             health_generate_headers={},
             default_max_new_tokens=128,
+            request_class=GenerateReqInput,
+            server_added_custom_params=(),
         )
+        # What a crash dump carries.
+        self.assertIs(instance.server_args, sentinel.server_args)
         extension.Server.assert_called_once_with(
             sentinel.args,
             cores=None,
@@ -724,6 +735,26 @@ class TestRustServerExtension(CustomTestCase):
         self.assertIsInstance(instance, ModelServer)
         self.assertEqual(instance.http_port, 30001)
         self.assertTrue(instance._multimodal_enabled)
+
+    def test_failed_startup_warmup_signals_the_parent(self):
+        """A failed startup warmup takes the server down as a crashed
+        scheduler does: SIGQUIT to the parent, which kills the process tree;
+        a server that shuts down normally signals nothing."""
+        for failure in ["warmup timed out after 600 s", None]:
+            with self.subTest(failure=failure):
+                server = Mock()
+                server.wait_startup_failure.return_value = failure
+                with patch.object(server_module.psutil, "Process") as process:
+                    RustServer(server, http_port=30000)._watch_startup_failure().join(
+                        timeout=10
+                    )
+                parent = process.return_value.parent.return_value
+                if failure is None:
+                    parent.send_signal.assert_not_called()
+                else:
+                    parent.send_signal.assert_called_once_with(
+                        server_module.signal.SIGQUIT
+                    )
 
     def test_gather_server_endpoints_lists_every_listener_by_dp_rank(self):
         """Every rank joins the collective; only listener ranks contribute an
@@ -822,7 +853,10 @@ class TestRustServerExtension(CustomTestCase):
                 ):
                     RustServer.gather_server_endpoints(hosts_listener=False)
 
-    def test_gather_server_endpoints_checks_bind_family_on_every_rank(self):
+    def test_gather_server_endpoints_publishes_an_address_the_bind_serves(self):
+        """An IPv4 wildcard listener publishes 127.0.0.1 for SGLANG_HOST_IP=::1
+        (the same machine) and refuses any other IPv6 SGLANG_HOST_IP, which it
+        does not serve, on every rank, listener or not."""
         parallel = SimpleNamespace(
             nnodes=1,
             attn_dp_size=1,
@@ -831,40 +865,44 @@ class TestRustServerExtension(CustomTestCase):
             world_group=SimpleNamespace(all_gather_object=Mock()),
         )
         serving = SimpleNamespace(host="0.0.0.0", port=30000)
-        with (
-            patch.object(server_module, "get_parallel", return_value=parallel),
-            patch.object(
-                server_module,
-                "get_exec",
-                return_value=SimpleNamespace(moe=SimpleNamespace(is_ep_joiner=False)),
-            ),
-            patch.object(server_module, "get_serving", return_value=serving),
-            patch.object(RustServer, "_port_offset", return_value=0),
-            patch.object(server_module, "get_local_ip_auto") as advertised,
+        for bind, host_ip, published in (
+            ("0.0.0.0", "10.0.0.1", "10.0.0.1"),
+            ("::", "2001:db8::1", "2001:db8::1"),
+            ("::", "::1", "::1"),
+            ("0.0.0.0", "::1", "127.0.0.1"),
+            ("0.0.0.0", "2001:db8::1", None),
         ):
-            for bind, host in (
-                ("0.0.0.0", "10.0.0.1"),
-                ("::", "2001:db8::1"),
-                ("0.0.0.0", "2001:db8::1"),
+            serving.host = bind
+            gathered = []
+
+            def gather(entry):
+                if entry is not None:
+                    gathered[:] = [entry]
+                return [*gathered, None]
+
+            parallel.world_group.all_gather_object.side_effect = gather
+            with (
+                patch.dict(os.environ, {"SGLANG_HOST_IP": host_ip}),
+                patch.object(server_module, "get_parallel", return_value=parallel),
+                patch.object(
+                    server_module,
+                    "get_exec",
+                    return_value=SimpleNamespace(
+                        moe=SimpleNamespace(is_ep_joiner=False)
+                    ),
+                ),
+                patch.object(server_module, "get_serving", return_value=serving),
+                patch.object(RustServer, "_port_offset", return_value=0),
             ):
-                serving.host = bind
-                advertised.return_value = host
-                gathered = []
-
-                def gather(entry):
-                    if entry is not None:
-                        gathered.append(entry)
-                    return gathered
-
-                parallel.world_group.all_gather_object.side_effect = gather
                 for hosts_listener in (True, False):
-                    with self.subTest(bind=bind, host=host, listener=hosts_listener):
-                        if bind == "0.0.0.0" and ":" in host:
+                    with self.subTest(
+                        bind=bind, host_ip=host_ip, listener=hosts_listener
+                    ):
+                        if published is None:
                             with self.assertRaisesRegex(
                                 ValueError, "DP rank 0.*IPv4.*2001:db8::1"
                             ):
                                 RustServer.gather_server_endpoints(hosts_listener)
-                            self.assertEqual(len(gathered), 1)
                         else:
                             self.assertEqual(
                                 RustServer.gather_server_endpoints(hosts_listener),
@@ -872,7 +910,7 @@ class TestRustServerExtension(CustomTestCase):
                                     {
                                         "dp_rank": 0,
                                         "endpoint": server_module.NetworkAddress(
-                                            host, 30000
+                                            published, 30000
                                         ).to_url(),
                                     }
                                 ],
@@ -1070,6 +1108,28 @@ class TestRustServerExtension(CustomTestCase):
         )
         scheduler.output_streamer.release_detokenize_state.assert_called_once_with(req)
 
+    def test_freeze_gc_skips_the_detokenizer_socket_in_rust_mode(self):
+        """The scheduler freezes its own GC either way; only without the Rust
+        server, whose detokenizer shares the process, does it forward the
+        request to a detokenizer process."""
+        from sglang.srt.managers.io_struct import FreezeGCReq
+        from sglang.srt.managers.scheduler import Scheduler
+
+        req = FreezeGCReq(rid="r#1", gc_threshold=[700, 10, 1000])
+        scheduler = SimpleNamespace(
+            rust_server=RustServer(Mock(), http_port=30000), ipc_channels=Mock()
+        )
+        with patch("sglang.srt.managers.scheduler.freeze_gc") as freeze_gc:
+            Scheduler.handle_freeze_gc(scheduler, req)
+            freeze_gc.assert_called_once_with("Scheduler", [700, 10, 1000])
+            scheduler.ipc_channels.send_to_detokenizer.send_output.assert_not_called()
+
+            scheduler.rust_server = None
+            Scheduler.handle_freeze_gc(scheduler, req)
+        scheduler.ipc_channels.send_to_detokenizer.send_output.assert_called_once_with(
+            req, req
+        )
+
     def test_mixed_logprob_batch_frame(self):
         """In a batch where only some rows carry each logprob family, every row
         reads back its own cells from the frame (`for_each_chunk`'s column
@@ -1204,6 +1264,7 @@ class TestRustServerExtension(CustomTestCase):
             processor=sentinel.processor,
             model_config=SimpleNamespace(
                 is_multimodal=True,
+                is_generation=False,
                 hf_config=SimpleNamespace(model_type="unsupported_vlm"),
                 model_path="test/model",
             ),
@@ -1215,6 +1276,10 @@ class TestRustServerExtension(CustomTestCase):
                 BuiltinServer, "_build_mm_spec", return_value=sentinel.worker_spec
             ),
         ):
+            with self.assertRaisesRegex(RuntimeError, "serves generation models only"):
+                BuiltinServer.launch(scheduler)
+
+            scheduler.model_config.is_generation = True
             mm_processor.return_value.resolve_spec.return_value = None
             with self.assertRaisesRegex(
                 RuntimeError, "no Rust MM pipeline for model_type='unsupported_vlm'"
@@ -1267,9 +1332,11 @@ class TestRustServerExtension(CustomTestCase):
                 processor=sentinel.processor,
                 model_config=SimpleNamespace(
                     is_multimodal=True,
+                    is_generation=True,
                     hf_config=sentinel.config,
                     model_path="test/model",
                 ),
+                server_args=sentinel.server_args,
             )
             with launch_context(ModelServer, cores=([launch_core], server_cores)):
                 ModelServer.launch(scheduler)
