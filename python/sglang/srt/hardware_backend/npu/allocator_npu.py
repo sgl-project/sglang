@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import KVCache
 
 
+_ALLOC_EXTEND_BLOCK_SIZE = 2048
+
+
 class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
     def __init__(
         self,
@@ -63,7 +66,11 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 dtype=torch.int64,
                 device=self.device,
             )
-            max_num_extend_tokens = next_power_of_2(extend_num_tokens)
+            # The kernel uses this constexpr only for cdiv(bound, BLOCK_SIZE).
+            # All one-block extends can therefore share its specialization.
+            max_num_extend_tokens = max(
+                _ALLOC_EXTEND_BLOCK_SIZE, next_power_of_2(extend_num_tokens)
+            )
             bs = prefix_lens.shape[0]
             alloc_extend_kernel[(bs,)](
                 prefix_lens,
@@ -74,6 +81,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
                 next_power_of_2(bs),
                 self.page_size,
                 max_num_extend_tokens,
+                BLOCK_SIZE=_ALLOC_EXTEND_BLOCK_SIZE,
             )
 
         else:
