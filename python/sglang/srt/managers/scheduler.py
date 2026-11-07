@@ -6111,36 +6111,25 @@ class Scheduler(
         if get_parallel().pp_size > 1:
             # The PP loops hold this pause until no micro-batch is in flight.
             self._pp_retract_microbatches()
-        else:
-            # Drain the overlapped result so nothing is in flight when retracting.
-            if self.enable_overlap and self.last_batch:
-                if (
-                    self.disaggregation_mode == DisaggregationMode.PREFILL
-                    and (req := self.chunked_req) is not None
-                ):
-                    # Retract skips the chunk step that sets this result's KV send boundary.
-                    req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
-                tmp_batch, tmp_result = self.result_queue.popleft()
-                self.process_batch_result(tmp_batch, tmp_result)
-            elif self.enable_overlap_mlx:
-                self._drain_mlx_pending_jobs()
-            self._retract_running_batch()
+            self._publish_paused_state()
+            return
 
-        # Surface the paused state to dashboards immediately. The scheduler
-        # event loop short-circuits before reaching ``on_idle`` while paused,
-        # so without this hop ``gen_throughput`` retains its last non-zero
-        # value and KV events are not flushed for the entire pause window
-        # (e.g. across a weight update). Zero the gauge, force a one-shot
-        # idle log by resetting the rate-limit timestamp, and flush pending
-        # KV events.
-        self.metrics_reporter.last_gen_throughput = 0.0
-        if self.metrics_reporter.current_scheduler_metrics_enabled:
-            self.metrics_reporter.metrics_collector.last_log_time = 0.0
-            self.metrics_reporter._maybe_log_idle_metrics()
-        self.kv_events_publisher.publish_kv_events()
+        if self.enable_overlap and self.last_batch:
+            if (
+                self.disaggregation_mode == DisaggregationMode.PREFILL
+                and (req := self.chunked_req) is not None
+            ):
+                # Retract skips the chunk step that sets this result's KV send boundary.
+                req.tmp_end_idx = min(req.extend_end, len(req.origin_input_ids))
+            tmp_batch, tmp_result = self.result_queue.popleft()
+            self.process_batch_result(tmp_batch, tmp_result)
+        elif self.enable_overlap_mlx:
+            self._drain_mlx_pending_jobs()
+        self._retract_running_batch()
+        self._publish_paused_state()
 
     def _retract_running_batch(self):
-        # A first retract starts the pause.
+        # A first retract starts the pause once the in-flight result has drained.
         if self._pause_started_at is None:
             self._pause_started_at = time.monotonic()
 
@@ -6191,7 +6180,7 @@ class Scheduler(
             )
         # Empties the batch through filter_batch so a beam tail goes with the reqs.
         self.running_batch.filter_batch(keep_indices=[])
-        # Under PP the lists span micro-batches; leave only this batch's reqs.
+        # Under PP the other micro-batches keep running.
         self.running_reqs.leave(retract_reqs)
         self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
@@ -6212,6 +6201,20 @@ class Scheduler(
         # Until then a weight-update pause leaves stale-weight prefix KV (off-policy).
         if self.disaggregation_mode != DisaggregationMode.PREFILL:
             self.chunked_req = None
+
+    def _publish_paused_state(self):
+        # Surface the paused state to dashboards immediately. The scheduler
+        # event loop short-circuits before reaching ``on_idle`` while paused,
+        # so without this hop ``gen_throughput`` retains its last non-zero
+        # value and KV events are not flushed for the entire pause window
+        # (e.g. across a weight update). Zero the gauge, force a one-shot
+        # idle log by resetting the rate-limit timestamp, and flush pending
+        # KV events.
+        self.metrics_reporter.last_gen_throughput = 0.0
+        if self.metrics_reporter.current_scheduler_metrics_enabled:
+            self.metrics_reporter.metrics_collector.last_log_time = 0.0
+            self.metrics_reporter._maybe_log_idle_metrics()
+        self.kv_events_publisher.publish_kv_events()
 
     def continue_generation(self, recv_req: ContinueGenerationReqInput):
         if recv_req.torch_empty_cache:
