@@ -336,6 +336,9 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
     Contiguous ND weights use byte views of the routed prefix. Other layouts
     use full-storage snapshots to preserve padding and shared-expert suffixes.
     Model tensors retain their dtype, format, strides and addresses.
+
+    load() replaces the pending snapshots; store() writes back that layer before
+    the next load(). Sender-only layers may skip store().
     """
 
     def __init__(
@@ -345,17 +348,25 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
         rank: int,
     ):
         super().__init__(weights_by_layer, layer_ids, rank)
-        self._layouts = [
-            _expert_storage_layout(weight) for weight in weights_by_layer[layer_ids[0]]
-        ]
-        for layer in layer_ids[1:]:
-            if [
-                _expert_storage_layout(weight) for weight in weights_by_layer[layer]
-            ] != self._layouts:
-                raise ValueError(
-                    f"[NPU EPLB] rank={rank} layer={layer}: expert storage layouts "
-                    "must match across the migration chunk"
-                )
+        self._layouts: list[_ExpertStorageLayout] = []
+        for layer_index, layer in enumerate(layer_ids):
+            for weight_index, weight in enumerate(weights_by_layer[layer]):
+                try:
+                    layout = _expert_storage_layout(weight)
+                except ValueError as error:
+                    raise ValueError(
+                        f"[NPU EPLB] rank={rank} layer={layer} "
+                        f"weight_index={weight_index}: {error}"
+                    ) from error
+                if layer_index == 0:
+                    self._layouts.append(layout)
+                elif layout != self._layouts[weight_index]:
+                    raise ValueError(
+                        f"[NPU EPLB] rank={rank} layer={layer} "
+                        f"weight_index={weight_index}: storage layout {layout} "
+                        f"does not match layer {layer_ids[0]}: "
+                        f"{self._layouts[weight_index]}"
+                    )
 
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
