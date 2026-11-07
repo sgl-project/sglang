@@ -553,8 +553,8 @@ void naive_reduce_scatter(
     char* output_ptr,
     char* data_ptr,
     c10::ScalarType scalar_type,
-    size_t chunk_size,
-    size_t chunk_el,
+    size_t chunk_n,
+    size_t rank_stride_el,
     int element_size) {
   const int state_group = STATE_GROUP_REDUCE_SCATTER;
   int& current_buffer = ctx->reduce_scatter_current_buffer;
@@ -581,8 +581,17 @@ void naive_reduce_scatter(
   }
   state_idx = (state_idx + 1) % 3;
 
-  // Step 1: copy local data to shared buffer
-  parallel_memcpy(ctx->reduce_scatter_buffer[current_buffer][ctx->group_rank], data_ptr, chunk_size);
+  // Step 1: copy chunk_n elements of every rank's slice into the shared buffer, packed by destination rank
+  const size_t piece_bytes = chunk_n * element_size;
+  char* local_buffer = ctx->reduce_scatter_buffer[current_buffer][ctx->group_rank];
+  if (chunk_n == rank_stride_el) {
+    // Single chunk: the packed layout is the contiguous input, so copy it in one pass.
+    parallel_memcpy(local_buffer, data_ptr, ctx->group_size * piece_bytes);
+  } else {
+    for (int r = 0; r < ctx->group_size; r++) {
+      parallel_memcpy(local_buffer + r * piece_bytes, data_ptr + r * rank_stride_el * element_size, piece_bytes);
+    }
+  }
   std::atomic_thread_fence(std::memory_order_release);
   ctx->workspace[ctx->group_rank]->states[state_group] = copy_current;
 
@@ -593,14 +602,14 @@ void naive_reduce_scatter(
     }
   }
 
-  // Step 3: do local reduce on this rank's slice only
-  int start_el = slice_el_start(chunk_el, ctx->group_rank, ctx->group_size);
+  // Step 3: do local reduce on this rank's piece only
+  int start_el = chunk_n * ctx->group_rank;
 
   // each rank reduce its slice of buffer independently so there is no need for
   // synchronization afterward
   reduce_all_buffers(
       start_el,
-      slice_size(chunk_el, ctx->group_rank, ctx->group_size),
+      chunk_n,
       scalar_type,
       output_ptr - start_el * element_size,
       ctx->reduce_scatter_buffer[current_buffer],
@@ -610,16 +619,25 @@ void naive_reduce_scatter(
   current_buffer = 1 - current_buffer;
 }
 
-void reduce_scatter_outer_loop(
-    torch::Tensor& output, torch::Tensor& data, size_t numel, int data_size, int64_t handle) {
+void reduce_scatter_outer_loop(torch::Tensor& output, torch::Tensor& data, size_t numel, int64_t handle) {
   auto* ctx = get_shm_context(handle);
-  for (int offset = 0; offset < data_size; offset += MAX_BUF_SIZE) {
-    auto data_ptr = ((char*)(data.data_ptr()) + offset);
-    auto output_ptr = ((char*)(output.data_ptr()) + offset);
-    size_t chunk_size = std::min((size_t)MAX_BUF_SIZE, (size_t)(data_size - offset));
-    size_t chunk_el = chunk_size / (data_size / numel);
+  TORCH_CHECK(
+      static_cast<size_t>(output.numel()) * ctx->group_size == numel,
+      "SHM reduce-scatter expects input numel == output numel * group size");
+  TORCH_CHECK(output.scalar_type() == data.scalar_type(), "SHM reduce-scatter expects input and output of same dtype");
+  TORCH_CHECK(data.is_contiguous() && output.is_contiguous(), "SHM reduce-scatter expects contiguous tensors");
 
-    naive_reduce_scatter(ctx, output_ptr, data_ptr, data.scalar_type(), chunk_size, chunk_el, data.element_size());
+  const size_t element_size = data.element_size();
+  const size_t per_rank_el = numel / ctx->group_size;
+  // The buffer holds one piece per destination rank, so a chunk is MAX_BUF_SIZE / group_size.
+  const size_t max_chunk_n = MAX_BUF_SIZE / (ctx->group_size * element_size);
+
+  for (size_t offset = 0; offset < per_rank_el; offset += max_chunk_n) {
+    size_t chunk_n = std::min(max_chunk_n, per_rank_el - offset);
+    auto data_ptr = (char*)data.data_ptr() + offset * element_size;
+    auto output_ptr = (char*)output.data_ptr() + offset * element_size;
+
+    naive_reduce_scatter(ctx, output_ptr, data_ptr, data.scalar_type(), chunk_n, per_rank_el, element_size);
   }
 }
 
