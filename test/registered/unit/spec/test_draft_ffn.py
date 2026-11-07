@@ -7,7 +7,7 @@ from unittest.mock import patch
 import torch
 from transformers import Qwen3Config
 
-from sglang.srt.layers.draft.ffn import DraftMoE
+from sglang.srt.layers.draft.ffn import DraftMLP, DraftMoE
 from sglang.srt.layers.draft.ffn_spec import (
     FFN_KIND_DENSE,
     FFN_KIND_MOE,
@@ -17,7 +17,7 @@ from sglang.srt.layers.draft.ffn_spec import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.utils import MoeA2ABackend
-from sglang.srt.models.dflash import DFlashDraftModel, DFlashMLP
+from sglang.srt.models.dflash import DFlashDraftModel
 from sglang.srt.models.dspark import DSparkDraftModel
 from sglang.srt.runtime_context import get_flags, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -405,7 +405,28 @@ class TestDraftMoeLoading(CustomTestCase):
             self.assertIsNotNone(layer.mlp.shared_expert_gate)
             self.assertIsNotNone(layer.mlp.gate.expert_bias)
         for layer in DFlashDraftModel(Qwen3Config(**BASE)).layers:  # no experts
-            self.assertIsInstance(layer.mlp, DFlashMLP)
+            self.assertIsInstance(layer.mlp, DraftMLP)
+
+    def test_mixed_dense_and_moe_layers_load_their_own_tensors(self):
+        config = Qwen3Config(**_moe_fields(ffn_layer_types=["dense", "moe"]))
+        model = DFlashDraftModel(config)
+        self.assertIsInstance(model.layers[0].mlp, DraftMLP)
+        self.assertIsInstance(model.layers[1].mlp, DraftMoE)
+        moe_weights, _, _ = _layer_checkpoint(1)
+        generator = torch.Generator().manual_seed(7)
+        dense_weights = {
+            "layers.0.mlp.gate_proj.weight": torch.randn(32, H, generator=generator),
+            "layers.0.mlp.up_proj.weight": torch.randn(32, H, generator=generator),
+            "layers.0.mlp.down_proj.weight": torch.randn(H, 32, generator=generator),
+        }
+        model.load_weights(list({**dense_weights, **moe_weights}.items()))
+        gate_up = model.layers[0].mlp.gate_up_proj.weight
+        torch.testing.assert_close(
+            gate_up[:32], dense_weights["layers.0.mlp.gate_proj.weight"]
+        )
+        torch.testing.assert_close(
+            gate_up[32:], dense_weights["layers.0.mlp.up_proj.weight"]
+        )
 
     def test_dspark_builds_moe_layers(self):
         dspark = dict(markov_rank=4, markov_head_type="vanilla")
@@ -413,7 +434,7 @@ class TestDraftMoeLoading(CustomTestCase):
         moe = Qwen3Config(**_moe_fields(dflash_config=dflash, **dspark))
         self.assertIsInstance(DSparkDraftModel(moe).layers[0].mlp, DraftMoE)
         dense = Qwen3Config(**dict(BASE, dflash_config=dflash, **dspark))
-        self.assertIsInstance(DSparkDraftModel(dense).layers[0].mlp, DFlashMLP)
+        self.assertIsInstance(DSparkDraftModel(dense).layers[0].mlp, DraftMLP)
 
     def test_moe_layers_refuse_dp_attention_and_a2a_dispatch(self):
         spec = DraftMixFFNSpec.from_config(_moe_fields()).moe

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import logging
-from functools import partial
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -18,18 +17,17 @@ from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecutio
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
 from sglang.srt.hf_transformers import get_rope_config
-from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.draft.ffn import (
-    build_draft_ffn,
+    DraftMLP,
+    build_ffn,
     check_draft_ffns_loaded,
     load_draft_ffn_weight,
 )
-from sglang.srt.layers.draft.ffn_spec import DraftMixFFNSpec
+from sglang.srt.layers.draft.ffn_spec import DraftDenseFFNSpec, DraftMixFFNSpec
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
-    MergedColumnParallelLinear,
     QKVParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -646,54 +644,20 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
             )
 
 
-class DFlashMLP(nn.Module):
+class DFlashMLP(DraftMLP):
+    """The dense FFN of a DFlash draft layer, sized from its config."""
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
-        super().__init__()
-        hidden_size = int(config.hidden_size)
-        intermediate_size = int(getattr(config, "intermediate_size", 0))
-        if intermediate_size <= 0:
-            raise ValueError(
-                f"Invalid intermediate_size={intermediate_size} for DFlash MLP."
-            )
-
-        self.gate_up_proj = MergedColumnParallelLinear(
-            hidden_size,
-            [intermediate_size] * 2,
-            bias=False,
+        dense = DraftDenseFFNSpec.from_config(config)
+        super().__init__(
+            int(config.hidden_size),
+            dense.intermediate_size,
+            dense.hidden_act,
+            swiglu_limit=dense.swiglu_limit,
+            swiglu_alpha=dense.swiglu_alpha,
             quant_config=quant_config,
-            prefix="gate_up_proj" if not prefix else f"{prefix}.gate_up_proj",
+            prefix=prefix,
         )
-        self.down_proj = RowParallelLinear(
-            intermediate_size,
-            hidden_size,
-            bias=False,
-            quant_config=quant_config,
-            prefix="down_proj" if not prefix else f"{prefix}.down_proj",
-        )
-        hidden_act = getattr(config, "hidden_act", "silu")
-        if hidden_act == "silu":
-            self.act_fn = SiluAndMul()
-        elif hidden_act == "swigluoai":
-            from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (
-                swiglu_no_interleaved_with_alpha_and_limit,
-            )
-
-            self.act_fn = partial(
-                swiglu_no_interleaved_with_alpha_and_limit,
-                gemm1_alpha=float(config.swiglu_alpha),
-                gemm1_limit=float(config.swiglu_limit),
-            )
-        else:
-            raise ValueError(
-                f"Unsupported DFlash activation: {hidden_act}. "
-                "Supported activations are silu and swigluoai."
-            )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate_up, _ = self.gate_up_proj(x)
-        x = self.act_fn(gate_up)
-        x, _ = self.down_proj(x)
-        return x
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
@@ -779,11 +743,11 @@ class DFlashDecoderLayer(nn.Module):
         config,
         layer_id: int,
         attention_cls: type[nn.Module],
+        ffn_spec: DraftMixFFNSpec,
         attention_conv: Optional[DFlashGroupedConv] = None,
         mlp_conv: Optional[DFlashGroupedConv] = None,
         quant_config=None,
         prefix: str = "",
-        ffn_spec: Optional[DraftMixFFNSpec] = None,
     ) -> None:
         super().__init__()
         hidden_size = int(config.hidden_size)
@@ -800,21 +764,12 @@ class DFlashDecoderLayer(nn.Module):
         )
         self.post_attention_layernorm = norm_cls(hidden_size, eps=rms_norm_eps)
         mlp_prefix = f"{prefix}.mlp" if prefix else ""
-        dense = partial(
-            DFlashMLP, config=config, quant_config=quant_config, prefix=mlp_prefix
-        )
-        # The dense FFN as before; the factory swaps in a DraftMoE for MoE layers.
-        self.mlp = (
-            dense()
-            if ffn_spec is None
-            else build_draft_ffn(
-                ffn_spec,
-                layer_id,
-                hidden_size,
-                dense=dense,
-                quant_config=quant_config,
-                prefix=mlp_prefix,
-            )
+        self.mlp = build_ffn(
+            ffn_spec,
+            layer_id,
+            hidden_size,
+            quant_config=quant_config,
+            prefix=mlp_prefix,
         )
 
         self.attention_conv = attention_conv

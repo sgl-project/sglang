@@ -1,4 +1,4 @@
-"""Draft FFN modules built from DraftMixFFNSpec: DraftMLP and DraftMoE."""
+"""A draft layer's FFN: build_ffn gives DraftMLP or DraftMoE, as the DraftMixFFNSpec says."""
 
 from __future__ import annotations
 
@@ -11,7 +11,8 @@ from torch import nn
 
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.draft.ffn_spec import (
-    FFN_KIND_DENSE,
+    FFN_KIND_MOE,
+    DraftDenseFFNSpec,
     DraftMixFFNSpec,
     DraftMoeFFNSpec,
 )
@@ -83,6 +84,25 @@ def gated_activation(
 
 class DraftMLP(nn.Module):
     """Gated dense FFN of a draft layer; also the shared expert of an MoE layer."""
+
+    @classmethod
+    def from_spec(
+        cls,
+        dense: DraftDenseFFNSpec,
+        hidden_size: int,
+        *,
+        quant_config: Optional[QuantizationConfig] = None,
+        prefix: str = "",
+    ) -> DraftMLP:
+        return cls(
+            hidden_size,
+            dense.intermediate_size,
+            dense.hidden_act,
+            swiglu_limit=dense.swiglu_limit,
+            swiglu_alpha=dense.swiglu_alpha,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
 
     def __init__(
         self,
@@ -443,23 +463,25 @@ def check_draft_ffns_loaded(layers) -> None:
             layer.mlp.check_loaded()
 
 
-def build_draft_ffn(
+def build_ffn(
     spec: DraftMixFFNSpec,
     layer_id: int,
     hidden_size: int,
     *,
-    dense: Callable[[], nn.Module],
     quant_config: Optional[QuantizationConfig] = None,
     prefix: str = "",
 ) -> nn.Module:
-    """The FFN of draft layer ``layer_id``: ``dense()`` as today, or a DraftMoE."""
-    if spec.kind(layer_id) == FFN_KIND_DENSE:
-        return dense()
-    assert spec.moe is not None
-    return DraftMoE(
-        spec.moe,
-        hidden_size,
-        layer_id=layer_id,
-        quant_config=quant_config,
-        prefix=prefix,
+    """The FFN of draft layer ``layer_id``: DraftMoE where the spec says MoE, else DraftMLP."""
+    if spec.kind(layer_id) == FFN_KIND_MOE:
+        return DraftMoE(
+            spec.moe,
+            hidden_size,
+            layer_id=layer_id,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+    if spec.dense is None:
+        raise ValueError("Draft FFN: intermediate_size is required for dense layers.")
+    return DraftMLP.from_spec(
+        spec.dense, hidden_size, quant_config=quant_config, prefix=prefix
     )

@@ -68,6 +68,8 @@ def _kind_list(raw: Any, key: str, names: dict) -> Tuple[str, ...]:
 class DraftDenseFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
     intermediate_size: int
     hidden_act: str
+    swiglu_limit: Optional[float] = None
+    swiglu_alpha: Optional[float] = None
 
     @classmethod
     def from_config(cls, draft_hf_config: Any) -> DraftDenseFFNSpec:
@@ -79,6 +81,12 @@ class DraftDenseFFNSpec(msgspec.Struct, frozen=True, kw_only=True):
                 "for dense layers",
             ),
             hidden_act=str(cfg_get(text, "hidden_act", "silu")),
+            swiglu_limit=_optional_positive_float(
+                cfg_get(text, "swiglu_limit", None), "swiglu_limit"
+            ),
+            swiglu_alpha=_optional_positive_float(
+                cfg_get(text, "swiglu_alpha", None), "swiglu_alpha"
+            ),
         )
 
 
