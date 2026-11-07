@@ -451,6 +451,10 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
 
 def _get_arg_value(args_list, name):
     for i, arg in enumerate(args_list):
+        # Args are not always strings: launcher-injected values (ports,
+        # sizes) are ints and must not be probed for a "--key=value" prefix.
+        if not isinstance(arg, str):
+            continue
         if arg == name and i + 1 < len(args_list):
             return args_list[i + 1]
         # Also accept the --key=value form.
