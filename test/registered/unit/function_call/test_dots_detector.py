@@ -108,6 +108,25 @@ class TestDotsToolDetector(unittest.TestCase):
             ],
         )
 
+    def test_non_stream_keeps_text_between_and_after_tool_calls(self):
+        tools = [_tool("search", {"query": {"type": "string"}})]
+        detector = DotsToolDetector()
+        text = (
+            "before<dots_function_call>"
+            '<invoke name="search"><parameter name="query">chairs</parameter></invoke>'
+            "</dots_function_call>"
+            "middle"
+            "<dots_function_call>"
+            '<invoke name="search"><parameter name="query">tables</parameter></invoke>'
+            "</dots_function_call>"
+            "after"
+        )
+
+        result = detector.detect_and_parse(text, tools)
+
+        self.assertEqual(result.normal_text, "beforemiddleafter")
+        self.assertEqual([call.name for call in result.calls], ["search", "search"])
+
     def test_streaming_buffers_partial_marker_and_emits_all_complete_calls(self):
         tools = [_tool("search", {"query": {"type": "string"}})]
         detector = DotsToolDetector()

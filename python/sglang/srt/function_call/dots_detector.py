@@ -181,20 +181,24 @@ class DotsToolDetector(BaseFormatDetector):
         return self.bot_token in text
 
     def detect_and_parse(self, text: str, tools: list[Tool]) -> StreamingParseResult:
-        marker_index = text.find(self.bot_token)
-        if marker_index == -1:
+        if self.bot_token not in text:
             return StreamingParseResult(normal_text=text)
 
         calls: list[ToolCallItem] = []
+        normal_parts: list[str] = []
+        last_end = 0
         for block in self.func_call_regex.finditer(text):
+            normal_parts.append(text[last_end : block.start()])
+            last_end = block.end()
             try:
                 for parsed in self._parse_block(block.group(1), tools):
                     calls.extend(self.parse_base_json(parsed, tools))
             except (json.JSONDecodeError, ValueError, TypeError) as exc:
                 logger.warning("Failed to parse dots tool call: %s", exc)
+        normal_parts.append(text[last_end:])
 
         return StreamingParseResult(
-            normal_text=text[:marker_index].strip(), calls=calls
+            normal_text="".join(normal_parts).strip(), calls=calls
         )
 
     def _append_stream_call(
