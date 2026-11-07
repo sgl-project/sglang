@@ -129,7 +129,9 @@ class StreamingSession:
                 return None
 
         # Lend the record; the slot keeps the tree lock. A rejected chunked
-        # request matches again next cycle and borrows the same record.
+        # request matches again next cycle and borrows the same record. The
+        # row stays parked until the turn is allocated (`take`): a match is
+        # not admission, and a rejected turn runs nothing on it.
         req.kv = slot.kv
 
         # token_ids = get_fill_ids()[:input_len-1] (1-token logit reserve
@@ -200,6 +202,8 @@ class StreamingSession:
         # Use the finished length, not the req clock (it lags an in-flight verify
         # by ~1 under overlap); clamp so committed <= allocated.
         slot.kv.commit_finished(target)
+        # The slot keeps its row until the next turn, with nothing running.
+        self._storage().park_row(slot)
 
         # Update req_nodes to this successfully finished request.
         req.session.finish_req(req)
@@ -221,10 +225,15 @@ class StreamingSession:
     # -- Record ownership --
 
     def take(self, req: Req) -> None:
-        """A streaming turn's first row allocation: the session takes the
-        request's record and the tree lock it took at admission, and the
-        request borrows them from here on."""
-        if not _is_streaming(req) or self.borrowed_slot(req) is not None:
+        """A streaming turn's row allocation, the point its work starts. The
+        first turn's record and the tree lock it took at admission move to a
+        new slot, and the request borrows them from here on; a later turn
+        runs on its slot's parked row again."""
+        if not _is_streaming(req):
+            return
+        slot = self.borrowed_slot(req)
+        if slot is not None:
+            self._storage().unpark_row(slot)
             return
         session_id = req.session.session_id
         assert session_id not in self.slots, f"{session_id=} already has a slot"
@@ -280,6 +289,11 @@ class StreamingSession:
             slot.kv.mamba_ping_pong_empty = None
 
     # -- Internal helpers (streaming body bits) --
+
+    def _storage(self):
+        return kv_storage_of(
+            self.cache.req_to_token_pool, self.cache.token_to_kv_pool_allocator
+        )
 
     def _lock_to_slot(self, req: Req, slot: SessionSlot) -> None:
         slot.lock, req.lock = req.lock, None

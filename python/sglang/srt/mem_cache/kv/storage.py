@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.kv.plan import (
     TreeSlot,
     WireEntry,
 )
+from sglang.srt.mem_cache.kv.requests import RowState
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
 
 if TYPE_CHECKING:
@@ -95,7 +96,7 @@ class KVStorage:
         self.sized = sized
         self._allocator = allocator
         self.start_layer = start_layer
-        # The request table: rows and the ids they hold.
+        # The request table: rows, who holds each, and the ids they hold.
         self.requests = requests
         self.scratch = scratch
         self._request_memory = request_memory
@@ -109,6 +110,10 @@ class KVStorage:
         # Receive rows held for a destination publish still to come, per
         # request: their logical release.
         self._receive_holds: Dict[int, Tuple[Any, ReceiveHold]] = {}
+        if requests is not None:
+            # A table reset frees every row, so nothing keyed by its requests
+            # outlives it.
+            requests.add_clear_hook(self._forget_network_transfers)
         # Readers reaching a window further back than its own layers (a fused
         # draft's front rows), by sub-pool, and the length of a window the
         # model does not state: bound once at startup (`bind_window_retention`).
@@ -335,18 +340,37 @@ class KVStorage:
         )
 
     def release_row(self, holder) -> None:
-        """Give back the row of ``holder`` (a request, or a streaming
-        session's slot); its ids went back before. A request's network
-        transfers end here at the latest, and only its own: another request
-        with the same ``rid`` keeps its own. A session's slot has none, since
-        its request ended them when the row passed on."""
-        self.end_network_transfer(holder)
+        """Give back the row of ``holder`` (a request, a streaming session's
+        slot, a retained document window); its ids went back before. A
+        request's network transfers end here at the latest, and only its own:
+        another request with the same ``rid`` keeps its own. A parked or held
+        row has none, since its request ended them when the row passed on."""
+        row = holder.kv.req_pool_idx
+        assert row is not None, "the holder has no request row"
+        if self.requests.state_of(row) is RowState.ACTIVE:
+            self.end_network_transfer(holder)
         self.requests.free(holder)
+
+    def park_row(self, holder) -> None:
+        """``holder`` keeps its row with no work in flight on it (a
+        streaming session between turns): a row held this way gives nothing
+        back by itself, so it is not memory another request may wait for."""
+        if holder.kv.req_pool_idx is not None:
+            self.requests.park(holder.kv.req_pool_idx)
+
+    def unpark_row(self, holder) -> None:
+        """Work runs on ``holder``'s parked row again."""
+        self.requests.unpark(holder.kv.req_pool_idx)
+
+    def hold_row(self, holder) -> None:
+        """``holder``, no request, takes over a finished request's row (a
+        retained document window) until `release_row`."""
+        self.requests.hold(holder.kv.req_pool_idx)
 
     def take_rows(self, num_rows: int) -> Optional[List[int]]:
         """Rows bound to no request (beam search members); None when too few
         are free."""
-        rows = self.requests.alloc_rows(num_rows)
+        rows = self.requests.alloc_rows(num_rows, state=RowState.HELD)
         if rows is not None and self._request_memory is not None:
             self._request_memory.reset_rows(rows)
         return rows
@@ -969,6 +993,17 @@ class KVStorage:
         _, transfers = self._network_transfers.pop(_lifetime(req), (req, ()))
         for transfer in transfers:
             transfer.released = True
+
+    def _forget_network_transfers(self) -> None:
+        """The request table was reset: every request's rows are gone, so
+        every network transfer and receive hold recorded for one ends."""
+        for _, release in self._receive_holds.values():
+            release.released = True
+        self._receive_holds.clear()
+        for _, transfers in self._network_transfers.values():
+            for transfer in transfers:
+                transfer.released = True
+        self._network_transfers.clear()
 
     def unit_tokens(self, sub_pool: str) -> int:
         """Tokens one transfer unit of ``sub_pool`` spans: its page, or one for
