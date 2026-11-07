@@ -507,4 +507,48 @@ def resolve_fp8_mqa_logits_fn():
         return _fp8_mqa_logits_torch
     import deep_gemm
 
+    if envs.SGLANG_DSA_MQA_LOGITS_SCHEDULED.get() and hasattr(
+        deep_gemm, "get_mqa_logits_metadata_legacy"
+    ):
+        return _fp8_mqa_logits_scheduled
     return deep_gemm.fp8_mqa_logits
+
+
+def _fp8_mqa_logits_scheduled(q, kv, weights, ks, ke, clean_logits=False):
+    """DeepGEMM's legacy MQA logits with its row schedule: the kernel balances
+    rows of different key ranges across SMs (same values as the unscheduled
+    call, which splits rows evenly)."""
+    import deep_gemm
+
+    kv_rows = kv[0].shape[0] if isinstance(kv, (tuple, list)) else kv.shape[0]
+    schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
+        ks, ke, kv_rows, q.shape[1]
+    )
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(
+        q, kv, weights, ks, ke, clean_logits, 0, torch.float, schedule_meta
+    )
+
+
+def use_bf16_indexer_logits() -> bool:
+    return envs.SGLANG_DSA_INDEXER_BF16_LOGITS.get() and is_cuda()
+
+
+def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
+    """MQA logits in bf16 from the FP8 query and keys, absolute columns like
+    fp8_mqa_logits. bf16 logits need bf16 weights."""
+    import deep_gemm
+
+    schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
+        ks, ke, kv_fp8[0].shape[0], q_fp8.shape[1]
+    )
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(
+        q_fp8,
+        kv_fp8,
+        weights.to(torch.bfloat16),
+        ks,
+        ke,
+        False,
+        0,
+        torch.bfloat16,
+        schedule_meta,
+    )

@@ -2222,6 +2222,12 @@ class Envs:
     SGLANG_DSA_PREFILL_DENSE_ATTN_KV_LEN_THRESHOLD = EnvInt(2048)
     SGLANG_DSA_HIP_DISABLE_PRESHUFFLE = EnvBool(False)
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
+    # Pass DeepGEMM's MQA-logits row schedule (get_mqa_logits_metadata_legacy) to the
+    # prefill indexer's logits kernel. Same values as the unscheduled kernel.
+    SGLANG_DSA_MQA_LOGITS_SCHEDULED = EnvBool(False)
+    # Prefill indexer on CUDA: write the MQA logits in bf16 instead of fp32 (same FP8
+    # inputs); the top-k reads the bf16 scores and a logits chunk holds twice the rows.
+    SGLANG_DSA_INDEXER_BF16_LOGITS = EnvBool(False)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
     # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
