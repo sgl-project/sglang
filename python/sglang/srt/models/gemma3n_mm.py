@@ -460,6 +460,12 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
 
         for name, loaded_weight in weights:
             name = re.sub(r"^model\.", "", name)
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
+
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
                     continue
@@ -477,10 +483,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                     name = name.replace(".self_attn.out_proj", ".self_attn.proj")
                 # Skip loading extra bias for GPTQ models
                 if name.endswith(".bias") and name not in params_dict:
-                    continue
-                # Remapping the name of FP8 kv-scale
-                name = maybe_remap_kv_scale_name(name, params_dict)
-                if name is None:
                     continue
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)

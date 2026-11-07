@@ -57,6 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     kv_cache_scales_loader,
+    maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
 
@@ -568,6 +569,12 @@ class Glm4ForCausalLM(nn.Module):
                     )[1]
                     loaded_weight = embed_token_weights
                 else:
+                    continue
+
+            # Remap KV-cache scale names before the q/k/v_proj -> qkv_proj rename.
+            if "scale" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
                     continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

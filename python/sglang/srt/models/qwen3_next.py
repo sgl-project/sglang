@@ -1186,6 +1186,9 @@ class Qwen3NextForCausalLM(nn.Module):
             if "rotary_emb.inv_freq" in name:
                 continue
 
+            if name.endswith((".self_attn.k_scale", ".self_attn.v_scale")):
+                # compressed-tensors stores the scales on the attention module.
+                name = name.replace(".self_attn.", ".self_attn.attn.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
 
