@@ -74,7 +74,7 @@ def extend(
         and A_log is not None
         and dt_bias is not None
         and all(x.dtype == torch.bfloat16 for x in (q, k, v, g, beta))
-        and ssm_states.dtype == torch.float32
+        and ssm_states.dtype in (torch.float32, torch.bfloat16)
         and ssm_states.is_contiguous()
         and q.shape == k.shape == v.shape == g.shape
         and q.ndim == 4
@@ -85,6 +85,16 @@ def extend(
         return None
     # the launch layout depends on the longest sequence; T bounds it without a sync
     seq_lens = kwargs.get("extend_seq_lens_cpu")
+    if ssm_states.dtype == torch.bfloat16:
+        # The kernel keeps an fp32 state; run it on fp32 copies of the batch's slots.
+        slots = cache_indices.to(torch.int64)
+        states = ssm_states.index_select(0, slots).float()
+        state_slots = torch.arange(
+            slots.numel(), dtype=torch.int32, device=slots.device
+        )
+    else:
+        states = ssm_states
+        state_slots = cache_indices.to(torch.int32).contiguous()
     output = get_kernel("attention.kda_prefill_gfx950", KernelBackend.KDA)(
         q.contiguous(),
         k.contiguous(),
@@ -93,8 +103,8 @@ def extend(
         beta.contiguous(),
         A_log.reshape(-1).float().contiguous(),
         dt_bias.reshape(-1).float().contiguous(),
-        ssm_states,
-        cache_indices.to(torch.int32).contiguous(),
+        states,
+        state_slots,
         query_start_loc.to(torch.int32).contiguous(),
         max(seq_lens) if seq_lens else q.shape[1],
         q.shape[-1] ** -0.5,
@@ -105,4 +115,6 @@ def extend(
             else track_chunk_idx.to(torch.int64).contiguous()
         ),
     )
+    if states is not ssm_states:
+        ssm_states.index_copy_(0, slots, states.to(ssm_states.dtype))
     return (output, None) if return_intermediate_states else output
