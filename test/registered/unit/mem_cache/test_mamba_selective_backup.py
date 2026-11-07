@@ -136,7 +136,6 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
 
     def test_buffer_mode_uses_the_same_tree_endpoint_and_retry_policy(self):
         cache, nodes = self.make_cache()
-        cache.page_size = 1
         cache.components = {ComponentType.MAMBA: MagicMock()}
         cache.sidecar_pool_specs = []
         cache.storage_existence_cache = StorageExistenceCache()
