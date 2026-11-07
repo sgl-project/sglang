@@ -9,7 +9,7 @@ from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload import config, dispatch
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, stage="base-a")
+register_cpu_ci(est_time=1, stage="base-a", runner_config="cpu")
 
 MODEL_CONFIG = SimpleNamespace(
     num_attention_heads=128,
