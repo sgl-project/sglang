@@ -529,6 +529,53 @@ def ulysses_head_group_pipelined_attention(
     return out.permute(2, 1, 0, 3, 4).reshape(rows, heads, head_size)
 
 
+def fp8_ulysses_attention(impl, q, k, v) -> torch.Tensor | None:
+    """Dense Ulysses attention through ``fp8_fa_sm120`` with an E4M3 input exchange.
+
+    q/k/v are ``[1, s_local, H, 128]`` sequence shards; returns the
+    ``[1, s_local, H, 128]`` output rows of this rank, the same bytes as the BF16
+    exchange followed by the kernel on the gathered rows (see
+    ``fp8_fa_sm120.ulysses``), or None when the kernel does not take this call.
+    """
+    from sglang.kernels.ops.attention.fp8_fa_sm120.ulysses import (
+        fp8_ulysses_attention as run,
+    )
+    from sglang.multimodal_gen import envs
+
+    world = get_ulysses_parallel_world_size()
+    if (
+        not envs.SGLANG_DIFFUSION_FP8_ULYSSES_EXCHANGE
+        or world <= 1
+        or q.shape[0] != 1
+        or q.shape[2] % world
+        or torch.compiler.is_compiling()
+        or impl._fallback_reason(q[0], k[0], v[0]) is not None
+    ):
+        return None
+    group = get_sp_group().ulysses_group
+
+    def all_reduce_max(t):
+        dist.all_reduce(t, op=dist.ReduceOp.MAX, group=group)
+
+    def all_to_all(send):
+        return _usp_all_to_all_single(send, role="usp_fp8_input")
+
+    try:
+        out = run(
+            q[0],
+            k[0],
+            v[0],
+            world=world,
+            rank=get_ulysses_parallel_rank(),
+            all_reduce_max=all_reduce_max,
+            all_to_all=all_to_all,
+            softmax_scale=impl.softmax_scale,
+        )
+    except ValueError:
+        return None
+    return _usp_output_all_to_all(out.unsqueeze(0), head_dim=2)
+
+
 def _packed_qkv_row_view_is_free(x: torch.Tensor) -> bool:
     """True when ``x.view(b * s_local, h, d)`` costs no copy.
 
