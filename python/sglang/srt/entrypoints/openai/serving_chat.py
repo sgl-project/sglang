@@ -1970,13 +1970,16 @@ class OpenAIServingChat(OpenAIServingBase):
         # When input_ids are provided, skip template tokenization entirely;
         # only stop tokens and tool_call_constraint are needed.
         if request.input_ids is not None:
-            image_data, video_data, audio_data, modalities = [], [], [], []
-            # A partially expanded request still sends every media item of the
+            # A pre-tokenized request (e.g. the miles TITO session server) keeps the
+            # media in its messages; the client's ids carry one placeholder per item,
+            # which the multimodal processor expands in place (SGLANG_MM_AVOID_RETOKENIZE).
+            # A partially expanded request also sends every media item of the
             # conversation, for the token-space processor to match to its IDs.
-            if request.mm_token_expansion_start_len:
-                image_data, video_data, audio_data, modalities = _collect_message_media(
-                    request.messages
-                )
+            image_data, video_data, audio_data, modalities = (
+                _collect_message_media(request.messages)
+                if is_multimodal or request.mm_token_expansion_start_len
+                else ([], [], [], [])
+            )
             result = MessageProcessingResult(
                 prompt="",
                 prompt_ids=request.input_ids,
