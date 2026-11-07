@@ -2730,7 +2730,6 @@ def hc_mix_stats_sinkhorn_deepgemm(
     hc_mult: int = 4,
 ):
     from sglang.srt.layers.deep_gemm_wrapper.entrypoint import (
-        has_tf32_hc_prenorm_gemm_dual,
         tf32_hc_prenorm_gemm,
         tf32_hc_prenorm_gemm_dual,
     )
@@ -2751,7 +2750,7 @@ def hc_mix_stats_sinkhorn_deepgemm(
     mix_hi = torch.empty((slices, m, mix), dtype=torch.float32, device=dev)
     mix_lo = torch.empty_like(mix_hi)
     sq = torch.empty((slices, m), dtype=torch.float32, device=dev)
-    if current_arch().is_sm(10) and has_tf32_hc_prenorm_gemm_dual():
+    if current_arch().is_sm(10):
         tf32_hc_prenorm_gemm_dual(x_flat, high, low, mix_hi, mix_lo, sq, slices)
     else:
         tf32_hc_prenorm_gemm(x_flat, high, mix_hi, sq, slices)
