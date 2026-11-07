@@ -24,7 +24,12 @@ from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM
-from sglang.srt.multimodal.media_io import ImageData, VideoData, download_remote_media
+from sglang.srt.multimodal.media_io import (
+    ImageData,
+    VideoData,
+    download_remote_media,
+    resolve_media_url,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
@@ -471,6 +476,10 @@ class MiMoProcessor:
         ):
             timeout = int(os.getenv("REQUEST_TIMEOUT", "10"))
             path_or_data = download_remote_media(path_or_data, timeout=timeout)
+        elif isinstance(path_or_data, str) and (
+            (resolved := resolve_media_url(path_or_data)) is not None
+        ):
+            path_or_data = resolved
 
         if isinstance(path_or_data, bytes):
             source = BytesIO(path_or_data)
