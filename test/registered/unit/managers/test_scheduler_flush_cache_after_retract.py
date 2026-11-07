@@ -12,7 +12,11 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
@@ -46,7 +50,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch = None
-        scheduler.chunked_req = None
+        scheduler.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.is_empty.return_value = True
@@ -58,13 +62,14 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
-        scheduler.prefill_launched_reqs = RequestList()
+        scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.running_reqs = []
         scheduler.dllm_config = None
         scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_transfer_queue = None
+        scheduler.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         scheduler.disagg_decode_prealloc_queue = None
         scheduler.disagg_decode_transfer_queue = None
         scheduler.hisparse_coordinator = None
@@ -78,6 +83,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
+        scheduler.invariant_checker = MagicMock()
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):

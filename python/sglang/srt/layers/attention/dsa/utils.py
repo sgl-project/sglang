@@ -275,11 +275,17 @@ def cal_padded_tokens(forward_batch: "ForwardBatch"):
     return tokens
 
 
-def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
+def dsa_cache_seqlens_may_be_padded(forward_batch: "ForwardBatch") -> bool:
+    """Whether pad_dsa_cache_seqlens may append zero-length metadata rows: the
+    interleave CP physical shard or the DP / MLP-sync padded token count."""
     attn_cp_size = get_parallel().attn_cp_size
     needs_cp_pad = attn_cp_size > 1 and can_dsa_prefill_cp_interleave(forward_batch)
     needs_dp_pad = forward_batch.global_num_tokens_cpu is not None
-    if not needs_cp_pad and not needs_dp_pad:
+    return needs_cp_pad or needs_dp_pad
+
+
+def pad_dsa_cache_seqlens(forward_batch: "ForwardBatch", dsa_cache_seqlens):
+    if not dsa_cache_seqlens_may_be_padded(forward_batch):
         return dsa_cache_seqlens
     tokens = cal_padded_tokens(forward_batch)
     pad_len = tokens - dsa_cache_seqlens.shape[0]

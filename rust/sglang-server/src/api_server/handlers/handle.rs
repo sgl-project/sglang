@@ -3,7 +3,7 @@
 
 use std::sync::{
     Arc, OnceLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
 
@@ -25,7 +25,9 @@ use crate::utils::fsm::RequestState;
 use super::control::PEER_ABORT_MAX_IN_FLIGHT;
 use super::generate::{Cancellation, Generation, Generations};
 use crate::api_server::core::fanout::{ControlTarget, RankId};
-use crate::api_server::core::{CoreError, DrainEnd, DrainState, FrontendMetrics};
+use crate::api_server::core::{
+    CoreError, DrainEnd, DrainState, FrontendMetrics, GenerateValidator, InFlight, RequestLog,
+};
 
 /// How long the listeners keep open connections after a drain's requests
 /// finished: enough to flush the last responses and close idle connections.
@@ -43,11 +45,16 @@ pub(crate) struct CoreConfig {
     pub(crate) metadata: CoreMetadata,
     /// Request metrics, when `--enable-metrics` is on.
     pub(crate) metrics: Option<Arc<FrontendMetrics>>,
+    /// Request logging and crash-dump recording, when either is on.
+    pub(crate) request_log: Option<Arc<RequestLog>>,
     /// The targets answering for the DP ranks this process does not host,
     /// which every multi-rank control operation fans out to alongside the
     /// local scheduler (see [`fanout`]). Empty means this process answers
     /// for its own rank only.
     pub(crate) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    /// A model package's admission check, run on every client generation
+    /// before media prefetch.
+    pub(crate) generate_validator: Option<Arc<dyn GenerateValidator>>,
 }
 
 /// Immutable, transport-independent metadata retained by the core.
@@ -76,6 +83,21 @@ pub(crate) struct CoreMetadata {
     /// Priority for a generation that sets none (see
     /// `ServerArgs::default_priority_value`).
     pub(super) default_priority: Option<i64>,
+    /// The scheduler `internal_state` fields `/server_info` reports beyond its
+    /// typed ones, which an embedding package registers (see
+    /// `RuntimeConfig::server_info_state_keys`).
+    pub(super) server_info_state_keys: Vec<String>,
+}
+
+impl CoreMetadata {
+    /// This metadata, with `/server_info` reporting `keys` beyond its typed
+    /// scheduler fields.
+    pub(crate) fn with_server_info_state_keys(self, keys: Vec<String>) -> Self {
+        Self {
+            server_info_state_keys: keys,
+            ..self
+        }
+    }
 }
 
 impl From<&ServerArgs> for CoreMetadata {
@@ -100,6 +122,7 @@ impl From<&ServerArgs> for CoreMetadata {
             launch_server_info: args.launch_server_info.0.clone(),
             launch_model_info: args.launch_model_info.0.clone(),
             default_priority: args.default_priority_value,
+            server_info_state_keys: Vec::new(),
         }
     }
 }
@@ -129,9 +152,11 @@ pub(super) struct CoreInner {
     pub(super) metadata: CoreMetadata,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
+    pub(super) request_log: Option<Arc<RequestLog>>,
     /// The DP rank the local scheduler answers for, and the targets for the rest.
     pub(super) dp_rank: RankId,
     pub(super) peer_endpoints: Vec<Arc<dyn ControlTarget>>,
+    pub(super) generate_validator: Option<Arc<dyn GenerateValidator>>,
     /// Shared by every transport (see [`CoreHandle::begin_drain`]).
     pub(super) drain: Arc<DrainState>,
     /// Overrides [`GRACEFUL_CLOSE_TIMEOUT`] (see
@@ -140,6 +165,22 @@ pub(super) struct CoreInner {
     /// Relayed aborts in flight at once, across every abort (see
     /// [`CoreHandle::abort_peers`]).
     pub(super) peer_abort_permits: tokio::sync::Semaphore,
+    /// Requests this listener relayed to another DP rank's listener and has
+    /// not finished answering (see [`CoreHandle::track_relayed`]).
+    pub(super) relayed: AtomicUsize,
+}
+
+/// A request relayed to another DP rank's listener, counted until dropped
+/// (see [`CoreHandle::track_relayed`]).
+pub(crate) struct RelayedRequest {
+    core: CoreHandle,
+    _in_flight: InFlight,
+}
+
+impl Drop for RelayedRequest {
+    fn drop(&mut self) {
+        self.core.inner.relayed.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl CoreHandle {
@@ -163,11 +204,14 @@ impl CoreHandle {
                 metadata: config.metadata,
                 generations: Generations::default(),
                 metrics: config.metrics,
+                request_log: config.request_log,
                 dp_rank,
                 peer_endpoints: config.peer_endpoints,
+                generate_validator: config.generate_validator,
                 drain: Arc::default(),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
+                relayed: AtomicUsize::new(0),
             }),
         }
     }
@@ -194,6 +238,11 @@ impl CoreHandle {
         self.inner.metrics.as_ref()
     }
 
+    /// The DP rank the local scheduler answers for.
+    pub(crate) fn dp_rank(&self) -> RankId {
+        self.inner.dp_rank
+    }
+
     /// Record successful completion of the startup warmup. The state is
     /// shared by every transport.
     pub(crate) fn mark_ready(&self) {
@@ -214,6 +263,22 @@ impl CoreHandle {
 
     pub(crate) fn is_draining(&self) -> bool {
         self.inner.drain.is_draining()
+    }
+
+    /// Count a request this listener relayed to another DP rank's listener
+    /// until the guard drops: the drain waits for it, and `/abort_request`
+    /// here reaches the other ranks meanwhile (see [`CoreHandle::abort_peers`]).
+    pub(crate) fn track_relayed(&self) -> RelayedRequest {
+        self.inner.relayed.fetch_add(1, Ordering::SeqCst);
+        RelayedRequest {
+            core: self.clone(),
+            _in_flight: self.inner.drain.track(),
+        }
+    }
+
+    /// Whether the drain was begun forced (see [`DrainState::is_forced`]).
+    pub(crate) fn is_drain_forced(&self) -> bool {
+        self.inner.drain.is_forced()
     }
 
     /// Resolve once the drain has ended (see [`DrainState::ended`]); the
