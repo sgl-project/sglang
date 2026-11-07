@@ -311,6 +311,7 @@ if HAS_TILELANG:
         min_scored_len: int = 0,
         threads: int = 128,
         dtype: str = "bfloat16",
+        groups_per_cta: int = 0,
     ):
         # The MMA layout needs 64 GEMM rows; a compressed page has full_page // ratio,
         # so pages are packed as sub-pages of one 64-row tile.
@@ -333,7 +334,15 @@ if HAS_TILELANG:
         ):
             # A fixed number of CTAs per row strides over that row's groups, so the
             # grid no longer scales with the page-table width (the max context).
-            with T.Kernel(batch, ctas_per_row, threads=threads) as (bx, cta):
+            # With groups_per_cta > 0 (ROCm) each CTA scores that many consecutive
+            # groups instead and the grid spans the page table; CTAs past a row's
+            # context exit at once.
+            grid_y = (
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta)
+                if groups_per_cta > 0
+                else ctas_per_row
+            )
+            with T.Kernel(batch, grid_y, threads=threads) as (bx, cta):
                 q_shared = T.alloc_shared([heads, head_dim], dtype)
                 k_shared = T.alloc_shared([GROUP, head_dim], dtype)
                 scores = T.alloc_fragment([GROUP, heads], T.float32)
@@ -343,11 +352,24 @@ if HAS_TILELANG:
                 num_groups = T.ceildiv(context_len, GROUP)
 
                 # Rows at or below min_scored_len select every block, so their
-                # scores are never read.
-                if context_len > min_scored_len:
+                # scores are never read. Branches on groups_per_cta are trace-time,
+                # keeping ROCm-only terms out of the CUDA kernel.
+                if (
+                    context_len > min_scored_len and cta * groups_per_cta < num_groups
+                    if groups_per_cta > 0
+                    else context_len > min_scored_len
+                ):
                     T.copy(Q[bx, 0, :, :], q_shared)
-                    for step in T.serial(T.ceildiv(num_groups, ctas_per_row)):
-                        group = step * ctas_per_row + cta
+                    for step in T.serial(
+                        groups_per_cta
+                        if groups_per_cta > 0
+                        else T.ceildiv(num_groups, ctas_per_row)
+                    ):
+                        group = (
+                            cta * groups_per_cta + step
+                            if groups_per_cta > 0
+                            else step * ctas_per_row + cta
+                        )
                         if group < num_groups:
                             # TileLang's pipeliner rejects dynamic loops around smem
                             # copies; unroll the sub-pages at the Python level.
@@ -539,6 +561,14 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+# CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires sixteen;
+# the indexer pads Q to this in its fused prep so the wrapper need not copy it.
+QSA_DECODE_HEAD_ALIGNMENT = 16 if is_hip() else 8
+# Four wavefronts per CTA on ROCm: about 1.5x faster than 128 threads on MI355X.
+_DECODE_THREADS = 256 if is_hip() else 128
+# ROCm: four consecutive groups per CTA over a page-table-wide grid is 1.2-1.7x
+# faster than the fixed CTAs per row on MI355X at 50k-200k context (bit-exact).
+_DECODE_GROUPS_PER_CTA = 4 if is_hip() else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -593,10 +623,9 @@ def tilelang_qsa_mqa_decode(
         )
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    # Zero-padding preserves the weight-free head sum.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
+    head_alignment = QSA_DECODE_HEAD_ALIGNMENT
     kernel_heads = max(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
@@ -615,9 +644,15 @@ def tilelang_qsa_mqa_decode(
         heads=kernel_heads,
         head_dim=head_dim,
         page_size=page_size,
-        ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
+        # Unused with groups_per_cta (it sets the grid); fixed so it does not
+        # multiply the kernel specializations.
+        ctas_per_row=(
+            1 if _DECODE_GROUPS_PER_CTA else _decode_ctas_per_row(q.shape[0], q.device)
+        ),
         min_scored_len=min_scored_len,
+        threads=_DECODE_THREADS,
         dtype=_TILELANG_DTYPES[scoring_dtype],
+        groups_per_cta=_DECODE_GROUPS_PER_CTA,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
