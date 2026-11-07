@@ -288,11 +288,15 @@ def cached_tokens_details_from_dict(
             host=details.get("host", 0),
             storage=details.get("storage", 0),
             storage_backend=details.get("storage_backend"),
+            host_write_back=details.get("host_write_back"),
+            host_prefetch=details.get("host_prefetch"),
         )
     else:
         return CachedTokensDetails(
             device=details.get("device", 0),
             host=details.get("host", 0),
+            host_write_back=details.get("host_write_back"),
+            host_prefetch=details.get("host_prefetch"),
         )
 
 

@@ -46,7 +46,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
 )
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
-from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.radix_cache import HostSource, RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     BackupKV,
     CacheAction,
@@ -160,6 +160,10 @@ class UnifiedTreeNode:
         # inserting request's host base, copied on split, read through
         # req.last_node at alloc time. None when sharding is off.
         self.rotation_base: Optional[int] = None
+        # How the node's Full host_value was last written (device backup vs L3
+        # prefetch), for attributing host hits; None when host_value is absent
+        # or written by a path with unknown provenance.
+        self.host_source: Optional[HostSource] = None
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -2744,6 +2748,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 full_data = node.component_data[BASE_COMPONENT_TYPE]
                 if full_data.host_value is None:
                     full_data.host_value = matched_host_value.clone()
+                    node.host_source = HostSource.L3_PREFETCH
                     if node.hash_value is None:
                         node.hash_value = list(matched_hash_value)
                     self.kv_events.record_store(node, medium=StorageMedium.CPU)
@@ -2792,6 +2797,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             _set_tlru_lens_and_raise_history(new_node, node)
         new_node.hash_value = hash_value
         new_node.component_data[BASE_COMPONENT_TYPE].host_value = host_value.clone()
+        # Only a newly inserted L3 host suffix carries the prefetch source; a
+        # full overlap returns above without touching the existing source.
+        new_node.host_source = HostSource.L3_PREFETCH
         node.children[child_key] = new_node
         self._update_evictable_leaf_sets(new_node)
         self._update_evictable_leaf_sets(node)
@@ -2993,6 +3001,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 transfers=[kv_xfer],
                 cache_actions=cache_actions,
             )
+            # Only a successful Full host backup commit tags the source;
+            # failures, cancellations, and dropped transfers never reach here.
+            node.host_source = HostSource.DEVICE_BACKUP
         for ct, xfers in comp_xfers.items():
             self.components_by_type[ct].commit_hicache_transfer(
                 node,

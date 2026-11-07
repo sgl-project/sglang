@@ -3202,6 +3202,8 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         decode_req.req.cached_tokens_device = cached_tokens[1].item()
         decode_req.req.cached_tokens_host = cached_tokens[2].item()
         decode_req.req.cached_tokens_storage = cached_tokens[3].item()
+        decode_req.req.cached_tokens_host_write_back = cached_tokens[7].item()
+        decode_req.req.cached_tokens_host_prefetch = cached_tokens[8].item()
         # Multimodal prompt token counts packed into cached_tokens slots 4-6
         # by the prefill node (see MetadataBuffers.set_buf).
         decode_req.req.mm_image_tokens = cached_tokens[4].item()

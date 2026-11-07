@@ -2951,6 +2951,12 @@ impl ::serde::Serialize for CachedTokensDetails {
         if let Some(v) = &self.storage_backend {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "storage_backend", v)?;
         }
+        if let Some(v) = &self.host_write_back {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "host_write_back", v)?;
+        }
+        if let Some(v) = &self.host_prefetch {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "host_prefetch", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -2971,6 +2977,8 @@ impl<'de> ::serde::Deserialize<'de> for CachedTokensDetails {
                 let mut f_host = None;
                 let mut f_storage = None;
                 let mut f_storage_backend = None;
+                let mut f_host_write_back = None;
+                let mut f_host_prefetch = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "device" => {
@@ -2998,6 +3006,18 @@ impl<'de> ::serde::Deserialize<'de> for CachedTokensDetails {
                             f_storage_backend =
                                 Some(map.next_value::<Option<::prost::alloc::string::String>>()?);
                         }
+                        "host_write_back" => {
+                            if f_host_write_back.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("host_write_back"));
+                            }
+                            f_host_write_back = Some(map.next_value::<Option<u32>>()?);
+                        }
+                        "host_prefetch" => {
+                            if f_host_prefetch.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("host_prefetch"));
+                            }
+                            f_host_prefetch = Some(map.next_value::<Option<u32>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -3008,6 +3028,8 @@ impl<'de> ::serde::Deserialize<'de> for CachedTokensDetails {
                     host: f_host.unwrap_or_default(),
                     storage: f_storage.flatten(),
                     storage_backend: f_storage_backend.flatten(),
+                    host_write_back: f_host_write_back.flatten(),
+                    host_prefetch: f_host_prefetch.flatten(),
                 })
             }
         }

@@ -711,7 +711,7 @@ class RustServer:
         self,
         payload: BatchTokenIDOutput,
         decode_latencies: Dict[int, float],
-        cached_tokens_split: Optional[List[Tuple[int, int, int]]] = None,
+        cached_tokens_split: Optional[List[Tuple[int, ...]]] = None,
         storage_backend: Optional[str] = None,
         request_stats: Optional[Dict[int, Dict[str, Any]]] = None,
     ) -> None:

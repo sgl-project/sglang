@@ -377,12 +377,26 @@ impl IntoIterator for CustomizedInfo {
 }
 
 /// One row of [`BatchHeader::cached_tokens_split`], encoded
-/// `[device, host, storage]`.
+/// `[device, host, storage, host_write_back?, host_prefetch?]`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedTokensSplit {
     pub device: u32,
     pub host: u32,
     pub storage: u32,
+    #[serde(default)]
+    pub host_write_back: Option<u32>,
+    #[serde(default)]
+    pub host_prefetch: Option<u32>,
+}
+
+impl CachedTokensSplit {
+    pub fn host_source(self) -> Option<(u32, u32)> {
+        self.host_write_back
+            .zip(self.host_prefetch)
+            .filter(|&(wb, pf)| {
+                self.host > 0 && u64::from(wb) + u64::from(pf) == u64::from(self.host)
+            })
+    }
 }
 
 /// A request's cached prompt tokens by the cache tier that served them, as
@@ -396,6 +410,8 @@ pub struct CachedTokensDetails {
     pub storage: Option<u32>,
     /// The attached storage tier's backend.
     pub storage_backend: Option<Arc<str>>,
+    pub host_write_back: Option<u32>,
+    pub host_prefetch: Option<u32>,
 }
 
 impl CachedTokensDetails {
@@ -408,10 +424,12 @@ impl CachedTokensDetails {
         cached_tokens: u32,
         storage_backend: Option<&Arc<str>>,
     ) -> Option<Self> {
+        let source = split.host_source();
         let CachedTokensSplit {
             device,
             host,
             storage,
+            ..
         } = split;
         let device_only = host == 0 && storage == 0 && storage_backend.is_none();
         if (device == 0 && host == 0 && storage == 0) || (device_only && device == cached_tokens) {
@@ -422,6 +440,8 @@ impl CachedTokensDetails {
             host,
             storage: (storage > 0 || storage_backend.is_some()).then_some(storage),
             storage_backend: storage_backend.cloned(),
+            host_write_back: source.map(|x| x.0),
+            host_prefetch: source.map(|x| x.1),
         })
     }
 
@@ -433,6 +453,8 @@ impl CachedTokensDetails {
             host: 0,
             storage: None,
             storage_backend: None,
+            host_write_back: None,
+            host_prefetch: None,
         })
     }
 }
@@ -1014,6 +1036,34 @@ impl ChunkExtras {
 mod tests {
     use super::*;
     use crate::message::finish_reason::{FinishKind, Matched};
+
+    #[test]
+    fn cached_tokens_origin_accepts_legacy_and_extended_wire_rows() {
+        let legacy: CachedTokensSplit =
+            rmp_serde::from_slice(&rmp_serde::to_vec(&(2_u32, 8_u32, 0_u32)).unwrap()).unwrap();
+        assert_eq!(legacy.host_source(), None);
+        let extended: CachedTokensSplit = rmp_serde::from_slice(
+            &rmp_serde::to_vec(&(2_u32, 8_u32, 0_u32, 3_u32, 5_u32)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(extended.host_source(), Some((3, 5)));
+        let details = CachedTokensDetails::from_split(extended, 10, None).unwrap();
+        assert_eq!(
+            (details.host_write_back, details.host_prefetch),
+            (Some(3), Some(5))
+        );
+        let incomplete = CachedTokensSplit {
+            host_prefetch: Some(4),
+            ..extended
+        };
+        assert_eq!(incomplete.host_source(), None);
+        let overflow = CachedTokensSplit {
+            host_write_back: Some(u32::MAX),
+            host_prefetch: Some(9),
+            ..extended
+        };
+        assert_eq!(overflow.host_source(), None);
+    }
 
     #[test]
     fn batch_cols_match_single_joined_buffer() {

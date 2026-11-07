@@ -616,6 +616,9 @@ class Req(ReqDllmMixin):
         self.best_match_node: Any = None
         # Per-component host hit lengths split off from host_hit_length:
         self.host_hit_length = 0
+        self.host_hit_write_back = 0
+        self.host_hit_prefetch = 0
+        self.host_hit_source_ranges = ()
         self.swa_host_hit_length = 0
         self.matched_auxiliary_swa_host_hit_length = 0
         self.mamba_host_hit_length = 0
@@ -750,6 +753,8 @@ class Req(ReqDllmMixin):
         # Detailed breakdown of cached tokens by source (for HiCache)
         self.cached_tokens_device = 0  # Tokens from device cache (GPU)
         self.cached_tokens_host = 0  # Tokens from host cache (CPU memory)
+        self.cached_tokens_host_write_back = 0  # host portion backed up from device
+        self.cached_tokens_host_prefetch = 0  # host portion prefetched from L3
         self.cached_tokens_storage = 0  # Tokens from L3 storage backend
         self._cache_breakdown_computed = (
             False  # Track if breakdown was already computed
@@ -1903,6 +1908,68 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def compute_hicache_source_breakdown(
+    host_hit_length: int,
+    host_hit_write_back: int,
+    host_hit_prefetch: int,
+    storage_hit_length: int,
+    prefix_indices_len: int,
+    storage_hit_start: Optional[int] = None,
+    host_hit_is_storage: bool = False,
+    host_source_ranges: tuple = (),
+) -> tuple[int, int, int, int, int]:
+    """Keep the tier split and attribute only the materialized L2 interval.
+
+    Current-request L3 reads are excluded even when their rows are staged in
+    L2. Old or partially known provenance yields zero/zero, which egress omits.
+    """
+    prefix_len = max(0, prefix_indices_len)
+    host_len = min(prefix_len, max(0, host_hit_length))
+    storage_len = max(0, storage_hit_length)
+    device, host, storage = split_cached_prefix_by_tier(
+        prefix_len, host_len, storage_len, storage_hit_start, host_hit_is_storage
+    )
+    if host == 0:
+        return device, host, storage, 0, 0
+    if not host_source_ranges:
+        # Legacy callers can provide aggregate counts. Only an uncut interval
+        # or a single known source can be attributed without ordered ranges.
+        wb, pf = max(0, host_hit_write_back), max(0, host_hit_prefetch)
+        if wb + pf != host_hit_length:
+            return device, host, storage, 0, 0
+        if host == host_hit_length:
+            return device, host, storage, wb, pf
+        if wb == host_hit_length:
+            return device, host, storage, host, 0
+        if pf == host_hit_length:
+            return device, host, storage, 0, host
+        return device, host, storage, 0, 0
+
+    host_start = prefix_len - host_len
+    storage_start = (
+        storage_hit_start
+        if storage_hit_start is not None
+        else prefix_len - min(host_len, storage_len)
+    )
+    storage_end = storage_start + storage_len
+    write_back = prefetch = 0
+    previous_end = -1
+    for start, end, source in host_source_ranges:
+        if start < previous_end or end < start:
+            return device, host, storage, 0, 0
+        previous_end = end
+        lo, hi = max(start, host_start), min(end, prefix_len)
+        count = max(0, hi - lo)
+        count -= max(0, min(hi, storage_end) - max(lo, storage_start))
+        if source == "device_backup":
+            write_back += count
+        elif source == "l3_prefetch":
+            prefetch += count
+    if write_back + prefetch != host:
+        return device, host, storage, 0, 0
+    return device, host, storage, write_back, prefetch
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2443,12 +2510,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                         req.cached_tokens_device,
                         req.cached_tokens_host,
                         req.cached_tokens_storage,
-                    ) = split_cached_prefix_by_tier(
-                        prefix_len=req.prefix_len,
-                        host_hit_len=req.materialized_host_hit_len(),
-                        storage_hit_len=req.storage_hit_length,
+                        req.cached_tokens_host_write_back,
+                        req.cached_tokens_host_prefetch,
+                    ) = compute_hicache_source_breakdown(
+                        host_hit_length=req.materialized_host_hit_len(),
+                        host_hit_write_back=req.host_hit_write_back,
+                        host_hit_prefetch=req.host_hit_prefetch,
+                        storage_hit_length=req.storage_hit_length,
+                        prefix_indices_len=req.prefix_len,
                         storage_hit_start=req.storage_hit_start,
                         host_hit_is_storage=req.host_hit_is_storage,
+                        host_source_ranges=req.host_hit_source_ranges,
                     )
                     req._cache_breakdown_computed = True
 

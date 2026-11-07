@@ -229,6 +229,9 @@ message CachedTokensDetails {
   optional uint32 storage = 3;
   // The attached storage tier's backend.
   optional string storage_backend = 4;
+  // L2 origin detail, present when the host-hit interval is fully attributed.
+  optional uint32 host_write_back = 5;
+  optional uint32 host_prefetch = 6;
 }
 
 message GenerateResponse {
