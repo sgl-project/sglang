@@ -4,6 +4,7 @@
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 
+#include <bit>
 #include <cstdint>
 #ifndef USE_ROCM
 #include <cuda_fp8.h>
@@ -62,7 +63,7 @@ SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
 // not produce the fnuz flavour that arch needs, so it takes a separate fix.
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   const fp32x2_t v{fp8_e4m3_clip(x), fp8_e4m3_clip(y)};
-  return __hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3);
+  return std::bit_cast<fp8x2_e4m3_t>(__hip_cvt_float2_to_fp8x2(v, __HIP_NOSAT, __HIP_E4M3));
 }
 #else
 // Software float -> FP8 E4M3 conversion for the archs the branch above skips: gfx942,
@@ -135,7 +136,7 @@ SGL_DEVICE uint8_t cvt_float_to_fp8_e4m3(float val) {
 SGL_DEVICE fp8x2_e4m3_t pack_fp8(float x, float y) {
   uint8_t x8 = cvt_float_to_fp8_e4m3(x);
   uint8_t y8 = cvt_float_to_fp8_e4m3(y);
-  return static_cast<uint16_t>(x8) | (static_cast<uint16_t>(y8) << 8);
+  return std::bit_cast<fp8x2_e4m3_t>(static_cast<uint16_t>(x8 | (y8 << 8)));
 }
 #endif  // HIP_FP8_TYPE_OCP && !HIP_FP8_TYPE_FNUZ
 #endif
