@@ -398,8 +398,11 @@ directory in the normal SGLang/Hugging Face snapshot; the builder never
 downloads a second copy. A cache only covers the scheduler settings used to
 create it, including its mode, step count, flow shifts, and condition noise
 values. SGLang rejects a request outside that coverage instead of silently
-changing conditioning. Cache mode supports the matching unquantized checkpoint
-only.
+changing conditioning. Cache mode needs the checkpoint the cache was built
+from. Its other linears may be quantized, for example a ConvRot INT8 file
+quantized from the same weights or `--quantization convrot_int8`: the cache
+replaces only the AdaLN branches, which then keep their original BF16 outputs.
+The online rebuild below still requires unquantized weights.
 
 ### Advanced: online AdaLN rebuild with a host cache
 
