@@ -54,6 +54,11 @@ class TestSamplingParamsValidate(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, r"num_outputs_per_prompt"):
             SamplingParams(num_outputs_per_prompt=0)
 
+    def test_skipping_the_generated_output_is_rollout_only(self):
+        with self.assertRaisesRegex(ValueError, r"rollout/generate"):
+            SamplingParams(rollout_return_generated_output=False)
+        SamplingParams(rollout=True, rollout_return_generated_output=False)
+
     def test_quality_defaults_to_lossless(self):
         # The default runs every fast path that keeps the reference math;
         # "exact" is the opt-in for bit-identical output.
