@@ -1349,8 +1349,9 @@ class ShmPointerMMData:
                 # the process is killed with SIGBUS. Reserving the pages up
                 # front turns exhaustion into a catchable OSError (ENOSPC).
                 os.posix_fallocate(shm._fd, 0, nbytes)
-            dst = torch.frombuffer(shm.buf, dtype=torch.uint8)
-            dst.copy_(tensor.view(torch.uint8).reshape(-1))
+            # Small multimodal features should not fan out to the global
+            # PyTorch intra-op pool while the tokenizer event loop is blocked.
+            shm.buf[:] = tensor.detach().view(torch.uint8).reshape(-1).numpy()
         except BaseException:
             shm.close()
             shm.unlink()
