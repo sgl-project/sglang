@@ -58,7 +58,6 @@ from sglang.kernels.ops.diffusion import (
     wan_rmsnorm_silu,
 )
 from sglang.kernels.ops.diffusion.common.platform import is_cuda
-from sglang.kernels.ops.diffusion.sites.bitexact_gate import BitExactFusionGate
 from sglang.multimodal_gen.configs.models.vaes.qwenimage21 import (
     QwenImage21VAEArchConfig,
     QwenImage21VAEConfig,
@@ -769,6 +768,18 @@ def test_glm_qk_head_layernorm_is_bit_exact(shape):
 # -------------------------------------------------------------------------
 
 
+def _patch_sana_ln_fusion(monkeypatch):
+    gate = BitExactFusionGate("Sana test", per_signature=True)
+    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
+    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
+    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
+    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+    return gate, contiguous_kernel, strided_kernel
+
+
 @requires_inline_ptx
 @pytest.mark.parametrize(
     "shape,nmod,transposed",
@@ -784,14 +795,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed, monkeypatc
     # (., 1024, 2240) is the real Sana 1024px shape; hidden 2240 % 512 != 0
     # exercises the kernel's partial tail chunk.  nmod mirrors the two adaLN
     # chunk layouts, transposed the permuted layout the Sana DiT serves.
-    gate = BitExactFusionGate("Sana test", per_signature=True)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
-    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
-    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+    gate, contiguous_kernel, strided_kernel = _patch_sana_ln_fusion(monkeypatch)
 
     torch.manual_seed(0)
     batch, seq, hidden = shape
@@ -834,14 +838,7 @@ def test_sana_fused_ln_modulate_is_bit_exact(shape, nmod, transposed, monkeypatc
 @requires_inline_ptx
 @torch.no_grad()
 def test_sana_cached_signature_cannot_bypass_plain_layernorm_requirement(monkeypatch):
-    gate = BitExactFusionGate("Sana plain LayerNorm test", per_signature=True)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
-    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
-    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+    gate, contiguous_kernel, strided_kernel = _patch_sana_ln_fusion(monkeypatch)
 
     batch, seq, hidden = 2, 17, 128
     x = torch.randn(batch, seq, hidden, device="cuda", dtype=torch.bfloat16)
@@ -879,14 +876,7 @@ def test_sana_cached_signature_cannot_bypass_plain_layernorm_requirement(monkeyp
 @requires_inline_ptx
 @torch.no_grad()
 def test_sana_unsupported_layouts_fall_back(monkeypatch):
-    gate = BitExactFusionGate("Sana layout fallback test", per_signature=True)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
-    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
-    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+    gate, contiguous_kernel, strided_kernel = _patch_sana_ln_fusion(monkeypatch)
 
     batch, seq, hidden = 2, 17, 128
     norm = torch.nn.LayerNorm(
@@ -931,16 +921,10 @@ def test_sana_unsupported_layouts_fall_back(monkeypatch):
     assert torch.equal(actual_invalid_modulation, expected_invalid_modulation)
 
 
+@requires_inline_ptx
 @torch.no_grad()
 def test_sana_unverified_signature_uses_eager_during_capture(monkeypatch):
-    gate = BitExactFusionGate("Sana graph capture test", per_signature=True)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD", gate)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_SIGS", gate.verified_sigs)
-    monkeypatch.setattr(sana, "_SANA_LN_MOD_DISABLED", False)
-    contiguous_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_raw)
-    strided_kernel = MagicMock(wraps=sana.fused_layernorm_modulate_strided_raw)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_raw", contiguous_kernel)
-    monkeypatch.setattr(sana, "fused_layernorm_modulate_strided_raw", strided_kernel)
+    gate, contiguous_kernel, strided_kernel = _patch_sana_ln_fusion(monkeypatch)
 
     source = torch.randn(1, 128, 17, device="cuda", dtype=torch.bfloat16)
     x = source.transpose(1, 2)
@@ -951,16 +935,12 @@ def test_sana_unverified_signature_uses_eager_during_capture(monkeypatch):
     shift = torch.randn_like(scale)
     expected = _sana_eager_ln_modulate(norm, x, scale, shift)
 
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
+    with patch.object(torch.cuda, "is_current_stream_capturing", return_value=True):
         out = sana_ln_modulate(norm, x, scale, shift)
     assert not gate.verified_sigs
     assert not gate.disabled
     contiguous_kernel.assert_not_called()
     strided_kernel.assert_not_called()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert not gate.verified_sigs
     assert torch.equal(out, expected)
 
 

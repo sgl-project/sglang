@@ -102,7 +102,7 @@ def test_strided_graph_replay_reads_updated_values(has_shift):
     current_stream.synchronize()
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph, stream=current_stream):
+    with torch.cuda.graph(graph):
         replayed = fused_layernorm_modulate_strided_raw(x, scale, shift, eps)
     assert replayed.is_contiguous()
 
