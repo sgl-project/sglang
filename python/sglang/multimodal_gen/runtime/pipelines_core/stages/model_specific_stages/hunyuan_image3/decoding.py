@@ -11,7 +11,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
     OutputBatch,
     Req,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 OUTPUT_GEOMETRY_EXTRA_KEY = "hunyuan_image3_output_geometry"
@@ -325,6 +328,7 @@ def apply_hunyuan_image3_spatial_plan(
 class HunyuanImage3DecodingStage(DecodingStage):
     """Decode a complete native bucket, then apply request-scoped geometry."""
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         output_batch = super().forward(batch, server_args)

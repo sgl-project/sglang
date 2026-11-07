@@ -5,7 +5,9 @@
 Decoding stage for diffusion pipelines.
 """
 
+import functools
 import weakref
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -118,6 +120,18 @@ def rollout_output_without_decode(batch: Req) -> OutputBatch:
     )
 
 
+def skip_decode_if_requested(forward):
+    """Return the trajectory alone, without running the VAE, when the request asks for no generated output."""
+
+    @functools.wraps(forward)
+    def wrapper(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if not batch.rollout_return_generated_output:
+            return rollout_output_without_decode(batch)
+        return forward(self, batch, server_args)
+
+    return wrapper
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -125,6 +139,10 @@ class DecodingStage(PipelineStage):
     This stage handles the decoding of latent representations into the final
     output format (e.g., pixel values).
     """
+
+    # False on a stage whose forward also advances state (a session's streaming
+    # decoder, a memory bank); admission rejects skip requests for it.
+    skip_decode_supported: ClassVar[bool] = True
 
     @property
     def role_affinity(self):
@@ -396,6 +414,7 @@ class DecodingStage(PipelineStage):
             return None
         return EncodeWhileDecoding(save_file_path, batch)
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(
         self,
@@ -410,8 +429,6 @@ class DecodingStage(PipelineStage):
         trajectory latents for visualization purposes.
 
         """
-        if not batch.rollout_return_generated_output:
-            return rollout_output_without_decode(batch)
         # load vae if not already loaded (used for memory constrained devices)
         self.load_model()
 

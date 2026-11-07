@@ -26,7 +26,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
-    rollout_output_without_decode,
+    skip_decode_if_requested,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
@@ -432,10 +432,9 @@ class MiniMaxH3DecodingStage(DecodingStage):
             frames = canonical_frames
         return frames
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
-        if not batch.rollout_return_generated_output:
-            return rollout_output_without_decode(batch)
         _minimax_h3_decoder_task(batch)
         visual_latent = _required_tensor(batch.latents, "batch.latents")
         audio_latent = _required_tensor(batch.audio_latents, "batch.audio_latents")

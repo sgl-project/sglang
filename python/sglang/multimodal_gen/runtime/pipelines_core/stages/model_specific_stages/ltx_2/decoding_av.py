@@ -16,7 +16,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
     can_encode_while_decoding,
@@ -147,6 +150,7 @@ class LTX2AVDecodingStage(DecodingStage):
         stream.synchronize()
         return host.numpy()
 
+    @skip_decode_if_requested
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         self.load_model()
         output_batch = OutputBatch(

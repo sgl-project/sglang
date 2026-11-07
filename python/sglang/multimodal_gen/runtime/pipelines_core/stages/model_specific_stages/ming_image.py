@@ -27,7 +27,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.models.encoders.ming_image import ming_position_ids
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.text_encoding import (
     TextEncodingStage,
 )
@@ -218,6 +221,7 @@ class MingImageDecodingStage(DecodingStage):
         decoded = super().decode(flat, server_args, vae_dtype=vae_dtype)
         return decoded.reshape(batch, frames, 4, *decoded.shape[-2:]).transpose(1, 2)
 
+    @skip_decode_if_requested
     def forward(self, batch, server_args):
         output = super().forward(batch, server_args)
         images = output.output
