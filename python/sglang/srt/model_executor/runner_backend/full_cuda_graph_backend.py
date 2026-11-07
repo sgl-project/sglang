@@ -151,14 +151,18 @@ class FullCudaGraphBackend(BaseGraphBackend):
         foundry = get_foundry_adapter()
         if foundry.enabled:
             # CUDA graph persistence: SAVE captures and archives this shape;
-            # LOAD restores it.
-            self._graphs[shape_key], self._outputs[shape_key] = foundry.capture_one(
+            # LOAD restores it. None: Foundry fell back, capture natively.
+            persisted = foundry.capture_one(
                 shape_key=shape_key,
                 forward_fn=forward_fn,
                 pool=self._pool,
                 stream=self._capture_stream,
             )
-            return
+            if persisted is not None:
+                self._graphs[shape_key], self._outputs[shape_key] = persisted
+                # Restored kernels read the same dummy-batch tensors as captured ones.
+                self._capture_inputs[shape_key] = capture_inputs
+                return
         # When per-bs capture traces are enabled (--enable-profile-cuda-graph +
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()

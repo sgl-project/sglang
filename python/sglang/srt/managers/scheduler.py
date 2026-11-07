@@ -427,7 +427,7 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
-from sglang.srt.utils.foundry_adapter import activate_foundry
+from sglang.srt.utils.foundry_adapter import activate_foundry, get_foundry_adapter
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
@@ -7050,6 +7050,7 @@ def run_scheduler_process(
     hit_exception = False
     try:
         scheduler = Scheduler(server_args, port_args)
+        get_foundry_adapter().log_init_summary()
 
         # Send initialization info back to the parent process
         pipe_writer.send(scheduler.get_init_info())
