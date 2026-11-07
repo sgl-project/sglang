@@ -11,6 +11,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
+    ComfyInt8EmbeddingMethod,
+    is_comfy_int8_embedding,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
@@ -20,6 +24,9 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_conf
 )
 from sglang.multimodal_gen.runtime.layers.quantization.kitchen_w4a4 import (
     KitchenW4A4LinearMethod,
+)
+from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 
@@ -94,9 +101,20 @@ class KitchenW4A4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> QuantizeMethodBase | None:
+        marker = self.layer_markers.get(prefix)
+        if isinstance(layer, VocabParallelEmbedding):
+            if marker is None:
+                return None
+            if not is_comfy_int8_embedding(marker):
+                raise ValueError(
+                    f"Unsupported quantized embedding marker for {prefix!r}: {marker}"
+                )
+            self.selected.append(prefix)
+            return ComfyInt8EmbeddingMethod(
+                tensorwise=bool(marker.get("_is_tensorwise_scalar"))
+            )
         if not isinstance(layer, LinearBase):
             return None
-        marker = self.layer_markers.get(prefix)
         if marker is None:
             return UnquantizedLinearMethod()
         if marker.get("format") == "int8_tensorwise":
@@ -155,3 +173,6 @@ class KitchenW4A4Config(QuantizationConfig):
             )
         convrot_group_size, _ = self._parse_marker(prefix, marker)
         return self._supports_input_size(input_size_per_partition, convrot_group_size)
+
+    def quantizes_embedding(self, prefix: str) -> bool:
+        return is_comfy_int8_embedding(self.layer_markers.get(prefix))
