@@ -163,6 +163,19 @@ def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
     return q
 
 
+def _qem_unique_edge_keys(f: np.ndarray, nv: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Return sorted packed keys and incidence counts for undirected edges."""
+    fa, fb, fc = f.T
+    edge_keys = np.concatenate(
+        [
+            np.minimum(fa, fb) * nv + np.maximum(fa, fb),
+            np.minimum(fb, fc) * nv + np.maximum(fb, fc),
+            np.minimum(fc, fa) * nv + np.maximum(fc, fa),
+        ]
+    )
+    return np.unique(edge_keys, return_counts=True)
+
+
 def _qem_collapse_targets(
     q: np.ndarray, va: np.ndarray, vb: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -206,8 +219,7 @@ def _qem_decimate(
         if len(f) <= target_faces:
             break
         nv = len(v)
-        e = np.sort(np.concatenate([f[:, [0, 1]], f[:, [1, 2]], f[:, [2, 0]]]), axis=1)
-        key, count = np.unique(e[:, 0] * nv + e[:, 1], return_counts=True)
+        key, count = _qem_unique_edge_keys(f, nv)
         e = np.stack([key // nv, key % nv], axis=1)
         on_boundary = np.zeros(nv, dtype=bool)
         on_boundary[e[count == 1].ravel()] = True

@@ -319,6 +319,33 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
         )
         np.testing.assert_array_equal(actual, expected)
 
+    def test_qem_unique_edge_keys_match_sorted_numpy_edges(self):
+        faces = np.array(
+            [[0, 1, 2], [2, 1, 0], [2, 1, 3], [3, 2, 1], [4, 5, 6]],
+            dtype=np.int64,
+        )
+        nv = 8
+        for typed_faces in (faces, faces.astype(np.int32)):
+            with self.subTest(dtype=typed_faces.dtype):
+                edges = np.sort(
+                    np.concatenate(
+                        [
+                            typed_faces[:, [0, 1]],
+                            typed_faces[:, [1, 2]],
+                            typed_faces[:, [2, 0]],
+                        ]
+                    ),
+                    axis=1,
+                )
+                expected_keys, expected_counts = np.unique(
+                    edges[:, 0] * nv + edges[:, 1], return_counts=True
+                )
+                actual_keys, actual_counts = mesh3d_utils._qem_unique_edge_keys(
+                    typed_faces, nv
+                )
+                np.testing.assert_array_equal(actual_keys, expected_keys)
+                np.testing.assert_array_equal(actual_counts, expected_counts)
+
     def test_vertex_quadrics_match_reference_exactly(self):
         closed = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
         open_boundary = trimesh.Trimesh(
