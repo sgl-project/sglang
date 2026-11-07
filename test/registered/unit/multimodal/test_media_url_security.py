@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import requests
 
-from sglang.srt.utils.common import (
+from sglang.srt.multimodal.media_io import (
     _normalize_video_input,
     configure_media_url_security,
     download_remote_media,
@@ -166,7 +166,7 @@ class TestMediaURLSecurity(unittest.TestCase):
     def test_all_common_loaders_share_the_policy(self):
         blocked = ValueError("media URL domain is not allowed")
         with patch(
-            "sglang.srt.utils.common.download_remote_media", side_effect=blocked
+            "sglang.srt.multimodal.media_io.download_remote_media", side_effect=blocked
         ) as download:
             for loader in (
                 get_image_bytes,
