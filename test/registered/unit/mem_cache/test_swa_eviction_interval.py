@@ -1,5 +1,4 @@
 import unittest
-from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -9,7 +8,7 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.mem_cache.radix_cache import RadixCache
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_flags
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -18,7 +17,7 @@ register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 class _SwaCache(RadixCache):
-    def __init__(self, *, auxiliary=False):
+    def __init__(self):
         self.disable = False
         self.sliding_window_size = 128
         self.page_size = 16
@@ -32,18 +31,23 @@ class _SwaCache(RadixCache):
                 "free_group_end",
                 "page_size",
                 "storage",
+                "window_pool_names",
+                "get_kvcache",
             ]
         )
-        self.token_to_kv_pool_allocator.page_size = 16
-        self.token_to_kv_pool_allocator.storage = None
+        allocator = self.token_to_kv_pool_allocator
+        allocator.page_size = 16
+        allocator.storage = None
+        # A static window pool keeping the 128-token window.
+        allocator.window_pool_names = lambda: ("swa",)
+        allocator.get_kvcache = lambda: SimpleNamespace(request_window=None)
+        kv_storage_of(self.req_to_token_pool, allocator).bind_window_retention(
+            128, None
+        )
         self.trim_calls = 0
-        self.auxiliary = auxiliary
 
     def supports_swa(self):
         return True
-
-    def supports_auxiliary_swa(self):
-        return self.auxiliary
 
     def swa_retain_floor(self, req):
         # Read once per window retirement the scheduler runs.
@@ -53,22 +57,20 @@ class _SwaCache(RadixCache):
 
 class TestSWAEvictionInterval(unittest.TestCase):
     def test_scheduler_gates_on_request_cursor_before_protected_prefix(self):
-        for (protected, shield), auxiliary in product(
-            [(256, 0), (0, 249)], [False, True]
-        ):
+        for protected, shield in [(256, 0), (0, 249)]:
             with (
-                self.subTest(protected=protected, shield=shield, auxiliary=auxiliary),
+                self.subTest(protected=protected, shield=shield),
                 envs.SGLANG_SWA_EVICTION_INTERVAL.override(128),
                 envs.SGLANG_OPT_RELEASE_PREFILL_SWA.override(False),
             ):
-                cache = _SwaCache(auxiliary=auxiliary)
+                cache = _SwaCache()
                 req = SimpleNamespace(
                     seqlen=401,
                     decode_batch_idx=1,
                     kv=ReqKvInfo(
                         req_pool_idx=0,
                         cache_protected_len=protected,
-                        swa_evict_floor=shield,
+                        window_evict_floor=shield,
                     ),
                 )
                 batch = ScheduleBatch(
@@ -89,17 +91,18 @@ class TestSWAEvictionInterval(unittest.TestCase):
                     torch.equal(free.call_args.args[0], torch.arange(256, 272))
                 )
                 self.assertEqual(free.call_args.kwargs, {"start_pos": 256})
-                self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 272)
+                self.assertEqual(req.kv.get_evicted_seqlen("swa"), 272)
                 free.reset_mock()
 
+                # Not due: the window's own cursor gates the retirement.
                 req.seqlen = 528
                 batch.maybe_evict_swa()
-                self.assertEqual(cache.trim_calls, 1 + auxiliary)
+                self.assertEqual(cache.trim_calls, 1)
                 free.assert_not_called()
 
                 req.seqlen += 1
                 batch.maybe_evict_swa()
-                self.assertEqual(cache.trim_calls, 2 + auxiliary)
+                self.assertEqual(cache.trim_calls, 2)
                 free.assert_called_once()
                 self.assertTrue(
                     torch.equal(free.call_args.args[0], torch.arange(272, 400))
@@ -134,7 +137,7 @@ class TestSWAEvictionInterval(unittest.TestCase):
 
         free.assert_called_once()
         self.assertTrue(torch.equal(free.call_args.args[0], torch.arange(64)))
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), 64)
+        self.assertEqual(req.kv.get_evicted_seqlen("swa"), 64)
 
 
 if __name__ == "__main__":

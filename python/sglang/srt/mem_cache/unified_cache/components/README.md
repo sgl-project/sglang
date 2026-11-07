@@ -51,11 +51,20 @@ A component-based, pluggable prefix cache framework for SGLang that unifies Full
 
 ```python
 node.component_data[ComponentType.FULL]   # FullComponent data
-node.component_data[ComponentType.SWA]    # SWAComponent data
+node.component_data[window_slot]          # SWAComponent data, one per window slot
 node.component_data[ComponentType.MAMBA]  # MambaComponent data
 ```
 
-**`UnifiedLRUList`** — One doubly-linked list per auxiliary component, threaded through the same tree nodes via `lru_prev[component_type]`/`lru_next[component_type]`. Host LRUs use a separate pointer slot range so device and host lists do not collide. Supports O(1) insert/remove/promote and O(L) scan for eviction (L = locked nodes skipped). Full eviction is driven by `evictable_device_leaves` / `evictable_host_leaves`, not a Full LRU.
+A slot's id comes from its name (`tree_slot_ids`): a window slot goes by its
+sub-pool's name; `window_slot` is the cache's `slot_id(TREE_WINDOW)` or one of
+`window_slots()`.
+
+The list is indexed by id, but only the token component and the tree's own
+components get a record of their own; every other id shares
+`ABSENT_COMPONENT_DATA`, an empty record that refuses writes
+(`node_component_records`).
+
+**`UnifiedLRUList`** — One doubly-linked list per auxiliary component, threaded through the same tree nodes via `lru_prev[pt]`/`lru_next[pt]`, where `pt` (`lru_pointer_slot`) numbers only the tree's own components. Host LRUs use a separate pointer slot range so device and host lists do not collide. Supports O(1) insert/remove/promote and O(L) scan for eviction (L = locked nodes skipped). Full eviction is driven by `evictable_device_leaves` / `evictable_host_leaves`, not a Full LRU.
 
 **`ComponentData`** — Per-component data stored on each node:
 - `value: Tensor | None` — Device indices into the component's memory pool (`TokenToKVPool` for Full, `SWAKVPool` for SWA, `MambaPool` for Mamba). `None` means tombstone (data evicted but node structure retained).
@@ -149,8 +158,8 @@ Free cached tokens to reclaim memory.
 | Aspect | Detail |
 |--------|--------|
 | **Purpose** | Each component drives eviction from its own LRU list until its target is met |
-| **Inputs** | `params.num_tokens` (full), `params.swa_num_tokens` (SWA), `params.mamba_num` (Mamba) |
-| **Output** | `EvictResult(num_tokens_evicted, swa_num_tokens_evicted, mamba_num_evicted)` |
+| **Inputs** | `params.num_tokens` (full), `params.window_num_tokens` (tokens per window slot, by component id), `params.mamba_num` (Mamba) |
+| **Output** | `EvictResult(num_tokens_evicted, window_num_tokens_evicted, mamba_num_evicted)` |
 | **Mutation** | Frees pool indices; removes nodes from LRU lists; deletes leaf nodes from tree; cascades to lower-priority components; walks up parent chain to delete tombstone ancestors |
 | **Complexity** | **O(E·H + L)** — E = nodes evicted, H = tombstone chain height, L = locked nodes skipped in LRU scan. |
 

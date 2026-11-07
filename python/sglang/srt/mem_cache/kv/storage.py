@@ -14,8 +14,13 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence,
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.advance import TrackingAdvance, advance_tracking
-from sglang.srt.mem_cache.kv.decl import StateLifetime, WindowLifetime
+from sglang.srt.mem_cache.kv.advance import (
+    TrackingAdvance,
+    advance_tracking,
+    coalesce_ranges,
+    retire_window_rows,
+)
+from sglang.srt.mem_cache.kv.decl import Region, StateLifetime, WindowLifetime
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLAHostLayout
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
@@ -50,22 +55,6 @@ class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     metrics: str
     capacity: int
     available: int
-
-
-class Region(msgspec.Struct, frozen=True, kw_only=True):
-    """A sub-pool's device memory as a PD peer registers it: one entry per
-    buffer, and per entry the slices a peer of another TP size reads. A whole
-    page envelope has no slices: both peers must lay it out identically."""
-
-    ptrs: Tuple[int, ...]
-    lens: Tuple[int, ...]
-    item_lens: Tuple[int, ...]
-    dim_per_tensor: Tuple[int, ...] = ()
-    conv_shard_groups: Tuple[Any, ...] = ()
-    slice_outer_counts: Tuple[int, ...] = ()
-    layer_ids: Tuple[int, ...] = ()
-    # The token KV byte layout both peers must share, for views that have one.
-    kv_layout: Optional[str] = None
 
 
 class ResumeUnits(msgspec.Struct, frozen=True, kw_only=True):
@@ -105,6 +94,11 @@ class KVStorage:
         self.requests = requests
         self.scratch = scratch
         self._request_memory = request_memory
+        # Readers reaching a window further back than its own layers (a fused
+        # draft's front rows), by sub-pool, and the length of a window the
+        # model does not state: bound once at startup (`bind_window_retention`).
+        self._window_reaches: Dict[str, int] = {}
+        self._unstated_window: Optional[int] = None
         state = allocator.state
         self._views: Dict[str, Any] = {}
         sub_pools = []
@@ -202,6 +196,7 @@ class KVStorage:
     ) -> Optional[torch.Tensor]:
         """Owner token ids, one per token (page size 1); None when they do not
         fit."""
+
         make_room(num_tokens)
         return self._allocator.alloc(num_tokens)
 
@@ -232,6 +227,7 @@ class KVStorage:
             + len(seq_lens_cpu) * self._allocator.page_size,
             shard_size=1,
         )
+
         make_room(demand)
         if window_tail is not None:
             return self._allocator.alloc_extend_swa_tail(
@@ -245,7 +241,12 @@ class KVStorage:
                 window_tail_lens=stated_window_tails,
             )
         return self._allocator.alloc_extend(
-            prefix_lens, prefix_lens_cpu, seq_lens, seq_lens_cpu, last_loc, num_tokens
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            num_tokens,
         )
 
     def take_decode(
@@ -260,6 +261,7 @@ class KVStorage:
         """One owner token id per ``rows`` entry, at ``seq_len - 1``, taking a
         page only when that request's last page is full; None when they do not
         fit."""
+
         make_room(len(seq_lens) * self._allocator.page_size)
         return self._allocator.alloc_decode(seq_lens, seq_lens_cpu, last_loc)
 
@@ -277,7 +279,7 @@ class KVStorage:
         shares_prefixes: bool = False,
         eviction_interval: int = 1,
         tracking: Optional[TrackingAdvance] = None,
-        component_type=None,
+        window_sub_pool: Optional[str] = None,
     ) -> None:
         """Apply checkpoint tracking and retire rows outside the read window.
 
@@ -291,16 +293,11 @@ class KVStorage:
         if frontier is None:
             raise ValueError("window retirement needs a token frontier")
 
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+        if window_sub_pool is None:
+            raise ValueError("window retirement names the window's sub-pool")
 
-        component_type = ComponentType.SWA if component_type is None else component_type
-        sub_pool = next(
-            s.name
-            for s in self._plan.sub_pools
-            if s.external.tree_component == component_type.name
-        )
-        free_swa_out_of_window_slots(
+        sub_pool = window_sub_pool
+        retire_window_rows(
             req,
             frontier,
             sliding_window_size=window,
@@ -310,7 +307,7 @@ class KVStorage:
             supports_prefix_sharing=shares_prefixes,
             retain_floor=retain_floor,
             eviction_interval=eviction_interval,
-            component_type=component_type,
+            window_sub_pool=sub_pool,
             free_segment=lambda ids, start_pos: self._allocator.free_window_segment(
                 sub_pool, ids, start_pos=start_pos
             ),
@@ -334,12 +331,15 @@ class KVStorage:
 
     # -- what the prefix tree's effects reach --
 
-    def tree_sub_pool(self, component: str) -> str:
-        """The sub-pool whose values the prefix tree's ``component`` holds."""
+    def tree_sub_pool(self, slot: str, *, family: Optional[str] = None) -> str:
+        """The sub-pool whose values the prefix tree's slot named ``slot`` (a
+        `TreeSlot.component`) holds; ``family``, the slot's family, is not
+        needed here, as every slot is named by its sub-pool. The tree numbers
+        its slots itself; the storage only knows their names."""
         for s in self._sub_pools:
-            if s.external.tree_component == component:
+            if s.external.tree_component == slot:
                 return s.name
-        raise KeyError(f"no sub-pool backs the tree component {component!r}")
+        raise KeyError(f"no sub-pool backs the tree slot {slot!r}")
 
     def _band(self, sub_pool: str):
         """The band that hands out ``sub_pool``'s rows on their own: the
@@ -383,21 +383,13 @@ class KVStorage:
         self._allocator.free_full_segment(ids, start_pos=0)
 
     def free_row(self, kv: ReqKvInfo, ranges: list[tuple[int, int]]) -> None:
-        from sglang.srt.mem_cache.common import coalesce_ranges
-        from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-
         row = self.requests.req_to_token[kv.req_pool_idx]
         ranges = coalesce_ranges(ranges)
+        dead_lo = kv.window_dead_lo(self._allocator.page_size)
         for sub_pool in self._sub_pools:
             if sub_pool.name not in self._allocator.window_allocators:
                 continue
-            component = ComponentType[sub_pool.external.tree_component]
-            dead_lo = (
-                kv.swa_dead_lo(self._allocator.page_size)
-                if component == ComponentType.SWA
-                else kv.cache_protected_len
-            )
-            dead_hi = max(dead_lo, kv.get_evicted_seqlen(component))
+            dead_hi = max(dead_lo, kv.get_evicted_seqlen(sub_pool.name))
             for start, end in ranges:
                 lo = min(max(dead_lo, start), end)
                 hi = min(max(dead_hi, start), end)
@@ -579,12 +571,13 @@ class KVStorage:
         every sub-pool pins."""
         return tuple(s.name for s in self._sub_pools)
 
-    def tree_slots(
-        self, *, window_reaches: Optional[Dict[str, int]] = None
-    ) -> Tuple[TreeSlot, ...]:
+    def tree_slots(self) -> Tuple[TreeSlot, ...]:
         """The prefix tree's slot per sub-pool, in the order the tree drives
-        their eviction. Extra reader reaches widen only their named storage band."""
-        return self._plan.tree_slots(window_reaches=window_reaches)
+        their eviction; a window slot keeps the window's retained length
+        (`retained_window_lengths`). A window the model leaves unstated has
+        none until its length is bound, which the builder does before any
+        tree is built."""
+        return self._plan.tree_slots(window_lengths=self._retained_lengths())
 
     def view(self, sub_pool: str) -> Any:
         return self._views[sub_pool]
@@ -616,6 +609,57 @@ class KVStorage:
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
+
+    def host_pool_name(self, sub_pool: str) -> str:
+        """The host pool a sub-pool's rows back up to and load from."""
+        return self._plan.sub_pool(sub_pool).external.host_pool
+
+    def storage_format_tag(self) -> Optional[str]:
+        """The tag a persisted host copy of this storage's layout carries."""
+        return self._plan.storage_format_tag()
+
+    def draft_hosting_sub_pools(self) -> Tuple[str, ...]:
+        """The sub-pools whose entries also hold a fused draft's rows."""
+        return tuple(
+            s.name for s in self._plan.sub_pools if s.spec.draft_region is not None
+        )
+
+    def holds_view(self, pool) -> bool:
+        """Whether ``pool`` views this storage's own memory."""
+        return pool._arena is self._allocator.arena
+
+    def bind_window_retention(
+        self, sliding_window: Optional[int], reaches: Optional[Dict[str, int]]
+    ) -> None:
+        """Bind, once at startup, how far back readers beyond a window's own
+        layers read it (``reaches``, by sub-pool) and the length of a window
+        the model does not state (``sliding_window``)."""
+        self._window_reaches = dict(reaches or {})
+        self._unstated_window = sliding_window
+
+    def retained_window_lengths(self) -> Dict[str, int]:
+        """The tail a running request keeps of each window sub-pool, by name:
+        the window its layers declare, widened by a reader reaching further
+        back. The prefix tree retains, backs up and restores this much."""
+        lengths = self._retained_lengths()
+        for s in self._plan.sub_pools:
+            if isinstance(s.lifetime, WindowLifetime) and s.name not in lengths:
+                raise ValueError(f"window {s.name!r} states no retention length")
+        return lengths
+
+    def _retained_lengths(self) -> Dict[str, int]:
+        """`retained_window_lengths` for the windows whose length is known."""
+        lengths = {}
+        for s in self._plan.sub_pools:
+            if isinstance(s.lifetime, WindowLifetime):
+                window = (
+                    s.lifetime.window
+                    if s.lifetime.window is not None
+                    else self._unstated_window
+                )
+                if window is not None:
+                    lengths[s.name] = max(window, self._window_reaches.get(s.name, 0))
+        return lengths
 
     def stated_window_lengths(self) -> Dict[str, Tuple[int, str]]:
         """Window sub-pools whose lifetime states the tokens they retain, by

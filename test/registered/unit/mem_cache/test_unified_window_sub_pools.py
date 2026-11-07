@@ -131,10 +131,10 @@ class TestWindowNames(CustomTestCase):
                 external.metrics,
                 external.wire,
             ),
-            ("swa", "SWA", "swa", "swa"),
+            ("swa", "WINDOW_16", "swa", "swa"),
         )
         self.assertEqual(
-            [slot.component for slot in plan.tree_slots()], ["FULL", "SWA"]
+            [slot.component for slot in plan.tree_slots()], ["FULL", "WINDOW_16"]
         )
         self.assertEqual(
             [(e.sub_pool, e.state_type) for e in plan.wire_entries()],
@@ -163,14 +163,17 @@ class TestDraftWindowNames(CustomTestCase):
             {s.name for s in plan.sub_pools}, {"full", "window_16", "window_32"}
         )
         # The target's window stays the primary one; the draft's goes by the
-        # second window entry of the prefix tree, host pools and PD peers.
+        # second window entry of the host pools and PD peers, and the prefix
+        # tree names each window by its sub-pool.
         self.assertEqual(plan.primary_window().name, "window_16")
         external = plan.sub_pool("window_32").external
         self.assertEqual(
             (external.host_pool, external.tree_component, external.wire),
-            ("auxiliary_swa", "AUXILIARY_SWA", "auxiliary_swa"),
+            ("auxiliary_swa", "WINDOW_32", "auxiliary_swa"),
         )
-        self.assertEqual(plan.sub_pool("window_16").external.tree_component, "SWA")
+        self.assertEqual(
+            plan.sub_pool("window_16").external.tree_component, "WINDOW_16"
+        )
 
     def test_a_draft_window_without_a_target_window_takes_the_window_names(self):
         decls = kv_layer_decls(full_layer_ids=(0,), full_geometry=_MHA)
@@ -178,7 +181,9 @@ class TestDraftWindowNames(CustomTestCase):
         self.assertEqual(set(placement.new_bands), {"window_32"})
         plan = plan_kv_storage(decls, page_size=4, fused_draft=placement)
         self.assertEqual(plan.primary_window().name, "window_32")
-        self.assertEqual(plan.sub_pool("window_32").external.tree_component, "SWA")
+        self.assertEqual(
+            plan.sub_pool("window_32").external.tree_component, "WINDOW_32"
+        )
 
     def test_a_draft_band_cannot_take_a_target_name(self):
         from sglang.srt.mem_cache.layout.fused_draft import (

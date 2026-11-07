@@ -62,6 +62,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import ends_fit
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
 from sglang.srt.mem_cache.kv.layout.state import MambaSubPoolSpec
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW, TreeSlot
 from sglang.srt.mem_cache.prefill_budget import estimate_swa_kv_tokens
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -651,7 +652,7 @@ class TestWindowChainAllocator(unittest.TestCase):
         tree_cache = MagicMock()
         tree_cache.supports_prefix_sharing.return_value = True
         tree_cache.full_evictable_size.return_value = 8
-        tree_cache.swa_evictable_size.return_value = 8
+        tree_cache.window_evictable_size.return_value = 8
         allocator.reclaim_plan = MagicMock(return_value=(0, 0))
         cases = (
             ({}, None, False),
@@ -1129,7 +1130,7 @@ class TestJointLRUEviction(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
 
-    def _cache(self, eviction_policy="joint_lru", **params):
+    def _cache(self, eviction_policy="joint_lru", window_slot=None, **params):
         # The allocator fixture reads no instance state.
         _, allocator, _ = TestWindowChainAllocator._build(
             self, n_full_slots=48, n_swa_slots=48, full_layer_num=2, swa_layer_num=6
@@ -1141,7 +1142,12 @@ class TestJointLRUEviction(unittest.TestCase):
                 page_size=1,
                 disable=False,
                 sliding_window_size=4,
-                tree_slots=tree_slots_of((self.FULL, self.SWA), window=4),
+                tree_slots=(
+                    tree_slots_of((self.FULL, self.SWA), window=4)
+                    if window_slot is None
+                    else tree_slots_of((self.FULL,))
+                    + (TreeSlot(component=window_slot, family=TREE_WINDOW, window=4),)
+                ),
                 tree_core_backend="python",
                 eviction_policy=eviction_policy,
                 **params,
@@ -1176,6 +1182,14 @@ class TestJointLRUEviction(unittest.TestCase):
             sub_pool.pin_sources = (lambda: True,)
 
     @staticmethod
+    def _params(allocator, num_tokens=0, window_tokens=0):
+        window = allocator.swa_attn_allocator.sub_pool_name
+        return EvictParams(
+            num_tokens=num_tokens,
+            window_num_tokens={window: window_tokens} if window_tokens else {},
+        )
+
+    @staticmethod
     def _record_victims(cache):
         core, victims = cache.tree_core, []
         select = core.next_joint_eviction_victim
@@ -1202,7 +1216,7 @@ class TestJointLRUEviction(unittest.TestCase):
     def test_victims_follow_access_time_across_components(self):
         cache, allocator = self._tree()
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        cache.evict(self._params(allocator, 12, 12))
         self.assertEqual(
             victims,
             [
@@ -1224,7 +1238,7 @@ class TestJointLRUEviction(unittest.TestCase):
         cache, allocator = self._tree()
         victims = self._record_victims(cache)
         # 2 Full + 12 SWA tokens of room ends the walk at [7..10]'s SWA.
-        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=12))
+        cache.evict(self._params(allocator, 2, 12))
         self.assertEqual(victims[-1], (self.SWA, [7, 8, 9, 10]))
         leaf = self._node(cache, [7, 8, 9, 10])
         self.assertIn(leaf, cache.tree_core.evictable_device_leaves)
@@ -1233,10 +1247,25 @@ class TestJointLRUEviction(unittest.TestCase):
 
         self._insert(cache, allocator, [30, 31])
         self._block_compaction(allocator)
-        cache.evict(EvictParams(swa_num_tokens=2))
+        cache.evict(self._params(allocator, window_tokens=2))
         self.assertEqual(len(victims), 4, "no joint walk with compaction blocked")
         # The legacy SWA walk evicts the whole SWA leaf, Full included.
         self.assertIsNone(self._node(cache, [30, 31]))
+
+    def test_a_window_slot_named_by_its_length_keeps_the_joint_order(self):
+        # Unified pools name a window's tree slot by its length, not SWA.
+        orders = []
+        for window_slot in (None, "WINDOW_4"):
+            cache, allocator = self._cache(window_slot=window_slot)
+            self.assertTrue(cache.evicts_by_joint_lru)
+            self._insert(cache, allocator, [1, 2, 3, 4])
+            self._insert(cache, allocator, list(range(1, 11)))
+            self._insert(cache, allocator, [20, 21])
+            self._match(cache, list(range(1, 11)))
+            victims = self._record_victims(cache)
+            cache.evict(self._params(allocator, 12, 12))
+            orders.append([(int(ct != self.FULL), key) for ct, key in victims])
+        self.assertEqual(orders[0], orders[1])
 
     def test_dispatch_needs_joint_lru_and_unblocked_compaction(self):
         for policy, blocked, joint in (
@@ -1286,10 +1315,10 @@ class TestJointLRUEviction(unittest.TestCase):
         for sub_pool in (allocator.full_attn_allocator, allocator.swa_attn_allocator):
             sub_pool.pin_sources = ()
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
-        open_cache, _ = self._tree()
+        cache.evict(self._params(allocator, 12, 12))
+        open_cache, open_allocator = self._tree()
         open_victims = self._record_victims(open_cache)
-        open_cache.evict(EvictParams(num_tokens=12, swa_num_tokens=12))
+        open_cache.evict(self._params(open_allocator, 12, 12))
         self.assertEqual(victims, open_victims)
 
     def test_swa_access_times_follow_device_swa(self):
@@ -1327,7 +1356,7 @@ class TestJointLRUEviction(unittest.TestCase):
         )
 
         victims = self._record_victims(cache)
-        cache.evict(EvictParams(num_tokens=2, swa_num_tokens=8))
+        cache.evict(self._params(allocator, 2, 8))
         self.assertEqual(
             victims, [(self.FULL, [9, 10]), (self.SWA, [1, 2, 3, 4, 5, 6])]
         )

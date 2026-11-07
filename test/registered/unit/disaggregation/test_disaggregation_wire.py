@@ -138,6 +138,40 @@ class TestBatchStagingReservations(CustomTestCase):
         run(scheduler, batch)
 
 
+class TestRequestWindowRetention(CustomTestCase):
+    """DeepSeek-V4.1 encoder replay keeps SWA in per-request window rows over a
+    plain paged allocator, which keeps no window pool: the window entry's kept
+    tail still comes from the pool's window."""
+
+    def test_request_window_over_a_paged_allocator_keeps_the_window(self):
+        page_size, window = 4, 8
+        calls = []
+
+        class _Rows:
+            def page_indices(self, slot, start, end):
+                calls.append((slot, start, end))
+                return list(range(start // page_size, -(-end // page_size)))
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = _Rows()
+        pool.sliding_window = window
+        pool.page_size = page_size
+        allocator = SimpleNamespace(
+            storage=None,
+            state=None,
+            page_size=page_size,
+            get_kvcache=lambda: pool,
+            window_pool_names=lambda: (),
+        )
+        storage = StaticKVStorage(None, allocator)
+        self.assertEqual(storage.retained_window_lengths(), {"swa": window})
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        units = storage.resume_units("swa", req, token_start=0, token_boundary=21)
+        self.assertEqual(calls, [(3, 12, 21)])
+        self.assertEqual(units.token_start, 12)
+        self.assertEqual(units.unit_ids.tolist(), [3, 4, 5])
+
+
 class TestMixedSWAKVBlockScales(CustomTestCase):
     def test_swa_block_scales_follow_each_subpools_dtype(self):
         from sglang.srt.mem_cache.memory_pool import (

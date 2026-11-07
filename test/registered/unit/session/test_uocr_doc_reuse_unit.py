@@ -451,6 +451,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
         owner = object.__new__(UnifiedRadixCache)
         owner.tree_core = SimpleNamespace(page_size=32)
         owner.session = SimpleNamespace(slots={})
+        owner._window_slots = ()
         owner.uocr_doc_reuse = cache.reuse
         observer = SchedulerPoolStatsObserver(
             tree_cache=owner,
@@ -466,7 +467,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
                     entry = cache.reuse.docs.pop("doc")
                     cache.reuse.sources[id(entry)] = entry
                 self.assertEqual(observer.session_held_tokens(), 96)
-                self.assertEqual(observer.session_held_swa_tokens(), 96)
+                self.assertEqual(observer.session_held_window_tokens("swa"), 96)
                 self.assertEqual(observer.session_held_req_count(), 1)
         cache.reuse.reset()
         self.assertEqual(observer.session_held_tokens(), 0)
