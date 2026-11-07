@@ -42,6 +42,10 @@ class MambaFullCacheDonor(Protocol):
 
 
 class BaseTokenToKVPoolAllocator(abc.ABC):
+    # Some composite allocators do not call the base constructor. Keep the
+    # default immutable and register the separate pools after draft allocation.
+    cpu_retraction_draft_pools: tuple[KVCache, ...] = ()
+
     # Ids handed out index a virtual space the allocator translates to physical
     # rows (a unified pool's chain), not the pool's rows themselves.
     hands_out_virtual_ids = False
@@ -84,6 +88,20 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     @property
     def size_full(self):
         return self.size
+
+    def register_cpu_retraction_draft_pools(self, pools: tuple[KVCache, ...]) -> None:
+        """Separate EAGLE/MTP pools using this allocator's logical token ids.
+
+        Each pool owns its CPU-copy layout, including MLA DCP localization and
+        DSA index keys/scales. Shared target storage must not be copied twice.
+        """
+        seen = {id(self.get_kvcache())}
+        unique = []
+        for pool in pools:
+            if id(pool) not in seen:
+                seen.add(id(pool))
+                unique.append(pool)
+        self.cpu_retraction_draft_pools = tuple(unique)
 
     @property
     def has_window_pool(self) -> bool:
