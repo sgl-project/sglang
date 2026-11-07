@@ -310,13 +310,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self, batch: OutputBatch, server_args: ServerArgs
     ) -> VerificationResult:
         result = VerificationResult()
-        if (
-            batch.output is None
-            and batch.output_file_paths is None
-            and batch.audio is None
-            and batch.rollout_trajectory_data is not None
-        ):
-            # rollout_output_without_decode: a rollout that asked for no generated output.
+        if batch.generated_output_skipped:
             return result
         if not batch.output_file_paths:
             result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
