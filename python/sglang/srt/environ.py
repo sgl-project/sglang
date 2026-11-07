@@ -2276,6 +2276,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # TP-shard the K3 MoE front's router + latent-down rows (KimiK3MoE._front_shard)
+    # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
+    # gemm_ag_up_fits). Online weight updates are rejected while on.
+    SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
