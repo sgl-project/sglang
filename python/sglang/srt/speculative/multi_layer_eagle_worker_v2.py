@@ -213,7 +213,7 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
         )
-        self.init_lm_head()
+        self.share_target_embed_and_head()
         self._init_boundary_kv_fix_state()
 
     def init_attention_backends(self):
