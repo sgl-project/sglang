@@ -43,7 +43,7 @@ use super::{
     contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
     submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
@@ -112,6 +112,25 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let tool_choice = dynamo_tool_choice(&request.tool_choice);
+    let tools =
+        sglang_processor::chat_tool_definitions(request.tools.as_deref(), &request.messages);
+    // Python logs the request once its `_validate_request` accepts it, so
+    // only the checks this server shares with it (messages, media for a
+    // text-only model, tool definitions, tool choice) come first; a request
+    // this server goes on to refuse, or to serve where Python would refuse
+    // it, is logged.
+    if state.core.logs_openai_requests()
+        && !request.messages.is_empty()
+        && (state.server_args.model_is_multimodal() || !has_media_part(&raw["messages"]))
+        && tools.as_ref().is_ok_and(|tools| {
+            sglang_processor::tool_constraint(None, &tool_choice, tools, None).is_ok()
+        })
+    {
+        state
+            .core
+            .log_openai_request(OpenAiRequest::ChatCompletion, &body, &headers);
+    }
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
@@ -159,11 +178,7 @@ async fn chat_completions(
         );
     }
 
-    let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools = match sglang_processor::chat_tool_definitions(
-        request.tools.as_deref(),
-        &request.messages,
-    ) {
+    let tools = match tools {
         Ok(tools) => tools,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
@@ -433,6 +448,24 @@ pub(super) async fn prepare_chat_request(
         )
     })?;
     Ok((request, rendered))
+}
+
+/// Python `_validate_media_content`'s test for a text-only model: a message
+/// content part of a media type, counting `input_audio`, which Python's
+/// request model turns into an `audio_url` part.
+fn has_media_part(messages: &Value) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                    )
+                })
+            })
+        })
+    })
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
