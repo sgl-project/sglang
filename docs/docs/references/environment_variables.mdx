@@ -1953,6 +1953,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>256</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 on ROCm: write the absorbed MLA decode and target-verify query and the latent KV cache in one launch, with AITER on gfx950 and the AITER Triton kernel elsewhere. Applies to AITER MLA decode and target-verify and to Triton MLA decode, without DCP and with a unit KV-cache scale; everything else keeps the split rope/concat/cache chain.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_K3_KDA_FUSED_BACKEND</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Kimi-K3 fused KDA decode on ROCm: <code>gfx950</code> runs the in-tree gfx950 kernel, <code>aiter</code> runs AITER's FlyDSL kernel. Any other value keeps the unfused decode.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>gfx950</code></td>

@@ -1124,6 +1124,9 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Kimi-K3 MLA decode: write the identity-RoPE Q and latent KV cache in one launch,
+    # AITER on gfx950 and AITER Triton elsewhere, instead of the split chain.
+    SGLANG_OPT_HIP_K3_MLA_Q_CACHE_FUSION = EnvBool(False)
     # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
     # any other value keeps the unfused decode.
     SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
