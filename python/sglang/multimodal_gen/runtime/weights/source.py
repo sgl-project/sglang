@@ -11,7 +11,8 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
+from huggingface_hub.errors import LocalEntryNotFoundError
 from huggingface_hub.utils import validate_repo_id
 
 WeightSourceKind = Literal["local", "huggingface"]
@@ -286,6 +287,41 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
     )
 
 
+def _cached_hub_inventory(source: WeightSource) -> WeightInventory | None:
+    """List the locally cached snapshot of a Hub source without any network call.
+
+    Returns None when the revision is not cached. The listing holds only the
+    files downloaded so far, so callers must use it only to find a file they
+    name exactly, never to choose among candidates.
+    """
+    assert source.repo_id is not None
+    try:
+        snapshot = Path(
+            snapshot_download(
+                source.repo_id, revision=source.revision, local_files_only=True
+            )
+        )
+    except LocalEntryNotFoundError:
+        return None
+    # An empty refs file resolves to the snapshots/ parent instead of a revision.
+    if snapshot.parent.name != "snapshots":
+        return None
+    files = tuple(
+        path.relative_to(snapshot).as_posix()
+        for path in sorted(snapshot.rglob("*"))
+        if path.is_file()
+    )
+    try:
+        files = _filter_inventory_files(files, source)
+    except FileNotFoundError:
+        return None
+    return WeightInventory(
+        source=source,
+        resolved_revision=snapshot.name,
+        files=files,
+    )
+
+
 def _select_named_file(candidates: tuple[str, ...], weight_name: str) -> str:
     exact = tuple(path for path in candidates if path == weight_name)
     if exact:
@@ -331,6 +367,24 @@ def resolve_weight(
 ) -> ResolvedWeight:
     """Resolve one weight file without downloading its tensor payload."""
     parsed_source = parse_weight_source(source, revision=revision)
+    if parsed_source.kind == "huggingface" and (
+        parsed_source.filename is not None or weight_name is not None
+    ):
+        # A named file already in the local cache needs no Hub API call.
+        cached = _cached_hub_inventory(parsed_source)
+        if cached is not None:
+            # A partial snapshot may lack the file, or hold only basename
+            # matches that hide an exact path elsewhere in the repo, so only an
+            # exact path skips the Hub.
+            try:
+                selected_file = select_weight_file(cached, weight_name)
+            except (FileNotFoundError, ValueError):
+                selected_file = None
+            if selected_file is not None and selected_file in (
+                parsed_source.filename,
+                weight_name,
+            ):
+                return ResolvedWeight(inventory=cached, selected_file=selected_file)
     inventory = resolve_weight_inventory(parsed_source)
     selected_file = select_weight_file(inventory, weight_name)
     return ResolvedWeight(

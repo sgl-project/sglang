@@ -53,6 +53,7 @@ def vision_topk(
             num_shared_topk_slots == 0
             and expert_location_dispatch_info is None
             and not use_mega_moe
+            and not routing_simulation_enabled()
             and config.runner_backend is not None
             and config.runner_backend.is_flashinfer_mxfp4()
         ):

@@ -10,7 +10,14 @@ from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import spec as spe
 _MARKER = {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256}
 
 
-def _load(monkeypatch, spec, h3_markers=None, quantization=None, local_device="cpu"):
+def _load(
+    monkeypatch,
+    spec,
+    h3_markers=None,
+    quantization=None,
+    local_device="cpu",
+    model_path="/models/dit.safetensors",
+):
     """Run load_comfyui_transformer with a dummy spec; return the load kwargs."""
     seen = {}
 
@@ -55,10 +62,11 @@ def _load(monkeypatch, spec, h3_markers=None, quantization=None, local_device="c
     )
     pipeline = SimpleNamespace(
         pipeline_name="DummyPipeline",
-        model_path="/models/dit.safetensors",
+        model_path=model_path,
         get_module=lambda name: "scheduler",
     )
     spec_mod.load_comfyui_transformer(pipeline, server_args)
+    seen["server_args"] = server_args
     return seen
 
 
@@ -101,6 +109,86 @@ def test_h3_spec_still_rejects_non_int8_markers(monkeypatch):
     )
     with pytest.raises(ValueError, match="INT8 ConvRot"):
         _load(monkeypatch, h3, h3_markers={"x": {"format": "nvfp4"}})
+
+
+def _write_gguf(path, names):
+    import gguf
+    import numpy as np
+
+    writer = gguf.GGUFWriter(str(path), "flux")
+    for i, name in enumerate(names):
+        writer.add_tensor(name, np.full((2, 4), i, dtype=np.float32))
+    writer.write_header_to_file()
+    writer.write_kv_data_to_file()
+    writer.write_tensors_to_file()
+    writer.close()
+
+
+def test_gguf_unet_loads_with_runtime_names(monkeypatch, tmp_path):
+    """A GGUF unet loads as the DiT, keyed by runtime layer names for both quant
+    lookup and loading: Z-Image's qkv is to_qkv and its w1/w3 fuse into w13."""
+    from dataclasses import replace
+
+    from sglang.multimodal_gen.configs.models.dits.zimage import ZImageDitConfig
+
+    gguf_path = tmp_path / "z-image-turbo-Q4_K_M.gguf"
+    _write_gguf(
+        gguf_path,
+        [
+            "layers.0.attention.qkv.weight",
+            "layers.0.feed_forward.w1.weight",
+            "layers.0.feed_forward.w2.weight",
+            "layers.0.feed_forward.w3.weight",
+        ],
+    )
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.loader.transformer_load_utils."
+        "_validate_gguf_runtime_support",
+        lambda *args: None,
+    )
+    zimage = spec_mod.get_comfyui_checkpoint_spec("ZImagePipeline")
+    seen = _load(
+        monkeypatch,
+        replace(zimage, build_dit_config=lambda server_args: ZImageDitConfig()),
+        model_path=str(gguf_path),
+    )
+    meta = seen["init_params"]["quant_config"].tensor_meta
+    weights = dict(seen["weights_iterator"])
+    assert spec_mod.is_comfyui_single_file(str(gguf_path))
+    assert seen["server_args"].model_paths["transformer"] == str(tmp_path)
+    assert meta["layers.0.attention.to_qkv.weight"].logical_shape == (2, 4)
+    assert meta["layers.0.feed_forward.w13.weight"].logical_shape == (4, 4)
+    assert list(weights) == [
+        "layers.0.attention.to_qkv.weight",
+        "layers.0.feed_forward.w2.weight",
+        "layers.0.feed_forward.w13.weight",
+    ]
+    assert weights["layers.0.feed_forward.w13.weight"][:, 0].tolist() == [1, 1, 3, 3]
+
+
+def test_gguf_unet_architecture_is_detected_from_its_header(tmp_path):
+    """Detection rejected every GGUF, so only MiniMax-H3 with a BF16 companion
+    file could load one."""
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.core.generator import (
+        _load_state_dict_for_detection,
+    )
+
+    path = tmp_path / "flux1-dev-Q4_K_M.gguf"
+    _write_gguf(path, ["img_in.weight"])
+    state_dict = _load_state_dict_for_detection(str(path))
+    assert {k: tuple(v.shape) for k, v in state_dict.items()} == {
+        "img_in.weight": (2, 4)
+    }
+
+
+def test_flux_guidance_probe_reads_gguf_tensor_names(tmp_path):
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import flux
+
+    dev, schnell = tmp_path / "dev.gguf", tmp_path / "schnell.gguf"
+    _write_gguf(dev, ["img_in.weight", "guidance_in.in_layer.weight"])
+    _write_gguf(schnell, ["img_in.weight"])
+    assert flux._checkpoint_has_guidance_embeds(str(dev))
+    assert not flux._checkpoint_has_guidance_embeds(str(schnell))
 
 
 @pytest.mark.parametrize("quantization", ["fp8", "convrot_int8"])

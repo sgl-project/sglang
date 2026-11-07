@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -24,11 +25,6 @@ if TYPE_CHECKING:
     )
 
 _VEC = 8
-
-
-@cache_once
-def _supports_clusters() -> bool:
-    return torch.cuda.get_device_capability()[0] >= 10
 
 
 @cache_once
@@ -78,7 +74,7 @@ def all_gather_norm_residual_supported(
         or num_tokens * hidden_size * 2 > comm.max_push_size
     ):
         return False
-    if not _supports_clusters():
+    if not current_arch().is_sm_at_least(10):
         return False
     try:
         cluster_size, _, _ = norm_residual_launch_config(

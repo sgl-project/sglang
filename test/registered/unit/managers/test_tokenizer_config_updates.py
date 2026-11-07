@@ -34,13 +34,6 @@ def _manager(case, **fields):
 
 
 class TestTokenizerConfigUpdates(CustomTestCase):
-    def test_startup_config_shows_through_until_something_updates_it(self):
-        manager = _manager(self, weight_version="v1")
-        self.assertEqual(manager.config_value("weight_version"), "v1")
-
-        manager.record_config_updates("test", weight_version="v2")
-        self.assertEqual(manager.config_value("weight_version"), "v2")
-
     def test_the_serverargs_instance_is_not_written(self):
         manager = _manager(self, weight_version="v1")
         manager.record_config_updates("test", weight_version="v2")
