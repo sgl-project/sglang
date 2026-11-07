@@ -1,18 +1,59 @@
-name: Auto Label PRs
+name: Auto Label PRs and Issues
 
 on:
   pull_request_target:
-    types: [opened, synchronize, reopened]
+    types: [opened, edited, synchronize, reopened]
+  issues:
+    types: [opened, edited, reopened]
 
 permissions:
   contents: read
+  issues: write
   pull-requests: write
 
 jobs:
   label:
     runs-on: ubuntu-latest
     steps:
+      - name: Auto-label Beam titles
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const label = 'beam';
+            try {
+              await github.rest.issues.getLabel({ ...context.repo, name: label });
+            } catch (error) {
+              if (error.status !== 404) throw error;
+              try {
+                await github.rest.issues.createLabel({
+                  ...context.repo,
+                  name: label,
+                  color: '5319e7',
+                  description: 'Reflection Beam model support',
+                });
+              } catch (error) {
+                // Another labeling run may have created it concurrently.
+                const alreadyExists = error.status === 422 &&
+                  error.response?.data?.errors?.some(e => e.code === 'already_exists');
+                if (!alreadyExists) throw error;
+              }
+            }
+            const { data: issue } = await github.rest.issues.get({
+              ...context.repo,
+              issue_number: context.issue.number,
+            });
+            // Bare "beam" also describes beam search; require a model identifier.
+            const pattern = /(?:\bbeam[- ]\d|\breflection(?:\s+ai)?[ /-]+beam\b|\bBeamForCausalLM\b|\bBeamConfig\b|\[beam\])/i;
+            if (pattern.test(issue.title)) {
+              await github.rest.issues.addLabels({
+                ...context.repo,
+                issue_number: context.issue.number,
+                labels: [label],
+              });
+            }
+
       - name: Auto-label by file changes
+        if: github.event_name == 'pull_request_target'
         uses: actions/labeler@v5
         with:
           repo-token: "${{ secrets.GITHUB_TOKEN }}"
