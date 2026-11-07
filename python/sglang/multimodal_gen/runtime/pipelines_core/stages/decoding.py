@@ -51,6 +51,7 @@ from sglang.multimodal_gen.runtime.utils.torch_compile import (
     ActiveTargetCompiledCallable,
     resolve_torch_compile_kwargs,
 )
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -386,7 +387,9 @@ class DecodingStage(PipelineStage):
         )
         if save_file_path is None:
             return None
-        return EncodeWhileDecoding(save_file_path, batch)
+        return EncodeWhileDecoding(
+            save_file_path, batch, use_nvenc=envs.SGLANG_USE_NVENC.get()
+        )
 
     @torch.no_grad()
     def forward(

@@ -1706,7 +1706,7 @@ class Envs:
     SGLANG_MM_SKIP_COMPUTE_HASH = EnvBool(False)
     # Supported by Kimi-K2.5 and native diffusion RGB input preprocessing.
     SGLANG_FORCE_CPU_IMAGE_PREPROCESSING = EnvBool(False)
-    # Enable NVENC video output encoding; currently validated only for Cosmos3.
+    # Use NVENC to encode video output on the GPU.
     SGLANG_USE_NVENC = EnvBool(False)
     # For pre-tokenized (list[int]) multimodal prompts,
     # preserve the user's original tokens to avoid retokenization drift.

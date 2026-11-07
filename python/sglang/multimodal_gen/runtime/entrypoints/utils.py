@@ -49,6 +49,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger
 from sglang.multimodal_gen.runtime.utils.profiler import maybe_record_function
+from sglang.srt.environ import envs
 from sglang.srt.observability.trace import TraceReqContext
 
 logger = init_logger(__name__)
@@ -662,48 +663,92 @@ def _try_save_cuda_video_direct(
     output_compression: Optional[int],
     x264_preset: Optional[str] = None,
 ) -> bool:
-    """Stream CUDA RGB chunks to ffmpeg through a registered memfd."""
+    """Save CUDA frames, or CPU tensor frames with NVENC enabled."""
     video, audio = _split_sample_audio(sample)
+    use_nvenc = envs.SGLANG_USE_NVENC.get()
     if not (
         isinstance(video, torch.Tensor)
-        and video.device.type == "cuda"
         and video.dim() in (3, 4)
+        and video.shape[0] == 3
+        and (
+            video.device.type == "cuda"
+            or (use_nvenc and video.device.type == "cpu" and torch.cuda.is_available())
+        )
     ):
         return False
     if video.dim() == 3:
         video = video.unsqueeze(1)
-    if video.shape[0] != 3:
-        return False
-
     _, num_frames, height, width = video.shape
+    device = (
+        video.device
+        if video.device.type == "cuda"
+        else torch.device("cuda", torch.cuda.current_device())
+    )
     encoder = None
+    using_nvenc = False
     try:
-        encoder = CudaVideoEncoder.open(
-            save_file_path,
-            device=video.device,
+        encoder_kwargs = dict(
+            device=device,
             height=height,
             width=width,
             fps=fps,
             num_frames=num_frames,
             element_size=video.element_size(),
-            audio=audio,
             audio_sample_rate=audio_sample_rate,
             output_compression=output_compression,
             x264_preset=x264_preset,
         )
+        if use_nvenc:
+            from sglang.multimodal_gen.runtime.entrypoints.nvenc_video_encoder import (
+                NvencVideoEncoder,
+            )
+
+            try:
+                encoder = NvencVideoEncoder.open(
+                    save_file_path, audio=None, **encoder_kwargs
+                )
+            except Exception:
+                logger.warning_once("Cannot start NVENC; using CPU encoding instead.")
+                logger.debug("NVENC startup failure", exc_info=True)
+            using_nvenc = encoder is not None
         if encoder is None:
-            return False
-        encoder.write(video)
+            if video.device.type != "cuda":
+                return False
+            encoder = CudaVideoEncoder.open(
+                save_file_path, audio=audio, **encoder_kwargs
+            )
+            if encoder is None:
+                return False
+        if using_nvenc and video.device.type == "cpu":
+            chunk_frames = min(
+                4,
+                _conversion_chunk_frames(
+                    num_frames, height, width, video.element_size()
+                ),
+            )
+            for chunk in video.split(chunk_frames, dim=1):
+                encoder.write(chunk.to(device))
+        else:
+            encoder.write(video)
         encoder.close()
+        if using_nvenc and audio is not None:
+            _maybe_mux_audio_into_mp4(
+                save_file_path=save_file_path,
+                audio=audio,
+                frames=range(num_frames),
+                fps=fps,
+                audio_sample_rate=audio_sample_rate,
+            )
         return True
     except Exception:
         if encoder is not None:
             encoder.abort()
         logger.warning_once(
-            "Direct CUDA video save failed; falling back to CPU ffmpeg encoding. "
-            "Enable debug logging for exception details."
+            "%s video save failed; falling back to CPU ffmpeg encoding. "
+            "Enable debug logging for exception details.",
+            "NVENC" if using_nvenc else "Direct CUDA",
         )
-        logger.debug("Direct CUDA video save failure", exc_info=True)
+        logger.debug("Direct video save failure", exc_info=True)
         return False
 
 
@@ -717,7 +762,11 @@ def _try_save_cuda_videos_direct(
     x264_preset: Optional[str] = None,
 ) -> list[bool] | None:
     """Save independent CUDA videos concurrently when memory permits."""
-    if len(samples) < 2 or len(samples) != len(save_file_paths):
+    if (
+        envs.SGLANG_USE_NVENC.get()
+        or len(samples) < 2
+        or len(samples) != len(save_file_paths)
+    ):
         return None
 
     videos = []

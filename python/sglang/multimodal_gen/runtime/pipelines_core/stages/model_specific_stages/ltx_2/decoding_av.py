@@ -32,6 +32,7 @@ from sglang.multimodal_gen.runtime.utils.precision import (
     resolve_precision,
     temporary_module_dtype,
 )
+from sglang.srt.environ import envs
 
 logger = init_logger(__name__)
 
@@ -184,6 +185,7 @@ class LTX2AVDecodingStage(DecodingStage):
                 finish_frames=lambda frames: (frames / 2 + 0.5).clamp(0, 1).float(),
                 audio=output_batch.audio,
                 audio_sample_rate=output_batch.audio_sample_rate,
+                use_nvenc=envs.SGLANG_USE_NVENC.get(),
             )
         try:
             video = self._decode_video(batch, server_args, on_frames=stream)
