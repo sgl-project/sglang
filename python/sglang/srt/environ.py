@@ -1103,6 +1103,9 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Quantize the absorbed MLA value projection from the AITER batched-GEMM accumulator,
+    # avoiding the intermediate BF16 tensor.
+    SGLANG_OPT_HIP_FUSE_MLA_VALUE_MXFP4_QUANT = EnvBool(True)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
     SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)

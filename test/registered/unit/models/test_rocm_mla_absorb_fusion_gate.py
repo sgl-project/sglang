@@ -10,6 +10,7 @@ The gfx95 caller carries one further term, ``not q_replicate_active``, which
 needs a ForwardBatch to evaluate and so is not part of that predicate.
 """
 
+import contextlib
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -32,6 +33,7 @@ register_cpu_ci(est_time=20, suite="base-a-test-cpu")
 
 _CAN_FUSE = forward_mla_rocm._can_fuse_bmm_rope_cat_and_cache
 _ABSORB_CONFIG = forward_mla_rocm._absorb_bmm_config
+_CAN_FUSE_VALUE_QUANT = forward_mla_rocm._can_fuse_rocm_mla_value_mxfp4_quant
 
 
 def _attn(**overrides):
@@ -121,6 +123,85 @@ class TestAbsorbBmmConfig(CustomTestCase):
     def test_large_row_count_falls_back(self):
         self.assertIsNone(_ABSORB_CONFIG(16, 0, 512))
         self.assertIsNone(_ABSORB_CONFIG(16, 257, 512))
+
+
+def _value_attn(**overrides):
+    """An attention module the value-quant gate accepts, before the caller breaks one."""
+    attn = SimpleNamespace(
+        current_attention_backend="aiter",
+        use_dsa=False,
+        o_proj=SimpleNamespace(weight=torch.empty(1, dtype=torch.uint8)),
+        kv_lora_rank=512,
+        v_head_dim=128,
+    )
+    for k, v in overrides.items():
+        setattr(attn, k, v)
+    return attn
+
+
+def _forward_batch(is_decode_or_idle=True):
+    return SimpleNamespace(
+        forward_mode=SimpleNamespace(is_decode_or_idle=lambda: is_decode_or_idle)
+    )
+
+
+class TestValueQuantFusionGate(CustomTestCase):
+    """The gate that picks the fused value BMM + MXFP4 output-quant kernel.
+
+    The kernel emits the MXFP4 o_proj input directly, skipping the BF16 value output;
+    a kv_b_proj LoRA delta or a non-MXFP4 o_proj needs that output and stays split.
+    """
+
+    def setUp(self):
+        stack = contextlib.ExitStack()
+        self.addCleanup(stack.close)
+        stack.enter_context(
+            mock.patch.object(
+                forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", True
+            )
+        )
+        stack.enter_context(
+            mock.patch.object(
+                forward_mla_rocm, "is_kv_b_lora_active", return_value=False
+            )
+        )
+
+    def test_takes_the_fused_path_when_every_term_holds(self):
+        self.assertTrue(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
+
+    def test_active_kv_b_lora_turns_it_off(self):
+        """The fused kernel has no hook for the kv_b_proj LoRA delta on the value output."""
+        with mock.patch.object(
+            forward_mla_rocm, "is_kv_b_lora_active", return_value=True
+        ):
+            self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
+
+    def test_each_term_alone_turns_it_off(self):
+        # The kernel is decode-only on the AITER MLA backend, feeds an MXFP4 o_proj,
+        # and is pinned to the Kimi N=128, K=512 shape.
+        for name, broken in (
+            ("current_attention_backend", "triton"),
+            ("use_dsa", True),
+            ("o_proj", SimpleNamespace(weight=torch.empty(1, dtype=torch.bfloat16))),
+            ("kv_lora_rank", 576),
+            ("v_head_dim", 64),
+        ):
+            with self.subTest(term=name):
+                self.assertFalse(
+                    _CAN_FUSE_VALUE_QUANT(
+                        _value_attn(**{name: broken}), _forward_batch()
+                    )
+                )
+        with self.subTest(term="forward_mode"):
+            self.assertFalse(
+                _CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch(False))
+            )
+        # Off when the env var disables it or AITER lacks the kernel's helpers.
+        with self.subTest(term="_use_fused_mla_value_mxfp4_quant"):
+            with mock.patch.object(
+                forward_mla_rocm, "_use_fused_mla_value_mxfp4_quant", False
+            ):
+                self.assertFalse(_CAN_FUSE_VALUE_QUANT(_value_attn(), _forward_batch()))
 
 
 _ROPE_HEAD_DIM = 64
