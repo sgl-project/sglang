@@ -192,13 +192,11 @@ def fast_sample(
             # Unit column stride is enough: the multi-layer EAGLE single-graph
             # draft passes a [bs, step] view of a [max_bs, steps, vocab] buffer.
             and probs.stride(-1) == 1
+            # Size gate measured on RTX PRO 6000 and GB300; re-tune for other GPUs.
             and probs.numel() >= 1 << 23
             and can_argmax(q)
         ):
-            # One pass, same index as the clamp_min_ / division / sampling_argmax
-            # below (where sampling_argmax runs its CUDA kernel: NaN never wins).
-            # Below ~8M elements (bs x vocab) the split-vocab launch does not pay
-            # off on every GPU.
+            # Same index as the clamp_min_ / division / sampling_argmax below.
             sample_index = div_argmax(
                 probs, q, divisor_min=torch.finfo(torch.float32).tiny, ignore_nan=True
             ).unsqueeze(-1)
