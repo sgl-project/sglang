@@ -1,7 +1,7 @@
 import json
 import logging
 import re
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from sglang.srt.entrypoints.openai.protocol import Tool
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
@@ -13,6 +13,34 @@ from sglang.srt.function_call.core_types import (
 from sglang.srt.function_call.utils import get_schema_properties
 
 logger = logging.getLogger(__name__)
+
+
+def _search_quoted_tag(
+    text: str, prefix: str, close_tag: Optional[str] = None, pos: int = 0
+) -> Optional[Tuple[str, Optional[str], int]]:
+    # Linear `prefix([^>]+)">` (then `(.*?)close_tag` if given) search from pos ->
+    # (name, body, match end); that regex rescans from every prefix when ">" or
+    # the close tag never arrives, and a missing one stays missing for later prefixes.
+    gt = -1
+    while (start := text.find(prefix, pos)) != -1:
+        name_start = start + len(prefix)
+        if gt < name_start:
+            gt = text.find(">", name_start)
+            if gt == -1:
+                return None
+        if gt - 1 > name_start and text[gt - 1] == '"':
+            if close_tag is None:
+                return text[name_start : gt - 1], None, gt + 1
+            close = text.find(close_tag, gt + 1)
+            if close == -1:
+                return None
+            return (
+                text[name_start : gt - 1],
+                text[gt + 1 : close],
+                close + len(close_tag),
+            )
+        pos = start + 1
+    return None
 
 
 class MinimaxM2Detector(BaseFormatDetector):
@@ -266,9 +294,9 @@ class MinimaxM2Detector(BaseFormatDetector):
             # We're in a tool call, try to parse function name if not sent yet
             if not self._function_name_sent:
                 # Look for function name pattern: <invoke name=name>
-                function_match = re.search(r"<invoke name=\"([^>]+)\">", self._buf)
+                function_match = _search_quoted_tag(self._buf, self.tool_call_prefix)
                 if function_match:
-                    function_name = function_match.group(1).strip()
+                    function_name = function_match[0].strip()
 
                     # Validate function name
                     if function_name in self._tool_indices:
@@ -301,7 +329,7 @@ class MinimaxM2Detector(BaseFormatDetector):
                         )
 
                         # Remove the processed function declaration
-                        self._buf = self._buf[function_match.end() :]
+                        self._buf = self._buf[function_match[2] :]
                         continue
                     else:
                         # Invalid function name, reset state
@@ -376,19 +404,14 @@ class MinimaxM2Detector(BaseFormatDetector):
         calls: List[ToolCallItem] = []
 
         # Find all complete parameter patterns
-        param_matches = list(
-            re.finditer(
-                r"<parameter name=\"([^>]+)\">(.*?)</parameter>",
-                text_to_parse,
-                re.DOTALL,
-            )
-        )
-
-        # Build new parameters dictionary
         new_params = {}
-        for match in param_matches:
-            param_name = match.group(1).strip()
-            param_value = match.group(2)
+        pos = 0
+        while match := _search_quoted_tag(
+            text_to_parse, '<parameter name="', "</parameter>", pos
+        ):
+            pos = match[2]
+            param_name = match[0].strip()
+            param_value = match[1]
             new_params[param_name] = self._parse_parameter(
                 self._current_function_name, param_name, param_value, tools
             )
