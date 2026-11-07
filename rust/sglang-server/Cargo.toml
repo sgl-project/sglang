@@ -4,6 +4,7 @@ description = "Sglang server in rust"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module.
 [package.metadata.sglang]
@@ -46,6 +47,8 @@ sglang-processor = { path = "../sglang-processor", features = ["openai"] }
 flume = "0.12.0"
 http = "1.5.0"
 itertools = "0.14"
+# Already in the tree via axum; the `/generate` body's content-type check.
+mime = "0.3"
 # POSIX shm (`shm_open` family) for the MM feature fan-out (`utils::shm`), and
 # thread CPU affinity (`utils::threads`).
 rustix = { version = "1", features = ["fs", "mm", "pipe", "shm", "thread"] }
@@ -69,6 +72,9 @@ sha2 = "0.10"
 sglang_mm = { package = "sglang-mm", path = "../sglang-mm", default-features = false }
 tonic = { workspace = true }
 tokio-stream = { workspace = true }
+# Request bodies tagged `x-body-compressed: zstd`
+# (`SGLANG_ENABLE_REQUEST_DECOMPRESSION`).
+zstd = { version = "0.13", default-features = false }
 sglang_api_types = { package = "sglang-api-types", path = "../sglang-api-types" }
 
 [dev-dependencies]

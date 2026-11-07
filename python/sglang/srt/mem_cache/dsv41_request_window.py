@@ -329,9 +329,9 @@ class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
 def request_window_workspace_rows(
     num_slots: int, window: int, draft_tokens: int
 ) -> int:
+    from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.runtime_context import get_exec, get_schedule
-    from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
     graph_config = get_exec().graph.cuda_graph_config
     prefill = graph_config.prefill if graph_config is not None else None
