@@ -1654,11 +1654,11 @@ def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
     # DSpark deployments have no prefill draft pool.
     if not kv_args.num_draft_entries:
         return None
+    # Block size is left out: the flag stays None when gamma is inferred from
+    # the draft checkpoint, so comparing it would reject matching pairs.
     return {
         "algorithm": algorithm.name,
         "num_draft_entries": kv_args.num_draft_entries,
-        "dspark_block_size": spec.speculative_dspark_block_size,
-        "dflash_block_size": spec.speculative_dflash_block_size,
     }
 
 
