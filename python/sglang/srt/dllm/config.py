@@ -18,6 +18,7 @@ class DllmConfig:
         capture_input_preparation: bool = False,
         delete_token_id: int | None = None,
         split_token_id: int | None = None,
+        carries_block_state: bool = False,
     ):
         self.algorithm = algorithm
         self.algorithm_config = algorithm_config
@@ -29,6 +30,7 @@ class DllmConfig:
         self.capture_input_preparation = capture_input_preparation
         self.delete_token_id = delete_token_id
         self.split_token_id = split_token_id
+        self.carries_block_state = carries_block_state
 
     def validate_request(self, req) -> str | None:
         from sglang.srt.dllm.algorithm import get_algorithm_cls
@@ -57,6 +59,12 @@ class DllmConfig:
                 "block_size": getattr(model_config.hf_config, "canvas_length", 256),
                 "mask_id": -1,
                 "algorithm": "Gemma4Renoise",
+            },
+            # Values from the Fast-dVLM release (NVlabs/Fast-dLLM).
+            "Fast_dVLMForConditionalGeneration": {
+                "block_size": 32,
+                "mask_id": 151665,
+                "algorithm": "HierarchyBlock",
             },
         }
 
@@ -181,4 +189,5 @@ class DllmConfig:
             ),
             delete_token_id=delete_token_id,
             split_token_id=split_token_id,
+            carries_block_state=algorithm_cls.carries_block_state,
         )

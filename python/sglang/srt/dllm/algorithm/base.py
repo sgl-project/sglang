@@ -37,6 +37,9 @@ class DllmAlgorithm:
     reuse_forward_metadata: bool = False
     supported_attention_backends: Tuple[str, ...] = ()
     capture_input_preparation: bool = False
+    # Sync-mode algorithms that return per-request state from ``run`` to be
+    # stored on the request and passed back in for its next block.
+    carries_block_state: bool = False
 
     def __init__(self, config: DllmConfig):
         self.block_size = config.block_size
