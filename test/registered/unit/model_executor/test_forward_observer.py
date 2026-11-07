@@ -89,7 +89,7 @@ def test_tp_worker_attaches_observer_output_to_the_result(has_observer, can_run_
         sample=Mock(return_value=torch.tensor([3])),
         _elastic_cuda_graph_enabled=Mock(return_value=False),
     )
-    batch = SimpleNamespace(hicache_consumer_index=0)
+    batch = SimpleNamespace(hicache_consumer_index=0, swa_recompute_starts=None)
     forward_batch = SimpleNamespace(
         is_prefill_only=False,
         apply_deprecated_skip_attn_backend_init=Mock(),
