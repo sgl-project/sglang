@@ -10,6 +10,11 @@ from sglang.srt.multimodal.multimodal_processor_mixin import (
     load_image_item,
     load_video_item,
 )
+from sglang.srt.utils import (
+    GPUImageDecodeMode,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
+)
 
 
 def concat_media_features(item_features):
@@ -63,9 +68,12 @@ class TokenSpaceProcessStrategy:
     discard_alpha_channel: bool = True
     # Where a video request decodes and preprocesses; mm_process_config overrides it.
     video_preprocessing_device: str | None = None
+    # The image loader's defaults for this model; mm_process_config overrides them per server
+    # ("image_decoder": pil | nvjpeg | nvjpeg_fancy, "image_rgb_conversion": convert | white | smart).
     # False decodes JPEGs with PIL even on CUDA; nvJPEG pixels differ from PIL's.
-    gpu_image_decode: bool = True
-    smart_rgb_conversion: bool = False
+    gpu_image_decode: GPUImageDecodeMode = True
+    # "convert" drops alpha, "white" composites it onto white as qwen_vl_utils does, "smart" picks a background.
+    rgb_conversion: str = "convert"
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         # `processor` is the shared original; read config from it here, never keep it.
@@ -74,6 +82,12 @@ class TokenSpaceProcessStrategy:
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+        self.gpu_image_decode = resolve_gpu_image_decode(
+            mm_process_config, type(self).gpu_image_decode
+        )
+        self.rgb_conversion = resolve_rgb_conversion(
+            mm_process_config, type(self).rgb_conversion
+        )
         # Token IDs and sizes for expansion, e.g. image_token_id, spatial_merge_size.
         self.mm_token_expansion_params = {}
 
@@ -86,7 +100,7 @@ class TokenSpaceProcessStrategy:
             source,
             gpu_image_decode=self.gpu_image_decode,
             discard_alpha_channel=self.discard_alpha_channel,
-            smart_rgb_conversion=self.smart_rgb_conversion,
+            rgb_conversion=self.rgb_conversion,
         )
 
     def load_video(self, source, *, video_decode_device):

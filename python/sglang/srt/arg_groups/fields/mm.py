@@ -69,9 +69,12 @@ class Mm(msgspec.Struct):
     mm_process_config: A[
         Optional[Dict[str, Any]],
         Arg(
-            help="Multimodal preprocessing config, a json config contains keys: `image`, `video`, `audio`, "
-            "and `video_preprocessing_device`, the device the token-space processor decodes and preprocesses "
-            'a video request on (e.g. `{"video_preprocessing_device": "cpu"}`)',
+            help="Multimodal preprocessing config, a json config with keys `image`, `video` and `audio` "
+            "(kwargs for the HuggingFace processor), `video_preprocessing_device` (the device the token-space "
+            'processor decodes and preprocesses a video request on, e.g. `{"video_preprocessing_device": "cpu"}`), '
+            "`image_decoder` (`pil`, `nvjpeg` or `nvjpeg_fancy`: the JPEG decoder) and `image_rgb_conversion` "
+            "(`convert`, `white` or `smart`: how an image with alpha becomes RGB), both read by the token-space "
+            "processor only and defaulting to the model's strategy",
             type_parser=json.loads,
         ),
     ] = None

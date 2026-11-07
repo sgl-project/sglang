@@ -188,6 +188,13 @@ def handle_multimodal(server_args: Any):
                     f"mm_process_config['{key}'] must be a dict, "
                     f"but got {type(cfg.mm_process_config[key])}"
                 )
+        if not cfg.enable_token_space_processor:
+            for key in ("image_decoder", "image_rgb_conversion"):
+                if key in cfg.mm_process_config:
+                    raise ValueError(
+                        f"mm_process_config['{key}'] is read by the token-space processor only; "
+                        "it requires --enable-token-space-processor"
+                    )
 
 
 def handle_crash_dump_env(server_args: Any):

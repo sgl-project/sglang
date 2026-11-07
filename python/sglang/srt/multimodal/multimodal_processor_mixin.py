@@ -9,33 +9,34 @@ from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    GPUImageDecodeMode,
     configure_media_url_security,
     load_audio,
     load_image,
     load_video,
     logger,
-    smart_to_rgb,
+    to_rgb,
 )
 
 
 def load_image_item(
     data,
     *,
-    gpu_image_decode: bool,
+    gpu_image_decode: GPUImageDecodeMode,
     discard_alpha_channel: bool,
-    smart_rgb_conversion: bool,
+    rgb_conversion: str,
 ):
-    """Decode one image source to a PIL image, or a GPU tensor when nvJPEG decoded it."""
+    """Decode one image source to a PIL image, or a GPU tensor when nvJPEG decoded it.
+
+    ``rgb_conversion`` is one of ``RGB_CONVERSIONS``: how an image with alpha becomes RGB.
+    """
     img, _ = load_image(data, gpu_image_decode)
     if isinstance(img, torch.Tensor):
         return img  # JPEG already decoded on GPU by nvJPEG
+    if discard_alpha_channel:
+        img = to_rgb(img, rgb_conversion)
     # PIL decodes lazily; do it here in the io worker so the decode
     # doesn't run later on the event-loop thread.
-    if discard_alpha_channel:
-        if smart_rgb_conversion:
-            return smart_to_rgb(img)
-        if img.mode != "RGB":
-            return img.convert("RGB")
     img.load()
     return img
 
@@ -265,7 +266,7 @@ class MultimodalProcessorMixin:
                     data,
                     gpu_image_decode=cls.gpu_image_decode,
                     discard_alpha_channel=discard_alpha_channel,
-                    smart_rgb_conversion=cls.smart_rgb_conversion,
+                    rgb_conversion="smart" if cls.smart_rgb_conversion else "convert",
                 )
             elif modality == Modality.VIDEO:
                 if video_decode_device is None:

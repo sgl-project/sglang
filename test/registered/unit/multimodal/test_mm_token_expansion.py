@@ -592,7 +592,11 @@ def _token_space_defaults(strategy_class, hf_config):
     # Serving takes the IO thread default from the serving spec, not the core.
     serving_spec = serving_spec_for(hf_config)(hf_config)
     defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
-    defaults["video_preprocessing_device"] = strategy_class.video_preprocessing_device
+    # The strategy's loader defaults apply per instance; the class keeps the mixin's. `smart` is the one
+    # RGB conversion both processors share; a strategy's `white` composites alpha the legacy loader drops.
+    for name in ("gpu_image_decode", "video_preprocessing_device"):
+        defaults[name] = getattr(strategy_class, name)
+    defaults["smart_rgb_conversion"] = strategy_class.rgb_conversion == "smart"
     return defaults
 
 
