@@ -223,6 +223,53 @@ class TestFIFOScheduler(CustomTestCase):
         self.assertEqual(len(gpu.pending_requests), 1)
         self.assertEqual(gpu.pending_requests[0].request_id, "r2")
 
+    def test_schedule_shared_prefix_incremental_admission(self):
+        scheduler = FIFOScheduler()
+        gpu = GPUState(gpu_id=0, max_total_tokens=260)
+        gpu.running_requests = [
+            SimRequest(
+                request_id="r0",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            )
+        ]
+        # r1 does not share group_id and needs 150 tokens (150 + 150 = 300 > 260 -> skipped)
+        # r2 shares g0 so its marginal token cost is 150 - 100 = 50 (150 + 50 = 200 <= 260 -> admitted)
+        # r3 is a new group g1 with 60 tokens (200 + 60 = 260 <= 260 -> admitted)
+        # r4 shares g1 so its marginal cost is 60 - 40 = 20 (260 + 20 = 280 > 260 -> skipped)
+        gpu.pending_requests = [
+            SimRequest(request_id="r1", input_len=150, output_len=50),
+            SimRequest(
+                request_id="r2",
+                input_len=150,
+                output_len=50,
+                group_id="g0",
+                prefix_len=100,
+            ),
+            SimRequest(
+                request_id="r3",
+                input_len=60,
+                output_len=20,
+                group_id="g1",
+                prefix_len=40,
+            ),
+            SimRequest(
+                request_id="r4",
+                input_len=60,
+                output_len=20,
+                group_id="g1",
+                prefix_len=40,
+            ),
+        ]
+        scheduler.schedule(gpu)
+        self.assertEqual(
+            [r.request_id for r in gpu.running_requests], ["r0", "r2", "r3"]
+        )
+        self.assertEqual([r.request_id for r in gpu.pending_requests], ["r1", "r4"])
+        self.assertEqual(gpu.total_seq_len(), 260)
+
 
 class TestMetrics(CustomTestCase):
     def test_batch_size_balancedness(self):
