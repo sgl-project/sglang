@@ -1295,18 +1295,15 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         )
 
     def test_kimi_k3_flashinfer_mxfp4_rejects_situ_without_trtllm_gen(self):
-        """An explicit flashinfer_mxfp4 outside the SM100 family ran K3's SiTU experts as SwiGLU."""
+        """An explicit flashinfer_mxfp4 on SM90/SM120 ran K3's SiTU experts as SwiGLU."""
         from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
             _kimi_k3_moe_runner_overrides,
         )
 
-        def _k3_hf(hidden_act):
+        def _k3_hf(hidden_act, flat=False):
             qc = {"config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}}}
-            return SimpleNamespace(
-                text_config=SimpleNamespace(
-                    hidden_act=hidden_act, quantization_config=qc
-                )
-            )
+            text_config = SimpleNamespace(hidden_act=hidden_act, quantization_config=qc)
+            return text_config if flat else SimpleNamespace(text_config=text_config)
 
         def _run(runner, hf_config, **platform):
             with override_platform(**platform):
@@ -1324,18 +1321,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         hopper = _gpu(90)
-        # SM110 stands in for an arch without a dedicated check.
-        for platform in (hopper, _gpu(120), _gpu(110)):
-            with self.subTest(**platform):
-                with self.assertRaisesRegex(RuntimeError, "marlin"):
-                    _run("flashinfer_mxfp4", _k3_hf("situ"), **platform)
-        for platform in (_gpu(100), _gpu(103)):
+        for platform in (hopper, _gpu(120)):
+            for flat in (False, True):
+                with self.subTest(flat=flat, **platform):
+                    with self.assertRaisesRegex(RuntimeError, "marlin"):
+                        _run("flashinfer_mxfp4", _k3_hf("situ", flat), **platform)
+        # SM110 has no flashinfer_mxfp4 kernel; Mxfp4MoEMethod reports that.
+        for platform in (_gpu(100), _gpu(103), _gpu(110)):
             with self.subTest(**platform):
                 self.assertEqual(
                     _run("flashinfer_mxfp4", _k3_hf("situ"), **platform), {}
                 )
         self.assertEqual(_run("marlin", _k3_hf("situ"), **hopper), {})
         self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("silu"), **hopper), {})
+        self.assertEqual(
+            _run("flashinfer_mxfp4", _k3_hf("silu", flat=True), **hopper), {}
+        )
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
