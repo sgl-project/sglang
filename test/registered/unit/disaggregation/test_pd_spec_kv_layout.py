@@ -29,15 +29,12 @@ SENTINEL_QUERY = dict.fromkeys(
 )
 
 
-def layout(
-    algorithm, *, num_draft_entries=6, num_steps=3, num_draft_tokens=4, block_size=4
-):
+def layout(algorithm, *, num_draft_entries=6, num_draft_tokens=5, block_size_flag=4):
     kv_args = SimpleNamespace(num_draft_entries=num_draft_entries)
     with published_topology(
         speculative_algorithm=algorithm,
-        speculative_num_steps=num_steps,
         speculative_num_draft_tokens=num_draft_tokens,
-        speculative_dspark_block_size=block_size,
+        speculative_dspark_block_size=block_size_flag,
         speculative_dflash_block_size=None,
     ):
         return get_spec_kv_layout(kv_args)
@@ -102,12 +99,15 @@ class TestSpecKVLayout(CustomTestCase):
             with self.subTest(algorithm=algorithm):
                 self.assertEqual(layout(algorithm), {})
         self.assertEqual(layout("DSPARK"), DSPARK)
-        self.assertEqual(layout("DSPARK", num_steps=8, num_draft_tokens=16), DSPARK)
-        # An explicit block size and one inferred from the draft checkpoint
-        # (flag left None) publish the same layout.
-        self.assertEqual(layout("DSPARK", block_size=None), DSPARK)
+        self.assertEqual(layout("DSPARK", block_size_flag=None), DSPARK)
+        self.assertEqual(
+            layout("DSPARK", num_draft_tokens=9, block_size_flag=8), DSPARK
+        )
         self.assertEqual(layout("DSPARK", num_draft_entries=0), None)
-        self.assertEqual(layout("DFLASH"), {**DSPARK, "algorithm": "DFLASH"})
+        self.assertEqual(
+            layout("DFLASH", num_draft_tokens=4, block_size_flag=None),
+            {**DSPARK, "algorithm": "DFLASH"},
+        )
 
     def test_decode_compares_only_published_layouts(self):
         cases = {

@@ -1349,8 +1349,7 @@ class CommonKVManager(BaseKVManager):
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
                 data = response.json()
-                # Ignore fields a newer prefill publishes that this decode
-                # does not know, so bootstrap can grow without lockstep upgrades.
+                # Drop fields from newer prefills.
                 known = {f.name for f in dataclasses.fields(PrefillServerInfo)}
                 info = PrefillServerInfo(
                     **{key: value for key, value in data.items() if key in known}
@@ -1436,10 +1435,7 @@ class CommonKVManager(BaseKVManager):
                     "servers (including prefill CP ranks for MLA)"
                 )
 
-        # Only a prefill that injects draft KV publishes a layout. Decode ranks
-        # without draft KV entries (draftless PP stages, state-only drafts)
-        # carry None and skip the comparison; a target-only decode carries {}
-        # and is rejected, since it cannot consume the injected bytes.
+        # None (draftless PP stage, state-only draft) skips the check.
         if (
             info.spec_kv_layout is not None
             and self.spec_kv_layout is not None
@@ -1663,8 +1659,6 @@ class CommonKVManager(BaseKVManager):
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
-            # Only an injected draft KV layout goes on the wire; {} (no draft
-            # KV by design) is sent as absent so peers never see a new field.
             "spec_kv_layout": self.spec_kv_layout or None,
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,

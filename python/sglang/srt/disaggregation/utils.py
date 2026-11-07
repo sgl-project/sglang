@@ -1639,23 +1639,16 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
 
 
 def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
-    """Prefill-injected draft KV layout for this rank.
-
-    {} when the algorithm injects none (target-only, EAGLE, NEXTN), None when
-    this rank has no draft KV entries (draftless PP stage, state-only drafts)
-    so it skips the comparison. Only a non-empty layout is published."""
+    """{} without injected draft KV; None when this rank has no draft KV entries."""
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     spec = get_spec()
     algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
     if not algorithm.is_dflash_family():
         return {}
-    # State-only drafts (DSV4) keep legacy behavior: existing NPU decode-only
-    # DSpark deployments have no prefill draft pool.
     if not kv_args.num_draft_entries:
         return None
-    # Block size is left out: the flag stays None when gamma is inferred from
-    # the draft checkpoint, so comparing it would reject matching pairs.
+    # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
     return {
         "algorithm": algorithm.name,
         "num_draft_entries": kv_args.num_draft_entries,
