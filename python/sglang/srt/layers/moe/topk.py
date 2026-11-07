@@ -455,6 +455,15 @@ class BypassedTopKOutput(NamedTuple):
             )
         return self.raw_router_logits
 
+    @property
+    def needs_select_experts(self) -> bool:
+        """Whether routing straight from logits would skip select_experts work: the
+        placement remap, routed-expert capture, distribution recording or simulation."""
+        return (
+            self.expert_location_dispatch_info is not None
+            or select_experts_hooks_enabled(self.topk_config)
+        )
+
     def to_standard(self, layer_id: Optional[int] = None) -> StandardTopKOutput:
         """Materialize routing tensors. Used by MoE kernels that need explicit
         topk_ids / topk_weights rather than doing routing internally."""
@@ -2517,6 +2526,18 @@ def routing_simulation_enabled() -> bool:
     return (
         envs.SGLANG_SIMULATE_UNIFORM_EXPERTS.get()
         or envs.SGLANG_SIMULATE_ROUND_ROBIN_EXPERTS.get()
+    )
+
+
+def select_experts_hooks_enabled(topk_config: TopKConfig) -> bool:
+    """Whether select_experts' capture, recording or simulation hooks must run."""
+    return (
+        (
+            topk_config.allow_routed_experts_capture
+            and get_global_experts_capturer() is not None
+        )
+        or get_exec().moe.expert_distribution_recorder_mode is not None
+        or routing_simulation_enabled()
     )
 
 

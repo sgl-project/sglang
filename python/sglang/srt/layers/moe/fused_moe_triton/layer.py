@@ -1751,10 +1751,11 @@ class FusedMoE(torch.nn.Module):
             return forward_fuseep(self, hidden_states, topk_output)
         if is_in_tc_piecewise_cuda_graph():
             if TopKOutputChecker.format_is_bypassed(topk_output) and (
-                topk_output.expert_location_dispatch_info is not None
+                topk_output.needs_select_experts
                 or topk_output.num_token_non_padded is not None
             ):
-                # The opaque logits-only op cannot carry padding or placement metadata.
+                # The opaque logits-only op carries neither the padding bound nor the
+                # full TopK config that select_experts needs.
                 return self.forward_impl(
                     hidden_states, topk_output, pre_quant_input=pre_quant_input
                 )

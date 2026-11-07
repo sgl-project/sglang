@@ -1162,9 +1162,11 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         else hidden_states.dtype
     )
     topk_output = dispatch_output.topk_output
-    if TopKOutputChecker.format_is_bypassed(topk_output) and (
-        topk_output.num_token_non_padded is not None
-        or topk_output.expert_location_dispatch_info is not None
+    # A padding bound alone keeps the in-kernel router: padded rows stay on this rank
+    # and the caller drops their outputs.
+    if (
+        TopKOutputChecker.format_is_bypassed(topk_output)
+        and topk_output.needs_select_experts
     ):
         topk_output = topk_output.to_standard()
     materialized_topk = not use_routed_topk and TopKOutputChecker.format_is_standard(
