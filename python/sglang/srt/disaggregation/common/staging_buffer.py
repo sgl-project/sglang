@@ -452,7 +452,6 @@ class StagingAllocator:
         self.head = 0
         self.round = 0
         self.allocations: dict = {}  # alloc_id -> (offset, size, round)
-        self.alloc_order: List[int] = []
         self.next_alloc_id = 0
         self.watermark_round = 0
         self.watermark_tail = 0
@@ -486,7 +485,6 @@ class StagingAllocator:
             alloc_id = self.next_alloc_id
             self.next_alloc_id += 1
             self.allocations[alloc_id] = (offset, required_bytes, self.round)
-            self.alloc_order.append(alloc_id)
             return (alloc_id, offset, self.round)
 
     def free(self, alloc_id: int):
@@ -496,9 +494,6 @@ class StagingAllocator:
                 return
             self.allocations.pop(alloc_id)
 
-            while self.alloc_order and self.alloc_order[0] not in self.allocations:
-                self.alloc_order.pop(0)
-
             if not self.allocations:
                 # An empty ring makes the entire prior round reusable. Start a
                 # fresh round at offset zero so the watermark cannot stay stale.
@@ -506,8 +501,8 @@ class StagingAllocator:
                 self.head = 0
                 self.watermark_round = self.round
                 self.watermark_tail = 0
-            elif self.alloc_order:
-                off, _, rnd = self.allocations[self.alloc_order[0]]
+            else:
+                off, _, rnd = next(iter(self.allocations.values()))
                 self.watermark_round = rnd
                 self.watermark_tail = off
 
