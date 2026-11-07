@@ -8,7 +8,9 @@ use std::time::Duration;
 use axum::Router;
 
 use super::generate_hook::GenerateHook;
-use super::{auth, hicache, info, loads, metrics, native_api, openai, pre_generate};
+use super::{
+    auth, hicache, info, loads, metrics, native_api, openai, pre_generate, request_decompression,
+};
 use crate::HttpLayer;
 use crate::api_server::core::{DrainEnd, FLUSH_INTERVAL};
 use crate::api_server::disaggregation::bootstrap as pd_bootstrap;
@@ -178,8 +180,11 @@ pub async fn serve(
     if let Some(http_layer) = http_layer {
         app = pre_generate::apply(app, &http_layer, core);
     }
+    // Outside the embedding package's layers, so they read decompressed bodies.
+    app = request_decompression::apply(app, &server_args);
     // Outside the extension layer, so its routes are keyed too. The bootstrap
-    // registry below stays open, as Python serves it on its own server.
+    // registry below stays open, as Python serves it on its own server. Auth
+    // runs before decompression, so an unauthenticated body is never inflated.
     app = auth::apply(app, &server_args.api_keys);
 
     // Prefill-only KV bootstrap registry. Merged AFTER `with_state` — its
