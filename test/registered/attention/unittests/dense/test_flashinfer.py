@@ -3,12 +3,16 @@ import unittest
 import torch
 
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.sparse_query import SparseQueryMetadata
 from sglang.srt.utils import is_flashinfer_available
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
     DenseAttentionCase,
+    build_dense_attention_fixture,
+    expected_dense_fixture_output,
     make_dense_cases,
     run_dense_attention_case,
+    run_dense_fixture_eager,
 )
 from sglang.test.kits.attention_unittest.runner_modes.cuda_graph_decode_runner import (
     run_dense_cuda_graph_decode_case,
@@ -280,6 +284,67 @@ class TestFlashInferDenseAttentionBackendCorrectness(CustomTestCase):
             prefix_lens=(4, 7),
         ),
     )
+
+    def test_sparse_queries_preserve_positions_and_unselected_kv(self) -> None:
+        """Compacting queries must preserve causal positions and physical writes."""
+        case = DenseAttentionCase(
+            name="sparse_gqa_across_requests_and_pages",
+            backend="flashinfer",
+            forward_mode=ForwardMode.EXTEND,
+            num_heads=4,
+            num_kv_heads=2,
+            page_size=16,
+            prefix_lens=(0, 0),
+            extend_lens=(17, 21),
+        )
+        fixture = build_dense_attention_fixture(
+            self, case, head_dim=self.HEAD_DIM, hidden_size=self.HIDDEN_SIZE
+        )
+        with torch.no_grad():
+            run_dense_fixture_eager(fixture)
+            batch = fixture.forward_batch
+            selected = torch.tensor([0, 7, 16, 18, 22, 37], device="cuda")
+            fixture.input_hidden[selected] += 0.5
+            expected = expected_dense_fixture_output(fixture)[selected]
+            storage = fixture.runner.token_to_kv_pool.layer_router.read(0)
+            full_slots = batch.out_cache_loc.clone()
+            old_k = storage.key()[full_slots].clone()
+            old_v = storage.value()[full_slots].clone()
+
+            fixture.input_hidden = fixture.input_hidden[selected]
+            batch.input_ids = batch.input_ids[selected]
+            batch.positions = batch.positions[selected]
+            batch.iteration_ids.bind(batch, fixture.runner.runner_ids, cols=selected)
+            batch.extend_num_tokens = len(selected)
+            batch.extend_seq_lens = torch.tensor(
+                [3, 3], dtype=torch.int32, device="cuda"
+            )
+            batch.extend_seq_lens_cpu = [3, 3]
+            batch.extend_start_loc = torch.tensor(
+                [0, 3], dtype=torch.int32, device="cuda"
+            )
+            batch.sparse_query = SparseQueryMetadata((3, 3), batch.positions)
+
+            actual = run_dense_fixture_eager(fixture)
+            torch.testing.assert_close(actual, expected, atol=3e-2, rtol=3e-2)
+            _, new_k, new_v = fixture.actual_module.project_qkv(fixture.input_hidden)
+            for cached, previous, updated in (
+                (storage.key(), old_k, new_k),
+                (storage.value(), old_v, new_v),
+            ):
+                torch.testing.assert_close(
+                    cached[batch.out_cache_loc],
+                    updated.view(-1, case.num_kv_heads, self.HEAD_DIM),
+                    atol=0,
+                    rtol=0,
+                )
+                untouched = torch.ones(
+                    len(full_slots), dtype=torch.bool, device=cached.device
+                )
+                untouched[selected] = False
+                torch.testing.assert_close(
+                    cached[full_slots[untouched]], previous[untouched], atol=0, rtol=0
+                )
 
     def test_projected_dense_attention_cases(self):
         for case in self.CASES:
