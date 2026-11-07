@@ -346,6 +346,61 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
                 np.testing.assert_array_equal(actual_keys, expected_keys)
                 np.testing.assert_array_equal(actual_counts, expected_counts)
 
+    def test_qem_symmetric_determinant_mask_matches_numpy(self):
+        threshold = 1e-12
+        below = np.nextafter(threshold, 0.0)
+        above = np.nextafter(threshold, np.inf)
+        matrices = np.array(
+            [
+                [[4.0, 1.0, 0.5], [1.0, 3.0, 0.25], [0.5, 0.25, 2.0]],
+                [[1.0, 2.0, 3.0], [2.0, 4.0, 6.0], [3.0, 6.0, 9.0]],
+                np.diag([1.0, 1.0, 1e-14]),
+                np.diag([1.0, 1.0, below]),
+                np.diag([1.0, 1.0, threshold]),
+                np.diag([1.0, 1.0, above]),
+                # The determinant is near the threshold after cancellation of ~1 terms.
+                [[1.0, 1.0, 0.0], [1.0, 1.0 + threshold, 0.0], [0.0, 0.0, 1.0]],
+            ],
+            dtype=np.float64,
+        )
+        expected = np.abs(np.linalg.det(matrices)) > threshold
+        actual = mesh3d_utils._qem_symmetric_determinant_mask(matrices)
+        np.testing.assert_array_equal(actual, expected)
+
+    def test_qem_collapse_targets_match_numpy_determinant_reference(self):
+        q = np.zeros((3, 4, 4), dtype=np.float64)
+        q[:, :3, :3] = np.array(
+            [
+                [[3.0, 0.2, 0.0], [0.2, 2.0, 0.1], [0.0, 0.1, 1.0]],
+                [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 0.0]],
+                np.diag([1.0, 1.0, np.nextafter(1e-12, np.inf)]),
+            ]
+        )
+        linear = np.array([[0.2, -0.1, 0.3], [1.0, 2.0, 3.0], [1.0, 2.0, 1.0]])
+        q[:, :3, 3] = linear
+        q[:, 3, :3] = linear
+        q[:, 3, 3] = [1.0, 2.0, 3.0]
+        va = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+        vb = np.array([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 1.0]])
+
+        mid = (va + vb) / 2
+        expected_x = mid.copy()
+        solvable = np.abs(np.linalg.det(q[:, :3, :3])) > 1e-12
+        if solvable.any():
+            expected_x[solvable] = np.linalg.solve(
+                q[solvable, :3, :3], -q[solvable, :3, 3:]
+            )[:, :, 0]
+            far = np.linalg.norm(expected_x - mid, axis=1) > 2 * np.linalg.norm(
+                vb - va, axis=1
+            )
+            expected_x[far] = mid[far]
+        xh = np.concatenate([expected_x, np.ones((len(expected_x), 1))], axis=1)
+        expected_cost = np.maximum(np.einsum("ni,nij,nj->n", xh, q, xh), 0)
+
+        actual_x, actual_cost = mesh3d_utils._qem_collapse_targets(q, va, vb)
+        np.testing.assert_array_equal(actual_x, expected_x)
+        np.testing.assert_array_equal(actual_cost, expected_cost)
+
     def test_vertex_quadrics_match_reference_exactly(self):
         closed = trimesh.creation.icosphere(subdivisions=1, radius=1.0)
         open_boundary = trimesh.Trimesh(

@@ -176,6 +176,27 @@ def _qem_unique_edge_keys(f: np.ndarray, nv: int) -> Tuple[np.ndarray, np.ndarra
     return np.unique(edge_keys, return_counts=True)
 
 
+def _qem_symmetric_determinant_mask(a: np.ndarray) -> np.ndarray:
+    """Check symmetric 3x3 solvability, using NumPy near the threshold."""
+    a00, a01, a02 = a[:, 0, 0], a[:, 0, 1], a[:, 0, 2]
+    a11, a12, a22 = a[:, 1, 1], a[:, 1, 2], a[:, 2, 2]
+    p0, p1 = a11 * a22, a12 * a12
+    p2, p3 = a01 * a22, a12 * a02
+    p4, p5 = a01 * a12, a11 * a02
+    det = a00 * (p0 - p1) - a01 * (p2 - p3) + a02 * (p4 - p5)
+    scale = (
+        np.abs(a00) * (np.abs(p0) + np.abs(p1))
+        + np.abs(a01) * (np.abs(p2) + np.abs(p3))
+        + np.abs(a02) * (np.abs(p4) + np.abs(p5))
+    )
+    margin = 128 * np.finfo(np.float64).eps * scale
+    uncertain = (~np.isfinite(det)) | (np.abs(np.abs(det) - 1e-12) <= margin)
+    solvable = np.abs(det) > 1e-12
+    if uncertain.any():
+        solvable[uncertain] = np.abs(np.linalg.det(a[uncertain])) > 1e-12
+    return solvable
+
+
 def _qem_collapse_targets(
     q: np.ndarray, va: np.ndarray, vb: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray]:
@@ -183,7 +204,7 @@ def _qem_collapse_targets(
     mid = (va + vb) / 2
     x = mid.copy()
     a = q[:, :3, :3]
-    solvable = np.abs(np.linalg.det(a)) > 1e-12
+    solvable = _qem_symmetric_determinant_mask(a)
     if solvable.any():
         x[solvable] = np.linalg.solve(a[solvable], -q[solvable, :3, 3:])[:, :, 0]
         # an optimum far from the edge is unstable; use the midpoint instead
