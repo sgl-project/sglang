@@ -104,6 +104,7 @@ class _FoundryAdapterReal(FoundryAdapter):
         self.mode = mode
         # (step, reason) once Foundry reported this configuration unsupported.
         self._unsupported: Optional[tuple[str, str]] = None
+        self._quiet = False
         self._guarded(api.activate, mode=mode, config_path=config_path)
 
     @property
@@ -123,7 +124,15 @@ class _FoundryAdapterReal(FoundryAdapter):
 
     def _deactivate(self, unsupported) -> None:
         self._unsupported = (unsupported.step, unsupported.reason)
-        self._api.deactivate(step=unsupported.step, reason=unsupported.reason)
+        self._quiet = unsupported.quiet
+        self._api.deactivate(
+            step=unsupported.step, reason=unsupported.reason, quiet=unsupported.quiet
+        )
+        if unsupported.quiet:
+            logger.info(
+                f"[Foundry] cuda-graph persistence inactive: {unsupported.reason}"
+            )
+            return
         if unsupported.inherited:
             logger.info(
                 f"[Foundry] {unsupported}; cuda-graph persistence disabled by the "
@@ -201,6 +210,8 @@ class _FoundryAdapterReal(FoundryAdapter):
     def log_init_summary(self) -> None:
         if self._unsupported is None:
             self._api.log_init_summary()
+            return
+        if self._quiet:
             return
         import torch.distributed as dist
 

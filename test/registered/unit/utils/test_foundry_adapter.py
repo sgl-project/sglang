@@ -53,11 +53,12 @@ _API_MODULE = "foundry.integration.sglang.api"
 
 
 class _Unsupported(Exception):
-    def __init__(self, step, reason, *, inherited=False):
+    def __init__(self, step, reason, *, inherited=False, quiet=False):
         super().__init__(f"unsupported at {step}: {reason}")
         self.step = step
         self.reason = reason
         self.inherited = inherited
+        self.quiet = quiet
 
 
 def _fake_api(
