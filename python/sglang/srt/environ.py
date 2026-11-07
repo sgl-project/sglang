@@ -925,6 +925,9 @@ class Envs:
     # larger transfers; 0 preserves the legacy single-batch behavior.
     SGLANG_MOONCAKE_MAX_TRANSFER_BATCH_INDICES = EnvInt(0)
     ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE = EnvBool(False)
+    # Some Ascend Direct wheels select the device from the bound ACL context
+    # and parse initialization endpoints as host:port, without :npu_<id>.
+    SGLANG_MOONCAKE_ASCEND_USE_DEVICE_SUFFIX = EnvBool(True)
     ASCEND_NPU_PHY_ID = EnvInt(-1)
     SGLANG_MOONCAKE_SEND_AUX_TCP = EnvBool(False)
     SGLANG_ENABLE_FAILED_SESSION_PROBE = EnvBool(True)

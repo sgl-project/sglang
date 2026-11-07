@@ -200,8 +200,17 @@ class MooncakeTransferEngine:
         """Initialize the mooncake instance."""
         if envs.ENABLE_ASCEND_TRANSFER_WITH_MOONCAKE.get():
             npu_phy_id = envs.ASCEND_NPU_PHY_ID.get()
-            suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
-            hostname += f":{get_free_port()}:npu_{suffix}"
+            use_device_suffix = envs.SGLANG_MOONCAKE_ASCEND_USE_DEVICE_SUFFIX.get()
+            if not use_device_suffix and npu_phy_id != -1:
+                raise ValueError(
+                    "ASCEND_NPU_PHY_ID requires "
+                    "SGLANG_MOONCAKE_ASCEND_USE_DEVICE_SUFFIX=True. "
+                    "Without the suffix, Mooncake uses the bound device context."
+                )
+            hostname += f":{get_free_port()}"
+            if use_device_suffix:
+                suffix = self.gpu_id if npu_phy_id == -1 else npu_phy_id
+                hostname += f":npu_{suffix}"
             protocol = "ascend"
         else:
             # MOONCAKE_PROTOCOL selects the transport (rdma | efa | tcp | ...).
