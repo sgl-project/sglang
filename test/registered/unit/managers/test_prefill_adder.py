@@ -1716,6 +1716,35 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
 
+    def test_load_back_rechecks_admission_when_its_host_pin_removes_write_back_room(
+        self,
+    ):
+        """The round's budget counted evictable device KV that write-back can
+        free only with host room the candidate's own host match provided. Once
+        admission pins that match for load-back the KV is unreclaimable, so the
+        request is re-checked and deferred before any H2D is queued."""
+        self.mock_tree_cache.full_evictable_size.return_value = 100_000
+        self.mock_tree_cache.full_unreclaimable_size.return_value = 0
+        adder = self._create_delayer_adder(available_tokens=0, delayer=None)
+        req = self._create_host_hit_req(host_hit=8192, tail=1024)
+        # Pinning the match for load-back leaves nothing write-back can free.
+        self.mock_tree_cache.full_unreclaimable_size.return_value = 100_000
+
+        self.assertEqual(adder.add_one_req(req, False, None), AddReqResult.NO_TOKEN)
+        self.mock_tree_cache.init_load_back.assert_not_called()
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(adder.memory_budget.full_unreclaimable, 100_000)
+
+    def test_load_back_keeps_admission_when_the_host_pin_leaves_room(self):
+        self.mock_tree_cache.full_evictable_size.return_value = 100_000
+        adder = self._create_delayer_adder(available_tokens=0, delayer=None)
+        req = self._create_host_hit_req(host_hit=8192, tail=1024)
+        self.mock_tree_cache.init_load_back.return_value = (8192, req.last_node)
+
+        adder.add_one_req(req, False, None)
+        self.mock_tree_cache.init_load_back.assert_called_once()
+        self.assertEqual(adder.can_run_list, [req])
+
     def test_successful_load_back_commits_the_selected_shape_once(self):
         cases = (
             ("full", 0, 24, None, None, 8, 8),

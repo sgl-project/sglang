@@ -718,6 +718,48 @@ class _WriteBackBatchingSuite:
                 cache.dec_host_lock_ref(child_node, pin)
                 cache.sanity_check()
 
+    def test_admission_rereads_room_after_pinning_a_host_match_for_load_back(self):
+        """An unpinned host-only span (e.g. a prefetched L3 hit) is the room that
+        lets an unbacked parent with a pinned host-only child back up. Admission
+        then pins that span to load it back: the round's snapshot still counts
+        the parent as freeable, eviction cannot free it, and only a refresh of
+        the budget withdraws the promise."""
+        cache, allocator, host_pool = write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            host_tokens=BATCH_TOKENS,
+        )
+        span = [5000 + t for t in range(2 * PAGE)]
+        parent = [1000 + t for t in range(2 * PAGE)]
+        child = parent + [3000 + t for t in range(PAGE)]
+        for seq in (span, parent, child):
+            insert_seq(cache, allocator, seq)
+        child_node = match_seq(cache, child).last_device_node
+        cache.evict(EvictParams(num_tokens=len(span) + PAGE))
+        span_node = match_seq(cache, span).last_host_node
+        self.assertEqual(match_seq(cache, span).host_hit_length, len(span))
+        child_pin = cache.inc_host_lock_ref(child_node).to_dec_params()
+        self.assertIsNotNone(host_pool.alloc(host_pool.available_size()))
+
+        budget = PrefillBudget(allocator, cache)
+        self.assertEqual(budget.full_unreclaimable, 0)
+        promised = budget.remaining_total - allocator.available_size()
+        self.assertEqual(promised, len(parent))
+
+        # Admission pins the span for its load-back.
+        span_pin = cache.inc_host_lock_ref(span_node).to_dec_params()
+        self.assertEqual(budget.remaining_total - allocator.available_size(), promised)
+        self.assertTrue(budget.refresh_full_unreclaimable())
+        self.assertEqual(budget.remaining_total - allocator.available_size(), 0)
+        self.assertEqual(
+            cache.evict(EvictParams(num_tokens=promised)).num_tokens_evicted, 0
+        )
+        self.assertFalse(budget.refresh_full_unreclaimable())
+
+        cache.dec_host_lock_ref(span_node, span_pin)
+        cache.dec_host_lock_ref(child_node, child_pin)
+        cache.sanity_check()
+
 
 class TestWriteBackBatchingRustCore(_WriteBackBatchingSuite, CustomTestCase):
     tree_core_backend = "rust"

@@ -89,8 +89,9 @@ class PrefillBudget:
         self.total_offset = num_mixed_decode_tokens
         self.current_offset = num_mixed_decode_tokens
         self.swa_offset = 0
-        # Snapshotted once per round: admission only locks prefixes, which moves
-        # tokens out of the evictable count, so the snapshot never undercounts.
+        # Snapshotted once per round. Locking a prefix only moves tokens out of
+        # the evictable count; pinning a host match for load-back also removes
+        # write-back room, so that path refreshes it.
         self.full_unreclaimable = tree_cache.full_unreclaimable_size()
 
     def ceil_paged_tokens(self, tokens: int) -> int:
@@ -116,6 +117,13 @@ class PrefillBudget:
     def _full_evictable(self) -> int:
         """FULL evictable tokens eviction can actually free this round."""
         return max(0, self.tree_cache.full_evictable_size() - self.full_unreclaimable)
+
+    def refresh_full_unreclaimable(self) -> bool:
+        """Re-read the unreclaimable FULL tokens after admission pinned host
+        nodes the snapshot counted as write-back room; True if they grew."""
+        previous = self.full_unreclaimable
+        self.full_unreclaimable = self.tree_cache.full_unreclaimable_size()
+        return self.full_unreclaimable > previous
 
     def _available_and_evictable(self):
         evictable = (

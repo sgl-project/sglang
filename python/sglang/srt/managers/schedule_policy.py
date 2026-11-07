@@ -1497,6 +1497,25 @@ class PrefillAdder:
                     if isinstance(self.tree_cache, UnifiedRadixCache)
                     else nullcontext()
                 ):
+                    # The pinned host match may be room the round's write-back
+                    # snapshot credited to evicting unbacked device KV.
+                    if self.memory_budget.refresh_full_unreclaimable():
+                        admission = self._select_prefill_admission(
+                            req,
+                            total_tokens=total_tokens,
+                            state_slots=state_slots,
+                            host_hit_length=req.host_hit_length,
+                            swa_host_hit_length=req.swa_host_hit_length,
+                            truncation_align_size=truncation_align_size,
+                            has_chunked_req=has_chunked_req,
+                        )
+                        if isinstance(admission, AddReqResult):
+                            if admission is AddReqResult.NO_TOKEN:
+                                self._defer_staged_for_capacity_if_idle(
+                                    req, pool="prefill_budget"
+                                )
+                            return admission
+                        load_max_new = min(max_new, admission.max_new_tokens)
                     full_load_tokens = req.host_hit_length
                     if (
                         self.memory_budget.load_back_needs_full_tokens
@@ -1547,6 +1566,8 @@ class PrefillAdder:
                         )
                 if loaded is None:
                     return AddReqResult.OTHER
+                # The load keeps its host span pinned until H2D completes.
+                self.memory_budget.refresh_full_unreclaimable()
                 req.host_loaded_length, req.last_node = loaded
                 state_slots = self._state_slots_for_req(req)
                 if 0 < req.host_loaded_length < promised_host_hit:
