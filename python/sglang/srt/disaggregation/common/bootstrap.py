@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 BootstrapNotification = tuple[tuple[str, int], bool] | None
@@ -90,6 +91,18 @@ class DeferredBootstrap:
                 return None
             state.failed = True
             return self._notification(state)
+
+    def live_rooms_bound_to(
+        self, is_lost: Callable[[tuple[str, int]], bool]
+    ) -> list[tuple[int, tuple[str, int]]]:
+        with self.lock:
+            return [
+                (room, state.endpoint)
+                for room, state in self.rooms.items()
+                if state.endpoint is not None
+                and not state.failed
+                and is_lost(state.endpoint)
+            ]
 
     def close(
         self, room: int, owner: object, *, success: bool = False
