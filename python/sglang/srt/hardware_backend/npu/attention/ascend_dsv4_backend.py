@@ -113,38 +113,19 @@ def _ensure_dsv41_static_verify_mode() -> None:
 
 @functools.cache
 def _ds41_ops():
-    """The V4.1 operator entry points, called directly.
-
-    Seven operators are plain functions of the vendor DSL operator wheel
-    (import name ``ops``) and are invoked directly, skipping the vendor
-    torch.library wrapper: ``compressor``,
-    ``indexer_prologue_k``, ``quant_lightning_indexer(_metadata)``,
-    ``quant_sparse_lightning_indexer(_metadata)`` and
-    ``mixed_quant_sparse_flash_mla(_metadata)``. Their keyword names are the
-    ``samples`` sources' parameters, which differ from the torch-op schemas.
-
-    ``mixed_quant_sparse_flash_mla`` is the caller-allocated ABI: the caller
-    passes ``out``/``lse`` tensors. ``compressor`` is the one exception that is
-    NOT a DSL sample (it is an AOT AscendC extension in the vendor ops repo), so
-    it goes through the registered ``torch.ops`` ds41
-    namespace -- importing this module is also what registers it. Call this
-    once during backend init, before any ``torch.ops`` use.
-    """
+    """Resolve seven migrated DSL functions and the existing AscendC compressor."""
     from types import SimpleNamespace
 
     import cann_ops_transformer.ops.ds41  # noqa: F401 - registers torch.ops ds41
-    import ops
-    from ops.indexer_prologue_k import indexer_prologue_k
-    from ops.mixed_quant_sparse_flash_mla import (
+    from sgl_kernel_npu.operators.attention import (
         mixed_quant_sparse_flash_mla,
         mixed_quant_sparse_flash_mla_metadata,
     )
-    from ops.quant_lightning_indexer_dsl import quant_lightning_indexer
-    from ops.quant_lightning_indexer_metadata_dsl import (
+    from sgl_kernel_npu.operators.indexer import (
+        indexer_prologue_k,
+        quant_lightning_indexer,
         quant_lightning_indexer_metadata,
-    )
-    from ops.quant_sparse_lightning_indexer_dsl import quant_sparse_lightning_indexer
-    from ops.quant_sparse_lightning_indexer_metadata_dsl import (
+        quant_sparse_lightning_indexer,
         quant_sparse_lightning_indexer_metadata,
     )
 
@@ -2179,7 +2160,7 @@ class LowRatioCompressAscendBackendMixin:
 
         if self._dsv41_has_candidate_consumers():
             # Only the record count matters for the probe; replay rewrites it.
-            visible_blocks = torch.ones((bs, 1), dtype=torch.int32, device=device)
+            visible_blocks = torch.ones((t, 1), dtype=torch.int32, device=device)
             probe = ds41.quant_sparse_lightning_indexer_metadata(
                 candidate_block_length=visible_blocks,
                 cu_seqlens_q=cu_seqlens_q,

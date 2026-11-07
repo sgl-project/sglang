@@ -231,19 +231,6 @@ def init_npu_backend():
             e,
         )
 
-    try:
-        # Vendor DSL operator wheel (import name ``ops``): the DeepSeek-V4.1
-        # attention/indexer operators sglang calls directly. Absent for
-        # DSV4-only deployments; a missing package surfaces as an ImportError
-        # from the first _ds41_ops() call.
-        import ops  # noqa: F401
-    except ImportError as e:
-        logger.warning(
-            "Vendor DSv4.1 DSL operator wheel (ops) unavailable; DeepSeek-V4.1 "
-            "NPU DSL operators will not load: %s",
-            e,
-        )
-
     import torch_npu
 
     # These imports lead to unpredictable behavior in diffusion models
