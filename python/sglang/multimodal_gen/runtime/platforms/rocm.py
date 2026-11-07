@@ -392,14 +392,9 @@ class RocmPlatform(Platform):
                 .unfold(1, kt, stride_t)
                 .permute(0, 1, 2, 3, 5, 4)
             )
-            unfolded = unfolded.view(N * T_out, H, W, kt * C_in).permute(0, 3, 1, 2)
-            w = weight_2d.to(compute_dtype)
-            b = bias.to(compute_dtype) if bias is not None else None
-            out = F.conv2d(unfolded, w, b, stride=(stride_h, stride_w))
-            if out.dtype != orig_dtype:
-                out = out.to(orig_dtype)
-            _, _, H_out, W_out = out.shape
-            return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
+            return RocmPlatform._conv2d_on_unfolded_nhwc(
+                unfolded, weight_2d, bias, stride, orig_dtype
+            )
 
         # (N, C_in, T, H, W) -> (N, T_out, Kt, C_in, H, W) -> (N*T_out, Kt*C_in, H, W)
         unfolded = x_padded.unfold(2, kt, stride_t)
@@ -424,6 +419,28 @@ class RocmPlatform(Platform):
         return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
 
     @staticmethod
+    def _conv2d_on_unfolded_nhwc(
+        unfolded: torch.Tensor,
+        weight_2d: torch.Tensor,
+        bias: torch.Tensor | None,
+        stride: tuple[int, ...],
+        orig_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Conv2D over ``unfolded`` ``[N, T_out, H, W, Kt, C_in]`` (NHWC frames),
+        folded back to a ``channels_last_3d`` ``[N, C_out, T_out, H_out, W_out]``."""
+        N, T_out, H, W, kt, C_in = unfolded.shape
+        C_out = weight_2d.shape[0]
+        compute_dtype = unfolded.dtype
+        frames = unfolded.view(N * T_out, H, W, kt * C_in).permute(0, 3, 1, 2)
+        w = weight_2d.to(compute_dtype)
+        b = bias.to(compute_dtype) if bias is not None else None
+        out = F.conv2d(frames, w, b, stride=tuple(stride[1:]))
+        if out.dtype != orig_dtype:
+            out = out.to(orig_dtype)
+        _, _, H_out, W_out = out.shape
+        return out.reshape(N, T_out, C_out, H_out, W_out).permute(0, 2, 1, 3, 4)
+
+    @staticmethod
     def _replace_conv3d_with_conv2d(
         module: torch.nn.Module, use_bf16: bool = False
     ) -> int:
@@ -443,6 +460,8 @@ class RocmPlatform(Platform):
         decomposition is installed as the inner ``_halo_conv_forward`` kernel
         instead, leaving the halo exchange and output trim intact.
         """
+        from sglang.kernels.ops.diffusion import causal_unfold_nhwc
+
         patched = 0
         patched_halo = 0
         skipped = 0
@@ -502,6 +521,29 @@ class RocmPlatform(Platform):
                 _kt=kt,
                 _bf16=use_bf16,
             ):
+                if (
+                    _bf16
+                    and x.dtype == self.weight.dtype
+                    and self._weight_2d.is_contiguous(memory_format=torch.channels_last)
+                ):
+                    # Same tensor the cat/pad/unfold/copy_ chain below builds, in one pass.
+                    unfolded = causal_unfold_nhwc(
+                        x,
+                        cache_x if _padding[4] > 0 else None,
+                        _padding,
+                        _kt,
+                        _stride[0],
+                        torch.bfloat16,
+                    )
+                    if unfolded is not None:
+                        out = RocmPlatform._conv2d_on_unfolded_nhwc(
+                            unfolded,
+                            self._weight_2d,
+                            None if skip_bias else self.bias,
+                            _stride,
+                            x.dtype,
+                        )
+                        return out if residual is None else out + residual
                 pad = list(_padding)
                 if cache_x is not None and _padding[4] > 0:
                     cache_x = cache_x.to(x.device)
