@@ -29,10 +29,6 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     MmItemMemoryPool,
     _pool_handle_cache_clear,
 )
-from sglang.srt.multimodal.transport.memory_pool import (
-    stream_wait_value32,
-    stream_write_value32,
-)
 from sglang.srt.multimodal.transport.publisher import BoundedFeaturePublisher
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -122,8 +118,8 @@ class TestCudaIpcTransport(CustomTestCase):
         )
         source_ref = weakref.ref(source)
         expected = source.cpu()
-        gate = torch.zeros(1, device="cuda", dtype=torch.int32)
-        copy_stream, release_stream = torch.cuda.Stream(), torch.cuda.Stream()
+        copy_stream = torch.cuda.Stream()
+        delay_done = torch.cuda.Event()
         torch.cuda.synchronize()
         leases = pool.try_reserve_batch([source.numel() * source.element_size()])
         published = threading.Event()
@@ -132,7 +128,9 @@ class TestCudaIpcTransport(CustomTestCase):
         def publish(tensor):
             try:
                 with torch.cuda.stream(copy_stream):
-                    stream_wait_value32(0, gate.data_ptr(), 1, "test")
+                    # finite device work avoids a test-induced circular CUDA wait
+                    torch.cuda._sleep(500_000_000)
+                    delay_done.record()
                     proxies.extend(pool.publish_reserved_batch([[tensor]], leases))
             except BaseException as error:
                 failures.append(error)
@@ -150,13 +148,13 @@ class TestCudaIpcTransport(CustomTestCase):
                 worker.join(5)
                 self.assertFalse(worker.is_alive())
                 self.assertEqual(failures, [])
+                self.assertFalse(
+                    delay_done.query(), "publication waited for device work"
+                )
                 self.assertIsNotNone(
                     source_ref(), "source was released before its copy"
                 )
             finally:
-                # release on another stream even if old code blocks publication
-                with torch.cuda.stream(release_stream):
-                    stream_write_value32(0, gate.data_ptr(), 1, "test")
                 worker.join(10)
                 copy_stream.synchronize()
             lease = leases[0]
