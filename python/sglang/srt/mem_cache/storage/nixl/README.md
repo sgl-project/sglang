@@ -56,6 +56,8 @@ The current implementation performs per-transfer registration for file / object 
 ### L3 Cleaner (`nixl_cleaner.py`)
 For FILE-backed plugins, TP rank 0 starts a best-effort background cleaner that scans the bucketed storage directories and deletes the oldest logical cache-key groups when disk usage exceeds the configured high watermark. Deleted files are handled by the cache layer as ordinary storage misses and can be recomputed.
 
+By default, disk usage is the fill level of the whole filesystem containing a storage directory. On a volume shared with other data, set `l3_cleaner_capacity_gb` so the watermarks apply to the total size of the cache's own files under the storage directories instead; otherwise data outside the cache can keep the filesystem above the high watermark and the cleaner deletes the cache on every cycle.
+
 Set the top-level `l3_cleaner_enabled` config key to `false` when an external cleaner is responsible for L3 cache eviction.
 
 ## Using NIXL as the HiCache Storage Backend
@@ -447,6 +449,7 @@ The following keys are placed at the **top level** of the config file (not insid
 | `l3_cleaner_enabled` | boolean | `true` | Enable the built-in background cleaner for FILE-backed L3 storage. Set to `false` when using an external cleaner. |
 | `l3_cleaner_high_watermark` | float | `80.0` | Start cleanup when the built-in cleaner is enabled and the filesystem containing a configured storage directory reaches this disk-usage percentage. |
 | `l3_cleaner_low_watermark` | float | `70.0` | Stop cleanup after hot filesystems drop below this disk-usage percentage. Must be lower than `l3_cleaner_high_watermark`. |
+| `l3_cleaner_capacity_gb` | float | unset | Capacity budget in GiB for the cache's own files. When set, the watermarks apply to the total size of the NIXL FILE objects under all configured storage directories as a percentage of this budget, instead of to filesystem usage. Use this on shared volumes. |
 
 **Page-alignment and `O_DIRECT`**
 
@@ -473,6 +476,16 @@ To tune FILE-backend cleanup watermarks:
 l3_cleaner_enabled = true
 l3_cleaner_high_watermark = 85.0
 l3_cleaner_low_watermark = 75.0
+
+[plugin.posix]
+use_uring = "true"
+active = true
+```
+
+To bound the cache to its own budget on a shared volume (cleanup starts at 80% of 2048 GiB of cache files and stops below 70%):
+
+```toml
+l3_cleaner_capacity_gb = 2048
 
 [plugin.posix]
 use_uring = "true"
