@@ -15,6 +15,9 @@ import unittest
 from collections import deque
 from contextlib import nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -26,8 +29,12 @@ from sglang.test.test_utils import (
 maybe_stub_sgl_kernel()
 
 from sglang.srt.environ import envs  # noqa: E402
-from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin  # noqa: E402
+from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    PPBatchMetadata,
+    SchedulerPPMixin,
+)
 from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -82,6 +89,128 @@ def _posted_output_ops(pp_rank, spec_relay, send_msg, recv_msg, **server_args):
 
 
 class TestPPOutputExchangeOrder(CustomTestCase):
+    def test_decode_sends_current_activation_before_waiting_for_cpu_results(self):
+        # Stop the real loop at the next slot's D2H wait: the downstream
+        # stage must already have the current activation and control messages.
+        batch = SimpleNamespace(forward_mode=ForwardMode.DECODE)
+        scheduler = MagicMock(spec=SchedulerPPMixin)
+        scheduler.pp_loop_size = 2
+        scheduler.pp_group = SimpleNamespace(is_last_rank=False)
+        scheduler.mbs = [None, batch]
+        scheduler.running_mbs = [batch, batch]
+        scheduler.last_mbs = [None, None]
+        scheduler.mb_metadata = [None, None]
+        scheduler.last_rank_comm_queue = deque()
+        scheduler.send_req_work = []
+        scheduler.increment_scheduler_iterations = MagicMock()
+        scheduler.ingest_requests = MagicMock(return_value=["request"])
+        scheduler.get_next_disagg_decode_batch_to_run = MagicMock(
+            return_value=SimpleNamespace(running_batch=batch, batch_to_run=batch)
+        )
+        scheduler._pp_pd_get_retract_ids.return_value = ["retract"]
+        scheduler._pp_pd_get_prealloc_ids.return_value = [["prealloc"], []]
+        scheduler._pp_pd_get_decode_transferred_ids.return_value = {"transfer": False}
+        result = object()
+        scheduler._pp_launch_batch.return_value = (result, None)
+        done = MagicMock()
+        done.synchronize.side_effect = EOFError("next-slot D2H wait")
+        scheduler._pp_commit_send_output_work_and_preprocess_output_tensors.return_value = (
+            None,
+            None,
+            done,
+        )
+        scheduler._pp_pd_send_consensus_bootstrapped_ids.return_value = ([], None)
+        scheduler._pp_pd_send_consensus_release_ids.return_value = ([], None)
+        sent = []
+        scheduler._pp_send_pyobj_to_next_stage.side_effect = lambda data, **kwargs: (
+            sent.append(data) or []
+        )
+        scheduler._pp_send_proxy_to_next_stage.side_effect = sent.append
+
+        with (
+            published_topology(role="scheduler", pp_size=2, pp_async_batch_depth=0),
+            self.assertRaisesRegex(EOFError, "next-slot D2H wait"),
+        ):
+            SchedulerPPMixin.event_loop_pp_disagg_decode(scheduler)
+
+        self.assertEqual(
+            sent,
+            [
+                ["request"],
+                ["retract"],
+                [["prealloc"], []],
+                {"transfer": False},
+                result,
+            ],
+        )
+        scheduler._pp_commit_proxy_send_work.assert_called_once_with()
+        scheduler._pp_process_batch_result.assert_not_called()
+
+    def test_decode_readback_preserves_device_relay_and_future_tokens(self):
+        # Exercise real result preparation and copy_to_cpu. Only transport,
+        # stream/event and copy primitives are replaced in this CPU regression.
+        for mode, spec, should_copy in (
+            (ForwardMode.DECODE, SpeculativeAlgorithm.NONE, True),
+            (ForwardMode.EXTEND, SpeculativeAlgorithm.NONE, False),
+            (ForwardMode.DECODE, SpeculativeAlgorithm.EAGLE, False),
+        ):
+            with self.subTest(mode=mode, spec=spec):
+                tokens = torch.tensor([7, 11], dtype=torch.int64)
+                scheduler = SchedulerPPMixin()
+                scheduler.pp_group = SimpleNamespace(is_first_rank=False)
+                scheduler.launch_event = None
+                scheduler.schedule_stream = None
+                scheduler.copy_stream = MagicMock()
+                scheduler.copy_stream_ctx = nullcontext()
+                scheduler.device_module = MagicMock()
+                scheduler.future_map = MagicMock()
+                recv_done = object()
+                scheduler._pp_recv_dict_from_prev_stage = lambda: (
+                    {"next_token_ids": tokens},
+                    recv_done,
+                )
+                scheduler._pp_send_output_to_next_stage = lambda *args: []
+                batch = SimpleNamespace(
+                    forward_mode=mode,
+                    spec_algorithm=spec,
+                    return_logprob=False,
+                    reqs=[object(), object()],
+                    req_pool_indices=torch.tensor([0, 1]),
+                )
+                with (
+                    published_topology(
+                        role="scheduler", ranks={"world_rank": 1}, pp_size=2
+                    ),
+                    patch(
+                        "sglang.srt.managers.utils._async_d2h",
+                        side_effect=lambda tensor: tensor.clone(),
+                    ) as copy,
+                ):
+                    relay, result, done, _ = (
+                        scheduler._pp_send_recv_and_preprocess_output_tensors(
+                            0,
+                            1,
+                            [None, batch],
+                            [None, PPBatchMetadata(True)],
+                            deque(),
+                            None,
+                        )
+                    )
+
+                self.assertEqual(copy.call_count, int(should_copy))
+                self.assertEqual(result.next_token_ids.tolist(), [7, 11])
+                self.assertIs(result.copy_done, done if should_copy else None)
+                self.assertIs(relay["next_token_ids"], tokens)
+                self.assertIs(
+                    scheduler.future_map.stash.call_args.args[1].bonus_tokens, tokens
+                )
+                scheduler.copy_stream.wait_event.assert_called_once_with(recv_done)
+                if should_copy:
+                    self.assertIsNot(result.next_token_ids, tokens)
+                    done.record.assert_called_once_with()
+                else:
+                    self.assertIs(result.next_token_ids, tokens)
+
     def test_two_in_flight_output_exchange_does_not_cross_deadlock(self):
         for spec_relay in (False, True):
             with self.subTest(spec_relay=spec_relay):
