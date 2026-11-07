@@ -27,12 +27,13 @@ jobs:
             const modelName = new RegExp([
               String.raw`\bbeam[ _-]?v?\d+[._]\d+`,
               String.raw`\breflection(?:[\s_/-]*ai)?[\s_/-]*beam\b`,
+              String.raw`\bbeam\s*\(\s*reflection\b`,
               String.raw`\bBeam(?:ForCausalLM|Config|Model|DecoderLayer|MoE|Detector|ReasoningDetector|ToolAdapter)\b`,
             ].join('|'), 'i');
             // These hints also fit beam search wording, so they need a title without it.
             const modelHints = [
               /^(?:(?:Revert|Reapply) ")*(?:\[[^\]]*\]\s*)*(?:[\w.-]+\/)*beam(?:\/[\w.-]+)*\s*:/i,
-              /\[beam\]/i,
+              /\[`?beam`?\]/i,
               /\bBeam-\d/,
               /\bbeam\s+(?:models?|images?|docker|checkpoints?|cookbook|recipes?|serving|deployment|reasoning|parsers?|tool[\s_-]?(?:calls?|parsers?)|lora|moe|bf16|fp8|nvfp4)\b/i,
               /\b(?:for|in|of|on|to|with)\s+(?:the\s+)?Beam\b/,
