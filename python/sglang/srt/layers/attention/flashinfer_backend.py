@@ -15,7 +15,6 @@ Each backend supports two operators: extend (i.e. prefill with cached prefix) an
 """
 
 import logging
-import os
 from dataclasses import dataclass
 from enum import Enum, auto
 from functools import partial
@@ -42,6 +41,7 @@ from sglang.srt.layers.cp.base import (
     get_cp_strategy,
 )
 from sglang.srt.layers.cp.utils import is_cp_active
+from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -72,12 +72,7 @@ from sglang.srt.speculative.spec_utils import (
     fill_draft_window_rail,
     resolve_draft_decode_window,
 )
-from sglang.srt.utils import (
-    get_cuda_graph_max_batch_size,
-    get_int_env_var,
-    is_flashinfer_available,
-    next_power_of_2,
-)
+from sglang.srt.utils import get_int_env_var, is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -312,6 +307,10 @@ def fast_prefill_plan(
     )
     self._cached_o_data_type = o_data_type
     self._block_tables = None
+    # FlashInfer's plan() clears this on every call and may set it again for its
+    # SM90 fp8-KV verify kernel. This plan never takes that route, so clear it
+    # here too rather than let run() launch it with a previous plan's state.
+    self._eagle_verify_fp8kv_sm90_state = None
 
     args = [
         self._float_workspace_buffer,
@@ -334,6 +333,7 @@ def fast_prefill_plan(
         False,  # disable_split_kv
         0,  # num_colocated_ctas
         0,  # uniform_q_len
+        False,  # fixed_uniform_q_len
     ]
     self._plan_info = self._cached_module.plan(*args)
 
@@ -2975,10 +2975,9 @@ def should_use_tensor_core(
     Returns:
         bool: Whether to use tensor cores
     """
-    # Try to use environment variable first
-    env_override = os.environ.get("SGLANG_FLASHINFER_USE_TENSOR_CORE")
-    if env_override is not None:
-        return env_override.lower() == "true"
+    forced = envs.SGLANG_FLASHINFER_USE_TENSOR_CORE.get()
+    if forced is not None:
+        return forced
 
     # Try to use _grouped_size_compiled_for_decode_kernels if available
     # This is for flashinfer <=0.1.6. Otherwise, there is an accuracy bug
