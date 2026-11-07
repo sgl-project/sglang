@@ -774,6 +774,31 @@ pub struct MmData {
     pub prefetched: Vec<bytes::Bytes>,
     /// See [`GenerateBody::mm_hashes`]; applied by the MM worker.
     pub mm_hashes: Vec<String>,
+    /// How admission handled the media, for the processor's own timing.
+    pub admission: MediaAdmission,
+}
+
+/// How admission handled one request's media before the MM processor runs:
+/// the media prefetch, and the hand-off to the MM worker pool.
+#[derive(Clone, Debug, Default)]
+pub struct MediaAdmission {
+    /// Wall time `core::prefetch` spent resolving the request's I/O-backed
+    /// sources; zero when it had none.
+    pub prefetch: std::time::Duration,
+    /// The sources the processor resolved itself
+    /// ([`crate::MmProcessor::fetch_media`]), in `payload::io_sources` order.
+    pub processor_fetches: Vec<ProcessorFetch>,
+    /// When the request was queued for the MM worker pool.
+    pub queued_at: Option<std::time::Instant>,
+}
+
+/// One source the processor fetched: when its `fetch_media` call started,
+/// how long it took, and the bytes it returned.
+#[derive(Clone, Copy, Debug)]
+pub struct ProcessorFetch {
+    pub started: std::time::Instant,
+    pub elapsed: std::time::Duration,
+    pub bytes: usize,
 }
 
 impl GenerateRequest {
