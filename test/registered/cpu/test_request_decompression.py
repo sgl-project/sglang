@@ -99,6 +99,44 @@ class TestRequestDecompressionMiddleware(CustomTestCase):
         seen, _ = _drive(scope, [(COMPRESSED[:half], True), (COMPRESSED[half:], False)])
         self.assertEqual(seen["body"], PAYLOAD)
 
+    def test_many_small_chunks_reassembled(self):
+        scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
+        pieces = [COMPRESSED[i : i + 1] for i in range(len(COMPRESSED))]
+        chunks = [(piece, True) for piece in pieces[:-1]] + [(pieces[-1], False)]
+        seen, sent = _drive(scope, chunks)
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(sent, [])
+
+    def test_empty_chunks_are_ignored(self):
+        half = len(COMPRESSED) // 2
+        scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
+        chunks = [
+            (b"", True),
+            (COMPRESSED[:half], True),
+            (b"", True),
+            (COMPRESSED[half:], True),
+            (b"", False),
+        ]
+        seen, _ = _drive(scope, chunks)
+        self.assertEqual(seen["body"], PAYLOAD)
+
+    def test_body_chunks_are_not_concatenated_pairwise(self):
+        # `buffer += chunk` recopies the whole buffer per chunk (quadratic in
+        # the number of chunks); a bytes subclass makes that path observable.
+        class NoConcat(bytes):
+            def __radd__(self, other):
+                raise AssertionError("body chunks must be joined once, not appended")
+
+        half = len(COMPRESSED) // 2
+        scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
+        chunks = [
+            (NoConcat(COMPRESSED[:half]), True),
+            (NoConcat(COMPRESSED[half:]), False),
+        ]
+        seen, sent = _drive(scope, chunks)
+        self.assertEqual(seen["body"], PAYLOAD)
+        self.assertEqual(sent, [])
+
     def test_bad_body_returns_400(self):
         scope = {"type": "http", "headers": [(b"x-body-compressed", b"zstd")]}
         seen, sent = _drive(scope, [(b"not-zstd-data", False)])

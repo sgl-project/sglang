@@ -58,15 +58,17 @@ class RequestDecompressionMiddleware:
             )(scope, receive, send)
 
         # Collect request body.
-        body = b""
+        # Join once at the end: repeated `bytes +=` recopies the whole buffer per chunk.
+        chunks = []
         more_body = True
         while more_body:
             message = await receive()
             # Incomplete body (e.g. client disconnect); hand off to later stages.
             if message["type"] != "http.request":
                 return await self.app(scope, receive, send)
-            body += message.get("body", b"")
+            chunks.append(message.get("body", b""))
             more_body = message.get("more_body", False)
+        body = b"".join(chunks)
 
         # Decompress off the event loop by releasing the GIL around the C decompress.
         try:
