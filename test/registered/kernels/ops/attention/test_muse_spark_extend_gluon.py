@@ -2,7 +2,7 @@
 and dequantized paged cache: requests with and without a cached prefix, query lengths and contexts off the 16-token
 query block and 128-key tile grids (partial blocks, diagonal and tail tiles), 2 and 4 KV heads (TP8 / TP4), 16- and
 128-token pages, and the 2047-token sliding window (NaN codes in the keys before each window); full layers also on the FlyDSL
-kernel."""
+kernel. One compiled Gluon variant per window, whatever the request count and page-table width."""
 
 import pytest
 import torch
@@ -128,3 +128,42 @@ def test_sliding_window_extend(kv_heads, page):
         lo, hi = cu[i].item(), cu[i + 1].item()
         err = (out[lo:hi].float() - ref[lo:hi]).norm() / ref[lo:hi].norm()
         assert err < 0.04, (i, err.item())
+
+
+def test_batch_shape_does_not_recompile(monkeypatch):
+    """The request count and the page-table width change with every batch; a variant per (== 1, multiple of 16)
+    class of either would compile on one rank mid-serving while the others wait in a collective."""
+    import triton.knobs as knobs
+
+    if not hasattr(getattr(knobs, "compilation", None), "listener"):
+        pytest.skip("triton.knobs.compilation.listener is not available")
+    from sglang.kernels.ops.attention.muse_extend_gluon import muse_extend_attention
+
+    compiled = []
+    prev = knobs.compilation.listener
+
+    def listener(*, src, **kwargs):
+        if src.name == "_muse_extend_kernel":
+            compiled.append(src.name)
+        if prev is not None:
+            prev(src=src, **kwargs)
+
+    monkeypatch.setattr(knobs.compilation, "listener", listener)
+    # 1 / 16 / 3 requests, each with a 16-page and a 17-page table (page 16)
+    batches = [
+        [(256, 0)],
+        [(257, 0)],
+        [(241 + i, 0) for i in range(16)],
+        [(250 + i, 0) for i in range(16)],
+        [(256, 0), (10, 0), (20, 0)],
+        [(257, 0), (10, 0), (20, 0)],
+    ]
+    for window in (0, 2047):
+        for new_ctx in batches:
+            q8, kc, vc, cu, lens, table, qd, kd, vd = _inputs(new_ctx, 2)
+            out = torch.empty(q8.shape, device="cuda", dtype=torch.bfloat16)
+            muse_extend_attention(
+                q8, kc, vc, out, cu, lens, table, qd, kd, vd, SCALE, window=window
+            )
+    torch.cuda.synchronize()
+    assert len(compiled) <= 2, compiled

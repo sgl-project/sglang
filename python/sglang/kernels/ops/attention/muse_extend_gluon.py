@@ -221,7 +221,7 @@ def _step(
     return pg, pg_v, m_new, l_i, acc
 
 
-@gluon.jit
+@gluon.jit(do_not_specialize=["num_seqs", "bt_stride"])
 def _muse_extend_kernel(
     OUT,
     Q,
