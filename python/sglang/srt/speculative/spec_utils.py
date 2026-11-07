@@ -936,10 +936,25 @@ def draft_tp_context(layout: DraftParallelLayout):
     """Enter an already-resolved draft placement from outside any draft scope."""
     if layout.tp_group is None:
         return contextlib.nullcontext()
-    tp_context = patch_tensor_parallel_group(layout.tp_group, owns_attention=True)
+    tp_context = _draft_tp_scope(layout.tp_group)
     if layout.disable_cp:
         return _draft_without_cp(tp_context)
     return tp_context
+
+
+@contextmanager
+def _draft_tp_scope(tp_group):
+    from sglang.srt.model_executor.runner.flashinfer_autotune import (
+        draft_autotune_sync_scope,
+    )
+
+    # The draft's autotune agrees across the stage, not just the narrowed group.
+    stage_tp_group = get_parallel().tp_group
+    with (
+        draft_autotune_sync_scope(stage_tp_group),
+        patch_tensor_parallel_group(tp_group, owns_attention=True),
+    ):
+        yield
 
 
 @contextmanager
