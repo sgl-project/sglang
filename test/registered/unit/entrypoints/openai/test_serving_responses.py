@@ -21,6 +21,7 @@ from utils import (
     MockTemplateManager,
     MockTokenizerManager,
     StreamFixture,
+    collect_stream_events,
     engine_chunk,
     event_payloads,
     make_serving,
@@ -2515,6 +2516,114 @@ def test_pd_tool_continuation_stops_before_side_effect(response_serving):
         asyncio.run(run())
     context.call_tool.assert_not_awaited()
     assert serving.tokenizer_manager.generate_request.call_count == 1
+
+
+class StreamingPrevalidationTestCase(CustomTestCase):
+    """/v1/responses must run tokenizer validation before the SSE stream
+    starts (issue #48557): an over-context streaming request returned HTTP
+    200 and then a single response.failed(server_error) event, while
+    chat/completions answered a clean 400 for the same input."""
+
+    @staticmethod
+    def _make_request(stream=True):
+        return ResponsesRequest(
+            model="x",
+            input="hello",
+            stream=stream,
+            request_id="resp_prevalidate",
+            store=False,
+        )
+
+    @staticmethod
+    def _rendered():
+        return MessageProcessingResult(
+            prompt="prompt",
+            prompt_ids=[1, 2, 3],
+            image_data=None,
+            audio_data=None,
+            video_data=None,
+            modalities=[],
+            stop=[],
+        )
+
+    def test_stream_validation_error_returns_http_400_before_stream(self):
+        serving = make_serving()
+
+        async def failing_generate(*args, **kwargs):
+            raise ValueError(
+                "Requested token count exceeds the model's maximum context "
+                "length of 262144 tokens."
+            )
+            yield  # pragma: no cover -- makes this an async generator
+
+        serving._generate_with_builtin_tools = failing_generate
+        request = self._make_request(stream=True)
+        with patch.object(
+            serving,
+            "_process_messages",
+            return_value=self._rendered(),
+        ):
+            result = asyncio.run(serving.create_responses(request))
+        self.assertIsInstance(result, ORJSONResponse)
+        self.assertEqual(result.status_code, 400)
+        body = orjson.loads(result.body)
+        self.assertIn("maximum context length", body["error"]["message"])
+        self.assertEqual(body["error"]["type"], "invalid_request_error")
+
+    def test_non_stream_validation_error_stays_http_400(self):
+        serving = make_serving()
+
+        async def failing_generate(*args, **kwargs):
+            raise ValueError("Requested token count exceeds the limit")
+            yield  # pragma: no cover
+
+        serving._generate_with_builtin_tools = failing_generate
+        request = self._make_request(stream=False)
+        with patch.object(
+            serving,
+            "_process_messages",
+            return_value=self._rendered(),
+        ):
+            result = asyncio.run(serving.create_responses(request))
+        self.assertIsInstance(result, ORJSONResponse)
+        self.assertEqual(result.status_code, 400)
+
+    def test_stream_kick_start_does_not_swallow_first_result(self):
+        """The kick-start must prepend the first engine result back into the
+        stream instead of dropping it."""
+        serving = make_serving()
+
+        async def fake_generate(*args, **kwargs):
+            # One complete generation turn, like the real builtin-tool loop
+            # yields when no tool call is requested.
+            context = args[4]
+            context.append_output(
+                {
+                    "text": "alpha beta",
+                    "meta_info": {
+                        "prompt_tokens": 1,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                    },
+                }
+            )
+            yield context
+
+        serving._generate_with_builtin_tools = fake_generate
+        request = self._make_request(stream=True)
+        with patch.object(
+            serving,
+            "_process_messages",
+            return_value=self._rendered(),
+        ):
+            result = asyncio.run(serving.create_responses(request))
+        events = asyncio.run(collect_stream_events(result))
+        deltas = [
+            payload.get("delta", "")
+            for payload in event_payloads(events)
+            if payload.get("type") == "response.output_text.delta"
+        ]
+        self.assertEqual("".join(deltas), "alpha beta")
 
 
 if __name__ == "__main__":
