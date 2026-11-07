@@ -273,7 +273,6 @@ class AttentionBackend(ABC):
         self,
         forward_batch: ForwardBatch,
         *,
-        num_qo_tokens: int,
         build_snapshot: bool = True,
     ) -> SharedReadEnds:
         """Return this batch's prefill read end, building a snapshot when asked.
@@ -288,13 +287,11 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
         if build_snapshot:
-            return self._snapshot_prefill_shared_reads(
-                forward_batch, num_qo_tokens=num_qo_tokens
-            )
+            return self._snapshot_prefill_shared_reads(forward_batch)
         return self.shared_read_ends(forward_batch.forward_mode)
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         """Snapshot late shared reads; return PRE_REPLAY only if none remain.
 
