@@ -55,7 +55,9 @@ METASERVICE_CONFIG = {
 # DCMI v2, so device_sdma fails with "dram segment does not support sdma in
 # current environment" and every rank aborts the MemCache store init.
 # world_size is the prefill instance's tp_size*pp_size, and dram_size is the
-# per-rank DRAM contribution.
+# per-rank DRAM contribution. All 16 ranks live on the prefill node, so the
+# node must donate world_size * dram_size of host DRAM (16 x 4GB = 64GB here);
+# 10GB per rank exhausted the node during MemCache init.
 HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
     {
         "meta_service_url": METASERVICE_CONFIG["meta_service_url"],
@@ -63,7 +65,7 @@ HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
         "log_level": "info",
         "world_size": 16,
         "protocol": "device_rdma",
-        "dram_size": "10GB",
+        "dram_size": "4GB",
     }
 )
 
@@ -91,7 +93,6 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -121,6 +122,12 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ENVS = {
 # Decode node environment variables for DSV4-Flash-0731 PD-Sep deployment.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS,
+    # The DSPARK fast kernel is a CUDA JIT path; on NPU it tries to build the
+    # q_norm_rope module with nvcc and fails during decode graph capture
+    # ("Failed to build JIT module ... main_q_norm_rope"). Keep this decode
+    # scoped: the value in COMMON_ENVS is dropped when the PR is merged onto
+    # main, which silently re-enables the CUDA-only kernel.
+    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "HCCL_BUFFSIZE": "1200",
     "DEEPEP_NORMAL_LONG_SEQ_ROUND": "8",
     "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "2048",
@@ -279,46 +286,48 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
 ):
     """Test NPU accuracy for DeepSeek-V4-Flash W8A8 16p 1P1D GPQA."""
 
-    # @classmethod
-    # def setUpClass(cls):
-    #     # Follow the HiCache L3 wiki: inspect and clean host memory on the
-    #     # prefill node before starting MetaService and the model server.
-    #     if "prefill" in os.environ.get("HOSTNAME", ""):
-    #         commands = [
-    #             ("Host memory before cache cleanup", ["free", "-g"], False),
-    #             (
-    #                 "drop_caches execution result",
-    #                 "sync && echo 1 > /proc/sys/vm/drop_caches",
-    #                 True,
-    #             ),
-    #             ("Host memory after cache cleanup", ["free", "-g"], False),
-    #         ]
-    #         for description, command, use_shell in commands:
-    #             result = subprocess.run(
-    #                 command,
-    #                 shell=use_shell,
-    #                 executable="/bin/bash" if use_shell else None,
-    #                 capture_output=True,
-    #                 text=True,
-    #             )
-    #             logger.info(
-    #                 "%s: command=%r, returncode=%d\nstdout:\n%s\nstderr:\n%s",
-    #                 description,
-    #                 command,
-    #                 result.returncode,
-    #                 result.stdout,
-    #                 result.stderr,
-    #             )
-    #             if result.returncode != 0:
-    #                 # Best-effort host maintenance, not a test assertion: raising
-    #                 # here makes the prefill pod exit early and the multi-node
-    #                 # harness then reports a misleading "pod is not running".
-    #                 logger.warning(
-    #                     "%s failed with returncode %d; continuing without it",
-    #                     description,
-    #                     result.returncode,
-    #                 )
-    #     super().setUpClass()
+    @classmethod
+    def setUpClass(cls):
+        # Follow the HiCache L3 wiki: inspect and clean host memory on the
+        # prefill node before starting MetaService and the model server.
+        # Page cache from loading the model weights otherwise leaves too little
+        # DRAM for the MemCache pool (halMemAlloc fails with ENOMEM).
+        if "prefill" in os.environ.get("HOSTNAME", ""):
+            commands = [
+                ("Host memory before cache cleanup", ["free", "-g"], False),
+                (
+                    "drop_caches execution result",
+                    "sync && echo 1 > /proc/sys/vm/drop_caches",
+                    True,
+                ),
+                ("Host memory after cache cleanup", ["free", "-g"], False),
+            ]
+            for description, command, use_shell in commands:
+                result = subprocess.run(
+                    command,
+                    shell=use_shell,
+                    executable="/bin/bash" if use_shell else None,
+                    capture_output=True,
+                    text=True,
+                )
+                logger.info(
+                    "%s: command=%r, returncode=%d\nstdout:\n%s\nstderr:\n%s",
+                    description,
+                    command,
+                    result.returncode,
+                    result.stdout,
+                    result.stderr,
+                )
+                if result.returncode != 0:
+                    # Best-effort host maintenance, not a test assertion: raising
+                    # here makes the prefill pod exit early and the multi-node
+                    # harness then reports a misleading "pod is not running".
+                    logger.warning(
+                        "%s failed with returncode %d; continuing without it",
+                        description,
+                        result.returncode,
+                    )
+        super().setUpClass()
 
     model_config = DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_MODEL_CONFIG
     # Start the npu_memcache MetaService on the prefill node before the model
