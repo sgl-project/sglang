@@ -23,6 +23,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.models.fast_dvlm import _flatten_weight_name
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -218,6 +219,21 @@ class TestHierarchyBlockRun(unittest.TestCase):
         _, next_ids, _, states, _ = _algorithm().run(runner, batch, [])
 
         self.assertEqual((next_ids, states), ([], []))
+
+
+class TestFastDVLMWeightNames(unittest.TestCase):
+    def test_nested_checkpoint_names_map_to_qwen2_5_vl_params(self):
+        """The Fast-dVLM release nests weights under model.language_model. and
+        model.visual.; Qwen2.5-VL's loader keys on the flat names."""
+        cases = {
+            "model.language_model.layers.0.mlp.gate_proj.weight": "model.layers.0.mlp.gate_proj.weight",
+            "model.language_model.embed_tokens.weight": "model.embed_tokens.weight",
+            "model.visual.blocks.0.attn.qkv.weight": "visual.blocks.0.attn.qkv.weight",
+            "lm_head.weight": "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight": "model.layers.0.self_attn.q_proj.weight",
+        }
+        for name, expected in cases.items():
+            self.assertEqual(_flatten_weight_name(name), expected)
 
 
 class TestHierarchyBlockLaunch(unittest.TestCase):

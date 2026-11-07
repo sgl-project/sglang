@@ -5,8 +5,9 @@ diffusion step and a switch between bidirectional attention inside the block
 being denoised and causal attention for the forward that writes its final KV.
 """
 
-from typing import Optional, Tuple
+from typing import Iterable, Optional, Tuple
 
+import torch
 from transformers.models.qwen2_5_vl.configuration_qwen2_5_vl import (
     Qwen2_5_VLConfig,
 )
@@ -42,6 +43,21 @@ class Fast_dVLMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
         attn_type = AttentionType.DECODER if causal else AttentionType.ENCODER_ONLY
         for layer in self._block_attention_layers:
             layer.attn_type = attn_type
+
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        return super().load_weights(
+            (_flatten_weight_name(name), tensor) for name, tensor in weights
+        )
+
+
+def _flatten_weight_name(name: str) -> str:
+    # The release is saved in the transformers >= 4.52 layout, which nests the
+    # language model and vision tower under "model."; Qwen2.5-VL loads flat names.
+    if name.startswith("model.language_model."):
+        return "model." + name[len("model.language_model.") :]
+    if name.startswith("model.visual."):
+        return name[len("model.") :]
+    return name
 
 
 EntryClass = [Fast_dVLMForConditionalGeneration]
