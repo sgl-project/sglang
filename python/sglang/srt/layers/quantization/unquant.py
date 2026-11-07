@@ -33,6 +33,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.utils import copy_or_rebind_param
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_lora,
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -137,187 +137,63 @@ _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
 _hopper_bf16_tiny_gemv = None
 _use_hopper_bf16_tiny_gemv = None
-_splitk_tactic = None
-_run_splitk_dense = None
-_direct_default_tactic = None
-_prefer_direct = None
-_run_direct_dense = None
 _warp_splitk_tactic = None
 _run_warp_splitk_dense = None
-_enable_bf16_splitk_gemm = False
+_mm_bf16 = None
+_flashinfer_autotuner = None
+_BF16_LOW_M_AUTOTUNE_MAX_M = 32
 
-# GB300 TP16 tactics measured under CUDA graph replay with PDL and cold weights.
-# Unlisted shapes, including M=64, retain the existing TGV/cuBLAS path.
-_BF16_SPLITK_TUNED_TACTICS = {
-    (1, 256, 8192): (64, 8, 4, 11),
-    (2, 256, 8192): (64, 8, 4, 11),
-    (4, 256, 8192): (64, 8, 4, 11),
-    (8, 256, 8192): (64, 8, 4, 11),
-    (16, 256, 8192): (64, 8, 4, 10),
-    (24, 256, 8192): (64, 8, 4, 11),
-    (32, 256, 8192): (64, 8, 4, 12),
-    (1, 512, 8192): (64, 8, 4, 11),
-    (2, 512, 8192): (64, 8, 4, 12),
-    (4, 512, 8192): (64, 8, 4, 10),
-    (8, 512, 8192): (64, 8, 4, 12),
-    (12, 512, 8192): (64, 8, 4, 12),
-    (16, 512, 8192): (64, 8, 4, 12),
-    (24, 512, 8192): (64, 8, 4, 12),
-    (32, 512, 8192): (64, 16, 4, 9),
-    (24, 2304, 8192): (64, 32, 2, 9),
-    (32, 2304, 8192): (64, 32, 2, 9),
-    (1, 2560, 8192): (64, 8, 2, 10),
-    (2, 2560, 8192): (64, 8, 2, 10),
-    (4, 2560, 8192): (64, 8, 2, 10),
-    (8, 2560, 8192): (64, 8, 2, 10),
-    (16, 2560, 8192): (64, 16, 2, 11),
-    (24, 2560, 8192): (64, 32, 2, 9),
-    (32, 2560, 8192): (64, 32, 2, 9),
-    # MuseSpark TP8 unpooler slice; only swept M are listed.
-    (4, 1024, 4096): (64, 8, 4, 12),
-    (8, 1024, 4096): (64, 8, 4, 12),
-    (12, 1024, 4096): (64, 16, 4, 8),
-    (16, 1024, 4096): (64, 16, 4, 8),
-    # MuseSpark TP4 qkvg and pooler/unpooler slices on GB300, same method;
-    # only swept M are listed; other M were not tuned and stay on TGV/cuBLAS.
-    (24, 4608, 8192): (64, 32, 2, 9),
-    (32, 4608, 8192): (64, 32, 2, 9),
-    (1, 1024, 8192): (64, 16, 4, 10),
-    (2, 1024, 8192): (64, 16, 4, 10),
-    (4, 1024, 8192): (64, 16, 4, 10),
-    (8, 1024, 8192): (64, 16, 4, 10),
-    (12, 1024, 8192): (64, 16, 4, 10),
-    (16, 1024, 8192): (64, 16, 4, 10),
-    (24, 1024, 8192): (64, 16, 4, 10),
-    (32, 1024, 8192): (64, 16, 4, 10),
-    # Qwen4-Exp TP4 decode shapes, measured on B300 (sm103) under CUDA graph replay;
-    # unlisted (m, n, k) keep the CuTe DSL/cuBLAS path.
-    (1, 320, 2560): (64, 8, 4, 11),
-    (1, 512, 2560): (64, 8, 4, 11),
-    (1, 640, 2560): (64, 8, 4, 10),
-    (1, 2560, 1536): (64, 8, 2, 6),
-    (1, 2560, 2560): (64, 8, 2, 6),
-    (1, 3584, 2560): (64, 8, 2, 6),
-    (1, 4096, 2560): (64, 8, 2, 6),
-    (1, 4120, 2560): (64, 8, 2, 6),
-    (2, 320, 2560): (64, 8, 4, 10),
-    (2, 512, 2560): (64, 8, 4, 11),
-    (2, 640, 2560): (64, 8, 4, 11),
-    (2, 2560, 1536): (64, 8, 2, 6),
-    (2, 2560, 2560): (64, 8, 2, 6),
-    (2, 3584, 2560): (64, 8, 2, 6),
-    (2, 4096, 2560): (64, 8, 2, 6),
-    (2, 4120, 2560): (64, 8, 2, 6),
-    (3, 320, 2560): (64, 8, 4, 10),
-    (3, 512, 2560): (64, 8, 4, 10),
-    (3, 640, 2560): (64, 8, 4, 10),
-    (3, 2560, 1536): (64, 8, 2, 6),
-    (3, 2560, 2560): (64, 8, 2, 6),
-    (3, 3584, 2560): (64, 8, 2, 6),
-    (3, 4096, 2560): (64, 8, 2, 6),
-    (3, 4120, 2560): (64, 8, 2, 6),
-    (4, 320, 2560): (64, 8, 4, 12),
-    (4, 512, 2560): (64, 8, 4, 10),
-    (4, 640, 2560): (64, 8, 4, 11),
-    (4, 2560, 1536): (64, 8, 2, 6),
-    (4, 2560, 2560): (64, 8, 2, 6),
-    (4, 3584, 2560): (64, 8, 2, 6),
-    (4, 4096, 2560): (64, 8, 2, 6),
-    (4, 4120, 2560): (64, 8, 2, 6),
-    (8, 320, 2560): (64, 8, 4, 11),
-    (8, 512, 2560): (64, 8, 4, 10),
-    (8, 640, 2560): (64, 8, 4, 11),
-    (8, 2560, 1536): (64, 8, 2, 10),
-    (8, 2560, 2560): (64, 8, 2, 6),
-    (8, 3584, 2560): (64, 8, 2, 6),
-    (8, 4096, 2560): (64, 8, 2, 6),
-    (8, 4120, 2560): (64, 8, 2, 6),
-    # GB300: DFLASH draft candidate head (202048-vocab org shard), TP8.
-    (7, 25256, 8192): (64, 8, 1, 12),
+# GLM-5 TP4 decode on SM107 (Vera Rubin NVL72), the low-M path on SM107 instead of autotune;
+# FlashInfer's default tactics, each faster than TGV/cuBLAS/fused_a per call with PDL.
+_BF16_SM107_WARP_SPLITK_TUNED_TACTICS = {
+    # o_proj.
+    (1, 6144, 4096): (32, 8, 256, 11, 2),
+    (4, 6144, 4096): (32, 8, 256, 11, 2),
+    (5, 6144, 4096): (32, 8, 256, 11, 2),
+    (20, 6144, 4096): (32, 32, 256, 6, 2),
+    # fused_qkv_a.
+    (1, 2624, 6144): (16, 8, 256, 16, 2),
+    (4, 2624, 6144): (16, 8, 256, 16, 2),
+    (5, 2624, 6144): (16, 8, 256, 16, 2),
+    (20, 2624, 6144): (16, 32, 256, 9, 2),
+    # Indexer wk and weights_proj.
+    (5, 160, 6144): (16, 8, 256, 16, 2),
+    # Shared expert gate_up and down.
+    (1, 1024, 6144): (16, 8, 256, 16, 2),
+    (4, 1024, 6144): (16, 8, 256, 16, 2),
+    (5, 1024, 6144): (16, 8, 256, 16, 2),
+    (20, 1024, 6144): (16, 16, 256, 13, 2),
+    (1, 6144, 512): (32, 8, 128, 4, 1),
+    (4, 6144, 512): (32, 8, 128, 4, 1),
+    (5, 6144, 512): (32, 8, 128, 4, 1),
 }
-
-# FlashInfer warp split-K (output_tile, token_tile, k_tile, stages, b_loader_warps),
-# MuseSpark TP4/TP8 on GB300 of the per-M best.
-# Takes precedence over _BF16_SPLITK_TUNED_TACTICS.
-_BF16_WARP_SPLITK_TUNED_TACTICS = {
-    # TP4 qkvg, o_proj and unpooler slice.
-    (1, 4608, 8192): (32, 8, 256, 10, 2),
-    (2, 4608, 8192): (32, 8, 256, 10, 2),
-    (4, 4608, 8192): (32, 8, 256, 10, 2),
-    (8, 4608, 8192): (32, 8, 256, 10, 2),
-    (12, 4608, 8192): (32, 16, 256, 9, 2),
-    (16, 4608, 8192): (32, 16, 256, 9, 2),
-    (1, 8192, 2048): (16, 8, 256, 4, 2),
-    (2, 8192, 2048): (16, 8, 256, 4, 2),
-    (4, 8192, 2048): (16, 8, 256, 4, 2),
-    (8, 8192, 2048): (16, 8, 256, 4, 2),
-    (12, 8192, 2048): (32, 16, 256, 4, 2),
-    (16, 8192, 2048): (32, 16, 256, 4, 2),
-    (1, 2048, 4096): (16, 8, 256, 15, 2),
-    (2, 2048, 4096): (16, 8, 256, 15, 2),
-    (4, 2048, 4096): (16, 8, 256, 15, 2),
-    (8, 2048, 4096): (16, 8, 256, 15, 2),
-    (12, 2048, 4096): (16, 16, 256, 12, 2),
-    (16, 2048, 4096): (16, 16, 256, 12, 2),
-    (24, 2048, 4096): (32, 16, 256, 9, 2),
-    (32, 2048, 4096): (32, 16, 256, 9, 2),
-    # TP8 qkvg, o_proj and unpooler slice.
-    (1, 2304, 8192): (16, 8, 256, 16, 2),
-    (2, 2304, 8192): (16, 8, 256, 16, 2),
-    (4, 2304, 8192): (16, 8, 256, 16, 2),
-    (8, 2304, 8192): (16, 8, 256, 16, 2),
-    (12, 2304, 8192): (16, 16, 256, 13, 2),
-    (16, 2304, 8192): (16, 16, 256, 13, 2),
-    (1, 8192, 1024): (32, 8, 128, 8, 2),
-    (2, 8192, 1024): (32, 8, 128, 8, 2),
-    (4, 8192, 1024): (32, 8, 128, 8, 2),
-    (8, 8192, 1024): (32, 8, 128, 8, 2),
-    (12, 8192, 1024): (32, 16, 256, 4, 2),
-    (16, 8192, 1024): (32, 16, 256, 4, 2),
-    (1, 1024, 4096): (16, 8, 256, 16, 2),
-    (2, 1024, 4096): (16, 8, 256, 16, 2),
-    (24, 1024, 4096): (16, 16, 256, 10, 2),
-    (32, 1024, 4096): (16, 16, 256, 10, 2),
-    # GB300, measured on the DFLASH draft of Muse Spark
-    (8, 2048, 8192): (16, 8, 256, 16, 2),
-    (16, 2048, 8192): (16, 16, 256, 13, 2),
-    (24, 2048, 8192): (16, 32, 256, 9, 2),
-    (32, 2048, 8192): (32, 16, 256, 8, 2),
-    # hidden 8192 / intermediate 28672 / 64q8kv heads (also Llama-3-70B-class) at TP4:
-    # gate_up, down, qkv; the qkv rows replace the split-K tactics above.
-    # Then the TP4 candidate head (202048-vocab org shard).
-    (8, 14336, 8192): (16, 8, 128, 12, 2),
-    (16, 14336, 8192): (32, 16, 256, 9, 2),
-    (8, 8192, 7168): (32, 8, 128, 10, 1),
-    (16, 8192, 7168): (32, 16, 256, 4, 2),
-    (8, 2560, 8192): (32, 8, 256, 11, 1),
-    (16, 2560, 8192): (32, 16, 256, 9, 1),
-    (7, 50512, 8192): (16, 8, 256, 9, 2),
-    (14, 50512, 8192): (16, 16, 256, 4, 2),
-    # Same model shapes at TP8: gate_up, down, qkv.
-    (8, 7168, 8192): (16, 8, 256, 6, 2),
-    (16, 7168, 8192): (16, 16, 256, 4, 2),
-    (8, 8192, 3584): (32, 8, 256, 5, 2),
-    (16, 8192, 3584): (32, 16, 128, 8, 1),
-    (8, 1280, 8192): (16, 8, 256, 11, 2),
-    (16, 1280, 8192): (16, 16, 256, 13, 2),
-    (24, 1280, 8192): (32, 8, 256, 9, 2),
-    (32, 1280, 8192): (32, 16, 256, 9, 2),
-}
+# fused_qkv_a keys that leave the fused_a JIT (M <= 16) for warp split-K on SM107.
+_BF16_SM107_FUSED_A_SPLITK_KEYS = frozenset(
+    {(1, 2624, 6144), (4, 2624, 6144), (5, 2624, 6144)}
+)
+_use_sm107_splitk_tactics = False
 
 
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
-    key = (m, n, k)
-    return key in _BF16_SPLITK_TUNED_TACTICS or key in _BF16_WARP_SPLITK_TUNED_TACTICS
+    return (
+        _use_sm107_splitk_tactics and (m, n, k) in _BF16_SM107_WARP_SPLITK_TUNED_TACTICS
+    )
 
 
-def precompile_splitk_tactics() -> bool:
-    """JIT-compile every tuned tactic through the real dispatch,
+def prefer_bf16_splitk_over_fused_a(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
+        _use_sm107_splitk_tactics
+        and (x.shape[0], *weight.shape) in _BF16_SM107_FUSED_A_SPLITK_KEYS
+    )
+
+
+def precompile_sm107_splitk_tactics() -> bool:
+    """JIT-compile every SM107 tactic through the real dispatch,
     so CUDA graph capture never hits a cold kernel."""
-    if not _enable_bf16_splitk_gemm:
+    if not _use_sm107_splitk_tactics:
         return False
     device = torch.cuda.current_device()
-    for m, n, k in {**_BF16_SPLITK_TUNED_TACTICS, **_BF16_WARP_SPLITK_TUNED_TACTICS}:
+    for m, n, k in _BF16_SM107_WARP_SPLITK_TUNED_TACTICS:
         x = torch.zeros(m, k, dtype=torch.bfloat16, device=device)
         weight = torch.zeros(n, k, dtype=torch.bfloat16, device=device)
         out = torch.empty(m, n, dtype=torch.bfloat16, device=device)
@@ -326,21 +202,11 @@ def precompile_splitk_tactics() -> bool:
     return True
 
 
-def should_enable_bf16_splitk_gemm(backend: Bf16GemmBackend) -> bool:
-    """Return whether the optional Split-K path should be initialized."""
-    return backend.is_cutedsl() and envs.SGLANG_ENABLE_BF16_SPLITK_GEMM.get()
-
-
 def initialize_bf16_gemm_config() -> None:
     global _BF16_GEMM_BACKEND
     global _cutedsl_bf16_gemm, _use_cutedsl_bf16_gemm
-    global _splitk_tactic
-    global _run_splitk_dense
-    global _direct_default_tactic
-    global _prefer_direct
-    global _run_direct_dense
-    global _warp_splitk_tactic, _run_warp_splitk_dense
-    global _enable_bf16_splitk_gemm
+    global _warp_splitk_tactic, _run_warp_splitk_dense, _use_sm107_splitk_tactics
+    global _mm_bf16, _flashinfer_autotuner
     global _skip_aiter_unquant
 
     _skip_aiter_unquant = (
@@ -398,30 +264,23 @@ def initialize_bf16_gemm_config() -> None:
         _cutedsl_bf16_gemm = cutedsl_bf16_gemm
         _use_cutedsl_bf16_gemm = use_cutedsl_bf16_gemm
 
-    _enable_bf16_splitk_gemm = False
-    if should_enable_bf16_splitk_gemm(backend):
-        from flashinfer.gemm.kernels.dense_bf16_gemm_direct import (
-            default_tactic,
-            prefer_direct_bf16_gemm_sm100,
-            run_direct_dense,
-        )
-        from flashinfer.gemm.kernels.dense_bf16_gemm_sm100_splitk import (
-            SplitKTactic,
-            run_splitk_dense,
-        )
+    _use_sm107_splitk_tactics = False
+    _mm_bf16 = None
+    if backend.is_cutedsl() and get_platform().device_sm == 107:
         from flashinfer.gemm.kernels.dense_bf16_gemm_warp_splitk import (
             WarpSplitKTactic,
             run_warp_splitk_dense,
         )
 
-        _splitk_tactic = SplitKTactic
-        _run_splitk_dense = run_splitk_dense
-        _direct_default_tactic = default_tactic
-        _prefer_direct = prefer_direct_bf16_gemm_sm100
-        _run_direct_dense = run_direct_dense
         _warp_splitk_tactic = WarpSplitKTactic
         _run_warp_splitk_dense = run_warp_splitk_dense
-        _enable_bf16_splitk_gemm = True
+        _use_sm107_splitk_tactics = True
+    elif backend.is_cutedsl() and not get_exec().kernel.disable_flashinfer_autotune:
+        from flashinfer.autotuner import AutoTuner
+        from flashinfer.gemm import mm_bf16
+
+        _mm_bf16 = mm_bf16
+        _flashinfer_autotuner = AutoTuner
 
     _BF16_GEMM_BACKEND = backend
 
@@ -455,24 +314,8 @@ def _bf16_splitk_gemm_out(
     out: torch.Tensor,
 ) -> torch.Tensor:
     m, n, k = x_2d.shape[0], weight.shape[0], weight.shape[1]
-    warp_tactic = _BF16_WARP_SPLITK_TUNED_TACTICS.get((m, n, k))
-    if warp_tactic is not None:
-        _run_warp_splitk_dense(
-            x_2d, weight.T, out, True, _warp_splitk_tactic(*warp_tactic), bias
-        )
-    elif bias is None and _prefer_direct(m, n, k):
-        tactic = _direct_default_tactic(m, n, k)
-        _run_direct_dense(x_2d, weight.T, out, True, tactic)
-    else:
-        tactic = _splitk_tactic(*_BF16_SPLITK_TUNED_TACTICS[(m, n, k)])
-        _run_splitk_dense(
-            x_2d,
-            weight.T,
-            bias,
-            out,
-            True,
-            tactic,
-        )
+    tactic = _warp_splitk_tactic(*_BF16_SM107_WARP_SPLITK_TUNED_TACTICS[(m, n, k)])
+    _run_warp_splitk_dense(x_2d, weight.T, out, True, tactic, bias)
     return out
 
 
@@ -485,16 +328,54 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
+def _bf16_low_m_autotune(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run M <= 32 through FlashInfer's autotuned low-M kernels; None if not taken.
+
+    Inside FlashInfer autotune, a larger M profiles the M <= 32 buckets instead.
+    """
+    if not (
+        _mm_bf16 is not None
+        and (bias is None or bias.dtype == torch.bfloat16)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and weight.is_contiguous()
+        and not weight.requires_grad
+    ):
+        return None
+    x_2d = x.view(-1, x.shape[-1])
+    m = x_2d.shape[0]
+    if 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
+        output = _mm_bf16(x_2d, weight.T, bias, pdl=True, out=out, backend="auto")
+        return output.view(*x.shape[:-1], weight.shape[0])
+    if m > _BF16_LOW_M_AUTOTUNE_MAX_M and _flashinfer_autotuner.get().is_tuning_mode:
+        _mm_bf16(
+            x_2d[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+            weight.T,
+            bias,
+            pdl=True,
+            backend="auto",
+        )
+    return None
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    output = _bf16_low_m_autotune(x, weight, bias)
+    if output is not None:
+        return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
-    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
-        m, weight.shape[0], weight.shape[1]
-    ):
+    if use_bf16_splitk_gemm(m, weight.shape[0], weight.shape[1]):
         output = _bf16_splitk_gemm(x, weight, bias)
     elif _use_bf16_tiny_gemv(x, weight, bias):
         output = _hopper_bf16_tiny_gemv(x.view(-1, x.shape[-1]), weight).view(
@@ -566,6 +447,10 @@ def _can_accumulate_into_addend(
     )
 
 
+def bf16_gemm_needs_autotune() -> bool:
+    return get_bf16_gemm_backend().is_cutedsl() and get_platform().device_sm != 107
+
+
 def get_bf16_gemm_backend() -> Bf16GemmBackend:
     global _BF16_GEMM_BACKEND
     if _BF16_GEMM_BACKEND is None:
@@ -597,7 +482,7 @@ def maybe_pad_weight_for_gfx115(weight: torch.Tensor) -> torch.Tensor:
     slice, not the full checkpoint K. Non-contiguous weights, including ones
     already padded, come back unchanged, which keeps a reload from padding twice.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return weight
     if weight.dim() != 2 or not weight.is_contiguous():
         return weight
@@ -618,7 +503,7 @@ def finalize_gfx115_weight_padding(model: torch.nn.Module) -> None:
     Also runs after every weight update; already-padded weights are skipped, so
     storage pointers stay stable for CUDA graphs.
     """
-    if not _is_gfx115 or envs.SGLANG_DISABLE_GFX115_WEIGHT_PADDING.get():
+    if not _is_gfx115:
         return
     for head in _unquantized_lm_heads(model):
         head.weight.data = maybe_pad_weight_for_gfx115(head.weight.data)
@@ -813,8 +698,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
     ) -> torch.Tensor:
         """Run an inference-only BF16 linear into caller-owned storage."""
         if (
-            _enable_bf16_splitk_gemm
-            and bias is None
+            x.ndim == 2
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
+        ):
+            return output
+        if (
+            bias is None
             and x.is_cuda
             and x.ndim == 2
             and x.dtype == torch.bfloat16
