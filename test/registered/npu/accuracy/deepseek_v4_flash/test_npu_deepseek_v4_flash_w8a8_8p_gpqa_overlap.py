@@ -6,6 +6,7 @@ from sglang.test.ascend.e2e.test_npu_accuracy_utils import (
     BENCHMARK_TOOL_DEFAULT,
     TestNpuAccuracyTestCaseBase,
 )
+from sglang.test.ascend.test_ascend_utils import is_npu_a5
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
 )
@@ -69,7 +70,7 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    16,
+    8 if is_npu_a5() else 16,
     "--trust-remote-code",
     "--device",
     "npu",
