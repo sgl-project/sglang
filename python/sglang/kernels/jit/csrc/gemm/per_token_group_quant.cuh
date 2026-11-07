@@ -547,7 +547,12 @@ QuantHostContext<Trait> build_quant_context( //
   auto H = SymbolicSize{"hidden_size"};
   auto G = SymbolicSize{"num_scale_groups"};
 
-  if constexpr (kMasked) {
+  if constexpr (Trait::kUe8m0 && !Trait::kPackedScale) {
+    TensorMatcher({N, H}).with_dtype<T>().with_device(device).verify(input);
+    TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).ensure_alignment(16).verify(
+        output_q);
+    TensorMatcher({N, G}).with_dtype<S>().with_device(device).verify(output_s);
+  } else if constexpr (kMasked) {
     TensorMatcher({E, N, -1}).with_strides({-1, -1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({E, N, H}).with_strides({-1, -1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({E, N, G}).with_strides({-1, -1, -1}).with_dtype<S>().with_device(device).verify(output_s);
@@ -557,11 +562,6 @@ QuantHostContext<Trait> build_quant_context( //
     TensorMatcher({N, -1}).with_strides({-1, 1}).with_dtype<T>().with_device(device).verify(input);
     TensorMatcher({N, H}).with_strides({-1, 1}).with_dtype<Q>().with_device(device).verify(output_q);
     TensorMatcher({N, G}).with_strides({-1, -1}).with_dtype<S>().with_device(device).verify(output_s);
-  }
-  if constexpr (Trait::kUe8m0 && !Trait::kPackedScale) {
-    TensorMatcher({N, H}).with_dtype<T>().with_device(device).verify(input);
-    TensorMatcher({N, H}).with_dtype<Q>().with_device(device).ensure_alignment(16).verify(output_q);
-    TensorMatcher({N, G}).with_dtype<S>().with_device(device).verify(output_s);
   }
   // The 32B/lane vectorized loads need every input row to start 32B-aligned
   // (kMaxVecBytes on Blackwell; over-strict but harmless on Hopper, whose

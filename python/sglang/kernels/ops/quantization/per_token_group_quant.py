@@ -263,7 +263,9 @@ def per_token_group_quant(
       int32 contiguous    -> row-major UE8M0 bytes packed 4-per-int32
     The packed layouts require ``scale_ue8m0=True``. With a supplied contiguous
     float32 buffer, this flag instead stores the power-of-two scales as FP32.
-    The buffers must be contiguous, non-overlapping CUDA tensors. The public
+    Input and FP32 scales must be contiguous. Output rows need unit inner
+    stride and 16B alignment; v2 additionally requires contiguous output.
+    All buffers must be non-overlapping CUDA tensors. The public
     FP8 dispatch selects this specialization for flat BF16 group32 inputs on
     Hopper with 32B alignment; other architectures and 16B-aligned input views
     use v2. FP16 stays on v2 because the trait kernel's FP16 quantization
