@@ -16,6 +16,7 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
+from sglang.srt.platforms import current_platform
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.device import is_musa, is_npu
 
@@ -41,6 +42,9 @@ SGLANG_TP_RANK = None
 
 def monkey_patch_torch_reductions():
     """Monkey patching before Torch https://github.com/pytorch/pytorch/pull/149248 is fixed"""
+
+    if current_platform.register_tensor_ipc_reducers():
+        return
 
     if not _is_npu:
         if hasattr(reductions, "_reduce_tensor_original"):

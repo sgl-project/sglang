@@ -24,6 +24,8 @@ from typing import List, Union
 import pybase64
 import torch
 
+from sglang.srt.platforms import current_platform
+
 __all__ = [
     "MultiprocessingSerializer",
     "SerializedTensorPayload",
@@ -342,6 +344,10 @@ class SafeUnpickler(pickle.Unpickler):
             return _safe_load_torch_storage
         if (module, name) in self.ALLOWED_GLOBALS:
             return super().find_class(module, name)
+
+        rebuild_fn = current_platform.get_tensor_ipc_rebuild_fn(module, name)
+        if rebuild_fn is not None:
+            return rebuild_fn
 
         raise RuntimeError(
             f"Blocked unsafe global ({module}.{name}) during pickle deserialization"

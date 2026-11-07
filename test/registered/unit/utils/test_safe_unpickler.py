@@ -1,11 +1,15 @@
+import io
 import pickle
 import unittest
 from collections import OrderedDict, defaultdict, deque
 from functools import partial
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
+from sglang.srt.platforms.cpu import CpuSRTPlatform
+from sglang.srt.utils import serialization
 from sglang.srt.utils.serialization import (
     MultiprocessingSerializer,
     SafeUnpickler,
@@ -108,6 +112,43 @@ class TestSafeUnpickler(CustomTestCase):
         for payload in (current, pre_move):
             with self.subTest(payload=payload):
                 self.assertIs(safe_pickle_loads(payload), Modality.IMAGE)
+
+    def test_platform_rebuild_deserializes_tensor(self):
+        """A backend tensor payload must deserialize without general-plugin loading."""
+
+        class Platform(CpuSRTPlatform):
+            def get_tensor_ipc_rebuild_fn(self, module, name):
+                if (module, name) == ("example_backend.reductions", "rebuild_tensor"):
+                    return torch.tensor
+                return None
+
+        # GLOBAL + REDUCE reconstructs a tensor from the arguments ((1, 2),).
+        payload = b"cexample_backend.reductions\nrebuild_tensor\n((I1\nI2\nttR."
+        with patch.object(serialization, "current_platform", Platform()):
+            restored = safe_pickle_loads(payload)
+        self.assertTrue(torch.equal(restored, torch.tensor([1, 2])))
+
+    def test_platform_default_does_not_allow_unknown_global(self):
+        """Declining a backend global must not fall back to unrestricted imports."""
+        with patch.object(serialization, "current_platform", CpuSRTPlatform()):
+            with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
+                safe_pickle_loads(b"cos\nsystem\n.")
+
+    def test_builtin_globals_and_storage_loader_take_precedence(self):
+        """Backend lookup must not replace built-ins or the restricted storage loader."""
+
+        class Platform(CpuSRTPlatform):
+            def get_tensor_ipc_rebuild_fn(self, module, name):
+                raise AssertionError("Built-in globals must not consult the backend")
+
+        with patch.object(serialization, "current_platform", Platform()):
+            restored = safe_pickle_loads(b"cbuiltins\nset\n((I1\nI2\nttR.")
+            self.assertEqual(restored, {1, 2})
+            unpickler = serialization.SafeUnpickler(io.BytesIO())
+            self.assertIs(
+                unpickler.find_class("torch.storage", "_load_from_bytes"),
+                serialization._safe_load_torch_storage,
+            )
 
 
 if __name__ == "__main__":

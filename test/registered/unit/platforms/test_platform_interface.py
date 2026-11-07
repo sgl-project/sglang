@@ -1056,6 +1056,79 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
             _ = plat_mod.nonexistent_attribute
 
 
+class TestTensorIPCRegistration(CustomTestCase):
+    def test_backend_reducer_survives_repeated_initialization(self):
+        """A backend's CPU-usable reducer must not be replaced by CUDA setup."""
+        import pickle
+        from multiprocessing.reduction import ForkingPickler
+
+        from sglang.srt.utils import patch_torch
+
+        def reduce_tensor(tensor):
+            return torch.tensor, (tensor.tolist(),)
+
+        class Platform(CpuSRTPlatform):
+            def register_tensor_ipc_reducers(self):
+                ForkingPickler.register(torch.Tensor, reduce_tensor)
+                return True
+
+        with (
+            patch.object(patch_torch, "current_platform", Platform()),
+            patch.object(patch_torch, "reductions", None),
+            patch.dict(ForkingPickler._extra_reducers),
+        ):
+            patch_torch.monkey_patch_torch_reductions()
+            patch_torch.monkey_patch_torch_reductions()
+            tensor = torch.arange(6).reshape(2, 3)
+            restored = pickle.loads(ForkingPickler.dumps(tensor))
+            self.assertTrue(torch.equal(restored, tensor))
+
+    def test_default_platform_preserves_builtin_reducers(self):
+        """Platforms without an override retain CUDA/NPU setup and idempotency."""
+        from types import SimpleNamespace
+
+        from sglang.srt.utils import patch_torch
+
+        for is_npu in (False, True):
+            with self.subTest(is_npu=is_npu):
+                original = MagicMock()
+                reductions = SimpleNamespace(
+                    reduce_tensor=original,
+                    rebuild_cuda_tensor=original,
+                    rebuild_npu_tensor=original,
+                    init_reductions=MagicMock(),
+                )
+                # NPU's replacement is defined only on NPU at module import.
+                replacement = MagicMock()
+                with (
+                    patch.object(patch_torch, "current_platform", CpuSRTPlatform()),
+                    patch.object(patch_torch, "_is_npu", is_npu),
+                    patch.object(patch_torch, "reductions", reductions),
+                    patch.object(
+                        patch_torch, "npu_reductions", reductions, create=True
+                    ),
+                    patch.object(
+                        patch_torch,
+                        "_rebuild_npu_tensor_modified",
+                        replacement,
+                        create=True,
+                    ),
+                ):
+                    patch_torch.monkey_patch_torch_reductions()
+                    patch_torch.monkey_patch_torch_reductions()
+                    if is_npu:
+                        self.assertIs(reductions._rebuild_npu_tensor_original, original)
+                        self.assertIs(reductions.rebuild_npu_tensor, replacement)
+                        reductions.init_reductions.assert_not_called()
+                    else:
+                        self.assertIs(reductions._reduce_tensor_original, original)
+                        self.assertIs(
+                            reductions.reduce_tensor,
+                            patch_torch._reduce_tensor_modified,
+                        )
+                        reductions.init_reductions.assert_called_once_with()
+
+
 if __name__ == "__main__":
     import unittest
 
