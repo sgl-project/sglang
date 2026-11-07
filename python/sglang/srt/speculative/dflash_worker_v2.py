@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
+from sglang.kernels.ops.communication import dflash_commit as dflash_commit_op
 from sglang.kernels.ops.speculative.cache_locs import (
     assign_extend_cache_locs_func,
     rebuild_compact_draft_req_to_token_func,
@@ -219,6 +220,41 @@ def _commit_accept(candidates, accept_len, bonus_tokens):
     out_tokens[:, -1].fill_(0)
     out_tokens.scatter_(1, accept_len.to(torch.int64)[:, None], bonus_tokens[:, None])
     return out_tokens, accept_len.to(torch.int32) + 1
+
+
+def _eager_commit_comm(tp_sync: SpecTpSync):
+    """(needs broadcast, communicator or None) for the eager commit."""
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    if not tp_sync.enabled(SpecTpSyncSite.DFLASH_SELECTOR):
+        return False, None
+    group = tp_sync._tp_group
+    if group.world_size == 1:
+        return False, None
+    comm = group.ca_comm
+    if (
+        group.world_size not in (2, 4, 8)
+        or not isinstance(comm, CustomAllReduceV2)
+        or comm.disabled
+    ):
+        return True, None
+    return True, comm
+
+
+def _eager_commit_fits(candidates, accept_len, bonus) -> bool:
+    """The layouts the eager-commit kernel takes."""
+    return (
+        candidates.dtype == torch.int64
+        and candidates.dim() == 2
+        and candidates.is_contiguous()
+        and candidates.shape[0] <= 1024
+        and accept_len.dtype == torch.int32
+        and bonus.dtype == torch.int64
+        and accept_len.is_contiguous()
+        and bonus.is_contiguous()
+    )
 
 
 def _resolve_dflash_embedding_module(draft_model, target_model):
@@ -605,6 +641,18 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._draft_greedy_index_cap: int = 0
         self._use_fused_kv_materialize = is_cuda() or is_hip() or is_xpu()
         self._fused_kv_helper: Optional[object] = None
+        # Side stream for the verify step's context projection; see
+        # _start_ctx_projection. Created on first use so a server that never
+        # verifies, or runs with the flag off, does not pay for a stream.
+        self._overlap_ctx_projection = (
+            get_spec().speculative_overlap_ctx_projection and is_cuda()
+        )
+        self._ctx_proj_stream: Optional[torch.cuda.Stream] = None
+        self._ctx_proj_pending: Optional[
+            Tuple[torch.Tensor, torch.Tensor, torch.cuda.Event]
+        ] = None
+        self._eager_commit = envs.SGLANG_OPT_DFLASH_EAGER_COMMIT.get() and is_cuda()
+        self._eager_commit_logged = False
         if self._use_fused_kv_materialize:
             self._init_fused_kv_helper()
 
@@ -1829,6 +1877,73 @@ class DFlashWorkerV2(BaseSpecWorker):
         physical ids for a fused draft, the virtual ids for a private one."""
         return plan.write_ids(self.draft_model_runner.runner_ids, kind=kind)
 
+    def _start_ctx_projection(self, target_hidden: torch.Tensor) -> None:
+        """Issue the verify step's context projection on a side stream.
+
+        ``project_target_hidden`` reads only the verify hidden states, but the worker
+        calls it after accept and sampling, which read only the logits. Issuing it here,
+        as soon as the verify forward returns, lets the two run concurrently;
+        ``_take_ctx_projection`` joins the side stream where the result is first needed.
+
+        Same call on the same tensor, so the result is unchanged. A capture, a missing
+        stream or any failure leaves nothing pending and the stock call runs.
+        """
+        if not self._overlap_ctx_projection:
+            return
+        if target_hidden is None or target_hidden.numel() == 0:
+            return
+        if torch.cuda.is_current_stream_capturing():
+            return
+        if self._ctx_proj_stream is None:
+            self._ctx_proj_stream = torch.cuda.Stream(device=self.device)
+        ready = torch.cuda.Event()
+        ready.record(torch.cuda.current_stream(self.device))
+        try:
+            with (
+                torch.cuda.stream(self._ctx_proj_stream),
+                torch.inference_mode(),
+                draft_tp_context(self.draft_parallel_layout),
+            ):
+                self._ctx_proj_stream.wait_event(ready)
+                # The side stream reads a buffer the worker's stream produced and
+                # allocated; it must be held until the side work is done.
+                target_hidden.record_stream(self._ctx_proj_stream)
+                projected = self.draft_model.project_target_hidden(target_hidden)
+                done = torch.cuda.Event()
+                done.record(self._ctx_proj_stream)
+        except Exception as e:
+            logger.warning(
+                "DFLASH side-stream context projection failed; "
+                "falling back to the inline projection: %s",
+                e,
+            )
+            self._overlap_ctx_projection = False
+            self._ctx_proj_pending = None
+            return
+        self._ctx_proj_pending = (target_hidden, projected, done)
+
+    def _take_ctx_projection(
+        self, target_hidden: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        """The pending projection of ``target_hidden``, after joining the side stream.
+
+        The match is by identity: the pending result belongs to the exact tensor
+        ``_start_ctx_projection`` was given. Any other tensor gets None and is projected
+        inline, but the join still happens, so the side stream is never left reading a
+        buffer the next verify replay is free to overwrite.
+        """
+        pending = self._ctx_proj_pending
+        if pending is None:
+            return None
+        self._ctx_proj_pending = None
+        started, projected, done = pending
+        current = torch.cuda.current_stream(self.device)
+        current.wait_event(done)
+        projected.record_stream(current)
+        if started is not target_hidden:
+            return None
+        return projected
+
     def _append_target_hidden_to_draft_kv_by_loc(
         self,
         *,
@@ -1947,7 +2062,9 @@ class DFlashWorkerV2(BaseSpecWorker):
             torch.inference_mode(),
             draft_tp_context(self.draft_parallel_layout),
         ):
-            ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
+            ctx_hidden = self._take_ctx_projection(target_hidden)
+            if ctx_hidden is None:
+                ctx_hidden = self.draft_model.project_target_hidden(target_hidden)
             if self.lilicorr is not None:
                 self._lilicorr_anchor = publish_anchor(
                     draft_sampler=self._draft_sampler,
@@ -2246,6 +2363,28 @@ class DFlashWorkerV2(BaseSpecWorker):
             self._new_seq_lens_bufs[slot][:bs],
         )
 
+    def _commit_selector_accept(
+        self,
+        *,
+        candidates: torch.Tensor,
+        accept_len: torch.Tensor,
+        bonus: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Rank 0's selector decision on every rank, then the committed block. With
+        SGLANG_OPT_DFLASH_EAGER_COMMIT both run as one kernel."""
+        if self._eager_commit and _eager_commit_fits(candidates, accept_len, bonus):
+            need, comm = _eager_commit_comm(self._tp_sync)
+            if not need or comm is not None:
+                if not self._eager_commit_logged:
+                    self._eager_commit_logged = True
+                    logger.info(
+                        "DFLASH eager commit engaged (exchange=%s)", comm is not None
+                    )
+                return dflash_commit_op.commit(candidates, accept_len, bonus, comm)
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
+        self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+        return _commit_accept(candidates, accept_len, bonus)
+
     def _accept_block(
         self,
         *,
@@ -2268,9 +2407,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
-            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
-            out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
+            out_tokens, commit_lens = self._commit_selector_accept(
+                candidates=candidates, accept_len=accept_len, bonus=bonus
+            )
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
         ):
@@ -2948,6 +3087,17 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
+        hidden = logits_output.hidden_states
+        if hidden is None:
+            raise RuntimeError(
+                "DFLASH verify requires target hidden states, but got None."
+            )
+        hidden = hidden.view(bs, int(self.block_size), -1)
+        target_hidden = hidden.reshape(-1, hidden.shape[-1])
+        # The draft KV write below needs these hidden states projected, and nothing
+        # between here and there reads them. Start that work now so it overlaps the
+        # logits path; the write takes the result only if handed this same tensor.
+        self._start_ctx_projection(target_hidden)
         target_predict = None
         target_lp = self._target_logits_processor
         if target_lp is not None and target_lp.is_deferred_shard(
@@ -3039,18 +3189,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             on_publish(new_seq_lens)
 
         # --- 3) Materialize committed verify-input tokens into draft KV cache.
-        hidden = logits_output.hidden_states
-        if hidden is None:
-            raise RuntimeError(
-                "DFLASH verify requires target hidden states, but got None."
-            )
-        hidden = hidden.view(bs, int(self.block_size), -1)
-
         # Consume in this step: every decode graph size shares one aux output,
         # which the next target forward overwrites (resolve_aux_hidden_states_width).
         cache_loc = self._draft_write_ids(iteration_ids)
         self._append_target_hidden_to_draft_kv_by_loc(
-            target_hidden=hidden.reshape(-1, hidden.shape[-1]),
+            target_hidden=target_hidden,
             cache_loc=cache_loc,
             cache_loc_2d=cache_loc.view(verify_out_cache_loc_2d.shape),
             swa_cache_loc=self._draft_write_ids(

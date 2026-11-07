@@ -802,6 +802,8 @@ class TestRoutedDraftPool(CustomTestCase):
         worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
         worker.draft_parallel_layout = None
         worker.lilicorr = None
+        # No side-stream projection pending: the writer projects inline.
+        worker._ctx_proj_pending = None
         worker.draft_model = SimpleNamespace(
             layers=self._draft_layers(values),
             project_target_hidden=lambda hidden: hidden,
