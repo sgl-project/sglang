@@ -39,10 +39,6 @@ class GpuDeltaBackend:
         from sglang.srt.weight_sync.gpu_delta.checkpoint import (
             read_canonical_checkpoint_inventory,
         )
-        from sglang.srt.weight_sync.gpu_delta.host import (
-            HostPayloadPool,
-            configured_cpu_workers,
-        )
 
         self._canonical_plan_digest = None
         self.batch_plan = None
@@ -56,8 +52,7 @@ class GpuDeltaBackend:
             raise ValueError("direct GPU deltas require an explicit CUDA device")
         from sglang.srt.weight_sync.gpu_delta.host import HostArena
 
-        self.payload_pool = HostPayloadPool(configured_cpu_workers())
-        self.host_arena = HostArena(identity["engine_id"], self.device.index)
+        self.host_arena = HostArena(identity["engine_id"], self.device.index, identity)
         self.decoders = {}
         self.apply_stream = None
         self.io_stream = None
@@ -66,21 +61,22 @@ class GpuDeltaBackend:
         self.layout.check_identity()
         return self.layout.description
 
-    def prepare(self, manifest_path, manifest_sha256, metadata):
+    def prepare(self, manifest_path, manifest_sha256, metadata, cancelled=None):
         # Called by the background worker. Small scalar calibration may be read
         # to prepare derived values; no live writes, collectives, loader hooks
         # or generation-stream synchronization occur here.
         with torch.cuda.device(self.device):
             prepared = PreparedDelta.__new__(PreparedDelta)
             try:
-                prepared.__init__(self, manifest_path, manifest_sha256, metadata)
+                prepared.__init__(
+                    self, manifest_path, manifest_sha256, metadata, cancelled
+                )
                 return prepared
             except BaseException:
                 prepared.close()
                 raise
 
     def close(self):
-        self.payload_pool.close()
         self.host_arena.close()
 
 
@@ -231,7 +227,9 @@ def _qualify_canonical_plan(backend, manifest):
 
 class PreparedDelta:
     @profiling.annotate("gpu_delta.prepare.layout")
-    def __init__(self, backend, manifest_path, manifest_sha256, metadata):
+    def __init__(
+        self, backend, manifest_path, manifest_sha256, metadata, cancelled=None
+    ):
         from pathlib import Path
 
         from sglang.srt.weight_sync.gpu_delta.host import copy_bytes, validate_codec
@@ -272,16 +270,17 @@ class PreparedDelta:
         self.timings["host_plan_validate_s"] = time.perf_counter() - plan_started
         self.timings["host_plan_cache_reused"] = int(reused_plan)
         payload_started = time.perf_counter()
-        index, files = backend.host_arena.prepare_encoded(
+        index = backend.host_arena.prepare_encoded(
             path,
             manifest_sha256,
             manifest,
-            backend.payload_pool,
             self.timings,
             metadata,
+            self.hardware,
+            cancelled,
         )
         release_started = time.perf_counter()
-        # READY admission drained file reads/hashes; keep only this rank's entries.
+        # READY includes shared inputs; retain only this rank's metadata.
         entries = {
             binding.name: entries[binding.name] for binding in backend.layout.bindings
         }
@@ -291,15 +290,12 @@ class PreparedDelta:
         )
         self.host_snapshot = backend.host_arena.prepare_local(
             index,
-            files,
             list(entries.values()),
-            backend.payload_pool,
             self.timings,
             self.hardware,
         )
         self.timings["host_rank_prepare_body_s"] = time.perf_counter() - payload_started
-        del files
-        self.timings["host_rank_prepare_s"] = time.perf_counter() - payload_started
+        self.timings["host_rank_prepare_s"] = self.timings["host_rank_prepare_body_s"]
 
         tensors_started = time.perf_counter()
         compressed, raw_entries, ue8m0_entries = [], [], []

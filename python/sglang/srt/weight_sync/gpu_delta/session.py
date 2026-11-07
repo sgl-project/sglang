@@ -26,6 +26,7 @@ from sglang.srt.weight_sync.gpu_delta import profiling
 @dataclass
 class _Session:
     request: dict
+    cancelled: threading.Event = field(default_factory=threading.Event)
     state: str = "PREPARING"
     message: str = ""
     prepared: Any = None
@@ -124,7 +125,7 @@ class DeltaSession:
                 self._release_future.result()
             req = session.request
             prepared = self.backend.prepare(
-                req["manifest_path"], req["manifest_sha256"], req
+                req["manifest_path"], req["manifest_sha256"], req, session.cancelled
             )
             with self._lock:
                 if session.state != "ABORTED":
@@ -224,6 +225,9 @@ class DeltaSession:
                 }
             session = self._session
             session.state = "ABORTED"
+            # Wake ranks waiting for their shared preparation owner, including
+            # when that owner failed before reaching host-cache construction.
+            session.cancelled.set()
             if session.prepared is not None:
                 prepared, session.prepared = session.prepared, None
                 self._executor.submit(prepared.close)

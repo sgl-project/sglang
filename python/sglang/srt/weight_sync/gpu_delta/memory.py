@@ -7,8 +7,8 @@
 
 """Feature-owned host arenas and hardware-decompression device allocations.
 
-Each rank owns its persistent host input arena; allocations are never exported
-or imported.
+Prepared input shares a tmpfs mapping. CUDA decoders register it for H2D copies;
+DE decoders copy local spans into their original rank-private capable arenas.
 Device buffers use cuMemAlloc directly, without changing PyTorch's allocator.
 """
 
@@ -169,19 +169,49 @@ def record_device_stream(tensor, stream):
         owner.streams[stream.cuda_stream] = stream
 
 
-class PinnedHostAllocation:
-    """Persistent pinned input for the CUDA decoder's double-buffered H2D copies."""
+class HostMapping:
+    """Own an engine-shared mapping, optionally registered for CUDA H2D reads.
 
-    def __init__(self, capacity):
-        import torch
+    The caller drains CPU tasks and H2D readers before closing or replacing the
+    mapping. Registration persists across publications that fit this capacity.
+    """
 
-        self.tensor = torch.empty(capacity, dtype=torch.uint8, pin_memory=True)
-        self.capacity = capacity
-        self.view = memoryview(self.tensor.numpy())
+    def __init__(self, mapping, pinned):
+        self.mapping = mapping
+        self.capacity = len(mapping)
+        self.view = memoryview(mapping)
+        self.registered = False
+        try:
+            if pinned:
+                self.driver = driver = _driver()
+                self.context = _check(driver.cuCtxGetCurrent(), "cuCtxGetCurrent")
+                self.address = ctypes.addressof(ctypes.c_ubyte.from_buffer(mapping))
+                _check(
+                    driver.cuMemHostRegister(self.address, self.capacity, 0),
+                    "cuMemHostRegister",
+                )
+                self.registered = True
+        except BaseException:
+            self.close()
+            raise
 
     def close(self):
-        self.view.release()
-        self.view = self.tensor = None
+        if self.registered:
+            driver = self.driver
+            # Clear may run on another thread; the model owns this context.
+            _check(driver.cuCtxPushCurrent(self.context), "cuCtxPushCurrent")
+            try:
+                _check(driver.cuMemHostUnregister(self.address), "cuMemHostUnregister")
+                self.registered = False
+            finally:
+                _check(driver.cuCtxPopCurrent(), "cuCtxPopCurrent")
+        if self.view is not None:
+            self.view.release()
+            self.view = None
+        # A drained worker's exception traceback can still retain a byte view.
+        # Let its final reference close the mmap rather than invalidating that
+        # lease or failing cleanup with BufferError from outstanding exports.
+        self.mapping = None
 
 
 class HostAllocation:

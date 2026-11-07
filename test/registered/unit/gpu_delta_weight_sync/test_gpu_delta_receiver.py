@@ -392,7 +392,6 @@ class TestReceiverPreparation(unittest.TestCase):
     def test_prepare_releases_foreign_metadata_before_local_work(self):
         backend, manifest = TestCanonicalPlanCache().publication()
         backend.device = torch.device("cpu")
-        backend.payload_pool = object()
         backend.decoders = {"lz4": SimpleNamespace(backend="hardware")}
         manifest.update(
             codec="lz4-zstd",
@@ -416,9 +415,9 @@ class TestReceiverPreparation(unittest.TestCase):
 
         def admit(*args):
             self.assertIsNotNone(refs[-1]())
-            return {}, {}
+            return {}
 
-        def prepare_local(index, files, entries, pool, timings, hardware):
+        def prepare_local(index, entries, timings, hardware):
             self.assertTrue(hardware)
             self.assertIsNone(refs[-1]())
             self.assertEqual([entry["name"] for entry in entries], ["local"])

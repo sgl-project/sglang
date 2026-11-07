@@ -11,7 +11,8 @@ for the end-to-end design and performance motivation.
 Implementation ownership is explicit: `layout.py` admits immutable canonical
 bindings and consumer identities; `receiver.py` prepares publications and runs
 the fixed decode/apply pipeline. `host.py` owns payload workers, the shared encoded
-cache and rank-local arenas. `tokenizer.py` coordinates the public update and
+cache, shared prepared images and DE's rank-local input arenas. `tokenizer.py`
+coordinates the public update and
 correlates internal replies; `session.py` owns scheduler integration and each
 rank's state. HTTP routes and IPC schemas stay in `http.py` and `io.py`.
 
@@ -130,9 +131,10 @@ The optional `weight_version` labels admitted generations independently of the
 transport's target sequence; omission uses the transport target version.
 
 `clear_gpu_delta_state` is valid when idle or successfully resumed. It drains each
-rank's FIFO release work, closes workers/private host allocations and drops
+rank's FIFO release work, closes workers/host allocations and drops
 planning, decoder and stream objects. After every rank acknowledges, one process
-per engine-host deletes the shared encoded cache. Weights, publications, committed
+per engine-host deletes the shared encoded and prepared caches. Weights,
+publications, committed
 version, process identity, small provenance and pause state remain unchanged.
 Describe can recreate the backend at that version. Framework allocator/JIT caches
 are not cleared.
@@ -161,10 +163,10 @@ capacity. Streams can change codec without changing their canonical plan; native
 decoders are cached by inner codec.
 
 Wrapped matrix frames use independent GPU-compressed outer Zstd chunks with at
-most 1 MiB output. The CPU worker pool unwraps them directly into each rank's host
-arena. Plain LZ4/Bitcomp has an empty outer `frames` list and equal encoded/decoded
-extents; workers copy each local tensor's inner arena once. DE reads this host
-arena directly; CUDA decoders receive batch-sized H2D copies through two GPU slots.
+most 1 MiB output. CPU workers unwrap them into shared host storage. Plain
+LZ4/Bitcomp has an empty outer `frames` list and equal encoded/decoded extents;
+workers copy the inner compressed bytes. DE reads its host arena directly;
+CUDA decoders receive batch-sized H2D copies through two GPU slots.
 There is no full-publication HBM copy.
 Unchanged frames are omitted. Scalars/vectors use `raw_bytes`: complete target
 values, no XOR/compression, and no payload when unchanged.
@@ -172,23 +174,36 @@ values, no XOR/compression, and no payload when unchanged.
 One engine-host creator reads and optionally SHA256-checks owner files in parallel
 into retained tmpfs slices. Source identity/extent is checked across each read;
 all tasks drain before READY or failure. Namespace/publication records bind the
-original cohort, stream, path, digest, session, versions and hash policy. Ranks then
-release the cache lock and independently prepare local payloads. Global manifest
-and foreign entries are dropped after READY, before local preparation. Mapped
-encoded-file views remain owned until every submitted worker drains.
+original cohort, stream, path, digest, session, versions and hash policy. Mapped
+encoded bytes remain owned until every submitted worker drains.
+
+For every codec, one fixed original rank per engine-host owns the reusable CPU
+pool and prepares the complete canonical image before publishing READY. Wrapped
+codecs use one native Zstd `BufferWithSegments` per bounded worker group over the
+encoded mapping, without per-frame input views or payload copies. Segment spans
+remain bounded by their logical files. `multi_decompress_to_buffer(threads=0)`
+checks declared decoded sizes, then workers scatter temporary ordinary CPU output
+into the persistent image. Native decoding creates no extra workers.
+Every rank maps that same prepared tmpfs inode.
+CUDA decoders register their mappings for asynchronous H2D; rank-local plans
+select the required tensors without another host copy.
+Followers create no payload pool; abort cancels their owner wait. Global manifest
+and encoded mappings are dropped after host preparation.
 
 DE ranks own private CUDA 13 `HOST_NUMA`/`PINNED` allocations with
-`CU_MEM_CREATE_USAGE_HW_DECOMPRESS`; these are never exported/imported. CUDA decode
-uses ordinary pinned Torch host memory. Both paths retain their rank-local arena.
-Both the rank arena and encoded cache fit the initial extent, rounded to their
-allocation granularity. Growth reserves twice the required extent; fitting updates
-reuse storage. Host RAM and tmpfs capacity are separate.
+`CU_MEM_CREATE_USAGE_HW_DECOMPRESS`; these are never exported/imported. Each DE rank
+maps the shared prepared image without registration and copies only its required
+tensor spans into its private arena, without another file read, hash or
+outer decode. All arenas and caches fit the initial extent, rounded to allocation
+granularity. Growth reserves twice the required extent; fitting
+updates reuse storage and CUDA registrations. Shared prepared capacity is counted
+once per engine-host, while DE rank-private capacity is counted per rank.
 
-Successful all-rank resume authorizes encoded-cache reuse. The session queues
-release and view cleanup ahead of its next prepare on the same FIFO executor.
+Successful all-rank resume authorizes encoded and prepared-cache reuse. The session
+queues release and view cleanup ahead of its next prepare on the same FIFO executor.
 BUILDING precedes overwrite; failed/aborted publications remain nonreusable, and
 late old releases cannot release newer bytes. Explicit clear removes retained
-encoded files only after the rank-close barrier.
+encoded and prepared files only after the rank-close barrier.
 
 ## Fixed decode/apply pipeline
 
@@ -243,20 +258,21 @@ identity cannot detect unrelated same-buffer writes by another updater.
 ## Configuration and observations
 
 Feature environment variables are development controls, not a stable public API.
-Keep them fixed for the stream's lifetime. Batch size and worker count are
-captured when the backend is created; sorting is captured by each decoder.
+Keep them fixed for the stream's lifetime. Batch size is captured at backend
+creation, worker count when its pool is first needed, and sorting by each decoder.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
 | `GPU_DELTA_LAYERS_PER_BATCH` | `1` | Positive count of active adjacent model layers per batch |
-| `GPU_DELTA_CPU_WORKERS` | `32` | Reusable workers per rank, allowed range 1–32 |
+| `GPU_DELTA_CPU_WORKERS` | `32` | Reusable workers on one owner per engine-host, for every codec; range 1–64 |
 | `GPU_DELTA_SORT_BEFORE_HW_DECOMPRESS` | `0` | `0`/`1`, native sorting on the paused DE call |
 | `GPU_DELTA_HOST_CACHE_DIR` | `/dev/shm/sglang-gpu-delta-<uid>` | Private user-owned tmpfs visible to the engine's host-local cohort |
 | `SGLANG_ENABLE_NVTX_OPERATIONS` | `0` | Standard SGLang detailed operation annotations, including GPU delta |
 
 There is no decode-depth or legacy timing/NVTX knob. Wrapped workers have independent
-Zstd contexts and at most four tasks per worker. Two EP4 engines can use eight pools
-of 32 workers. Engine IDs and `host_cache_id`, not hostname alone, define cache
+Zstd contexts and at most four tasks per worker. Two host-local EP4 engines use two
+preparation pools on either decoder path. Engine IDs and
+`host_cache_id`, not hostname alone, define cache
 sharing. Independent engines share no cache locks or release lifecycle.
 
 Payload verification is selected per update by `validate_payload_hash=True` on
@@ -310,16 +326,25 @@ CPU slab construction and launch prebinding are outside
   and `hash_bytes` count work once. `skip_payload_hash` is reported on every rank;
   skipped SHA time/counts are zero.
 - `host_rank_outer_zstd_decode_s` encloses task submission/join, including raw
-  copies; `host_rank_outer_zstd_worker_decode_sum_s` sums workers.
-  `host_rank_outer_zstd_{encoded_bytes,decoded_bytes,tensors,frames}` counts local
-  wrapped work. Plain LZ4/Bitcomp uses `host_rank_encoded_copy_s` and
+  copies; `host_rank_outer_zstd_worker_decode_sum_s` sums each worker's native
+  batch decode and scatter into the shared image.
+  `host_rank_outer_zstd_{encoded_bytes,decoded_bytes,tensors,frames}` counts
+  full-image wrapped work only on the owner and zero on followers.
+  Plain LZ4/Bitcomp uses `host_rank_encoded_copy_s` and
   `host_rank_encoded_copy_{worker_sum_s,bytes,tensors}` instead; copy counters
   exclude raw targets. Inactive codec counters are zero.
 - `host_rank_{arena_bytes,capacity_bytes,capacity_generation,mapping_reused}` and
-  `host_rank_allocation_{s,calls,bytes}` describe private arenas.
+  `host_rank_allocation_{s,calls,bytes}` describe local mappings and required bytes.
+  CUDA ranks share physical capacity; its allocation calls count registrations.
+  `host_rank_private_capacity_bytes` counts only private DE input storage.
+  `host_rank_staging_copy_{s,bytes}` measures DE's local copy from the shared image;
+  it is zero for CUDA decode.
   `host_encoded_cache_capacity_{bytes,generation}` and creator-only
   `host_encoded_cache_allocation_{s,calls,bytes}` describe shared tmpfs.
-  `host_rank_cpu_workers` records pool size.
+  `host_prepared_cache_*` describes the shared prepared image; `build_s` repeats
+  its owner duration on followers and must not be summed. `host_rank_cpu_workers`
+  records pool size, zero for followers on either path. Capacity counters exclude
+  temporary native Zstd output slabs and do not measure total host RAM usage.
 
 `scheduler_timing.blocked_s` is the pause metric: process-local `monotonic_ns` from
 setting the pause flag before reader fencing through resume clearing it. It includes
@@ -367,8 +392,11 @@ Manual tests use the paired CUDA 13 Miles image, `nvidia-libnvcomp-cu13==6.0.0.1
 DE cases and the DE allocator test require SM100/SM103. CUDA Bitcomp/Snappy/LZ4
 cases do not require DE. Together they exercise sorting off/on, fixed-slot reuse,
 known byte output and ownership without sending malformed compressed streams into
-nvCOMP. The host CUDA test additionally checks private rank allocations,
-once-per-engine file verification and warm reuse/growth. Its two-engine DE case
+nvCOMP. The host tests additionally check one-owner preparation, shared bytes and
+capacity reuse/growth, cancellation and failure lifetimes. The host CUDA test
+checks shared registered mappings and asynchronous H2D after a peer unregisters,
+plus private DE rank allocations and once-per-engine file verification. Its
+two-engine DE case
 and the allocator context-restoration test each require two DE-capable devices.
 Use separate fresh processes for each ambient allocator mode:
 
