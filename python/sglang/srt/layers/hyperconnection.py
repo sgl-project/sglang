@@ -7,11 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.srt.environ import envs
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
     weight_cache_key,
 )
+from sglang.srt.utils.common import is_gfx95_supported
 
 
 @lru_cache(None)
@@ -173,6 +175,25 @@ class GatedResidual(HyperConnectionBase):
             self._mix_flydsl_ok = None
             self._mix_flydsl_weights = None
             self._mix_flydsl_weight_key = None
+        # Decode-sized gfx950 sites: the norm and the inject GEMV fold into the mix,
+        # which hands its combine the inject logits as gate partials.
+        self._fused_hc_ok = (
+            use_mix
+            and envs.SGLANG_OPT_QWEN4_FUSED_HC.get()
+            and self.hc_count == 4
+            and self.config.hc_per_branch_norm
+            and is_gfx95_supported()
+        )
+        if self._fused_hc_ok:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import (
+                hc_fused_shapes_supported,
+            )
+
+            self._fused_hc_ok = hc_fused_shapes_supported(
+                self.hc_count * self.hidden_size, self.config.hc_lowrank
+            )
+        self._fused_hc_weights = None
+        self._fused_hc_weight_key = None
 
         self._gate_stream = None
         if use_combine:
@@ -203,6 +224,8 @@ class GatedResidual(HyperConnectionBase):
             ):
                 # Create before graph capture; all layers on a device share it.
                 self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
+        else:
+            self.block_inject_weight = None
 
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
@@ -251,6 +274,34 @@ class GatedResidual(HyperConnectionBase):
             )
         return self._mix_flydsl_ok
 
+    def _fused_mix(self, hyper_input: torch.Tensor, sumsq: Optional[torch.Tensor]):
+        from sglang.kernels.ops.gemm.hc_fused_flydsl import HcFusedWeights, hc_fused_mix
+
+        down = self.input_mix_weight_down.weight
+        up = self.input_mix_weight_up.weight
+        norm = self.hc_norm.weight
+        inject = self.block_inject_weight
+        inject = None if inject is None else inject.weight
+        # The norm and inject weights are folded into the packed copy as well.
+        key = (
+            weight_cache_key(down, up),
+            weight_cache_key(norm, norm if inject is None else inject),
+        )
+        if self._fused_hc_weight_key != key:
+            self._fused_hc_weights = HcFusedWeights(
+                down=down,
+                up=up,
+                inject=inject,
+                norm_weight=norm,
+                eps=self.hc_norm.variance_epsilon,
+            )
+            self._fused_hc_weight_key = key
+        mixed_input, inject_logits = hc_fused_mix(
+            h=hyper_input, weights=self._fused_hc_weights, sumsq=sumsq
+        )
+        # The fused combine never reads the normed slot.
+        return mixed_input, (hyper_input, hyper_input, inject_logits)
+
     def mix(
         self,
         hyper_input: torch.Tensor,
@@ -262,6 +313,13 @@ class GatedResidual(HyperConnectionBase):
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input, None)
+        if (
+            self._fused_hc_ok
+            and not torch.compiler.is_compiling()
+            and flydsl_hc_mix_supported(hyper_input, True)
+        ):
+            # Fused sites get combine_and_normalize's sums of squares as normalized_input.
+            return self._fused_mix(hyper_input, sumsq=normalized_input)
 
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
@@ -357,6 +415,14 @@ class GatedResidual(HyperConnectionBase):
         Callers must only pass the norm when no PLE or other update intervenes.
         """
         hyper_input, _, partials = residuals
+        if self._fused_hc_ok and partials is not None:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
+
+            # The next fused mix takes the combine's sums of squares in place of the norm.
+            out, sumsq = hc_apply_inject(
+                h=hyper_input, y=block_output.contiguous(), g=partials
+            )
+            return out, (sumsq if next_norm is not None else None)
         if (
             partials is not None
             and next_norm is not None
@@ -386,6 +452,12 @@ class GatedResidual(HyperConnectionBase):
         residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if self._fused_hc_ok and partials is not None:
+            from sglang.kernels.ops.gemm.hc_fused_flydsl import hc_apply_inject
+
+            return hc_apply_inject(
+                h=hyper_input, y=block_output.contiguous(), g=partials
+            )[0]
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,
