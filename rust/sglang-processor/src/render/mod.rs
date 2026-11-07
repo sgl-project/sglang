@@ -26,9 +26,9 @@ pub use self::media::extract_images;
 pub(crate) use self::models::deepseek_v4_thinking;
 pub use self::models::{DeepSeekTokenizer, continues_final_message};
 use self::models::{
-    deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38,
-    prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3, render_minimax_m3,
-    render_qwen38, takes_content_parts,
+    deep_sort, encode_tools_to_typescript, extract_glm53_images, is_glm53, is_minimax_m3,
+    is_qwen38, prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3,
+    render_minimax_m3, render_qwen38, takes_content_parts,
 };
 #[cfg(feature = "openai")]
 pub(crate) use self::models::{
@@ -90,6 +90,16 @@ pub enum ChatFormatter {
 }
 
 impl ChatFormatter {
+    /// Image sources in the order this formatter renders their placeholders.
+    /// Use this instead of the free `extract_images` function when a formatter
+    /// can reorder image-bearing tool results.
+    pub fn extract_images(&self, messages: &Value) -> Result<Vec<String>, String> {
+        match self {
+            ChatFormatter::Glm53(_) => extract_glm53_images(messages),
+            _ => extract_images(messages),
+        }
+    }
+
     /// Render the request's messages to a single prompt string.
     #[cfg(test)]
     pub(super) fn render(&self, request: &dyn OAIChatLikeRequest) -> Result<String, TemplateError> {

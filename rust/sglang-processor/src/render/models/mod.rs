@@ -17,7 +17,9 @@ pub(crate) use self::deepseek_v4::{
     continued_message as deepseek_v4_continued_message, parse_start as deepseek_v4_parse_start,
     special_tokens as deepseek_v4_special_tokens, task as deepseek_v4_task,
 };
-pub(super) use self::glm53::{is_glm53, render as render_glm53};
+pub(super) use self::glm53::{
+    extract_images as extract_glm53_images, is_glm53, render as render_glm53,
+};
 pub(super) use self::kimi_k3::render as render_kimi_k3;
 pub(super) use self::kimi_k25::{deep_sort, encode_tools_to_typescript};
 pub(super) use self::minimax_m3::{

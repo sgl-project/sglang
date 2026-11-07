@@ -22,7 +22,7 @@ pub fn extract_images(messages: &Value) -> Result<Vec<String>, String> {
 }
 
 /// `image_url` is an object with `url`, or (the flat form) the URL itself.
-fn image_url(part: &Value) -> Option<&str> {
+pub(super) fn image_url(part: &Value) -> Option<&str> {
     match &part["image_url"] {
         Value::String(url) => Some(url),
         object => object["url"].as_str(),

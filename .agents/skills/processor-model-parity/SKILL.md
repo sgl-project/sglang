@@ -13,9 +13,11 @@ the implementation, and SGLang code exists only where the two differ.
 
 Scope: the request -> prompt -> token ids path, plus the checks that let hosts
 serve the model's OpenAI requests through `/generate` (see "OpenAI layer").
-Chat rendering with media is not covered here: `render_request` fails on media
-content parts, so hosts send those chats to the engine. The fixture generator
-serves every checkpoint text-only, so a media case records that rejection.
+GLM-5.3 also renders image chats. Set `is_multimodal: true` in its fixture to
+record the prompt and the ordered `image_sources` collected by Python;
+`tests/parity.rs` checks both rendering and `ChatFormatter::extract_images`.
+Other fixtures default to a text-only server, where media cases record rejection.
+Hosts still validate whether their loaded model accepts media.
 
 Image preprocessing (`src/mm/`) has its own skill:
 [`processor-mm-parity`](../processor-mm-parity/SKILL.md).

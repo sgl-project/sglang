@@ -122,6 +122,7 @@ async fn chat_completions(
     let images = match chat_images(
         &request.messages,
         state.server_args.model_config.is_multimodal,
+        state.chat_formatter.as_ref(),
     ) {
         Ok(images) => images,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
@@ -382,6 +383,7 @@ async fn chat_completions(
 fn chat_images<T: serde::Serialize>(
     messages: &T,
     is_multimodal: bool,
+    formatter: Option<&ChatFormatter>,
 ) -> Result<Vec<MmItem>, String> {
     let messages = serde_json::to_value(messages).unwrap_or_default();
     if !contains_media(&messages) {
@@ -390,7 +392,10 @@ fn chat_images<T: serde::Serialize>(
     if !is_multimodal || contains_non_image_media(&messages) {
         return Err("image, audio, video, and file message content is not supported".into());
     }
-    let images = sglang_processor::extract_images(&messages)?;
+    let images = match formatter {
+        Some(formatter) => formatter.extract_images(&messages),
+        None => sglang_processor::extract_images(&messages),
+    }?;
     Ok(images.into_iter().map(MmItem::Source).collect())
 }
 
@@ -1161,23 +1166,67 @@ mod tests {
             {"role": "user", "content": "plain"},
             {"role": "user", "content": [image("b")]},
         ]);
-        let urls: Vec<String> = chat_images(&messages, true)
+        let urls: Vec<String> = chat_images(&messages, true, None)
             .unwrap()
             .into_iter()
             .map(|item| item.source().unwrap().to_owned())
             .collect();
         assert_eq!(urls, ["a", "b"]);
-        assert!(chat_images(&messages, false).is_err());
+        assert!(chat_images(&messages, false, None).is_err());
         let video = serde_json::json!([{"role": "user", "content": [
             {"type": "video_url", "video_url": {"url": "v"}}
         ]}]);
-        assert!(chat_images(&video, true).is_err());
+        assert!(chat_images(&video, true, None).is_err());
         let text = serde_json::json!([{"role": "user", "content": "plain"}]);
-        assert!(chat_images(&text, false).unwrap().is_empty());
+        assert!(chat_images(&text, false, None).unwrap().is_empty());
         let no_url = serde_json::json!([{"role": "user", "content": [
             {"type": "image_url", "image_url": null, "uuid": "cached"}
         ]}]);
-        assert!(chat_images(&no_url, true).is_err());
+        assert!(chat_images(&no_url, true, None).is_err());
+    }
+
+    /// Exercise the endpoint's typed message serialization and template path:
+    /// features must follow the Python prompt's placeholders after tool sorting.
+    #[test]
+    fn glm_image_prompts_and_sources_match_python() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../sglang-processor/tests/fixtures/parity/glm-5.3-flash.json"
+        )))
+        .unwrap();
+        let formatter = super::super::test_utils::checkpoint_formatter(
+            &fixture["config"],
+            fixture["chat_template"].as_str().unwrap(),
+        );
+        for name in [
+            "text_parts_after_image",
+            "tool_image_order",
+            "tool_image_multiple_parts",
+            "tool_image_multiple_runs",
+        ] {
+            let case = fixture["cases"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|case| case["name"] == name)
+                .unwrap();
+            let body = case["request"].clone();
+            let request: CreateChatCompletionRequest =
+                serde_json::from_value(body.clone()).unwrap();
+            let images: Vec<_> = chat_images(&request.messages, true, Some(&formatter))
+                .unwrap()
+                .into_iter()
+                .map(|item| item.source().unwrap().to_owned())
+                .collect();
+            assert_eq!(serde_json::json!(images), case["image_sources"], "{name}");
+            let rendered =
+                super::render_chat(&formatter, body, &request, &Default::default()).unwrap();
+            assert_eq!(
+                rendered.prompt.as_str().to_owned() + &rendered.continuation,
+                case["prompt"],
+                "{name}"
+            );
+        }
     }
 
     /// Python `to_sampling_params` priority: user value > model generation

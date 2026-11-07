@@ -40,8 +40,8 @@ deepseek-recipe-core = { version = "=0.2.0", optional = true }
 deepseek-recipe-encoding = { version = "=0.2.0", optional = true }
 # DeepSeek prompt ids as recipe encodes them; the version is recipe's.
 tokenizers = { version = "0.23.2", default-features = false, optional = true }
-# GLM image processing: pin the upstream PR until its first crate release.
-dynamo-multimodal = { git = "https://github.com/sherlockwu/frontend-crates.git", rev = "ebf6d290bc3e18f8caa7f65e9b85cc66a88f33aa", default-features = false, optional = true }
+# Includes GLM image processing and the PIL patch-expansion validation.
+dynamo-multimodal = { version = "=0.2.6", default-features = false, optional = true }
 dynamo-parsers = { version = "=9.2.8", optional = true }
 dynamo-protocols = { version = "7.0.0", optional = true }
 dynamo-renderer = { version = "7.1.1", optional = true }
