@@ -421,6 +421,14 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                     self.views["resolving_view"](hf_bf16).linear_attn_verify_backend,
                     "triton",
                 )
+                # The actual pool must also be FP32: this is the mismatch the
+                # hf_config value previously hid.
+                with self._runtime_scope():
+                    hf_bf16_pool = self._state_pool(self._args(dtype=None))
+                self.assertEqual(
+                    hf_bf16_pool.mamba2_layer_cache(0).temporal.dtype,
+                    torch.float32,
+                )
                 # The default FP32 pool (no CLI flag, no HF value) must reach
                 # the explicit FP32 Kimi fused route.
                 default_fp32 = self._args(dtype=None, hf_dtype=None)
