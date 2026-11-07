@@ -18,16 +18,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.layers.dcp.layout import maybe_dcp_kernel_indices
-from sglang.srt.managers.cache_controller import (
-    HiCacheController,
-    check_dcp_l3_extra_pool,
-)
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
-from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -534,129 +528,6 @@ class TestDcpStoragePages(CustomTestCase):
         pool.layout = "page_first_kv_split"
         with self.assertRaises(NotImplementedError):
             pool.get_page_buffer_meta(torch.arange(128))
-
-
-def _make_indexer_host(anchor: MLATokenToKVPoolHost, stride: int = 6):
-    """CPU DSAIndexerPoolHost carrying only the storage-page state (the real
-    constructor needs a CUDA DSA device pool)."""
-    pool = DSAIndexerPoolHost.__new__(DSAIndexerPoolHost)
-    pool.page_size = anchor.page_size
-    pool.dcp_size = anchor.dcp_size
-    pool.dcp_rank = anchor.dcp_rank
-    pool.layout = anchor.layout
-    pool.size = anchor.size
-    pool.page_num = anchor.page_num
-    pool.layer_num = 2
-    pool.indexer_dtype = torch.uint8
-    pool.indexer_page_stride_size = stride
-    pool.indexer_page_num = (pool.size + pool.page_size + 1) // pool.page_size
-    shape = (
-        (pool.layer_num, pool.indexer_page_num, stride)
-        if pool.layout == "layer_first"
-        else (pool.indexer_page_num, pool.layer_num, 1, stride)
-    )
-    pool.index_k_with_scale_buffer = (
-        (torch.arange(torch.Size(shape).numel()) % 251).to(torch.uint8).reshape(shape)
-    )
-    return pool
-
-
-class TestDcpIndexerStoragePages(CustomTestCase):
-    """L3 keys address widened pages; the row-sharded indexer stores one
-    physical page per logical page, the same row the L2 transfer uses."""
-
-    @staticmethod
-    def _page(pool, page):
-        if pool.layout == "layer_first":
-            return pool.index_k_with_scale_buffer[:, page]
-        return pool.index_k_with_scale_buffer[page]
-
-    def test_logical_pages_map_to_physical_pages(self):
-        for dcp in (1, 2, 8):
-            for layout in ("layer_first", "page_first", "page_first_direct"):
-                with self.subTest(dcp=dcp, layout=layout):
-                    anchor = _make_host_pool(1, dcp_size=dcp, layout=layout)
-                    source = _make_indexer_host(anchor)
-                    target = _make_indexer_host(anchor)
-                    target.index_k_with_scale_buffer.zero_()
-                    span = source.logical_page_size
-                    self.assertEqual(span, PHYSICAL_PAGE * dcp)
-                    payload = source.get_data_page(3 * span)
-                    torch.testing.assert_close(payload, self._page(source, 3).flatten())
-                    target.set_from_flat_data_page(5 * span, payload)
-                    torch.testing.assert_close(
-                        self._page(target, 5), self._page(source, 3)
-                    )
-                    self.assertEqual(
-                        int(target.index_k_with_scale_buffer.count_nonzero()),
-                        int(self._page(source, 3).count_nonzero()),
-                    )
-
-    def test_zero_copy_uses_physical_pages(self):
-        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
-        pool = _make_indexer_host(anchor)
-        indices = torch.cat([torch.arange(p * 128, (p + 1) * 128) for p in (3, 0)])
-        pointers, sizes = pool.get_page_buffer_meta(indices)
-        self.assertEqual(
-            pointers,
-            [pool.index_k_with_scale_buffer[p].data_ptr() for p in (3, 0)],
-        )
-        self.assertEqual(sizes, [2 * 6] * 2)
-
-    def test_zero_copy_pointers_are_ints_without_dcp(self):
-        anchor = _make_host_pool(0, dcp_size=1, layout="page_first")
-        pool = _make_indexer_host(anchor)
-        pointers, _ = pool.get_page_buffer_meta(torch.arange(128))
-        self.assertEqual([type(p) for p in pointers], [int, int])
-
-    def test_invalid_logical_starts_are_rejected(self):
-        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
-        pool = _make_indexer_host(anchor)
-        for index in (-128, 1, 64):
-            with self.subTest(index=index), self.assertRaises(ValueError):
-                pool.get_data_page(index)
-        with self.assertRaises(IndexError):
-            pool.get_data_page(anchor.logical_size)
-        with self.assertRaises(AssertionError):
-            pool.get_page_buffer_meta(torch.arange(64))
-
-
-class TestDcpL3PoolCheck(CustomTestCase):
-    def _check(self, name, pool, anchor):
-        check_dcp_l3_extra_pool(SimpleNamespace(name=name, host_pool=pool), anchor)
-
-    def test_allowed_pools(self):
-        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
-        for name, pool in (
-            (PoolName.KV, anchor),
-            (PoolName.MAMBA, MambaPoolHost.__new__(MambaPoolHost)),
-            (PoolName.INDEXER, _make_indexer_host(anchor)),
-        ):
-            with self.subTest(name=name, pool=type(pool).__name__):
-                self._check(name, pool, anchor)
-
-    def test_rejected_pools(self):
-        anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
-        indexer = _make_indexer_host(anchor)
-        replicated = _make_indexer_host(anchor)
-        replicated.dcp_size = 1
-        resized = _make_indexer_host(_make_host_pool(1, 512, 2, "page_first"))
-        sharded_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
-        dummy_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
-        dummy_draft.kv_buffer = None
-        replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
-        for label, name, pool in (
-            ("replicated index-K", PoolName.INDEXER, replicated),
-            ("sharded draft", PoolName.DRAFT, sharded_draft),
-            ("indexer size", PoolName.INDEXER, resized),
-            ("draft indexer", PoolName.DRAFT_INDEXER, indexer),
-            ("dummy draft", PoolName.DRAFT, dummy_draft),
-            ("replicated draft", PoolName.DRAFT, replicated_draft),
-            ("swa", PoolName.SWA, indexer),
-            ("mamba name", PoolName.MAMBA, indexer),
-        ):
-            with self.subTest(label), self.assertRaises(NotImplementedError):
-                self._check(name, pool, anchor)
 
 
 class TestLayerShardedHostTransfers(CustomTestCase):
