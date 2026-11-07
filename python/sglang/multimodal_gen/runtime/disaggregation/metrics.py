@@ -12,7 +12,6 @@ class RoleStats:
     requests_completed: int = 0
     requests_failed: int = 0
     requests_in_flight: int = 0
-    requests_timed_out: int = 0
     queue_depth: int = 0
     last_latency_s: float = 0.0
     avg_latency_s: float = 0.0
@@ -26,7 +25,6 @@ class RoleStats:
             "requests_completed": self.requests_completed,
             "requests_failed": self.requests_failed,
             "requests_in_flight": self.requests_in_flight,
-            "requests_timed_out": self.requests_timed_out,
             "queue_depth": self.queue_depth,
             "last_latency_s": round(self.last_latency_s, 4),
             "avg_latency_s": round(self.avg_latency_s, 4),
@@ -46,7 +44,6 @@ class DisaggMetrics:
 
         self._completed = 0
         self._failed = 0
-        self._timed_out = 0
 
         self._in_flight: dict[str, float] = {}
 
@@ -86,11 +83,6 @@ class DisaggMetrics:
             self._in_flight.pop(request_id, None)
             self._failed += 1
 
-    def record_request_timeout(self, request_id: str) -> None:
-        with self._lock:
-            self._in_flight.pop(request_id, None)
-            self._timed_out += 1
-
     def update_queue_depth(self, depth: int) -> None:
         with self._lock:
             self._queue_depth = depth
@@ -112,7 +104,6 @@ class DisaggMetrics:
                 requests_completed=self._completed,
                 requests_failed=self._failed,
                 requests_in_flight=len(self._in_flight),
-                requests_timed_out=self._timed_out,
                 queue_depth=self._queue_depth,
                 last_latency_s=self._last_latency,
                 avg_latency_s=avg_latency,

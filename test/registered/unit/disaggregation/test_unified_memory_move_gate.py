@@ -18,6 +18,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
 from sglang.srt.managers.scheduler_components.request_list import ListKind
@@ -41,11 +42,12 @@ class _FakeTransferQueue:
         self.queue = decode_queue(ListKind.PD_RECEIVING)
 
 
-class _FakePreallocQueue:
+class _FakePreallocQueue(DecodePreallocQueue):
     """Mirrors the real queue's published-destination bookkeeping."""
 
-    def __init__(self):
+    def __init__(self, transfer_queue):
         self._num_published_destinations = 0
+        self.transfer_queue = transfer_queue
 
     @property
     def has_published_destinations(self) -> bool:
@@ -67,7 +69,9 @@ class _FakeScheduler:
         self.disagg_prefill_transfer_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
-        self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.disagg_decode_prealloc_queue = _FakePreallocQueue(
+            self.disagg_decode_transfer_queue
+        )
         self.decode_offload_manager = None
 
 
@@ -163,6 +167,7 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
             self._load_pinned_pages = 0
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
+            self._unsettled_free = ()  # no frees held for an in-flight forward
 
         def _is_frontier_transparent(self):
             return False
@@ -170,6 +175,7 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
         # Exercise the production predicates when checking each source.
         moves_blocked = Band.moves_blocked
         pinned_by_source = Band.pinned_by_source
+        _unsettled_page_count = Band._unsettled_page_count
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from
@@ -316,7 +322,9 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 scheduler.disaggregation_mode = DisaggregationMode.DECODE
                 scheduler.disagg_prefill_transfer_queue = None
                 scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
-                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
+                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue(
+                    scheduler.disagg_decode_transfer_queue
+                )
                 check_pins(False)
                 scheduler.disagg_decode_transfer_queue.queue.join(
                     [SimpleNamespace(req=FakeReq(), host_staged=False)]
