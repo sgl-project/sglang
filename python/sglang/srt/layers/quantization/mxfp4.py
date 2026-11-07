@@ -36,7 +36,11 @@ from sglang.srt.layers.amx_utils import (
 )
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
-from sglang.srt.layers.moe.utils import get_moe_a2a_backend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    get_moe_a2a_backend,
+    get_moe_runner_backend,
+    route_dropped_experts_to_local,
+)
 from sglang.srt.layers.quantization.base_config import (
     FusedMoEMethodBase,
     QuantizationConfig,
@@ -1677,6 +1681,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             assert TopKOutputChecker.format_is_standard(topk_output)
             topk_weights, topk_ids, _ = topk_output
+            topk_weights, topk_ids = route_dropped_experts_to_local(
+                topk_weights=topk_weights, topk_ids=topk_ids
+            )
             moe_runner_config = self.moe_runner_config
             output = sgl_fused_experts(
                 x,
