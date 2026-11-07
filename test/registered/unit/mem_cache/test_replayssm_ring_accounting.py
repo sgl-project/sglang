@@ -96,16 +96,19 @@ class TestReplaySSMRingAccounting(CustomTestCase):
             ),
             (0, per_req),
         )
-        # Host-only: 96 live requests plus the pool padding slot.
-        self.assertEqual(
-            replayssm_ring_memory_charge(
-                per_req,
-                request_scoped=True,
-                max_running_requests=96,
-                attn_dp_size=1,
-            ),
-            (per_req * 97, 0),
-        )
+        # Request-indexed rings also need the PD in-transfer rows.
+        for pre_alloc_size in (0, 16):
+            with self.subTest(pre_alloc_size=pre_alloc_size):
+                self.assertEqual(
+                    replayssm_ring_memory_charge(
+                        per_req,
+                        request_scoped=True,
+                        max_running_requests=96,
+                        attn_dp_size=1,
+                        pre_alloc_size=pre_alloc_size,
+                    ),
+                    (per_req * (97 + pre_alloc_size), 0),
+                )
 
     def test_zero_len_ring(self):
         self.assertEqual(_gdn_params().replayssm_ring_bytes_per_req(record_len=0), 0)
