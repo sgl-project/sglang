@@ -5,6 +5,16 @@ import torch
 from transformers import BatchFeature
 
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.multimodal_processor_mixin import (
+    load_audio_item,
+    load_image_item,
+    load_video_item,
+)
+from sglang.srt.utils import (
+    GPUImageDecodeMode,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
+)
 
 
 def concat_media_features(item_features):
@@ -58,8 +68,12 @@ class TokenSpaceProcessStrategy:
     discard_alpha_channel: bool = True
     # Where a video request decodes and preprocesses; mm_process_config overrides it.
     video_preprocessing_device: str | None = None
+    # The image loader's defaults for this model; mm_process_config overrides them per server
+    # ("image_decoder": pil | nvjpeg | nvjpeg_fancy, "image_rgb_conversion": convert | white | smart).
     # False decodes JPEGs with PIL even on CUDA; nvJPEG pixels differ from PIL's.
-    gpu_image_decode: bool = True
+    gpu_image_decode: GPUImageDecodeMode = True
+    # "convert" drops alpha, "white" composites it onto white as qwen_vl_utils does, "smart" picks a background.
+    rgb_conversion: str = "convert"
 
     def __init__(self, hf_config, processor, *, mm_process_config=None):
         # `processor` is the shared original; read config from it here, never keep it.
@@ -68,8 +82,34 @@ class TokenSpaceProcessStrategy:
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
+        self.gpu_image_decode = resolve_gpu_image_decode(
+            mm_process_config, type(self).gpu_image_decode
+        )
+        self.rgb_conversion = resolve_rgb_conversion(
+            mm_process_config, type(self).rgb_conversion
+        )
         # Token IDs and sizes for expansion, e.g. image_token_id, spatial_merge_size.
         self.mm_token_expansion_params = {}
+
+    # Media loading, one source per call. The IO threads share this instance: these read
+    # class attributes and __init__ state and never write `self`. Override to decode as
+    # the model's own processor does.
+    def load_image(self, source):
+        """The decoded image of one source: a PIL image, or a GPU tensor when nvJPEG decoded it."""
+        return load_image_item(
+            source,
+            gpu_image_decode=self.gpu_image_decode,
+            discard_alpha_channel=self.discard_alpha_channel,
+            rgb_conversion=self.rgb_conversion,
+        )
+
+    def load_video(self, source, *, video_decode_device):
+        """The frame reader of one source; decodes on the GPU unless the device is "cpu"."""
+        return load_video_item(source, video_decode_device=video_decode_device)
+
+    def load_audio(self, source):
+        """The mono waveform of one source at `audio_sample_rate`."""
+        return load_audio_item(source, audio_sample_rate=self.audio_sample_rate)
 
     def resolve_media_options(
         self, processor, *, image_device=None, video_device=None
