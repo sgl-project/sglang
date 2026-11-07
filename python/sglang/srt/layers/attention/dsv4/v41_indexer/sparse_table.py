@@ -33,7 +33,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_from_metadata,
 )
 from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 from .scoring import (
     DeepGEMMDecodeData,

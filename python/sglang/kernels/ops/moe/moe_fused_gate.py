@@ -252,7 +252,9 @@ def _router_triton_kernel(
             in_g = (group_of_n[None, :] == g) & mask_n[None, :]
             vals = tl.where(in_g, biased, -float("inf"))
             top1 = tl.max(vals, axis=1)[:, None]  # [BLOCK_M, 1]
-            vals2 = tl.where(vals >= top1, -float("inf"), vals)
+            # Drop only the first copy of the max: a tied max also counts as top2.
+            top1_n = tl.min(tl.where(vals == top1, offs_n[None, :], BLOCK_N), axis=1)
+            vals2 = tl.where(offs_n[None, :] == top1_n[:, None], -float("inf"), vals)
             top2 = tl.max(vals2, axis=1)[:, None]  # [BLOCK_M, 1]
             group_score = tl.where(offs_g[None, :] == g, top1 + top2, group_score)
 
@@ -504,7 +506,6 @@ def moe_fused_gate(
             num_fused_shared_experts,
             num_expert_group,
             topk_group,
-            scores.device.index,
         )
         and moe_route_warp.bias_layout_ok(bias, bias_alt)
     ):
