@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -23,6 +24,31 @@ if TYPE_CHECKING:
 
 if is_npu():
     import torch_npu
+
+
+logger = logging.getLogger(__name__)
+
+
+class _NpuCpuBackupCopier:
+    """Fall back to pageable storage when pinned host allocation fails."""
+
+    def __init__(self):
+        self.non_blocking = True
+
+    def __call__(self, selected):
+        # Index the NPU buffer before calling this helper: a pageable retry
+        # cannot resolve failures allocating the selected device tensor.
+        try:
+            return selected.to("cpu", non_blocking=self.non_blocking)
+        except torch.OutOfMemoryError:
+            if not self.non_blocking:
+                raise
+            logger.warning(
+                "Pinned host allocation failed during NPU KV retraction; "
+                "using synchronous pageable copies for this backup."
+            )
+            self.non_blocking = False
+            return selected.to("cpu", non_blocking=False)
 
 
 def _mla_fia_nz_scatter_indices(
@@ -434,17 +460,14 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
 
     def _chunk_copy_npu_to_cpu(self, buf_of_layers, indices):
         chunk_size = self.cpu_offloading_chunk_size
+        copy_to_cpu = _NpuCpuBackupCopier()
         out = []
         for tensors_per_layer in buf_of_layers:  # [k_buf, v_buf]
             layer_chunks = []
             for i in range(0, len(indices), chunk_size):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
-                    [
-                        t[ci].to("cpu", non_blocking=True)
-                        for t in tensors_per_layer
-                        if t is not None
-                    ]
+                    [copy_to_cpu(t[ci]) for t in tensors_per_layer if t is not None]
                 )
             out.append(layer_chunks)
         return out
@@ -1122,6 +1145,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self, buf_of_layers, indices, uses_global_slots_per_layer
     ):
         chunk_size = self.cpu_offloading_chunk_size
+        copy_to_cpu = _NpuCpuBackupCopier()
         out = []
         for tensors_per_layer, uses_global_slots in zip(
             buf_of_layers, uses_global_slots_per_layer, strict=True
@@ -1131,9 +1155,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                 ci = indices[i : i + chunk_size]
                 layer_chunks.append(
                     [
-                        t[self._copy_indices_for_buffer(ci, uses_global)].to(
-                            "cpu", non_blocking=True
-                        )
+                        copy_to_cpu(t[self._copy_indices_for_buffer(ci, uses_global)])
                         for t, uses_global in zip(
                             tensors_per_layer, uses_global_slots, strict=True
                         )
