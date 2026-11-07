@@ -625,9 +625,9 @@ class HostKVCache(abc.ABC):
     def _storage_page_index(self, index: int) -> int:
         """Physical slot of the page an L3 key covers; storage backends address
         pages by logical (widened) slot, one physical page per rank under DCP."""
+        index = int(index)
         if self.dcp_size == 1:
             return index
-        index = int(index)
         if index < 0 or index % self.logical_page_size != 0:
             raise ValueError(
                 "DCP L3 page start must be a nonnegative logical page boundary."
