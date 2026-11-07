@@ -17,6 +17,11 @@ from typing import Callable, Optional
 
 import torch
 
+# Kimi K3/K3.1 KDA geometry after TP8 sharding: 12 local heads x 128.
+# Keep the admission explicit; this consumer is not a generic KDA adapter.
+_KIMI_KDA_HEADS = 12
+_KIMI_KDA_HEAD_DIM = 128
+
 
 @lru_cache(maxsize=1)
 def _get_fused_kda_decode() -> Optional[Callable]:
@@ -59,6 +64,104 @@ class PreparedFlashInferKDADecode:
     norm_weight: torch.Tensor
     norm_eps: float
     lower_bound: Optional[float]
+    heads: int
+    head_dim: int
+
+    @property
+    def seg(self) -> int:
+        return self.heads * self.head_dim
+
+    def unsupported_layout_reason(
+        self,
+        mixed_qkv: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        conv_states: torch.Tensor,
+        ssm_states: torch.Tensor,
+        cache_indices: torch.Tensor,
+        onorm_gate: torch.Tensor,
+    ) -> Optional[str]:
+        """Return why this layout is not covered, or ``None`` when it is.
+
+        Metadata only; do not read indices or copy strided inputs. This is the
+        single source of truth for ``covered`` and the one-shot provider log, so
+        an unexpected layout fallback is diagnosable instead of silent.
+
+        Ordinary decode owns unique positive Mamba slots. Slot zero is reserved
+        for dummy/idle traffic, and graph padding is -1. FlashInfer's
+        ``unique_or_null`` assertion therefore allows both kinds of null rows.
+        Verify and ReplaySSM do not enter this consumer.
+        """
+        heads, width, seg = self.heads, self.head_dim, self.seg
+        if mixed_qkv.ndim != 2:
+            return f"mixed_qkv is {mixed_qkv.ndim}-D, expected 2-D"
+        batch = mixed_qkv.shape[0]
+        if batch <= 0:
+            return "empty batch"
+        tensors = (mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_gate)
+        if any(t.device != self.weight.device for t in tensors):
+            return "input tensors are on a different device than the prepared weights"
+
+        if tuple(mixed_qkv.shape) != (batch, 3 * seg):
+            return f"mixed_qkv shape {tuple(mixed_qkv.shape)} != {(batch, 3 * seg)}"
+        if mixed_qkv.dtype != torch.bfloat16:
+            return f"mixed_qkv dtype {mixed_qkv.dtype} != torch.bfloat16"
+        if mixed_qkv.stride(1) != 1 or mixed_qkv.data_ptr() % 16 != 0:
+            return "mixed_qkv is not a 16-byte-aligned row view"
+
+        if (
+            tuple(a.shape) != (batch, seg)
+            or a.dtype != torch.bfloat16
+            or not a.is_contiguous()
+            or a.data_ptr() % 16 != 0
+        ):
+            return "raw_gate is not a 16-byte-aligned contiguous BF16 [batch, seg]"
+        if (
+            tuple(b.shape) != (batch, heads)
+            or b.dtype != torch.bfloat16
+            or b.stride(1) != 1
+            or b.data_ptr() % 16 != 0
+        ):
+            return "raw_beta is not a 16-byte-aligned BF16 [batch, heads] row view"
+        if (
+            tuple(onorm_gate.shape) != (batch, seg)
+            or onorm_gate.dtype != torch.bfloat16
+            or onorm_gate.stride(1) != 1
+            or onorm_gate.data_ptr() % 16 != 0
+        ):
+            return "output gate is not a 16-byte-aligned BF16 [batch, seg] row view"
+
+        if (
+            conv_states.ndim != 3
+            or tuple(conv_states.shape[1:]) != (3, 3 * seg)
+            or conv_states.dtype != torch.bfloat16
+            or conv_states.stride(1) != 3 * seg
+            or conv_states.stride(2) != 1
+            or conv_states.stride(0) < 9 * seg
+            or conv_states.stride(0) % 4 != 0
+            or conv_states.data_ptr() % 8 != 0
+        ):
+            return "conv state is not the expected BF16 envelope-strided view"
+        if (
+            ssm_states.ndim != 4
+            or tuple(ssm_states.shape[1:]) != (heads, width, width)
+            or ssm_states.shape[0] != conv_states.shape[0]
+            or ssm_states.dtype != torch.float32
+            or ssm_states.stride()[1:] != (width * width, width, 1)
+            or ssm_states.stride(0) < heads * width * width
+            or ssm_states.stride(0) % 4 != 0
+            or ssm_states.data_ptr() % 16 != 0
+        ):
+            return "SSM state is not the expected FP32 envelope-strided view"
+        if (
+            cache_indices.ndim != 1
+            or cache_indices.shape[0] != batch
+            or cache_indices.dtype != torch.int32
+            or not cache_indices.is_contiguous()
+            or cache_indices.data_ptr() % 16 != 0
+        ):
+            return "cache indices are not a 16-byte-aligned contiguous int32 [batch]"
+        return None
 
     def covered(
         self,
@@ -70,59 +173,18 @@ class PreparedFlashInferKDADecode:
         cache_indices: torch.Tensor,
         onorm_gate: torch.Tensor,
     ) -> bool:
-        """Check metadata only; do not read indices or copy strided inputs.
-
-        Ordinary decode owns unique positive Mamba slots. Slot zero is reserved
-        for dummy/idle traffic, and graph padding is -1. FlashInfer's
-        ``unique_or_null`` assertion therefore allows both kinds of null rows.
-        Verify and ReplaySSM do not enter this consumer.
-        """
-        heads, width = 12, 128
-        seg = heads * width
-        if mixed_qkv.ndim != 2:
-            return False
-        batch = mixed_qkv.shape[0]
-        tensors = (mixed_qkv, a, b, conv_states, ssm_states, cache_indices, onorm_gate)
+        """Check metadata only; ``unsupported_layout_reason`` owns the rules."""
         return (
-            batch > 0
-            and all(t.device == self.weight.device for t in tensors)
-            and tuple(mixed_qkv.shape) == (batch, 3 * seg)
-            and mixed_qkv.dtype == torch.bfloat16
-            and mixed_qkv.stride(1) == 1
-            and mixed_qkv.data_ptr() % 16 == 0
-            and tuple(a.shape) == (batch, seg)
-            and a.dtype == torch.bfloat16
-            and a.is_contiguous()
-            and a.data_ptr() % 16 == 0
-            and tuple(b.shape) == (batch, heads)
-            and b.dtype == torch.bfloat16
-            and b.stride(1) == 1
-            and b.data_ptr() % 16 == 0
-            and tuple(onorm_gate.shape) == (batch, seg)
-            and onorm_gate.dtype == torch.bfloat16
-            and onorm_gate.stride(1) == 1
-            and onorm_gate.data_ptr() % 16 == 0
-            and conv_states.ndim == 3
-            and tuple(conv_states.shape[1:]) == (3, 3 * seg)
-            and conv_states.dtype == torch.bfloat16
-            and conv_states.stride(1) == 3 * seg
-            and conv_states.stride(2) == 1
-            and conv_states.stride(0) >= 9 * seg
-            and conv_states.stride(0) % 4 == 0
-            and conv_states.data_ptr() % 8 == 0
-            and ssm_states.ndim == 4
-            and tuple(ssm_states.shape[1:]) == (heads, width, width)
-            and ssm_states.shape[0] == conv_states.shape[0]
-            and ssm_states.dtype == torch.float32
-            and ssm_states.stride()[1:] == (width * width, width, 1)
-            and ssm_states.stride(0) >= heads * width * width
-            and ssm_states.stride(0) % 4 == 0
-            and ssm_states.data_ptr() % 16 == 0
-            and cache_indices.ndim == 1
-            and cache_indices.shape[0] == batch
-            and cache_indices.dtype == torch.int32
-            and cache_indices.is_contiguous()
-            and cache_indices.data_ptr() % 16 == 0
+            self.unsupported_layout_reason(
+                mixed_qkv,
+                a,
+                b,
+                conv_states,
+                ssm_states,
+                cache_indices,
+                onorm_gate,
+            )
+            is None
         )
 
     def run(
@@ -142,13 +204,13 @@ class PreparedFlashInferKDADecode:
             x=mixed_qkv,
             weight=self.weight,
             conv_state=conv_states.transpose(-1, -2),
-            raw_gate=a.view(1, batch, 12, 128),
+            raw_gate=a.view(1, batch, self.heads, self.head_dim),
             raw_beta=b.unsqueeze(0),
             A_log=self.A_log,
             dt_bias=self.dt_bias,
             state_indices=cache_indices,
             state=ssm_states,
-            output_gate=onorm_gate.unflatten(-1, (12, 128)),
+            output_gate=onorm_gate.unflatten(-1, (self.heads, self.head_dim)),
             norm_weight=self.norm_weight,
             lower_bound=self.lower_bound,
             norm_eps=self.norm_eps,
@@ -178,15 +240,16 @@ def prepare_fused_kda_decode(
     w_q, w_k, w_v, _conv_bias, A_log, norm_weight, norm_eps = fused_static
     if (
         any(
-            tuple(w.shape) != (4, 12 * 128) or w.dtype != torch.float32
+            tuple(w.shape) != (4, _KIMI_KDA_HEADS * _KIMI_KDA_HEAD_DIM)
+            or w.dtype != torch.float32
             for w in (w_q, w_k, w_v)
         )
         or A_log.dtype != torch.float32
-        or A_log.numel() != 12
+        or A_log.numel() != _KIMI_KDA_HEADS
         or dt_bias.dtype != torch.float32
-        or tuple(dt_bias.shape) != (12 * 128,)
+        or tuple(dt_bias.shape) != (_KIMI_KDA_HEADS * _KIMI_KDA_HEAD_DIM,)
         or norm_weight.dtype != torch.float32
-        or tuple(norm_weight.shape) != (128,)
+        or tuple(norm_weight.shape) != (_KIMI_KDA_HEAD_DIM,)
         or any(
             not t.is_contiguous() or t.data_ptr() % 16 != 0
             for t in (A_log, dt_bias, norm_weight)
@@ -208,4 +271,6 @@ def prepare_fused_kda_decode(
         norm_weight=norm_weight.contiguous(),
         norm_eps=float(norm_eps),
         lower_bound=lower_bound,
+        heads=_KIMI_KDA_HEADS,
+        head_dim=_KIMI_KDA_HEAD_DIM,
     )

@@ -206,6 +206,9 @@ class TestFlashInferFusedKDAConsumer(CustomTestCase):
         kernel = Mock(return_value=torch.zeros(1, 3, 12, 128))
         _prepare(model, kernel)
         prepared = model.attn._k3_flashinfer_fused_decode
+        self.assertEqual(prepared.heads, 12)
+        self.assertEqual(prepared.head_dim, 128)
+        self.assertEqual(prepared.seg, 1536)
         expected = model.attn.conv_weights.t().reshape(4, 3, -1).permute(1, 0, 2)
         torch.testing.assert_close(prepared.weight, expected)
         self.assertTrue(prepared.weight.is_contiguous())
@@ -246,7 +249,36 @@ class TestFlashInferFusedKDAConsumer(CustomTestCase):
             kernel.assert_not_called()
             self.assertTrue(model.attn._k3_onorm_consumed)
             backend._track_mamba_state_decode.assert_called_once()
-            self.assertIn("native CUDA JIT", log.call_args.args[0])
+            message = log.call_args.args[0]
+            self.assertIn("native CUDA JIT", message)
+            self.assertIn("layout:", message)
+            if missing_api:
+                self.assertIn("not prepared", message)
+            else:
+                self.assertIn("raw_gate", message)
+
+    def test_unsupported_layout_reason_names_the_rejected_input(self):
+        model, _, inputs = _make_inputs()
+        _prepare(model, Mock())
+        prepared = model.attn._k3_flashinfer_fused_decode
+        self.assertIsNone(prepared.unsupported_layout_reason(*inputs))
+        x, a, b, conv, state, indices, gate = inputs
+        self.assertIn(
+            "raw_gate",
+            prepared.unsupported_layout_reason(
+                x, a.float(), b, conv, state, indices, gate
+            ),
+        )
+        self.assertIn(
+            "cache indices",
+            prepared.unsupported_layout_reason(
+                x, a, b, conv, state, indices.long(), gate
+            ),
+        )
+        self.assertIn(
+            "2-D",
+            prepared.unsupported_layout_reason(x[0], a, b, conv, state, indices, gate),
+        )
 
     def test_launch_failure_is_not_retried_after_state_mutation(self):
         model, backend, inputs = _make_inputs()

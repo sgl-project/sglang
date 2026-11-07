@@ -953,9 +953,26 @@ class KDAAttnBackend(MambaAttnBackendBase):
                         if use_flashinfer
                         else "native CUDA JIT"
                     )
+                    reason = None
+                    if flashinfer_fused is None:
+                        reason = (
+                            "FlashInfer consumer not prepared (API unavailable or "
+                            "unsupported static inputs)"
+                        )
+                    elif not use_flashinfer:
+                        reason = flashinfer_fused.unsupported_layout_reason(
+                            mixed_qkv,
+                            a,
+                            b[0],
+                            conv_states,
+                            ssm_states,
+                            cache_indices,
+                            onorm_gate,
+                        )
+                    layout = f"; layout: {reason}" if reason is not None else ""
                     rank0_log(
                         f"K3 fused KDA decode provider: {provider}; requested "
-                        f"decode backend: {self._fused_override_notice}."
+                        f"decode backend: {self._fused_override_notice}{layout}."
                     )
                     self._fused_override_notice = None
                 if use_flashinfer:
