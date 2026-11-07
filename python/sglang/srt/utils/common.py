@@ -2038,7 +2038,7 @@ def resolve_gpu_image_decode(
     mode = mm_process_config.get("image_decoder")
     if mode is None:
         return default
-    if mode not in IMAGE_DECODE_MODES:
+    if not isinstance(mode, str) or mode not in IMAGE_DECODE_MODES:
         raise ValueError(
             f"mm_process_config image_decoder must be one of {sorted(IMAGE_DECODE_MODES)}, got {mode!r}"
         )
@@ -2047,8 +2047,10 @@ def resolve_gpu_image_decode(
 
 def resolve_rgb_conversion(mm_process_config: dict, default: str) -> str:
     """How a processor drops alpha: ``mm_process_config["image_rgb_conversion"]`` over the processor's default."""
-    mode = mm_process_config.get("image_rgb_conversion", default)
-    if mode not in RGB_CONVERSIONS:
+    mode = mm_process_config.get("image_rgb_conversion")
+    if mode is None:
+        return default
+    if not isinstance(mode, str) or mode not in RGB_CONVERSIONS:
         raise ValueError(
             f"mm_process_config image_rgb_conversion must be one of {RGB_CONVERSIONS}, got {mode!r}"
         )
