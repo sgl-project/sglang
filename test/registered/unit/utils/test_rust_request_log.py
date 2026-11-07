@@ -262,6 +262,14 @@ _CASES = [
         "headers": {},
         "out": {"text": "", "output_ids": [1], "meta_info": {"id": "rid-7"}},
     },
+    {
+        # More bytes than max_length but not more code points: printed whole.
+        "name": "multibyte_text_under_limit",
+        "levels": [2],
+        "body": {"rid": "rid-8", "text": "🙂" * 1000},
+        "headers": {},
+        "out": {"text": "", "output_ids": [1], "meta_info": {"id": "rid-8"}},
+    },
 ]
 
 

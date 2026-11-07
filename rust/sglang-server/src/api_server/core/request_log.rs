@@ -930,14 +930,19 @@ fn write_field(out: &mut String, name: &str, value: &Value, max_length: usize, i
 /// One value as `_dataclass_to_string_truncated(value, max_length)` prints it.
 fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_watermark: bool) {
     match value {
-        Value::String(s) => match str_halves(s, max_length) {
-            Some((head, tail)) => {
-                write_str_repr(out, &s[..head]);
-                out.push_str(" ... ");
-                write_str_repr(out, &s[tail..]);
-            }
-            None => write_str_repr(out, s),
-        },
+        // Every char is at least one byte, so a short `s` skips the char walk.
+        Value::String(s) if s.len() > max_length && s.chars().nth(max_length).is_some() => {
+            let half = max_length / 2;
+            let head = s.char_indices().nth(half).map_or(s.len(), |(i, _)| i);
+            let tail = match half {
+                0 => 0,
+                _ => s.char_indices().nth_back(half - 1).map_or(0, |(i, _)| i),
+            };
+            write_str_repr(out, &s[..head]);
+            out.push_str(" ... ");
+            write_str_repr(out, &s[tail..]);
+        }
+        Value::String(s) => write_str_repr(out, s),
         Value::Array(items) if items.len() > max_length => {
             let (head, tail) = halves(items.len(), max_length);
             write_list(out, &items[..head], in_watermark);
@@ -954,22 +959,6 @@ fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_waterm
 fn halves(len: usize, max_length: usize) -> (usize, usize) {
     let half = max_length / 2;
     (half, if half == 0 { 0 } else { len - half })
-}
-
-/// `halves` as byte offsets, or `None` when `s` has at most `max_length`
-/// chars (Python's code points); walks only the chars it needs from each end.
-fn str_halves(s: &str, max_length: usize) -> Option<(usize, usize)> {
-    // Every char is at least one byte.
-    if s.len() <= max_length || s.char_indices().nth(max_length).is_none() {
-        return None;
-    }
-    let half = max_length / 2;
-    let head = s.char_indices().nth(half).map_or(s.len(), |(i, _)| i);
-    let tail = match half {
-        0 => 0,
-        _ => s.char_indices().nth_back(half - 1).map_or(0, |(i, _)| i),
-    };
-    Some((head, tail))
 }
 
 /// A dict level of `_dataclass_to_string_truncated`: keys quoted as they are,
