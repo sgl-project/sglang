@@ -1,4 +1,5 @@
-"""Dense activation/quantization fusion for the block-FP8 DeepGEMM path."""
+"""Dense activation/quantization fusion: the block-FP8 DeepGEMM path on CUDA, and
+per-tensor FP8 down projections on gfx95."""
 
 from __future__ import annotations
 
@@ -8,6 +9,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.kernels.fused_op import get_fused_op_backend
+from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_exec,
     get_forward,
@@ -15,11 +17,13 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import is_cuda
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.activation import SiluAndMul
     from sglang.srt.layers.linear import RowParallelLinear
+
+_is_hip = is_hip()
 
 
 class DenseSiluAndMulQuant:
@@ -29,6 +33,12 @@ class DenseSiluAndMulQuant:
         self.enabled = False
         self.down_proj = down_proj
         self.quant_method = down_proj.quant_method
+        # ROCm: whether down_proj's weights turned out per-tensor, without a
+        # static input scale; known only once they have loaded.
+        self._per_tensor = None
+        if _is_hip:
+            self.enabled = self._rocm_candidate(down_proj)
+            return
         if not (is_cuda() and get_platform().is_sm100 and get_parallel().tp_size == 1):
             return
 
@@ -65,15 +75,81 @@ class DenseSiluAndMulQuant:
             )
         )
 
+    def _rocm_candidate(self, down_proj: RowParallelLinear) -> bool:
+        from sglang.srt.layers.linear import RowParallelLinear
+        from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
+
+        method = self.quant_method
+        return (
+            envs.SGLANG_USE_AITER.get()
+            and is_gfx95_supported()
+            and get_parallel().tp_size == 1
+            and type(down_proj) is RowParallelLinear
+            and type(method) is Fp8LinearMethod
+            and method.weight_block_size is None
+            and method.quant_config.activation_scheme == "dynamic"
+            and not method.use_marlin
+            and down_proj.input_is_parallel
+        )
+
+    def _forward_decode_rocm(
+        self,
+        x: torch.Tensor,
+        act_fn: SiluAndMul,
+        down_proj: RowParallelLinear,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.dtype]:
+        from sglang.kernels.ops.quantization.aiter_fp8_quant_triton import (
+            SILU_AND_MUL_FP8_PER_TENSOR_MAX_ROWS,
+            silu_and_mul_fp8_per_tensor,
+        )
+        from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+        from sglang.srt.layers.activation import SiluAndMul
+
+        if self._per_tensor is None:
+            # Then apply_fp8_linear quantizes act_fn's output dynamically per tensor.
+            weight_scale = getattr(down_proj, "weight_scale", None)
+            self._per_tensor = (
+                weight_scale is not None
+                and weight_scale.numel() == 1
+                and getattr(down_proj, "input_scale", None) is None
+                and not self.quant_method.use_per_token_if_dynamic
+            )
+        deterministic = get_exec().deterministic
+        if (
+            not self._per_tensor
+            or down_proj is not self.down_proj
+            or down_proj.quant_method is not self.quant_method
+            or type(act_fn) is not SiluAndMul
+            or (act_fn._forward_method or act_fn._resolve_forward_method())
+            != act_fn.forward_cuda
+            or act_fn.is_torch_compile
+            or get_fused_op_backend() is not None
+            or deterministic.enable_deterministic_inference
+            or deterministic.rl_on_policy_target is not None
+            or is_batch_invariant_mode_enabled()
+            or get_lora().enable_lora
+            or get_forward().sp_active
+            or x.dtype != torch.bfloat16
+            or x.ndim != 2
+            or not 0 < x.shape[0] <= SILU_AND_MUL_FP8_PER_TENSOR_MAX_ROWS
+            or x.stride(1) != 1
+            or x.shape[1] != 2 * down_proj.input_size_per_partition
+        ):
+            return act_fn(x)
+        q, scale = silu_and_mul_fp8_per_tensor(x)
+        return q, scale, x.dtype
+
     def forward_decode(
         self,
         x: torch.Tensor,
         act_fn: SiluAndMul,
         down_proj: RowParallelLinear,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         """Try fusion for decode; callers must bypass this helper in other modes."""
         if not self.enabled or torch.compiler.is_compiling():
             return act_fn(x)
+        if _is_hip:
+            return self._forward_decode_rocm(x, act_fn, down_proj)
 
         from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
         from sglang.srt.layers.activation import SiluAndMul
