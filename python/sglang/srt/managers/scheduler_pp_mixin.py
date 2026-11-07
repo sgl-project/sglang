@@ -28,10 +28,14 @@ from sglang.srt.managers.utils import (
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.req_time_stats import set_time_batch
-from sglang.srt.runtime_context import get_disagg, get_parallel, get_spec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_parallel, get_spec
 from sglang.srt.sampling.sampling_observer_pp import (
     add_auxiliary_output_to_pp_tensors,
     pop_auxiliary_output_from_pp_tensors,
+)
+from sglang.srt.state_capturer.routed_experts import (
+    PP_ROUTED_EXPERTS_KEY,
+    returned_routed_experts_output,
 )
 from sglang.srt.utils import DynamicGradMode, point_to_point_pyobj
 from sglang.srt.utils.device import is_npu
@@ -48,12 +52,21 @@ def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
     """Check if output send/recv can be skipped for this batch."""
     return (
         envs.SGLANG_PP_SKIP_PURE_CHUNKED_OUTPUT_COMM.get()
+        # The output message carries every chunk's routed experts to stage 0.
+        and not get_exec().features.enable_return_routed_experts
         and batch is not None
         and batch.forward_mode == ForwardMode.EXTEND
         and len(batch.reqs) == 1
         and not batch.contains_last_prefill_chunk
         and not batch.return_logprob
     )
+
+
+def _pp_routed_experts_slots(result: GenerationBatchResult) -> Optional[torch.Tensor]:
+    output = result.routed_experts_output
+    if output is None or output.host_cache is None:
+        return None
+    return output.out_cache_loc
 
 
 def _pp_snapshot_forward_batch(batch: ScheduleBatch) -> Optional[ScheduleBatch]:
@@ -91,6 +104,8 @@ class PPBatchMetadata:
     verify_out_cache_loc: Optional[torch.Tensor] = None
     # Rank-local; never sent over the wire.
     fpm_timing: Optional[FpmTiming] = None
+    # First stage only: where the routed experts that come back belong.
+    routed_experts_slots: Optional[torch.Tensor] = None
 
 
 class SchedulerPPMixin:
@@ -855,6 +870,8 @@ class SchedulerPPMixin:
             else None
         )
         add_auxiliary_output_to_pp_tensors(tensor_dict, auxiliary_output)
+        if result.routed_experts_output is not None:
+            tensor_dict[PP_ROUTED_EXPERTS_KEY] = result.routed_experts_output.topk
         return tensor_dict
 
     def _pp_send_dict_to_next_stage(
@@ -985,6 +1002,7 @@ class SchedulerPPMixin:
         logits_output = None
         extend_input_len_per_req = None
         extend_logprob_start_len_per_req = None
+        routed_experts_rows = pp_outputs.tensors.pop(PP_ROUTED_EXPERTS_KEY, None)
 
         if (
             batch.return_logprob
@@ -1148,6 +1166,9 @@ class SchedulerPPMixin:
             extend_logprob_start_len_per_req=extend_logprob_start_len_per_req,
             can_run_cuda_graph=mb_metadata.can_run_cuda_graph,
             fpm_timing=mb_metadata.fpm_timing,
+            routed_experts_output=returned_routed_experts_output(
+                rows=routed_experts_rows, slots=mb_metadata.routed_experts_slots
+            ),
         )
         output_result.copy_auxiliary_output_to_cpu()
         return output_result
@@ -1688,6 +1709,7 @@ class SchedulerPPMixin:
                     fwd_batch=_pp_snapshot_forward_batch(cur_batch),
                     verify_out_cache_loc=result.spec_verify_out_cache_loc,
                     fpm_timing=result.fpm_timing,
+                    routed_experts_slots=_pp_routed_experts_slots(result),
                 )
                 event = self.device_module.Event()
                 event.record(self.device_module.current_stream())
