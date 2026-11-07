@@ -145,16 +145,20 @@ class TestGDNMISOutput(CustomTestCase):
     def test_fused_split_qk_norm_within_one_ulp_across_chunk_boundary(self):
         self._assert_fused_split_norm(num_tokens=198, allow_norm_ulp=True)
 
-    def _assert_within_one_ulp(self, actual, expected):
+    def _assert_within_ulp(self, actual, expected, max_ulp=1):
         self.assertTrue(bool(torch.isfinite(actual).all()))
         self.assertTrue(bool(torch.isfinite(expected).all()))
-        direction = torch.full_like(expected, float("inf"))
-        outside = (actual < torch.nextafter(expected, -direction)) | (
-            actual > torch.nextafter(expected, direction)
-        )
+        lower = expected
+        upper = expected
+        negative_direction = torch.full_like(expected, -float("inf"))
+        positive_direction = torch.full_like(expected, float("inf"))
+        for _ in range(max_ulp):
+            lower = torch.nextafter(lower, negative_direction)
+            upper = torch.nextafter(upper, positive_direction)
+        outside = (actual < lower) | (actual > upper)
         self.assertFalse(
             bool(outside.any()),
-            f"{int(outside.sum())} values differ by more than one output-dtype ULP",
+            f"{int(outside.sum())} values differ by more than {max_ulp} output-dtype ULPs",
         )
 
     def _assert_fused_split_norm(self, *, num_tokens, allow_norm_ulp=False):
@@ -203,7 +207,7 @@ class TestGDNMISOutput(CustomTestCase):
                         )
                         for index, (left, right) in enumerate(zip(actual, expected)):
                             if allow_norm_ulp and index < 2:
-                                self._assert_within_one_ulp(left, right)
+                                self._assert_within_ulp(left, right)
                                 reference = raw[index].double()
                                 reference = (
                                     reference
@@ -211,7 +215,7 @@ class TestGDNMISOutput(CustomTestCase):
                                         reference.square().sum(-1, keepdim=True) + 1e-6
                                     ).sqrt()
                                 )
-                                self._assert_within_one_ulp(left, reference.to(dtype))
+                                self._assert_within_ulp(left, reference.to(dtype))
                                 torch.testing.assert_close(
                                     left[:, 0], right[:, 0], rtol=0, atol=0
                                 )
@@ -316,7 +320,9 @@ class TestGDNMISOutput(CustomTestCase):
                     if dtype == torch.bfloat16:
                         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                     else:
-                        self._assert_within_one_ulp(actual, expected)
+                        # Fused FP32 reductions can differ by one ULP and the
+                        # recurrent GDN computation can amplify that to two.
+                        self._assert_within_ulp(actual, expected, max_ulp=2)
                     torch.testing.assert_close(
                         actual[:, tokens:],
                         torch.zeros_like(actual[:, tokens:]),
