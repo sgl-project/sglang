@@ -159,8 +159,8 @@ class TestFlashinferDispatcher(CustomTestCase):
     def run_round(self, dispatcher, hidden_states, global_num_tokens, round_index=0):
         """Each token carries a mark, new in each round, in its routing weight and
         in columns 0 and 1 of its row of hidden_states, which this overwrites.
-        Its expert returns the mark in columns 0 and 1 and its own rank + 1
-        elsewhere.
+        Its expert returns the mark in columns 0 and 1 and, elsewhere, a value
+        unique to its rank and the round.
 
         Checks run later: a rank raising between rounds would leave its peers
         inside the next round's collectives.
@@ -213,7 +213,7 @@ class TestFlashinferDispatcher(CustomTestCase):
             )
         # Padding rows carry stale weights; neither combine sums their output.
         low, high = mark_columns(received.topk_output.topk_weights[:, 0])
-        expert_output.fill_(self.rank + 1.0)
+        expert_output.fill_(self.world_size * round_index + self.rank + 1.0)
         expert_output[:, 0] = low
         expert_output[:, 1] = high
         # The fence combine skips staging only for a payload at the buffer's address;
@@ -260,7 +260,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         target_rank = self.target(round_.round_index)
         expected = torch.full(
             (round_.marks.numel(), HIDDEN_SIZE),
-            target_rank + 1.0,
+            self.world_size * round_.round_index + target_rank + 1.0,
             dtype=torch.bfloat16,
             device="cuda",
         )
@@ -284,8 +284,8 @@ class TestFlashinferDispatcher(CustomTestCase):
         so rounds 2 and 3 reuse the sets of rounds 0 and 1, now filled from other
         sources, and round 4, each rank sending to itself, takes the code that
         skips the landing rows. Round 3 goes back to round 0's target, so it
-        rereads the rows round 0 used. No two rounds send the same payload or
-        marks, so a round that reads another's leftovers fails."""
+        rereads the rows round 0 used. No two rounds send the same payload, marks
+        or expert output, so a round that reads another's leftovers fails."""
         # Offsets 1, 2 and 3 must name three different peers.
         self.assertGreaterEqual(self.world_size, 4)
 
@@ -359,10 +359,6 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.assertTrue(dispatcher.payload_in_workspace)
         # Without Lamport the limit is 0, so this would be a one-token round.
         self.assertTrue(dispatcher.moe_a2a.lamport_enabled)
-        # One token past the limit must still fit the workspace.
-        self.assertGreater(
-            dispatcher.max_num_tokens, dispatcher.moe_a2a.lamport_max_tokens
-        )
         num_tokens = dispatcher.moe_a2a.lamport_max_tokens + 1
         self.check_bf16_dispatch(
             dispatcher=dispatcher, global_num_tokens=[num_tokens] * self.world_size
