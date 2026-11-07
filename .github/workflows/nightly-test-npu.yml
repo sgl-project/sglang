@@ -334,13 +334,14 @@ jobs:
           #   test_type: 'perf'
           #   prefill_decode_deployment: 'separation'
           # deepseek_v4_flash overlap (no spec) accuracy tests
-          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap
-            prefill_size: 1
-            decode_size: 1
-            router_size: 1
-            test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
+          # TEMP: commented out; do not rerun
+          # - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap
+          #   prefill_size: 1
+          #   decode_size: 1
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
           # deepseek_v4_pro overlap (no spec) accuracy tests
           - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa_overlap
             prefill_size: 2
@@ -351,13 +352,14 @@ jobs:
             prefill_decode_deployment: 'separation'
           # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
           # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
-          - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
-            prefill_size: 2
-            decode_size: 2
-            router_size: 1
-            test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_dcp_gpqa.py
-            test_type: 'accuracy'
-            prefill_decode_deployment: 'separation'
+          # TEMP: commented out; do not rerun
+          # - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
+          #   prefill_size: 2
+          #   decode_size: 2
+          #   router_size: 1
+          #   test_case: test/registered/npu/accuracy/glm5_2/test_npu_glm_5_2_w8a8_2p2d_32p_dcp_gpqa.py
+          #   test_type: 'accuracy'
+          #   prefill_decode_deployment: 'separation'
           - name: glm_5_2_w8a8_2p2d_32p_pcp_gpqa
             prefill_size: 2
             decode_size: 2

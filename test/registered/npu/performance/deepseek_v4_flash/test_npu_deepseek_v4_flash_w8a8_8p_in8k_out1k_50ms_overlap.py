@@ -8,7 +8,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
-from sglang.test.ascend.test_ascend_utils import is_npu_a5
 from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression, record_pass1
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST
@@ -68,7 +67,7 @@ DEEPSEEK_V4_FLASH_W8A8_8P_OTHER_ARGS = [
     "--page-size",
     128,
     "--tp-size",
-    8 if is_npu_a5() else 16,
+    16,
     "--trust-remote-code",
     "--device",
     "npu",
