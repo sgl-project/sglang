@@ -104,6 +104,61 @@ class TestNgramSpeculativeDecodingFlashinfer(NgramServerBase, GSM8KMixin):
             f"baseline ({baseline_accept_len:.2f}) when corpus matches output",
         )
 
+    def test_request_corpus_ids_selects_corpus(self):
+        """Per-request ngram_corpus_ids: drafting from the matching corpus
+        beats an unrelated one loaded on the same server."""
+        prompts = [
+            "The capital of France is",
+            "In mathematics, the Pythagorean theorem states that",
+            "Water boils at a temperature of",
+        ]
+
+        def generate(prompt, corpus_ids):
+            sampling_params = {"temperature": 0, "max_new_tokens": 128}
+            if corpus_ids is not None:
+                sampling_params["ngram_corpus_ids"] = corpus_ids
+            resp = requests.post(
+                self.base_url + "/generate",
+                json={"text": prompt, "sampling_params": sampling_params},
+                timeout=120,
+            )
+            self.assertEqual(resp.status_code, 200, resp.text)
+            out = resp.json()
+            return out["text"], out["meta_info"]["spec_accept_length"]
+
+        def run(corpus_ids):
+            # Flush so the online trie does not carry over between phases.
+            requests.post(self.base_url + "/flush_cache", timeout=30)
+            results = [generate(p, corpus_ids) for p in prompts]
+            texts = [t for t, _ in results]
+            return texts, sum(a for _, a in results) / len(results)
+
+        baseline_texts, _ = run([])
+        for corpus_id, documents in (
+            ("matching", baseline_texts),
+            ("unrelated", ["Lorem ipsum dolor sit amet, consectetur adipiscing elit."]),
+        ):
+            resp = requests.post(
+                self.base_url + "/add_external_corpus",
+                json={"corpus_id": corpus_id, "documents": documents},
+                timeout=120,
+            )
+            self.assertTrue(resp.json()["success"], resp.text)
+        try:
+            _, unrelated_len = run(["unrelated"])
+            _, matching_len = run(["matching"])
+            print(
+                f"\n  accept length unrelated={unrelated_len:.2f} matching={matching_len:.2f}"
+            )
+            self.assertGreater(matching_len, unrelated_len * 1.5)
+        finally:
+            for corpus_id in ("matching", "unrelated"):
+                requests.post(
+                    self.base_url + "/remove_external_corpus",
+                    json={"corpus_id": corpus_id},
+                    timeout=30,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

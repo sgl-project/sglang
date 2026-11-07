@@ -97,6 +97,9 @@ def get_ngram_corpus_cls():
                 np.int64
             )
 
+        def set_filter(self, state_id: int, corpus_ids: List[str]) -> None:
+            self.set_corpus_filter(state_id, "\n".join(corpus_ids))  # type: ignore
+
         def erase_states(self, state_ids: List[int]) -> None:
             state_ids_t = torch.tensor(state_ids, dtype=torch.int64)
             self.erase_match_state(state_ids_t)  # type: ignore
