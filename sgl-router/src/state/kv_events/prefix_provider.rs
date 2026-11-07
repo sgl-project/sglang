@@ -52,6 +52,11 @@ impl RadixTreePrefixProvider {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn pending_consult_below(&self) -> Option<f64> {
+        self.pending_consult_below
+    }
+
     pub fn match_request_tokens(
         &self,
         tokens: &[u32],
