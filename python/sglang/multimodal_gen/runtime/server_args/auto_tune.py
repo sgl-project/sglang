@@ -927,7 +927,9 @@ class ServerArgsAutoTuner:
                 empty_cache=False,
             )
             for device_id in range(
-                args.base_gpu_id, args.base_gpu_id + max(1, args.num_gpus)
+                args.base_gpu_id,
+                # num_gpus is the total across nodes; probe only this node's GPUs.
+                args.base_gpu_id + max(1, args.num_gpus // max(1, args.nnodes)),
             )
         )
 
