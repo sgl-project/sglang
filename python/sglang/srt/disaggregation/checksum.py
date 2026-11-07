@@ -2,25 +2,12 @@ from __future__ import annotations
 
 from typing import List, Optional, Sequence
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.managers.schedule_batch import Req
-from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
-
-NestedInts = Sequence[int] | Sequence[Sequence[int]]
-
-
-def _flatten_ints(values: NestedInts) -> list[int]:
-    flattened: list[int] = []
-    for value in values:
-        if isinstance(value, (list, tuple)):
-            flattened.extend(int(item) for item in value)
-        else:
-            flattened.append(int(value))
-    return flattened
 
 
 def is_health_check_req(req: Req) -> bool:
@@ -40,47 +27,29 @@ def page_indices_for_request(
 ) -> torch.Tensor:
     # start_idx is the page-aligned prefix decode already held, which prefill
     # never sent; both sides digest [start_idx, end_idx) of their own row.
-    page_size = scheduler.token_to_kv_pool_allocator.page_size
+    allocator = scheduler.token_to_kv_pool_allocator
     kv_indices = scheduler.req_to_token_pool.req_to_token[
         req.kv.req_pool_idx, start_idx:end_idx
     ]
-    return _to_page_indices_gpu(kv_indices, page_size)
+    # The ids the transfer addressed; a virtual-id pool's raw row points elsewhere.
+    kv_indices = allocator.translate_kv_indices_for_transfer(kv_indices)
+    return _to_page_indices_gpu(kv_indices, allocator.page_size)
 
 
-def state_indices_for_request(
-    scheduler, req: Req, seq_len: int, start_idx: int = 0
-) -> Optional[torch.Tensor]:
-    pool = scheduler.token_to_kv_pool_allocator.get_kvcache()
-    router = pool.layer_router
-    # A pool wrapping one token KV view keeps its other layers' state per request.
-    if router.wrapped_view() is not None:
-        return (
-            scheduler.req_to_token_pool.req_index_to_mamba_index_mapping[
-                req.kv.req_pool_idx
-            ]
-            .to(torch.int64)
-            .contiguous()
-            .reshape(-1)
-        )
-    if router.sub_pool(IdSpaceKind.SLIDING_WINDOW) is not None:
-        page_size = scheduler.token_to_kv_pool_allocator.page_size
-        window_size = scheduler.sliding_window_size
-        window_start = max(start_idx, seq_len - window_size)
-        window_start = (window_start // page_size) * page_size
-        window_full = scheduler.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, window_start:seq_len
-        ]
-        window_swa = scheduler.token_to_kv_pool_allocator.id_spaces()[
-            IdSpaceKind.SLIDING_WINDOW
-        ].ids(window_full)
-        return _to_page_indices_gpu(window_swa, page_size)
-    if isinstance(pool, (DSATokenToKVPool, MiniMaxSparseKVPool)):
-        device_page_size = pool.page_size
-        kv_full = scheduler.req_to_token_pool.req_to_token[
-            req.kv.req_pool_idx, start_idx:seq_len
-        ]
-        return _to_page_indices_gpu(kv_full, device_page_size)
-    return None
+def _index_tensor(indices, device: torch.device) -> torch.Tensor:
+    """One state transfer payload (tensor, array, int list, or a list of
+    arrays) as a flat int64 tensor on `device`."""
+    if isinstance(indices, torch.Tensor):
+        flat = indices.reshape(-1)
+    elif (
+        isinstance(indices, (list, tuple))
+        and len(indices) > 0
+        and not np.isscalar(indices[0])
+    ):
+        return torch.cat([_index_tensor(part, device) for part in indices])
+    else:
+        flat = torch.from_numpy(np.asarray(indices, dtype=np.int64).reshape(-1))
+    return flat.to(device=device, dtype=torch.int64).contiguous()
 
 
 class KvChecksumComputer:
@@ -89,33 +58,49 @@ class KvChecksumComputer:
         device: torch.device,
         kv_data_ptrs: Sequence[int],
         kv_item_lens: Sequence[int],
-        state_data_ptrs: NestedInts = (),
-        state_item_lens: NestedInts = (),
+        state_data_ptrs: Sequence[Sequence[int]] = (),
+        state_item_lens: Sequence[Sequence[int]] = (),
     ):
         assert len(kv_data_ptrs) == len(kv_item_lens)
+        assert len(state_data_ptrs) == len(state_item_lens)
         self._device = torch.device(device)
         self._kv_data_ptrs = [int(ptr) for ptr in kv_data_ptrs]
         self._kv_item_lens = [int(item_len) for item_len in kv_item_lens]
-        self._state_data_ptrs = _flatten_ints(state_data_ptrs)
-        self._state_item_lens = _flatten_ints(state_item_lens)
-        assert len(self._state_data_ptrs) == len(self._state_item_lens)
-        assert self._kv_data_ptrs or self._state_data_ptrs
+        # One (ptrs, item_lens) per state component, in kv_args.state_types order;
+        # the transfer addresses every buffer of a component by that component's
+        # own index list, so the digest must too.
+        self._state_components = [
+            ([int(ptr) for ptr in ptrs], [int(item_len) for item_len in lens])
+            for ptrs, lens in zip(state_data_ptrs, state_item_lens)
+        ]
+        for ptrs, lens in self._state_components:
+            assert len(ptrs) == len(lens)
+        assert self._kv_data_ptrs or any(ptrs for ptrs, _ in self._state_components)
 
     def compute(
         self,
-        kv_page_indices_gpu: torch.Tensor,
-        state_indices_gpu: Optional[torch.Tensor] = None,
+        kv_page_indices,
+        state_indices: Sequence[Optional[object]] = (),
     ) -> int:
-        assert kv_page_indices_gpu.is_cuda and kv_page_indices_gpu.is_contiguous()
+        """Digest the KV pages and, per state component, the transfer payload
+        that side sent or received for it; None skips a component that ships
+        nothing for this request."""
+        assert len(state_indices) == len(self._state_components), (
+            f"{len(state_indices)} state payloads for "
+            f"{len(self._state_components)} state components"
+        )
         all_ptrs = list(self._kv_data_ptrs)
         all_lens = list(self._kv_item_lens)
-        all_indices: List[torch.Tensor] = [kv_page_indices_gpu] * len(
-            self._kv_data_ptrs
-        )
-        if self._state_data_ptrs:
-            assert state_indices_gpu is not None
-            assert state_indices_gpu.is_cuda and state_indices_gpu.is_contiguous()
-            all_ptrs += self._state_data_ptrs
-            all_lens += self._state_item_lens
-            all_indices += [state_indices_gpu] * len(self._state_data_ptrs)
+        all_indices: List[torch.Tensor] = [
+            _index_tensor(kv_page_indices, self._device)
+        ] * len(self._kv_data_ptrs)
+        for (ptrs, lens), indices in zip(self._state_components, state_indices):
+            if indices is None:
+                continue
+            all_ptrs += ptrs
+            all_lens += lens
+            all_indices += [_index_tensor(indices, self._device)] * len(ptrs)
+        if not all_indices:
+            # Adler-32 of no bytes, as the kernel returns for empty indices.
+            return 1
         return adler32_strided_checksum(all_ptrs, all_lens, all_indices)
