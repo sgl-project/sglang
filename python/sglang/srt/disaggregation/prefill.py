@@ -78,6 +78,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ReqList,
     move,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -776,6 +777,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _supports_result_wait_polling(self: Scheduler) -> bool:
         """Whether the overlap loop can wait for a result without blocking.
@@ -1000,6 +1002,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
