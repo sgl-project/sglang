@@ -157,6 +157,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.__dict__.update(
             dsa_prefill_impl=implementation,
+            attn_dcp_size=1,
             use_mha=False,
             use_fused_topk=True,
             hisparse_coordinator=None,
@@ -253,6 +254,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         )
         backend = SimpleNamespace(
             forward_metadata=metadata,
+            _trtllm_fused_q=False,
             kv_cache_dtype=torch.bfloat16,
             kv_layers=_routed(
                 SimpleNamespace(get_key_buffer=lambda _layer_id: torch.zeros((24, 3)))

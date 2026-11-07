@@ -8,7 +8,10 @@ repos:
       - id: check-symlinks
       - id: destroyed-symlinks
       - id: trailing-whitespace
+        # Preserve unified-diff context lines.
+        exclude: ^(python/sglang/kernels/aot/patches/flashmla/|docker/k31-image/.*\.patch$)
       - id: end-of-file-fixer
+        exclude: ^docker/k31-image/.*\.patch$
       - id: check-yaml
         args: [--allow-multiple-documents]
       - id: check-toml

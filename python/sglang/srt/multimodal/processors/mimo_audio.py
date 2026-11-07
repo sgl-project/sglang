@@ -3,7 +3,6 @@
 import io
 import logging
 import math
-import os
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -13,6 +12,7 @@ import numpy as np
 import pybase64
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal import media_io
 
 logger = logging.getLogger(__name__)
@@ -189,7 +189,7 @@ class MiMoAudioPipeline:
                     )
                 elif audio.startswith("http://") or audio.startswith("https://"):
                     dl_start = time.perf_counter()
-                    timeout = int(os.getenv("REQUEST_TIMEOUT", "5"))
+                    timeout = envs.SGLANG_MEDIA_URL_TIMEOUT.get()
                     try:
                         content = media_io.download_remote_media(audio, timeout=timeout)
                         dl_elapsed_ms = (time.perf_counter() - dl_start) * 1000

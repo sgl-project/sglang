@@ -1,0 +1,244 @@
+From 7b71695a0af9920c3b8450848c8a6393bbafbd6d Mon Sep 17 00:00:00 2001
+From: gitover22 <qidizou88@gmail.com>
+Date: Mon, 27 Jul 2026 18:02:11 +0800
+Subject: [PATCH 1/2] fix(bindings): preserve session affinity through chat
+ processors
+
+Signed-off-by: gitover22 <qidizou88@gmail.com>
+Signed-off-by: Abhinandan <abhinandanverma551@gmail.com>
+
+(cherry picked from commit 5a0f34445a70faaeca3b662181901498af7b0e1e)
+(cherry picked from commit 1bef20db6b1e18cdc497c07e5305e8eb4b48e016)
+---
+ lib/bindings/python/Cargo.lock                |  1 +
+ lib/bindings/python/Cargo.toml                |  1 +
+ lib/bindings/python/rust/context.rs           | 20 +++++++
+ lib/bindings/python/rust/engine.rs            | 15 ++++--
+ lib/bindings/python/rust/llm/routed_engine.rs | 54 ++++++++++++++++---
+ 5 files changed, 81 insertions(+), 10 deletions(-)
+
+diff --git a/lib/bindings/python/Cargo.lock b/lib/bindings/python/Cargo.lock
+index b7c02006e7..1611289e87 100644
+--- a/lib/bindings/python/Cargo.lock
++++ b/lib/bindings/python/Cargo.lock
+@@ -2429,6 +2429,7 @@ dependencies = [
+  "dynamo-vllm-sidecar",
+  "dynamo-worker-selection-policy-catalog",
+  "futures",
++ "http 1.4.2",
+  "once_cell",
+  "opentelemetry",
+  "opentelemetry_sdk",
+diff --git a/lib/bindings/python/Cargo.toml b/lib/bindings/python/Cargo.toml
+index 85178b470d..59dbe8addd 100644
+--- a/lib/bindings/python/Cargo.toml
++++ b/lib/bindings/python/Cargo.toml
+@@ -130,6 +130,7 @@ dynamo-llm = { path = "../../llm" }
+ dynamo-llm = { path = "../../llm", default-features = false }
+ 
+ [dev-dependencies]
++http = "1"
+ opentelemetry_sdk = { version = "0.31.0", features = ["trace"] }
+ tracing-subscriber = { version = "0.3", features = ["registry"] }
+ 
+diff --git a/lib/bindings/python/rust/context.rs b/lib/bindings/python/rust/context.rs
+index 158a4487e0..42fd51322c 100644
+--- a/lib/bindings/python/rust/context.rs
++++ b/lib/bindings/python/rust/context.rs
+@@ -11,8 +11,10 @@
+ // `set_status` operations mirror the OTel `Span` API.
+ 
+ use dynamo_backend_common::FirstTokenNotifier;
++use dynamo_llm::protocols::common::extensions::{SESSION_AFFINITY_CONTEXT_KEY, SessionAffinityId};
+ use dynamo_runtime::logging::DistributedTraceContext;
+ pub use dynamo_runtime::pipeline::AsyncEngineContext;
++use dynamo_runtime::pipeline::Context as PipelineContext;
+ use dynamo_runtime::pipeline::context::Controller;
+ use opentelemetry::global::BoxedSpan;
+ use opentelemetry::trace::{Span as OtelSpan, Status, TraceContextExt, Tracer};
+@@ -63,6 +65,7 @@ pub struct Context {
+     trace_context: Option<DistributedTraceContext>,
+     first_token: Option<FirstTokenNotifier>,
+     metadata: Arc<Mutex<BTreeMap<String, String>>>,
++    session_affinity: Option<SessionAffinityId>,
+     /// Captured `engine.generate` span. `None` for Python-instantiated test
+     /// contexts (where no parent span was plumbed in) — `current_span` /
+     /// `start_span` return a no-op `SpanProxy` in that case.
+@@ -182,10 +185,21 @@ impl Context {
+             trace_context,
+             first_token,
+             metadata: Arc::new(Mutex::new(metadata)),
++            session_affinity: None,
+             span: None,
+         }
+     }
+ 
++    pub fn with_session_affinity_from<T: Send + Sync + 'static>(
++        mut self,
++        context: &PipelineContext<T>,
++    ) -> Result<Self, String> {
++        self.session_affinity = context
++            .get_optional::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)?
++            .map(|session_affinity| session_affinity.as_ref().clone());
++        Ok(self)
++    }
++
+     /// Attach the `engine.generate` span. Called by `PyLLMEngine::generate`
+     /// after capturing `Span::current()` outside the spawn_blocking boundary.
+     /// See `lib/bindings/python/rust/backend.rs` for the invariant.
+@@ -225,6 +239,10 @@ impl Context {
+             FirstTokenNotifier::for_request(None, Some(source), self.inner.id(), Some(dp_rank));
+     }
+ 
++    pub fn session_affinity(&self) -> Option<&SessionAffinityId> {
++        self.session_affinity.as_ref()
++    }
++
+     /// Build the `traceparent` header value. Prefers the engine.generate
+     /// OTel span context when valid so downstream engine spans nest under
+     /// `engine.generate`; falls back to the inbound trace context.
+@@ -272,6 +290,7 @@ impl Context {
+             trace_context: None,
+             first_token: None,
+             metadata: Arc::new(Mutex::new(metadata.unwrap_or_default())),
++            session_affinity: None,
+             span: None,
+         }
+     }
+@@ -289,6 +308,7 @@ impl Context {
+             trace_context: self.trace_context.clone(),
+             first_token: None,
+             metadata: Arc::new(Mutex::new(self.metadata_snapshot())),
++            session_affinity: self.session_affinity.clone(),
+             span: self.span.clone(),
+         }
+     }
+diff --git a/lib/bindings/python/rust/engine.rs b/lib/bindings/python/rust/engine.rs
+index 903b0ed7a2..785a5a8713 100644
+--- a/lib/bindings/python/rust/engine.rs
++++ b/lib/bindings/python/rust/engine.rs
+@@ -310,15 +310,22 @@ where
+ 
+     let current_trace_context = get_distributed_tracing_context();
+     let metadata = context.metadata().clone();
++    let py_context = if engine.has_context {
++        Some(
++            Context::new(ctx.clone(), current_trace_context, None, metadata)
++                .with_session_affinity_from(&context)
++                .map_err(anyhow::Error::msg)?,
++        )
++    } else {
++        None
++    };
+     let stream = invoke_generator(
+         engine.generator.clone(),
+         engine.event_loop.clone(),
+         move |py| to_python_input(py, request),
+-        engine.has_context.then_some({
+-            let ctx = ctx.clone();
++        py_context.map(|py_context| {
+             move |py: Python<'_>| {
+-                Py::new(py, Context::new(ctx, current_trace_context, None, metadata))
+-                    .map(|context| vec![("context", context.into_any())])
++                Py::new(py, py_context).map(|context| vec![("context", context.into_any())])
+             }
+         }),
+     )
+diff --git a/lib/bindings/python/rust/llm/routed_engine.rs b/lib/bindings/python/rust/llm/routed_engine.rs
+index f10ec6a654..b677cd1ac6 100644
+--- a/lib/bindings/python/rust/llm/routed_engine.rs
++++ b/lib/bindings/python/rust/llm/routed_engine.rs
+@@ -8,6 +8,7 @@ use tracing::Instrument;
+ use tracing_opentelemetry::OpenTelemetrySpanExt;
+ 
+ use dynamo_llm::entrypoint::PrefillRoutedEngine;
++use dynamo_llm::protocols::common::extensions::SESSION_AFFINITY_CONTEXT_KEY;
+ use dynamo_llm::protocols::common::preprocessor::PreprocessedRequest;
+ use dynamo_runtime::logging::{DistributedTraceContext, otel_parent_context_from_distributed};
+ use dynamo_runtime::pipeline::{AsyncEngineContextProvider, SingleIn};
+@@ -27,6 +28,15 @@ impl RoutedEngine {
+     }
+ }
+ 
++fn copy_session_affinity(
++    parent_context: &crate::context::Context,
++    child_context: &mut SingleIn<PreprocessedRequest>,
++) {
++    if let Some(session_affinity) = parent_context.session_affinity() {
++        child_context.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity.clone());
++    }
++}
++
+ #[pymethods]
+ impl RoutedEngine {
+     /// Send a preprocessed request through the Rust prefill-routed pipeline.
+@@ -40,17 +50,18 @@ impl RoutedEngine {
+         let request: PreprocessedRequest = depythonize(preprocessed.bind(py)).map_err(to_pyerr)?;
+         let request_context = if let Some(parent_context) = context.as_ref() {
+             let parent_metadata = parent_context.metadata_snapshot();
+-            let parent_context = parent_context.inner();
+-            let child_context = SingleIn::with_id_and_metadata(
++            let parent_controller = parent_context.inner();
++            let mut child_context = SingleIn::with_id_and_metadata(
+                 request,
+-                parent_context.id().to_string(),
++                parent_controller.id().to_string(),
+                 parent_metadata,
+             );
++            copy_session_affinity(parent_context, &mut child_context);
+             let child_controller = child_context.context();
+-            parent_context.link_child(child_controller.clone());
+-            if parent_context.is_killed() {
++            parent_controller.link_child(child_controller.clone());
++            if parent_controller.is_killed() {
+                 child_controller.kill();
+-            } else if parent_context.is_stopped() {
++            } else if parent_controller.is_stopped() {
+                 child_controller.stop_generating();
+             }
+             child_context
+@@ -140,10 +151,41 @@ fn dispatch_span(
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++    use dynamo_llm::protocols::common::extensions::{
++        SessionAffinityId, session_affinity_from_headers,
++    };
+     use dynamo_runtime::logging::{DistributedTraceIdLayer, inject_trace_headers_into_map};
+     use opentelemetry::trace::{TraceContextExt, TraceId, TracerProvider as _};
+     use tracing_subscriber::layer::SubscriberExt;
+ 
++    fn preprocessed_request() -> PreprocessedRequest {
++        serde_json::from_value(serde_json::json!({
++            "token_ids": []
++        }))
++        .expect("minimal preprocessed request")
++    }
++
++    #[test]
++    fn request_context_preserves_session_affinity_across_python_boundary() {
++        let mut headers = http::HeaderMap::new();
++        headers.insert("x-dynamo-session-id", "session-123".parse().unwrap());
++        let session_affinity =
++            session_affinity_from_headers(&headers).expect("session affinity header");
++        let mut source = SingleIn::new(());
++        source.insert(SESSION_AFFINITY_CONTEXT_KEY, session_affinity);
++        let python_context =
++            crate::context::Context::new(source.context(), None, None, Default::default())
++                .with_session_affinity_from(&source)
++                .expect("pipeline context converts to Python binding context");
++        let mut routed_context = SingleIn::new(preprocessed_request());
++        copy_session_affinity(&python_context, &mut routed_context);
++
++        let session_affinity = routed_context
++            .get::<SessionAffinityId>(SESSION_AFFINITY_CONTEXT_KEY)
++            .expect("session affinity restored after Python boundary");
++        assert_eq!(session_affinity.as_str(), "session-123");
++    }
++
+     fn make_trace_context(
+         trace_id: &str,
+         span_id: &str,
+-- 
+2.39.3
+

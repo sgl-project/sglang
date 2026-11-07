@@ -30,7 +30,7 @@ decode rows instead merge in one kernel (``DcpTopKMerge``).
 from __future__ import annotations
 
 from functools import partial
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 import triton
@@ -67,6 +67,14 @@ def _side_stream(device: torch.device) -> torch.cuda.Stream:
 
 
 class DcpCandidateAllGather:
+    """All-gather of the top-k candidates over the DCP group through torch
+    symmetric memory (NVLS multimem, as TorchSymmMemCommunicator does for
+    all-reduce): every rank writes its candidates into one symmetric output
+    buffer, rendezvoused once at init. Falls back to the group all-gather when
+    multicast is unavailable or the payload does not fit. Only the first
+    min(local_lens[row], topk) pairs in each row are valid.
+    """
+
     def __init__(self, group, max_rows: int, topk: int):
         import torch.distributed._symmetric_memory as symm_mem
 
@@ -416,16 +424,22 @@ def dcp_global_topk(
     topk: int,
     page_size: int,
     plan: torch.Tensor,
+    *,
+    all_gather: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """Decode: global top-k over the DCP group as widened KV slots, -1 padded.
+    """Decode / target verify: global top-k over the DCP group as widened KV
+    slots, -1 padded.
 
-    Row i is request i. ``local_lens`` / ``global_lens``: [rows] visible keys
-    of this rank / of the whole sequence. ``page_table``: [rows, pages] this
-    rank's physical page ids, which are the widened page ids of the request:
+    Row i is a query row (decode: request i; target verify: request i // n,
+    draft step i % n). ``local_lens`` / ``global_lens``: [rows] visible keys
+    of this rank / of the whole sequence for that row. ``page_table``: [rows,
+    pages] this rank's physical page ids, which are the widened page ids of the
+    row's request:
     global position p maps to slot ``page_table[p // span] * span + p % span``
     with span ``page_size * dcp_size``. ``plan``: the v2 top-k plan of
-    ``global_lens``. Every rank must call this with the same number of rows,
-    also when it has no local keys.
+    ``global_lens``. ``all_gather`` replaces the group all-gather (tests run
+    every rank in one process). Every rank must call this with the same number
+    of rows, also when it has no local keys.
 
     With ``DcpTopKMerge`` the result holds only this rank's slots, which is all
     ``dcp_localize_compact`` keeps.
@@ -437,22 +451,23 @@ def dcp_global_topk(
     out = torch.empty((rows, topk), dtype=torch.int32, device=logits.device)
     if rows == 0:
         return out
-    if _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
+    if all_gather is None and _TOPK_MERGE is not None and _TOPK_MERGE.usable(rows):
         candidates = _local_candidates(logits, local_lens, topk)
         _TOPK_MERGE(candidates, global_lens, page_table, out, span)
         return out
-    workspace = _CANDIDATE_ALL_GATHER
+    workspace = _CANDIDATE_ALL_GATHER if all_gather is None else None
     compact_prefix = (
         workspace is not None
         and workspace.prefix_handle is not None
         and rows <= workspace.max_rows
         and topk == workspace.topk
     )
-    all_gather = (
-        partial(workspace, local_lens=local_lens, compact_prefix=compact_prefix)
-        if workspace is not None
-        else partial(parallel.dcp_group.all_gather, dim=0)
-    )
+    if all_gather is None and workspace is not None:
+        all_gather = partial(
+            workspace, local_lens=local_lens, compact_prefix=compact_prefix
+        )
+    if all_gather is None:
+        all_gather = partial(parallel.dcp_group.all_gather, dim=0)
 
     # Row i of `dense` holds the candidate scores at their global positions.
     # Its -inf fill depends on the lengths only, so it overlaps the local top-k
@@ -496,7 +511,7 @@ def dcp_select_all_slots(
     topk: int,
     page_size: int,
 ) -> torch.Tensor:
-    """Decode: every visible position as widened KV slots, for
+    """Decode / target verify: every visible position as widened KV slots, for
     rows that see at most ``topk`` keys (the indexer's k-only path), -1 padded."""
     span = page_size * get_parallel().attn_dcp_size
     rows = global_lens.shape[0]

@@ -116,6 +116,10 @@ def select_verify_intermediate_state_indices(
 
     import torch
 
+    # A callable `valid` is evaluated only here, so per-layer callers launch no
+    # mask kernel when stable rows are off.
+    if callable(valid):
+        valid = valid()
     req_rows = req_pool_indices[: valid.shape[0]]
     return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
         torch.int32

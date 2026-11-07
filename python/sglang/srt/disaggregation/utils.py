@@ -1561,8 +1561,10 @@ def setup_state_kv_args(
     from sglang.srt.disaggregation.base.conn import StateType
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
     kv_args.state_types = []
+    kv_args.dsa_index_k_token_bytes = None
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []
     kv_args.state_item_lens = []
@@ -1598,6 +1600,18 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
+    # Per-token bytes of a hybrid DSA pool's index-K page: the fp8 keys of
+    # every token, then their scales. A PD DCP relayout moves the two parts
+    # separately.
+    if (
+        kv_args.is_hybrid_mla_backend
+        and StateType.DSA in kv_args.state_types
+        and isinstance(owner_view, DSATokenToKVPool)
+        and owner_view.index_kpool == 1
+    ):
+        value_bytes = owner_view.index_head_dim
+        scale_bytes = owner_view.index_head_dim // owner_view.quant_block_size * 4
+        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
     if isinstance(owner_view, NPUMLATokenToKVPool):
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
@@ -1606,6 +1620,7 @@ def setup_state_kv_args(
             if draft_token_to_kv_pool is not None
             else 0
         )
+    _append_draft_kv_ring_state(kv_args)
 
 
 def _token_kv_view(token_to_kv_pool):
@@ -1613,6 +1628,28 @@ def _token_kv_view(token_to_kv_pool):
     a pool wrapping one beside recurrent state (a hybrid draft) holds its
     layers in, else the pool itself."""
     return token_to_kv_pool.layer_router.wrapped_view() or token_to_kv_pool
+
+
+def _append_draft_kv_ring_state(kv_args: KVArgs) -> None:
+    """A DFLASH draft KV ring ships its last window and its floor, last on both
+    sides so the component order matches. A PP stage without the draft keeps
+    empty slots and sends nothing for them."""
+    from sglang.srt.disaggregation.base.conn import StateType
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_enabled,
+        get_draft_kv_ring,
+    )
+
+    ring = get_draft_kv_ring()
+    if ring is not None:
+        append_state_component(kv_args, StateType.DRAFT_RING, *ring.ring_buf_infos())
+        append_state_component(kv_args, StateType.REQUEST_ROW, *ring.floor_buf_infos())
+    elif (
+        str(get_spec().speculative_algorithm).upper() == "DFLASH"
+        and draft_kv_ring_enabled()
+    ):
+        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
+        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
 
 
 def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:

@@ -10,6 +10,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    decode_state_free_radix_of,
     mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
@@ -1105,7 +1106,9 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so neither the extra buffer
+        # nor no_buffer's page-1 / non-overlap requirements apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

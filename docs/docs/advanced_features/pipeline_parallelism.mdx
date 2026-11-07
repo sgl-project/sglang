@@ -49,6 +49,10 @@ Due to the variation in hardware, models, and target workloads, a static configu
   * 1.0: Follows the model strictly.
   * **0.6 – 0.85 (Recommended)**: Typical range for the best balance between dynamic scaling and hardware stability. Through experiments, we find that a range between 0.6 and 0.85 typically yields the best performance for dynamic chunking.
   * 0: Disables dynamic adjustment, reverting to traditional fixed-size chunking.
+
+### Small Chunks for Mostly Cached Batches
+
+A prefill batch with few new tokens, such as many requests with long cached prefixes, makes too few chunks to fill the pipeline, and the stages run almost one after another. `--pp-min-chunked-prefill-size <N>` uses a chunk of `N` tokens for such batches. If any pending request has at least `--chunked-prefill-size` uncached tokens, the full `--chunked-prefill-size` is used instead, because every chunk rereads its whole prefix in the sparse-attention indexer and a long prefill in small chunks costs more. Pending requests are probed without changing the prefix cache. It applies only with `--pp-size` > 1.
 * **Another small optimization tip:** Put the larger partition in the higher PP rank when the layers are not evenly divisible across ranks. It can increase the GPU utilization when a larger PP rank is waiting for the previous stage’s result, hence reducing the bubbles on higher PP ranks. If we take DeepSeek-V3.1 as an example, `SGLANG_PP_LAYER_PARTITION=15,15,15,16` usually performs better than `16,15,15,15`.
 
 ## Best Practice for Long Context

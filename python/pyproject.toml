@@ -62,6 +62,7 @@ dependencies = [
   "partial_json_parser",
   # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
   "pillow<13",
+  "pillow-heif",
   "prometheus-client>=0.20.0",
   "psutil",
   "py-spy",

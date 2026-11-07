@@ -68,6 +68,11 @@ def _jit_spec_module(
     )
 
 
+# Mirrors the static_asserts in kvcacheio/hisparse_spec.cuh.
+SPEC_SWAP_MAX_STEPS = 8
+SPEC_SWAP_MAX_OCCURRENCES = 16384
+
+
 def load_cache_to_device_buffer_spec_mla(
     *,
     top_k_tokens: torch.Tensor,
@@ -92,9 +97,10 @@ def load_cache_to_device_buffer_spec_mla(
     ``copy_cache_planned_mla``.
     """
     _, num_steps, num_top_k = top_k_tokens.shape
-    if not 2 <= num_steps <= 4:
+    if not 2 <= num_steps <= SPEC_SWAP_MAX_STEPS:
         raise ValueError(
-            f"HiSparse speculative swap requires 2-4 steps, got {num_steps}."
+            f"HiSparse speculative swap requires 2-{SPEC_SWAP_MAX_STEPS} steps, "
+            f"got {num_steps}."
         )
     hot_buffer_size = state.cache_policy.size(1)
     page_size = device_buffer_tokens.size(1) - hot_buffer_size

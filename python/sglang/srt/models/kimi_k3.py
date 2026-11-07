@@ -67,6 +67,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
+    _bank_rows,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -156,6 +157,9 @@ from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
 from sglang.srt.utils.log_utils import rank0_log
 
+if TYPE_CHECKING:
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
 logger = logging.getLogger(__name__)
 
 # `experts.<expert_id>.<w1|w2|w3>.` fragment of a checkpoint tensor name, the
@@ -164,6 +168,79 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+# Kimi-K3.1 dense GEMMs routed to TGV for every caller of the shape: (n, k) ->
+# ((m_lo, m_hi, tactic), ...), tactic None = the ladder pick.
+# K=7168 shapes up to 64 decode rows on any SM10x (B300, CUDA graph, cold HBM
+# via rotated weights: e.g. m=64 MoE front 16.0 vs 19.4 us, KDA qkvg 16.3 vs
+# 19.6 us).
+_K31_TGV_M_RANGES = {
+    (6144, 7168): ((1, 64, None),),  # KDA fused qkvg
+    (6016, 7168): ((1, 64, None),),  # merged MoE front
+    (1536, 7168): ((1, 64, None),),  # MLA q_a / shared gate_up / output gate
+    (2112, 7168): ((1, 64, None),),  # MLA fused q_a + kv_a
+}
+
+# GB300 (SM103) TP8 decode / DFLASH-verify rows (M = 6 x graph bs) where a fixed
+# TGV tactic beats the cuBLAS / ladder pick. CUDA graph, cold HBM, us per GEMM,
+# old pick -> TGV:
+#   KDA qkvg          M 72-96   18.4-18.6 -> 17.0-17.3 (cuBLAS wins above)
+#   MLA qkv_a         M 72-288  9.6-16.4 -> 9.0-12.6 (cuBLAS ties at 144)
+#   MLA g_proj        M 72-288  8.3-12.0 -> 7.5-9.8 (ties at 108-156)
+#   KDA / MLA o_proj  M 72-84   6.1-6.3 -> 5.6-5.8 (cuBLAS wins above)
+#   latent-up slice   M 84-156  4.8 -> 4.5 (ladder ties above)
+_K31_GB300_TGV_M_RANGES = {
+    (6144, 7168): ((72, 96, 24),),
+    (2112, 7168): ((72, 120, 21), (132, 132, 23), (156, 240, 23), (264, 288, 24)),
+    (1536, 7168): ((72, 192, 21), (240, 288, 23)),
+    (7168, 1536): ((72, 84, 24),),
+    # TP-sharded latent-up slice (k3_ar_fusion.slice_gemm)
+    (896, 3584): ((84, 156, 21),),
+}
+
+# GB300 TP8 KDA [f_a | b] (144 x 7168) on the attention side stream only: a
+# 12-16 CTA TGV streams beside the wide [q,k,v,g] GEMM, where cuBLAS split-K
+# waits for SMs (qkvg + [f_a|b] + f_b 24.1-25.9 -> 19.7-21.8 us at M 72-120,
+# 29.3-34.5 serial -> 23.8-29.9 at 132-288). Not registered globally: run
+# alone, the few CTAs lose, so every other caller of the shape keeps its pick.
+_K31_GB300_BFA_SIDE_TGV_M_RANGES = {
+    (144, 7168): ((72, 128, 21), (129, 256, 23), (257, 288, 24)),
+}
+
+
+def _k31_gb300_tuning(config) -> bool:
+    """Kimi-K3.1 on GB300: _K31_GB300_* tactics and the 288-row side streams.
+    SGLANG_K31_DECODE_GEMM_TACTICS=0 restores the generic picks."""
+    return (
+        is_kimi_k31(config)
+        and get_platform().device_sm == 103
+        and envs.SGLANG_K31_DECODE_GEMM_TACTICS.get()
+    )
+
+
+def _k3_side_stream_max_tokens(config) -> int:
+    """Largest graphed decode / verify batch whose attention side-stream GEMMs
+    (MLA g_proj, KDA [f_a | b] -> f_b) overlap the main stream. Above it the
+    attention core fills the SMs and the overlap only adds sync overhead; on
+    K3.1 GB300 the TGV picks above keep the gate and [f_a | b] cheap enough to
+    hide up to 288 verify rows."""
+    if not get_platform().is_blackwell:
+        return 64
+    return 288 if _k31_gb300_tuning(config) else 128
+
+
+def _k3_bfa_side_gemm(
+    x: torch.Tensor, w: torch.Tensor, tgv_tactic: Optional[int]
+) -> torch.Tensor:
+    """[f_a | b] GEMM on the KDA attention side stream: TGV with tgv_tactic,
+    or the tiny GEMM when it is None."""
+    if tgv_tactic is None:
+        from sglang.kernels.ops.gemm import kimi_k3_tiny_gemm
+
+        return kimi_k3_tiny_gemm(x, w)
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
+
+    return cutedsl_bf16_gemm(x, w, tactic=tgv_tactic)
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -911,6 +988,7 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_mma_type,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -925,6 +1003,7 @@ class KimiK3MoE(nn.Module):
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
             f"the env var to cover the per-rank rows"
         )
+        mma_type = _mega_moe_mma_type(self.experts)
         buf = self._mega_moe_buffer()
 
         if num_tokens > 0:
@@ -938,7 +1017,18 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
+        valid_rows = None
+        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+            # The graph bucket is static; its live CP prefix changes on replay.
+            # Mask NaNs as well as routes before quantization/dispatch.
+            valid_rows = (
+                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+            )
+            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        dispatch_args = (
             routed_input,
             topk_ids_in,
             topk_weights_in,
@@ -946,9 +1036,21 @@ class KimiK3MoE(nn.Module):
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
-            num_token_non_padded=valid_token_count,
         )
+        if mma_type == "mxf4xmxf4":
+            # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
+            deep_gemm.mega_moe_pre_dispatch(
+                *dispatch_args,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                *dispatch_args,
+                quant_group_size=32,
+                num_token_non_padded=valid_token_count,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
@@ -966,8 +1068,9 @@ class KimiK3MoE(nn.Module):
                 fast_math=True,
             )
         y = y[:num_tokens]
-        if valid_token_count is not None:
-            valid_rows = torch.arange(num_tokens, device=y.device) < valid_token_count
+        # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
+        # the combine writes zeros for a row with no route, so only mxf4 masks.
+        if valid_rows is not None:
             y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1320,6 +1423,10 @@ class KimiK3MoE(nn.Module):
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
+        elif hidden_states.shape[0] == 0:
+            # An idle DP-attention rank routes nothing but still enters the EP
+            # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
@@ -1751,10 +1858,10 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            (128 if get_platform().is_blackwell else 64)
-            if bfa_alt_stream is not None
-            else 0
+            _k3_side_stream_max_tokens(config) if bfa_alt_stream is not None else 0
         )
+        # TGV m ranges of the side-stream [f_a | b] GEMM, set with _bfa_w.
+        self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: head-sharded params follow the
         # attention-TP group, matching the mamba state cache sizing. Under
@@ -2085,6 +2192,17 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if _k31_gb300_tuning(self.config) and get_bf16_gemm_backend().is_cutedsl():
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
+            m_ranges = TGVMRanges()
+            for m_lo, m_hi, tactic in _K31_GB300_BFA_SIDE_TGV_M_RANGES.get(
+                tuple(self._bfa_w.shape), ()
+            ):
+                m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+            self._bfa_side_tgv_m_ranges = m_ranges
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2296,8 +2414,12 @@ class KimiK3DeltaAttention(nn.Module):
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    m_ranges = self._bfa_side_tgv_m_ranges
+                    tgv_tactic = (
+                        None if m_ranges is None else m_ranges(hidden_states.shape[0])
+                    )
                     with torch.cuda.stream(alt):
-                        bfa = gemm(hidden_states, w)
+                        bfa = _k3_bfa_side_gemm(hidden_states, w, tgv_tactic=tgv_tactic)
                         forget_gate = (
                             bfa[..., :n_fa]
                             if defer_f_b
@@ -2422,6 +2544,8 @@ class KimiK3DeltaAttention(nn.Module):
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
+    # Kimi-K3.1 DSA layers (K3 has no indexer)
+    dsa_decode_absorb_under_indexer = True
     dcp_v_preproject = True
 
     def __init__(
@@ -2554,11 +2678,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_hidden_states = None
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
-            # Above this token count the attention-core kernels fill the SMs
-            # on their own and the overlap only adds sync overhead (same
-            # bound as deepseek_v4).
             self._gate_bs_limit = (
-                (128 if get_platform().is_blackwell else 64)
+                _k3_side_stream_max_tokens(config)
                 if self._gate_alt_stream is not None
                 else 0
             )
@@ -2719,10 +2840,10 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
-    gathers what it read. A rank then holds only its own rows of the bank, so
-    neither a later pipeline rank nor a draft model's capture of the target's
-    hidden states can take them; it is decided at construction. Nor can a
-    dense layer after an SP-MoE one, whose FFN reads every row of the bank:
+    gathers what it read. DSpark gathers the pre-norm mixture at its capture
+    layers, but other aux-capture and pipeline paths need the whole bank;
+    this is decided at construction. Nor can a dense layer after an SP-MoE
+    one, whose FFN reads every row of the bank:
     every layer from the first MoE layer on must be one. This layout also
     works with NCCL: custom collective kernels only fuse the local bank
     read with the gather, and are not required to keep the bank sharded."""
@@ -2737,7 +2858,7 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     if True not in moe or not all(moe[moe.index(True) :]):
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return not (spec.is_eagle3() or spec.is_dflash_family())
+    return spec.is_dspark() or not (spec.is_eagle3() or spec.is_dflash_family())
 
 
 def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -3030,13 +3151,17 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
-            valid_token_count = None
             if is_interleave_extend(forward_batch):
                 from sglang.srt.layers.cp.base import get_cp_strategy
 
                 valid_token_count = get_cp_strategy().moe_num_token_non_padded(
                     forward_batch
                 )
+            else:
+                # Padded rows (a graph bucket, or SP rows rounded up to the
+                # attention-TP size) would otherwise be routed: their stale
+                # contents pile onto a few experts that every rank then waits on.
+                valid_token_count = forward_batch.moe_num_token_non_padded()
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=(
@@ -3315,13 +3440,20 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        return aggregate_stream(
+        bank = self.attn_bank.require()
+        rows = _bank_rows(bank, hidden_states)
+        mixed = aggregate_stream(
             hidden_states,
-            self.attn_bank.require().block_residual,
+            bank.block_residual if rows is None else bank.block_residual[rows],
             nvb,
             score_proj,
             score_norm,
         )
+        # Only the mixture is needed by the draft. Keep the bank sharded and
+        # return owned storage so a later layer's gather cannot overwrite it.
+        if rows is not None:
+            return get_parallel().attn_tp_group.all_gather(mixed, dim=0)
+        return mixed
 
 
 class KimiK3LinearForCausalLM(nn.Module):
@@ -3353,6 +3485,14 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if is_kimi_k31(config):
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
+
+            register_tgv_m_ranges(_K31_TGV_M_RANGES)
+            if _k31_gb300_tuning(config):
+                register_tgv_m_ranges(_K31_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -3407,12 +3547,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
-            )
-        if self.model.carries_bank_slices:
-            raise RuntimeError(
-                "the model keeps each rank's shard of the rows across SP-MoE "
-                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
-                "to capture whole"
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
@@ -3692,6 +3826,15 @@ class KimiK3LinearForCausalLM(nn.Module):
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
+        num_dsa_layers = sum(
+            self.config.is_dsa_layer(i)
+            for i in range(self.model.start_layer, self.model.end_layer)
+        )
+        assert num_dsa_layers > 0 or not expected
+        assert len(expected) == 5 * num_dsa_layers, (
+            f"Kimi-K3.1: built {len(expected)} DSA indexer params, expected "
+            f"5 per DSA layer x {num_dsa_layers} layers."
+        )
         missing = sorted(expected - loaded_params)
         assert not missing, (
             f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
@@ -3799,6 +3942,11 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+            if (
+                isinstance(layer.self_attn, KimiK3MLAAttention)
+                and layer.self_attn.indexer is not None
+            ):
+                layer.self_attn.indexer.prepare_merged_k_gate()
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

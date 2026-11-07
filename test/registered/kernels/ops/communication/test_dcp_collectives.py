@@ -1,5 +1,6 @@
 """Run with python on eight GPUs; validate peer exchange and graph replay."""
 
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -13,7 +14,7 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     dcp_lse_combine_triton,
 )
 from sglang.srt.layers.dcp import comm
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import published_topology
@@ -180,6 +181,8 @@ def test_request_ordered_byte_gather():
 
 
 def test_candidate_merge_scratch_and_graph_replay():
+    from functools import partial
+
     from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
     from sglang.srt.layers.attention.dsa import dsa_dcp_sharded as dsa_dcp
 
@@ -199,7 +202,7 @@ def test_candidate_merge_scratch_and_graph_replay():
             local = (lengths + world - 1 - rank) // world
             table = torch.arange(64, device="cuda", dtype=torch.int32).expand(rows, -1)
 
-            def call(scores, local, lengths, table):
+            def call(scores, local, lengths, table, **kwargs):
                 return dsa_dcp.dcp_global_topk(
                     scores,
                     local,
@@ -208,6 +211,7 @@ def test_candidate_merge_scratch_and_graph_replay():
                     2048,
                     64,
                     plan_topk_v2(lengths),
+                    **kwargs,
                 )
 
             for _ in range(2):
@@ -223,9 +227,13 @@ def test_candidate_merge_scratch_and_graph_replay():
                 scores.uniform_()
                 lengths.fill_(length)
                 local.copy_((lengths + world - 1 - rank) // world)
-                # Eager reference through the plain group all-gather.
-                with patch.object(dsa_dcp, "_CANDIDATE_ALL_GATHER", None):
-                    expected = call(scores, local, lengths, table)
+                expected = call(
+                    scores,
+                    local,
+                    lengths,
+                    table,
+                    all_gather=partial(group.all_gather, dim=0),
+                )
                 graph.replay()
                 torch.cuda.synchronize()
                 # The top-k contract specifies the selected set, not output order.
@@ -233,6 +241,146 @@ def test_candidate_merge_scratch_and_graph_replay():
                     actual.sort(dim=-1).values, expected.sort(dim=-1).values
                 ), (actual.shape[0], length)
                 assert workspace.merge_buffer.data_ptr() == scratch_ptr
+
+
+def test_token_packing_after_dcp_gather():
+    fixture._init_world()
+    group = ps._WORLD
+    rank, world_size = group.rank_in_group, group.world_size
+    if not get_platform().is_sm100:
+        pytest.skip("token packing requires SM100")
+    from sglang.kernels.ops.attention.dsa.dequant_k_cache import dequantize_k_cache
+    from sglang.kernels.ops.attention.dsa.flashmla_token_pack import (
+        flashmla_kv_token_packed,
+        flashmla_token_pack_available,
+    )
+    from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
+    from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
+
+    if not flashmla_token_pack_available():
+        pytest.skip("installed FlashMLA predates token packing")
+    torch.backends.cuda.matmul.allow_tf32 = False
+    with (
+        published_topology(tp_size=world_size, dcp_size=world_size),
+        get_parallel().override(
+            dcp_group=group,
+            dcp_rank=rank,
+            attn_dcp_rank=rank,
+        ),
+    ):
+        # Unequal rank shares, ranks with no rows, request boundaries
+        # inside a five-query group, non-contiguous physical pages,
+        # incomplete pages, and both short and full 2048-key support.
+        for case, lengths in enumerate(
+            ([1], [1, 7, 9], [65, 63, 129], [513, 2051, 17])
+        ):
+            torch.manual_seed(100 + case)
+            total = sum(lengths)
+            full = (
+                quantize_k_cache(
+                    torch.randn(
+                        (total + 63) // 64,
+                        64,
+                        1,
+                        576,
+                        device=f"cuda:{rank}",
+                        dtype=torch.bfloat16,
+                    ),
+                    scale_ue8m0=True,
+                )
+                .view(torch.uint8)
+                .view(-1, 656)
+            )
+            local_pool = torch.full(
+                (8192, 656), 91, device=f"cuda:{rank}", dtype=torch.uint8
+            )
+            local_rows = []
+            offset = 0
+            for request, length in enumerate(lengths):
+                positions = torch.arange(length, device=f"cuda:{rank}")[
+                    rank::world_size
+                ]
+                physical = 64 + request * 2048 + positions // world_size
+                local_pool[physical] = full[offset + positions]
+                local_rows.append(physical)
+                offset += length
+            batch = SimpleNamespace(seq_lens_cpu=torch.tensor(lengths))
+            metadata = SimpleNamespace(dcp_local_kv_rows=torch.cat(local_rows))
+            backend = SimpleNamespace(kv_cache_dim=656, physical_page_size=64)
+            gathered = (
+                DeepseekSparseAttnBackend.dcp_gather_kv_cache(
+                    backend,
+                    local_pool.view(torch.float8_e4m3fn),
+                    batch,
+                    metadata,
+                )
+                .view(torch.uint8)
+                .view(-1, 656)
+            )
+            assert torch.equal(gathered[:total], full[:total])
+            assert torch.count_nonzero(gathered[total:]).item() == 0
+
+            extend = [min(length, 6 + i % 3) for i, length in enumerate(lengths)]
+            tokens = sum(extend)
+            torch.manual_seed(200 + rank + case)
+            q = torch.randn(
+                tokens, 12, 576, device=f"cuda:{rank}", dtype=torch.bfloat16
+            )
+            rows = torch.full(
+                (tokens, 2048), -1, device=f"cuda:{rank}", dtype=torch.int32
+            )
+            offset = row = 0
+            for length, count in zip(lengths, extend):
+                for query in range(count):
+                    visible = length - count + query + 1
+                    selected = torch.randperm(visible, device=f"cuda:{rank}")[:2048]
+                    rows[row, : selected.numel()] = selected.int() + offset
+                    row += 1
+                offset += length
+            cache = gathered.view(-1, 64, 1, 656)
+            actual = flashmla_kv_token_packed(
+                q[:, :, :512], q[:, :, 512:], cache, rows, 192**-0.5
+            )
+            reference = torch.ops.sgl_kernel.sparse_decode_fwd.default(
+                q.unsqueeze(1),
+                cache,
+                rows.unsqueeze(1),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                512,
+                192**-0.5,
+                "V32",
+                0,
+            )[0]
+            # Packing reorders KV rows, so compare both BF16 kernels
+            # with a complete FP32 reference before checking their pairwise
+            # error. Bound global FP32 error as well as pairwise error.
+            keys = (
+                dequantize_k_cache(cache.view(torch.float8_e4m3fn))
+                .reshape(-1, 576)
+                .float()
+            )
+            gold = torch.empty_like(reference, dtype=torch.float32)
+            for query in range(tokens):
+                selected = rows[query][rows[query] >= 0].long()
+                visible_keys = keys[selected]
+                scores = q[query].float() @ visible_keys.T * 192**-0.5
+                gold[query, 0] = scores.softmax(-1) @ visible_keys[:, :512]
+            native_rmse = (reference.float() - gold).square().mean().sqrt()
+            packed_rmse = (actual.float() - gold).square().mean().sqrt()
+            relative_l2 = torch.linalg.vector_norm(actual.float() - gold) / (
+                torch.linalg.vector_norm(gold)
+            )
+            assert torch.isfinite(gold).all()
+            assert relative_l2 < 2.5e-3
+            assert packed_rmse <= 1.2 * native_rmse + 3e-6
+            torch.testing.assert_close(actual, reference, atol=5e-3, rtol=1e-2)
+            torch.cuda.synchronize()
 
 
 if __name__ == "__main__":

@@ -28,6 +28,8 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 @dataclass(kw_only=True)
 class ForwardMetadata:
     query_start_loc: torch.Tensor
+    # int64 copy of query_start_loc for extend kernels that need it; None otherwise.
+    query_start_loc_i64: Optional[torch.Tensor] = None
     mamba_cache_indices: torch.Tensor
     conv_block_table: Optional[torch.Tensor] = None
     logical_num_tokens: Optional[int] = None

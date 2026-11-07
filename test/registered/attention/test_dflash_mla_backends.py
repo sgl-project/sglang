@@ -1,6 +1,7 @@
 """DFlash MLA drafts on real MLA backends, bidirectional and causal, eager and graph."""
 
 import copy
+import importlib.util
 import math
 import unittest
 
@@ -16,7 +17,6 @@ from sglang.srt.runtime_context import get_context, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.dflash_info import DFlashVerifyInput
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-from sglang.srt.utils import BumpAllocator
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.attention_unittest.attention_methods.mla_attention import (
     MLAAttentionCase,
@@ -30,7 +30,7 @@ register_cuda_ci(est_time=40, stage="base-b", runner_config="4-gpu-b200")
 
 HIDDEN, HEADS, RANK, NOPE, ROPE, VALUE, BLOCK = 128, 32, 512, 128, 64, 128, 8
 CAPACITY = 256
-BACKENDS = ("triton", "flashinfer")
+BACKENDS = ("triton", "flashinfer", "tokenspeed_mla")
 
 
 def _rope(x, positions):
@@ -88,7 +88,7 @@ class TestDFlashMLABackends(unittest.TestCase):
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy", device="cuda", tp_size=1), role="test")
 
-    def _make_runner(self, backend_name, config):
+    def _make_runner(self, backend_name, config, fp8):
         model_config = TinyMLAModelConfig(
             num_heads=HEADS,
             kv_lora_rank=RANK,
@@ -96,6 +96,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             hidden_size=HIDDEN,
             context_len=CAPACITY,
         )
+        model_config.is_dflash_mla_draft = True
         model_config.hf_config = model_config.hf_text_config = config
         model_config.qk_nope_head_dim = NOPE
         model_config.head_dim = NOPE + ROPE
@@ -119,6 +120,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             kv_lora_rank=RANK,
             qk_rope_head_dim=ROPE,
             disable_cuda_graph=False,
+            fp8_kv_cache=fp8,
         )
         runner.is_draft_worker = True
         runner.spec_algorithm = SpeculativeAlgorithm.DFLASH
@@ -131,19 +133,15 @@ class TestDFlashMLABackends(unittest.TestCase):
             speculative_num_draft_tokens=BLOCK,
             speculative_num_steps=BLOCK - 1,
         )
-        return runner
-
-    def _make_backend(self, backend_name, runner, module):
-        # Backends read the mask from the attn_type of the model's layers.
-        runner.model = module
         backend = ATTENTION_BACKENDS[backend_name](runner)
         # Normally stamped by ModelRunner, which this fixture bypasses.
         backend.prefill_attention_backend_str = backend_name
         backend.decode_attention_backend_str = backend_name
-        return backend
+        return runner, backend
 
     def _check(self, backend_name, *, causal):
         torch.manual_seed(20261016)
+        fp8 = backend_name == "tokenspeed_mla"
         config = Qwen3Config(
             hidden_size=HIDDEN,
             num_hidden_layers=1,
@@ -160,7 +158,7 @@ class TestDFlashMLABackends(unittest.TestCase):
             layer_types=["full_attention"],
             dflash_config={"attention_mode": "mla", "block_size": BLOCK},
         )
-        runner = self._make_runner(backend_name, config)
+        runner, backend = self._make_runner(backend_name, config, fp8)
         module = DFlashMLAAttention(config, layer_id=0)
         # get_rope() shares one cached instance, and the CUDA RoPE kernel reads
         # an FP32 table that Module.to would round to BF16.
@@ -175,10 +173,6 @@ class TestDFlashMLABackends(unittest.TestCase):
                 else:
                     param.normal_(std=1 / math.sqrt(param.shape[-1]))
         module.absorb_kv_b_proj()
-        backend = self._make_backend(backend_name, runner, module)
-        zero_allocator = BumpAllocator(
-            buffer_size=2, dtype=torch.float32, device="cuda"
-        )
 
         def make_inputs(prefix_lens):
             current = MLAAttentionCase(
@@ -232,13 +226,16 @@ class TestDFlashMLABackends(unittest.TestCase):
         def check(actual, expected):
             self.assertTrue(torch.isfinite(actual).all())
             relative_l2 = (actual.float() - expected).norm() / expected.norm()
-            self.assertLess(relative_l2.item(), 0.012)
-            torch.testing.assert_close(actual.float(), expected, atol=0.025, rtol=0.025)
+            self.assertLess(relative_l2.item(), 0.05 if fp8 else 0.012)
+            if not fp8:
+                torch.testing.assert_close(
+                    actual.float(), expected, atol=0.025, rtol=0.025
+                )
 
         with torch.no_grad(), forward_context(ForwardContext(attn_backend=backend)):
             batch, hidden, expected = make_inputs((0, 31))
             backend.init_forward_metadata(batch)
-            check(module(batch.positions, hidden, batch, zero_allocator), expected)
+            check(module(batch.positions, hidden, batch), expected)
 
             # Capture on a fresh batch, then replay with different prefixes so a
             # mask or plan baked in at capture would show up.
@@ -251,13 +248,13 @@ class TestDFlashMLABackends(unittest.TestCase):
             with torch.cuda.stream(stream):
                 for _ in range(3):
                     backend.init_forward_metadata_in_graph(batch)
-                    module(batch.positions, hidden, batch, zero_allocator)
+                    module(batch.positions, hidden, batch)
             torch.cuda.current_stream().wait_stream(stream)
             backend.on_after_cuda_graph_warmup()
             graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, stream=stream):
                 backend.init_forward_metadata_in_graph(batch)
-                output = module(batch.positions, hidden, batch, zero_allocator)
+                output = module(batch.positions, hidden, batch)
 
             replay, next_hidden, expected = make_inputs((63, 32))
             hidden.copy_(next_hidden)
@@ -272,6 +269,11 @@ class TestDFlashMLABackends(unittest.TestCase):
     def _check_backends(self, *, causal):
         for backend_name in BACKENDS:
             with self.subTest(backend=backend_name):
+                if backend_name == "tokenspeed_mla" and (
+                    torch.cuda.get_device_capability() not in {(10, 0), (10, 3)}
+                    or importlib.util.find_spec("tokenspeed_mla") is None
+                ):
+                    self.skipTest("TokenSpeed MLA requires SM100/SM103 and the package")
                 self._check(backend_name, causal=causal)
 
     def test_bidirectional(self):

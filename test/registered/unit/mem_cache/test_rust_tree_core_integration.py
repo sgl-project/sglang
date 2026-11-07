@@ -265,6 +265,30 @@ def test_insert_then_match_back_returns_the_exact_indices(backend):
 
 
 @pytest.mark.parametrize("backend", ["python", "rust"])
+def test_node_hit_count_counts_each_insert_through_a_node(backend):
+    core = _tree_core(backend)
+    leaf = _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node
+    assert core.node_hit_count(leaf) == 1
+    assert _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node == leaf
+    assert core.node_hit_count(leaf) == 2
+
+
+def test_node_hit_count_matches_python_across_a_split():
+    counts = {}
+    for backend in ("python", "rust"):
+        core = _tree_core(backend)
+        _insert(core, [1, 2, 3], [10, 11, 12])
+        _insert(core, [1, 2, 3], [10, 11, 12])
+        branch = _insert(core, [1, 2, 4], [10, 11, 13]).last_device_node
+        matched = core.match_prefix(MatchPrefixParams(key=_key([1, 2, 3])))
+        paths = core.collect_path_info([matched.last_device_node, branch])
+        counts[backend] = [
+            [core.node_hit_count(node.node_id) for node in path] for path in paths
+        ]
+    assert counts["rust"] == counts["python"]
+
+
+@pytest.mark.parametrize("backend", ["python", "rust"])
 def test_match_reports_split_prefix_and_zero_match_clears_walk_facts(backend):
     core = _tree_core(backend)
     leaf = _insert(core, [1, 2, 3], [10, 11, 12]).last_device_node

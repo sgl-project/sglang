@@ -183,6 +183,9 @@ def _gpu_fabric_clique(device: torch.device):
         clique_id = fabric.partitionId
     if fabric.state != _NVML_GPU_FABRIC_STATE_COMPLETED:
         return None
+    # Standalone NVSwitch nodes can report COMPLETED with an unset UUID.
+    if not any(bytes(fabric.clusterUuid)):
+        return None
     return (bytes(fabric.clusterUuid), int(clique_id))
 
 

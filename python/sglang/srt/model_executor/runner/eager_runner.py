@@ -24,6 +24,7 @@ import torch
 from sglang.kernels.ops.attention.kv_indices import (
     create_chunked_prefix_cache_kv_indices,
 )
+from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -278,6 +279,12 @@ class EagerRunner(BaseRunner):
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
                 and forward_batch.extend_prefix_lens is not None
+                # MLA target verify uses rank-local decode KV and LSE merge,
+                # not the prefill KV gather layout (or its prefix lengths).
+                and not (
+                    forward_batch.forward_mode.is_target_verify()
+                    and model_runner.model_config.attention_arch == AttentionArch.MLA
+                )
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (

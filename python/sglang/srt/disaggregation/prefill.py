@@ -85,7 +85,6 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
-    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -104,6 +103,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
+from sglang.srt.speculative.dflash_draft_ring import get_draft_kv_ring
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
 
@@ -1708,10 +1708,25 @@ class SchedulerDisaggregationPrefillMixin:
         # The schedule stream may wait on the in-flight forward. A sender that takes
         # host-tensor indices waits on their copy's event itself, so the scheduler
         # never blocks on these device reads.
-        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
-            sender.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+        host_indices = (
+            # Only Mooncake's sender consumes the async host snapshots under
+            # indices_event. Other backends keep synchronous .cpu().numpy().
+            getattr(sender, "supports_host_tensor_indices", False)
+            # KV-sharded sends filter host values before enqueueing them.
+            and getattr(sender.kv_mgr, "kv_shard_size", 1) == 1
+            and not (
+                sender.kv_mgr.enable_all_cp_ranks_for_transfer
+                and not get_parallel().enable_dsa_cache_layer_split
+            )
         )
+
+        def _host_indices(indices: torch.Tensor) -> np.ndarray:
+            # State rides the last segment's send, whose indices_event is
+            # recorded behind this copy on the same stream. NumPy retains the
+            # pinned tensor storage without reading it.
+            if host_indices:
+                return async_d2h(indices).numpy()
+            return indices.cpu().numpy()
 
         def page_indices_of(kv_indices: torch.Tensor):
             if not host_indices:
@@ -1719,8 +1734,6 @@ class SchedulerDisaggregationPrefillMixin:
             return async_d2h(kv_indices[::page_size] // page_size)
 
         def state_page_indices(kv_indices: torch.Tensor) -> np.ndarray:
-            # State rides the last segment's send, whose indices_event is
-            # recorded behind this copy on the same stream.
             page_indices = page_indices_of(kv_indices)
             return page_indices.numpy() if host_indices else page_indices
 
@@ -1750,13 +1763,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.req_to_token_pool.state_sub_pool
                 )
                 return [
-                    state_ids.ids(
-                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                            req.kv.req_pool_idx
-                        ]
+                    _host_indices(
+                        state_ids.ids(
+                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                                req.kv.req_pool_idx
+                            ]
+                        )
                     )
-                    .cpu()
-                    .numpy()
                 ]
 
             def _swa_payload(sub_pool="swa", window=_SCHEDULER_WINDOW):
@@ -1796,12 +1809,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
-                return suffix_page_indices(
-                    self.req_to_token_pool.req_to_token,
-                    req.kv.req_pool_idx,
-                    req.disagg_decode_prefix_len,
-                    seq_len,
-                    page_size,
+                return state_page_indices(
+                    self.req_to_token_pool.req_to_token[
+                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
+                    ]
                 )
 
             def _dsa_tail_payload():
@@ -1835,6 +1846,12 @@ class SchedulerDisaggregationPrefillMixin:
                     int(req.kv.req_pool_idx), c128_seq_len
                 )
 
+            def _draft_ring_payload():
+                ring = get_draft_kv_ring()
+                if ring is None:
+                    return None
+                return ring.transfer_rows(int(req.kv.req_pool_idx), seq_len)
+
             def _request_row_payload():
                 return np.array([req.kv.req_pool_idx], dtype=np.int32)
 
@@ -1852,6 +1869,7 @@ class SchedulerDisaggregationPrefillMixin:
                 StateType.MINIMAX_INDEX_K: _minimax_payload,
                 StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
                 StateType.SWA_RING: _swa_ring_payload,
+                StateType.DRAFT_RING: _draft_ring_payload,
                 StateType.DSV4_REQUEST_STATE: _request_state_payload,
                 StateType.REQUEST_ROW: _request_row_payload,
                 StateType.BLOCK_SCALE: _full_kv_pages_payload,

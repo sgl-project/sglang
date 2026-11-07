@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.runtime_context import (
     get_disagg,
+    get_exec,
     get_memory,
     get_serving,
 )
@@ -192,6 +193,11 @@ def create_unified_radix_cache(
         shape=_static_tree_shape(ctx, allocator),
     )
     tree_slots = list(storage.tree_slots(window_reaches=params.draft_window_reaches))
+    if ctx.is_hybrid_ssm and get_exec().mamba.decode_state_free_radix:
+        # A PD decode tree keeps FULL KV only: prefill sends every request's
+        # final state, so no tree-held state is ever read.
+        params.request_mamba_only = True
+        tree_slots = [slot for slot in tree_slots if slot.family != TREE_STATE]
 
     if hasattr(params.req_to_token_pool, "req_to_c128_sidecar"):
         from sglang.srt.hardware_backend.npu.dsv4.c128_sidecar_component import (
