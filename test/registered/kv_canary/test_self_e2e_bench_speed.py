@@ -5,7 +5,7 @@ import dataclasses
 import os
 import unittest
 from pathlib import Path
-from typing import ClassVar, Optional
+from typing import ClassVar, List, Optional
 
 from sglang.benchmark.one_batch_server import (
     BenchArgs,
@@ -20,7 +20,7 @@ from sglang.test.test_utils import DEFAULT_PORT_FOR_SRT_TEST_RUNNER
 # CUDA-only: this self-bench asserts a 1.0% kv_canary overhead budget tuned on
 # the CUDA (H100) runner. On ROCm the measured overhead is ~1.26%, so the
 # benchmark is not portable as-is; keep it off AMD CI rather than register-and-skip.
-register_cuda_ci(est_time=335, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=400, stage="extra-a", runner_config="1-gpu-large")
 
 
 _QWEN3_MODEL = "Qwen/Qwen3-30B-A3B"
@@ -31,6 +31,11 @@ _PROFILE_STEPS = 30
 _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 # start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
 _PROFILE_NO_GRAPH_STEPS = 3
+
+# One bench run occasionally stalls for ~1-2 s (seen on both the off and on side,
+# on several H100 hosts), which turns a ~1.5% overhead into a 20-60% one. Time
+# each setting this many times on the same server and compare the fastest runs.
+_TIMED_REPEATS = 3
 
 
 def _make_server_args(
@@ -54,10 +59,13 @@ def _make_server_args(
     return ServerArgs.from_cli_args(namespace)
 
 
-def _make_bench_args(*, batch_size: int, input_len: int, output_len: int) -> BenchArgs:
+def _make_bench_args(
+    *, batch_size: int, input_len: int, output_len: int, repeats: int = 1
+) -> BenchArgs:
     return BenchArgs(
         run_name=f"canary_self_bench_bs{batch_size}_isl{input_len}_osl{output_len}",
-        batch_size=(batch_size,),
+        # Repeating the batch size runs the same case again; each run flushes the cache first.
+        batch_size=(batch_size,) * repeats,
         input_len=(input_len,),
         output_len=(output_len,),
         temperature=0.0,
@@ -77,12 +85,16 @@ def _run_one_canary_setting(
     disable_cuda_graph: bool = False,
     profile_output_dir: Optional[Path] = None,
     profile_steps: int = _PROFILE_STEPS,
-) -> BenchOneCaseResult:
+    repeats: int = 1,
+) -> List[BenchOneCaseResult]:
     server_args = _make_server_args(
         canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
     )
     bench_args = _make_bench_args(
-        batch_size=batch_size, input_len=input_len, output_len=output_len
+        batch_size=batch_size,
+        input_len=input_len,
+        output_len=output_len,
+        repeats=repeats,
     )
     if profile_output_dir is not None:
         profile_output_dir.mkdir(parents=True, exist_ok=True)
@@ -110,7 +122,7 @@ def _run_one_canary_setting(
             f"bs={batch_size}, isl={input_len}, osl={output_len}); the runner's "
             f"KV cache is too small to fit this configuration -- nothing to measure."
         )
-    return results[0]
+    return results
 
 
 def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> str:
@@ -144,7 +156,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         graph_dir = scenario_root / "cuda_graph"
         # +3 to cover prefill chunks + tail; capped so long decode runs still stop after 30 steps.
         graph_profile_steps = min(_PROFILE_STEPS, output_len + 3)
-        graph_run = _run_one_canary_setting(
+        (graph_run,) = _run_one_canary_setting(
             canary_on=True,
             batch_size=batch_size,
             input_len=input_len,
@@ -159,7 +171,7 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
         )
 
         no_graph_dir = scenario_root / "no_cuda_graph_osl3"
-        no_graph_run = _run_one_canary_setting(
+        (no_graph_run,) = _run_one_canary_setting(
             canary_on=True,
             batch_size=batch_size,
             input_len=input_len,
@@ -198,22 +210,23 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             )
             return
 
-        off = _run_one_canary_setting(
-            canary_on=False,
+        scenario = dict(
             batch_size=batch_size,
             input_len=input_len,
             output_len=output_len,
+            repeats=_TIMED_REPEATS,
         )
-        on = _run_one_canary_setting(
-            canary_on=True,
-            batch_size=batch_size,
-            input_len=input_len,
-            output_len=output_len,
-        )
-        overhead_pct = ((on.latency - off.latency) / off.latency) * 100.0
+        off_runs = _run_one_canary_setting(canary_on=False, **scenario)
+        on_runs = _run_one_canary_setting(canary_on=True, **scenario)
+        off = min(r.latency for r in off_runs)
+        on = min(r.latency for r in on_runs)
+        overhead_pct = ((on - off) / off) * 100.0
         summary = (
             f"[canary self-bench] {scenario_key}: "
-            f"off={off.latency:.4f}s on={on.latency:.4f}s overhead={overhead_pct:.2f}%"
+            f"off={off:.4f}s on={on:.4f}s overhead={overhead_pct:.2f}% "
+            f"(fastest of {_TIMED_REPEATS}; "
+            f"off runs={[round(r.latency, 4) for r in off_runs]}, "
+            f"on runs={[round(r.latency, 4) for r in on_runs]})"
         )
         print(summary, flush=True)
         self.assertLess(
