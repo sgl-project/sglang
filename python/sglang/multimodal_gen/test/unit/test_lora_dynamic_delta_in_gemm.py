@@ -287,6 +287,45 @@ def test_fused_delta_interleaves_swiglu_value_and_gate_columns(multi):
     _assert_fused_delta(_fused_delta(layer, x, swiglu_rows=True), interleaved)
 
 
+@pytest.mark.parametrize("stacked", [False, True])
+@pytest.mark.parametrize("swiglu_rows", [False, True])
+@pytest.mark.parametrize("quality", ["exact", "lossless"])
+def test_fused_multi_adapter_delta_matches_the_forward_delta_per_tier(
+    stacked, swiglu_rows, quality
+):
+    """With several adapters the fused delta accumulates into a zero buffer
+    through _add_lora_delta, which at lossless adds each adapter inside the
+    GEMM (in place); it must still equal the forward's delta."""
+    import sglang.multimodal_gen.runtime.layers.lora.linear as lora_linear
+
+    layer = _column_layer(
+        stacked=stacked,
+        alpha=2 * RANK,
+        strength=0.7,
+        output_offset=torch.randn(OUT_DIM),
+        multi=True,
+    )
+    x = _activations(TOKENS, IN_DIM, seed=13)
+    with (
+        torch.inference_mode(),
+        set_forward_context(0, None, _batch(quality)),
+        patch.object(
+            lora_linear,
+            "_add_lora_delta_in_gemm",
+            wraps=lora_linear._add_lora_delta_in_gemm,
+        ) as in_gemm,
+    ):
+        expected = _forward_delta(layer, x)
+        in_gemm.reset_mock()
+        fused = _fused_delta(layer, x, swiglu_rows=swiglu_rows)
+    # lossless takes the in-GEMM path once per adapter; exact never does
+    assert in_gemm.call_count == (2 if quality == "lossless" else 0)
+    if swiglu_rows:
+        gate, value = expected.chunk(2, dim=-1)
+        expected = torch.stack((value, gate), dim=-1).flatten(-2)
+    _assert_fused_delta(fused, expected)
+
+
 def test_fused_delta_drops_cached_factors_for_new_adapter_weights():
     layer = _column_layer()
     x = _activations(TOKENS, IN_DIM, seed=10)
