@@ -216,10 +216,9 @@ class RoutedMoeSplit:
             local_expert_offset=local_expert_offset,
             routed_scaling_factor=routed_scaling_factor,
             routing_method_type=routing_method_type,
-            # Same PDL choice as the ordinary routed call: FlashInfer keeps it off for this
-            # pipeline on SM107 (fused_moe.core._device_support_moe_pdl).
-            enable_pdl=core.device_support_pdl(device)
-            and torch.cuda.get_device_capability(device) != (10, 7),
+            # GEMM2 launches while GEMM1 drains; the routing metadata comes from the router
+            # stream, so it stays a full graph dependency of GEMM1.
+            enable_pdl=core.device_support_pdl(device),
             do_finalize=do_finalize,
             activation_type=activation_type,
             num_fused_shared_experts=0,
