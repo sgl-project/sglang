@@ -32,7 +32,7 @@ class _DummyTokenizer:
 
 
 def _patch_hf_transformers(get_tokenizer, get_config=None):
-    module = ModuleType("sglang.srt.utils.hf_transformers")
+    module = ModuleType("sglang.srt.hf_transformers")
     module.get_tokenizer = get_tokenizer
     if get_config is not None:
         module.get_config = get_config
