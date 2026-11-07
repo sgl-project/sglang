@@ -19,6 +19,11 @@ except ImportError:
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.device import (
+    create_device_event,
+    create_device_stream,
+    device_stream_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -789,8 +794,8 @@ class EmbeddingCacheController:
         try:
             device = dst_tensor.device
             copy_stream = self._get_copy_stream(device)
-            event = torch.cuda.Event()
-            with torch.cuda.stream(copy_stream):
+            event = create_device_event(device)
+            with device_stream_context(copy_stream):
                 self._copy_embedding_page_runs(
                     src=pool.tensor,
                     dst=dst_tensor,
@@ -855,11 +860,11 @@ class EmbeddingCacheController:
                 if entry is not None:
                     self._unpin_read(entry)
 
-    def _get_copy_stream(self, device: torch.device) -> "torch.cuda.Stream":
+    def _get_copy_stream(self, device: torch.device):
         key = str(device)
         stream = self._copy_streams.get(key)
         if stream is None:
-            stream = torch.cuda.Stream(device=device)
+            stream = create_device_stream(device)
             self._copy_streams[key] = stream
         return stream
 
@@ -919,9 +924,9 @@ class EmbeddingCacheController:
         Returns: pending D2H handles; pass to wait_store_to_pool().
         """
         for tensor in tensors:
-            if tensor.device.type != "cuda":
+            if tensor.device.type not in ("cuda", "npu"):
                 raise ValueError(
-                    f"store_to_pool_async expects CUDA tensors, "
+                    f"store_to_pool_async expects CUDA or NPU tensors, "
                     f"got device={tensor.device}"
                 )
 
@@ -1018,12 +1023,12 @@ class EmbeddingCacheController:
             src = src.contiguous()
 
         device = src.device
-        producer_stream = torch.cuda.current_stream(device)
+        producer_stream = torch.get_device_module(device).current_stream(device)
         copy_stream = self._get_copy_stream(device)
         copy_stream.wait_stream(producer_stream)
         src.record_stream(copy_stream)
-        event = torch.cuda.Event()
-        with torch.cuda.stream(copy_stream):
+        event = create_device_event(device)
+        with device_stream_context(copy_stream):
             self._copy_embedding_page_runs(
                 src=src,
                 dst=pool.tensor,
