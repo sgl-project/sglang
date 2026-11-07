@@ -129,7 +129,9 @@ def _prepare(model, kernel, *, backend="flashinfer", speculative=False):
         "_is_npu": False,
         "get_exec": lambda: SimpleNamespace(
             mamba=SimpleNamespace(
-                linear_attn_backend="triton", linear_attn_decode_backend=backend
+                linear_attn_backend="triton",
+                linear_attn_decode_backend=backend,
+                mamba_ssm_dtype=None,
             )
         ),
         "get_spec": lambda: SimpleNamespace(
@@ -138,6 +140,7 @@ def _prepare(model, kernel, *, backend="flashinfer", speculative=False):
         "SpeculativeAlgorithm": SimpleNamespace(
             from_string=lambda value: SimpleNamespace(is_none=lambda: value is None)
         ),
+        "get_platform": lambda: SimpleNamespace(is_cuda=True),
         "rank0_log": Mock(),
     }
     prepare = _source_function(
@@ -155,6 +158,7 @@ def _prepare(model, kernel, *, backend="flashinfer", speculative=False):
             },
         ),
         patch.object(adapter, "_get_fused_kda_decode", return_value=kernel) as probe,
+        patch.object(torch.cuda, "get_device_capability", return_value=(10, 3)),
     ):
         prepare(model)
     return probe

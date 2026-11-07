@@ -110,13 +110,6 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                 dict(envs=cls.envs),
             ),
         )
-        cls.resolve = staticmethod(
-            consumer._source_function(
-                ROOT / "python/sglang/srt/arg_groups/attention_hook.py",
-                "handle_linear_attn_backend",
-                hook_globals,
-            )
-        )
         cls.export_env = staticmethod(
             consumer._source_function(
                 ROOT / "python/sglang/srt/arg_groups/serving_hook.py",
@@ -193,14 +186,32 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                 rank0_log=Mock(),
             ),
         )["KDAKernelDispatcher"]
+        cls.resolve = staticmethod(
+            consumer._source_function(
+                ROOT / "python/sglang/srt/arg_groups/attention_hook.py",
+                "handle_linear_attn_backend",
+                dict(
+                    **hook_globals,
+                    mamba2_state_dtype=cls.params["mamba2_state_dtype"],
+                    SpeculativeAlgorithm=cls.algorithm,
+                ),
+            )
+        )
 
     def _args(
         self,
         *,
         dtype="float32",
         architecture="KimiK3ForConditionalGeneration",
+        hf_dtype="bfloat16",
         **changes,
     ):
+        hf_config = SimpleNamespace(
+            architectures=[architecture],
+            linear_attn_config={"kda_layers": [0]},
+        )
+        if hf_dtype is not None:
+            hf_config.mamba_ssm_dtype = hf_dtype
         args = SimpleNamespace(
             linear_attn_decode_backend="flashinfer",
             linear_attn_backend="triton",
@@ -216,13 +227,7 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
             debug_cuda_graph=False,
             enable_deepseek_v4_fp4_indexer=False,
             enable_fp4_indexer=False,
-            _model_config=SimpleNamespace(
-                hf_config=SimpleNamespace(
-                    architectures=[architecture],
-                    linear_attn_config={"kda_layers": [0]},
-                    mamba_ssm_dtype="bfloat16",
-                )
-            ),
+            _model_config=SimpleNamespace(hf_config=hf_config),
         )
         vars(args).update(changes)
         return args
@@ -271,6 +276,7 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                 get_platform=lambda: self.platform,
                 is_kimi_k3=self.predicates["is_kimi_k3"],
                 uses_kda_attention=self.predicates["uses_kda_attention"],
+                SpeculativeAlgorithm=self.algorithm,
             ),
         )
         owner = SimpleNamespace(
@@ -341,6 +347,7 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                             speculative_algorithm=view.speculative_algorithm
                         ),
                         SpeculativeAlgorithm=self.algorithm,
+                        get_platform=lambda: SimpleNamespace(is_cuda=True),
                     ),
                 )
                 with (
@@ -358,6 +365,9 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                     patch.object(
                         consumer.adapter, "_get_fused_kda_decode", return_value=kernel
                     ),
+                    patch.object(
+                        torch.cuda, "get_device_capability", return_value=(10, 3)
+                    ),
                 ):
                     prepare(model)
                 decode, native, _, call = consumer._decode(model, backend, inputs)
@@ -368,7 +378,6 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
     def test_existing_dtype_verify_and_spec_guards_remain(self):
         cases = (
             dict(dtype="float16"),
-            dict(dtype=None),
             dict(architecture="Qwen3NextForCausalLM"),
             dict(architecture="KimiLinearForCausalLM"),
             dict(speculative_algorithm="DSPARK"),
@@ -396,6 +405,40 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
             self.assertIsNone(
                 self.views["resolving_view"](defaults).linear_attn_decode_backend
             )
+            with self.envs.SGLANG_MAMBA_SSM_DTYPE.override(None):
+                # HF-config BF16 without the CLI flag must keep the normal FI
+                # route instead of being rejected as "got None".
+                hf_bf16 = self._args(dtype=None)
+                self.resolve(hf_bf16)
+                self.assertIsNone(
+                    self.views["resolving_view"](hf_bf16).linear_attn_verify_backend
+                )
+                # The default FP32 pool (no CLI flag, no HF value) must reach
+                # the explicit FP32 Kimi fused route.
+                default_fp32 = self._args(dtype=None, hf_dtype=None)
+                self.resolve(default_fp32)
+                self.assertEqual(
+                    self.views["resolving_view"](
+                        default_fp32
+                    ).linear_attn_verify_backend,
+                    "triton",
+                )
+                # --speculative-algorithm NONE is a real no-spec value.
+                spec_none = self._args(speculative_algorithm="NONE")
+                self.resolve(spec_none)
+                self.assertEqual(
+                    self.views["resolving_view"](spec_none).linear_attn_verify_backend,
+                    "triton",
+                )
+            with self.envs.SGLANG_MAMBA_SSM_DTYPE.override("float32"):
+                # The dtype may also arrive through the environment without
+                # the CLI flag; that is still the explicit FP32 route.
+                env_fp32 = self._args(dtype=None, hf_dtype=None)
+                self.resolve(env_fp32)
+                self.assertEqual(
+                    self.views["resolving_view"](env_fp32).linear_attn_verify_backend,
+                    "triton",
+                )
             with (
                 patch.object(torch.version, "cuda", "12.9"),
                 self.assertRaisesRegex(ValueError, "CUDA 13"),

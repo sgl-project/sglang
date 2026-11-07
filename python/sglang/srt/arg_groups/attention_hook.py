@@ -36,12 +36,14 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.platform_hook import (
     handle_sail_attention_backend_compatibility,
 )
+from sglang.srt.configs.mamba_utils import mamba2_state_dtype
 from sglang.srt.configs.model_config import is_kimi_k3, uses_kda_attention
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -348,29 +350,49 @@ def handle_linear_attn_backend(server_args: Any):
 
     # The opt-in Kimi fused consumer owns an FP32 pool. Its uncovered
     # shapes use Triton; the separate recurrent FlashInfer API stays BF16.
+    # Resolve the pool dtype here: the CLI flag only reaches the dtype env in a
+    # later hook, so testing the raw string would miss the default FP32 pool.
     fp32_kimi_fused_decode = False
-    if (
-        decode == "flashinfer"
-        and cfg.mamba_ssm_dtype == "float32"
-        and cfg.speculative_algorithm is None
-        and cfg.linear_attn_verify_backend != "flashinfer"
-        and get_platform().is_cuda
-        and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
-    ):
+    ssm_dtype = None
+    capability = None
+    if decode == "flashinfer" or cfg.linear_attn_verify_backend == "flashinfer":
         hf_config = model_config_of(server_args).hf_config
-        fp32_kimi_fused_decode = is_kimi_k3(hf_config) and uses_kda_attention(hf_config)
+        configured_ssm_dtype = cfg.mamba_ssm_dtype
+        if configured_ssm_dtype is None:
+            ssm_dtype = mamba2_state_dtype(hf_config).temporal
+        else:
+            ssm_dtype = {
+                "float32": torch.float32,
+                "bfloat16": torch.bfloat16,
+                "float16": torch.float16,
+            }.get(configured_ssm_dtype, torch.float32)
+        capability = (
+            torch.cuda.get_device_capability() if get_platform().is_cuda else None
+        )
+        fp32_kimi_fused_decode = (
+            decode == "flashinfer"
+            and cfg.linear_attn_decode_backend == "flashinfer"
+            and ssm_dtype == torch.float32
+            and SpeculativeAlgorithm.from_string(cfg.speculative_algorithm).is_none()
+            and cfg.linear_attn_verify_backend != "flashinfer"
+            and capability in ((10, 0), (10, 3))
+            and is_kimi_k3(hf_config)
+            and uses_kda_attention(hf_config)
+        )
 
     if (
         decode == "flashinfer"
         and not fp32_kimi_fused_decode
-        and cfg.mamba_ssm_dtype != "bfloat16"
         and get_platform().is_cuda
-        and torch.cuda.get_device_capability()[0] >= 10
+        and capability is not None
+        and capability[0] >= 10
+        and ssm_dtype != torch.bfloat16
     ):
         raise ValueError(
-            "--linear-attn-decode-backend flashinfer on SM100+ requires "
-            "--mamba-ssm-dtype bfloat16, "
-            f"got {cfg.mamba_ssm_dtype!r}"
+            "--linear-attn-decode-backend flashinfer on SM100+ requires a "
+            "BF16 Mamba state by default. Pass --mamba-ssm-dtype bfloat16, "
+            "or use the explicit FP32 Kimi route with "
+            f"--mamba-ssm-dtype float32. Effective dtype: {ssm_dtype}."
         )
 
     verify = cfg.linear_attn_verify_backend
@@ -405,14 +427,15 @@ def handle_linear_attn_backend(server_args: Any):
         )
     if (
         verify == "flashinfer"
-        and cfg.mamba_ssm_dtype != "bfloat16"
+        and ssm_dtype != torch.bfloat16
         and get_platform().is_cuda
-        and torch.cuda.get_device_capability()[0] >= 10
+        and capability is not None
+        and capability[0] >= 10
     ):
         raise ValueError(
-            "--linear-attn-verify-backend flashinfer on SM100+ requires "
-            "--mamba-ssm-dtype bfloat16, "
-            f"got {cfg.mamba_ssm_dtype!r}"
+            "--linear-attn-verify-backend flashinfer on SM100+ requires a "
+            "BF16 Mamba state; "
+            f"effective dtype: {ssm_dtype}."
         )
 
     # SM100+ FlashInfer GDN prefill requires CUDA 13+ (CuTe DSL kernel)

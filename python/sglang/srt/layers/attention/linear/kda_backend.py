@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
     get_spec,
     mamba_cache_chunk_size,
 )
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
 def _validate_flashinfer_kda_prefill(
@@ -489,10 +490,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
     def _create_kernel_dispatcher(self, backends):
         decode_backend = backends.decode
+        self._decode_backend_substituted = False
         if (
             decode_backend.is_flashinfer()
-            and get_exec().mamba.mamba_ssm_dtype == "float32"
-            and get_spec().speculative_algorithm is None
+            and SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_none()
             and self.state_pool.mamba_cache.temporal.dtype == torch.float32
             and get_platform().is_cuda
             and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
@@ -507,6 +510,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 # recurrent FI API needs BF16 and is not needed by this route;
                 # do not import/probe it for an FP32 Kimi pool.
                 decode_backend = LinearAttnKernelBackend.TRITON
+                self._decode_backend_substituted = True
         return KDAKernelDispatcher(decode_backend, backends.prefill, backends.verify)
 
     def __init__(self, model_runner: ModelRunner):
@@ -534,6 +538,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
                 "(EAGLE tree verify / retrieve_parent_token is unsupported)."
             )
         self.kernel_dispatcher = self._create_kernel_dispatcher(backends)
+        if self._decode_backend_substituted:
+            rank0_log(
+                "K3 FP32 Kimi pool: the requested FlashInfer recurrent decode "
+                "is replaced by the Triton fallback; the fused FlashInfer "
+                "consumer remains the only FI decode path for covered shapes."
+            )
         if prefill_backend.is_flashinfer():
             _validate_flashinfer_kda_prefill(
                 chunk_size=self.mamba_chunk_size,
@@ -542,7 +552,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             )
         # One-shot; include the actual fused provider selected below, rather
         # than inferring it from the requested fallback backend.
-        self._fused_override_notice = str(decode_backend)
+        self._fused_override_notice = decode_backend.value
         self._fused_chain_verify_fn = None
         if (
             envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
@@ -972,7 +982,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
                     layout = f"; layout: {reason}" if reason is not None else ""
                     rank0_log(
                         f"K3 fused KDA decode provider: {provider}; requested "
-                        f"decode backend: {self._fused_override_notice}{layout}."
+                        f"decode backend: {self._fused_override_notice} "
+                        "(fallback only for shapes the fused kernel does not "
+                        f"cover){layout}."
                     )
                     self._fused_override_notice = None
                 if use_flashinfer:

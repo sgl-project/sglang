@@ -2053,11 +2053,19 @@ class KimiK3DeltaAttention(nn.Module):
             float(self.o_norm.eps),
         )
         mamba = get_exec().mamba
+        # The FP32 fused consumer is only reachable on the admitted SM100/103
+        # Kimi route. Repeat that gate here so a direct caller does not import
+        # FlashInfer or pack the per-layer FP32 weights for a BF16 pool; the
+        # actual pool dtype still remains authoritative at run time.
         if (
-            mamba.linear_attn_decode_backend or mamba.linear_attn_backend
-        ) == "flashinfer" and SpeculativeAlgorithm.from_string(
-            get_spec().speculative_algorithm
-        ).is_none():
+            mamba.linear_attn_decode_backend == "flashinfer"
+            and mamba.mamba_ssm_dtype != "bfloat16"
+            and SpeculativeAlgorithm.from_string(
+                get_spec().speculative_algorithm
+            ).is_none()
+            and get_platform().is_cuda
+            and torch.cuda.get_device_capability() in ((10, 0), (10, 3))
+        ):
             from sglang.srt.layers.attention.linear.kernels.kda_flashinfer_fused import (
                 prepare_fused_kda_decode,
             )
