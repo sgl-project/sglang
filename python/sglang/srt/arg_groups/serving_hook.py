@@ -20,12 +20,12 @@ from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_pha
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.sampling.watermarking.config import load_watermark_config
 from sglang.srt.utils.common import (
-    resolve_gpu_image_decode,
-    resolve_rgb_conversion,
     configure_media_url_security,
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
+    resolve_gpu_image_decode,
+    resolve_rgb_conversion,
 )
 from sglang.utils import is_in_ci
 

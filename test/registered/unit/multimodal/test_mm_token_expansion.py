@@ -70,13 +70,13 @@ from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreproces
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
-from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
@@ -545,7 +545,9 @@ class TestTokenSpaceProcessor(unittest.TestCase):
 
             def process_image(self, image, processor, preprocess_kwargs, **kwargs):
                 seen.append((image.mode, image.getpixel((0, 0))))
-                return super().process_image(image, processor, preprocess_kwargs, **kwargs)
+                return super().process_image(
+                    image, processor, preprocess_kwargs, **kwargs
+                )
 
         class _KeepAlphaStrategy(_RecordingStrategy):
             discard_alpha_channel = False
@@ -554,14 +556,22 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         Image.new("RGBA", (2, 1), (10, 20, 30, 0)).save(rgba, format="PNG")
         for strategy_class, mm_process_config, expected in (
             (_RecordingStrategy, None, ("RGB", (10, 20, 30))),
-            (_RecordingStrategy, {"image_rgb_conversion": "white"}, ("RGB", (255, 255, 255))),
+            (
+                _RecordingStrategy,
+                {"image_rgb_conversion": "white"},
+                ("RGB", (255, 255, 255)),
+            ),
             (_KeepAlphaStrategy, None, ("RGBA", (10, 20, 30, 0))),
         ):
             seen.clear()
-            processor = self._processor(strategy_class, mm_process_config=mm_process_config)
+            processor = self._processor(
+                strategy_class, mm_process_config=mm_process_config
+            )
             asyncio.run(processor.process([rgba.getvalue()], input_ids=[1, IMAGE]))
             self.assertEqual(seen, [expected])
-        with patch("sglang.srt.multimodal.multimodal_processor_mixin.load_audio") as load_audio:
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_audio"
+        ) as load_audio:
             _RecordingStrategy(None, None).load_audio("clip.wav")
         load_audio.assert_called_once_with("clip.wav", 24000)
 
@@ -594,7 +604,9 @@ def _legacy_defaults(processor_cls, hf_config):
         for name in _LOADER_ATTRIBUTES
         if name != "rgb_conversion"
     }
-    defaults["rgb_conversion"] = "smart" if processor.smart_rgb_conversion else "convert"
+    defaults["rgb_conversion"] = (
+        "smart" if processor.smart_rgb_conversion else "convert"
+    )
     # None and an unset worker default both mean the base's own choice.
     defaults["auto_mm_processor_worker_num"] = (
         processor.auto_mm_processor_worker_num or 2
@@ -1017,7 +1029,9 @@ class TestStrategyLoaders(unittest.TestCase):
 
         class _FailingStrategy(_ImageWidthStrategy):
             def load_image(self, source):
-                raise {"bad": UnidentifiedImageError, "io": OSError}[source]("cannot decode")
+                raise {"bad": UnidentifiedImageError, "io": OSError}[source](
+                    "cannot decode"
+                )
 
         processor = self._processor(_FailingStrategy)
         with self.assertRaises(ValueError):

@@ -67,7 +67,9 @@ class TestImageLoadOptions(CustomTestCase):
         )
         # JSON null means the default; a wrong name or a non-string is a ValueError, never a TypeError.
         self.assertIs(resolve_gpu_image_decode({"image_decoder": None}, True), True)
-        self.assertEqual(resolve_rgb_conversion({"image_rgb_conversion": None}, "smart"), "smart")
+        self.assertEqual(
+            resolve_rgb_conversion({"image_rgb_conversion": None}, "smart"), "smart"
+        )
         for bad in ({"image_decoder": "cuda"}, {"image_decoder": ["pil"]}):
             with self.assertRaises(ValueError):
                 resolve_gpu_image_decode(bad, True)
@@ -95,13 +97,21 @@ class TestImageLoadOptions(CustomTestCase):
 
     def test_the_strategy_loads_with_its_class_default_and_the_config_wins(self):
         # The base strategy drops alpha; a model's `white` default composites it; the config overrides either.
-        self.assertEqual(_strategy().load_image(_rgba_png()).getpixel((0, 0)), (10, 20, 30))
+        self.assertEqual(
+            _strategy().load_image(_rgba_png()).getpixel((0, 0)), (10, 20, 30)
+        )
         white = _strategy(_WhiteStrategy)
-        self.assertEqual(white.load_image(_rgba_png()).getpixel((0, 0)), (255, 255, 255))
+        self.assertEqual(
+            white.load_image(_rgba_png()).getpixel((0, 0)), (255, 255, 255)
+        )
         self.assertEqual(white.load_image(_rgba_png()).mode, "RGB")
-        overridden = _strategy(_WhiteStrategy, image_decoder="pil", image_rgb_conversion="convert")
+        overridden = _strategy(
+            _WhiteStrategy, image_decoder="pil", image_rgb_conversion="convert"
+        )
         self.assertIs(overridden.gpu_image_decode, False)
-        self.assertEqual(overridden.load_image(_rgba_png()).getpixel((0, 0)), (10, 20, 30))
+        self.assertEqual(
+            overridden.load_image(_rgba_png()).getpixel((0, 0)), (10, 20, 30)
+        )
         with self.assertRaises(ValueError):
             _strategy(image_rgb_conversion="black")
 
@@ -110,7 +120,9 @@ class TestImageLoadOptions(CustomTestCase):
         # and with it a bad value is rejected at argument resolution, before any process starts.
         with self.assertRaises(ValueError):
             handle_multimodal(
-                ServerArgs(model_path="dummy", mm_process_config={"image_decoder": "pil"})
+                ServerArgs(
+                    model_path="dummy", mm_process_config={"image_decoder": "pil"}
+                )
             )
         with self.assertRaises(ValueError):
             handle_multimodal(
@@ -123,7 +135,10 @@ class TestImageLoadOptions(CustomTestCase):
         handle_multimodal(
             ServerArgs(
                 model_path="dummy",
-                mm_process_config={"image_decoder": "pil", "image_rgb_conversion": None},
+                mm_process_config={
+                    "image_decoder": "pil",
+                    "image_rgb_conversion": None,
+                },
                 enable_token_space_processor=True,
             )
         )
