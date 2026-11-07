@@ -27,12 +27,12 @@
 // then, at `lse_offset`, one 16 B word [lse, -0, -0, -0] per row.
 //
 // A warp owns a row at a time, on the same (block, warp) on every rank, so the
-// producer and the consumer of a row share a block and its phase counter; the
-// plane is this op's own, so a call may use fewer blocks than the plane has.
+// producer and the consumer of a row share a block; every block commits the
+// plane's single phase word, so a call may use fewer blocks than the plane has.
 
 namespace sglang {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 using host::distributed::CommunicatorRef;
 
 namespace dcp_push_combine {
@@ -58,7 +58,7 @@ struct Params {
   int64_t lse_stride_h;
   uint8_t* out;  // [B, H / N * kHeadDim] bf16, contiguous
   uint8_t* workspaces[kWorldSize];
-  Counter* counter;
+  EpochCounter* counter;
   uint32_t slot_bytes;
   uint32_t lse_offset;
   uint32_t rank;
@@ -108,7 +108,7 @@ __global__ __launch_bounds__(kBlockSize, 1) void push_combine_kernel(const __gri
   const uint32_t hpr = p.heads_per_rank;
 
   device::PDLWaitPrimary<kUsePDL>();
-  const uint32_t phase = p.counter[bx].get() & 1;
+  const uint32_t phase = p.counter->load();
   const auto slot = [&](uint32_t dst, uint32_t src) {
     return p.workspaces[dst] + (phase * kWorldSize + src) * p.slot_bytes;
   };
@@ -205,8 +205,8 @@ __global__ __launch_bounds__(kBlockSize, 1) void push_combine_kernel(const __gri
     }
   }
 
-  __syncthreads();
-  if (threadIdx.x == 0) p.counter[bx].set(phase ^ 1);
+  __syncthreads();  // every thread has read the phase before this block commits
+  if (threadIdx.x == 0) p.counter->commit();
 }
 
 }  // namespace dcp_push_combine
@@ -260,9 +260,8 @@ struct DcpPushCombineKernel {
     p.heads_per_rank = static_cast<uint32_t>(hpr);
     p.lse_base_e = lse_base_e;
     // A warp per row is enough: small batches launch fewer blocks. The grid is
-    // a function of the row count alone, so every rank maps a row to the same
-    // block and that block's phase counter (blocks past it keep their phase).
-    const auto num_blocks = std::min<int64_t>(push.num_blocks, div_ceil(num_rows, int64_t{kWarps}));
+    // a function of the row count alone, so every rank maps a row to the same block.
+    const auto num_blocks = std::min<int64_t>(push.default_blocks, div_ceil(num_rows, int64_t{kWarps}));
     LaunchKernel(static_cast<uint32_t>(num_blocks), kBlockSize, v.device())
         .enable_pdl(kUsePDL)(push_combine_kernel<kWorldSize, kUsePDL>, p);
   }

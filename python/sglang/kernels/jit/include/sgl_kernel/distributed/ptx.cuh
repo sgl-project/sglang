@@ -374,6 +374,22 @@ SGL_DEVICE void red_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
   __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
+SGL_DEVICE void red_add_relaxed_gpu(uint32_t* ptr, uint32_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE void red_add_relaxed_gpu(uint64_t* ptr, uint64_t val) {
+  __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+}
+
+SGL_DEVICE uint32_t atomic_add_relaxed_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+SGL_DEVICE uint32_t atomic_add_acquire_sys(uint32_t* ptr, uint32_t val) {
+  return __hip_atomic_fetch_add(ptr, val, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
 SGL_DEVICE void red_add_release_sys(uint32_t* ptr, uint32_t val) {
   __hip_atomic_fetch_add(ptr, val, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
