@@ -462,8 +462,7 @@ class OpenAIServingChat(OpenAIServingBase):
         self.chat_encoding_spec = self._resolve_chat_encoding_spec()
         self.supports_inline_system = self._resolve_inline_system_support()
         self._encoding_adapter = self._build_chat_encoding_adapter()
-        # Logprob bytes for byte-level BPE token ids; one id always maps to the
-        # same bytes, and top_logprobs repeat the same ids over and over.
+        # Logprob bytes for byte-level BPE token ids
         self._byte_level_token_bytes: dict[int, list[int] | None] = {}
 
         # Per-request response parser for custom decoding (set by _encode_messages)

@@ -643,8 +643,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
     def init_tokenizer_and_processor(self):
         server_args = self.server_args
-        # Logprob outputs decode the same ids over and over, and one id always
-        # decodes to the same text.
+        # Decoded text of logprob token ids
         self._logprob_token_text_cache: dict[int, str] = {}
 
         # Initialize tokenizer and processor
