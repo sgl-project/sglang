@@ -1661,6 +1661,12 @@ class MoriKVManager(CommonKVManager):
                 continue
             if dst_indices is None or dst_indices.size == 0:
                 continue
+            if st == "dsa" and self.kv_shard_size > 1:
+                src_indices, dst_indices = self._prepare_sharded_dsa_indices(
+                    src_indices, dst_indices
+                )
+                if src_indices.size == 0:
+                    continue
 
             src_descs = self.state_mem_descs[i]
             dst_descs = peer_info.dst_state_mem_descs[i]

@@ -49,6 +49,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_kv_layers,
@@ -1258,9 +1259,11 @@ class DeepseekMLARocmForwardMixin:
         Check if we should skip rope and use fused rope+cache path for TileLang/Triton DSA on gfx95.
         """
         # The fused write targets the unsharded loc and its core path takes no LSE.
+        # A page-sharded pool must route writes through its owner write plan.
         return (
             _use_aiter_gfx95
             and self.dcp_size == 1
+            and not isinstance(get_token_to_kv_pool(), PageInterleaveKVPoolMixin)
             and self.current_attention_backend in ("dsa", "nsa")
             and (
                 get_exec().kernel.dsa_decode_backend in ("tilelang", "triton")

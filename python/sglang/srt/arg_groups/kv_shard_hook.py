@@ -21,7 +21,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import attn_dp_enabled_of
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
@@ -32,55 +32,76 @@ def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> No
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
     if prefill_backend == "dsa":
         hf_config = model_config_of(server_args).hf_config
+        if get_platform().is_hip:
+            # Attention TP is the shard axis; the latent and indexer projections
+            # are replicated across it.
+            if cfg.attn_cp_size > 1 or cfg.pp_size != 1:
+                raise ValueError(
+                    "DSA KV sharding on ROCm shards across attention TP and "
+                    "requires attn_cp_size 1 and PP1."
+                )
+            if cfg.page_size != 64:
+                raise ValueError(
+                    "DSA KV sharding on ROCm requires page size 64, which needs "
+                    "aiter's preshuffle paged-MQA path (Triton>=3.5.0 or "
+                    "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1, and "
+                    "SGLANG_DSA_HIP_DISABLE_PRESHUFFLE unset); "
+                    f"got page size {cfg.page_size}."
+                )
+            dsa_backends = ("tilelang", "triton")
+            transfer_backends = ("mori",)
+        else:
+            if (
+                cfg.device != "cuda"
+                or not cfg.enable_prefill_cp
+                or cfg.attn_cp_size <= 1
+                or cfg.cp_strategy != "interleave"
+                or cfg.pp_size != 1
+            ):
+                raise ValueError(
+                    "DSA KV sharding requires CUDA interleave prefill CP > 1 and PP1."
+                )
+            dsa_backends = ("trtllm",)
+            transfer_backends = ("mooncake",)
         if (
-            cfg.device != "cuda"
-            or not cfg.enable_prefill_cp
-            or cfg.attn_cp_size <= 1
-            or cfg.cp_strategy != "interleave"
-            or cfg.pp_size != 1
-        ):
-            raise ValueError(
-                "DSA KV sharding requires CUDA interleave prefill CP > 1 and PP1."
-            )
-        if (
-            cfg.dsa_prefill_backend != "trtllm"
-            or cfg.dsa_decode_backend != "trtllm"
+            cfg.dsa_prefill_backend not in dsa_backends
+            or cfg.dsa_decode_backend not in dsa_backends
             or cfg.kv_cache_dtype != "fp8_e4m3"
             or cfg.page_size != 64
         ):
             raise ValueError(
-                "DSA KV sharding requires TRTLLM prefill/decode with fp8_e4m3 "
-                "KV and page size 64."
+                f"DSA KV sharding requires {'/'.join(dsa_backends)} prefill/decode "
+                "with fp8_e4m3 KV and page size 64."
             )
         if (
-            cfg.disaggregation_transfer_backend != "mooncake"
+            cfg.disaggregation_transfer_backend not in transfer_backends
             or cfg.enable_dsa_cache_layer_split
             or get_dsa_index_kpool(hf_config) != 1
             or get_dsa_index_kpool_compress(hf_config)
         ):
             raise ValueError(
-                "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
-                "and no DSA cache layer splitting."
+                f"DSA KV sharding requires {'/'.join(transfer_backends)}, "
+                "uncompressed index_kpool=1 and no DSA cache layer splitting."
             )
         return
     if is_deepseek_dsa(model_config_of(server_args).hf_config):
         raise ValueError("DSA KV sharding requires the dsa attention backend.")
     if prefill_backend == "fa3":
         return
-    if prefill_backend != "trtllm_mla":
+    if prefill_backend not in ("trtllm_mla", "aiter"):
         raise ValueError(
             "--enable-kv-cache-sharding currently requires the fa3 prefill "
-            "attention backend, or trtllm_mla for plain-TP MLA; "
+            "attention backend, or trtllm_mla / aiter for plain-TP MLA; "
             f"got {prefill_backend!r}."
         )
     if not use_mla_backend(server_args):
-        raise ValueError("KV sharding with trtllm_mla requires an MLA model.")
+        raise ValueError(f"KV sharding with {prefill_backend} requires an MLA model.")
     if cfg.attn_cp_size > 1:
         raise ValueError(
-            "KV sharding with trtllm_mla only supports plain-TP MLA "
+            f"KV sharding with {prefill_backend} only supports plain-TP MLA "
             "(attn_cp_size must be 1)."
         )
-    if cfg.disable_chunked_prefix_cache:
+    if prefill_backend == "trtllm_mla" and cfg.disable_chunked_prefix_cache:
         raise ValueError("KV sharding with trtllm_mla requires chunked prefix caching.")
 
 
@@ -188,13 +209,13 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         model_config_of(server_args).hf_config
     ):
         if cfg.hicache_host_memory_mode != "cache":
-            raise ValueError("CP-sharded DSA HiCache requires host memory mode cache")
+            raise ValueError("Sharded DSA HiCache requires host memory mode cache")
         if cfg.hicache_io_backend != "kernel" or cfg.hicache_mem_layout not in (
             "layer_first",
             "page_first",
         ):
             raise ValueError(
-                "CP-sharded DSA HiCache requires kernel I/O with layer_first or page_first"
+                "Sharded DSA HiCache requires kernel I/O with layer_first or page_first"
             )
     if cfg.enable_lmcache:
         raise ValueError(
@@ -205,6 +226,12 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "--enable-kv-cache-sharding does not support --enable-hisparse: "
             "HiSparse selects a non-sharded allocator and assumes each rank "
             "owns complete KV pages."
+        )
+    if cfg.disaggregation_enable_kv_checksum:
+        raise ValueError(
+            "--enable-kv-cache-sharding does not support "
+            "--disaggregation-enable-kv-checksum: the checksum reads every "
+            "logical page from the local (sharded) pool."
         )
     # The dynamic sizer only runs with pipeline parallelism. Its profiling
     # and predicted chunks can exceed the fixed shard-scratch capacity.
@@ -238,10 +265,10 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
-    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl", "mori"):
         raise ValueError(
-            "--enable-kv-cache-sharding currently only supports the mooncake "
-            "and nixl transfer backends: both route sends through "
+            "--enable-kv-cache-sharding currently only supports the mooncake, "
+            "nixl and mori transfer backends: they route sends through "
             "CommonKVSender._prepare_send_indices and pair destinations by "
             "fancy index. Got --disaggregation-transfer-backend "
             f"{cfg.disaggregation_transfer_backend!r}."

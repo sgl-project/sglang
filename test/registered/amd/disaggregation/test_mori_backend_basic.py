@@ -8,6 +8,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mori import conn as mori_conn
+from sglang.srt.disaggregation.utils import filter_kv_indices_for_shard_rank
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=5, suite="stage-a-test-1-gpu-small-amd")
@@ -89,6 +90,50 @@ class TestMoriDCP(unittest.TestCase):
         self.assertIs(args[2], dst_indices)
         self.assertEqual(kwargs["src_page_offset"], 2)
         self.assertEqual(kwargs["num_kv_tokens"], 13)
+
+    def test_sharded_send_uses_destinations_at_owned_positions(self):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.request_status = {7: mori_conn.KVPoll.WaitingForInput}
+        manager.transfer_lock = threading.Lock()
+        manager.transfer_infos = {
+            7: {
+                "peer": mori_conn.TransferInfo(
+                    room=7,
+                    endpoint="127.0.0.1",
+                    dst_port=1,
+                    engine_key="peer",
+                    dst_kv_indices=np.arange(100, 110, dtype=np.int32),
+                    dst_aux_index=-1,
+                    dst_state_indices=[],
+                    required_dst_info_num=1,
+                    is_dummy=False,
+                )
+            }
+        }
+        manager.decode_kv_args_table = {
+            "peer": SimpleNamespace(requires_dcp_relayout=False)
+        }
+        manager.update_status = Mock()
+        manager.send_kvcache = Mock(return_value=[])
+        pages = np.array([11, 12, 13, 14, 15], dtype=np.int32)
+
+        for rank, local_pages, dst_pages in (
+            (0, [6, 7], [105, 107]),
+            (1, [5, 6, 7], [104, 106, 108]),
+        ):
+            with self.subTest(rank=rank):
+                kv_indices, index_slice = filter_kv_indices_for_shard_rank(
+                    kv_indices=pages,
+                    index_slice=slice(4, 9),
+                    shard_rank=rank,
+                    shard_size=2,
+                )
+                manager._submit_kv_transfer(7, kv_indices, index_slice, False)
+
+                _, src, dst = manager.send_kvcache.call_args.args
+                np.testing.assert_array_equal(src, local_pages)
+                np.testing.assert_array_equal(dst, dst_pages)
 
     def test_pp_local_descriptors_map_by_layer(self):
         manager = object.__new__(mori_conn.MoriKVManager)
@@ -183,6 +228,48 @@ class TestMoriDsaStateElision(unittest.TestCase):
         # Decode elided layer 4. Writing to it would use a None descriptor.
         calls = self._send([4, 5], [3, 4, 5], [132, 132], [132, 0, 132])
         self.assertEqual(calls, [call("s5", "d5", "plan")])
+
+
+class TestMoriShardedDsaState(unittest.TestCase):
+    def _send_state(self, shard_rank, shard_size, src_pages, dst_pages):
+        manager = object.__new__(mori_conn.MoriKVManager)
+        manager.kv_shard_rank, manager.kv_shard_size = shard_rank, shard_size
+        manager.state_mem_descs = [["src"]]
+        manager.kv_args = SimpleNamespace(
+            state_types=["dsa"],
+            state_item_lens=[[8448]],
+            state_dim_per_tensor=[[]],
+            state_layer_ids=[[]],
+        )
+        manager._send_swa_dsa_state = Mock(return_value=[])
+        peer = SimpleNamespace(
+            dst_state_mem_descs=[["dst"]],
+            dst_state_item_lens=[[8448]],
+            dst_state_dim_per_tensor=[[]],
+            dst_state_layer_ids=[[]],
+        )
+        manager.send_state(
+            peer,
+            [np.array(src_pages, dtype=np.int32)],
+            [np.array(dst_pages, dtype=np.int32)],
+        )
+        return manager._send_swa_dsa_state.call_args_list
+
+    def test_each_owner_sends_its_local_pages_to_the_paired_destinations(self):
+        logical = [15, 3, 24, 9, 18, 6]
+        dst = [29, 5, 16, 8, 1, 27]
+        for rank, local_pages, dst_pages in (
+            (0, [12, 9, 3], [16, 1, 27]),
+            (1, [7, 1, 4], [29, 5, 8]),
+        ):
+            with self.subTest(rank=rank):
+                (sent,) = self._send_state(rank, 2, logical, dst)
+                _, src, dst_sent, *_ = sent.args
+                np.testing.assert_array_equal(src, local_pages)
+                np.testing.assert_array_equal(dst_sent, dst_pages)
+
+    def test_rank_without_owned_pages_sends_nothing(self):
+        self.assertEqual(self._send_state(1, 2, [0, 2], [5, 6]), [])
 
 
 if __name__ == "__main__":

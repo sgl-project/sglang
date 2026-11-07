@@ -4681,6 +4681,16 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
 
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
 
+    def test_aiter_accepts_plain_tp_without_chunked_prefix_cache(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.attention_backend = "aiter"
+        args.disable_chunked_prefix_cache = True
+
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+        self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
+
     def test_mla_without_cp_rejects_attention_dp(self):
         for backend in ("fa3", "trtllm_mla"):
             with self.subTest(backend=backend):
@@ -4724,16 +4734,18 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
 
         self.assertEqual(resolution_result(args, "chunked_prefill_size"), 2112)
 
-    def test_trtllm_mla_rejects_unsupported_shard_topologies(self):
+    def test_plain_tp_mla_backends_reject_unsupported_shard_topologies(self):
         cases = (
-            (False, 1, False, "requires an MLA model"),
-            (True, 2, False, "only supports plain-TP MLA"),
-            (True, 1, True, "requires chunked prefix caching"),
+            ("trtllm_mla", False, 1, False, "requires an MLA model"),
+            ("trtllm_mla", True, 2, False, "only supports plain-TP MLA"),
+            ("trtllm_mla", True, 1, True, "requires chunked prefix caching"),
+            ("aiter", False, 1, False, "requires an MLA model"),
+            ("aiter", True, 2, False, "only supports plain-TP MLA"),
         )
-        for is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
-            with self.subTest(error=error):
+        for backend, is_mla, attn_cp_size, disable_chunked_prefix_cache, error in cases:
+            with self.subTest(backend=backend, error=error):
                 args = self._args()
-                args.attention_backend = "trtllm_mla"
+                args.attention_backend = backend
                 args._model_config.attention_arch = (
                     AttentionArch.MLA if is_mla else AttentionArch.MHA
                 )
@@ -4742,8 +4754,76 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
                     disable_chunked_prefix_cache=disable_chunked_prefix_cache,
                 )
 
-                with self.assertRaisesRegex(ValueError, error):
+                with self.assertRaisesRegex(ValueError, f"with {backend} {error}"):
                     validate_kv_shard_attention_backend(args, view)
+
+    def test_mori_transfer_backend_is_allowed(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.disaggregation_transfer_backend = "mori"
+        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+            handle_kv_cache_sharding(args, 80 * 1024)
+
+    def _hip_dsa_args(self):
+        args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
+        args.attention_backend = "dsa"
+        args.dsa_prefill_backend = "triton"
+        args.dsa_decode_backend = "triton"
+        args.kv_cache_dtype = "fp8_e4m3"
+        args.disaggregation_transfer_backend = "mori"
+        args._model_config.hf_config = SimpleNamespace(
+            architectures=["GlmMoeDsaForCausalLM"]
+        )
+        return args
+
+    @staticmethod
+    def _hip_dsa_view(**overrides):
+        view = SimpleNamespace(
+            device="cuda",
+            enable_prefill_cp=False,
+            cp_strategy="interleave",
+            attn_cp_size=1,
+            pp_size=1,
+            dsa_prefill_backend="triton",
+            dsa_decode_backend="triton",
+            kv_cache_dtype="fp8_e4m3",
+            page_size=64,
+            disaggregation_transfer_backend="mori",
+            enable_dsa_cache_layer_split=False,
+        )
+        for key, value in overrides.items():
+            setattr(view, key, value)
+        return view
+
+    @override_platform(is_hip=True)
+    def test_hip_dsa_shards_across_attention_tp(self):
+        for dsa_backend in ("tilelang", "triton"):
+            with self.subTest(dsa=dsa_backend):
+                args = self._hip_dsa_args()
+                args.dsa_prefill_backend = args.dsa_decode_backend = dsa_backend
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    handle_kv_cache_sharding(args, 80 * 1024)
+
+    @override_platform(is_hip=True)
+    def test_hip_dsa_rejects_unsupported_shapes(self):
+        cases = (
+            ({"attn_cp_size": 2}, "requires attn_cp_size 1"),
+            ({"dsa_prefill_backend": "trtllm"}, "tilelang/triton prefill/decode"),
+            ({"page_size": 1}, "preshuffle paged-MQA"),
+            ({"disaggregation_transfer_backend": "mooncake"}, "requires mori"),
+        )
+        for overrides, error in cases:
+            with self.subTest(overrides=overrides):
+                with self.assertRaisesRegex(ValueError, error):
+                    validate_kv_shard_attention_backend(
+                        self._hip_dsa_args(), self._hip_dsa_view(**overrides)
+                    )
+
+    @override_platform(is_hip=False)
+    def test_cuda_dsa_still_requires_interleave_prefill_cp(self):
+        with self.assertRaisesRegex(ValueError, "CUDA interleave prefill CP"):
+            validate_kv_shard_attention_backend(
+                self._hip_dsa_args(), self._hip_dsa_view()
+            )
 
     def test_hisparse_allocator_is_rejected(self):
         args = self._args(enable_hisparse=True)
@@ -4761,6 +4841,14 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
             enable_hierarchical_cache=True, hicache_storage_backend="file"
         )
         with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
+            handle_kv_cache_sharding(args)
+
+    def test_kv_checksum_is_rejected(self):
+        args = self._args(disaggregation_enable_kv_checksum=True)
+
+        with self.assertRaisesRegex(
+            ValueError, "does not support --disaggregation-enable-kv-checksum"
+        ):
             handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):
