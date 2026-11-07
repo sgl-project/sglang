@@ -11,6 +11,7 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     DecodingStage,
+    skip_decode_if_requested,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -33,6 +34,7 @@ class HeliosDecodingStage(DecodingStage):
     HeliosPipeline behavior) and concatenates the results in pixel space.
     """
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(
         self,

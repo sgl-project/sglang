@@ -12,7 +12,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -25,6 +28,7 @@ from sglang.multimodal_gen.runtime.server_args import ServerArgs
 class Kandinsky6DecodingStage(DecodingStage):
     """Convert video to channel-first for shared VAE decode; attach the decoded audio."""
 
+    @skip_decode_if_requested
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         if batch.latents is None:
             raise ValueError("latents must be available before Kandinsky6 decoding.")

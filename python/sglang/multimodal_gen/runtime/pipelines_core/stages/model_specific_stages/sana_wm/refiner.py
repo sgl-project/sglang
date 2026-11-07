@@ -36,6 +36,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
     StageParallelismType,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.precision_types import PRECISION_TO_TYPE
@@ -762,6 +765,7 @@ class SanaWMLTX2RefinerStage(PipelineStage):
 class SanaWMRefinerDecodingStage(SanaWMDecodingStage):
     """Decode refined latents and drop the clean sink anchor frame."""
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs):
         self._drop_refiner_sink = bool(
