@@ -39,7 +39,8 @@
 
 #if SUPPORT_CLUSTER
 #include <sgl_kernel/math.cuh>
-#include <sgl_kernel/mbarrier.cuh>
+
+#include <sgl_kernel/ptx/barrier.cuh>
 #endif
 
 // The exactness contract, chosen once per process (SGLANG_TOPK_V2_MODE -> -DSGL_TOPK_MODE).
@@ -1191,7 +1192,7 @@ struct TopKStreaming : TopKRadixBase<12> {
 
 #if SUPPORT_CLUSTER
 
-/// Single-instruction PTX wrappers of the cluster path, on top of sgl_kernel/mbarrier.cuh.
+/// Single-instruction PTX wrappers of the cluster path, on top of sgl_kernel/ptx/barrier.cuh.
 namespace ptx {
 
 using device::ptx::mbar_init;
@@ -1229,7 +1230,7 @@ SGL_DEVICE void st_async_v2(uint32_t dst, uint32_t a, uint32_t b, uint32_t mbar)
 SGL_DEVICE void fence_mbar_init() {
   asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
 }
-// The waits below differ from mbarrier.cuh: a "memory" clobber, and a cluster-scope acquire
+// The waits below differ from ptx/barrier.cuh: a "memory" clobber, and a cluster-scope acquire
 // that pairs with the remote st.async complete_tx. They wait on phase 0 only: after every
 // used phase the CTA completes the next one empty (mbar_skip_phase), so each problem
 // starts every mbarrier on an even phase.
