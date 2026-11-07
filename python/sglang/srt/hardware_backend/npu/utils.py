@@ -216,6 +216,18 @@ def init_npu_backend():
     except ImportError as e:
         logger.warning("NPU custom kernel packages unavailable: %s", e)
 
+    try:
+        # Registers the ds41 (DeepSeek-V4.1) Python operators under the
+        # vendor operator extension's ds41 namespace. Absent for DSV4-only
+        # deployments.
+        import cann_ops_transformer  # noqa: F401
+    except ImportError as e:
+        logger.warning(
+            "Vendor DSv4.1 operator extension unavailable; DeepSeek-V4.1 NPU "
+            "operators will not be registered: %s",
+            e,
+        )
+
     import torch_npu
 
     # These imports lead to unpredictable behavior in diffusion models

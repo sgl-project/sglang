@@ -122,7 +122,7 @@ def apply_rotary_pos_emb_native_eager(
     return q_embed, k_embed
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def apply_rotary_pos_emb_native(
     q: torch.Tensor,
     k: torch.Tensor,

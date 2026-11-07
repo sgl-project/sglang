@@ -2042,7 +2042,7 @@ def _zero_topk_weights_padded_region(
     topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def _biased_grouped_topk_postprocess(
     topk_ids, expert_location_dispatch_info, num_token_non_padded
 ):

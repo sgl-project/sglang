@@ -66,7 +66,7 @@ from sglang.srt.speculative.dspark_components.dspark_config import (
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 
 class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):

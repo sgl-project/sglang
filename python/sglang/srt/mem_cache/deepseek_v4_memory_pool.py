@@ -1247,7 +1247,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                     self.sliding_window,
                     online_mtp_max_draft_tokens or 0,
                 ),
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
             )
             self.request_window_memory = RequestWindowMemory(
                 window_spec,
@@ -1271,7 +1271,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
         elif self._unified_kv:
@@ -1316,7 +1316,7 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
                 device=device,
                 enable_memory_saver=enable_memory_saver,
                 global_page_size=swa_page_size,
-                kv_layout=self.kv_layout,
+                kv_layout=self._window_kv_layout(),
                 cls=kv_pool_cls,
             )
 
@@ -1876,6 +1876,12 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             global_page_size=global_page_size,
             kv_layout=kv_layout,
         )
+
+    def _window_kv_layout(self) -> KVLayout:
+        """kv_layout of the non-compressed (full/swa/window) pools. Mirrors
+        :func:`compressed_kv_layout` so backends resolve their row format per
+        pool role; the default keeps the model-level value."""
+        return self.kv_layout
 
     def compressed_kv_layout(self, compress_ratio: int) -> KVLayout:
         """See :func:`resolve_compressed_kv_layout`."""

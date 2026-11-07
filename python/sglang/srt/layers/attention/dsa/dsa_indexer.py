@@ -649,7 +649,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert weights.dtype == torch.bfloat16
         return (weights * self.n_heads**-0.5).float()
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _project_and_scale_head_gates_fp32(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
     ):
@@ -657,7 +657,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights * self.n_heads**-0.5
         return weights
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _get_logits_head_gate_fp32(
         self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]], q_scale: torch.Tensor
     ):
@@ -666,13 +666,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _scale_head_gates(self, weights_raw: torch.Tensor, q_scale: torch.Tensor):
         weights = weights_raw * self.n_heads**-0.5
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale

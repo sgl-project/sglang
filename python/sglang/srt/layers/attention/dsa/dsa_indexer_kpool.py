@@ -34,6 +34,8 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import ceil_align, is_cuda, is_gfx1250_supported, is_hip, is_npu
 
+_is_npu = is_npu()
+
 if is_cuda():
     try:
         import deep_gemm
@@ -244,19 +246,19 @@ class IndexerKPool(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _get_logits_head_gate(self, x: torch.Tensor, q_scale: torch.Tensor):
         weights, _ = self.weights_proj(x.float())
         weights = weights * self.n_heads**-0.5
         weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
         return weights
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _project_and_scale_head_gates(self, x: torch.Tensor) -> torch.Tensor:
         weights, _ = self.weights_proj(x.float())
         return weights * self.n_heads**-0.5
 
-    @torch.compile(dynamic=True)
+    @torch.compile(dynamic=True, disable=_is_npu)
     def _apply_q_scale_and_softmax_scale(
         self, weights: torch.Tensor, q_scale: torch.Tensor
     ) -> torch.Tensor:

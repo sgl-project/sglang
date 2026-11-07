@@ -52,10 +52,17 @@ from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.deepseek import DeepseekForCausalLM
 from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM, DeepseekV3ForCausalLM
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.utils import cdiv, cpu_has_amx_support, get_compiler_backend, is_cpu
+from sglang.srt.utils import (
+    cdiv,
+    cpu_has_amx_support,
+    get_compiler_backend,
+    is_cpu,
+    is_npu,
+)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
+_is_npu = is_npu()
 
 NestedTensors: TypeAlias = Union[
     list["NestedTensors"],
@@ -1045,7 +1052,7 @@ class NoTPAttention(torch.nn.Module):
         return output
 
 
-@torch.compile(dynamic=True, backend=get_compiler_backend())
+@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def quick_gelu(x):
     return x * torch.sigmoid(1.702 * x)
 

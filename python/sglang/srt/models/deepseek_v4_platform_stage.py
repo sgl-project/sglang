@@ -569,11 +569,12 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.attn_hc, mhc.HcState(hidden_states, prev_pre))
+        attn_state = mhc.HcState(hidden_states, prev_pre)
+        x = mhc.combine(self.attn_hc, attn_state)
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             x = self.self_attn(positions, x, forward_batch)
-        attn_pre, attn_post, attn_comb = mhc.mix_stats(
-            self.attn_hc, hidden_states, stats_stream
+        attn_pre, attn_post, attn_comb = mhc.mix_stats_from_state(
+            self.attn_hc, hidden_states, attn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)
@@ -581,10 +582,11 @@ class NonCudaDSparkMixin(NonCudaDecoderMixin):
 
         residual = hidden_states
         mhc.fork_stats_stream(stats_stream)
-        x = mhc.combine(self.ffn_hc, mhc.HcState(hidden_states, attn_pre))
+        ffn_state = mhc.HcState(hidden_states, attn_pre)
+        x = mhc.combine(self.ffn_hc, ffn_state)
         x = self._run_ffn(x, forward_batch)
-        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats(
-            self.ffn_hc, hidden_states, stats_stream
+        ffn_pre, ffn_post, ffn_comb = mhc.mix_stats_from_state(
+            self.ffn_hc, hidden_states, ffn_state, stats_stream
         )
         if stats_stream is not None:
             torch.cuda.current_stream().wait_stream(stats_stream)

@@ -358,6 +358,28 @@ def mix_stats(
     return coefficients
 
 
+def mix_stats_from_state(
+    hc: HcSubLayer,
+    residual: torch.Tensor,
+    state: HcState,
+    stats_stream: Optional[torch.cuda.Stream] = None,
+) -> HcTriplet:
+    """``mix_stats``, unless the combine already stashed the triplet.
+
+    The A5 NPU combine (``npu_hc_pre_v2``, see ``_npu_combine_premix``) predicts
+    this sublayer's ``(pre, post, comb)`` as a by-product and parks it on
+    ``state.stats``.  This consumes the fused operator's coefficients exactly
+    like the target model does (``precomputed=state.stats`` through
+    ``run_attn_post`` / ``run_moe_post``), so the draft and the target run the
+    same operator; re-predicting would take the CUDA-only sinkhorn path, which
+    has no Ascend implementation.  Every other platform leaves ``state.stats``
+    unset, so this lands on plain ``mix_stats`` there.
+    """
+    if state.stats is not None:
+        return state.stats
+    return mix_stats(hc, residual, stats_stream)
+
+
 def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     from sglang.kernels.ops.layernorm.mhc import (
         hc_mix_stats,
@@ -493,16 +515,66 @@ def combine(
     return _combine(hc, state, quantized)
 
 
+def _npu_combine_premix(
+    hc: HcSubLayer,
+    state: HcState,
+    x: torch.Tensor,
+    apply_pre: Optional[torch.Tensor],
+) -> torch.Tensor:
+    """A5 single-pass mHC pre-mix + coefficient prediction.
+
+    ``combine`` collapses the streams and ``mix_stats`` predicts the triplet in
+    two steps elsewhere; the AscendC kernel does both in one launch -- it folds
+    the residual with the *previous* sublayer's pre-mix and returns this
+    sublayer's own ``(pre, post, comb)``. Those coefficients are stashed on
+    ``state.stats``, which ``_compute_triplet`` prefers over re-predicting, so the
+    post that follows consumes them.
+
+    Recipes: models/deepseek_v4_1/models/modules/op_impls/mhc.py L57-L71
+    (``hc_pre_ascendc``) and modeling_deepseek.py L1621-L1624 / L1638-L1640.
+    """
+    cfg = hc.cfg
+    if x.shape[0] == 0:
+        # Idle / DP-padding rank: nothing to mix, and the coefficient writers
+        # below accept empty batches.
+        state.stats = (
+            x.new_empty((0, cfg.mult), dtype=torch.float32),
+            x.new_empty((0, cfg.mult), dtype=torch.float32),
+            x.new_empty((0, cfg.mult, cfg.mult), dtype=torch.float32),
+        )
+        return hc.norm(x[:, 0, :])
+    if apply_pre is None:
+        # The first sublayer has no previous pre-mix to fold; seed the identity
+        # one-hot (stream 0 on its own).
+        apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
+        apply_pre[:, 0] = 1.0
+    y, post_mix, comb, pre = torch.ops.custom.npu_hc_pre_v2(
+        x=x,
+        hc_fn=hc.fn,
+        hc_scale=hc.scale,
+        hc_base=hc.base,
+        pre_mix=apply_pre,
+        hc_mult=cfg.mult,
+        hc_sinkhorn_iters=cfg.sinkhorn_iters,
+        norm_eps=cfg.rms_eps,
+        hc_eps=cfg.eps,
+    )
+    state.stats = (pre, post_mix, comb)
+    return hc.norm(y)
+
+
 def _combine(
     hc: HcSubLayer,
     state: HcState,
     quantized: Optional[list],
 ) -> torch.Tensor:
     """The combine computed from the residual's rows."""
-    from sglang.kernels.ops.layernorm.mhc import mhc_combine
-
     cfg, norm = hc.cfg, hc.norm
     x, apply_pre = state.residual, state.pre
+    if _is_npu and cfg.pre_from_prev:
+        return _npu_combine_premix(hc, state, x, apply_pre)
+    from sglang.kernels.ops.layernorm.mhc import mhc_combine
+
     quantize = quantized is not None
     x_flat = x.flatten(1)
 
@@ -563,6 +635,11 @@ def post(
         return torch.empty((0, cfg.mult, x.shape[-1]), dtype=x.dtype, device=x.device)
 
     if _is_npu:
+        if cfg.pre_from_prev:
+            # V4.1 (A5) CANN mhc_post(x, hRes, hOut, hPost): the residual is
+            # the base stream, comb its res-mixing matrix, x the sublayer
+            # output and post its post-mix.
+            return torch.ops.cann_ops_transformer.mhc_post(residual, comb, x, post_mix)
         if not is_npu_arch35():
             return torch.ops.custom.npu_hc_post(x, residual, post_mix, comb)
         # The Ascend 950 build of npu_hc_post is batched -- it requires a leading

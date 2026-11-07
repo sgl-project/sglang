@@ -86,7 +86,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_serving,
 )
-from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +100,25 @@ def _cuda_kernels(t: torch.Tensor) -> bool:
     """True where the Triton kernels apply (CUDA and gfx950); other ROCm GPUs and CPU
     take the torch paths."""
     return t.is_cuda and (is_cuda() or is_gfx95_supported())
+
+
+def _needs_fp8_byte_view() -> bool:
+    """True on Ascend A5, whose index kernel implements no fp8 dtype: the engram
+    tables there are gathered through a uint8 view; elsewhere they index directly."""
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+    return is_npu_arch35()
+
+
+def _e8m0_to_float(raw: torch.Tensor) -> torch.Tensor:
+    """e8m0 bytes -> fp32 as 2**(e - 127), the arithmetic of torch's own cast.
+
+    A5 implements no cast for this dtype either, so the float bits are assembled
+    from the exponent byte -- the same shift the GPU gather kernel applies.
+    """
+    exps = raw.to(torch.int32)
+    # E == 0 is 2**-127, a subnormal, not what zero exponent bits bitcast to.
+    return (exps << 23).view(torch.float32).masked_fill(exps == 0, 2.0**-127)
 
 
 def _is_prime(n: int) -> bool:
@@ -1316,11 +1335,20 @@ class EngramEmbedding(nn.Module):
             local = indices - self.row_start
             owned = (local >= 0) & (local < self.rows)
             local = local.masked_fill(~owned, 0)
-            rows = self.weight[local]
-            if self.mxfp4:
-                rows = unpack_mxfp4_rows(rows)
-            rows = rows.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
-            values = (rows * self.scale[local].float().unsqueeze(-1)).flatten(-2)
+            weight, scale = self.weight, self.scale
+            if _needs_fp8_byte_view():
+                # A5 has neither an fp8 index nor an e8m0 cast, so both tables are
+                # read as bytes and the scale's float bits are built directly.
+                weight = weight.view(torch.uint8)[local].view(torch.float8_e4m3fn)
+                scale = _e8m0_to_float(scale.view(torch.uint8)[local])
+            else:
+                weight, scale = weight[local], scale[local]
+                if self.mxfp4:
+                    weight = unpack_mxfp4_rows(weight)
+            values = (
+                weight.float().unflatten(-1, (-1, FP8_BLOCK_SIZE))
+                * scale.float().unsqueeze(-1)
+            ).flatten(-2)
             return values.to(torch.bfloat16).masked_fill(~owned.unsqueeze(-1), 0)
         out = self.new_rows(indices)
         engram_gather(
@@ -1504,7 +1532,14 @@ def engram_gate(
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
+    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
+    if is_npu():
+        # Ascend has no copysign kernel (its fallback copies through the host,
+        # which aclgraph rejects while capturing); `where` is elementwise.
+        # Only a negative-zero dot picks the other sign.
+        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
+    else:
+        gate = torch.sigmoid(torch.copysign(magnitude, dot))
     out = (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
