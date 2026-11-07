@@ -20,6 +20,8 @@ if TYPE_CHECKING:
 
 _DEBUG_LOG = get_bool_env_var("SGLANG_PREFILL_DELAYER_DEBUG_LOG")
 
+DEFAULT_MAX_DELAY_PASSES = 30
+
 logger = logging.getLogger(__name__)
 
 
@@ -76,12 +78,19 @@ class _NegotiateOutput(NamedTuple):
 class PrefillDelayer:
     def __init__(
         self,
-        max_delay_passes: int,
+        max_delay_passes: Optional[int],
         token_usage_low_watermark: Optional[float],
         metrics_collector: Optional["SchedulerMetricsCollector"] = None,
         debug_log_enabled: bool = True,
     ):
-        self._max_delay_passes = max_delay_passes
+        # Only an explicit max_delay_passes bounds queue-triggered delays;
+        # otherwise they are bounded by max_delay_ms alone.
+        self._queue_max_delay_passes = max_delay_passes
+        self._max_delay_passes = (
+            max_delay_passes
+            if max_delay_passes is not None
+            else DEFAULT_MAX_DELAY_PASSES
+        )
         self._token_usage_low_watermark = token_usage_low_watermark
         self._debug_log_enabled = _DEBUG_LOG and debug_log_enabled
         # Queue-based trigger is opt-in: activates only when queue_min_ratio
@@ -249,21 +258,22 @@ class PrefillDelayer:
             global_waiting_queue_max = int(global_waiting_queue_len.max().item())
 
             # Queue-based trigger: delay prefill until the waiting queue
-            # reaches queue_min = min(running_req * ratio, max_prefill_bs),
-            # capped by a wall-clock timeout to bound worst-case TTFT.
-            # Targets workloads where decode requests finish one-at-a-time
-            # and fragment prefill into many tiny batches.
+            # reaches queue_min = running_req * ratio (capped by
+            # prefill_max_requests), bounded by a wall-clock timeout to cap
+            # worst-case TTFT. Targets workloads where decode requests finish
+            # one-at-a-time and fragment prefill into many tiny batches.
             queue_condition = False
             if self._queue_trigger_enabled and global_running_batch_max > 0:
-                queue_capacity = (
-                    self._prefill_max_requests
-                    if self._prefill_max_requests is not None
-                    else global_max_prefill_bs_max
+                queue_min_effective = int(
+                    global_running_batch_max * self._queue_min_ratio
                 )
-                queue_min_effective = min(
-                    int(global_running_batch_max * self._queue_min_ratio),
-                    queue_capacity,
-                )
+                # Not capped by max_prefill_bs: delayed passes feed it the
+                # waiting-queue length, so it collapses toward the very queue
+                # this delay is waiting on.
+                if self._prefill_max_requests is not None:
+                    queue_min_effective = min(
+                        queue_min_effective, self._prefill_max_requests
+                    )
                 queue_condition = (
                     queue_min_effective > 0
                     and global_waiting_queue_max < queue_min_effective
@@ -279,15 +289,22 @@ class PrefillDelayer:
             if slot_condition or queue_condition:
                 # When the "max_decode_bs - running_bs < max_prefill_bs" condition is met,
                 # the first merge_batch causes the decoding to fail to reach the maximum batch size.
-                if self.skip_first_delayer:
+                if self.skip_first_delayer and slot_condition:
                     self.skip_first_delayer = False
                     pass
                 else:
                     # Bound the wait like the "mixed" branch: on a saturated
                     # engine slot_condition may never turn false, so cap the
-                    # delay by max_delay_passes.
+                    # delay by max_delay_passes. A queue-triggered delay is
+                    # bounded by max_delay_ms (checked above), and by
+                    # max_delay_passes only when that is set explicitly.
+                    max_passes = (
+                        self._queue_max_delay_passes
+                        if queue_condition
+                        else self._max_delay_passes
+                    )
                     prev_delayed_count = prev_state.delayed_count if prev_state else 0
-                    if prev_delayed_count < self._max_delay_passes - 1:
+                    if max_passes is None or prev_delayed_count < max_passes - 1:
                         next_state = prev_state or _State()
                         next_state = next_state.bump_delayed_count()
                         return _NegotiateOutput(

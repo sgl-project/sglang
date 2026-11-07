@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Set, Union
 import msgspec
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.prefill_delayer import DEFAULT_MAX_DELAY_PASSES
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.observability.scheduler_stage_metrics import (
     FORWARD_OVERLAP_CATEGORIES,
@@ -1246,6 +1247,8 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Prefill delayer
         # =================================================================
         max_delay = get_schedule().prefill_delayer_max_delay_passes
+        if max_delay is None:
+            max_delay = DEFAULT_MAX_DELAY_PASSES
         self.prefill_delayer_wait_forward_passes = Histogram(
             name="sglang:prefill_delayer_wait_forward_passes",
             documentation="Histogram of forward passes waited by prefill delayer.",
