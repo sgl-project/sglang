@@ -13,9 +13,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEn
 from sglang.srt.mem_cache.storage.umbp.umbp_direct_linker import (
     UMBPDirectLinker,
     _ordered_layers,
+    _pool_suffixes,
     _PoolRangePlan,
     _storage_suffix,
 )
+from sglang.srt.mem_cache.storage.umbp.umbp_store import UMBPStore
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -54,6 +56,36 @@ class TestStorageSuffix(CustomTestCase):
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=0, pp_rank=0),
             _storage_suffix(rank_replicated=True, tp_rank=0, attn_cp_rank=1, pp_rank=0),
         )
+
+    def test_a_pool_shard_stands_in_for_the_tp_rank(self):
+        # Rank 3 of a group whose MLA KV declares shard 0.
+        pools = {
+            name: SimpleNamespace(name=name, shard=shard, packed=True, components=[[]])
+            for name, shard in (
+                (PoolName.KV, 0),
+                (PoolName.MAMBA, None),
+                (PoolName.DRAFT, None),
+            )
+        }
+        storage = UMBPStore.__new__(UMBPStore)
+        storage.registered_pools = pools
+        storage.is_mla_backend = True
+        storage.config_prefix = None
+        linker = UMBPDirectLinker.__new__(UMBPDirectLinker)
+        linker.storage = storage
+        linker.pools = pools
+        linker._pool_suffixes = _pool_suffixes(
+            pools.values(), rank_replicated=False, tp_rank=3, attn_cp_rank=1, pp_rank=2
+        )
+        for name, key in (
+            (PoolName.KV, "page_tp0_cp1_pp2_kv"),
+            (PoolName.MAMBA, "page_tp3_cp1_pp2_temporal"),
+            (PoolName.DRAFT, "page_tp3_cp1_pp2_draft"),
+        ):
+            keys, _ = linker._object_keys_for_pages(
+                ["page"], SimpleNamespace(name=name)
+            )
+            self.assertEqual(keys, [key])
 
 
 class TestPackedDraftRanges(CustomTestCase):
