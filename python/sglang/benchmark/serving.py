@@ -1067,6 +1067,9 @@ class BenchmarkMetrics:
     p99_tpot_ms: float
 
     # ITL - Inter-Token Latency (ms)
+    # Which convention produced the values below: "per-token" divides each streamed
+    # chunk's gap by the tokens it carried, "per-chunk" reports the gap as-is.
+    itl_convention: str
     mean_itl_ms: float
     median_itl_ms: float
     std_itl_ms: float
@@ -1150,10 +1153,13 @@ def calculate_metrics(
     e2e_latencies: List[float] = []
     retokenized_itls: List[float] = []
 
-    use_retokenized_itl = (
-        accept_length is not None
-        and accept_length > 0
-        and backend in ("sglang-oai", "sglang-oai-chat")
+    # Per-token ITL divides each streamed chunk's gap by the tokens that chunk carried.
+    # It only differs from the per-chunk gap when chunks carry more than one token, which
+    # is observable from the response stream for any streaming backend. Gating it on the
+    # backend name instead means one run can measure two systems under two definitions.
+    use_retokenized_itl = any(
+        o.success and o.text_chunks and o.output_len > len(o.text_chunks)
+        for o in outputs
     )
 
     for i in range(len(outputs)):
@@ -1261,9 +1267,21 @@ def calculate_metrics(
             else:
                 print("tip: install termplotlib and gnuplot to plot the metrics")
 
+    chunk_itls = itls
     itls = retokenized_itls if use_retokenized_itl else itls
+    itl_convention = "per-token" if use_retokenized_itl else "per-chunk"
+    if use_retokenized_itl and chunk_itls and itls:
+        ratio = float(np.median(chunk_itls)) / max(float(np.median(itls)), 1e-12)
+        if ratio > 1.1:
+            print(
+                f"warning: ITL is reported with the '{itl_convention}' convention. The "
+                f"per-chunk convention would report a {ratio:.2f}x larger median, because "
+                f"chunks carry multiple tokens here. Harnesses differ on this, so do not "
+                f"compare these ITL numbers against a tool that uses the other convention."
+            )
     metrics = BenchmarkMetrics(
         completed=completed,
+        itl_convention=itl_convention,
         total_input=total_input,
         total_input_text=total_input_text,
         total_input_vision=total_input_vision,
@@ -1784,6 +1802,7 @@ async def benchmark(
         print("{:<40} {:<10.2f}".format("P95 TPOT (ms):", metrics.p95_tpot_ms))
         print("{:<40} {:<10.2f}".format("P99 TPOT (ms):", metrics.p99_tpot_ms))
         print("{s:{c}^{n}}".format(s="Inter-Token Latency", n=50, c="-"))
+        print("{:<40} {:<10}".format("ITL convention:", metrics.itl_convention))
         print("{:<40} {:<10.2f}".format("Mean ITL (ms):", metrics.mean_itl_ms))
         print("{:<40} {:<10.2f}".format("Median ITL (ms):", metrics.median_itl_ms))
         print("{:<40} {:<10.2f}".format("P90 ITL (ms):", metrics.p90_itl_ms))
