@@ -90,6 +90,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import DEEPGEMM_SCALE_UE8M0
 from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     dp_gather_replicate,
+    dp_slot_in,
     get_global_dp_buffer_len,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -4443,6 +4444,8 @@ class DeepseekV4Model(nn.Module):
             gathered_cpu = gathered.tolist()
             dp_rank = get_parallel().attn_dp_rank
             attn_tp_rank = get_parallel().attn_tp_rank
+            parent_sizes = forward_batch.global_num_tokens_cpu
+            parent_dp_offset = sum(parent_sizes[: dp_slot_in(parent_sizes)])
             for idx, child in enumerate(children):
                 rank_sizes = [gathered_cpu[r][idx] for r in range(world)]
                 dp_sizes, tp_sizes = _tbo_collective_sizes(rank_sizes, attn_tp_size)
@@ -4450,6 +4453,7 @@ class DeepseekV4Model(nn.Module):
                 child.global_num_tokens_gpu = gathered[::attn_tp_size, idx].contiguous()
                 child.global_dp_buffer_len = sum(dp_sizes)
                 child._tbo_tp_sizes = tp_sizes
+                child.tbo_parent_dp_offset = parent_dp_offset
                 # Gather the ubatch's input_ids -> global ONCE here (cached on the
                 # child) instead of per-layer in op_gather_a. The hash MoE reads
                 # the SAME global ids every layer, so 61x2 per-layer all_gatherv of
