@@ -152,6 +152,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         graph_io.relay[indices] = published.to(torch.int64)
         result = SimpleNamespace(
             next_draft_input=None,
+            accept_lens=None,
             has_sampled_token_ids=True,
             next_token_ids=published,
             can_run_cuda_graph=True,
@@ -334,6 +335,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None

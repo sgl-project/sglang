@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -26,12 +27,9 @@ from sglang.srt.layers.logits_processor import (
 )
 from sglang.srt.managers.auxiliary_output import CommittedTokens
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_MATCHED_TOKEN
-from sglang.srt.managers.schedule_batch import (
-    Req,
-    ScheduleBatch,
-    mamba_lazy_spec_in_window,
-)
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.common import checkpoint_kv_cache
+from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import (
     get_required_capture_hidden_mode,
@@ -44,7 +42,6 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_observability,
     mamba_track_grid,
-    max_speculative_num_draft_tokens,
 )
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
@@ -168,7 +165,7 @@ class SchedulerBatchResultProcessor:
             req.update_finish_state()
             if req.finished():
                 req.time_stats.set_quick_finish_time()
-                self.request_retirer.release_finished(req, checkpoint=True)
+                self.request_retirer.release(req, checkpoint=True)
 
         # Note: Logprobs should be handled on the prefill engine.
         self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
@@ -314,6 +311,28 @@ class SchedulerBatchResultProcessor:
     ) -> None:
         output.consume(batch, cls._build_auxiliary_commits(batch, output_starts))
 
+    def _flush_prefill(
+        self,
+        batch: ScheduleBatch,
+        kv_ops: List[Callable[[], None]],
+        skip_stream_req: Optional[Req],
+    ) -> None:
+        """Run a prefill batch's queued KV calls in order, end the free group, then
+        send the outputs.
+
+        The loop queues each row's KV work (HiSparse finish, release, checkpoint,
+        staging admit) in row order, so an override that sends first moves only the
+        send. The send and the KV calls are coupled both ways: stream_output sets
+        finished_output and fills finished_len where it is None, and release_kv_cache
+        reads finished_len.
+        """
+        for op in kv_ops:
+            op()
+        self.token_to_kv_pool_allocator.free_group_end()
+        self.output_streamer.stream_output(
+            batch.reqs, batch.return_logprob, skip_stream_req
+        )
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -321,6 +340,8 @@ class SchedulerBatchResultProcessor:
     ):
         skip_stream_req = None
         self.token_to_kv_pool_allocator.free_group_begin()
+        # Each generation row's KV work, queued in row order for _flush_prefill.
+        kv_ops: List[Callable[[], None]] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -449,16 +470,27 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
-                            self._prepare_kv_cache_release(req)
-                        self.request_retirer.release_finished(
-                            req, checkpoint=discard_finish_reason is None
+                            kv_ops.append(partial(self._prepare_kv_cache_release, req))
+                        kv_ops.append(
+                            partial(
+                                self.request_retirer.release,
+                                req,
+                                checkpoint=discard_finish_reason is None,
+                            )
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        checkpoint_kv_cache(req, self.tree_cache)
+                        kv_ops.append(
+                            partial(checkpoint_kv_cache, req, self.tree_cache)
+                        )
                         if get_memory().enable_hisparse:
                             self.leave_prefill_launched([req])
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            kv_ops.append(
+                                partial(
+                                    self.hisparse_coordinator.admit_request_into_staging,
+                                    req,
+                                )
+                            )
 
                     if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
@@ -537,7 +569,7 @@ class SchedulerBatchResultProcessor:
                 if req.discard_output_reason is not None and not is_middle_chunk:
                     req.request_finish(req.discard_output_reason)
                     req.update_finish_state(0)
-                    self.request_retirer.release_finished(req, checkpoint=False)
+                    self.request_retirer.release(req, checkpoint=False)
                     req.time_stats.set_completion_time()
                     continue
 
@@ -555,7 +587,7 @@ class SchedulerBatchResultProcessor:
                     req.update_finish_state()
 
                     if req.finished():
-                        self.request_retirer.release_finished(req, checkpoint=True)
+                        self.request_retirer.release(req, checkpoint=True)
                         req.time_stats.set_completion_time()
                     else:
                         checkpoint_kv_cache(req, self.tree_cache)
@@ -563,10 +595,7 @@ class SchedulerBatchResultProcessor:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.token_to_kv_pool_allocator.free_group_end()
-        self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
-        )
+        self._flush_prefill(batch, kv_ops, skip_stream_req)
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
@@ -1456,7 +1485,7 @@ class SchedulerBatchResultProcessor:
             self.decode_offload_manager.finalize_release_on_finish(req)
         else:
             self._prepare_kv_cache_release(req)
-            self.request_retirer.release_finished(req, checkpoint=False)
+            self.request_retirer.release(req, checkpoint=False)
         req.time_stats.set_completion_time()
 
     def _handle_finish_state_updated_req(
@@ -1485,20 +1514,16 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
-                req.kv.mamba_last_track_idx = batch.mamba_track_buffer_indices[i]
-                # The slot that stops being the latest still holds its
-                # checkpoint; name it so a short key can fall back to it.
-                req.kv.mamba_prev_track_seqlen = req.kv.mamba_last_track_seqlen
-                req.kv.mamba_last_track_seqlen = req.kv.kv_committed_len - lookahead
-            elif (
-                req.finished()
-                and lazy
-                and lookahead == 1
-                and known_mamba_boundary
-                and req.kv.mamba_next_track_idx == req.kv.mamba_last_track_idx
-                and req.kv.mamba_untracked_decode_batch_idx != req.decode_batch_idx
-            ):
-                req.mamba_lazy_checkpoint = False
+                kv_storage_of(
+                    batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+                ).advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=req.kv.kv_committed_len - lookahead,
+                        last_position=batch.mamba_track_buffer_indices[i],
+                        preserve_previous=True,
+                    ),
+                )
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
@@ -1547,7 +1572,7 @@ class SchedulerBatchResultProcessor:
                     if get_exec().mamba.enable_mamba_extra_buffer_lazy
                     else True
                 )
-                self.request_retirer.release_finished(req, checkpoint=checkpoint)
+                self.request_retirer.release(req, checkpoint=checkpoint)
 
             req.time_stats.set_completion_time()
 
@@ -1674,19 +1699,30 @@ class SchedulerBatchResultProcessor:
         track_idx = req.kv.mamba_next_track_idx
         if not known_boundary and batch.mamba_track_buffer_indices is not None:
             track_idx = batch.mamba_track_buffer_indices[i]
-        previous_track_seqlen = req.kv.mamba_last_track_seqlen
-        if not known_boundary:
-            req.kv.mamba_last_track_seqlen = track_seqlen
+        storage = kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        )
         if lazy:
-            # Lazy frees the slot it stops tracking, so nothing names the
-            # previous checkpoint there; mamba_prev_track_seqlen stays None.
+            if not known_boundary:
+                storage.advance(req, tracking=TrackingAdvance(boundary=track_seqlen))
             self.mamba_lazy_post_decode_at_boundary(req, batch, track_idx)
         else:
             if not known_boundary:
-                req.kv.mamba_last_track_idx = track_idx
-                req.kv.mamba_prev_track_seqlen = previous_track_seqlen
-            req.kv.mamba_next_track_idx = (
-                batch.req_to_token_pool.get_mamba_ping_pong_other_idx(track_idx)
+                storage.advance(
+                    req,
+                    tracking=TrackingAdvance(
+                        boundary=track_seqlen,
+                        last_position=track_idx,
+                        preserve_previous=True,
+                    ),
+                )
+            storage.advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        track_idx
+                    )
+                ),
             )
 
     def _mamba_lazy_spec_update(
@@ -1696,10 +1732,11 @@ class SchedulerBatchResultProcessor:
 
         Running req with a confirmed crossing: the commit scattered the
         crossing state into the planned position; promote it to keep unless
-        the plan already pointed at the keep slot (in-place fallback, or
-        promoted by an earlier overlapped confirmation).
-        Finishing req: donate the keep slot only if no scatter wrote it
-        (this step) or may still write it (the in-flight next step).
+        the plan already pointed at the keep slot (promoted by an earlier
+        overlapped confirmation). A -1 plan had no slot: the keep slot and
+        mamba_last_track_seqlen stay.
+        Finishing req: donate the keep slot only if this step's scatter did
+        not write it.
         """
         positions = batch.mamba_lazy_spec_track_positions_cpu
         planned_pos = (
@@ -1709,40 +1746,30 @@ class SchedulerBatchResultProcessor:
         )
 
         if req.finished():
-            # Skip the donation if a scatter wrote or may still write the keep slot.
+            # Skip the donation if this step's scatter wrote the keep slot.
             keep_written_by_this_step = (
                 crossed and planned_pos == req.kv.mamba_next_track_idx
             )
-            other_idx = 1 - req.kv.mamba_next_track_idx
-            # Recompute the in-flight verify's plan (kv_committed_len is
-            # frozen since its prepare, so the recompute is exact).
-            keep_may_be_written_in_flight = req.kv.mamba_ping_pong_empty[
-                other_idx
-            ] and mamba_lazy_spec_in_window(
-                req,
-                mamba_track_grid(self.tree_cache.page_size),
-                max_speculative_num_draft_tokens(),
-            )
-            if (
-                planned_pos is None
-                or keep_written_by_this_step
-                or keep_may_be_written_in_flight
-            ):
+            if planned_pos is None or keep_written_by_this_step:
                 req.mamba_lazy_checkpoint = False
             return
 
-        if not crossed or planned_pos is None:
+        if not crossed or planned_pos is None or planned_pos < 0:
             return
-        if planned_pos != req.kv.mamba_next_track_idx:
-            # Promote pending -> keep: free the old checkpoint, repoint.
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, req.kv.mamba_next_track_idx)
-            req.kv.mamba_next_track_idx = planned_pos
-        # else: in-place fallback, or promoted by an earlier confirmation —
-        # keep holds the track_seqlen state either way.
-        req.kv.mamba_last_track_idx = planned_pos
-        req.kv.mamba_last_track_seqlen = track_seqlen
+        old_position = req.kv.mamba_next_track_idx
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                boundary=track_seqlen,
+                last_position=planned_pos,
+                next_position=planned_pos,
+                release_positions=(old_position,)
+                if planned_pos != old_position
+                else (),
+            ),
+        )
 
     @staticmethod
     def _mamba_assert_committed_len_lookahead(req: Req) -> None:
@@ -1798,10 +1825,13 @@ class SchedulerBatchResultProcessor:
         self, req: Req, batch: ScheduleBatch, track_idx: int
     ):
         """Commit a completed lazy-mode boundary and free its old slot."""
-        req.kv.mamba_last_track_idx = track_idx
-        req.kv.mamba_next_track_idx = track_idx
-        other_idx = 1 - track_idx
-        if not req.kv.mamba_ping_pong_empty[other_idx]:
-            kv_storage_of(
-                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
-            ).release_tracking_slot(req, other_idx)
+        kv_storage_of(
+            batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+        ).advance(
+            req,
+            tracking=TrackingAdvance(
+                last_position=track_idx,
+                next_position=track_idx,
+                release_positions=(1 - track_idx,),
+            ),
+        )
