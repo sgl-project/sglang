@@ -1620,6 +1620,8 @@ class Envs:
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # ROCm CustomAllReduceV2 workspace sharing: auto, fabric or posix_fd
+    SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
@@ -2252,6 +2254,18 @@ class Envs:
     SGLANG_M3_ALLOW_CUSTOM_AR = EnvBool(False)
 
     # ===================================================================
+    # Gemma 4
+    # ===================================================================
+    # Fused TP all-reduce + RMSNorm -> residual add -> RMSNorm -> per-128 FP8
+    # quant of the dense layer stack as one NVLS kernel per site, for extend
+    # batches of MIN..MAX tokens (SM90 with NVLink multicast, block-FP8 weights).
+    # MIN_TOKENS 0 takes the per-TP-size default (DEFAULT_MIN_TOKENS in
+    # srt/layers/communication/gemma4_ar_fusion.py).
+    SGLANG_GEMMA4_AR_FUSION = EnvBool(False)
+    SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS = EnvInt(0)
+    SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS = EnvInt(8192)
+
+    # ===================================================================
     # Kimi K3
     # ===================================================================
     # MNNVL fused all-reduce (bf16, TP8): zero-copy 1shot multicast-push for
@@ -2267,6 +2281,13 @@ class Envs:
     # TP4/TP8 GB300 and TP16 GB200/GB300 tuning; set 0/1 to override. See
     # srt/layers/communication/k3_sp_collective.py.
     SGLANG_K3_SP_COLLECTIVE = EnvBool(False)
+    # DCP MLA decode: push each peer's head partials straight into its
+    # CustomAllReduceV2 push slot and combine by LSE in one kernel, in place of
+    # the pack + all-to-all + combine (W_UV-before-reduce path, 128-wide heads).
+    # Rows per call up to SGLANG_DCP_PUSH_COMBINE_MAX_ROWS. See
+    # kernels/ops/attention/dcp_push_combine.py.
+    SGLANG_ENABLE_DCP_PUSH_COMBINE = EnvBool(True)
+    SGLANG_DCP_PUSH_COMBINE_MAX_ROWS = EnvInt(1024)
     # Keep K3's post-MoE residual stream token-sharded between consecutive
     # SP-MoE layers. The next attention-residual aggregation and snapshot
     # bank write run on the local shard, then only the normalized attention
@@ -2276,8 +2297,17 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # TP-shard the K3 MoE front's router + latent-down rows (KimiK3MoE._front_shard)
+    # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
+    # gemm_ag_up_fits). Online weight updates are rejected while on.
+    SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
+    # Kimi-K3.1 decode routed MoE on SM100/SM103: replace flashinfer's deferred-finalize
+    # trtllm-gen MXFP4 call with the JIT routing + persistent FC1/FC2 kernels
+    # (kernels/ops/moe/k31_decode_moe.py) for covered TP-MoE shapes (896 local
+    # experts, intermediate 384, top-16, <= 256 tokens); anything else runs flashinfer.
+    SGLANG_K31_DECODE_MOE = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import partial
 from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
@@ -324,6 +325,29 @@ class SchedulerBatchResultProcessor:
     def _live_reqs(batch: ScheduleBatch, live: List[bool]) -> List[Req]:
         return [req for req, row_live in zip(batch.reqs, live) if row_live]
 
+    def _flush_prefill(
+        self,
+        batch: ScheduleBatch,
+        live_reqs: List[Req],
+        kv_ops: List[Callable[[], None]],
+        skip_stream_req: Optional[Req],
+    ) -> None:
+        """Run a prefill batch's queued KV calls in order, end the free group, then
+        send the outputs of the step's live requests.
+
+        The loop queues each row's KV work (HiSparse finish, release, checkpoint,
+        staging admit) in row order, so an override that sends first moves only the
+        send. The send and the KV calls are coupled both ways: stream_output sets
+        finished_output and fills finished_len where it is None, and release_kv_cache
+        reads finished_len.
+        """
+        for op in kv_ops:
+            op()
+        self.token_to_kv_pool_allocator.free_group_end()
+        self.output_streamer.stream_output(
+            live_reqs, batch.return_logprob, skip_stream_req
+        )
+
     def process_batch_result_prefill(
         self,
         batch: ScheduleBatch,
@@ -332,6 +356,8 @@ class SchedulerBatchResultProcessor:
         skip_stream_req = None
         live = self._live_rows(batch)
         self.token_to_kv_pool_allocator.free_group_begin()
+        # Each generation row's KV work, queued in row order for _flush_prefill.
+        kv_ops: List[Callable[[], None]] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -467,16 +493,27 @@ class SchedulerBatchResultProcessor:
                             self._maybe_collect_routed_experts(req)
                             self._maybe_collect_indexer_topk(req)
                         if batch.decoding_reqs and req in batch.decoding_reqs:
-                            self._prepare_kv_cache_release(req)
-                        self.request_retirer.release(
-                            req, checkpoint=discard_finish_reason is None
+                            kv_ops.append(partial(self._prepare_kv_cache_release, req))
+                        kv_ops.append(
+                            partial(
+                                self.request_retirer.release,
+                                req,
+                                checkpoint=discard_finish_reason is None,
+                            )
                         )
                         req.time_stats.set_completion_time()
                     elif not batch.decoding_reqs or req not in batch.decoding_reqs:
-                        checkpoint_kv_cache(req, self.tree_cache)
+                        kv_ops.append(
+                            partial(checkpoint_kv_cache, req, self.tree_cache)
+                        )
                         if get_memory().enable_hisparse:
                             self.leave_prefill_launched([req])
-                            self.hisparse_coordinator.admit_request_into_staging(req)
+                            kv_ops.append(
+                                partial(
+                                    self.hisparse_coordinator.admit_request_into_staging,
+                                    req,
+                                )
+                            )
 
                     if discard_finish_reason is None:
                         self._maybe_collect_customized_info(i, req, logits_output)
@@ -583,9 +620,8 @@ class SchedulerBatchResultProcessor:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self.token_to_kv_pool_allocator.free_group_end()
-        self.output_streamer.stream_output(
-            self._live_reqs(batch, live), batch.return_logprob, skip_stream_req
+        self._flush_prefill(
+            batch, self._live_reqs(batch, live), kv_ops, skip_stream_req
         )
 
         can_run_cuda_graph = result.can_run_cuda_graph
