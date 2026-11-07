@@ -68,9 +68,10 @@ DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS = {
     "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
 }
 
-# Pass 1: ASCEND_USE_FIA left unset (image default).
+# Pass 1: ASCEND_USE_FIA left unset (image default), CPU seq_lens mirror kept (1).
 DEEPSEEK_V4_FLASH_W8A8_PASS1_ENVS = {
-    k: v for k, v in DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS.items() if k != "ASCEND_USE_FIA"
+    **{k: v for k, v in DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_ENVS.items() if k != "ASCEND_USE_FIA"},
+    "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "1",
 }
 
 DEEPSEEK_V4_FLASH_W8A8_DSPARK_8P_OTHER_ARGS = [

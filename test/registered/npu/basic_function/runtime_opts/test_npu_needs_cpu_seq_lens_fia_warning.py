@@ -55,6 +55,7 @@ class TestNpuNeedsCpuSeqLensFiaWarning(CustomTestCase):
             env={
                 "ASCEND_USE_FIA": "1",
                 "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
+                "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
             },
             return_stdout_stderr=(cls.out_log_file, cls.err_log_file),
         )
