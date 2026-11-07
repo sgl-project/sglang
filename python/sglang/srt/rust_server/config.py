@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.entrypoints.server_utils import (
+    build_model_info_fields,
+    build_server_info,
+)
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
     _num_accelerators_per_dp_rank,
@@ -18,6 +24,11 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.request_logger import (
+    WHITELISTED_HEADERS,
+    RequestLogger,
+    _dataclass_to_string_truncated,
+)
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
@@ -34,7 +45,6 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
@@ -51,6 +61,8 @@ def _build_server_args(
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
+    request_class: Optional[type] = None,
+    omit_custom_params: Tuple[str, ...] = (),
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -108,6 +120,7 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
+        "node_listeners": _node_listeners(grpc_port=grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -132,6 +145,7 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -212,7 +226,85 @@ def _build_server_args(
         metrics=(
             _build_metrics_config(ext) if get_observability().enable_metrics else None
         ),
+        request_log=(
+            ext.RequestLogConfig(
+                **request_log_settings(
+                    get_observability().log_requests_level, request_class
+                ),
+                omit_custom_params=list(omit_custom_params),
+            )
+            if get_observability().log_requests
+            else None
+        ),
     )
+
+
+def request_log_settings(level: int, request_class: Optional[type]) -> Dict[str, Any]:
+    """``RequestLogger``'s settings for ``--log-requests-level`` ``level``, for
+    the Rust server to render the lines ``TokenizerManager`` logs: the level's
+    metadata, and ``request_class``'s fields in declaration order with each
+    default rendered as ``_dataclass_to_string_truncated`` renders a value."""
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    request_class = request_class or GenerateReqInput
+    logger = RequestLogger(
+        log_requests=True,
+        log_requests_level=level,
+        log_requests_format="text",
+        log_requests_target=None,
+    )
+    max_length, skip_names, out_skip_names = logger.metadata
+
+    def default(field: dataclasses.Field) -> Any:
+        if field.default is not dataclasses.MISSING:
+            return field.default
+        return field.default_factory()
+
+    batch_item_fields, batch_shared_fields = _batch_item_fields(request_class)
+    return dict(
+        max_length=max_length,
+        skip_names=sorted(skip_names or ()),
+        out_skip_names=sorted(out_skip_names or ()),
+        class_name=request_class.__name__,
+        fields=[
+            (field.name, _dataclass_to_string_truncated(default(field), max_length))
+            for field in dataclasses.fields(request_class)
+        ],
+        batch_item_fields=batch_item_fields,
+        batch_shared_fields=batch_shared_fields,
+        headers=list(WHITELISTED_HEADERS),
+        exceeded_ms=logger.log_exceeded_ms,
+    )
+
+
+def _batch_item_fields(request_class: type) -> Tuple[List[str], List[str]]:
+    """The fields a batch item's object (``obj[i]``) takes from a normalized
+    batch: its own entry of a per-item field, or a shared field's value; the
+    rest keep their defaults. Read off ``request_class.__getitem__`` itself by
+    giving each field a marker per item."""
+    item_fields, shared_fields = [], []
+    for field in dataclasses.fields(request_class):
+        if not field.init:
+            continue
+        batch = request_class(text=["", ""])
+        try:
+            batch.normalize_batch_and_arguments()
+        except Exception as e:
+            raise RuntimeError(
+                f"cannot read which fields a batch item of {request_class.__name__} "
+                "keeps: normalizing a two-prompt batch failed"
+            ) from e
+        markers = [object(), object()]
+        setattr(batch, field.name, markers)
+        try:
+            value = getattr(batch[0], field.name)
+        except Exception:  # an item helper that cannot take the marker
+            continue
+        if value is markers[0]:
+            item_fields.append(field.name)
+        elif value is markers:
+            shared_fields.append(field.name)
+    return item_fields, shared_fields
 
 
 def _build_metrics_config(ext: ModuleType):
@@ -238,6 +330,42 @@ def _build_metrics_config(ext: ModuleType):
         bucket_prompt_tokens=token_buckets(obs.prompt_tokens_buckets),
         bucket_generation_tokens=token_buckets(obs.generation_tokens_buckets),
     )
+
+
+def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
+    """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
+    node, in port-offset order, so each of them reports the same table."""
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+    first_tp_rank = tp_size_per_node * (parallel.node_rank % nnodes_per_tp_group)
+    node_tp_ranks = range(first_tp_rank, first_tp_rank + tp_size_per_node)
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    leader_tp_ranks = [tp for tp in node_tp_ranks if tp % dp_group_width == 0]
+    # Plain DP launches every replica on these leaders; otherwise only this one.
+    if not parallel.attn_dp_enabled and parallel.dp_size > 1:
+        replicas = range(parallel.dp_size)
+    else:
+        replicas = [parallel.dp_rank]
+    # Each listener reports this as its own `dp_rank`.
+    listener_dp_ranks = [
+        select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, tp_rank // dp_group_width, dp_rank
+        )
+        for dp_rank in replicas
+        for tp_rank in leader_tp_ranks
+    ]
+    # RustServer.launch offsets a listener by the node's listeners before it.
+    return [
+        {
+            "port_offset": offset,
+            "dp_rank": dp_rank,
+            "http_port": get_serving().port + offset,
+            "grpc_port": None if grpc_port is None else grpc_port + offset,
+        }
+        for offset, dp_rank in enumerate(listener_dp_ranks)
+    ]
 
 
 def _launch_server_info(scheduler: Scheduler) -> str:
@@ -274,9 +402,33 @@ def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:
     return context_len
 
 
+def _frontend_cpu_key() -> Optional[Tuple[str, Tuple[int, ...]]]:
+    """This process's ``(hostname, allowed cores)``: listeners with equal keys
+    would partition the same cores, or ``None`` without an affinity API."""
+    if not hasattr(os, "sched_getaffinity"):
+        return None
+    try:
+        return socket.gethostname(), tuple(sorted(os.sched_getaffinity(0)))
+    except OSError:
+        return None
+
+
+def _frontend_cpu_share(
+    cpu_keys: List[Optional[Tuple[str, Tuple[int, ...]]]], rank: int
+) -> Tuple[int, int]:
+    """``(index, count)`` of ``rank`` among the ranks whose key equals its own,
+    in rank order; ``(0, 1)`` for a rank that contributed no key."""
+    own_key = cpu_keys[rank]
+    if own_key is None:
+        return 0, 1
+    peers = [peer for peer, key in enumerate(cpu_keys) if key == own_key]
+    return peers.index(rank), len(peers)
+
+
 def _partition_cores(
     mm_workers: int = 0,
     server_core_budget: Optional[Callable[[int, int], int]] = None,
+    cpu_share: Tuple[int, int] = (0, 1),
 ) -> Tuple[Optional[List[int]], Optional[List[int]]]:
     """Split this rank's allowed cores into ``(launch_cores, server_cores)``.
 
@@ -287,6 +439,12 @@ def _partition_cores(
     bind is on), so the partition stays NUMA-local. Returns ``(None, None)``
     (server runs unpinned, confined only by the process affinity) when the
     platform has no affinity API or too few cores to split.
+
+    ``cpu_share`` is ``(index, count)`` from ``_frontend_cpu_share``: under
+    attention DP every DP rank hosts a listener, and ranks launched with one
+    affinity mask would otherwise all pin their frontends onto the same first
+    cores of it. The mask is cut into ``count`` contiguous blocks and only
+    block ``index`` is partitioned.
     """
     if not hasattr(os, "sched_getaffinity"):
         return None, None
@@ -295,6 +453,19 @@ def _partition_cores(
     except OSError as e:
         logger.warning("rust server: cannot read cpu affinity: %s", e)
         return None, None
+
+    index, count = cpu_share
+    if count > 1:
+        block = len(allowed) // count
+        if block >= 4:
+            allowed = allowed[index * block : (index + 1) * block]
+        else:
+            logger.warning(
+                "rust server: %d cores shared by %d listeners; their frontend "
+                "cores overlap",
+                len(allowed),
+                count,
+            )
 
     # Need enough cores to reserve launch cores and still pin the pools.
     if len(allowed) < 4:

@@ -4,7 +4,7 @@
 //! [`RuntimeConfig`] pairing them for `runtime::start`, and the Rust MM
 //! pipeline handoff ([`MmSpec`]).
 //!
-//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] /
+//! [`ServerArgs`] / [`ModelConfig`] / [`MetricsConfig`] / [`RequestLogConfig`] /
 //! [`DefaultSamplingParams`] / [`DisaggregationMode`] / [`MmSpec`] /
 //! [`MmFamily`] / [`MmResample`] are
 //! also `#[pyclass]`es: the Python scheduler (`RustServer._build_server_args`
@@ -23,6 +23,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+
+/// Python's `--grpc-response-timeout-secs` default.
+pub const DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS: u64 = 300;
 
 /// Boot knobs specific to the embedded rust server — none of these exist in
 /// the Python-built [`ServerArgs`]; they arrive as explicit
@@ -44,6 +47,9 @@ pub struct RustServerServerArgs {
     /// the base port does: every listener would render the same node-wide
     /// files, so a scraper of each DP rank's port would count them N times.
     pub metrics_listener: bool,
+    /// How long a drain's listeners keep open connections once its requests
+    /// finished (see `CoreHandle::drain_close_deadline`).
+    pub graceful_close_timeout: std::time::Duration,
 }
 
 impl Default for RustServerServerArgs {
@@ -57,6 +63,7 @@ impl Default for RustServerServerArgs {
             stage_channel_cap: 8192,
             cores: None,
             metrics_listener: true,
+            graceful_close_timeout: crate::api_server::handlers::GRACEFUL_CLOSE_TIMEOUT,
         }
     }
 }
@@ -130,6 +137,10 @@ pub struct ServerArgs {
     /// Optional gRPC base port. The same per-rank offset as HTTP is applied at
     /// the Python→Rust startup boundary; `None` keeps gRPC disabled.
     pub grpc_port: Option<u16>,
+    /// `--grpc-response-timeout-secs`: the longest a gRPC call waits for its
+    /// next response event before ending with DEADLINE_EXCEEDED. `0` keeps
+    /// the default, as the legacy gRPC bridge does.
+    pub grpc_response_timeout_secs: u64,
     /// Log levels driving the access log — uvicorn runs at
     /// `log_level_http or log_level` (see [`Self::http_access_log_enabled`]).
     pub log_level: String,
@@ -228,6 +239,8 @@ pub struct ServerArgs {
     pub num_accelerators: u32,
     /// Prometheus metrics (`--enable-metrics`); `None` serves no `/metrics`.
     pub metrics: Option<MetricsConfig>,
+    /// Request logging (`--log-requests`); `None` logs no requests.
+    pub request_log: Option<RequestLogConfig>,
 }
 
 #[pyo3::pymethods]
@@ -248,6 +261,7 @@ impl ServerArgs {
         host,
         port,
         grpc_port,
+        grpc_response_timeout_secs,
         log_level,
         log_level_http,
         chat_template,
@@ -285,6 +299,7 @@ impl ServerArgs {
         accelerator,
         num_accelerators,
         metrics,
+        request_log,
     ))]
     // The parameter list IS the schema; one keyword per field, all required.
     #[allow(clippy::too_many_arguments)]
@@ -303,6 +318,7 @@ impl ServerArgs {
         host: String,
         port: u16,
         grpc_port: Option<u16>,
+        grpc_response_timeout_secs: u64,
         log_level: String,
         log_level_http: Option<String>,
         chat_template: Option<String>,
@@ -340,6 +356,7 @@ impl ServerArgs {
         accelerator: Option<String>,
         num_accelerators: u32,
         metrics: Option<MetricsConfig>,
+        request_log: Option<RequestLogConfig>,
     ) -> Self {
         Self {
             model_path,
@@ -356,6 +373,7 @@ impl ServerArgs {
             host,
             port,
             grpc_port,
+            grpc_response_timeout_secs,
             log_level,
             log_level_http,
             chat_template,
@@ -394,6 +412,7 @@ impl ServerArgs {
             accelerator,
             num_accelerators,
             metrics,
+            request_log,
         }
     }
 }
@@ -418,6 +437,7 @@ impl Default for ServerArgs {
             host: "127.0.0.1".into(),
             port: 30000,
             grpc_port: None,
+            grpc_response_timeout_secs: DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
             log_level: "info".into(),
             log_level_http: None,
             chat_template: None,
@@ -455,6 +475,7 @@ impl Default for ServerArgs {
             accelerator: None,
             num_accelerators: 0,
             metrics: None,
+            request_log: None,
         }
     }
 }
@@ -482,6 +503,8 @@ pub struct DeploymentInfo {
     pub hicache_host_total_tokens: Option<u64>,
     pub kv_event_sources: Vec<KvEventSource>,
     pub rust_server_endpoints: Vec<RustServerEndpoint>,
+    /// Every Rust listener of this launch on this node; the same table on each.
+    pub node_listeners: Vec<NodeRustListener>,
 }
 
 /// One DP rank's listener, as a base URL (`http://host:port`).
@@ -497,6 +520,14 @@ pub struct KvEventSource {
     pub endpoint: String,
     pub topic: String,
     pub block_size: u32,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct NodeRustListener {
+    pub port_offset: u16,
+    pub dp_rank: u32,
+    pub http_port: u16,
+    pub grpc_port: Option<u16>,
 }
 
 impl<'py> pyo3::FromPyObject<'_, 'py> for DeploymentInfo {
@@ -584,6 +615,81 @@ impl MetricsConfig {
             bucket_e2e_request_latency: None,
             bucket_prompt_tokens: None,
             bucket_generation_tokens: None,
+        }
+    }
+}
+
+/// Python's `RequestLogger` settings for `--log-requests` (text format to
+/// stdout; Rust mode refuses the other formats and targets at startup). Every
+/// value comes from Python so the two servers render the same lines: the
+/// level's metadata (`RequestLogger._compute_metadata`), the request class
+/// with its fields in order and each default as Python renders it, the header
+/// whitelist and `SGLANG_LOG_REQUEST_EXCEEDED_MS`.
+#[pyo3::pyclass(frozen, from_py_object, module = "sglang.srt.rust_extensions._server")]
+#[derive(Clone, Debug)]
+pub struct RequestLogConfig {
+    /// Strings and lists longer than this are cut to their two halves.
+    pub max_length: usize,
+    /// Request fields and output keys left out of the lines at this level.
+    pub skip_names: Vec<String>,
+    pub out_skip_names: Vec<String>,
+    /// The request class name and its `(field, rendered default)` pairs, in
+    /// declaration order.
+    pub class_name: String,
+    pub fields: Vec<(String, String)>,
+    /// The fields a batch item's object (Python `obj[i]`) takes from the
+    /// batch: its own entry of the per-item ones, the shared ones as they are;
+    /// the rest keep their defaults.
+    pub batch_item_fields: Vec<String>,
+    pub batch_shared_fields: Vec<String>,
+    /// Request headers a line carries when present, lowercase.
+    pub headers: Vec<String>,
+    /// A finished request faster than this (ms) is not logged; `<= 0` logs all.
+    pub exceeded_ms: i64,
+    /// `sampling_params.custom_params` keys the server itself adds to a
+    /// request before it is logged (none from a client); left out of the lines.
+    pub omit_custom_params: Vec<String>,
+}
+
+#[pyo3::pymethods]
+impl RequestLogConfig {
+    #[new]
+    #[pyo3(signature = (*,
+        max_length,
+        skip_names,
+        out_skip_names,
+        class_name,
+        fields,
+        batch_item_fields,
+        batch_shared_fields,
+        headers,
+        exceeded_ms,
+        omit_custom_params = Vec::new(),
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn py_new(
+        max_length: usize,
+        skip_names: Vec<String>,
+        out_skip_names: Vec<String>,
+        class_name: String,
+        fields: Vec<(String, String)>,
+        batch_item_fields: Vec<String>,
+        batch_shared_fields: Vec<String>,
+        headers: Vec<String>,
+        exceeded_ms: i64,
+        omit_custom_params: Vec<String>,
+    ) -> Self {
+        Self {
+            max_length,
+            skip_names,
+            out_skip_names,
+            class_name,
+            fields,
+            batch_item_fields,
+            batch_shared_fields,
+            headers,
+            exceeded_ms,
+            omit_custom_params,
         }
     }
 }
@@ -762,7 +868,7 @@ pub struct MmSpec {
     /// broadcasts across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
     /// The family pipeline and its resolved processor parameters.
-    pub pipeline: sglang_mm::registry::PipelineSpec,
+    pub pipeline: sglang_processor::dynamo_multimodal::registry::ProcessorSpec,
 }
 
 #[pyo3::pymethods]
@@ -788,7 +894,7 @@ impl MmSpec {
     fn py_new(
         family: MmFamily,
         feature_shm: bool,
-        image_token_id: i64,
+        image_token_id: i32,
         patch_size: usize,
         merge_size: usize,
         temporal_patch_size: usize,
@@ -798,9 +904,10 @@ impl MmSpec {
         image_std: [f32; 3],
         resample: MmResample,
     ) -> Self {
-        use sglang_mm::registry::PipelineSpec;
+        use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
+        use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
         let pipeline = match family {
-            MmFamily::QwenVl => PipelineSpec::QwenVl(sglang_mm::qwen_vl::QwenVlSpec {
+            MmFamily::QwenVl => ProcessorSpec::QwenVl(QwenVlSpec {
                 image_token_id,
                 patch_size,
                 merge_size,
@@ -819,8 +926,8 @@ impl MmSpec {
     }
 }
 
-/// Which `sglang_mm` family pipeline serves the model — one variant per
-/// [`sglang_mm::registry::PipelineSpec`] arm. Exposed to Python as an enum
+/// Which `dynamo-multimodal` family serves the model — one variant per
+/// `ProcessorSpec` arm. Exposed to Python as an enum
 /// (`MmFamily.QwenVl`); `RustMmFamily.name` maps onto it at handoff.
 #[pyo3::pyclass(
     eq,
@@ -834,7 +941,7 @@ pub enum MmFamily {
 }
 
 /// The HF image processor the Rust resize must reproduce bit-exactly (see
-/// [`sglang_mm::qwen_vl::Resampler`]). Exposed to Python as an enum
+/// `dynamo-multimodal`'s `qwen_vl::Resampler`). Exposed to Python as an enum
 /// (`MmResample.AtenU8` / `.Pil`); `RustMmFamily.image_processors` maps each
 /// processor class onto it.
 #[pyo3::pyclass(
@@ -851,7 +958,7 @@ pub enum MmResample {
     Pil,
 }
 
-impl From<MmResample> for sglang_mm::qwen_vl::Resampler {
+impl From<MmResample> for sglang_processor::dynamo_multimodal::models::qwen_vl::Resampler {
     fn from(r: MmResample) -> Self {
         match r {
             MmResample::AtenU8 => Self::AtenU8,

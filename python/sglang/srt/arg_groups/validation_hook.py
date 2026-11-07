@@ -9,13 +9,13 @@ import os
 from typing import Any, Dict, List, Optional
 
 from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
     declare_resolution,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
@@ -115,6 +115,10 @@ def validate_response_store(server_args: Any) -> None:
         )
 
 
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
+
+
 def check_pipeline_parallel_compat(cfg: Any) -> None:
     """Validate features used with pipeline parallelism."""
     assert cfg.disable_overlap_schedule, (
@@ -168,6 +172,21 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     )
 
 
+def check_rust_server_request_logging(cfg: Any) -> None:
+    """The Rust server logs requests as text to stdout only."""
+    if cfg.log_requests_format != "text":
+        raise ValueError(
+            f"--log-requests-format {cfg.log_requests_format} is not supported "
+            "with SGLANG_RUST_SERVER; it logs requests in the text format"
+        )
+    # `stdout` is the default target, matched as `create_log_targets` does.
+    if any(target.lower() != "stdout" for target in cfg.log_requests_target or ()):
+        raise ValueError(
+            f"--log-requests-target {' '.join(cfg.log_requests_target)} is not "
+            "supported with SGLANG_RUST_SERVER; it logs requests to stdout"
+        )
+
+
 def check_server_args(server_args: Any):
     from sglang.srt.arg_groups.lora_hook import check_lora_server_args
 
@@ -194,6 +213,9 @@ def check_server_args(server_args: Any):
 
     if cfg.pp_size > 1:
         check_pipeline_parallel_compat(cfg)
+
+    if envs.SGLANG_RUST_SERVER.get() and cfg.log_requests:
+        check_rust_server_request_logging(cfg)
 
     assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
         "multi-node data-parallel replicas are not supported; use attention DP "
@@ -316,6 +338,19 @@ def check_server_args(server_args: Any):
             "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
             f"got {cfg.device!r}."
         )
+
+    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK) use CUDA
+    # allocators, which XPU lacks; MUSA and Ascend NPU have their own paths.
+    if cfg.device == "xpu":
+        from sglang.srt.disaggregation.mooncake.utils import (
+            check_mooncake_custom_mem_pool_enabled,
+        )
+
+        if check_mooncake_custom_mem_pool_enabled()[0]:
+            raise ValueError(
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported on --device xpu; "
+                "unset it."
+            )
 
     # Check metrics labels
     if (

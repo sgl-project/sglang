@@ -9,7 +9,7 @@ import torch
 
 import sglang.srt.models.deepseek_v4 as dsv4
 from sglang.srt.layers.engram import engram_gate
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )

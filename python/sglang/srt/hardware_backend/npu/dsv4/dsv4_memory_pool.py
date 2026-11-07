@@ -9,7 +9,7 @@ rules as the GPU implementation:
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
 location required by the Atlas fused compressor operators. A3 uses explicit
-locations; A5 uses the same ring storage through its request-bank (cycle) ABI.
+locations; Ascend 950 uses the same ring storage through its request-bank (cycle) ABI.
 There is no paged state allocator or ``cache_mode=1`` compatibility storage.
 """
 
@@ -23,6 +23,10 @@ import torch_npu
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import (
+    DSV4IndexerBufferInfo,
+    DSV4PagedBufferInfo,
+)
 from sglang.srt.mem_cache.deepseek_v4_compress_state import CompressStatePool
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     ONLINE_C128,
@@ -60,6 +64,13 @@ class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
         # kernel_page_size is consumed here: the CUDA base __init__ has no
         # such parameter, so it must not be forwarded.
         super().__init__(*args, **kwargs)
+
+    def paged_buffer_info(self) -> DSV4PagedBufferInfo:
+        if self.store_dtype != torch.bfloat16:
+            return super().paged_buffer_info()
+        return DSV4PagedBufferInfo.from_buffers(
+            self.kv_buffer, page_slots=self.kernel_page_size, layout="pa_nd"
+        )
 
     def create_buffer(self, *, num_pages: int):
         # Non-bf16 store dtype (shouldn't happen here) falls back to base layout.
@@ -282,6 +293,20 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         )
         return layout.indexer_kv_info(self.index_head_dim)
 
+    def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
+        return DSV4IndexerBufferInfo(
+            key=DSV4PagedBufferInfo.from_buffers(
+                self.index_k_buffer,
+                page_slots=self._kernel_page_size,
+                layout="pa_nd",
+            ),
+            scale=DSV4PagedBufferInfo.from_buffers(
+                self.index_scale_buffer,
+                page_slots=self._kernel_page_size,
+                layout="pa_nd",
+            ),
+        )
+
     @property
     def has_npu_storage(self) -> bool:
         return True
@@ -488,8 +513,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # A5 cache_mode=2 addresses one ring bank per request; the A3
-        # explicit-location path can share the smaller flat pool.
+        # Ascend 950 cache_mode=2 addresses one ring bank per request.  The A3
+        # explicit-location path can share the smaller flat pool, but the Ascend 950
+        # cycle ABI needs enough physical banks for every req_pool_idx.
         size = config.state_size
         if is_npu_arch35():
             size = max(size, self.num_req_slots * ring_size)
@@ -642,9 +668,9 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """GPU-compatible ``StateType.SWA`` component.
 
-        On pre-A5 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
+        On pre-Ascend 950 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
         indexer state retain separate buffers but share the same SWA page/state
-        index.  On A5 (CYCLE cache_mode) the compressor addresses the C4 state
+        index.  On Ascend 950 (CYCLE cache_mode) the compressor addresses the C4 state
         ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
         here and registered separately via :meth:`get_c4_state_buf_infos`.
         """
@@ -709,7 +735,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
         kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on A5 and ``torch.ops.npu.compressor``
+        (``torch.ops.custom.compressor`` on Ascend 950 and ``torch.ops.npu.compressor``
         elsewhere)'s ``state_cache`` argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
@@ -829,7 +855,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
             return
         if pool.layout is NPUDSV4KVLayout.A5_FP8:
-            self._write_a5_packed_kv(buf=buf, loc=loc, cache=cache)
+            self._write_arch35_packed_kv(buf=buf, loc=loc, cache=cache)
             return
         buf_flat = buf.flatten(0, 1)  # (num_pages * page_size, 1, dim)
         # Caller (V4 MQALayer) may hand us cache shaped (T, dim); the buffer has
@@ -838,7 +864,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             cache = cache.unsqueeze(1)
         buf_flat[loc] = cache.to(buf_flat.dtype)
 
-    def _write_a5_packed_kv(
+    def _write_arch35_packed_kv(
         self,
         *,
         buf: torch.Tensor,
@@ -848,14 +874,14 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         cache_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         if cache.shape[-1] != cache_dim:
             raise RuntimeError(
-                f"DSV4 A5 KV cache expects input last dim {cache_dim}, "
+                f"DSV4 Ascend 950 KV cache expects input last dim {cache_dim}, "
                 f"got shape={tuple(cache.shape)}."
             )
         cache_2d = cache.reshape(-1, cache_dim).to(torch.bfloat16).contiguous()
         slot_mapping = loc.reshape(-1).contiguous()
         if cache_2d.shape[0] != slot_mapping.shape[0]:
             raise RuntimeError(
-                "DSV4 A5 KV cache write expects one slot per token, got "
+                "DSV4 Ascend 950 KV cache write expects one slot per token, got "
                 f"{cache_2d.shape[0]} rows and {slot_mapping.shape[0]} slots."
             )
         if cache_2d.shape[0] == 0:
@@ -882,7 +908,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         pool row at flat token positions ``loc``.
 
         ``kv_compress_epilog_v2`` quantizes *every* head_dim value (there is no
-        bf16 RoPE tail, unlike the V4 ``_write_a5_packed_kv``), so RoPE must
+        bf16 RoPE tail, unlike the V4 ``_write_arch35_packed_kv``), so RoPE must
         already have been applied by the caller. ``layout`` selects the side,
         matching :class:`NPUDSV4KVLayout` and the ds41 attention op's two
         arguments: window/``ori_kv`` = ``mxfp8_bf16`` group 32 (544 B),
@@ -1003,7 +1029,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
                 )
                 return
             if compress_pool.layout is NPUDSV4KVLayout.A5_FP8:
-                self._write_a5_packed_kv(buf=buf, loc=loc, cache=kv)
+                self._write_arch35_packed_kv(buf=buf, loc=loc, cache=kv)
                 return
             buf_flat = buf.flatten(0, 1)
             kv_view = kv.to(buf_flat.dtype)
@@ -1018,7 +1044,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         layer_id: int,
         from_indexer: bool,
     ) -> torch.Tensor:
-        # The indexer scale is fp16 on pre-A5 parts and fp32 on A5.
+        # The indexer scale is fp16 on pre-Ascend 950 parts and fp32 on Ascend 950.
         assert from_indexer, "only indexer compress pool has dequant scale"
         item = self.layer_mapping[layer_id]
         indexer_pool = self._indexer_pool(item.compress_ratio)

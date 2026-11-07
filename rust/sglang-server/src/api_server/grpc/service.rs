@@ -11,14 +11,14 @@ use sglang_api_types::api::v1::sglang_service_server::SglangService;
 use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
-use crate::api_server::core::HealthStatus;
-use crate::api_server::handlers::{CoreHandle, HiCacheManager};
-use crate::message::config::{PreferredSamplingParams, ServerArgs};
+use crate::api_server::core::{HealthStatus, ReceivedAs};
+use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheManager};
+use crate::message::config::{
+    DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
+};
 use crate::message::request::{GenerationPolicy, into_requests};
 use crate::message::wire::{ClientMaxNewTokens, fill_preferred_sampling};
 use crate::utils::environ;
-
-const DEFAULT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 
 pub(super) type ResponseStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
@@ -56,7 +56,7 @@ impl GrpcService {
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
                 incremental_streaming_output: server_args.incremental_streaming_output,
-                response_timeout: DEFAULT_RESPONSE_TIMEOUT,
+                response_timeout: response_timeout(server_args.grpc_response_timeout_secs),
                 health_timeout: Duration::from_secs(
                     environ::env_i64("SGLANG_HEALTH_CHECK_TIMEOUT", 20).max(0) as u64,
                 ),
@@ -87,6 +87,19 @@ impl GrpcService {
             },
         }
     }
+}
+
+/// A zero timeout would expire every call at once; like the legacy gRPC
+/// bridge, fall back to the default instead.
+fn response_timeout(secs: u64) -> Duration {
+    if secs == 0 {
+        tracing::warn!(
+            default = DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS,
+            "grpc_response_timeout_secs must be positive; using default"
+        );
+        return Duration::from_secs(DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS);
+    }
+    Duration::from_secs(secs)
 }
 
 #[tonic::async_trait]
@@ -122,7 +135,7 @@ impl SglangService for GrpcService {
         let created_at = Instant::now();
         let calls = self
             .core
-            .generate_batch(payloads)
+            .generate_batch(payloads, ReceivedAs::without_headers())
             .await
             .map_err(native_api::status)?;
         Ok(Response::new(native_api::generate_stream(
@@ -151,6 +164,9 @@ impl SglangService for GrpcService {
             Ok(HealthStatus::Stalled) => Err(Status::unavailable(
                 "no scheduler output within the health-check timeout",
             )),
+            Ok(HealthStatus::Draining) => {
+                Err(Status::unavailable("server is draining before shutdown"))
+            }
             Err(error) => Err(native_api::status(error)),
         }
     }
@@ -257,9 +273,10 @@ impl SglangService for GrpcService {
             ));
         }
         Ok(Response::new(api::AbortResponse {
-            success: self
-                .core
-                .abort((!request.abort_all).then_some(request.rid.as_str())),
+            success: self.core.abort(
+                (!request.abort_all).then_some(request.rid.as_str()),
+                AbortEnding::CancelledError,
+            ),
         }))
     }
 }
@@ -330,6 +347,7 @@ mod tests {
                         ..Default::default()
                     }),
                     metrics: None,
+                    request_log: None,
                 },
             );
             Self {
@@ -669,6 +687,28 @@ mod tests {
         assert_eq!(abort.rid().client_facing(), "too-slow");
     }
 
+    /// `--grpc-response-timeout-secs` sets the per-event wait; 0 keeps the
+    /// legacy gRPC bridge's 300 s default instead of expiring every call.
+    #[tokio::test]
+    async fn response_timeout_follows_the_launch_arg() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        let timeout_for = |secs| {
+            let server_args = ServerArgs {
+                grpc_response_timeout_secs: secs,
+                ..Default::default()
+            };
+            GrpcService::new(
+                harness.service.core.clone(),
+                &server_args,
+                harness.service.hicache_manager.clone(),
+            )
+            .config
+            .response_timeout
+        };
+        assert_eq!(timeout_for(900), Duration::from_secs(900));
+        assert_eq!(timeout_for(0), Duration::from_secs(300));
+    }
+
     #[tokio::test]
     async fn closed_intake_is_a_top_level_unavailable_status() {
         let (intake_tx, intake_rx) = flume::unbounded();
@@ -687,6 +727,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
             },
         );
         let service = GrpcService::for_test(core, None, false, Duration::from_secs(1));

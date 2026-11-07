@@ -15,6 +15,7 @@
 //! Keeping CPU-bound tokenize/detokenize off the async executor avoids stalling
 //! the HTTP/gRPC worker threads.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
@@ -51,6 +52,54 @@ pub struct Runtime {
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The single shutdown sender.
     shutdown_tx: Mutex<Option<flume::Sender<()>>>,
+    /// Set once the API listeners have closed and the drain's end is no
+    /// longer held (see [`Runtime::hold_drain_end`]).
+    listeners_closed: Arc<AtomicBool>,
+    /// Set once the API listeners have stopped serving and closed, held or not.
+    own_listeners_closed: Arc<AtomicBool>,
+    drain_end_gate: Arc<DrainEndGate>,
+    /// Where to report a drain's listeners closing (see
+    /// [`Runtime::drain_signal_fd`]).
+    drain_notify: Arc<std::sync::OnceLock<String>>,
+}
+
+/// [`Runtime::drain_state`] bit: a drain has begun.
+pub const DRAIN_DRAINING: u8 = 1;
+/// [`Runtime::drain_state`] bit: the drain was begun forced
+/// (`SGLANG_FORCE_SHUTDOWN`); a failed health probe does not set it.
+pub const DRAIN_FORCE_REQUESTED: u8 = 2;
+/// [`Runtime::drain_state`] bit: this runtime's own listeners have closed,
+/// whether or not the drain's end is held.
+pub const DRAIN_CLOSED: u8 = 4;
+
+/// Holds a drain's end past the listeners' close until released (see
+/// [`Runtime::hold_drain_end`]).
+#[derive(Default)]
+struct DrainEndGate {
+    held: AtomicBool,
+    released: AtomicBool,
+    changed: tokio::sync::Notify,
+}
+
+impl DrainEndGate {
+    fn release(&self) {
+        self.released.store(true, Ordering::SeqCst);
+        self.changed.notify_waiters();
+    }
+
+    async fn released(&self) {
+        loop {
+            // Register before checking, so a release between the check and
+            // the await still wakes this waiter.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.released.load(Ordering::SeqCst) {
+                return;
+            }
+            notified.await;
+        }
+    }
 }
 
 /// Deadline for joining worker threads on shutdown. Past it we abandon the join
@@ -110,6 +159,116 @@ impl Runtime {
         });
     }
 
+    /// Begin the graceful drain (see `CoreHandle::begin_drain`): health
+    /// answers 503, requests are still admitted, and the listeners close once
+    /// none is left in flight. `force` closes them without waiting.
+    pub fn begin_drain(&self, force: bool) {
+        self.core.begin_drain(force);
+    }
+
+    /// Whether a drain has begun and every listener has since closed, its
+    /// end released if held: the scheduler may stop. The other stages keep
+    /// running until [`Runtime::request_shutdown`].
+    pub fn drain_complete(&self) -> bool {
+        self.core.is_draining() && self.listeners_closed.load(Ordering::SeqCst)
+    }
+
+    /// The drain's progress as `DRAIN_*` bits, for the caller to share with
+    /// the runtimes of the other attention-DP ranks.
+    pub fn drain_state(&self) -> u8 {
+        let mut state = 0;
+        if self.core.is_draining() {
+            state |= DRAIN_DRAINING;
+        }
+        if self.core.is_drain_forced() {
+            state |= DRAIN_FORCE_REQUESTED;
+        }
+        if self.own_listeners_closed.load(Ordering::SeqCst) {
+            state |= DRAIN_CLOSED;
+        }
+        state
+    }
+
+    /// Hold the end of every later graceful drain until
+    /// [`Runtime::release_drain_end`]: the listeners still close once their
+    /// requests drained, but [`Runtime::drain_complete`], the scheduler
+    /// wake-up and the drain-ended datagram wait for the release. For DP rank
+    /// 0, whose drain end stops the schedulers of every DP rank, so that the
+    /// other DP ranks' listeners finish their requests first. A forced drain
+    /// (or a failed health probe), even one forced mid-hold, does not wait,
+    /// as Python's does not. While held, connections left open past the
+    /// graceful-close timeout stay open until the release. Must be called
+    /// before any drain begins.
+    pub fn hold_drain_end(&self) -> Result<(), String> {
+        if self.core.is_draining() {
+            return Err("a drain has already begun".into());
+        }
+        self.drain_end_gate.held.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Release a held drain end (see [`Runtime::hold_drain_end`]); latched,
+    /// so a release before the listeners closed ends the drain as they close.
+    /// Ignored, returning `false`, unless a drain has begun, so it can never
+    /// pre-release a later drain.
+    pub fn release_drain_end(&self) -> bool {
+        if !self.core.is_draining() {
+            return false;
+        }
+        self.drain_end_gate.release();
+        true
+    }
+
+    /// A pipe whose write end the caller installs as its signal wakeup fd
+    /// (Python's `signal.set_wakeup_fd`, which writes each caught signal's
+    /// number as one byte): `signum` begins the drain from a thread of this
+    /// runtime, so a scheduler thread blocked in a GPU call or collective
+    /// cannot delay it. Returns the write end, which stays open for the life
+    /// of the process; the watcher thread is detached, since it may block
+    /// until then.
+    ///
+    /// When the drain's listeners have closed, a datagram goes to the
+    /// abstract Unix socket `notify`, if given: the launching process's
+    /// positive signal that the drain ended, even while the scheduler thread
+    /// is wedged.
+    pub fn drain_signal_fd(
+        &self,
+        signum: u8,
+        force: bool,
+        notify: Option<String>,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::io::Read;
+
+        if let Some(notify) = notify {
+            let _ = self.drain_notify.set(notify);
+        }
+        let (read, write) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+        // Python requires a non-blocking wakeup fd.
+        rustix::fs::fcntl_setfl(&write, rustix::fs::OFlags::NONBLOCK)?;
+        let core = self.core.clone();
+        std::thread::Builder::new()
+            .name("drain-signal".into())
+            .spawn(move || {
+                let mut read = std::fs::File::from(read);
+                let mut buf = [0u8; 64];
+                loop {
+                    match read.read(&mut buf) {
+                        Ok(0) => return, // every write end closed
+                        Ok(n) if buf[..n].contains(&signum) => core.begin_drain(force),
+                        Ok(_) => {}
+                        // Python's signal handlers are installed without
+                        // SA_RESTART, so any caught signal can interrupt this.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => {
+                            tracing::error!(error = %e, "drain signal watcher stopped");
+                            return;
+                        }
+                    }
+                }
+            })?;
+        Ok(write)
+    }
+
     /// Stop the runtime and join every worker thread (with a bounded wait).
     pub fn request_shutdown(&self) {
         drop(self.shutdown_tx.lock().unwrap().take());
@@ -120,12 +279,30 @@ impl Runtime {
                 "shutdown: workers did not exit within {SHUTDOWN_JOIN_TIMEOUT:?}; abandoning join"
             );
         }
+        crate::api_server::core::flush_request_log();
     }
 }
 
 impl Drop for Runtime {
     fn drop(&mut self) {
         self.request_shutdown();
+    }
+}
+
+/// Send the drain-ended datagram to the abstract Unix socket `name`; best
+/// effort, since the launching process falls back to scheduler exits.
+fn notify_drained(name: &str) {
+    use std::os::linux::net::SocketAddrExt;
+    use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+    // Non-blocking: a full receive queue (EAGAIN) loses only this report.
+    let sent = SocketAddr::from_abstract_name(name).and_then(|addr| {
+        let socket = UnixDatagram::unbound()?;
+        socket.set_nonblocking(true)?;
+        socket.send_to_addr(b"drained", &addr)
+    });
+    if let Err(error) = sent {
+        tracing::warn!(%error, name, "could not report the drain's end");
     }
 }
 
@@ -330,14 +507,27 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
             )?,
             metadata: crate::api_server::handlers::CoreMetadata::from(cfg.server_args.as_ref()),
             metrics,
+            request_log: crate::api_server::core::RequestLog::from_server_args(&cfg.server_args),
         },
     );
+    core.set_graceful_close_timeout(cfg.rust_server_args.graceful_close_timeout);
 
     // --- HTTP + optional gRPC adapters (one tokio runtime, I/O bound) ---
+    let listeners_closed = Arc::new(AtomicBool::new(false));
+    let own_listeners_closed = Arc::new(AtomicBool::new(false));
+    let drain_end_gate = Arc::new(DrainEndGate::default());
+    let drain_notify = Arc::new(std::sync::OnceLock::<String>::new());
     {
         let cfg = cfg.clone();
         let shutdown_rx = shutdown_rx.clone();
+        let shutdown_for_gate = shutdown_rx.clone();
         let core = core.clone();
+        let listeners_closed = listeners_closed.clone();
+        let own_listeners_closed = own_listeners_closed.clone();
+        let drain_end_gate = drain_end_gate.clone();
+        let drain_notify = drain_notify.clone();
+        let waker = to_scheduler_rx.waker();
+        let core_for_close = core.clone();
         let hicache_manager = Arc::new(api_server::handlers::HiCacheManager::new(
             core.clone(),
             &cfg.server_args,
@@ -365,7 +555,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                 rt.block_on(async move {
                     let http = api_server::http::app::serve(
                         http_listener,
-                        core,
+                        core.clone(),
                         cfg.server_args.clone(),
                         cfg.rust_server_args.metrics_listener,
                         http_layer,
@@ -377,12 +567,41 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
                     if let Some((listener, service)) = grpc_server {
                         tokio::join!(
                             http,
-                            api_server::grpc::app::serve(listener, service, shutdown_rx)
+                            api_server::grpc::app::serve(listener, service, core, shutdown_rx)
                         );
                     } else {
                         http.await;
                     }
-                })
+                });
+                own_listeners_closed.store(true, Ordering::SeqCst);
+                if drain_end_gate.held.load(Ordering::SeqCst)
+                    && core_for_close.is_draining()
+                    && core_for_close.drain_force_reason().is_none()
+                {
+                    tracing::info!(
+                        "drain: listeners closed; holding the drain's end until released"
+                    );
+                    rt.block_on(async {
+                        tokio::select! {
+                            () = drain_end_gate.released() => {}
+                            () = core_for_close.drain_forced() => {}
+                            _ = shutdown_for_gate.recv_async() => {}
+                        }
+                    });
+                }
+                // Every listener is closed: report it before dropping the
+                // runtime, whose drop waits for blocking tasks (media fetches)
+                // and ends the connections still open.
+                listeners_closed.store(true, Ordering::SeqCst);
+                if core_for_close.is_draining() {
+                    // The scheduler stops at once rather than at its next idle
+                    // wake-up, and the launching process learns the drain ended.
+                    let _ = waker.send(());
+                    if let Some(name) = drain_notify.get() {
+                        notify_drained(name);
+                    }
+                }
+                drop(rt);
             })
             .expect("spawn api runtime");
         threads.push(handle);
@@ -399,6 +618,10 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         core,
         threads: Mutex::new(threads),
         shutdown_tx: Mutex::new(Some(shutdown_tx)),
+        listeners_closed,
+        own_listeners_closed,
+        drain_end_gate,
+        drain_notify,
     })
 }
 
@@ -471,11 +694,17 @@ mod tests {
     }
 
     fn terminal_token_frame(rid: String, output_ids: &[i64]) -> bytes::Bytes {
+        token_frame(rid, output_ids, true)
+    }
+
+    /// One scheduler output frame for `rid`, final when `finished`.
+    fn token_frame(rid: String, output_ids: &[i64], finished: bool) -> bytes::Bytes {
         let header = BatchHeader {
             rids: vec![rid],
-            finish_reasons: vec![Some(
-                serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap(),
-            )],
+            finish_reasons: vec![
+                finished
+                    .then(|| serde_json::from_value(serde_json::json!({"type": "stop"})).unwrap()),
+            ],
             prompt_tokens: vec![3],
             tok_lens: vec![output_ids.len() as u32],
             cached_tokens: vec![0],
@@ -500,6 +729,404 @@ mod tests {
             skip_server_warmup: true,
             ..Default::default()
         }
+    }
+
+    /// Write an HTTP/1.1 request on a fresh connection (closed after the
+    /// response), for the caller to read the response from.
+    fn send_http(
+        addr: std::net::SocketAddr,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> std::net::TcpStream {
+        use std::io::Write;
+        let mut conn = std::net::TcpStream::connect(addr).expect("connect");
+        conn.set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        write!(
+            conn,
+            "{method} {path} HTTP/1.1\r\nHost: t\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+        .unwrap();
+        conn
+    }
+
+    fn read_response(mut conn: std::net::TcpStream) -> String {
+        use std::io::Read;
+        let mut response = String::new();
+        conn.read_to_string(&mut response).expect("read response");
+        response
+    }
+
+    /// Wait for the next request on the scheduler ring and return its rid.
+    fn next_scheduler_rid(rt: &Runtime) -> String {
+        assert!(
+            rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)),
+            "no request reached the scheduler ring"
+        );
+        let requests = rt.to_scheduler_rx.drain(1);
+        assert_eq!(requests.len(), 1);
+        scheduler_rid(&requests[0].header)
+    }
+
+    fn wait_drain_complete(rt: &Runtime) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !rt.drain_complete() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain did not complete"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The graceful drain, as Python's SIGTERM handling: health answers 503
+    /// at once without probing the scheduler, an in-flight stream runs to its
+    /// `[DONE]`, a request arriving during the drain is still admitted and
+    /// served, and the listener closes only once both finished.
+    #[test]
+    fn drain_answers_503_and_serves_in_flight_requests_before_closing() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let streaming_rid = next_scheduler_rid(&rt);
+        assert!(
+            rt.from_scheduler_tx
+                .push(token_frame(streaming_rid.clone(), &[7], false))
+        );
+
+        // A router's idle keep-alive connection: answered, left open.
+        let mut keep_alive = std::net::TcpStream::connect(addr).expect("connect");
+        keep_alive
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
+        std::io::Write::write_all(
+            &mut keep_alive,
+            b"GET /model_info HTTP/1.1\r\nHost: t\r\n\r\n",
+        )
+        .unwrap();
+
+        rt.begin_drain(false);
+        for path in ["/health", "/health_generate"] {
+            let response = read_response(send_http(addr, "GET", path, ""));
+            assert!(response.starts_with("HTTP/1.1 503"), "{path}: {response}");
+        }
+        assert!(
+            !rt.to_scheduler_rx
+                .wait(std::time::Duration::from_millis(200)),
+            "a draining server must not send a health probe"
+        );
+
+        // Admitted during the drain, as Python admits it.
+        let late = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[4,5],"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let late_rid = next_scheduler_rid(&rt);
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(streaming_rid, &[8]))
+        );
+        let stream = read_response(streaming);
+        assert!(stream.starts_with("HTTP/1.1 200"), "{stream}");
+        assert!(stream.contains("data: [DONE]"), "stream cut: {stream}");
+
+        // The late request still holds the drain open.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.drain_complete());
+        assert!(std::net::TcpStream::connect(addr).is_ok());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(late_rid, &[9]))
+        );
+        let response = read_response(late);
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("[9]"), "{response}");
+
+        wait_drain_complete(&rt);
+        assert!(
+            std::net::TcpStream::connect(addr).is_err(),
+            "listener still open after the drain completed"
+        );
+        // The idle keep-alive connection did not hold the close open.
+        let keep_alive = read_response(keep_alive);
+        assert!(keep_alive.starts_with("HTTP/1.1 200"), "{keep_alive}");
+        rt.request_shutdown();
+    }
+
+    /// A forced drain (`SGLANG_FORCE_SHUTDOWN`, or a failed last health probe)
+    /// does not wait: the listener closes with a request still in flight, and
+    /// that request is cut.
+    #[test]
+    fn forced_drain_closes_without_waiting() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        let in_flight = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        next_scheduler_rid(&rt);
+
+        rt.begin_drain(true);
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!read_response(in_flight).contains("[DONE]"));
+        rt.request_shutdown();
+    }
+
+    /// The signal wakeup fd begins the drain from a runtime thread: only the
+    /// drain signal's byte counts, as a wakeup fd carries every caught signal.
+    /// Once the listeners have closed, the scheduler's parked wait ends and
+    /// the launching process gets its datagram.
+    #[test]
+    fn drain_signal_fd_begins_the_drain_and_reports_its_end() {
+        use std::io::Write;
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        let mut wakeup = std::fs::File::from(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        wakeup.write_all(&[2]).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert!(!rt.core.is_draining(), "another signal began the drain");
+
+        let parked = std::time::Instant::now();
+        wakeup.write_all(&[15]).unwrap();
+        assert!(rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)));
+        assert!(
+            parked.elapsed() < std::time::Duration::from_secs(4),
+            "the scheduler's wait was not woken"
+        );
+        assert!(rt.drain_complete());
+        let mut buf = [0u8; 16];
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    fn wait_drain_state(rt: &Runtime, state: u8) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rt.drain_state() != state {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "drain state {} never became {state}",
+                rt.drain_state()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// A held drain end: the listener closes once its requests drained, but
+    /// the drain completes, and the launching process hears of it, only on
+    /// the release. A release before any drain began is ignored, and the
+    /// hold cannot be taken once a drain began.
+    #[test]
+    fn held_drain_end_waits_for_the_release() {
+        use std::os::linux::net::SocketAddrExt;
+        use std::os::unix::net::{SocketAddr, UnixDatagram};
+
+        let name = format!("sglang-drain-hold-test-{}", std::process::id());
+        let launcher =
+            UnixDatagram::bind_addr(&SocketAddr::from_abstract_name(&name).unwrap()).unwrap();
+        launcher.set_nonblocking(true).unwrap();
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        drop(rt.drain_signal_fd(15, false, Some(name)).unwrap());
+        rt.hold_drain_end().unwrap();
+        assert!(!rt.release_drain_end(), "released with no drain under way");
+        assert_eq!(rt.drain_state(), 0);
+
+        rt.begin_drain(false);
+        wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(std::net::TcpStream::connect(addr).is_err());
+        assert!(!rt.drain_complete(), "the early release was latched");
+        let mut buf = [0u8; 16];
+        assert!(launcher.recv(&mut buf).is_err(), "drain end reported early");
+        assert!(rt.hold_drain_end().is_err());
+
+        assert!(rt.release_drain_end());
+        wait_drain_complete(&rt);
+        launcher.set_nonblocking(false).unwrap();
+        launcher
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let n = launcher.recv(&mut buf).expect("no drain-ended datagram");
+        assert_eq!(&buf[..n], b"drained");
+        rt.request_shutdown();
+    }
+
+    /// A release that arrives while the listener is still finishing a
+    /// request is latched: the drain completes as the listener closes.
+    #[test]
+    fn drain_end_release_is_latched() {
+        let (addr, _) = free_loopback_addrs();
+        let rt = start(test_config(addr, None), None).expect("start runtime");
+        rt.hold_drain_end().unwrap();
+        let streaming = send_http(
+            addr,
+            "POST",
+            "/generate",
+            r#"{"input_ids":[1,2,3],"stream":true,"sampling_params":{"max_new_tokens":8}}"#,
+        );
+        let rid = next_scheduler_rid(&rt);
+        rt.begin_drain(false);
+        assert!(rt.release_drain_end());
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        assert_eq!(rt.drain_state(), DRAIN_DRAINING);
+        assert!(rt.from_scheduler_tx.push(terminal_token_frame(rid, &[8])));
+        assert!(read_response(streaming).contains("data: [DONE]"));
+        wait_drain_complete(&rt);
+        rt.request_shutdown();
+    }
+
+    /// A forced drain does not wait for the release, whether forced from the
+    /// start or mid-hold, and a shutdown mid-hold still stops the runtime.
+    #[test]
+    fn forced_drain_or_shutdown_ends_a_held_drain() {
+        use std::time::{Duration, Instant};
+
+        for case in ["forced", "forced mid-hold", "shutdown mid-hold"] {
+            let (addr, _) = free_loopback_addrs();
+            let rt = start(test_config(addr, None), None).expect("start runtime");
+            rt.hold_drain_end().unwrap();
+            if case == "forced" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                assert_eq!(
+                    rt.drain_state(),
+                    DRAIN_DRAINING | DRAIN_FORCE_REQUESTED | DRAIN_CLOSED
+                );
+                rt.request_shutdown();
+                continue;
+            }
+            rt.begin_drain(false);
+            wait_drain_state(&rt, DRAIN_DRAINING | DRAIN_CLOSED);
+            if case == "forced mid-hold" {
+                rt.begin_drain(true);
+                wait_drain_complete(&rt);
+                rt.request_shutdown();
+            } else {
+                let started = Instant::now();
+                rt.request_shutdown();
+                assert!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "the held drain kept the runtime from stopping"
+                );
+            }
+        }
+    }
+
+    /// A response that never finishes (here a control request no scheduler
+    /// answers, which the drain does not count) holds the graceful close
+    /// only for the graceful-close timeout, so the scheduler's shutdown still
+    /// goes out.
+    #[test]
+    fn graceful_close_is_bounded() {
+        use std::time::{Duration, Instant};
+
+        let timeout = Duration::from_millis(500);
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        cfg.rust_server_args.graceful_close_timeout = timeout;
+        let rt = start(cfg, None).expect("start runtime");
+        let stuck = send_http(addr, "GET", "/server_info", "");
+        assert!(rt.to_scheduler_rx.wait(Duration::from_secs(5)));
+
+        let begun = Instant::now();
+        rt.begin_drain(false);
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(
+            !rt.drain_complete(),
+            "the open connection was not waited for"
+        );
+        while !rt.drain_complete() {
+            assert!(
+                begun.elapsed() < timeout + Duration::from_secs(3),
+                "the graceful close was not bounded"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        rt.request_shutdown();
+        drop(stuck);
+    }
+
+    /// gRPC drains with HTTP: `HealthCheck` is UNAVAILABLE, an in-flight
+    /// `Generate` stream completes, and both listeners close afterwards.
+    #[test]
+    fn grpc_drains_with_http() {
+        use std::time::Duration;
+
+        let (http_addr, grpc_addr) = free_loopback_addrs();
+        let rt = start(test_config(http_addr, Some(grpc_addr)), None).expect("start runtime");
+        let client_runtime = // Multi-threaded, so the client's connection task keeps answering
+        // the server's HTTP/2 shutdown handshake between `block_on`s.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (mut client, mut stream) = client_runtime.block_on(async {
+            let mut client = connect_grpc(grpc_addr).await;
+            let stream = client
+                .generate(grpc_ids_request(&[1, 2, 3], "draining"))
+                .await
+                .expect("Generate RPC")
+                .into_inner();
+            (client, stream)
+        });
+        let rid = next_scheduler_rid(&rt);
+
+        rt.begin_drain(false);
+        let health = client_runtime
+            .block_on(client.health_check(proto::HealthCheckRequest {}))
+            .expect_err("a draining server must not report healthy");
+        assert_eq!(health.code(), tonic::Code::Unavailable);
+        assert!(!rt.drain_complete());
+
+        assert!(
+            rt.from_scheduler_tx
+                .push(terminal_token_frame(rid, &[9, 10]))
+        );
+        let item = client_runtime
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), stream.message()).await
+            })
+            .expect("timed out waiting for the gRPC response")
+            .expect("gRPC stream error")
+            .expect("gRPC stream ended without a response");
+        assert!(matches!(
+            item.item,
+            Some(proto::generate_stream_item::Item::Frame(_))
+        ));
+        // The client keeps its connection open: the graceful close must not
+        // wait for an idle HTTP/2 connection.
+        wait_drain_complete(&rt);
+        assert!(std::net::TcpStream::connect(http_addr).is_err());
+        assert!(std::net::TcpStream::connect(grpc_addr).is_err());
+        drop((client, stream));
+        rt.request_shutdown();
     }
 
     /// Regression: `request_shutdown` must actually stop the API server — it joins

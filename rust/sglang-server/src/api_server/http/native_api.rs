@@ -15,9 +15,12 @@ use super::app::AppState;
 use super::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateTerminal,
 };
+use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
-use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, HealthStatus};
-use crate::api_server::handlers::{CoreCall, recv_indexed};
+use crate::api_server::core::{
+    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, ReceivedAs,
+};
+use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 #[cfg(test)]
 use crate::message::ids::Rid;
 #[cfg(test)]
@@ -525,7 +528,7 @@ fn health_routes() -> Router<Arc<AppState>> {
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
-    if state.core.is_serving() {
+    if state.core.is_serving() && !state.core.is_draining() {
         StatusCode::OK.into_response()
     } else {
         StatusCode::SERVICE_UNAVAILABLE.into_response()
@@ -565,7 +568,7 @@ async fn health_generate(
             }
             response
         }
-        Ok(HealthStatus::NotReady | HealthStatus::Stalled) => {
+        Ok(HealthStatus::NotReady | HealthStatus::Stalled | HealthStatus::Draining) => {
             StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(CoreError::Unavailable) => native_error(
@@ -588,6 +591,7 @@ async fn health_generate(
 async fn generate(
     State(state): State<Arc<AppState>>,
     start: Option<Extension<crate::RequestStart>>,
+    held: Option<Extension<HeldGeneration>>,
     headers: HeaderMap,
     body: Result<Json<serde_json::Value>, JsonRejection>,
 ) -> Response {
@@ -611,6 +615,11 @@ async fn generate(
         .generate_hook
         .as_ref()
         .and_then(|_| body.get("sampling_params").cloned());
+    // The request log shows the body as the client sent it: the defaults
+    // merged below go into a copy, as Python does.
+    let snapshot = state.core.snapshot_body(&body, &headers).map(|snapshot| {
+        snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
+    });
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -629,13 +638,16 @@ async fn generate(
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
         // `into_requests` guarantees exactly one payload for a non-batch body.
-        let payload = payloads
+        let mut payload = payloads
             .into_iter()
             .next()
             .expect("into_requests yields >=1 payload");
+        let held = held
+            .and_then(|Extension(held)| held.take())
+            .map(|held| held.claim(&mut payload));
         let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
         let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
-        generate_single(&state, payload, stream, request).await
+        generate_single(&state, payload, held, stream, request, snapshot).await
     } else {
         let requests = payloads
             .iter()
@@ -652,7 +664,7 @@ async fn generate(
                 )
             })
             .collect();
-        generate_batch(&state, payloads, stream, requests).await
+        generate_batch(&state, payloads, stream, requests, snapshot).await
     }
 }
 
@@ -713,12 +725,19 @@ pub(super) fn generate_requests(
 async fn generate_single(
     state: &AppState,
     req: GenerateRequest,
+    held: Option<PendingGeneration>,
     stream: bool,
     request: RequestState,
+    snapshot: Option<BodySnapshot>,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // the frame builder just reads them — no tokenizer needed here.
-    let mut call = match state.core.generate(req).await {
+    let received = ReceivedAs::Body(snapshot);
+    let call = match held {
+        Some(held) => state.core.generate_pending(req, received, held).await,
+        None => state.core.generate(req, received).await,
+    };
+    let mut call = match call {
         Ok(call) => call,
         Err(error) => return native_core_error(error, stream),
     };
@@ -814,11 +833,16 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
     request_states: Vec<RequestState>,
+    snapshot: Option<BodySnapshot>,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state.core.generate_batch(requests).await {
+    let calls = match state
+        .core
+        .generate_batch(requests, ReceivedAs::Body(snapshot))
+        .await
+    {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return native_core_error(error, stream),
     };
@@ -1075,6 +1099,7 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1122,6 +1147,7 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
                 },
             ),
             server_args: Arc::new(crate::message::config::ServerArgs::default()),
@@ -1168,6 +1194,7 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(&server_args),
@@ -1212,6 +1239,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1301,6 +1329,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: crate::api_server::handlers::CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
             },
         );
         let state = Arc::new(AppState {
@@ -1591,6 +1620,7 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: crate::api_server::handlers::CoreMetadata::default(),
                     metrics: None,
+                    request_log: None,
                 },
             );
             let top_p_hook = TopPHook::default();

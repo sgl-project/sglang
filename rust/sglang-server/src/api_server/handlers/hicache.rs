@@ -173,6 +173,7 @@ mod tests {
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata::default(),
                 metrics: None,
+                request_log: None,
             },
         );
         let manager = Arc::new(HiCacheManager::new(core, &ServerArgs::default()));

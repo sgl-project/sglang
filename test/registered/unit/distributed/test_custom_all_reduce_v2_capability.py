@@ -3,7 +3,10 @@ from unittest.mock import Mock
 import pytest
 import torch
 
-from sglang.srt.distributed.device_communicators import custom_all_reduce_v2
+from sglang.srt.distributed.device_communicators import (
+    custom_all_reduce_utils,
+    custom_all_reduce_v2,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
@@ -77,6 +80,28 @@ def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected
 
 
 @pytest.mark.parametrize(
+    ("hip_version", "expected"),
+    [((7, 0, 51831), False), ((7, 1, 0), False), ((7, 2, 0), True), ((7, 17, 0), True)],
+)
+def test_rocm_runtime_gate(monkeypatch, hip_version, expected):
+    """On ROCm a HIP runtime older than MIN_HIP_VERSION disables v2 up front."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=8, same_node=True)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: hip_version)
+    topology_check = Mock(return_value=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        topology_check,
+    )
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+    assert topology_check.called is expected
+
+
+@pytest.mark.parametrize(
     ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
     [
         (False, True, 1024, 4, True),
@@ -97,6 +122,37 @@ def test_supports_push(disabled, has_multicast, nbytes, num_blocks, expected):
         comm.max_push_size = 1024
         comm._push_counter = torch.zeros(4)
     assert comm.supports_push(nbytes=nbytes, num_blocks=num_blocks) is expected
+
+
+@pytest.mark.parametrize(
+    ("cluster_uuid", "peer_host", "expected"),
+    [
+        # HGX baseboards report a zero cluster UUID and clique 0 on every node.
+        (bytes(16), "node-a", True),
+        (bytes(16), "node-b", False),
+        # An NVL72 rack shares one nonzero cluster UUID across its nodes.
+        (b"\x01" * 16, "node-b", True),
+    ],
+)
+def test_zero_cluster_uuid_clique_ends_at_its_node(
+    monkeypatch, cluster_uuid, peer_host, expected
+):
+    monkeypatch.setattr(
+        custom_all_reduce_utils, "_gpu_fabric_clique", lambda device: (cluster_uuid, 0)
+    )
+    monkeypatch.setattr(custom_all_reduce_utils.dist, "get_world_size", lambda group: 2)
+    monkeypatch.setattr(custom_all_reduce_utils.socket, "gethostname", lambda: "node-a")
+
+    def all_gather_object(gathered, clique, group):
+        peer = clique if len(clique) == 2 else (*clique[:2], peer_host)
+        gathered[:] = [clique, peer]
+
+    monkeypatch.setattr(
+        custom_all_reduce_utils.dist, "all_gather_object", all_gather_object
+    )
+    # The undecorated function: the CPU runner has no NVML to initialize.
+    is_one_nvlink_clique = custom_all_reduce_utils.is_one_nvlink_clique.__wrapped__
+    assert is_one_nvlink_clique(object(), object()) is expected
 
 
 if __name__ == "__main__":
