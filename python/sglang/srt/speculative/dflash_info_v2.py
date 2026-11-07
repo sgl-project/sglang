@@ -111,6 +111,17 @@ class DFlashDraftInputV2(SpecInput):
             hidden_states=torch.empty((0, 0), device=device, dtype=torch.float16),
         )
 
+    @classmethod
+    def create_staged_input(
+        cls, future_indices: torch.Tensor, device: torch.device
+    ) -> "DFlashDraftInputV2":
+        """A request leaving HiSparse staging: an idle-shaped draft input whose
+        bonus tokens resolve from the FutureMap relay (`future_indices`), the
+        same contract as the EAGLE-family staged input."""
+        draft_input = cls.create_idle_input(device)
+        draft_input.future_indices = future_indices
+        return draft_input
+
     def prepare_for_decode(self, batch: ScheduleBatch):
         """Allocate headroom in the shared req_to_token pool for the next DFLASH step.
 

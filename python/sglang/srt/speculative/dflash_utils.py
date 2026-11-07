@@ -154,11 +154,19 @@ def scale_kv_cell_size_per_token_for_dflash(
     target_num_layers: int,
     draft_num_layers: int,
     draft_cell_size_per_token: Optional[int] = None,
+    draft_loc_space_scale: int = 1,
 ) -> int:
     """Compute bytes/token budget for combined target+draft KV pools (DFLASH).
 
     DFLASH runs a separate draft runner with its own KV pool. The target runner's
     token capacity must fit both pools in aggregate.
+
+    ``draft_loc_space_scale`` widens the draft contribution when the draft pool
+    is direct-indexed by an expanded logical token space: under HiSparse the
+    draft pool spans the target allocator's host-expanded token ids, so each
+    logical token costs draft bytes even though only a fraction is
+    device-resident (same reason the EAGLE draft pool scales by
+    ``host_to_device_ratio`` in the pool configurator).
 
     Returns:
         Approximate per-token bytes for (target KV + draft KV), expressed as a
@@ -178,15 +186,21 @@ def scale_kv_cell_size_per_token_for_dflash(
                 "draft_cell_size_per_token must be positive when provided, "
                 f"got {draft_cell_size_per_token}."
             )
-        return int(target_cell_size_per_token) + int(draft_cell_size_per_token)
+        return int(target_cell_size_per_token) + int(draft_cell_size_per_token) * int(
+            draft_loc_space_scale
+        )
 
     if target_num_layers <= 0 or draft_num_layers <= 0:
         return int(target_cell_size_per_token)
 
-    total_layers = int(target_num_layers) + int(draft_num_layers)
-    return (
-        int(target_cell_size_per_token) * int(total_layers) + int(target_num_layers) - 1
+    # Draft bytes estimated from the target's per-layer cost. With a scale of 1
+    # this equals the historical ceil(target * (T + D) / T) budget.
+    draft_bytes = (
+        int(target_cell_size_per_token) * int(draft_num_layers)
+        + int(target_num_layers)
+        - 1
     ) // int(target_num_layers)
+    return int(target_cell_size_per_token) + int(draft_loc_space_scale) * draft_bytes
 
 
 def resolve_dflash_verify_mask_policy(attn_backend: Any) -> tuple[str, bool]:
