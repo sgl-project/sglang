@@ -99,6 +99,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
             rf"|>(?P<body>.*?)(?P<end>(?:</{invoke}>|$)))"
         )
         self.current_tool_id = -1
+        # Streaming fast path for a long-form invoke whose closer has not
+        # arrived yet; see parse_streaming_increment. It is only armed while
+        # invoke_regex / invoke_end_token are still the ones built here.
+        self._open_invoke_tokens = (self.invoke_regex, self.invoke_end_token)
+        self._open_invoke = None
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek v32 format tool call."""
@@ -256,8 +261,22 @@ class DeepSeekV32Detector(BaseFormatDetector):
         Streaming incremental parsing tool calls for DeepSeekV32 format.
         Supports multiple consecutive invoke blocks.
         """
+        open_invoke, self._open_invoke = self._open_invoke, None
+        held_text = self._buffer
         self._buffer += new_text
         current_text = self._buffer
+
+        # While a long-form invoke is open, the buffer holds all of it and
+        # nothing is emitted until its closer arrives. Re-matching invoke_regex
+        # over the held body on every delta is quadratic in the length of the
+        # call. The open invoke stays the leftmost match (its header is
+        # complete), and a closer starting before scan_from was already ruled
+        # out, so only the text that just arrived needs to be searched.
+        if open_invoke is not None and open_invoke[0] is held_text:
+            scan_from = open_invoke[1]
+            if current_text.find(self.invoke_end_token, scan_from) == -1:
+                self._arm_open_invoke(current_text, scan_from)
+                return StreamingParseResult()
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
         # This handles partial/streaming DSML content
@@ -308,6 +327,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
                 if not is_tool_end:
+                    if invoke_match.group("body") is not None:
+                        self._arm_open_invoke(current_text, invoke_match.start("body"))
                     break
 
                 # Initialize state on the first complete invoke, malformed or
@@ -371,7 +392,19 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 preamble = self._text_before_dsml(current_text)
             return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
+    def _arm_open_invoke(self, text: str, scan_from: int) -> None:
+        """Record that `text` (the buffer) ends inside an open long-form invoke
+        and holds no closer at or after `scan_from`, which is at or after the
+        start of its body."""
+        if self._open_invoke_tokens != (self.invoke_regex, self.invoke_end_token):
+            return
+        self._open_invoke = (
+            text,
+            max(scan_from, len(text) - len(self.invoke_end_token) + 1),
+        )
+
     def finish(self, tools: list[Tool]) -> StreamingParseResult:
+        self._open_invoke = None
         if not self._buffer:
             return StreamingParseResult()
 
