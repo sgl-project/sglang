@@ -232,9 +232,7 @@ def main():
     parser.add_argument(
         "--index-pattern", choices=("shared", "random"), default="shared"
     )
-    parser.add_argument(
-        "--kv-dtype", choices=tuple(KV_DTYPES), default="bfloat16"
-    )
+    parser.add_argument("--kv-dtype", choices=tuple(KV_DTYPES), default="bfloat16")
     args = parser.parse_args()
     if not 0 <= args.live_topk <= TOPK:
         parser.error(f"--live-topk must be in [0, {TOPK}]")
