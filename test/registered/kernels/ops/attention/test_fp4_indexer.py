@@ -12,8 +12,13 @@ from sglang.kernels.ops.attention.dsv4 import (
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
+from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+    select_candidate_block_ids,
+    select_candidate_block_ids_triton,
+)
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     finish_paged_indexer_topk,
+    finish_prefill_indexer_topk,
     fp4_index_logits_decode,
     fp4_index_logits_paged,
 )
@@ -30,6 +35,44 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper prefill selection",
+)
+@pytest.mark.parametrize("width,topk", [(21, 32), (1021, 16), (32781, 2048)])
+def test_fused_prefill_candidate_selection(width, topk):
+    # Distinct maxima make the selected set unambiguous.
+    logits = torch.randperm(width, device="cuda").float().repeat(3, 1)
+    lens = torch.tensor([0, width // 2, width], device="cuda")[:, None]
+    logits.masked_fill_(torch.arange(width, device="cuda")[None, :] >= lens, -torch.inf)
+    expected = select_candidate_block_ids(logits, lens, topk, 8)
+    actual = select_candidate_block_ids_triton(logits, lens, topk, 8)
+    torch.testing.assert_close(actual.sort().values, expected.sort().values)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="Hopper prefill selection",
+)
+def test_fused_prefill_writeback():
+    idx = torch.tensor([[6, -1, 2], [4, 1, 0]], device="cuda")
+    slots = torch.arange(50, 57, device="cuda")
+    tokens = torch.tensor([3, 1], device="cuda")
+    lens = torch.tensor([5, 3], device="cuda")
+    raw = torch.full((4, 3), -1, device="cuda", dtype=torch.int32)
+    pages = raw.clone()
+    finish_prefill_indexer_topk(idx, slots, tokens, lens, raw, pages, 7)
+    torch.testing.assert_close(
+        raw, raw.new_tensor([[-1, -1, -1], [0, 1, -1], [-1, -1, -1], [2, -1, -1]])
+    )
+    torch.testing.assert_close(
+        pages,
+        pages.new_tensor([[-1, -1, -1], [50, 51, -1], [-1, -1, -1], [52, -1, -1]]),
+    )
+
+
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _is_xpu = is_xpu()

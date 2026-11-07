@@ -13,9 +13,12 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     candidate_block_mask,
     candidate_topk,
     select_candidate_block_ids,
+    select_candidate_block_ids_triton,
     topk_among_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
+from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_platform
 
 from .scoring import (
     DeepGEMMPrefillData,
@@ -187,6 +190,12 @@ class DenseBlocksBackend:
 
     def _torch_publish_prefill(self, inputs: PrefillInputs):
         picked = []  # (query rows, their block ids) per scored chunk
+        select_blocks = (
+            select_candidate_block_ids_triton
+            if envs.SGLANG_OPT_DSV41_TRITON_PREFILL_SELECTION.get()
+            and get_platform().is_sm90
+            else select_candidate_block_ids
+        )
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -195,7 +204,7 @@ class DenseBlocksBackend:
                 picked.append(
                     (
                         chunk.tok,
-                        select_candidate_block_ids(
+                        select_blocks(
                             chunk.scores,
                             chunk.lens[:, None],
                             topk_blocks=self.topk_blocks,
