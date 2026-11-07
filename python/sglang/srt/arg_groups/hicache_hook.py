@@ -85,6 +85,20 @@ def handle_hicache(server_args: Any):
     resolve_storage_layout_compatibility(server_args)
     resolve_unified_memory_layout_io(server_args)
     if (
+        cfg.hicache_io_backend == "direct_kernel"
+        and cfg.hicache_mem_layout != "page_first_direct"
+    ):
+        forced_by = (
+            " (forced by --disaggregation-decode-host-receive-threshold < 1)"
+            if cfg.disaggregation_decode_host_receive_threshold < 1
+            else ""
+        )
+        raise ValueError(
+            "--hicache-io-backend direct_kernel requires the page_first_direct "
+            f"host layout, got --hicache-mem-layout {cfg.hicache_mem_layout}"
+            + forced_by
+        )
+    if (
         cfg.disaggregation_decode_host_receive_threshold < 1
         and cfg.hicache_mem_layout != "layer_first"
     ):
@@ -272,14 +286,18 @@ def resolve_layout_io_compatibility(server_args: Any):
             "Kernel io backend does not support page first direct layout, switching to direct io backend"
         )
 
-    if cfg.hicache_mem_layout == "page_first" and cfg.hicache_io_backend == "direct":
+    if cfg.hicache_mem_layout == "page_first" and cfg.hicache_io_backend in (
+        "direct",
+        "direct_kernel",
+    ):
         declare_resolution(
             server_args,
             "_resolve_layout_io_compatibility",
             hicache_mem_layout="page_first_direct",
         )
         logger.warning(
-            "Page first layout is not supported with direct IO backend, switching to page first direct layout"
+            f"Page first layout is not supported with {cfg.hicache_io_backend} IO backend, "
+            "switching to page first direct layout"
         )
 
 
@@ -295,7 +313,7 @@ def resolve_storage_layout_compatibility(server_args: Any):
     ):
         return
 
-    if cfg.hicache_io_backend == "direct":
+    if cfg.hicache_io_backend in ("direct", "direct_kernel"):
         new_layout = "page_first_direct"
     elif cfg.hicache_io_backend == "kernel":
         new_layout = "page_first"
@@ -320,6 +338,7 @@ def resolve_unified_memory_layout_io(server_args: Any):
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory or cfg.hicache_mem_layout != "page_first_direct":
         return
+    configured_io_backend = cfg.hicache_io_backend
     declare_resolution(
         server_args,
         "_resolve_unified_memory_layout_io",
@@ -327,9 +346,9 @@ def resolve_unified_memory_layout_io(server_args: Any):
         hicache_io_backend="kernel",
     )
     logger.warning(
-        "--enable-unified-memory: the direct io backend cannot copy the unified "
-        "pool's strided KV rows, switching to the page_first layout with the "
-        "kernel io backend"
+        f"--enable-unified-memory: the {configured_io_backend} io backend cannot "
+        "copy the unified pool's strided KV rows, switching to the page_first "
+        "layout with the kernel io backend"
     )
 
 

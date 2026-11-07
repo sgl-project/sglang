@@ -130,8 +130,8 @@ class Memory(msgspec.Struct):
     hicache_io_backend: A[
         str,
         Arg(
-            help="The IO backend for KV cache transfer between CPU and GPU",
-            choices=["direct", "kernel", "kernel_ascend"],
+            help="The IO backend for KV cache transfer between CPU and GPU. 'direct' moves page_first_direct pages with copy engines; 'direct_kernel' moves the same layout with SM copy kernels driven by GPU-side indices (CUDA; MLA KV and DSA indexer pools only; pre-Blackwell PCIe hosts should keep 'direct').",
+            choices=["direct", "direct_kernel", "kernel", "kernel_ascend"],
         ),
     ] = "kernel"
     hicache_mem_layout: A[

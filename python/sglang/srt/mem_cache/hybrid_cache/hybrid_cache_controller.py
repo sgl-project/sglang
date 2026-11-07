@@ -503,6 +503,10 @@ class HybridCacheController(BaseHiCacheController):
     def register_host_pool_entry(self, entry: PoolEntry) -> None:
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        # Startup prepared only the pools present then; reject or build this one
+        # before it joins the group.
+        if self.io_backend == "direct_kernel":
+            entry.host_pool.prepare_io_backend(self.io_backend)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())

@@ -208,8 +208,9 @@ The startup handshake and `GET /get_hicache_l3_cache_layout` use the same layout
   - `write_through_selective`: Uses hit-count tracking to back up only frequently accessed data
   - `write_back`: Writes data back to slower tiers only when eviction is needed (reduces I/O load)
 
-- **`--hicache-io-backend {direct,kernel}`**: Choose the I/O backend for KV cache transfer between CPU and GPU. See [Data Transfer Optimization](#data-transfer-optimization) for details.
+- **`--hicache-io-backend {direct,direct_kernel,kernel}`**: Choose the I/O backend for KV cache transfer between CPU and GPU. See [Data Transfer Optimization](#data-transfer-optimization) for details.
   - `direct`: Standard CUDA memory copy operations
+  - `direct_kernel`: GPU-assisted page copies over the `page_first_direct` layout, driven by GPU-side indices, which skips the CPU-side index sync and copy descriptors of `direct`. CUDA only; supports the MLA KV and DSA indexer host pools (DeepSeek-V3.2 / GLM-5.x style models). It also requires a GPU that can access registered host memory at its CPU virtual address (`cudaDevAttrCanUseHostPointerForRegisteredMem`); it does not translate to a separate device alias, so startup refuses it on GPUs without that capability. On pre-Blackwell PCIe hosts SM copies to host memory are expected to be slower than the copy engine, so it logs a warning there and `direct` is the better choice
   - `kernel`: GPU-assisted I/O kernels (recommended for better performance)
 
 - **`--hicache-mem-layout {layer_first,page_first,page_first_direct}`**: Memory layout for the host memory pool. See [Data Transfer Optimization](#data-transfer-optimization) for details.

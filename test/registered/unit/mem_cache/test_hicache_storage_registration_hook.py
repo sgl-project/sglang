@@ -33,6 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -101,6 +102,7 @@ def _group() -> HostPoolGroup:
 def _controller(cls: type, storage_host_pool: Any, mem_pool_host: Any) -> Any:
     """Only the attributes ``attach_storage_backend`` reads."""
     controller = object.__new__(cls)
+    controller.io_backend = "kernel"
     controller.enable_storage = False
     controller.storage_stop_event = threading.Event()
     controller.storage_host_pool = storage_host_pool
@@ -231,6 +233,56 @@ class TestRegistrationBurstOrder(CustomTestCase):
             order,
             ["v1", "threads", "v2:kv", "v2:mamba", "complete", "v2:swa"],
         )
+
+
+class TestDirectKernelPoolPreparation(CustomTestCase):
+    """Under direct_kernel every host pool is validated before it can transfer,
+    including sidecars registered after the controller is built."""
+
+    def _direct_kernel_controller(self) -> Any:
+        group = _group()
+        controller = _controller(
+            HybridCacheController, group.anchor_entry.host_pool, group
+        )
+        controller.io_backend = "direct_kernel"
+        return controller
+
+    def test_late_sidecar_is_prepared_before_it_joins_the_group(self):
+        controller = self._direct_kernel_controller()
+        seen = []
+        pool = _fake_pool("swa")
+        pool.prepare_io_backend = lambda backend: seen.append(
+            (backend, PoolName.SWA in controller.mem_pool_host.entry_map)
+        )
+
+        controller.register_host_pool_entry(_entry(PoolName.SWA, pool))
+
+        self.assertEqual(seen, [("direct_kernel", False)])
+        self.assertIn(PoolName.SWA, controller.mem_pool_host.entry_map)
+
+    def test_rejected_late_sidecar_stays_out_of_the_group(self):
+        controller = self._direct_kernel_controller()
+        pool = _fake_pool("swa")
+
+        def reject(backend):
+            raise ValueError(f"no {backend}")
+
+        pool.prepare_io_backend = reject
+
+        with self.assertRaisesRegex(ValueError, "no direct_kernel"):
+            controller.register_host_pool_entry(_entry(PoolName.SWA, pool))
+        self.assertNotIn(PoolName.SWA, controller.mem_pool_host.entry_map)
+        self.assertNotIn(PoolName.SWA, controller.extra_host_mem_release_queues)
+
+    def test_logical_anchor_rejects_direct_kernel(self):
+        """A logical anchor (DeepSeek-V4) fails with the backend's message, not an
+        AttributeError from the group fan-out."""
+        group = HostPoolGroup(
+            [_entry(PoolName.KV, LogicalHostPool(PAGE * 4, PAGE), is_anchor=True)]
+        )
+        group.prepare_io_backend("kernel")
+        with self.assertRaisesRegex(ValueError, "does not support.*direct_kernel"):
+            group.prepare_io_backend("direct_kernel")
 
 
 if __name__ == "__main__":

@@ -3008,6 +3008,26 @@ class TestHiCacheArgs(CustomTestCase):
                 "expected_mem_layout": "page_first",
             },
             {
+                "name": "direct_kernel_with_page_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_io_backend": "direct_kernel",
+                },
+                "expected_io_backend": "direct_kernel",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
+                "name": "direct_kernel_mooncake_with_layer_first",
+                "overrides": {
+                    "enable_hierarchical_cache": True,
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_io_backend": "direct_kernel",
+                    "hicache_mem_layout": "layer_first",
+                },
+                "expected_io_backend": "direct_kernel",
+                "expected_mem_layout": "page_first_direct",
+            },
+            {
                 "name": "fa3_kernel_with_explicit_decode_backend",
                 "overrides": {
                     "enable_hierarchical_cache": True,
@@ -3036,6 +3056,15 @@ class TestHiCacheArgs(CustomTestCase):
                     expected_mem_layout=case["expected_mem_layout"],
                     expected_decode_backend=case.get("expected_decode_backend"),
                 )
+
+    def test_hicache_direct_kernel_rejects_other_layouts(self):
+        args = self._make_args(
+            enable_hierarchical_cache=True,
+            hicache_io_backend="direct_kernel",
+            hicache_mem_layout="layer_first",
+        )
+        with self.assertRaisesRegex(ValueError, "page_first_direct"):
+            handle_hicache(args)
 
     def test_hicache_kernel_keeps_implicit_fa3_decode_backend(self):
         args = self._make_args(
