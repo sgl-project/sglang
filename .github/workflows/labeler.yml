@@ -33,10 +33,11 @@ jobs:
             const modelHints = [
               /^(?:(?:Revert|Reapply) ")*(?:\[[^\]]*\]\s*)*(?:[\w.-]+\/)*beam(?:\/[\w.-]+)*\s*:/i,
               /\[beam\]/i,
+              /\bBeam-\d/,
               /\bbeam\s+(?:models?|images?|docker|checkpoints?|cookbook|recipes?|serving|deployment|reasoning|parsers?|tool[\s_-]?(?:calls?|parsers?)|lora|moe|bf16|fp8|nvfp4)\b/i,
               /\b(?:for|in|of|on|to|with)\s+(?:the\s+)?Beam\b/,
             ];
-            const beamSearch = /beam[\s_-]*search|\bbeams\b|num[\s_-]*beams|\bbeam[\s_-]*(?:width|size|group|leader|candidate|hypothes|score|decoding)/i;
+            const beamSearch = /beam[\s_-]*(?:\d+[\s_-]*)?search|\bbeams\b|num[\s_-]*beams|\bbeam[\s_-]*(?:width|size|group|leader|candidate|hypothes|score|decoding)/i;
             if (modelName.test(title) ||
                 (!beamSearch.test(title) && modelHints.some(hint => hint.test(title)))) {
               await github.rest.issues.addLabels({
