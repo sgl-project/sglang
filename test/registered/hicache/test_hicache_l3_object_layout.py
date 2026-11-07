@@ -89,6 +89,7 @@ class TestHiCacheL3ObjectLayout(CustomTestCase):
         return SimpleNamespace(
             kv_buffer=object(),
             page_size=64,
+            logical_page_size=64,
             get_page_buffer_meta=lambda indices: (
                 [128] * objects_per_page,
                 [64] * objects_per_page,

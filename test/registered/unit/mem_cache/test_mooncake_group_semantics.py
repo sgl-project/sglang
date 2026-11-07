@@ -175,6 +175,7 @@ class FakeHostKVCache:
 
 class FakeIndexerPool:
     page_size = 1
+    logical_page_size = 1
 
     def __init__(self):
         self.buffer = torch.empty((128,), dtype=torch.uint8)
@@ -188,6 +189,7 @@ class FakeIndexerPool:
 
 class FakeMultiBufferPool:
     page_size = 1
+    logical_page_size = 1
 
     def __init__(self):
         self.buffers = [
@@ -698,6 +700,7 @@ class TestMooncakeGroupSemantics(CustomTestCase):
 
         class RecordingKVDraftPool:
             page_size = 1
+            logical_page_size = 1
 
             def __init__(self):
                 self.kv_buffer = torch.empty((128,), dtype=torch.uint8)

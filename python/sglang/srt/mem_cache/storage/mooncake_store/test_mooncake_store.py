@@ -50,6 +50,7 @@ def create_mock_host_kv_cache(
             self.kv_buffer = buffer
             self.layout = "page_first"
             self.page_size = 1  # Simple page size for testing
+            self.logical_page_size = 1
             self.entries_per_page = entries_per_page
             self.page_elements = page_elements
 
