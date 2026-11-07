@@ -1022,4 +1022,8 @@ class LingDSparkModel(DSparkDraftModel):
     pass
 
 
-EntryClass = [Qwen3DSparkModel, LingDSparkModel, DSparkDraftModel]
+EntryClass = [
+    Qwen3DSparkModel,
+    LingDSparkModel,
+    DSparkDraftModel,
+]
