@@ -2,8 +2,10 @@
 """
 Bucket coverage-recommended tests per CI suite.
 
-Runs after test_selector.py has produced recommended_pytest_paths.txt (one
-pytest path per line, repo-relative, optional ::case suffix). For each
+Runs after the precision selector has produced recommended_pytest_paths.txt
+(one pytest path per line, repo-relative, optional ::case suffix). In CI that
+selector is the lb-actions/precision-test step (build-map + PR selection
+share the same Python package). For each
 requested suite, enumerate the suite's registered test files via list_tests.py
 and intersect with the recommended files, then write per-suite GitHub Actions
 step outputs:
@@ -11,14 +13,16 @@ step outputs:
     only_tests_<key>   multi-line list of intersected files (repo-relative);
                        exported non-empty ONLY in precision mode, so callers
                        can reference it without any extra guard expression
-    should_run_<key>   'false' when precision mode is active, the suite
-                       enumerated a non-empty registered pool, and this
-                       suite's bucket is empty -> the caller skips the whole
-                       job; also 'false' for ALL suites when nothing was
+    should_run_<key>   'false' when precision mode is active and this suite's
+                       bucket is empty -> the caller skips the whole job;
+                       also 'false' for ALL suites when nothing was
                        recommended and the changed-file list is available;
                        'true' otherwise (incl. full suites). A suite forced
                        full by the multimodal safety gate stays 'true'
-                       regardless of both skip paths.
+                       regardless of both skip paths. A suite that enumerates
+                       no registered test takes the precision skip path too:
+                       run_suite.py reads the same registry, so the job would
+                       execute zero tests.
 
 Suite keys replace '-' with '_' because GitHub Actions output names must be
 valid shell identifiers. Any failure path yields empty/missing outputs, which
@@ -28,10 +32,12 @@ Decision model (precision vs full)
 ----------------------------------
 Precision mode has the highest priority: when --precision-mode is not 'true',
 every suite runs in full, no matter what was recommended. Otherwise a full run
-is triggered by only two signals:
+is triggered by only three signals:
 
   - a changed path in _FULL_RUN_PATHS (the pipeline configuration files),
-  - a missing changed-file list (test_selector.py failed),
+  - a missing changed-file list (precision selector did not run to completion),
+  - no suite enumerating a single registered file (the enumeration itself is
+    broken: unreadable test tree or list_tests/run_suite drift),
 
 plus the multimodal baseline safety gate described below.
 
@@ -433,9 +439,9 @@ def write_github_summary(
     for suite, files in buckets.items():
         if suite in force_full:
             action = "run full suite (safety gate)"
-        elif skip_all_suites or (
-            precision_mode and suite_pool_sizes[suite] and not files
-        ):
+        elif precision_mode and not files and not suite_pool_sizes[suite]:
+            action = "skipped (suite registers no test)"
+        elif skip_all_suites or (precision_mode and not files):
             action = "skipped (no recommended test)"
         elif precision_mode and files:
             action = "run subset"
@@ -502,7 +508,7 @@ def main():
         "--recommended",
         type=str,
         default=str(SCRIPT_DIR / "recommended_pytest_paths.txt"),
-        help="recommended_pytest_paths.txt written by test_selector.py",
+        help="recommended_pytest_paths.txt written by lb-actions/precision-test",
     )
     parser.add_argument(
         "--suites",
@@ -535,7 +541,7 @@ def main():
         "--changed-files",
         type=str,
         default="",
-        help="pr_changed_files.txt written by test_selector.py. A path listed "
+        help="pr_changed_files.txt exported by the workflow (gh api). A path listed "
         "in _FULL_RUN_PATHS (pr-test-npu.yml, pyproject_npu.toml, "
         "npu_ci_install_dependency.sh) forces a full run; a missing or empty "
         "file forces it too, and everything else is decided by the "
@@ -603,10 +609,11 @@ def main():
     work_dir = Path(tempfile.mkdtemp(prefix="bucket_tests_"))
 
     buckets = {}
-    # Registered-pool size per suite. An empty ENUMERATION (0 files) must
-    # never let precision mode skip the whole job — that would silently drop
-    # the suite from the PR gate — so the output loop falls back to a
-    # full-suite run in that case.
+    # Registered-pool size per suite. A 0-file ENUMERATION means the suite has
+    # no registered PR test at this commit: run_suite.py applies the same
+    # registry + filter, so a full-suite run would select nothing and the job
+    # would burn a runner to execute zero tests and report success. Precision
+    # mode therefore skips it (with a warning) like any other empty bucket.
     suite_pool_sizes = {}
     # Suites that must run in full even when precision mode is on (safety-gate
     # failures, unreadable configs). A forced suite also opts out of the
@@ -620,11 +627,28 @@ def main():
         suite_pool_sizes[suite] = len(suite_files)
         all_pool |= suite_files
         if not suite_files:
-            print(f"::warning::Suite {suite}: enumerated 0 registered test files")
+            print(
+                f"::warning::Suite {suite}: enumerated 0 registered test files — "
+                "no PR test is registered for this suite at this commit, so it is "
+                "skipped in precision mode instead of running an empty suite"
+            )
         intersection = sorted(suite_files & recommended)
         buckets[suite] = intersection
         print(
             f"Suite {suite}: {len(suite_files)} files, {len(intersection)} recommended"
+        )
+
+    # One 0-file suite is a real registry state (that suite registers no PR
+    # test). EVERY suite enumerating 0 files is not: it means test/registered
+    # was unreadable or list_tests.py drifted from run_suite.py, so the
+    # enumeration cannot be trusted and no suite may be skipped.
+    enumeration_empty = bool(suites) and not any(
+        suite_pool_sizes[suite] for suite in suites
+    )
+    if enumeration_empty:
+        print(
+            "::warning::No suite enumerated any registered test file; the "
+            "enumeration cannot be trusted, so every suite runs in full"
         )
 
     if diffusion_suites:
@@ -688,10 +712,16 @@ def main():
         decision = "full"
         decision_reason = "precision mode disabled (--precision-mode is not 'true')"
     elif not changed_files:
-        # test_selector.py writes this file on every PR run; missing/empty
-        # means it failed, so there is no evidence to narrow anything down.
+        # The workflow writes this file only after the precision selector
+        # succeeded; missing/empty means selection failed, so there is no
+        # evidence to narrow anything down.
         decision = "full"
-        decision_reason = "changed-file list unavailable (test_selector.py did not run)"
+        decision_reason = (
+            "changed-file list unavailable (precision selector did not run)"
+        )
+    elif enumeration_empty:
+        decision = "full"
+        decision_reason = "no suite enumerated any registered test file"
     elif full_run_paths:
         decision = "full"
         decision_reason = "pipeline configuration changed: " + ", ".join(full_run_paths)
@@ -741,16 +771,14 @@ def main():
                 for line in bucket_files:
                     out.write(line + "\n")
                 out.write("EOF\n")
-                # 'false' when precision mode is on, the suite enumerated a
-                # non-empty registered pool, and this bucket is empty -> the
-                # caller skips the whole suite job; or for ALL suites when
+                # 'false' when precision mode is on and this bucket is empty ->
+                # the caller skips the whole suite job; or for ALL suites when
                 # nothing was recommended and the changed-file list was
-                # available (decision 'skip_all'). An empty ENUMERATION (0
-                # registered files, e.g. a list_tests/run_suite filter drift)
-                # falls back to 'true' so the job runs the full suite instead of
-                # silently vanishing, except under 'skip_all', where no suite is
-                # expected to run at all. Anything else ('true', or a missing
-                # output from a failed step) means a full-suite run.
+                # available (decision 'skip_all'). A 0-file enumeration takes
+                # the same path: run_suite.py selects from the same registry, so
+                # running the job would execute zero tests. Anything else
+                # ('true', or a missing output from a failed step) means a
+                # full-suite run.
                 # A force_full suite never takes either skip path: its baseline
                 # is incomplete, so "nothing recommended" proves nothing.
                 should_run = (
@@ -758,10 +786,7 @@ def main():
                     if (
                         not files
                         and suite not in force_full
-                        and (
-                            skip_all_suites
-                            or (precision_mode and suite_pool_sizes[suite])
-                        )
+                        and (skip_all_suites or precision_mode)
                     )
                     else "true"
                 )

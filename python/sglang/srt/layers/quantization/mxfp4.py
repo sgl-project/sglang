@@ -43,6 +43,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -57,7 +58,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     is_xpu,
     round_up,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
@@ -152,6 +152,12 @@ def _aiter_situ_uses_gu_interleaved_weights() -> bool:
     a8w4 = get_bool_env_var("AITER_SITUV2_A8W4", "false")
     a4w4 = get_bool_env_var("AITER_SITUV2_A4W4", "false")
     return a8w4 or not a4w4
+
+
+def _aiter_situ_uses_a8w4() -> bool:
+    """Match AITER's SiTU activation-mode precedence: A8W4 wins over A4W4, and
+    gfx1250 overrides it with fp4 activations."""
+    return is_gfx95_supported() and get_bool_env_var("AITER_SITUV2_A8W4", "false")
 
 
 def _get_flashinfer_mxfp4_device_permute_indices(

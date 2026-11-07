@@ -4,23 +4,23 @@
 
 use std::sync::Arc;
 
-use sglang_mm::driver::{self, Output};
-use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
-use sglang_mm::registry::build_pipeline;
+use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_processor::MmOutput;
+use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
 use crate::message::config::MmSpec;
 use crate::message::request::{MmData, Request, RequestKind};
 use crate::message::types::TokenIds;
+use crate::tokenizer_manager::to_scheduler::{Limits, fit_input};
 use crate::tokenizer_manager::wiring::TmEvent;
 use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
+/// Preserve legacy routing hints for observers. These do not override the
+/// full content identity computed by `make_buffers` for cache equality.
 fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -42,8 +42,7 @@ fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, c
 }
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// being the common case), keeping the low 64 bits — only the low 30 are
-/// observable, through `_compute_pad_value`.
+/// being the common case), keeping the low 64 bits in this legacy field only.
 fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -57,10 +56,26 @@ pub struct MmProcessOutput {
     /// The final placeholder-expanded prompt ids.
     pub input_ids: TokenIds,
     pub result: MmEncodedEntry,
+    /// Whatever the processor hands itself from [`MmProcessor::process`] to
+    /// [`MmProcessor::processed`]; dropped before the request is queued.
+    pub extension: Option<Box<dyn std::any::Any + Send>>,
 }
 
-/// Client/server class of a media preparation failure, mirroring Python's
-/// loader contract: `ValueError` is a 400, any other exception a 500.
+/// The request a multimodal result belongs to (see [`MmProcessor::processed`]).
+#[derive(Clone, Copy, Debug)]
+pub struct MmRequestInfo<'a> {
+    /// The rid the client sent (or the minted one), not the scheduler's
+    /// uniquified rid.
+    pub rid: &'a str,
+    /// The uniquified rid, unique among the process's requests: the
+    /// [`crate::GenerateRequest::rid`] a [`crate::GenerateHook`] saw.
+    pub runtime_rid: &'a str,
+    pub bootstrap_room: Option<i64>,
+}
+
+/// Client/server class of a media preparation or processing failure,
+/// mirroring Python's loader and processor contract: `ValueError` is a 400,
+/// any other exception a 500.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum MediaError {
     /// Bad input from the client (400).
@@ -81,7 +96,9 @@ pub enum MediaError {
 /// The media hooks run earlier, during admission on the API runtime, before
 /// any media is fetched or the request reaches the worker pool.
 pub trait MmProcessor: Send + Sync {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String>;
+    /// `Err` is the request's media refused (`Client`, e.g. an undecodable
+    /// image) or the processor's own failure (`Server`).
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError>;
 
     /// Reject a request's media before any of it is fetched, e.g. a modality
     /// the served model cannot encode. `Err` is a client error (400). Runs on
@@ -107,34 +124,51 @@ pub trait MmProcessor: Send + Sync {
     fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
         Ok(())
     }
+
+    /// Observe a request's final result, as the scheduler will receive it
+    /// (with the caller's `mm_hashes` applied, finalized, validated, and its
+    /// ids fitted to the context), on the worker before the request is queued
+    /// for the scheduler. Lets an implementation hand the result on without
+    /// waiting for the scheduler to drain the request. The default does
+    /// nothing.
+    fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
 }
 
-struct QwenMmProcessor {
-    family: Box<dyn MmFamilyProcessor>,
+/// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
+/// request's resolved media bytes.
+struct ImageMmProcessor {
+    pipeline: sglang_processor::MmProcessor,
 }
 
-impl QwenMmProcessor {
-    fn new(spec: MmSpec) -> Result<Self, String> {
-        Ok(Self {
-            family: build_pipeline(spec.pipeline)?,
-        })
+impl MmProcessor for ImageMmProcessor {
+    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(MediaError::Client(
+                "unsupported modality: video/audio input".into(),
+            ));
+        }
+        let media = super::payload::resolve_media_work(input_ids, mm)?;
+        let input_ids = (media.input_ids.iter())
+            .map(|&id| {
+                i32::try_from(id)
+                    .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
+        // The pipeline fails on the request's images and prompt layout.
+        let output = (self.pipeline)
+            .process(&input_ids, &images)
+            .map_err(|error| MediaError::Client(error.to_string()))?;
+        encode_output(output).map_err(MediaError::Server)
     }
 }
 
-impl MmProcessor for QwenMmProcessor {
-    fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
-        let input = super::payload::to_mm_input(input_ids, mm)?;
-        let output = driver::process(self.family.as_ref(), input)?;
-        encode_driver_output(output)
-    }
-}
-
-/// Map the driver's output straight onto the common encoded result: each
+/// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
 /// and hash ride along, and every auxiliary tensor is translated once into
 /// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
-    let Output {
+fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+    let MmOutput {
         input_ids,
         items,
         offsets,
@@ -153,28 +187,45 @@ fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
         .map(|(item, span)| {
             Ok(MmEncodedItem {
                 modality: MmModality::Image,
-                feature: item.feature,
+                feature: tensor(item.feature)?,
                 hash: item.hash,
                 offsets: vec![span],
                 model_specific_data: item
                     .aux
                     .into_iter()
-                    .map(|(name, tensor)| Ok((name.clone(), aux_meta(&name, tensor)?)))
+                    .map(|(name, aux)| {
+                        let meta = aux_meta(&name, tensor(aux)?)?;
+                        Ok((name, meta))
+                    })
                     .collect::<Result<_, String>>()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mrope = match positions {
-        PositionOutput::Rope1D => None,
         PositionOutput::MRope { positions, delta } => Some(MRope { positions, delta }),
+        _ => None,
     };
     Ok(MmProcessOutput {
-        input_ids,
+        input_ids: input_ids.into_iter().map(i64::from).collect(),
         result: MmEncodedEntry {
             items,
             token_ids: None,
             mrope,
         },
+        extension: None,
+    })
+}
+
+/// Dynamo's tensor as the one every processor hands the worker.
+fn tensor(tensor: dynamo::Tensor) -> Result<Tensor, String> {
+    let data = match tensor.data {
+        dynamo::TensorData::F32(values) => TensorData::F32(values),
+        dynamo::TensorData::I64(values) => TensorData::I64(values),
+        _ => return Err("mm: unsupported tensor dtype from dynamo-multimodal".into()),
+    };
+    Ok(Tensor {
+        shape: tensor.shape,
+        data,
     })
 }
 
@@ -198,14 +249,19 @@ pub struct MmContext {
     /// (`RustMmProcessor._use_feature_shm`) exactly when the scheduler broadcasts
     /// across TP ranks and will unwrap `ShmPointerMMData`.
     pub feature_shm: bool,
+    /// The intake limits, which fit the expanded ids to the context before
+    /// [`MmProcessor::processed`] sees them (`None`: left as processed).
+    pub limits: Option<Limits>,
 }
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let feature_shm = spec.feature_shm;
+        let pipeline =
+            sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
-            feature_shm,
+            processor: Arc::new(ImageMmProcessor { pipeline }),
+            feature_shm: spec.feature_shm,
+            limits: None,
         })
     }
 
@@ -213,6 +269,14 @@ impl MmContext {
         Self {
             processor,
             feature_shm,
+            limits: None,
+        }
+    }
+
+    pub fn with_limits(self, limits: Limits) -> Self {
+        Self {
+            limits: Some(limits),
+            ..self
         }
     }
 }
@@ -273,7 +337,7 @@ fn place_features(
 /// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
-    let meta = MmMeta::of(&entry).encode()?;
+    let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
     let features = items.into_iter().map(|item| item.feature).collect();
     let mut buffers = place_features(features, feature_shm, |_| {
@@ -292,22 +356,47 @@ fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>,
 }
 
 /// Run the processor for one request. `Ok` returns the final expanded ids and
-/// the buffers to ride the ring; `Err` rejects the request back to the client.
+/// the buffers to ride the ring; `Err` rejects the request back to the client:
+/// the processor's [`MediaError`] as `Encode`, which keeps its status class,
+/// and a malformed processor result or an unplaceable buffer -- the server's
+/// fault -- as `Internal` (a 500).
 fn process(
     ctx: &MmContext,
+    request: MmRequestInfo<'_>,
     input_ids: TokenIds,
     mut mm: MmData,
-) -> Result<(TokenIds, Vec<Buffer>), String> {
+) -> Result<(TokenIds, Vec<Buffer>), Error> {
     let caller_hashes = std::mem::take(&mut mm.mm_hashes);
-    let mut output = ctx.processor.process(input_ids, mm)?;
-    output.result.validate(output.input_ids.len())?;
+    let mut output = ctx
+        .processor
+        .process(input_ids, mm)
+        .map_err(Error::Encode)?;
+    output
+        .result
+        .validate(output.input_ids.len())
+        .map_err(Error::Internal)?;
     apply_caller_hashes(
         output.result.items.iter_mut().map(|item| &mut item.hash),
         &caller_hashes,
     );
-    ctx.processor.finalize(&mut output.result)?;
-    output.result.validate(output.input_ids.len())?;
-    let buffers = make_buffers(output.result, ctx.feature_shm)?;
+    ctx.processor
+        .finalize(&mut output.result)
+        .map_err(Error::Internal)?;
+    output
+        .result
+        .validate(output.input_ids.len())
+        .map_err(Error::Internal)?;
+    // Intake fits the ids to the context (`check_total_tokens`) before the
+    // scheduler sees them; fit them first, so `processed` sees the same ids. A
+    // prompt intake will reject is not observed.
+    let fits = ctx
+        .limits
+        .as_ref()
+        .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
+    if fits {
+        ctx.processor.processed(request, &output);
+    }
+    let buffers = make_buffers(output.result, ctx.feature_shm).map_err(Error::Internal)?;
     Ok((output.input_ids, buffers))
 }
 
@@ -320,6 +409,8 @@ pub struct MmWiring {
     pub mm_rx: flume::Receiver<Request>,
     /// Back-channel for the workers' `Encoded` into the to-scheduler loop.
     pub tm_tx: flume::Sender<TmEvent>,
+    /// Intake's limits, for the pool's [`MmContext::with_limits`].
+    pub limits: Limits,
 }
 
 /// One MM worker, spawned via `Runtime::start_mm_workers` (which owns the
@@ -346,8 +437,8 @@ impl Runnable for MmWorker {
     /// concurrency. Mirrors `TokenizerWorker`: carve the work out of the
     /// request, process, write the result back, advance the FSM
     /// (`EncodeDone` -> PreSendValidating, or `Error` -> Failed, which intake
-    /// rejects to the client as Python turns a per-request exception into a
-    /// 400), and return the request as `Encoded`.
+    /// rejects to the client; see [`process`] for the error's class), and
+    /// return the request as `Encoded`.
     fn run(self) {
         while let Ok(mut req) = self.mm_rx.recv() {
             // A request is never dropped here: a kind this pool cannot serve
@@ -360,16 +451,21 @@ impl Runnable for MmWorker {
                 // stays for the scheduler header; nothing reads `mm` after this.
                 let input_ids = g.input_ids.take().unwrap_or_default();
                 let mm = g.mm.take().map(|m| *m).unwrap_or_default();
-                match process(&self.ctx, input_ids, mm) {
+                let request = MmRequestInfo {
+                    rid: req.rid.client_facing(),
+                    runtime_rid: req.rid.as_str(),
+                    bootstrap_room: g.bootstrap_room,
+                };
+                match process(&self.ctx, request, input_ids, mm) {
                     Ok((input_ids, buffers)) => {
                         tracing::debug!(rid = %req.rid, tokens = input_ids.len(), "mm: processed");
                         g.input_ids = Some(input_ids);
                         g.mm_buffers = buffers;
                         Event::EncodeDone
                     }
-                    Err(message) => {
-                        tracing::warn!(rid = %req.rid, %message, "mm processing rejected");
-                        Event::Error(Error::Encode(message))
+                    Err(error) => {
+                        tracing::warn!(rid = %req.rid, %error, "mm processing rejected");
+                        Event::Error(error)
                     }
                 }
             } else {
@@ -388,8 +484,10 @@ impl Runnable for MmWorker {
 
 #[cfg(test)]
 mod tests {
-    use sglang_mm::driver::OutputItem;
     use std::collections::BTreeMap;
+
+    use sglang_processor::MmOutputItem;
+    use sglang_processor::dynamo_multimodal::processor as dynamo;
 
     use super::*;
     use crate::message::buffers::find;
@@ -403,7 +501,7 @@ mod tests {
     }
 
     impl MmProcessor for ExternalProcessor {
-        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, String> {
+        fn process(&self, input_ids: TokenIds, _mm: MmData) -> Result<MmProcessOutput, MediaError> {
             Ok(MmProcessOutput {
                 input_ids,
                 result: MmEncodedEntry {
@@ -423,40 +521,36 @@ mod tests {
                     token_ids: None,
                     mrope: None,
                 },
+                extension: None,
             })
         }
     }
 
-    /// The driver's output maps onto the encoded result without any
+    fn dynamo_tensor(shape: Vec<usize>, data: dynamo::TensorData) -> dynamo::Tensor {
+        dynamo::Tensor { shape, data }
+    }
+
+    /// The pipeline's output maps onto the encoded result without any
     /// reconstruction: feature tensors keep their shape and dtype, spans and
     /// hashes ride per item, integer aux tensors become metadata, and M-RoPE
     /// carries over; 1-D positions leave `mrope` empty.
     #[test]
-    fn driver_output_maps_directly() {
-        let item = |shape: Vec<usize>, hash| OutputItem {
-            feature: Tensor {
-                shape,
-                data: TensorData::F32(vec![0.5; 12]),
-            },
+    fn pipeline_output_maps_directly() {
+        let item = |shape: Vec<usize>, hash| MmOutputItem {
+            feature: dynamo_tensor(shape, dynamo::TensorData::F32(vec![0.5; 12])),
             aux: vec![
                 (
                     "image_grid_thw".into(),
-                    Tensor {
-                        shape: vec![3],
-                        data: TensorData::I64(vec![1, 2, 3]),
-                    },
+                    dynamo_tensor(vec![3], dynamo::TensorData::I64(vec![1, 2, 3])),
                 ),
                 (
                     "clip_index".into(),
-                    Tensor {
-                        shape: vec![],
-                        data: TensorData::I64(vec![7]),
-                    },
+                    dynamo_tensor(vec![], dynamo::TensorData::I64(vec![7])),
                 ),
             ],
             hash,
         };
-        let output = Output {
+        let output = MmOutput {
             input_ids: vec![1, 2, 2, 3],
             items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
             offsets: vec![(1, 2), (3, 3)],
@@ -465,7 +559,7 @@ mod tests {
                 delta: -2,
             },
         };
-        let encoded = encode_driver_output(output).unwrap();
+        let encoded = encode_output(output).unwrap();
         assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
         let items = &encoded.result.items;
         assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
@@ -484,34 +578,28 @@ mod tests {
         let mrope = encoded.result.mrope.as_ref().unwrap();
         assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
 
-        let plain = Output {
+        let plain = MmOutput {
             input_ids: vec![1],
             items: vec![],
             offsets: vec![],
             positions: PositionOutput::Rope1D,
         };
-        assert!(encode_driver_output(plain).unwrap().result.mrope.is_none());
+        assert!(encode_output(plain).unwrap().result.mrope.is_none());
 
-        let bad = Output {
+        let bad = MmOutput {
             input_ids: vec![1],
-            items: vec![OutputItem {
-                feature: Tensor {
-                    shape: vec![1],
-                    data: TensorData::F32(vec![1.0]),
-                },
+            items: vec![MmOutputItem {
+                feature: dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 aux: vec![(
                     "scale".into(),
-                    Tensor {
-                        shape: vec![1],
-                        data: TensorData::F32(vec![1.0]),
-                    },
+                    dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 )],
                 hash: 1,
             }],
             offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
         };
-        let Err(err) = encode_driver_output(bad) else {
+        let Err(err) = encode_output(bad) else {
             panic!("an f32 aux tensor must be rejected");
         };
         assert!(err.contains("no metadata form"), "{err}");
@@ -727,6 +815,12 @@ mod tests {
         );
     }
 
+    const NO_REQUEST: MmRequestInfo<'static> = MmRequestInfo {
+        rid: "r",
+        runtime_rid: "r",
+        bootstrap_room: None,
+    };
+
     /// An external processor's result rides the same buffers: its tensor's
     /// dtype and shape are kept, the caller hash override applies, and the
     /// sidecar carries its scalar metadata.
@@ -743,7 +837,7 @@ mod tests {
             mm_hashes: vec!["2a".to_owned()],
             ..Default::default()
         };
-        let (input_ids, buffers) = process(&ctx, vec![1, 2], mm).unwrap();
+        let (input_ids, buffers) = process(&ctx, NO_REQUEST, vec![1, 2], mm).unwrap();
         assert_eq!(input_ids, [1, 2]);
         assert_eq!(find(&buffers, "mm.feature.0").unwrap().shape, [1]);
         assert!(find(&buffers, "mm.mrope").is_none());
@@ -753,14 +847,17 @@ mod tests {
         assert!(text.contains("clip_index"), "{text}");
     }
 
+    /// Finalization sees the caller's hashes and is validated; `processed`
+    /// observes only a valid finalized result.
     #[test]
     fn finalization_runs_after_caller_hashes_and_is_validated() {
         struct FinalizingProcessor {
             final_end: u32,
+            processed: std::sync::Mutex<Vec<Vec<u64>>>,
         }
 
         impl MmProcessor for FinalizingProcessor {
-            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, String> {
+            fn process(&self, ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
                 ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(0, 0)],
@@ -784,22 +881,35 @@ mod tests {
                 });
                 Ok(())
             }
+
+            fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                let hashes = output.result.items.iter().map(|item| item.hash).collect();
+                self.processed.lock().unwrap().push(hashes);
+            }
         }
 
         for final_end in [1, 2] {
-            let ctx = MmContext::with_processor(Arc::new(FinalizingProcessor { final_end }), false);
+            let processor = Arc::new(FinalizingProcessor {
+                final_end,
+                processed: Default::default(),
+            });
+            let ctx = MmContext::with_processor(processor.clone(), false);
             let result = process(
                 &ctx,
+                NO_REQUEST,
                 vec![1, 2],
                 MmData {
                     mm_hashes: vec!["2a".to_owned()],
                     ..Default::default()
                 },
             );
+            let processed = processor.processed.lock().unwrap().clone();
             if final_end == 2 {
                 assert!(result.is_err(), "finalized spans must be validated");
+                assert!(processed.is_empty(), "an invalid result is not observed");
                 continue;
             }
+            assert_eq!(processed, [vec![43, 44]]);
             let (ids, buffers) = result.expect("valid finalized items");
             assert_eq!(ids, [1, 2]);
             assert!(find(&buffers, "mm.feature.1").is_some());
@@ -822,7 +932,7 @@ mod tests {
         ] {
             let ctx =
                 MmContext::with_processor(Arc::new(ExternalProcessor { shape, offsets }), false);
-            assert!(process(&ctx, vec![1, 2], MmData::default()).is_err());
+            assert!(process(&ctx, NO_REQUEST, vec![1, 2], MmData::default()).is_err());
         }
     }
 
@@ -846,8 +956,9 @@ mod tests {
 
     /// The worker loop takes the whole request, like the tokenizer pool: on
     /// success it writes the expanded ids and buffers back and advances to
-    /// `PreSendValidating`; on a processor error it marks the request
-    /// `Failed(Encode)`. Either way the request comes back as `Encoded`.
+    /// `PreSendValidating`; on a refusal it marks the request `Failed(Encode)`,
+    /// and on a processor failure or malformed result `Failed(Internal)`.
+    /// Either way the request comes back as `Encoded`.
     #[test]
     fn worker_returns_request_with_fsm_advanced() {
         use crate::utils::fsm::RequestState;
@@ -884,28 +995,165 @@ mod tests {
         assert!(find(&g.mm_buffers, "mm.feature.0").is_some());
         assert!(find(&g.mm_buffers, "mm.meta").is_some());
 
-        // A malformed result (span past the prompt) fails the request in place.
+        // The processor's own failure and a malformed result (span past the
+        // prompt) fail the request in place as the server's fault; a refusal
+        // as the client's.
+        let failing: Arc<dyn MmProcessor> = Arc::new(FailingProcessor(MediaError::Server(
+            "audio decode: Cannot allocate memory".into(),
+        )));
+        let malformed: Arc<dyn MmProcessor> = Arc::new(ExternalProcessor {
+            shape: vec![1],
+            offsets: vec![(1, 2)],
+        });
+        let refusing: Arc<dyn MmProcessor> =
+            Arc::new(FailingProcessor(MediaError::Client("bad image".into())));
+        for (processor, server_fault) in [(failing, true), (malformed, true), (refusing, false)] {
+            let (mm_tx, mm_rx) = flume::unbounded::<Request>();
+            let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
+            let ctx = Arc::new(MmContext::with_processor(processor, false));
+            let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
+            mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
+            drop(mm_tx);
+            worker.join().unwrap();
+            let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
+                panic!("expected Encoded");
+            };
+            let RequestState::Failed(error) = &req.state else {
+                panic!("{:?}", req.state);
+            };
+            assert_eq!(error.is_server_fault(), server_fault, "{error:?}");
+        }
+    }
+
+    /// A processor that fails every request with the given error.
+    struct FailingProcessor(MediaError);
+
+    impl MmProcessor for FailingProcessor {
+        fn process(
+            &self,
+            _input_ids: TokenIds,
+            _mm: MmData,
+        ) -> Result<MmProcessOutput, MediaError> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// `processed` sees the result the scheduler gets -- the caller's hash
+    /// applied -- under the client's rid, the uniquified rid and the request's
+    /// bootstrap room, with what `process` handed it.
+    #[test]
+    fn processed_observes_the_final_result_with_request_identity() {
+        use std::sync::Mutex;
+
+        /// What `processed` saw, as `rid room ids hashes extension`, and the
+        /// uniquified rid.
+        #[derive(Default)]
+        struct Observing(Mutex<Vec<(String, String)>>);
+        impl MmProcessor for Observing {
+            fn process(
+                &self,
+                input_ids: TokenIds,
+                mm: MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
+                let output = ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(1, 1)],
+                }
+                .process(input_ids, mm)?;
+                Ok(MmProcessOutput {
+                    extension: Some(Box::new("handed on")),
+                    ..output
+                })
+            }
+            fn processed(&self, request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                let hashes: Vec<u64> = output.result.items.iter().map(|item| item.hash).collect();
+                let extension = output
+                    .extension
+                    .as_ref()
+                    .and_then(|extension| extension.downcast_ref::<&str>());
+                self.0.lock().unwrap().push((
+                    format!(
+                        "{} {:?} {:?} {hashes:?} {extension:?}",
+                        request.rid, request.bootstrap_room, output.input_ids
+                    ),
+                    request.runtime_rid.to_owned(),
+                ));
+            }
+        }
+
+        let processor = Arc::new(Observing::default());
+        let ctx = Arc::new(MmContext::with_processor(processor.clone(), false));
         let (mm_tx, mm_rx) = flume::unbounded::<Request>();
-        let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
-        let bad_ctx = Arc::new(MmContext::with_processor(
-            Arc::new(ExternalProcessor {
-                shape: vec![1],
-                offsets: vec![(1, 2)],
-            }),
-            false,
-        ));
-        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, bad_ctx).run());
-        mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
+        let (tm_tx, _tm_rx) = flume::unbounded::<TmEvent>();
+        let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
+        let mut req = encoding_req("unused", vec![1, 2]);
+        req.rid = crate::message::ids::Rid::from_client("client");
+        let runtime_rid = req.rid.as_str().to_owned();
+        assert_ne!(runtime_rid, "client");
+        let RequestKind::Generate(g) = &mut req.kind else {
+            panic!("generate")
+        };
+        g.bootstrap_room = Some(9);
+        g.mm = Some(Box::new(MmData {
+            mm_hashes: vec!["2a".to_owned()],
+            ..Default::default()
+        }));
+        mm_tx.send(req).unwrap();
         drop(mm_tx);
         worker.join().unwrap();
-        let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
-            panic!("expected Encoded");
-        };
-        assert!(
-            matches!(req.state, RequestState::Failed(Error::Encode(_))),
-            "{:?}",
-            req.state
+        assert_eq!(
+            *processor.0.lock().unwrap(),
+            [(
+                r#"client Some(9) [1, 2] [42] Some("handed on")"#.to_owned(),
+                runtime_rid
+            )]
         );
+    }
+
+    /// `processed` sees the ids intake forwards, fitted to the context as
+    /// `check_total_tokens` fits them: a 12-token prompt on an 8-token context
+    /// is truncated under `allow_auto_truncate` (a prefill with a smaller
+    /// context than its decode publishes its own 8 ids), and not observed when
+    /// intake will reject it.
+    #[test]
+    fn processed_sees_the_ids_fitted_to_the_context() {
+        use std::sync::Mutex;
+
+        struct Observing(Mutex<Vec<TokenIds>>);
+        impl MmProcessor for Observing {
+            fn process(
+                &self,
+                input_ids: TokenIds,
+                mm: MmData,
+            ) -> Result<MmProcessOutput, MediaError> {
+                ExternalProcessor {
+                    shape: vec![1],
+                    offsets: vec![(6, 9)],
+                }
+                .process(input_ids, mm)
+            }
+            fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
+                self.0.lock().unwrap().push(output.input_ids.clone());
+            }
+        }
+
+        for (allow_auto_truncate, forwarded, observed) in [(true, 8, 1), (false, 12, 0)] {
+            let processor = Arc::new(Observing(Mutex::new(Vec::new())));
+            let ctx = MmContext::with_processor(processor.clone(), false).with_limits(Limits {
+                skip_tokenizer_init: false,
+                vocab_size: 1000,
+                context_len: 8,
+                num_reserved_tokens: 0,
+                allow_auto_truncate,
+                enable_return_hidden_states: false,
+            });
+            let (input_ids, _) =
+                process(&ctx, NO_REQUEST, (0..12).collect(), MmData::default()).unwrap();
+            assert_eq!(input_ids, (0..forwarded).collect::<TokenIds>());
+            let seen = processor.0.lock().unwrap();
+            assert_eq!(seen.len(), observed);
+            assert!(seen.iter().all(|ids| *ids == input_ids));
+        }
     }
 
     /// A kind the pool cannot serve is returned `Failed`, never dropped:

@@ -10,8 +10,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-# ==============================================================================
-"""A scheduler that manages a tensor parallel GPU worker."""
+# ======================================================================="""A scheduler that manages a tensor parallel GPU worker."""
 
 import dataclasses
 import faulthandler
@@ -26,7 +25,17 @@ from collections import deque
 from contextlib import ExitStack, contextmanager, nullcontext
 from functools import partial
 from http import HTTPStatus
-from typing import TYPE_CHECKING, Any, Deque, Dict, List, Optional, Set, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Deque,
+    Dict,
+    List,
+    Optional,
+    Set,
+    Tuple,
+    Union,
+)
 
 from sglang.srt.runtime_context import (
     SpawnRanks,
@@ -44,11 +53,12 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    is_scheduler_io_rank,
     publish,
     spawn_world_rank,
 )
 
-from sglang.srt.utils.common import suppress_noisy_warnings  # isort: skip
+from sglang.srt.utils.log_utils import suppress_noisy_warnings  # isort: skip
 
 suppress_noisy_warnings()
 
@@ -61,18 +71,23 @@ from torch.distributed import barrier
 if TYPE_CHECKING:
     from torch.cuda import Stream as CudaStream
 
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
 try:
     from sglang.kernels.ops.mamba.triton_ops import (
         initialize_mamba_selective_state_update_backend,
     )
 except ImportError:
     initialize_mamba_selective_state_update_backend = None
+import traceback
+
 from sglang.srt.beam_search.coordinator import BeamCoordinator
 from sglang.srt.configs.model_config import (
     ModelConfig,
     ModelImpl,
     is_deepseek_v4,
     is_minimax_sparse,
+    is_unlimited_ocr_v2,
 )
 from sglang.srt.constrained.grammar_manager import GrammarManager
 from sglang.srt.debug_utils.pr_fix_toggle import maybe_revert_pr_fix
@@ -88,19 +103,18 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
-    maybe_release_metadata_buffer,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
-    unified_memory_disagg_move_gate,
 )
 from sglang.srt.distributed import bootstrap
 from sglang.srt.distributed.parallel_state import (
@@ -110,13 +124,22 @@ from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
-from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.hf_transformers import (
+    get_processor,
+    get_tokenizer,
+    get_tokenizer_from_processor,
+    resolve_image_processor_backend,
+)
+from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
+from sglang.srt.layers.dp_attention import get_dp_tp_group, require_mlp_sync
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
 from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
+from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
 from sglang.srt.managers.io_struct import (
@@ -147,6 +170,8 @@ from sglang.srt.managers.io_struct import (
     FinishReasonDict,
     FlushCacheReqInput,
     FreezeGCReq,
+    GetHiCacheL3LayoutReq,
+    GetHiCacheL3LayoutReqOutput,
     GetInternalStateReq,
     GetWeightsByNameReqInput,
     HealthCheckOutput,
@@ -163,8 +188,10 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PluginWeightUpdateReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
+    ReleaseUocrDocReqInput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -208,10 +235,12 @@ from sglang.srt.managers.prefill_delayer import (
     PrefillDelayerSinglePassExecutor,
     RecentPrefillBatchSizeTracker,
 )
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     MultimodalInputs,
     MultimodalProcessorOutput,
+)
+from sglang.srt.managers.schedule_batch import (
     NextBatchPlan,
     Req,
     ScheduleBatch,
@@ -221,11 +250,20 @@ from sglang.srt.managers.schedule_policy import (
     AddReqResult,
     PrefillAdder,
     SchedulePolicy,
+    mamba_prefill_chunk_grid,
 )
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdapter
+from sglang.srt.managers.scheduler_components.deferred_responses import (
+    DeferredResponses,
+)
+from sglang.srt.managers.scheduler_components.dp_attn import (
+    DRAIN_STATE_NO_LISTENER,
+    MLP_SYNC_CARRIES_DRAIN_STATE,
+    SchedulerDPAttnAdapter,
+    should_skip_scheduler_all_gather,
+)
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
@@ -275,9 +313,17 @@ from sglang.srt.managers.scheduler_components.profiler_manager import (
 from sglang.srt.managers.scheduler_components.recv_skipper import (
     SchedulerRecvSkipper,
 )
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    ReqList,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (
     SchedulerRequestReceiver,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
 )
@@ -288,21 +334,27 @@ from sglang.srt.managers.utils import (
     GenerationBatchResult,
     allocate_distinct_stream,
     is_health_check_generate_req,
+    is_war_barrier_enabled,
+    make_abort_req,
     validate_input_length,
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
-from sglang.srt.mem_cache.common import (
-    checkpoint_kv_cache,
-    discard_kv_cache_backup,
-    release_kv_cache,
-)
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
+from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
-from sglang.srt.multiplex.multiplexing_mixin import SchedulerMultiplexMixin
+from sglang.srt.models.unlimited_ocr_v2_support.admission import UocrPrefillAdder
+from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
+    resolve_uocr_decode_graph_io,
+)
+from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
+    UocrSchedulerRuntime,
+)
+from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
     flush_trace_batch,
@@ -315,7 +367,6 @@ from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_PROCESS_BATCH_RESULT,
     SCHEDULER_STAGE_PROCESS_REQUESTS,
     SCHEDULER_STAGE_RUN_BATCH,
-    SCHEDULER_STAGE_SANITY_CHECK_CACHE,
     scheduler_stage_method,
 )
 from sglang.srt.observability.startup_time import build_scheduler_startup_time
@@ -323,7 +374,11 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
-from sglang.srt.rust_server.server import RustServer
+from sglang.srt.rust_server.server import (
+    RustServer,
+    claim_sigterm_before_compiles,
+    drain_notify_name,
+)
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
@@ -352,26 +407,16 @@ from sglang.srt.utils import (
     is_mps,
     kill_itself_when_parent_died,
     rank_consensus_checker,
-    require_mlp_sync,
     set_gpu_proc_affinity,
     set_random_seed,
     suppress_other_loggers,
     triton_load_watch,
 )
-from sglang.srt.utils.common import is_confidential_compute, is_npu
-from sglang.srt.utils.hf_transformers_utils import (
-    get_processor,
-    get_tokenizer,
-    get_tokenizer_from_processor,
-    resolve_image_processor_backend,
-)
+from sglang.srt.utils.common import TypeBasedDispatcher
+from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.srt.utils.weight_versions import (
-    compute_weight_version_spans,
-    record_weight_version_events,
-)
-from sglang.utils import TypeBasedDispatcher, get_exception_traceback
+from sglang.srt.utils.weight_versions import record_weight_version_events
 
 if is_mps():
     CudaStreamContext = nullcontext
@@ -444,7 +489,6 @@ _is_hip = is_hip()
 class Scheduler(
     SchedulerDisaggregationDecodeMixin,
     SchedulerDisaggregationPrefillMixin,
-    SchedulerMultiplexMixin,
     SchedulerPPMixin,
     SchedulerDllmMixin,
     SchedulerMlxOverlapMixin,
@@ -458,6 +502,9 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Unlimited-OCR collaborators; None for every other model.
+    uocr_runtime: Optional[UocrSchedulerRuntime] = None
+    resolve_forward_inputs = staticmethod(resolve_forward_inputs)
 
     def __init__(
         self,
@@ -500,7 +547,6 @@ class Scheduler(
         self.enable_overlap_mlx = (
             not get_schedule().disable_overlap_schedule and use_mlx()
         )
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
         self.stream_interval = get_serving().stream_interval
         self.spec_algorithm = SpeculativeAlgorithm.from_string(
@@ -543,10 +589,6 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
-
-        # Init PD-multiplexing context
-        if self.enable_pdmux:
-            self.init_pdmux()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -592,10 +634,10 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
-            draft_swa_window=(
-                self.draft_worker.draft_swa_window
+            draft_window_reaches=(
+                self.draft_worker.draft_window_reaches
                 if self.draft_worker is not None
-                else 0
+                else None
             ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
@@ -605,6 +647,9 @@ class Scheduler(
         self.swa_tokens_per_layer = result.swa_tokens_per_layer
         self.req_to_token_pool = result.req_to_token_pool
         self.token_to_kv_pool_allocator = result.token_to_kv_pool_allocator
+        self.logical_page_size = self.page_size
+        if is_cp_sharded_padded():
+            self.logical_page_size *= get_cp_strategy().cp_size
         self.kv_shard_widening = page_interleave_shard_size(
             self.token_to_kv_pool_allocator
         )
@@ -619,12 +664,15 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
-                if self.enable_unified_memory:
-                    # Keep device rows stable until host transfers are acknowledged.
-                    # Queue reads and relocation both run on the scheduler thread.
-                    self.token_to_kv_pool_allocator.set_host_transfer_move_gate(
-                        lambda c=cache_controller: not c.has_inflight_device_transfers()
-                    )
+                # Keep device rows stable until host transfers are acknowledged.
+                # Queue reads and relocation both run on the scheduler thread.
+                storage = kv_storage_of(
+                    self.req_to_token_pool, self.token_to_kv_pool_allocator
+                )
+                storage.add_pin_source(
+                    storage.sub_pool_names(),
+                    cache_controller.has_inflight_device_transfers,
+                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -645,6 +693,14 @@ class Scheduler(
             )
         else:
             self.decode_offload_manager = None
+        # Prefill read-done lets the schedule stream run ahead of the forward that
+        # writes a stashed chunk. The cache controller's fence streams above order
+        # its copies behind that forward; the decode offload controller has none.
+        self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream = (
+            self.enable_hierarchical_cache
+            and self.tree_cache.cache_controller is not None
+            and self.decode_offload_manager is None
+        )
 
         # Init running status
         self.init_running_status()
@@ -680,13 +736,17 @@ class Scheduler(
         # so the registry is accepting once this returns.) Must also precede
         # the request receiver, which reads self.recv_from_tokenizer to pick
         # its ingress transport.
-        self.maybe_init_rust_server()
+        self.maybe_init_rust_server(port_args)
 
         # Init prefill-decodedisaggregation
         self.init_disaggregation()
+        self.maybe_init_disaggregation_pin_source()
 
         # Init overlap schedule
         self.init_overlap()
+
+        # Init Unlimited-OCR document-window hooks and crop transfer
+        self.maybe_init_uocr_runtime()
 
         # Init Ngram Embedding
         self.maybe_init_ngram_embedding()
@@ -694,6 +754,7 @@ class Scheduler(
         # Init prefill kv split size when deterministic inference is enabled with various attention backends
         self.init_deterministic_inference_config()
         self.init_dsa_kpool_truncation_align()
+        self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
 
         self.init_weight_updater()
@@ -712,6 +773,8 @@ class Scheduler(
 
         self.maybe_init_scripted_scheduler_hook()
 
+        self.maybe_init_mm_feature_receive_budget()
+
         self.init_request_receiver()
 
         self.init_dp_attn_adapter()
@@ -724,7 +787,15 @@ class Scheduler(
 
         self.init_load_inquirer()
 
+        self.init_kv_weight_version_tracker()
+
         self.init_output_streamer()
+
+        self.init_deferred_responses()
+
+        self.init_beam_coordinator()
+
+        self.init_request_retirer()
 
         self.init_batch_result_processor()
 
@@ -809,11 +880,7 @@ class Scheduler(
         self.metrics_collector = self.metrics_collector_context.collector
 
     def init_ipc_channels(self, port_args: PortArgs):
-        is_rank_zero = (
-            get_parallel().pp_rank == 0
-            and get_parallel().attn_tp_rank == 0
-            and get_parallel().attn_cp_rank == 0
-        )
+        is_rank_zero = is_scheduler_io_rank()
         self.ipc_channels = SchedulerIpcChannels.create(
             port_args=port_args,
             is_rank_zero=is_rank_zero,
@@ -1134,7 +1201,7 @@ class Scheduler(
         self.kv_cache_allocation_time = time.perf_counter() - tic
         if self.enable_unified_memory:
             # The first compaction move must not happen while serving with a
-            # full pool (see MultiEndedAllocator.prewarm_compaction); prewarm it
+            # full pool (see Band.prewarm_compaction); prewarm it
             # before graph capture and KV sizing account for its memory.
             self.tp_worker.model_runner.token_to_kv_pool_allocator.prewarm_compaction()
 
@@ -1152,7 +1219,11 @@ class Scheduler(
                 ),
             )
         device_module = torch.get_device_module(model_runner.device)
-        self.schedule_stream = None if use_mlx() else device_module.Stream(priority=0)
+        self.schedule_stream = (
+            None
+            if use_mlx()
+            else device_module.Stream(priority=envs.SGLANG_PLB_STREAM_PRIORITY.get())
+        )
         # Match run_batch / _pp_launch_batch so warmup allocations stay reusable.
         forward_stream = (
             model_runner.forward_stream
@@ -1319,9 +1390,16 @@ class Scheduler(
         self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
-        self.waiting_queue: List[Req] = []
+        self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
+        # Requests merged into a running batch, until they finish or a retract,
+        # preemption or pause takes them out.
+        self.running_reqs = KeyedReqList(ListKind.DECODING)
+        # Prefill requests out of the chunked slot whose launched steps their next
+        # holder has not taken yet: the running batch at the merge, the PD
+        # transfer queue, HiSparse staging, or a requeue.
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         # The current forward batch
         self.cur_batch_for_debug: Optional[ScheduleBatch] = None
         # The last forward batch
@@ -1367,7 +1445,7 @@ class Scheduler(
             self.chunked_prefill_size = None
         elif self.chunked_prefill_size is not None and self.chunked_prefill_size <= 0:
             self.chunked_prefill_size = None
-        self.chunked_req = None
+        self.chunked_reqs = IndexedReqList(ListKind.CHUNKED, abort=self._abort_chunked)
         self._pending_chunked_abort_req = None
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
@@ -1399,7 +1477,13 @@ class Scheduler(
 
         # A small running batch admits prefill every round so it can grow;
         # the interval only protects decode once the batch is large enough.
-        if running_batch.batch_size() < self.prefill_decode_interval_min_bs:
+        # With nothing decoding there is no decode to protect, and waiting only
+        # idles the GPU between chunks. DP attention keeps the synchronized
+        # cadence because peer ranks may still be decoding.
+        nothing_decodes = running_batch.is_empty() or running_batch.is_prefill_only
+        if running_batch.batch_size() < self.prefill_decode_interval_min_bs or (
+            nothing_decodes and not self.require_mlp_sync
+        ):
             self._prefill_decode_interval_remaining = 0
             return False
 
@@ -1501,7 +1585,9 @@ class Scheduler(
     def init_disaggregation(self):
         self.mm_receiver = None
         self.disagg_prefill_bootstrap_queue = None
-        self.disagg_prefill_inflight_queue = None
+        self.disagg_prefill_transfer_queue = IndexedReqList(
+            ListKind.PD_SENDING, abort=self._abort_prefill_transfer
+        )
         self.disagg_decode_prealloc_queue = None
         self.disagg_decode_transfer_queue = None
 
@@ -1630,20 +1716,10 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
-            # The prefill requests that are in the middle of kv sending
-            self.disagg_prefill_inflight_queue: List[Req] = []
-            # Requests with a sent chunk that are not yet on the inflight queue.
+            # Requests with a sent chunk that are not yet on the transfer queue.
             self.disagg_prefill_pending_chunk_rids: Set[str] = set()
 
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
-
-        if (
-            self.enable_unified_memory
-            and self.disaggregation_mode != DisaggregationMode.NULL
-        ):
-            self.token_to_kv_pool_allocator.set_disagg_move_gate(
-                unified_memory_disagg_move_gate(self)
-            )
 
         # Init mm receiver for EPD disaggregation mode
         if get_disagg().language_only and get_disagg().encoder_transfer_backend in [
@@ -1655,6 +1731,16 @@ class Scheduler(
                 dtype=self.model_config.dtype,
                 hf_config=self.model_config.hf_config,
                 scheduler=self,
+            )
+
+    def maybe_init_disaggregation_pin_source(self):
+        # A role switch rebuilds PD queues, but the allocator keeps its pins.
+        if self.disaggregation_mode != DisaggregationMode.NULL:
+            storage = kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            )
+            storage.add_pin_source(
+                storage.sub_pool_names(), disagg_transfers_in_flight(self)
             )
 
     def init_overlap(self):
@@ -1708,7 +1794,9 @@ class Scheduler(
         self.forward_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.forward_stream
         )
-        self.copy_stream: CudaStream = self.device_module.Stream()
+        self.copy_stream: CudaStream = self.device_module.Stream(
+            priority=envs.SGLANG_PLB_STREAM_PRIORITY.get()
+        )
         self.copy_stream_ctx: CudaStreamContext = self.device_module.stream(
             self.copy_stream
         )
@@ -1777,6 +1865,24 @@ class Scheduler(
                 self.truncation_align_size, dsa_index_kpool
             )
 
+    def init_mamba_truncation_align(self):
+        """Under DCP a mamba checkpoint may only be donated where the cached
+        prefix sits on the kernel chunk grid, so a chunk that stops anywhere
+        else costs the request every donation it would have made after that.
+        Without DCP the prefix-relative rule already donates, so leave the
+        existing alignment alone. Use the LCM to preserve any alignment that
+        is already set."""
+        chunk_size = mamba_prefill_chunk_grid()
+        if chunk_size <= 1:
+            return
+
+        if self.truncation_align_size is None:
+            self.truncation_align_size = chunk_size
+        else:
+            self.truncation_align_size = math.lcm(
+                self.truncation_align_size, chunk_size
+            )
+
     def check_truncation_align_fits_chunk(self):
         """A chunk shorter than the alignment truncates to zero tokens, so a prompt
         longer than the chunk would wait in the queue forever."""
@@ -1816,6 +1922,7 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (ReleaseUocrDocReqInput, self.release_uocr_doc),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -1843,6 +1950,10 @@ class Scheduler(
                 (
                     EndWeightUpdateReqInput,
                     self.weight_updater.end_weight_update,
+                ),
+                (
+                    PluginWeightUpdateReqInput,
+                    self.weight_updater.plugin_weight_update,
                 ),
                 (
                     UpdateWeightsFromDistributedReqInput,
@@ -1886,6 +1997,7 @@ class Scheduler(
                 (ShutdownReq, self.handle_shutdown),
                 (GetInternalStateReq, self.get_internal_state),
                 (SetInternalStateReq, self.set_internal_state),
+                (GetHiCacheL3LayoutReq, self.get_hicache_l3_cache_layout),
                 (RpcReqInput, self.handle_rpc_request),
                 (ExpertDistributionReq, self.expert_distribution_handle),
                 (LoadLoRAAdapterReqInput, self.load_lora_adapter),
@@ -1924,6 +2036,8 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        result_dict["hicache_object_layout"] = self._hicache_l3_layout()
+
         if get_serving().grpc_port is not None and not (
             get_serving().smg_grpc_mode or get_serving().grpc_mode
         ):
@@ -1935,6 +2049,9 @@ class Scheduler(
         return result_dict
 
     def release_host_resources(self) -> None:
+        self.request_receiver.close()
+        if self.uocr_runtime is not None:
+            self.uocr_runtime.close()
         # Release pinned host buffers in userspace on graceful shutdown; see
         # HostKVCache.destroy. Called from run_scheduler_process's finally.
         if self.hisparse_coordinator is not None:
@@ -1979,7 +2096,7 @@ class Scheduler(
                 )
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
-        self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
+        self._war_barrier_enabled = is_war_barrier_enabled()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
             dispatch_event_loop(self)
@@ -1996,6 +2113,10 @@ class Scheduler(
             self.schedule_stream.wait_event(ev)
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
+
+    def increment_scheduler_iterations(self) -> None:
+        if get_observability().enable_metrics:
+            self.metrics_collector.increment_scheduler_iterations()
 
     @DynamicGradMode()
     def event_loop_normal(self):
@@ -2019,6 +2140,7 @@ class Scheduler(
                 if mps_runner is not None:
                     mps_runner.drain(discard=True)
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             incoming = self.ingest_requests()
@@ -2049,8 +2171,7 @@ class Scheduler(
 
             # Update last_batch
             self.last_batch = batch
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2068,12 +2189,27 @@ class Scheduler(
         while True:
             if self.gracefully_exit:
                 break
+            self.increment_scheduler_iterations()
 
             # Receive requests
             self.ingest_requests()
             if self._engine_paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
+
+            process_last_batch_early = self.should_process_last_batch_early(
+                self.last_batch
+            )
+            if process_last_batch_early:
+                pop_and_process()
+                # Opportunistic flush at the early-processing sync boundary:
+                # forward_stream is idle (prev forward drained, next not launched),
+                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
+                if self.enable_unified_memory:
+                    try:
+                        self.token_to_kv_pool_allocator.flush_opportunistic()
+                    except Exception:
+                        pass
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2082,22 +2218,6 @@ class Scheduler(
             self.running_batch = plan.running_batch
             batch = plan.batch_to_run
             self.cur_batch_for_debug = batch
-            disable_overlap_for_batch = self.is_disable_overlap_for_batch(
-                batch, last_batch=self.last_batch
-            )
-
-            # If we do not need to overlap the current batch with the last batch,
-            # we can process the last batch immediately.
-            if disable_overlap_for_batch:
-                pop_and_process()
-                # Opportunistic flush at the disable_overlap sync boundary:
-                # forward_stream is idle (prev forward drained, next not launched),
-                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.enable_unified_memory:
-                    try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
-                    except Exception:
-                        pass
 
             # Launch the current batch
             if batch:
@@ -2111,7 +2231,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not disable_overlap_for_batch:
+                if not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2125,46 +2245,28 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
-            if envs.SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY.get():
-                self.invariant_checker.self_check_during_busy()
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
-    def is_disable_overlap_for_batch(
-        self, batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
+    def should_process_last_batch_early(
+        self, last_batch: Optional[ScheduleBatch]
     ) -> bool:
-        # For two consecutive prefill batches, we disable overlap to improve the TTFT of the first batch.
-        # This might slightly hurt the throughput, so we use an environment variable to control it.
-        # In DP attention mode, use the globally synchronized is_extend_in_batch
-        # so all DP ranks make the same overlap decision (avoiding deadlock).
-        # In non-DP mode, use the local forward_mode directly.
-        if self.require_mlp_sync:
-            is_extend = lambda b: b and b.is_extend_in_batch
-        else:
-            is_extend = lambda b: b and b.forward_mode.is_extend()
+        """Whether to process the last result before scheduling the next batch,
+        not after launching it, so the requests it finishes are never launched."""
+        if last_batch is None:
+            return False
 
-        batch_is_extend = is_extend(batch)
-        last_batch_is_extend = is_extend(last_batch)
+        # A prefill's result goes early, for its TTFT. Under DP, is_extend_in_batch is
+        # synced, so all ranks decide the same (no deadlock).
+        if envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.get():
+            if self.require_mlp_sync:
+                last_batch_is_extend = last_batch.is_extend_in_batch
+            else:
+                last_batch_is_extend = last_batch.forward_mode.is_extend()
+            if last_batch_is_extend:
+                return True
 
-        disable_overlap_for_batch = (
-            envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.get()
-            and batch_is_extend
-            and last_batch_is_extend
-        )
-
-        # Sync so the FSM advance lands before the next batch's bitmask. Permanent
-        # path for host-draft algorithms, not a pending migration.
-        need_grammar_sync = (
-            batch
-            and not batch.spec_algorithm.is_none()
-            and batch.grammar_needs_sync()
-            and batch.forward_mode.is_decode()
-            and len(self.result_queue) > 0
-        )
-
-        # Algorithms that support grammar overlap advance the FSM inside verify()
-        # via the grammar barrier (overlapping the target forward), which resolves
-        # whatever result is still pending in the queue — including the
-        # extend->decode boundary — so no grammar-specific overlap disable is needed.
-        return disable_overlap_for_batch or need_grammar_sync
+        # The next batch's grammar bitmask needs this result's FSM advance.
+        return last_batch.grammar_needs_sync()
 
     def _advance_pending_grammar(self):
         """Grammar barrier (spec-v2 overlap): advance the FSM over any not-yet
@@ -2186,6 +2288,10 @@ class Scheduler(
         The one place a new per-iteration input source belongs; the return
         value exists for the pipeline stages that relay requests onward.
         """
+        if self.uocr_runtime is not None:
+            # Document windows released while their predecessor's KV was freed.
+            for req in self.uocr_runtime.take_released():
+                self._add_request_to_queue(req)
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
@@ -2271,6 +2377,7 @@ class Scheduler(
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
         else:
+            self.output_streamer.release_detokenize_state(req)
             self.ipc_channels.send_to_tokenizer.send_output(abort_req, req)
 
     def send_control_output(self, output, recv_req) -> None:
@@ -2331,7 +2438,7 @@ class Scheduler(
             local_error = None
             try:
                 if not isinstance(tokenized_req.mm_inputs, MultimodalInputs):
-                    tokenized_req.mm_inputs = MultimodalInputs.from_processor_output(
+                    tokenized_req.mm_inputs = self.mm_feature_receive_budget.materialize(
                         tokenized_req.mm_inputs,
                         requires_mm_token_modalities=self.model_config.requires_mm_token_modalities,
                     )
@@ -2410,6 +2517,15 @@ class Scheduler(
     def init_grammar_manager(self) -> None:
         self.grammar_manager = GrammarManager(self)
 
+    def maybe_init_mm_feature_receive_budget(self) -> None:
+        self.mm_feature_receive_budget = None
+        if get_mm().mm_feature_transport == "cuda_vmm":
+            self.mm_feature_receive_budget = ReceiveFeatureBudget(
+                device_index=torch.cuda.current_device(),
+                # Reserved per rank out of the KV budget by mm_runtime_reservation_gb.
+                gpu_budget_bytes=envs.SGLANG_MM_FEATURE_CACHE_MB.get() << 20,
+            )
+
     def maybe_init_scripted_scheduler_hook(self) -> None:
         if envs.SGLANG_TEST_SCRIPTED_RUNTIME.get():
             from sglang.test.scripted_runtime.scheduler_hook import (
@@ -2433,29 +2549,75 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         )
 
-    def maybe_init_rust_server(self) -> None:
+    def maybe_init_rust_server(self, port_args: PortArgs) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
         ``RustServer`` (scheduler_components/rust_scheduler.py)."""
 
-        if not self._hosts_rust_server():
+        hosts_listener = self._hosts_rust_server()
+        # A collective: every rank takes part so the listener ranks learn
+        # every other listener's address, for control-request fan-out.
+        self.rust_server_endpoints = (
+            self.get_rust_server_class().gather_server_endpoints(hosts_listener)
+            if envs.SGLANG_RUST_SERVER.get()
+            else []
+        )
+        # Also a collective: attention-DP listeners sharing one CPU mask split it.
+        frontend_cpu_share = (
+            self.get_rust_server_class().gather_frontend_cpu_share(hosts_listener)
+            if envs.SGLANG_RUST_SERVER.get()
+            else (0, 1)
+        )
+        if not hosts_listener:
             # Always define the attribute: init_output_streamer and the
             # process_input_requests hook read self.rust_server unconditionally.
             self.rust_server = None
             return
 
-        rust_server = self.get_rust_server_class().launch(self)
+        rust_server = self.get_rust_server_class().launch(
+            self, frontend_cpu_share=frontend_cpu_share
+        )
+        rust_server.install_sigterm_drain(
+            notify=drain_notify_name(port_args.instance_id),
+            hold_drain_end=self._holds_rust_drain_end(),
+        )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver
         # drains its request ring (rust_server_mode) instead of a zmq socket.
         self.recv_from_tokenizer = rust_server
-        # Park the idle loop on the request ring within the rank-0 rust-server
+        # The idle loop parks in the server's wait_request, on the request ring
+        # only with --sleep-on-idle (see RustServer.wait_request).
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
 
+    def _holds_rust_drain_end(self) -> bool:
+        """Whether this listener's drain ends only once every attention-DP
+        listener closed (``RustServer.on_drain_rows``): its ``ShutdownReq``
+        stops every rank. The DP groups share their drain state through the
+        MLP-sync gather of every step, which PP > 1 and
+        ``SGLANG_SCHEDULER_SKIP_ALL_GATHER`` do not run."""
+        parallel = get_parallel()
+        if parallel.attn_dp_size == 1 or parallel.tp_rank != 0:
+            return False
+        if (
+            parallel.dp_size == 1
+            and len(self.rust_server_endpoints) == parallel.attn_dp_size
+            and self.require_mlp_sync
+            and not should_skip_scheduler_all_gather(parallel.num_dp_ranks)
+            and parallel.pp_size == 1
+            and MLP_SYNC_CARRIES_DRAIN_STATE
+        ):
+            return True
+        logger.warning(
+            "rust server: no per-step MLP-sync gather between the attention-DP "
+            "listeners; DP rank 0's drain ends once its own listener closed, so "
+            "the other DP listeners' last requests may be cut"
+        )
+        return False
+
     def get_prefill_adder_class(self) -> type[PrefillAdder]:
-        return PrefillAdder
+        return UocrPrefillAdder if self.uocr_runtime is not None else PrefillAdder
 
     def get_rust_server_class(self) -> type[RustServer]:
         return RustServer
@@ -2463,8 +2625,46 @@ class Scheduler(
     def rust_server_tokenizer_path(self) -> str:
         return get_serving().tokenizer_path
 
+    def _target_model_runner(self) -> "ModelRunner":
+        # Spec workers have no .model_runner of their own.
+        target_worker = (
+            self.tp_worker.target_worker
+            if isinstance(self.tp_worker, BaseSpecWorker)
+            else self.tp_worker
+        )
+        return target_worker.model_runner
+
+    def maybe_init_uocr_runtime(self) -> None:
+        """Initialize Unlimited-OCR v2 split-document KV reuse and prefetch."""
+        if not is_unlimited_ocr_v2(self.model_config.hf_config):
+            return
+        runner = self._target_model_runner()
+        self.uocr_runtime = UocrSchedulerRuntime(
+            tree_cache=self.tree_cache,
+            crop_transfer=runner.model.crop_transfer,
+            enable_overlap=self.enable_overlap,
+            attn_backend=runner.attn_backend,
+            early_embeddings=runner.model.early_embeddings,
+            device=torch.device(runner.device),
+            forward_stream=runner.forward_stream,
+            tp_size=get_parallel().tp_size,
+            decode_graph_io=lambda: resolve_uocr_decode_graph_io(
+                runner.decode_cuda_graph_runner
+            ),
+            abort_windows=self._abort_uocr_doc_windows,
+        )
+        self.resolve_forward_inputs = self.uocr_runtime.resolve_forward_inputs
+
     def init_request_receiver(self) -> None:
-        self.request_receiver = SchedulerRequestReceiver(
+        receiver_factory = SchedulerRequestReceiver
+        if self.uocr_runtime is not None:
+            receiver_factory = partial(
+                self.uocr_runtime.create_request_receiver,
+                parallel=get_parallel(),
+                attn_dp_enabled=self.attn_dp_enabled,
+                mm_feature_transport=get_mm().mm_feature_transport,
+            )
+        self.request_receiver = receiver_factory(
             recv_from_tokenizer=self.recv_from_tokenizer,
             recv_from_rpc=self.ipc_channels.recv_from_rpc,
             recv_skipper=self.recv_skipper,
@@ -2475,6 +2675,7 @@ class Scheduler(
             max_recv_per_poll=self.max_recv_per_poll,
             stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
             get_last_batch=lambda: self.last_batch,
+            rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
@@ -2497,40 +2698,73 @@ class Scheduler(
             enable_overlap=self.enable_overlap,
             spec_algorithm=self.spec_algorithm,
             get_require_mlp_sync=lambda: self.require_mlp_sync,
+            get_shutting_down=lambda: self.gracefully_exit,
+            on_peer_shutdown=self.handle_peer_shutdown,
+            **self._dp_drain_column_callbacks(),
         )
 
+    def _dp_drain_column_callbacks(self) -> dict:
+        """The listener drain state this rank gathers (``DPDrainColumn``), and
+        on a listener-hosting rank what to do with every DP group's."""
+        if self.rust_server is not None:
+            return dict(
+                get_drain_state=self.rust_server.drain_state,
+                on_drain_rows=self.rust_server.on_drain_rows,
+            )
+        if envs.SGLANG_RUST_SERVER.get():
+            return dict(get_drain_state=lambda: DRAIN_STATE_NO_LISTENER)
+        return {}
+
     def init_pool_stats_observer(self) -> None:
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
+        storage = kv_storage_of(
+            self.req_to_token_pool,
+            self.token_to_kv_pool_allocator,
+            shape=StaticPoolShape(
+                has_window=self.is_hybrid_swa,
+                has_state=self.is_hybrid_ssm,
+                # Match the allocator and radix counters' logical units.
+                token_capacity=global_tokens,
+                full_tokens_per_layer=self.full_tokens_per_layer,
+                swa_tokens_per_layer=self.swa_tokens_per_layer,
+            ),
+        )
         self.pool_stats_observer = SchedulerPoolStatsObserver(
             tree_cache=self.tree_cache,
+            storage=storage,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            req_to_token_pool=self.req_to_token_pool,
             session_controller=self.session_controller,
             hisparse_coordinator=self.hisparse_coordinator,
-            is_hybrid_swa=self.is_hybrid_swa,
-            is_hybrid_ssm=self.is_hybrid_ssm,
             enable_hisparse=self.enable_hisparse,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            # Match the allocator and radix counters' logical units.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
         )
 
     def init_invariant_checker(self) -> None:
         self.invariant_checker = SchedulerInvariantChecker(
-            is_hybrid_swa=self.is_hybrid_swa,
-            is_hybrid_ssm=self.is_hybrid_ssm,
             disaggregation_mode=self.disaggregation_mode,
-            page_size=self.page_size,
-            full_tokens_per_layer=self.full_tokens_per_layer,
-            swa_tokens_per_layer=self.swa_tokens_per_layer,
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            page_size=self.logical_page_size,
             tree_cache=self.tree_cache,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             req_to_token_pool=self.req_to_token_pool,
             pool_stats_observer=self.pool_stats_observer,
-            get_last_batch=lambda: self.last_batch,
-            get_running_batch=lambda: self.running_batch,
+            get_request_lists=self.request_lists,
             get_chunked_req=lambda: self.chunked_req,
+            get_running_batches=lambda: (
+                self.running_batch,
+                *(self.running_mbs if get_parallel().pp_size > 1 else ()),
+            ),
+            get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            # Hisparse pool counters diverge during host backup (see the
+            # _get_swa_token_info clamp), and pending deferred KV releases hold
+            # pages out of the allocator by design.
+            get_skip_idle_pool_checks=lambda: (
+                self.enable_hisparse
+                or (
+                    self.disaggregation_mode == DisaggregationMode.DECODE
+                    and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
+                )
+            ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
@@ -2583,11 +2817,14 @@ class Scheduler(
             maxlen=PAUSE_WINDOWS_MAX
         )
         self._pause_started_at: Optional[float] = None
+        global_tokens = self.max_total_num_tokens * self.kv_shard_widening
+        if is_cp_sharded_padded():
+            global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
             server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
-            max_total_num_tokens=self.max_total_num_tokens * self.kv_shard_widening,
+            max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
             pool_stats_observer=self.pool_stats_observer,
             tp_worker=self.tp_worker,
@@ -2603,14 +2840,8 @@ class Scheduler(
             ),
             get_stats=lambda: self.metrics_reporter.stats,
             get_chunked_req=lambda: self.chunked_req,
-            get_disagg_prefill_bootstrap_queue=lambda: (
-                self.disagg_prefill_bootstrap_queue
-            ),
-            get_disagg_prefill_inflight_queue=lambda: (
-                self.disagg_prefill_inflight_queue
-            ),
+            get_request_lists=self.request_lists,
             get_disagg_decode_prealloc_queue=lambda: self.disagg_decode_prealloc_queue,
-            get_disagg_decode_transfer_queue=lambda: self.disagg_decode_transfer_queue,
             get_spec_total_num_accept_tokens=lambda: (
                 self.metrics_reporter.spec_total_num_accept_tokens
             ),
@@ -2625,6 +2856,14 @@ class Scheduler(
             get_waiting_storage_span=self.tree_cache.waiting_storage_span,
         )
 
+    def init_kv_weight_version_tracker(self) -> None:
+        self.kv_weight_version_tracker = KvWeightVersionTracker.maybe_create(
+            server_args=self.server_args,
+            model_config=self.model_config,
+            allocator=self.token_to_kv_pool_allocator,
+            req_to_token_pool=self.req_to_token_pool,
+        )
+
     def init_output_streamer(self) -> None:
         self.output_streamer = self.get_output_streamer_class()(
             send_to_detokenizer=self.ipc_channels.send_to_detokenizer,
@@ -2633,14 +2872,29 @@ class Scheduler(
             is_generation=self.is_generation,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
+            skip_tokenizer_init=self.skip_tokenizer_init,
             enable_hicache_storage=lambda: (
                 self.enable_hicache_storage or self.enable_lmcache
             ),
             rust_server=self.rust_server,
+            uocr_runtime=self.uocr_runtime,
         )
 
     def get_output_streamer_class(self) -> type[SchedulerOutputStreamer]:
         return SchedulerOutputStreamer
+
+    def init_deferred_responses(self) -> None:
+        self.deferred_responses = DeferredResponses(
+            disaggregation_mode=self.disaggregation_mode,
+            output_streamer=self.output_streamer,
+            send_abort=lambda req, finished_reason: self.send_abort_output(
+                make_abort_req(req, finished_reason=finished_reason), req
+            ),
+        )
+
+    def defer_response(self, req: Req, completion: ResponseCompletion) -> None:
+        """Hold a finished response until completion; see deferred_output."""
+        self.deferred_responses.defer(req, completion)
 
     def init_beam_coordinator(self) -> None:
         self.beam_coordinator = BeamCoordinator(
@@ -2654,8 +2908,16 @@ class Scheduler(
             future_map=self.future_map,
         )
 
+    def init_request_retirer(self) -> None:
+        self.request_retirer = RequestRetirer(
+            tree_cache=self.tree_cache,
+            beam_coordinator=self.beam_coordinator,
+            hisparse_coordinator=self.hisparse_coordinator,
+            uocr_runtime=self.uocr_runtime,
+            send_abort_output=self.send_abort_output,
+        )
+
     def init_batch_result_processor(self) -> None:
-        self.init_beam_coordinator()
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
@@ -2666,6 +2928,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             hisparse_coordinator=self.hisparse_coordinator,
             req_to_token_pool=self.req_to_token_pool,
+            kv_weight_version_tracker=self.kv_weight_version_tracker,
             decode_offload_manager=self.decode_offload_manager,
             metrics_collector=self.metrics_collector,
             metrics_reporter=self.metrics_reporter,
@@ -2676,7 +2939,10 @@ class Scheduler(
             ),
             output_streamer=self.output_streamer,
             beam_coordinator=self.beam_coordinator,
+            request_retirer=self.request_retirer,
             abort_request=self.abort_request,
+            uocr_runtime=self.uocr_runtime,
+            leave_prefill_launched=self.prefill_launched_reqs.leave,
         )
 
     def init_internal_state(self) -> None:
@@ -2715,6 +2981,16 @@ class Scheduler(
             self.max_total_num_tokens * self.kv_shard_widening
             - self.page_size * (self.kv_shard_widening - 1)
         )
+        if is_cp_sharded_padded():
+            token_capacity = from_cp_sharded(token_capacity)
+            # (-input_len) % size is padding to the next multiple of size.
+            # Replace physical-page padding and decode headroom with a CP group.
+            group_size = self.logical_page_size
+            group_padding = (-input_len) % group_size
+            page_padding = (-input_len) % self.page_size
+            extra_padding = group_padding - page_padding
+            extra_headroom = group_size - self.page_size
+            token_capacity -= extra_padding + extra_headroom
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
@@ -3124,7 +3400,7 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = _make_abort_req(
+            abort_req = make_abort_req(
                 req,
                 finished_reason={
                     "type": "abort",
@@ -3151,6 +3427,21 @@ class Scheduler(
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
                 return
+
+        if (
+            isinstance(self.spec_algorithm, SpeculativeAlgorithm)
+            and self.spec_algorithm.is_some()
+            and req.sampling_params.min_p > 0
+        ):
+            error_msg = (
+                f"min_p is not supported with {self.spec_algorithm.name} "
+                "speculative decoding; "
+                "disable min_p or speculative decoding."
+            )
+            req.set_finish_with_abort(error_msg)
+            self.init_req_max_new_tokens(req)
+            self._add_request_to_queue(req)
+            return
 
         if req.return_sampling_mask:
             if (
@@ -3313,15 +3604,26 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if get_parallel().pp_rank == 0 and getattr(
-            self.tree_cache.cache_controller, "pp_prefetch_command_group", None
-        ):
-            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
-            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+        self._bind_pp_arrival_prefetch(req, recv_req)
 
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
+
+    def _bind_pp_arrival_prefetch(self, req: Req, recv_req) -> None:
+        """PP0 decides the request's L3 ticket on arrival; every stage takes the
+        prefix match behind that decision at the same step."""
+        controller = self.tree_cache.cache_controller
+        if controller is None or controller.pp_prefetch_command_group is None:
+            return
+        if get_parallel().pp_rank == 0:
+            recv_req.pp_prefetch_ticketed = bool(self._prefetch_kvcache(req))
+            self.tree_cache.bind_prefetch_ticket(req.rid, recv_req.pp_prefetch_ticketed)
+            return
+        # PP0's ticket match refreshes the LRU and may split a node. A request the
+        # grammar queue holds back is enqueued (and matched) steps later, so take
+        # the same match here or the stages' trees drift apart in between.
+        req.init_next_round_input(self.tree_cache, cow_mamba=False)
 
     def handle_batch_generate_request(
         self,
@@ -3335,6 +3637,8 @@ class Scheduler(
             self.handle_generate_request(tokenized_req)
 
     def _prefetch_kvcache(self, req: Req, storage_hit_end: Optional[int] = None):
+        if self.enable_unified_cache_external_linker:
+            return self.tree_cache.linker.prefetch(req)
         if self.enable_hicache_storage or self.enable_lmcache:
             req.init_next_round_input(self.tree_cache, cow_mamba=False)
             tree_cache = self.tree_cache
@@ -3364,8 +3668,10 @@ class Scheduler(
                     and tree_cache.get_last_hash_value(last_host_node) is not None
                 )
             ):
-                match_end = req._compute_max_prefix_len(
-                    len(req.full_untruncated_fill_ids)
+                match_end = storage_prefetch_end(
+                    tree_cache,
+                    req,
+                    req._compute_max_prefix_len(len(req.full_untruncated_fill_ids)),
                 )
                 new_input_tokens = req.full_untruncated_fill_ids[matched_len:match_end]
                 prefix_keys = (
@@ -3449,32 +3755,22 @@ class Scheduler(
 
     def retire_unadmitted_request(self, req: Req) -> None:
         """Finish a request the disaggregation queues rejected at their door."""
-        # `create_req` marks a streaming session in-flight, and the pre-abort
-        # detach lives in `StreamingSession.find_active_slot`, which only runs
-        # while scheduling; a session left in-flight rejects every later request.
-        if req.session is not None and req.session.streaming:
-            req.release_mm_inputs_on_abort()
-            req.session.abort_req()
-            req.session = None
-        # `beam_coordinator.validate_and_init` counts the group in ahead of the
-        # checks that reject; no-op when the request has no group.
-        self.beam_coordinator.retire_group(req)
-        # PREFILL runs `_prefetch_kvcache` before its door, so even the
-        # one-token stub is registered with the cache by now:
-        # `prefetch_from_storage` arms the paced-retry set for this attempt's
-        # cache handle. Only a `finish`/ABORT and a `waiting_queue` sweep clear
-        # that, and a retired request reaches neither.
-        self._release_aborted_request(req)
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
+        # Holds no memory, but the detach still matters: `create_req` marked its
+        # streaming session in flight, and PREFILL's `_prefetch_kvcache` armed
+        # the cache's paced retry for its handle; nothing else clears either.
+        self.request_retirer.release(req, checkpoint=False)
+        # Like `find_active_slot`, the detached request also leaves its session.
+        if req.session is not None and req.session.streaming:
+            req.session = None
         self.output_streamer.stream_output([req], req.return_logprob)
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
-            self._release_aborted_request(req)
             return
         if is_retracted:
             req.storage_prefetch_retry_attempts = 0
@@ -3482,10 +3778,14 @@ class Scheduler(
             req.staged_prefetch_plan = None
         if self.disaggregation_mode == DisaggregationMode.NULL:
             if self._abort_on_queued_limit(req):
-                self._release_aborted_request(req)
                 return
             self._prefetch_kvcache(req)
-            self.waiting_queue.append(req)
+            if self.uocr_runtime is None:
+                self.waiting_queue.join([req])
+            elif not self.uocr_runtime.enqueue(
+                self.waiting_queue, req, is_retracted=is_retracted
+            ):
+                return
             req.time_stats.set_wait_queue_entry_time()
             req.arrival_processed_tokens = self.processed_tokens_counter
         elif self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -3524,25 +3824,34 @@ class Scheduler(
             and req.priority is not None
             and self.abort_on_priority_when_disabled
         ):
-            abort_req = _make_abort_req(
+            self._abort_unavailable(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": "Using priority is disabled for this server. Please send a new request without a priority.",
-                },
+                message="Using priority is disabled for this server. Please send a new request without a priority.",
             )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self.send_abort_output(abort_req, req)
             return False
         return True
 
-    def _release_aborted_request(self, req: Req) -> None:
-        """Drop the cache-side state an aborted request left behind."""
-        req.release_mm_inputs_on_abort()
-        self.tree_cache.finish(req.cache_request_handle, CacheRequestOutcome.ABORT)
-        if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+    def _abort_unavailable(self, req: Req, *, message: str) -> None:
+        self.request_retirer.abort(
+            req,
+            reason=FINISH_ABORT(message, HTTPStatus.SERVICE_UNAVAILABLE),
+            finished_reason={
+                "type": "abort",
+                "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                "message": message,
+            },
+        )
+        req.time_stats.trace_ctx.abort(abort_info={"reason": message})
+
+    def _abort_uocr_doc_windows(
+        self,
+        reqs: List[Req],
+        *,
+        finished_reason: Optional[FinishReasonDict] = None,
+    ) -> None:
+        """Abort document windows held off the waiting queue."""
+        for req in reqs:
+            self.request_retirer.abort(req, finished_reason=finished_reason)
 
     def _abort_on_queued_limit(self, recv_req: Req) -> bool:
         """Abort an incoming or existing request if the waiting queue is full. Returns True if the incoming request is aborted."""
@@ -3552,43 +3861,33 @@ class Scheduler(
         ):
             return False
 
-        # Reject the incoming request by default.
-        req_to_abort = recv_req
-        message = "The request queue is full."
         if self.enable_priority_scheduling:
             # With priority scheduling, consider aboritng an existing request based on the priority.
             # direction = 1  => smaller number = higher priority; -1 => larger number = higher priority.
             # max(...) + (direction * priority, queue_time_start) picks the least-preferred request.
             # Tie: later queue_time_start (newer) is evicted first. Preempt only if strictly better.
             direction = 1 if self.schedule_low_priority_values_first else -1
-            key_fn = lambda item: (
-                direction * item[1].priority,
-                item[1].time_stats.wait_queue_entry_time,
+            key_fn = lambda req: (
+                direction * req.priority,
+                req.time_stats.wait_queue_entry_time,
             )
-            idx, candidate_req = max(enumerate(self.waiting_queue), key=key_fn)
+            candidate_req = max(self.waiting_queue, key=key_fn)
             abort_existing_req = (
                 direction * recv_req.priority < direction * candidate_req.priority
             )
             if abort_existing_req:
-                self._release_aborted_request(candidate_req)
-                self.waiting_queue.pop(idx)
-                self.beam_coordinator.retire_group(candidate_req)
-                req_to_abort = candidate_req
-                message = "The request is aborted by a higher priority request."
+                self.waiting_queue.leave([candidate_req])
+                self._abort_unavailable(
+                    candidate_req,
+                    message="The request is aborted by a higher priority request.",
+                )
+                # An evicted request sharing the incoming rid refuses it too.
+                if candidate_req.rid != recv_req.rid:
+                    return False
 
-        self.send_abort_output(
-            _make_abort_req(
-                req_to_abort,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
-                    "message": message,
-                },
-            ),
-            req_to_abort,
-        )
-        req_to_abort.time_stats.trace_ctx.abort(abort_info={"reason": message})
-        return req_to_abort.rid == recv_req.rid
+        # Reject the incoming request by default.
+        self._abort_unavailable(recv_req, message="The request queue is full.")
+        return True
 
     def _poll_timeout_aborts(self) -> List[AbortReq]:
         """Emit aborts only; every rank must drop the same requests in the
@@ -3678,6 +3977,7 @@ class Scheduler(
             routed_dp_rank=recv_req.routed_dp_rank,
             priority=recv_req.priority,
             dimensions=recv_req.dimensions,
+            encoding_format=recv_req.encoding_format,
             lora_id=recv_req.lora_id,
             http_worker_ipc=recv_req.http_worker_ipc,
             time_stats=recv_req.time_stats,
@@ -3764,6 +4064,17 @@ class Scheduler(
         for tokenized_req in recv_req:
             self.handle_embedding_request(tokenized_req)
 
+    @property
+    def chunked_req(self) -> Optional[Req]:
+        """The request between two chunks of its prefill, or None."""
+        return next(iter(self.chunked_reqs), None)
+
+    @chunked_req.setter
+    def chunked_req(self, req: Optional[Req]) -> None:
+        self.chunked_reqs.clear()
+        if req is not None:
+            self.chunked_reqs.join([req])
+
     def stash_chunked_request(self, req: Req):
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
             self.checkpoint_disagg_prefill(req)
@@ -3777,8 +4088,8 @@ class Scheduler(
         (tearing it down mid-iteration is unsafe). Clearing ``chunked_req`` here at
         the top of the scheduling step stops the next chunk from launching; the
         chunk already launched is drained when its result is resolved. Under overlap
-        the result lands a step later, so the batch-result processors keep
-        ``inflight_middle_chunks`` accounting intact and skip the aborted chunk:
+        the result lands a step later; its batch still names the request as its
+        ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
         ``process_batch_result_prefill`` via its chunked branch (the finished req
         is excluded from streaming and its logprob offset is still accounted).
@@ -3802,24 +4113,16 @@ class Scheduler(
         reason = req.discard_output_reason or FINISH_ABORT("Aborted")
         prepare_abort(req, reason.message, reason.status_code)
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.to_finish = None
+        req.clear_requested_finish()
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.clear_pending_chunk_send(req)
-            req.disagg_kv_sender.abort()
-            maybe_release_metadata_buffer(
-                req, self.req_to_metadata_buffer_idx_allocator
-            )
-            req.pending_bootstrap = False
-        self._release_aborted_request(req)
-        release_kv_cache(req, self.tree_cache, checkpoint=False)
+            self.release_prefill_sender(req, abort_sender=True)
+        # A client abort leaves the message to the tokenizer.
+        self.request_retirer.abort(
+            req, finished_reason=req.discard_output_reason and reason.to_json()
+        )
 
         self.chunked_req = None
         self._pending_chunked_abort_req = None
-        # A client abort leaves the message to the tokenizer.
-        finished_reason = req.discard_output_reason and reason.to_json()
-        self.send_abort_output(
-            _make_abort_req(req, finished_reason=finished_reason), req
-        )
         logger.debug(f"Abort chunked prefill request. {req.rid=}")
 
     def _build_hisparse_decode_batch(self, reqs):
@@ -3873,8 +4176,9 @@ class Scheduler(
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
     ) -> None:
-        # The HiCache drain is TP-wide consensus; run it before rank-local
-        # decisions (_should_defer_prefill) or ranks enter different collectives.
+        # The HiCache drain is consensus over one DP rank's attention TP and CP
+        # ranks, not TP-wide; run it before rank-local decisions
+        # (_should_defer_prefill) or ranks enter different collectives.
         if (
             self.enable_hierarchical_cache
             or get_memory().enable_flexkv
@@ -3918,6 +4222,7 @@ class Scheduler(
             ready_reqs = self.hisparse_coordinator.collect_ready_reqs()
             if len(ready_reqs) > 0:
                 new_batch = self._build_hisparse_decode_batch(ready_reqs)
+                self.running_reqs.join(new_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = new_batch
                 else:
@@ -3949,6 +4254,9 @@ class Scheduler(
             # DP attention converted to extend is last_batch itself: filtered
             # in place above, nothing to merge.
             if not last_batch.is_empty() and last_batch is not running_batch:
+                # Its launched prefills start running at the merge.
+                self.prefill_launched_reqs.leave(last_batch.reqs)
+                self.running_reqs.join(last_batch.reqs)
                 if running_batch.is_empty():
                     running_batch = last_batch
                 else:
@@ -4109,11 +4417,22 @@ class Scheduler(
         ):
             return None, running_batch
 
+        num_allocatable_reqs = self.get_num_allocatable_reqs(
+            running_bs, running_batch=running_batch
+        )
+        if running_bs == 0 and self.chunked_req is None and num_allocatable_reqs <= 0:
+            if self.get_prefill_adder_class().release_request_slot(
+                self.tree_cache, self.waiting_queue
+            ):
+                num_allocatable_reqs = self.get_num_allocatable_reqs(
+                    running_bs, running_batch=running_batch
+                )
+
         # A chunked request skips this check: it keeps its req_to_token row across
         # chunks, and under PP it (or a dllm request) may finish in another
         # microbatch, so holding it back here would leak its memory.
         if (
-            self.get_num_allocatable_reqs(running_bs, running_batch=running_batch) <= 0
+            num_allocatable_reqs <= 0
             and self.chunked_req is None
             and not self.enable_priority_preemption
         ):
@@ -4121,10 +4440,17 @@ class Scheduler(
             return None, running_batch
 
         # Get priority queue
-        self.policy.calc_priority(
-            self.waiting_queue,
-            running_batch,
-            processed_tokens=self.processed_tokens_counter,
+        self.waiting_queue.replace(
+            self.policy.calc_priority(
+                self.waiting_queue,
+                running_batch,
+                processed_tokens=self.processed_tokens_counter,
+                bootstrap_queue=(
+                    self.disagg_prefill_bootstrap_queue.queue
+                    if self.disagg_prefill_bootstrap_queue is not None
+                    else []
+                ),
+            )
         )
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
@@ -4166,6 +4492,8 @@ class Scheduler(
             dllm_config=self.dllm_config,
             waiting_queue_len=len(self.waiting_queue),
             prefill_tile_block_m=prefill_tile_block_m,
+            request_retirer=self.request_retirer,
+            kv_awaiting_transfer=bool(self.disagg_prefill_transfer_queue),
         )
 
         if self.chunked_req is not None:
@@ -4179,19 +4507,31 @@ class Scheduler(
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
 
         if self.enable_lora:
-            running_loras = {
-                req.lora_id for req in running_batch.reqs if not req.finished()
-            }
+            running_reqs = running_batch.reqs
+            if get_parallel().pp_size > 1:
+                running_reqs = [*running_reqs, *self._get_all_pp_reqs()]
+            running_loras = {req.lora_id for req in running_reqs if not req.finished()}
+
             # Account for LoRAs that are already loaded in the adder, such as chunked requests
             running_loras.update(req.lora_id for req in adder.can_run_list)
 
             if self.lora_drainer:
+                lora_manager = self.tp_worker.model_runner.lora_manager
                 self.lora_drainer.update_draining_state(
                     self.waiting_queue,
-                    running_batch.reqs,
+                    [*running_reqs, *adder.can_run_list],
+                    pinned_loras=(
+                        {
+                            uid
+                            for uid, ref in lora_manager.lora_refs.items()
+                            if ref.pinned
+                        }
+                        if lora_manager.num_pinned_loras
+                        else None
+                    ),
                 )
 
-        mamba_allocator = getattr(self.req_to_token_pool, "mamba_allocator", None)
+        mamba_allocator = self.token_to_kv_pool_allocator.state_slots
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
@@ -4232,7 +4572,11 @@ class Scheduler(
                 ):
                     break
 
-            if self.enable_hicache_storage or self.enable_lmcache:
+            if (
+                self.enable_hicache_storage
+                or self.enable_lmcache
+                or self.enable_unified_cache_external_linker
+            ):
                 prefetch_done = self.tree_cache.check_prefetch_progress(
                     req.cache_request_handle
                 )
@@ -4253,6 +4597,8 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if adder.should_defer(req):
+                break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)
             ):
@@ -4273,9 +4619,8 @@ class Scheduler(
 
             if res != AddReqResult.CONTINUE:
                 if res == AddReqResult.NO_TOKEN:
-                    # Set batch_is_full after making sure there are requests that can be served
-                    running_batch.batch_is_full = len(adder.can_run_list) > 0 or (
-                        not running_batch.is_empty()
+                    running_batch.batch_is_full = adder.batch_is_full_after_rejection(
+                        req
                     )
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
@@ -4288,14 +4633,14 @@ class Scheduler(
                     req.kv.mamba_cow_src_index = None
                     req.kv.mamba_needs_clear = False
                     if req.kv.holds_mamba and not getattr(req, "session", None):
-                        self.tree_cache.req_to_token_pool.mamba_allocator.free(
-                            req.kv.mamba_pool_idx.unsqueeze(-1)
-                        )
-                        req.kv.mamba_pool_idx = None
+                        kv_storage_of(
+                            self.req_to_token_pool, self.token_to_kv_pool_allocator
+                        ).release_state_slot(req)
                 break
 
         if mamba_allocator is not None:
             mamba_allocator.alloc_group_end()
+        self.running_reqs.leave(adder.preempt_list)
 
         # Update waiting queue
         can_run_list: List[Req] = adder.can_run_list
@@ -4311,7 +4656,7 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
-        self.waiting_queue = [x for x in self.waiting_queue if x not in can_run_set]
+        self.waiting_queue.leave(can_run_set)
         if adder.preempt_list:
             for req in adder.preempt_list:
                 self._add_request_to_queue(req)
@@ -4320,9 +4665,6 @@ class Scheduler(
             # Update chunked prefill
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
-
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4338,8 +4680,9 @@ class Scheduler(
             chunked_req=self.chunked_req,
         )
 
-        new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+        # A parked chunked request runs no chunk in this batch.
+        new_batch.contains_last_prefill_chunk = len(can_run_list) != int(
+            self.chunked_req in can_run_set
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -4353,7 +4696,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.swa_evict_floor = req.extend_end
+                req.kv.shield_swa_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4436,17 +4779,98 @@ class Scheduler(
                 new_lora_set
             )
 
+    def _get_all_pp_reqs(self) -> List[Req]:
+        return [
+            req
+            for batch in (*self.running_mbs, *self.mbs)
+            if batch is not None
+            for req in batch.reqs
+            if not req.finished()
+        ]
+
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        """The lists that hold the live requests, by kind. A request is in at
+        most one."""
+        lists = {
+            ListKind.WAITING: self.waiting_queue,
+            ListKind.GRAMMAR: self.grammar_manager.grammar_queue,
+            ListKind.CHUNKED: self.chunked_reqs,
+            ListKind.PREFILL_LAUNCHED: self.prefill_launched_reqs,
+            ListKind.DECODING: self.running_reqs,
+        }
+        # Read at call time: a PD role switch rebuilds the PD queues.
+        if self.disagg_prefill_bootstrap_queue is not None:
+            lists[ListKind.PD_BOOTSTRAP] = self.disagg_prefill_bootstrap_queue.queue
+        lists[ListKind.PD_SENDING] = self.disagg_prefill_transfer_queue
+        if self.dllm_config is not None:
+            # Its staging queue is the part of this queue the current round runs.
+            lists[ListKind.DLLM] = self.dllm_manager.waiting_queue
+        components = (
+            self.disagg_decode_prealloc_queue,
+            self.disagg_decode_transfer_queue,
+            self.hisparse_coordinator,
+            self.uocr_runtime,
+            self.deferred_responses,
+        )
+        for component in components:
+            if component is None:
+                continue
+            component_lists = component.request_lists()
+            assert lists.keys().isdisjoint(component_lists), sorted(
+                lists.keys() & component_lists.keys()
+            )
+            lists.update(component_lists)
+        return lists
+
+    def _join_prefill_launched(self, batch: ScheduleBatch) -> None:
+        """Launching a request's last prefill chunk moves it out of the chunked slot
+        into prefill_launched_reqs. A row that is running already stays; dLLM keeps
+        its requests in its own queue."""
+        if self.dllm_config is None and batch.forward_mode.is_extend():
+            self.prefill_launched_reqs.join(
+                r
+                for r in batch.reqs
+                if r is not batch.chunked_req and r not in self.running_reqs
+            )
+
+    def _on_step_launch(self, batch: ScheduleBatch) -> None:
+        """The bookkeeping of every step launch, before its forward is issued."""
+        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        self.forward_ct += 1
+        batch.forward_iter = self.forward_ct
+        batch.launch_ts = time.monotonic()
+        batch.after_idle_gap = self._sched_idled
+        self._sched_idled = False
+
+        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
+        if batch.extend_num_tokens:
+            self.processed_tokens_counter += batch.extend_num_tokens
+
+        if self.scripted_scheduler_hook is not None:
+            self.scripted_scheduler_hook.on_run_batch(batch)
+
+        # Whether to run the profiler; a capture it starts here covers this step.
+        self.profiler_manager._profile_batch_predicate(batch)
+        batch.add_inflight_step()
+        self._join_prefill_launched(batch)
+        self.invariant_checker.run(CheckPhase.LAUNCH, batch)
+
+    def _on_step_processed(self, batch: ScheduleBatch) -> None:
+        """The bookkeeping of every step once its result is processed."""
+        self.invariant_checker.run(CheckPhase.RESULT, batch)
+        batch.drop_inflight_step()
+        # Requests finish only in a step's processing.
+        self.running_reqs.leave_finished()
+        self.prefill_launched_reqs.leave_finished()
+
     def _reqs_finishing_inflight(self, batch: ScheduleBatch) -> List[Req]:
-        """Requests whose queued result commits their last output by length."""
-        if not self.enable_skip_finishing_decode or not self.result_queue:
+        """Requests whose step in flight commits their last output by length."""
+        if not self.enable_skip_finishing_decode:
             return []
-        # At scheduling time the overlap loop has processed every result but the last.
-        assert len(self.result_queue) == 1
-        queued_reqs = set(self.result_queue[0][0].reqs)
         return [
             req
             for req in batch.reqs
-            if req in queued_reqs
+            if req.inflight_steps > 0
             and req.beam_group is None
             and req.next_output_finishes_by_length()
         ]
@@ -4461,6 +4885,9 @@ class Scheduler(
             batch.batch_is_full = False
             return batch
 
+        if self.uocr_runtime is not None:
+            # Retained document windows yield to running requests before retraction.
+            self.uocr_runtime.free_for_decode(batch)
         kv_full_retract_flag = not batch.check_decode_mem()
         if kv_full_retract_flag and finishing_reqs:
             # The queued result frees the finishing requests' KV at the end of
@@ -4477,15 +4904,16 @@ class Scheduler(
                 self.decode_offload_manager.drain_before_retraction()
             old_available_tokens = self.token_to_kv_pool_allocator.available_size()
             old_ratio = self.new_token_ratio_tracker.current
-            mamba_allocator = getattr(
-                self.tree_cache.req_to_token_pool, "mamba_allocator", None
-            )
+            mamba_allocator = self.tree_cache.token_to_kv_pool_allocator.state_slots
             old_mamba_available = (
                 mamba_allocator.available_size()
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
+                self.request_retirer
+            )
+            self.running_reqs.leave([*retracted_reqs, *reqs_to_abort])
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -4507,15 +4935,8 @@ class Scheduler(
                 )
             self.new_token_ratio_tracker.current = new_token_ratio
             for req in reqs_to_abort:
-                abort_reason: FINISH_ABORT = req.to_finish
-                self.send_abort_output(
-                    _make_abort_req(req, finished_reason=abort_reason.to_json()),
-                    req,
-                )
-            for req in reqs_to_abort:
-                # Member rows were freed inside retract_decode; the group only
-                # has to leave the live set.
-                self.beam_coordinator.retire_group(req)
+                # retract_decode recorded the reason and freed any member rows.
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
 
             msg_prefix = (
                 "KV cache pool is full. Retract requests. "
@@ -4557,9 +4978,17 @@ class Scheduler(
             getattr(batch, f.name, None) for f in dataclasses.fields(batch)
         ]
         self.batch_record_ct = (self.batch_record_ct + 1) % 2
+        retired = self.batch_record_buf[self.batch_record_ct]
         # List (not tuple) so that workers can register additional refs via
         # GenerationBatchResult.extra_keep_alive_refs after forward returns.
         self.batch_record_buf[self.batch_record_ct] = [batch, attr_snapshot]
+        if (
+            retired is not None
+            and self.uocr_runtime is not None
+            and self.uocr_runtime.overlap_release is not None
+        ):
+            # Dropping the last refs can free large multimodal tensors; do it off-thread.
+            self.uocr_runtime.overlap_release.defer(retired)
 
     @contextmanager
     def _forward_isolation(self, batch: ScheduleBatch, *, overlap: bool):
@@ -4612,26 +5041,8 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
-        self.forward_ct += 1
-        batch.forward_iter = self.forward_ct
-        batch.launch_ts = time.monotonic()
-        is_split_prefill = batch.forward_mode.is_split_prefill()
-        if not is_split_prefill or batch.split_index == 0:
-            batch.after_idle_gap = self._sched_idled
-            if is_split_prefill:
-                batch.split_prefill_start = (batch.forward_iter, batch.launch_ts)
-        self._sched_idled = False
+        self._on_step_launch(batch)
 
-        # Accumulate the prefill-token counter used by the HRRN scheduling policy. Decode / prebuilt batches contribute 0.
-        if batch.extend_num_tokens:
-            self.processed_tokens_counter += batch.extend_num_tokens
-
-        if self.scripted_scheduler_hook is not None:
-            self.scripted_scheduler_hook.on_run_batch(batch)
-
-        # Whether to run the profiler
-        self.profiler_manager._profile_batch_predicate(batch)
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
             time.sleep(self.forward_sleep_time)
@@ -4642,8 +5053,11 @@ class Scheduler(
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
+            # A load-back submitted in this build may still be writing pages that a
+            # later request matched as device prefix; don't early-send them (#44070).
+            load_pending = batch.hicache_consumer_index >= 0
             for req in batch.reqs:
-                self.maybe_send_cached_prefix_chunk(req)
+                self.maybe_send_cached_prefix_chunk(req, allow_send=not load_pending)
 
         # Run forward
         if self.is_generation:
@@ -4670,7 +5084,9 @@ class Scheduler(
                     # mix_running_indices). Run OUTSIDE isolation so the
                     # snapshot captures the post-consume state — restoring
                     # post-forward must not un-consume staging.
-                    resolve_forward_inputs(batch, self.future_map)
+                    input_ids_from_graph = self.resolve_forward_inputs(
+                        batch, self.future_map
+                    )
 
                     with self._forward_isolation(batch, overlap=True):
                         future_indices = batch.req_pool_indices
@@ -4692,11 +5108,15 @@ class Scheduler(
                                     self._advance_pending_grammar
                                 )
 
+                        if input_ids_from_graph:
+                            fwd_kwargs["input_ids_from_graph"] = True
+
                         # FIXME: pp is not compatible with overlap
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, **fwd_kwargs
                         )
-                        if batch.spec_algorithm.is_none():
+                        # Deferred decode graph I/O owns this step's relay.
+                        if batch.spec_algorithm.is_none() and not input_ids_from_graph:
                             self.future_map.publish(future_indices, batch.seq_lens + 1)
                         # Park any refs the worker wants kept alive 2 iters
                         # (cross-stream tensor lifetime; pinned in the same
@@ -4708,11 +5128,14 @@ class Scheduler(
                         if self.enable_unified_memory:
                             # Record a `forward_done` event after the forward (before
                             # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it. Only the unified pool's allocator exposes these hooks.
+                            # it, and writers of reused pages follow this stream. Only
+                            # the unified pool's allocator exposes these hooks.
                             allocator = self.token_to_kv_pool_allocator
                             forward_done = self.device_module.Event()
                             forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(forward_done)
+                            allocator.set_latest_forward_done_event(
+                                forward_done, self.forward_stream
+                            )
                             # Write-set classification: hand the allocator this
                             # forward's virtual out_cache_loc as a tensor ref (no GPU work).
                             allocator.set_inflight_forward(
@@ -4746,12 +5169,6 @@ class Scheduler(
                         batch.spec_info.dsa_topk_indices is not None
                     )
                     batch.spec_info.future_indices = future_indices
-            elif self.enable_pdmux and batch.forward_mode.is_split_prefill():
-                resolve_forward_inputs(batch, self.future_map)
-                batch_result = self.tp_worker.forward_batch_split_prefill(batch)
-                self._relay_forward_payload(batch, batch.req_pool_indices, batch_result)
-                batch.input_ids = None
-                self._copy_auxiliary_output_to_cpu(batch, batch_result)
             elif not batch.spec_algorithm.is_none():
                 is_verify_round = get_parallel().pp_size > 1 and not (
                     batch.forward_mode.is_extend() or batch.is_extend_in_batch
@@ -4770,7 +5187,7 @@ class Scheduler(
                     # the verify-shaped batch; sampling, accept and draft all
                     # live on the last stage. The plain tp_worker path already
                     # returns pp_hidden_states_proxy_tensors for relay.
-                    resolve_forward_inputs(batch, self.future_map)
+                    self.resolve_forward_inputs(batch, self.future_map)
                     if is_verify_round:
                         from sglang.srt.speculative.eagle_utils import (
                             eagle_prepare_for_verify,
@@ -4816,7 +5233,7 @@ class Scheduler(
                 else:
                     # Non-overlap: drive the V2 worker synchronously (no
                     # future_map relay / on_publish).
-                    resolve_forward_inputs(batch, self.future_map)
+                    self.resolve_forward_inputs(batch, self.future_map)
                     with self._forward_isolation(batch, overlap=False):
                         batch_result = self.model_worker.forward_batch_generation(
                             batch, pp_proxy_tensors=pp_proxy_tensors
@@ -4858,7 +5275,11 @@ class Scheduler(
                     if self.spec_algorithm.is_none()
                     else {}
                 )
-                resolve_forward_inputs(batch, self.future_map)
+                if self.enable_lora and get_parallel().pp_size > 1:
+                    kwargs["pp_loras"] = {
+                        req.lora_id for req in self._get_all_pp_reqs()
+                    }
+                self.resolve_forward_inputs(batch, self.future_map)
                 batch_result = self.model_worker.forward_batch_generation(
                     batch, **kwargs
                 )
@@ -4870,6 +5291,10 @@ class Scheduler(
                     batch.input_ids = None
                 self.update_cache_from_scheduler(batch, batch_result)
                 self._copy_auxiliary_output_to_cpu(batch, batch_result)
+
+            if self.uocr_runtime is not None:
+                # Commit the overlap text before the next batch is built from this one.
+                self.uocr_runtime.after_forward(batch, chunked_req=self.chunked_req)
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -4894,7 +5319,7 @@ class Scheduler(
                 self.record_batch_in_overlap(batch)
                 with self.forward_stream_ctx:
                     self.forward_stream.wait_stream(self.schedule_stream)
-                    resolve_forward_inputs(batch, self.future_map)
+                    self.resolve_forward_inputs(batch, self.future_map)
                     pooler_output, can_run_cuda_graph = (
                         self.tp_worker.forward_batch_embedding(batch)
                     )
@@ -4905,7 +5330,7 @@ class Scheduler(
                     )
                     ret.copy_to_cpu()
             else:
-                resolve_forward_inputs(batch, self.future_map)
+                self.resolve_forward_inputs(batch, self.future_map)
                 pooler_output, can_run_cuda_graph = (
                     self.tp_worker.forward_batch_embedding(batch)
                 )
@@ -4976,7 +5401,16 @@ class Scheduler(
             # The worker sliced the tail off before sampling, so sampled tokens
             # cover only the reqs-aligned rows; the coordinator relays the rest.
             future_indices = future_indices[: batch.beam_tail.num_base_rows]
-        self.future_map.stash(future_indices, payload)
+        if self.uocr_runtime is not None:
+            # The decode graph reads its relay; a step it did not publish seeds it.
+            self.uocr_runtime.relay_result(batch, batch_result, future_indices)
+        self.future_map.relay(
+            future_indices,
+            payload,
+            draft_input=batch_result.next_draft_input,
+            accepted_lengths=batch_result.accept_lens,
+            allow_defer=batch.beam_tail is None,
+        )
         self.beam_coordinator.maybe_select_and_relay(
             batch, batch_result, chunked_req=self.chunked_req
         )
@@ -4989,7 +5423,10 @@ class Scheduler(
         logits_output = result.logits_output
         if (
             logits_output is None
-            or logits_output.auxiliary_device_output is None
+            or (
+                logits_output.auxiliary_device_output is None
+                and result.forward_auxiliary_output is None
+            )
             or result.auxiliary_host_output is not None
         ):
             return
@@ -5068,6 +5505,7 @@ class Scheduler(
         batch: ScheduleBatch,
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
+        self.deferred_responses.stream_released()
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
@@ -5093,6 +5531,7 @@ class Scheduler(
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
+        self._on_step_processed(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5118,10 +5557,7 @@ class Scheduler(
             return
         if all(is_health_check_generate_req(req) for req in batch.reqs):
             return
-        if is_prefill and mode.is_split_prefill():
-            start_iter, start_ts = batch.split_prefill_start
-        else:
-            start_iter, start_ts = batch.forward_iter, batch.launch_ts
+        start_iter, start_ts = batch.forward_iter, batch.launch_ts
         prev = self._prev_step
         self._prev_step = (batch.forward_iter, batch.launch_ts, is_prefill)
         # An idle pass keeps forward_iter contiguous (forward_ct advances in run_batch).
@@ -5233,6 +5669,7 @@ class Scheduler(
     def on_idle(self):
         """Idle housekeeping: guard, check, metrics, reset, sleep."""
         self.dp_attn_adapter.drop_sync_wait_carry()
+        self.deferred_responses.stream_released()
         # Flush any health-check signal deferred while the engine was busy.
         self.maybe_send_health_check_signal()
 
@@ -5257,10 +5694,17 @@ class Scheduler(
                 self.enable_hicache_storage
                 or self.disaggregation_mode != DisaggregationMode.NULL
                 or self.enable_lmcache
+                or self.deferred_responses.has_pending()
+                or (
+                    self.enable_unified_cache_external_linker
+                    and self.tree_cache.linker.prefetches
+                )
             ):
-                # Storage and transfer workers need the GIL between I/O calls.
-                # Singleton PD polls no longer yield through a collective.
+                # Storage, transfer, and deferred-output workers need the GIL
+                # between I/O calls. Singleton PD polls no longer yield through
+                # a collective.
                 time.sleep(0)
+            self.request_receiver.wait_for_progress()
             return
         self.metrics_reporter.record_scheduler_idle()
 
@@ -5270,35 +5714,7 @@ class Scheduler(
             except Exception:
                 pass
 
-        # memory leak check (skipped for hisparse — pool counters intentionally
-        # diverge during host-backup, see _get_swa_token_info clamp).
-        # Also skipped while deferred KV releases are pending: they hold pages out
-        # of the allocator by design, so the pool is transiently below `total` and
-        # would trip the idle leak invariant. Resumes once the holds resolve.
-        deferred_pending = (
-            self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-        )
-        with self.scheduler_stage_metrics.record(SCHEDULER_STAGE_SANITY_CHECK_CACHE):
-            if not self.enable_hisparse and not deferred_pending:
-                has_leak, messages = self.invariant_checker._check_all_pools(
-                    self.pool_stats_observer.get_pool_stats(),
-                )
-                if has_leak:
-                    self.invariant_checker._report_leak("pool", "\n".join(messages))
-                self.invariant_checker._check_req_pool()
-                # Byte-conservation diagnostic (allocator-owned; static pools
-                # return [] — the token identity above can't see byte leaks).
-                byte_violations = (
-                    self.token_to_kv_pool_allocator.verify_byte_accounting()
-                )
-                if byte_violations:
-                    self.invariant_checker._report_leak(
-                        "pool-bytes", "\n".join(byte_violations)
-                    )
-
-            # tree cache sanity check
-            self.invariant_checker._check_tree_cache()
+        self.invariant_checker.run(CheckPhase.IDLE)
 
         # metrics every 30s
         self.metrics_reporter._maybe_log_idle_metrics()
@@ -5316,15 +5732,26 @@ class Scheduler(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
 
-        # sleep until next event
-        self.maybe_sleep_on_idle()
+        if self.deferred_responses.has_pending():
+            # Held responses are released by polling, not by a socket event:
+            # keep polling, and yield the GIL to the completion's worker.
+            time.sleep(0)
+        else:
+            # sleep until next event
+            self.maybe_sleep_on_idle()
         self.metrics_reporter.record_scheduler_idle()
 
     def _record_scheduler_state_for_paused_engine(self) -> None:
+        if self.deferred_responses.has_pending():
+            self.deferred_responses.stream_released()
+            time.sleep(0)
         if self.is_fully_idle():
             self.metrics_reporter.record_scheduler_idle()
         else:
             self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
+        # Paused loops skip on_idle; publish here so a pause-time flush_cache
+        # (weight update) reaches KV-event routers before resume.
+        self.kv_events_publisher.publish_kv_events()
 
     def is_fully_idle(self, for_health_check=False, ignore_waiting=False) -> bool:
         # Health check piggybacks on running requests in process_output.
@@ -5335,48 +5762,50 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
-            and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
             and (not self.enable_overlap or len(self.result_queue) == 0)
             and self._pp_microbatches_drained()
         )
 
-        # Waiting queues: waiting + bootstrapping + preallocation + kv transfer (decode)
-        if not ignore_waiting:
-            idle &= len(self.waiting_queue) == 0
+        lists = self.request_lists()
+        if for_health_check:
+            busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
+            if not self._engine_paused:
+                busy_lists.add(ListKind.PD_RETRACTED)
         else:
+            busy_lists = lists.keys() - {
+                # Their steps are counted through the batches above.
+                ListKind.DECODING,
+                ListKind.PREFILL_LAUNCHED,
+                # Only its staging part is counted, above.
+                ListKind.DLLM,
+                # Held across a weight update, whose cache flush needs idle.
+                ListKind.PD_HELD,
+                # Counted by uocr blocks_flush below.
+                ListKind.UOCR_PARKED,
+                ListKind.UOCR_RELEASED,
+                # Finished, and held only on the output rank; all ranks must agree.
+                ListKind.DEFERRED,
+            }
+        if ignore_waiting:
+            busy_lists.discard(ListKind.WAITING)
             # A PD-decode request waiting with its transferred KV still owns
             # its request row; a flush would free it.
             idle &= not any(r.kv.holds_kv for r in self.waiting_queue)
-
-        if (
-            for_health_check
-            and not self._engine_paused
-            and self.disaggregation_mode == DisaggregationMode.DECODE
-            and self.disagg_decode_prealloc_queue is not None
-        ):
-            idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
+        idle &= not any(lists.get(name) for name in busy_lists)
 
         if not for_health_check:
-            # Grammar queue and prefill inflight queue may not produce batch
-            # results instantly, but they still indicate the server is not idle.
-            idle &= len(self.grammar_manager.grammar_queue) == 0
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                idle &= len(self.disagg_prefill_inflight_queue) == 0
-                idle &= len(self.disagg_prefill_bootstrap_queue.queue) == 0
-
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                idle &= len(self.disagg_decode_prealloc_queue.queue) == 0
-                idle &= len(self.disagg_decode_prealloc_queue.retracted_queue) == 0
-                idle &= len(self.disagg_decode_transfer_queue.queue) == 0
-                idle &= not self.disagg_decode_transfer_queue.has_pending_deferred_releases()
-                if self.decode_offload_manager is not None:
-                    idle &= len(self.decode_offload_manager.ongoing_offload) == 0
-
-            # HiSparse: staging requests transitioning prefill -> decode
-            if self.enable_hisparse:
-                idle &= not self.hisparse_coordinator.has_ongoing_staging()
+            idle &= not self.request_receiver.has_pending()
+            if self.uocr_runtime is not None:
+                idle &= not self.uocr_runtime.blocks_flush(
+                    ignore_waiting=ignore_waiting
+                )
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.decode_offload_manager is not None
+            ):
+                idle &= len(self.decode_offload_manager.ongoing_offload) == 0
 
             # HiCache: in-flight async ops (GPU↔Host↔L3) must drain before
             # destructive operations like attach/detach/flush_cache.
@@ -5394,6 +5823,9 @@ class Scheduler(
                         idle &= tc.buffer_pipeline.is_idle()
             elif self.enable_lmcache:
                 idle &= not self.tree_cache.has_pending_cache_operations()
+
+            if self.enable_unified_cache_external_linker:
+                idle &= not self.tree_cache.linker.prefetches
 
         return idle
 
@@ -5512,6 +5944,17 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            if self.uocr_runtime is not None:
+                # Before the pool clear, which returns the retained windows' KV.
+                self._abort_uocr_doc_windows(
+                    self.uocr_runtime.reset(),
+                    finished_reason={
+                        "type": "abort",
+                        "status_code": HTTPStatus.SERVICE_UNAVAILABLE,
+                        "message": "The cache was flushed while this document "
+                        "window waited for the previous one.",
+                    },
+                )
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5528,6 +5971,7 @@ class Scheduler(
             # state-synchronous, but DP groups may diverge.
             if self.metrics_reporter.is_stats_logging_rank:
                 logger.info("Cache flushed successfully!")
+            self.invariant_checker.run(CheckPhase.FLUSH)
             success = True
         else:
             logging.warning(
@@ -5540,6 +5984,53 @@ class Scheduler(
 
     def get_internal_state(self, recv_req: GetInternalStateReq):
         return self.internal_state.get_internal_state(recv_req)
+
+    def _hicache_l3_layout(self) -> dict:
+        from sglang.srt.mem_cache.hicache_storage import disabled_l3_layout
+
+        if not self.enable_hierarchical_cache:
+            return disabled_l3_layout(
+                "Hierarchical cache is disabled", page_size=self.page_size
+            )
+
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+        from sglang.srt.mem_cache.unified_cache.components import ComponentType
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        tree_cache = self.tree_cache
+        controller = tree_cache.cache_controller
+        if controller is None:
+            return disabled_l3_layout(
+                "HiCache controller is not attached", page_size=self.page_size
+            )
+        storage_backend = controller.storage_backend
+        if not isinstance(storage_backend, MooncakeStore):
+            return disabled_l3_layout(
+                "Mooncake storage is not attached",
+                backend=controller.storage_backend_type,
+                page_size=self.page_size,
+            )
+
+        sidecar_pool_specs = ()
+        swa = None
+        if isinstance(tree_cache, UnifiedRadixCache):
+            sidecar_pool_specs = tree_cache.sidecar_pool_specs
+            swa = tree_cache.components.get(ComponentType.SWA)
+        return storage_backend.describe_l3_object_layout(
+            sidecar_pool_specs=sidecar_pool_specs,
+            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            page_size=self.page_size,
+        )
+
+    def get_hicache_l3_cache_layout(self, recv_req: GetHiCacheL3LayoutReq):
+        """Reply with the same external L3 layout used by the startup handshake."""
+        from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
+
+        return GetHiCacheL3LayoutReqOutput(
+            layout=msgspec_to_builtins(self._hicache_l3_layout())
+        )
 
     def set_internal_state(self, recv_req: SetInternalStateReq):
         return self.internal_state.set_internal_state(recv_req)
@@ -5585,27 +6076,22 @@ class Scheduler(
         old_version = get_serving().weight_version
         get_context().override("scheduler.weight_version", weight_version=new_version)
 
-        live_reqs = {
-            *self.collect_inflight_reqs(),
-            *self.waiting_queue,
-            *([self.chunked_req] if self.chunked_req is not None else []),
-        }
-        if self.hisparse_coordinator is not None:
-            live_reqs.update(
-                act.req for act in self.hisparse_coordinator.ack_staging_queue
-            )
+        live_reqs = [req for reqs in self.request_lists().values() for req in reqs]
         num_recorded = record_weight_version_events(live_reqs, old_version=old_version)
         logger.info(
             f"Weight version changed. {old_version=} {new_version=} {num_recorded=}"
         )
 
     def collect_inflight_reqs(self) -> Set[Req]:
-        return {
+        inflight_reqs = {
             req
             for batch in self._collect_inflight_batches()
             if batch is not None
             for req in batch.reqs
         }
+        # Prefilled and in no batch until their host copy lands.
+        inflight_reqs.update(self.request_lists().get(ListKind.HISPARSE_STAGING, ()))
+        return inflight_reqs
 
     def _collect_inflight_batches(self) -> list[ScheduleBatch | None]:
         if get_parallel().pp_size == 1:
@@ -5617,144 +6103,52 @@ class Scheduler(
             inflight_batches.extend(batch for batch, _ in self.result_queue)
         return inflight_batches
 
-    def abort_request(self, recv_req: AbortReq):
+    def _abort_waiting(self, recv_req: AbortReq) -> None:
+        is_decode = self.disaggregation_mode == DisaggregationMode.DECODE
+        is_prefill = self.disaggregation_mode == DisaggregationMode.PREFILL
+        for req in self.waiting_queue.take(lambda req: recv_req.matches(req.rid)):
+            if is_prefill:
+                # A PD prefill request may hold KV its sender still reads; abort
+                # the sender before that KV is freed.
+                self.release_prefill_sender(req, abort_sender=True)
+            # Without the initiator's reason the tokenizer falls back to a
+            # generic abort message.
+            self.request_retirer.abort(
+                req, finished_reason=recv_req.finished_reason, checkpoint=is_decode
+            )
+            logger.debug(f"Abort queued request. {req.rid=}")
+
+    def _abort_chunked(self, recv_req: AbortReq) -> None:
+        """Mark the chunked request; `process_pending_chunked_abort` aborts it at
+        the next schedule."""
         if (chunked_req := self.chunked_req) is not None:
-            if recv_req.abort_all or chunked_req.rid.startswith(recv_req.rid):
+            if recv_req.matches(chunked_req.rid):
                 self._pending_chunked_abort_req = chunked_req
 
-        # todo hisparse, release resources for abort requests in hisparse coordinator
+    def abort_request(self, recv_req: AbortReq):
         # Abort requests still waiting for encoder embeddings (EPD language-only)
         if self.mm_receiver is not None:
             self.mm_receiver.abort_waiting_requests(recv_req)
 
-        # Delete requests in the waiting queue
-        to_del = []
-        for i, req in enumerate(self.waiting_queue):
-            if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                to_del.append(i)
-
-        # Sort in reverse order to avoid index issues when deleting
-        for i in reversed(to_del):
-            # Abort method 1: directly pop from the queue
-            # This only works for requests that have not started anything.
-            # We still need to send something back to TokenizerManager to clean up the state.
-            req = self.waiting_queue.pop(i)
-            self._release_aborted_request(req)
-            self.beam_coordinator.retire_group(req)
-            # Without the initiator's reason the tokenizer falls back to a
-            # generic abort message.
-            self.send_abort_output(
-                _make_abort_req(req, finished_reason=recv_req.finished_reason), req
-            )
-            # For disaggregation decode mode, the request in the waiting queue has KV cache allocated.
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if get_disagg().disaggregation_decode_host_receive_threshold < 1:
-                    discard_kv_cache_backup(req, self.tree_cache, "host_pool")
-                if self.enable_hisparse:
-                    self.hisparse_coordinator.request_finished(req)
-                if req.finished_reason is None:
-                    req.finished_reason = FINISH_ABORT()
-                release_kv_cache(req, self.tree_cache, checkpoint=True)
-            if self.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.release_aborted_prefill_waiting_req(req)
-
-            # For mamba radix cache
-            if req.kv.holds_mamba and self.disaggregation_mode not in (
-                DisaggregationMode.PREFILL,
-                DisaggregationMode.DECODE,
-            ):
-                release_kv_cache(req, self.tree_cache, checkpoint=False)
-            logger.debug(f"Abort queued request. {req.rid=}")
-
-        if self.dllm_config is not None:
-            for req in self.dllm_manager.pop_aborted_reqs(
-                recv_req.abort_all, recv_req.rid
-            ):
-                self._release_aborted_request(req)
-                self.send_abort_output(_make_abort_req(req), req)
-                if req.kv.holds_kv or req.kv.holds_mamba:
-                    release_kv_cache(req, self.tree_cache, checkpoint=False)
-                logger.debug(f"Abort dLLM queued request. {req.rid=}")
-
-        # Delete the requests in the grammar queue
-        # Abort method 2: call `set_finish_with_abort`
-        # The request will still run one prefill forward pass.
-        # In this case, we change the input_ids to be only one token to make this prefill cheap.
-        self.grammar_manager.abort_requests(recv_req)
-
-        # Delete requests not in the waiting queue when PD disaggregation is enabled
-        if self.disaggregation_mode == DisaggregationMode.PREFILL:
-            # Abort requests that have not yet been bootstrapped
-            for req in self.disagg_prefill_bootstrap_queue.queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort bootstrap queue request. {req.rid=}")
-                    self._release_aborted_request(req)
-
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(req, "Aborted by AbortReq.")
-
-            # Abort in-flight requests
-            for req in self.disagg_prefill_inflight_queue:
-                if recv_req.abort_all or req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort inflight queue request. {req.rid=}")
-                    if hasattr(req.disagg_kv_sender, "abort"):
-                        req.disagg_kv_sender.abort()
-
-        elif self.disaggregation_mode == DisaggregationMode.DECODE:
-            # Abort requests that have not yet finished preallocation
-            for decode_req in self.disagg_decode_prealloc_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort prealloc queue request. {decode_req.req.rid=}")
-                    decode_req.kv_receiver.abort()
-                    if get_parallel().pp_size > 1:
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-
-            # Abort requests waiting for kvcache to release tree cache
-            for decode_req in self.disagg_decode_transfer_queue.queue:
-                if recv_req.abort_all or decode_req.req.rid.startswith(recv_req.rid):
-                    logger.debug(f"Abort transfer queue request. {decode_req.req.rid=}")
-                    if decode_req.host_staged:
-                        # Keep the host destination alive until prefill stops writing.
-                        prepare_abort(decode_req.req, "Aborted by AbortReq.")
-                        continue
-                    # The receiver arms drain-ack accounting before sending the
-                    # ABORT (see CommonKVReceiver._send_abort_notification), so
-                    # an ack racing back is never dropped.
-                    decode_req.kv_receiver.abort()
-
-            # Abort requests whose KV is already backed up for retraction.
-            if self.disagg_decode_prealloc_queue.retracted_queue:
-                remaining_retracted = []
-                for decode_req in self.disagg_decode_prealloc_queue.retracted_queue:
-                    if recv_req.abort_all or decode_req.rid.startswith(recv_req.rid):
-                        discard_kv_cache_backup(
-                            decode_req,
-                            self.tree_cache,
-                            get_disagg().disaggregation_decode_retraction_backup,
-                        )
-                        self.send_abort_output(_make_abort_req(decode_req), decode_req)
-                    else:
-                        remaining_retracted.append(decode_req)
-                self.disagg_decode_prealloc_queue.retracted_queue = remaining_retracted
+        for request_list in self.request_lists().values():
+            request_list.abort(recv_req)
 
         # Delete requests in the running batch
         for req in self.collect_inflight_reqs():
-            if not req.finished() and (
-                recv_req.abort_all or req.rid.startswith(recv_req.rid)
-            ):
-                # Abort method 3: set `to_finish`
-                # The request will still run one decode forward pass.
+            if not req.finished() and recv_req.matches(req.rid):
+                # A running request is finished through `request_finish` and
+                # still runs one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
-                    req.to_finish = FINISH_ABORT(
-                        recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                    req.request_finish(
+                        FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
                     )
                 else:
-                    req.to_finish = FINISH_ABORT()
+                    req.request_finish(FINISH_ABORT())
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -5798,7 +6192,7 @@ class Scheduler(
             # last_batch itself; its requests are already listed above.
             and self.last_batch is not self.running_batch
             # Skip merge for disagg prefill: completed prefill requests are
-            # already in disagg_prefill_inflight_queue. Merging them into
+            # already in disagg_prefill_transfer_queue. Merging them into
             # running_batch leaks them, since the prefill event loop never
             # calls update_running_batch to clean them up.
             and self.disaggregation_mode != DisaggregationMode.PREFILL
@@ -5816,12 +6210,7 @@ class Scheduler(
         if self.disaggregation_mode == DisaggregationMode.DECODE:
             # Transferred requests wait for a slot holding their row and KV;
             # retract them too, so their KV is rebuilt under the new weights.
-            staged = [r for r in self.waiting_queue if r.kv.holds_kv]
-            if staged:
-                self.waiting_queue = [
-                    r for r in self.waiting_queue if not r.kv.holds_kv
-                ]
-                retract_reqs += staged
+            retract_reqs += self.waiting_queue.take(lambda r: r.kv.holds_kv)
 
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -5830,25 +6219,26 @@ class Scheduler(
             # Pending offload copies may still read the device KV that retraction frees,
             # and the paused decode loop never drains them.
             self.decode_offload_manager.drain_before_retraction()
+        reqs_to_abort = []
         if retract_reqs:
-            # Decode-side retract always rebootstraps (recomputes the KV from
-            # the prefill), so skip the device->host KV offload that release_req
-            # would otherwise do; the offloaded copy would be immediately
-            # discarded. Non-decode modes ignore offload_kv (they never offload).
-            retract_all(
+            # Decode-side retract rebootstraps or aborts, so a host backup would
+            # be discarded; non-decode modes never offload.
+            reqs_to_abort = retract_all(
                 reqs=retract_reqs,
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
-                hisparse_coordinator=self.hisparse_coordinator,
+                request_retirer=self.request_retirer,
                 offload_kv=False,
             )
-        self.running_batch.reqs = []
+        # Empties the batch through filter_batch so a beam tail goes with the reqs.
+        self.running_batch.filter_batch(keep_indices=[])
+        # Under PP the other micro-batches keep running.
+        self.running_reqs.leave(retract_reqs)
+        self.prefill_launched_reqs.leave(retract_reqs)
         for req in retract_reqs:
-            if self.disaggregation_mode == DisaggregationMode.DECODE:
-                if req.output_ids:
-                    req.pd_rebootstrap_forced_output_id = req.output_ids.pop()
-                req.pd_rebootstrap_in_progress = True
+            if req in reqs_to_abort:
+                # retract_all recorded the reason and freed any member rows.
+                self.request_retirer.abort_retracted(req, reason=req.to_finish)
+            elif self.disaggregation_mode == DisaggregationMode.DECODE:
                 req.time_stats.set_retract_time()
                 self.disagg_decode_prealloc_queue.hold_rebootstrap(req)
             else:
@@ -6062,6 +6452,7 @@ class Scheduler(
             "load_inquirer",
             "output_streamer",
             "batch_result_processor",
+            "deferred_responses",
         ):
             comp = getattr(self, name, None)
             if comp is not None and hasattr(comp, "disaggregation_mode"):
@@ -6102,6 +6493,11 @@ class Scheduler(
         ):
             self.session_controller.close(recv_req)
 
+    def release_uocr_doc(self, recv_req: ReleaseUocrDocReqInput):
+        """Free the window a split document retained for its next window."""
+        if self.uocr_runtime is not None:
+            self.uocr_runtime.release_doc(recv_req.doc_id)
+
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
             self.idle_sleeper.maybe_sleep()
@@ -6116,6 +6512,12 @@ class Scheduler(
         # Break the event loop; the finally in run_scheduler_process releases resources.
         self.gracefully_exit = True
         return None
+
+    def handle_peer_shutdown(self) -> None:
+        # Another attention-DP rank honored a ShutdownReq in this step's MLP-sync
+        # gather; leave at the same step boundary as it, before the next gather.
+        logger.info("Scheduler exiting with its DP peers: a peer honored ShutdownReq")
+        self.gracefully_exit = True
 
     def configure_logging(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
@@ -6166,9 +6568,7 @@ def _dispatch_event_loop_once(scheduler: Scheduler):
     scheduler.enable_skip_finishing_decode = False
     disaggregation_mode: DisaggregationMode = scheduler.disaggregation_mode
     if disaggregation_mode == DisaggregationMode.NULL:
-        if scheduler.enable_pdmux:
-            scheduler.event_loop_pdmux()
-        elif get_parallel().pp_size > 1:
+        if get_parallel().pp_size > 1:
             scheduler.event_loop_pp()
         elif scheduler.enable_overlap_mlx:
             scheduler.event_loop_overlap_mlx()
@@ -6212,6 +6612,8 @@ def configure_scheduler_process(
     the context. display_* ranks are cosmetic; runtime ranks stay local.
     """
     kill_itself_when_parent_died()
+    if envs.SGLANG_RUST_SERVER.get():
+        claim_sigterm_before_compiles()
 
     # Generate the logger prefix
     parallel = get_parallel()
@@ -6313,8 +6715,7 @@ def run_scheduler_process(
         scheduler.run_event_loop()
 
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"Scheduler hit an exception: {traceback}")
+        logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.
@@ -6338,17 +6739,3 @@ def run_scheduler_process(
                 scheduler.release_host_resources()
                 # Last: anything above may still need a working communicator.
                 abort_distributed_environment()
-
-
-def _make_abort_req(
-    req: Req, finished_reason: Optional[FinishReasonDict] = None
-) -> AbortReq:
-    return AbortReq(
-        rid=req.rid,
-        finished_reason=finished_reason,
-        weight_versions=compute_weight_version_spans(
-            req.weight_version_events,
-            current_version=get_serving().weight_version,
-            num_output_tokens=len(req.output_ids),
-        ),
-    )

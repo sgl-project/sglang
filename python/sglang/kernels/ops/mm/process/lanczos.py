@@ -161,6 +161,14 @@ def _vertical_lanczos(
     tl.store(dst + batch * crop_height * crop_width * 3 + index, value, valid)
 
 
+@triton.jit
+def _normalize_rgb(src, dst, normalization, count, block: tl.constexpr):
+    index = tl.program_id(0) * block + tl.arange(0, block)
+    pixel = tl.load(src + index, index < count, 0).to(tl.int32)
+    value = tl.load(normalization + index % 3 * 256 + pixel)
+    tl.store(dst + index, value, index < count)
+
+
 def lanczos_resize(
     image: torch.Tensor,
     height: int,
@@ -218,6 +226,15 @@ def lanczos_resize(
             raise ValueError("mean/std must be finite and std must be positive")
 
     source_h, source_w = image.shape[-3:-1]
+    if (source_h, source_w) == (height, width) and crop is None:
+        image = image.contiguous()
+        if not normalize:
+            return image.clone()
+        output = torch.empty_like(image, dtype=torch.float32)
+        _normalize_rgb[(triton.cdiv(image.numel(), 256),)](
+            image, output, _normalization(mean, std, image.device), image.numel(), 256
+        )
+        return output
     batch_size = image.shape[0] if image.ndim == 4 else 1
     stride_batch = image.stride(0) if image.ndim == 4 else 0
     coeff_x, bounds_x, taps_x = _coefficients(source_w, width, image.device)
