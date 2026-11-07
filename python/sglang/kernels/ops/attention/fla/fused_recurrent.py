@@ -10,6 +10,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.attention.fla.op import exp
 from sglang.kernels.ops.attention.fla.utils import input_guard
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.utils import is_cuda
 
 
@@ -640,8 +641,9 @@ def fused_recurrent_kda_packed_decode(
     # row-streaming state update reaches the in-place R+W bandwidth of the
     # part (~9.6 TB/s) where this triton kernel tops out at ~5 TB/s holding a
     # [BV, K] register tile per warp. ULP-level output differences only
-    # (reduction order); small batches keep triton (launch-bound anyway).
-    if use_qk_l2norm_in_kernel:
+    # (reduction order); small batches keep triton (launch-bound anyway). Since it
+    # only engages from a batch size up, batch-invariant mode keeps triton.
+    if use_qk_l2norm_in_kernel and not is_batch_invariant_mode_enabled():
         from sglang.kernels.ops.attention import kda_packed_decode as kda_decode_cuda
 
         if kda_decode_cuda.covered(
