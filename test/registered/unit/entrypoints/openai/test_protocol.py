@@ -785,6 +785,46 @@ class TestFunctionDeferLoading(unittest.TestCase):
         self.assertEqual(parts[1].type, "text")
 
 
+class TestToolSchemaFieldOrder(unittest.TestCase):
+    """Test serialized tool schema key order."""
+
+    def test_function_dump_key_order_matches_openai(self):
+        """Chat templates render the serialized tool dict verbatim, so its key
+        order is part of the prompt and must be OpenAI's."""
+        function = Function(
+            name="get_weather",
+            description="Get the current weather",
+            parameters={"type": "object", "properties": {}},
+        )
+        self.assertEqual(
+            list(function.model_dump().keys()),
+            ["name", "description", "parameters", "strict"],
+        )
+
+    def test_tool_dump_key_order_is_independent_of_request_order(self):
+        """The key order a client happens to send must not leak into the
+        prompt; serialization has to canonicalize it."""
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[{"role": "user", "content": "Hello"}],
+            tools=[
+                {
+                    "type": "function",
+                    "function": {
+                        "parameters": {"type": "object", "properties": {}},
+                        "description": "Get the current weather",
+                        "name": "get_weather",
+                    },
+                }
+            ],
+        )
+        # The kwargs the chat entrypoint dumps tools with before rendering.
+        dumped = request.tools[0].model_dump(exclude_unset=True, by_alias=True)
+        self.assertEqual(
+            list(dumped["function"].keys()), ["name", "description", "parameters"]
+        )
+
+
 class TestValidationEdgeCases(unittest.TestCase):
     """Test edge cases and validation scenarios"""
 
