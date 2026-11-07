@@ -65,6 +65,12 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
         extra_weight_attrs.update(
             {"quant_method": FusedMoeWeightScaleSupported.CHANNEL.value}
         )
+        # Group scales and scale biases carry input partitions for w2, so
+        # they must use the loader that shards both projections under TP.
+        group_weight_attrs = {
+            **extra_weight_attrs,
+            "quant_method": FusedMoeWeightScaleSupported.GROUP.value,
+        }
 
         # Determine dimensions based on weight group
         if self.weight_prefix == "w13":
@@ -115,7 +121,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
                 requires_grad=False,
             )
             layer.register_parameter(f"{prefix}_weight_scale_second", scale_second)
-            set_weight_attrs(scale_second, extra_weight_attrs)
+            set_weight_attrs(scale_second, group_weight_attrs)
 
             offset_second = torch.nn.Parameter(
                 torch.empty(
@@ -127,10 +133,9 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
                 requires_grad=False,
             )
             layer.register_parameter(f"{prefix}_weight_offset_second", offset_second)
-            set_weight_attrs(offset_second, extra_weight_attrs)
+            set_weight_attrs(offset_second, group_weight_attrs)
 
-        # ---- bias for scale (activation clip path) ----
-        # This parameter is always created; the kernel uses it only when activation_use_clip is True.
+        # ---- bias for scale, summed over the local input partitions ----
         scale_bias = torch.nn.Parameter(
             torch.empty(
                 num_experts, 2 * out_features, bias_last_dim, dtype=torch.float32
@@ -138,7 +143,7 @@ class ModelSlimW4A8Int8MoE(ModelSlimMoEScheme):
             requires_grad=False,
         )
         layer.register_parameter(f"{prefix}_scale_bias", scale_bias)
-        set_weight_attrs(scale_bias, extra_weight_attrs)
+        set_weight_attrs(scale_bias, group_weight_attrs)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         """Delegate weight processing to the kernel for the assigned weight group."""
