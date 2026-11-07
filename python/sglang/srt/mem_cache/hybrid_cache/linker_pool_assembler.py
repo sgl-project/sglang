@@ -39,6 +39,8 @@ class DevicePoolEntry:
         self.components = [list(component) for component in components]
         self.layer_mapping = layer_mapping
         self.page_size = page_size
+        # The linker never runs under DCP, so a storage key covers one page.
+        self.logical_page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
         self._page_offsets = torch.arange(page_size)

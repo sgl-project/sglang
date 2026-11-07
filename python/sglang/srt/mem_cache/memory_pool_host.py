@@ -106,6 +106,7 @@ class LogicalHostPool:
         # Stands in for a host pool (and group anchor); DCP never widens it.
         self.logical_size = size
         self.page_size = page_size
+        self.logical_page_size = page_size
         self.device = "cpu"
         self.layout = layout
         self.dtype = torch.uint8

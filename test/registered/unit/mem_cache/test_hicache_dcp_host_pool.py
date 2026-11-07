@@ -22,7 +22,7 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController,
     check_dcp_l3_extra_pool,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, l3_page_span
+from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
@@ -579,9 +579,8 @@ class TestDcpIndexerStoragePages(CustomTestCase):
                     source = _make_indexer_host(anchor)
                     target = _make_indexer_host(anchor)
                     target.index_k_with_scale_buffer.zero_()
-                    span = l3_page_span(source)
+                    span = source.logical_page_size
                     self.assertEqual(span, PHYSICAL_PAGE * dcp)
-                    self.assertEqual(span, anchor.logical_page_size)
                     payload = source.get_data_page(3 * span)
                     torch.testing.assert_close(payload, self._page(source, 3).flatten())
                     target.set_from_flat_data_page(5 * span, payload)
@@ -623,12 +622,8 @@ class TestDcpIndexerStoragePages(CustomTestCase):
 
 
 class TestDcpL3PoolCheck(CustomTestCase):
-    def _check(self, name, pool, anchor, shards_index_k=True):
-        with mock.patch(
-            "sglang.srt.layers.dcp.layout.dsa_shards_index_k",
-            return_value=shards_index_k,
-        ):
-            check_dcp_l3_extra_pool(SimpleNamespace(name=name, host_pool=pool), anchor)
+    def _check(self, name, pool, anchor):
+        check_dcp_l3_extra_pool(SimpleNamespace(name=name, host_pool=pool), anchor)
 
     def test_allowed_pools(self):
         anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
@@ -643,23 +638,25 @@ class TestDcpL3PoolCheck(CustomTestCase):
     def test_rejected_pools(self):
         anchor = _make_host_pool(1, dcp_size=2, layout="page_first")
         indexer = _make_indexer_host(anchor)
+        replicated = _make_indexer_host(anchor)
+        replicated.dcp_size = 1
         resized = _make_indexer_host(_make_host_pool(1, 512, 2, "page_first"))
+        sharded_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
         dummy_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
         dummy_draft.kv_buffer = None
         replicated_draft = _make_host_pool(0, dcp_size=1, layout="page_first")
-        sharded_draft = _make_host_pool(1, dcp_size=2, layout="page_first")
-        for label, name, pool, shards in (
-            ("replicated index-K", PoolName.INDEXER, indexer, False),
-            ("sharded draft", PoolName.DRAFT, sharded_draft, True),
-            ("indexer size", PoolName.INDEXER, resized, True),
-            ("draft indexer", PoolName.DRAFT_INDEXER, indexer, True),
-            ("dummy draft", PoolName.DRAFT, dummy_draft, True),
-            ("replicated draft", PoolName.DRAFT, replicated_draft, True),
-            ("swa", PoolName.SWA, indexer, True),
-            ("mamba name", PoolName.MAMBA, indexer, True),
+        for label, name, pool in (
+            ("replicated index-K", PoolName.INDEXER, replicated),
+            ("sharded draft", PoolName.DRAFT, sharded_draft),
+            ("indexer size", PoolName.INDEXER, resized),
+            ("draft indexer", PoolName.DRAFT_INDEXER, indexer),
+            ("dummy draft", PoolName.DRAFT, dummy_draft),
+            ("replicated draft", PoolName.DRAFT, replicated_draft),
+            ("swa", PoolName.SWA, indexer),
+            ("mamba name", PoolName.MAMBA, indexer),
         ):
             with self.subTest(label), self.assertRaises(NotImplementedError):
-                self._check(name, pool, anchor, shards)
+                self._check(name, pool, anchor)
 
 
 class TestLayerShardedHostTransfers(CustomTestCase):

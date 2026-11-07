@@ -299,13 +299,7 @@ class PrefetchOperation(StorageOperation):
 
 
 def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
-    """Reject a host pool that HiCache L3 cannot store under DCP.
-
-    The DCP L3 path stores one physical page per logical page on each rank, so
-    every pool besides the MLA anchor must be either per-slot state or sharded
-    by the same DCP rows as the anchor.
-    """
-    from sglang.srt.layers.dcp.layout import dsa_shards_index_k
+    """Reject a non-anchor pool unless it is per-slot state or sharded like the anchor."""
     from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
     from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 
@@ -317,9 +311,8 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     if (
         entry.name == PoolName.INDEXER
         and isinstance(pool, DSAIndexerPoolHost)
-        and dsa_shards_index_k()
-        and pool.dcp_size == anchor.dcp_size
-        and pool.size == anchor.size
+        and pool.logical_page_size == anchor.logical_page_size
+        and pool.logical_size == anchor.logical_size
     ):
         return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
     raise NotImplementedError(

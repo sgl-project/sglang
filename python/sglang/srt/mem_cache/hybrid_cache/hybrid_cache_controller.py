@@ -60,6 +60,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 
 from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import broadcast_pyobj
 
 logger = logging.getLogger(__name__)
@@ -507,9 +508,8 @@ class HybridCacheController(BaseHiCacheController):
         if not isinstance(self.mem_pool_host, HostPoolGroup):
             raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
         storage_attached = self.enable_storage and self.storage_backend is not None
-        if storage_attached and getattr(self.storage_host_pool, "dcp_size", 1) > 1:
-            # Sidecars added after attach (e.g. the DFLASH draft) miss the
-            # attach-time DCP check.
+        if storage_attached and get_parallel().attn_dcp_size > 1:
+            # Sidecars registered after attach skip the attach-time DCP check.
             check_dcp_l3_extra_pool(entry, self.storage_host_pool)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
