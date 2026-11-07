@@ -1229,5 +1229,29 @@ class TestReasonerGrammarObjectCurrentToken(CustomTestCase):
         inner_grammar.accept_token.assert_not_called()
 
 
+class TestTokenSequenceMatcher(CustomTestCase):
+    def test_advance_after_full_match_with_overlapping_pattern(self):
+        from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+
+        matcher = TokenSequenceMatcher([1, 2, 1])
+        states = []
+        matched = 0
+        for token in (1, 2, 1, 2, 1, 9, 1, 2, 1):
+            matched = matcher.advance(matched, token)
+            states.append(matched)
+        self.assertEqual(states, [1, 2, 3, 2, 3, 0, 1, 2, 3])
+
+    def test_advance_after_full_match_single_token_pattern(self):
+        from sglang.srt.utils.token_sequence_matcher import TokenSequenceMatcher
+
+        matcher = TokenSequenceMatcher([7])
+        states = []
+        matched = 0
+        for token in (7, 7, 8, 7):
+            matched = matcher.advance(matched, token)
+            states.append(matched)
+        self.assertEqual(states, [1, 1, 0, 1])
+
+
 if __name__ == "__main__":
     unittest.main()
