@@ -32,6 +32,8 @@ def _build(
         multi_item_delimiter_indices=delimiters,
         input_ids=torch.zeros(total_tokens, dtype=torch.int64),
         positions=torch.zeros(total_tokens, dtype=torch.int64),
+        mrope_positions=None,
+        mm_inputs=None,
     )
     if seq_lens is not None:
         fb.extend_seq_lens_cpu = seq_lens
