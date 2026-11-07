@@ -8,11 +8,18 @@ import torch
 
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
+from sglang.srt.utils import is_hip, is_xpu
+from sglang.test.ci.ci_register import (
+    register_amd_ci,
+    register_cuda_ci,
+    register_xpu_ci,
+)
 
 register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_xpu_ci(est_time=30, suite="stage-b-test-1-gpu-xpu")
+
+DEVICE = "xpu:0" if is_xpu() else "cuda:0"
 
 
 @pytest.fixture(autouse=True)
@@ -55,7 +62,7 @@ def test_top_k_renorm_probs(batch_size, vocab_size, k):
     if k > vocab_size:
         pytest.skip("k should be less than vocab_size")
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=DEVICE)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, _ = torch.sort(normalized_prob, descending=True)
     pivot = sorted_prob[:, k - 1]
@@ -89,11 +96,11 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
     4. Renormalizes the remaining probabilities to sum to 1
     """
     torch.manual_seed(42)
-    pre_norm_prob = torch.rand(batch_size, vocab_size, device="cuda:0")
+    pre_norm_prob = torch.rand(batch_size, vocab_size, device=DEVICE)
     normalized_prob = pre_norm_prob / pre_norm_prob.sum(dim=-1, keepdim=True)
     sorted_prob, indices = torch.sort(normalized_prob, descending=False)
     cdf = torch.cumsum(sorted_prob, dim=-1)
-    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device="cuda:0")
+    mask = torch.zeros(batch_size, vocab_size, dtype=torch.int32, device=DEVICE)
     mask.scatter_add_(1, indices, (cdf >= (1 - p)).int())
     renorm_prob_ground_truth = normalized_prob.clone()
     renorm_prob_ground_truth[mask == 0] = 0
@@ -112,24 +119,26 @@ def test_top_p_renorm_probs(batch_size, vocab_size, p):
 
 def _flat_distribution(batch_size: int, vocab_size: int) -> torch.Tensor:
     """High-entropy rows: the regime where the float-atomic kernels return different bytes."""
-    gen = torch.Generator(device="cuda:0").manual_seed(7)
-    ranks = torch.arange(1, vocab_size + 1, device="cuda:0", dtype=torch.float32)
+    gen = torch.Generator(device=DEVICE).manual_seed(7)
+    ranks = torch.arange(1, vocab_size + 1, device=DEVICE, dtype=torch.float32)
     zipf = -1.1 * torch.log(ranks)
-    logits = torch.empty(batch_size, vocab_size, device="cuda:0")
+    logits = torch.empty(batch_size, vocab_size, device=DEVICE)
     for r in range(batch_size):
-        perm = torch.randperm(vocab_size, device="cuda:0", generator=gen)
+        perm = torch.randperm(vocab_size, device=DEVICE, generator=gen)
         logits[r] = zipf[perm] + 0.6 * torch.randn(
-            vocab_size, device="cuda:0", generator=gen
+            vocab_size, device=DEVICE, generator=gen
         )
     return torch.softmax(logits, dim=-1)
 
 
-@pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
+@pytest.mark.skipif(
+    is_hip(), reason="HIP tests the Triton kernels, which have no deterministic mode"
+)
 @pytest.mark.parametrize("batch_size,vocab_size", [(256, 128256)])
 def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
     """Repeated calls on the same input return bit-identical output."""
     probs = _flat_distribution(batch_size, vocab_size)
-    top_p = torch.full((batch_size,), 0.95, device="cuda:0")
+    top_p = torch.full((batch_size,), 0.95, device=DEVICE)
     ref = top_p_renorm_prob(probs, top_p, deterministic=True)
     for _ in range(30):
         out = top_p_renorm_prob(probs, top_p, deterministic=True)
@@ -139,12 +148,14 @@ def test_top_p_renorm_probs_is_deterministic(batch_size, vocab_size):
         assert torch.equal(top_p_renorm_prob(probs, top_p), ref)
 
 
-@pytest.mark.skipif(is_hip(), reason="CUDA-only: exercises the flashinfer dispatch")
+@pytest.mark.skipif(
+    is_hip(), reason="HIP tests the Triton kernels, which have no deterministic mode"
+)
 @pytest.mark.parametrize("batch_size,vocab_size,k", [(256, 128256, 40)])
 def test_top_k_renorm_probs_is_deterministic(batch_size, vocab_size, k):
     """Same invariant for top-k; the radix multi-CTA kernel sums with float atomics."""
     probs = _flat_distribution(batch_size, vocab_size)
-    top_k = torch.full((batch_size,), k, device="cuda:0", dtype=torch.int32)
+    top_k = torch.full((batch_size,), k, device=DEVICE, dtype=torch.int32)
     ref = top_k_renorm_prob(probs, top_k, deterministic=True)
     for _ in range(30):
         out = top_k_renorm_prob(probs, top_k, deterministic=True)
