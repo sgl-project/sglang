@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 from ..constants import MINIMAX_H3_SIGMAS_EXTRA_KEY
+from ..time_request import MINIMAX_H3_SMD_SAMPLING_PRESET, minimax_h3_smd_sigmas
 
 
 class MiniMaxH3TimestepPreparationStage(PipelineStage):
@@ -31,6 +32,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         sigma_shift_scales=None,
         dmd_denoising_steps: tuple[int, ...] | None = None,
         pdd_heads: str | None = None,
+        sampling_preset: str | None = None,
     ) -> None:
         super().__init__()
         # Per-model sigma shift override (model_index.json "_minimax_h3" release
@@ -38,10 +40,19 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         # serving contract — fl2va and ref2va use video 12 / audio 3 by default.
         self.sigma_shift_scales = sigma_shift_scales
         self.dmd_denoising_steps = dmd_denoising_steps
+        if sampling_preset not in (None, MINIMAX_H3_SMD_SAMPLING_PRESET):
+            raise ValueError(
+                f"unsupported MiniMax H3 sampling_preset {sampling_preset!r}"
+            )
+        self.sampling_preset = sampling_preset
         self._pdd_config = None
         # The pipeline resolves the release's fused heads; the env var serves
         # stages built without a pipeline.
         pdd_heads = pdd_heads or envs.SGLANG_DIFFUSION_MINIMAX_H3_PDD_HEADS
+        if sampling_preset is not None and (
+            pdd_heads or dmd_denoising_steps is not None
+        ):
+            raise ValueError("SMD must not stack PDD heads or a DMD schedule")
         if pdd_heads:
             from safetensors import safe_open
 
@@ -83,7 +94,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 f"{self.__class__.__name__} is a MiniMax H3 contract stage "
                 "and has no implementation yet."
             )
-        return (
+        fingerprint = (
             batch.num_inference_steps,
             batch.is_warmup,
             plan.flow_shift,
@@ -92,6 +103,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             plan.default_audio_flow_shift,
             self.freeze_for_dedup(self.sigma_shift_scales),
         )
+        if self.sampling_preset is None:
+            return fingerprint
+        return (*fingerprint, self.sampling_preset)
 
     def _apply_pdd_schedule(self, batch: Req) -> None:
         if self._pdd_config is None:
@@ -157,7 +171,7 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             minimax_h3_time_shift_sigmas,
         )
 
-        if MINIMAX_H3_SIGMAS_EXTRA_KEY in batch.extra:
+        if MINIMAX_H3_SIGMAS_EXTRA_KEY in batch.extra and self.sampling_preset is None:
             return
         requested_num_steps = getattr(batch, "num_inference_steps", None)
         if requested_num_steps is None:
@@ -214,6 +228,16 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                 task_default=plan.default_audio_flow_shift,
             ),
         }
+        if self.sampling_preset is not None:
+            if plan.task != "ref2va":
+                raise ValueError("SMD weights support only Ref2VA")
+            batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY] = minimax_h3_smd_sigmas(
+                num_steps=requested_num_steps,
+                video_shift=scales["video"],
+                audio_shift=scales["audio"],
+                is_warmup=batch.is_warmup,
+            )
+            return
         dmd_steps = self.dmd_denoising_steps
         num_steps = requested_num_steps
         if dmd_steps is not None and batch.is_warmup:
