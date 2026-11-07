@@ -1704,34 +1704,18 @@ class HybridCacheController(BaseHiCacheController):
         is a sliding window of the last N hit pages.
         """
         for transfer in pool_transfers:
-            if transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+            if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+                trailing_n = len(transfer.keys) if transfer.keys else 1
+                transfer.keys = all_hashes[
+                    max(0, kv_hit_pages - trailing_n) : kv_hit_pages
+                ]
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
                 # One key per complete block: the page that ends each block.
                 block = max(1, int(transfer.block_pages))
                 blocks = min(len(transfer.keys or ()), kv_hit_pages // block)
-                transfer.keys = [
-                    all_hashes[(i + 1) * block - 1] for i in range(blocks)
-                ]
-                entry = self.mem_pool_host.entry_map.get(transfer.name)
-                pool_page_size = (
-                    entry.host_pool.page_size if entry is not None else self.page_size
-                )
-                needed = blocks * pool_page_size
-                if transfer.host_indices is not None:
-                    if transfer.host_indices.numel() > needed:
-                        self.append_host_mem_release(
-                            extra_pools=[
-                                PoolTransfer(
-                                    name=transfer.name,
-                                    host_indices=transfer.host_indices[needed:],
-                                )
-                            ]
-                        )
-                        transfer.host_indices = transfer.host_indices[:needed]
+                transfer.keys = [all_hashes[(i + 1) * block - 1] for i in range(blocks)]
+            else:
                 continue
-            if transfer.hit_policy != PoolHitPolicy.TRAILING_PAGES:
-                continue
-            trailing_n = len(transfer.keys) if transfer.keys else 1
-            transfer.keys = all_hashes[max(0, kv_hit_pages - trailing_n) : kv_hit_pages]
             if transfer.host_indices is None or transfer.indices_from_pool is not None:
                 continue
             entry = self.mem_pool_host.entry_map.get(transfer.name)
