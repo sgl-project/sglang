@@ -153,11 +153,12 @@ with a positive integer `frame_bytes` up to 4 MiB (default 1 MiB). Miles default
 both initial synchronization and subsequent updates to `bitcomp-zstd`. SGLang
 selects the codec from each publication's manifest; it has no codec environment
 variable or independent default. Bitcomp uses sparse, lossless U8 encoding; it
-never requantizes weights. The decoder selects DE for Snappy/LZ4 on SM100/SM103
-and CUDA kernels otherwise. DE frames must fit
-the device's compressed and decoded limits. All paths validate geometry, alignment
-and capacity. Streams can change codec without changing their canonical plan;
-native decoders are cached by inner codec.
+never requantizes weights. GPU-delta does not require Blackwell: the decoder selects
+DE for Snappy/LZ4 on SM100/SM103 and CUDA kernels otherwise. Each inference backend
+retains its own hardware and weight-format requirements. DE frames must fit the
+device's compressed and decoded limits. All paths validate geometry, alignment and
+capacity. Streams can change codec without changing their canonical plan; native
+decoders are cached by inner codec.
 
 Wrapped matrix frames use independent GPU-compressed outer Zstd chunks with at
 most 1 MiB output. The CPU worker pool unwraps them directly into each rank's host
@@ -361,13 +362,14 @@ CPU cases register in `base-a-test-cpu`; layout CUDA cases register in
 nvCOMP. They compare against ordinary loader/preprocessing helpers and check
 padding, independent/aliased images, exact bytes, failure gates and graph addresses.
 
-Manual DE tests require Blackwell, CUDA 13, `nvidia-libnvcomp-cu13==6.0.0.12`,
-`zstandard`, `python-snappy` and `lz4`; missing prerequisites fail. They exercise
-Snappy/LZ4 DE sorting off/on, CUDA Bitcomp/Snappy/LZ4, fixed-slot reuse,
-known byte output and ownership without
-sending malformed compressed streams into nvCOMP. The host CUDA test additionally
-checks private rank allocations, once-per-engine file verification and warm
-reuse/growth. The allocator test requires two CUDA devices for context restoration.
+Manual tests use the paired CUDA 13 Miles image, `nvidia-libnvcomp-cu13==6.0.0.12`,
+`zstandard`, `python-snappy` and `lz4`; missing prerequisites fail. The Snappy/LZ4
+DE cases and the DE allocator test require SM100/SM103. CUDA Bitcomp/Snappy/LZ4
+cases do not require DE. Together they exercise sorting off/on, fixed-slot reuse,
+known byte output and ownership without sending malformed compressed streams into
+nvCOMP. The host CUDA test additionally checks private rank allocations,
+once-per-engine file verification and warm reuse/growth. Its two-engine DE case
+and the allocator context-restoration test each require two DE-capable devices.
 Use separate fresh processes for each ambient allocator mode:
 
 ```bash

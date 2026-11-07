@@ -1,9 +1,9 @@
 """GPU conformance for the prebuilt nvCOMP ABI; no extension compilation.
 
-Manual-only: DE cases require Blackwell; all cases use the paired Miles image, nvCOMP 6,
-zstandard, python-snappy, and lz4. Missing hardware or dependencies fail this suite.
-The hardware decoder preserves known bytes. Tests intentionally never feed malformed
-compressed streams to the GPU decoder.
+Manual-only: DE cases require SM100/SM103; CUDA decode cases do not require DE.
+All cases use the paired Miles image, nvCOMP 6, zstandard, python-snappy, and lz4.
+Missing hardware or dependencies fail this suite. Both decoder paths preserve known
+bytes. Tests intentionally never feed malformed compressed streams to the GPU decoder.
 """
 
 import sys
@@ -53,7 +53,7 @@ def _encode(values, codec, offsets=None):
     return payload, frames
 
 
-# Outer LZ4 wrapping is covered by the CPU payload suite; this exercises the two
+# Outer Zstd unwrapping is covered by the CPU payload suite; this exercises the two
 # distinct inner decoders with two output slots and both sorting settings.
 @pytest.mark.parametrize(
     "codec,sort_chunks",
