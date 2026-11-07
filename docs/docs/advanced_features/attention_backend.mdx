@@ -473,6 +473,72 @@ Internally, the DSA backend dispatches to different sub-backends for prefill and
   </tbody>
 </table>
 
+#### Shape-aware ROCm sparse prefill (experimental)
+
+You can opt into `--dsa-prefill-policy` to choose AITER or TileLang once per
+eager sparse-prefill batch. The decision uses host-visible query lengths and
+total KV lengths, is stored in batch metadata, and is reused across attention
+layers. Cached prefix tokens do not count as fresh query rows. Decode,
+speculative verification, draft extend, mixed batches, and dense attention keep
+their existing dispatch.
+
+The versioned profiles were fitted on GLM-5.3-MXFP4 with MI350X/gfx950 attention
+TP4, 16 local query heads, a 512-element KV latent, a 64-element RoPE dimension,
+and indexer top-k 2048. They require `--dsa-prefill-backend tilelang` as the
+fallback. CP, DCP, prefill CUDA graphs, deterministic inference, and pooled
+indexers are rejected at startup. Do not apply these measurements to other
+checkpoints, including GLM-5.3-Flash, without retuning and correctness validation.
+
+Choose a profile matching your existing KV cache dtype. The selector does not
+change the KV format, cache capacity, or top-k implementation.
+
+| Policy | Required KV cache dtype |
+| --- | --- |
+| `glm53-mi350x-tp4-bf16-v1` | `bf16` |
+| `glm53-mi350x-tp4-fp8-v1` | `fp8_e4m3` |
+
+Both profiles fall back to TileLang when the batch contains more than 32,768
+fresh query rows or more than eight requests. These are safety/measurement
+bounds, not claimed performance crossovers.
+
+For BF16, AITER is selected at 2,049 fresh rows for short contexts, 1,536 rows
+when the maximum KV length reaches 32,768, or 1,024 rows at 65,536 KV tokens.
+For FP8, AITER is selected if any of the following conditions holds within the
+batch bounds:
+
+- Longest fresh query length is at least 3,072.
+- Maximum KV length is at least 65,536 and aggregate fresh rows are at least 1,024.
+- Maximum KV length is at least 8,192 and aggregate fresh rows are at least 4,096.
+- Maximum KV length is at least 16,384 and longest fresh query length is at least 2,048.
+
+<Warning>
+The FP8 policy is not a numerical repair. AITER's FP8 softmax-numerator
+underflow is tracked in [ROCm/aiter#5535](https://github.com/ROCm/aiter/pull/5535).
+Validate the AITER variant selected by your installed version with magnitude
+checks and model-level correctness replay before enabling this profile. Policy
+unit tests do not validate GPU numerics, and SGLang does not bundle a patched
+AITER binary with this selector.
+</Warning>
+
+For a GLM-5.3-MXFP4 checkpoint already using BF16 KV, the explicit configuration is:
+
+```bash
+sglang serve \
+    --model-path MODEL_PATH \
+    --tp-size 4 \
+    --attention-backend dsa \
+    --dsa-prefill-backend tilelang \
+    --dsa-decode-backend tilelang \
+    --kv-cache-dtype bf16 \
+    --dsa-prefill-policy glm53-mi350x-tp4-bf16-v1 \
+    --cuda-graph-backend-prefill disabled \
+    --chunked-prefill-size 32768
+```
+
+Replace `MODEL_PATH` with the checkpoint path. Remove `--dsa-prefill-policy` to
+return to the configured static TileLang prefill backend. No policy is enabled
+by default.
+
 #### Gemma 4 on `aiter` (ROCm)
 
 Gemma 4's hybrid attention mixes sliding-window layers (`head_dim` 256) with
