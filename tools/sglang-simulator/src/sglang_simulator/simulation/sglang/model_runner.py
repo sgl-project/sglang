@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 from sglang_simulator.hook import BaseHook
 from sglang_simulator.simulation.manager import ConfigManager
@@ -6,6 +8,9 @@ from sglang_simulator.simulation.sglang.utils import (
     resolve_scheduler_config,
 )
 from sglang_simulator.simulation.utils import profile_device_available_bytes
+from sglang_simulator.utils import get_logger
+
+logger = get_logger("sgl_simulator")
 
 
 class _MockModel(torch.nn.Module):
@@ -33,6 +38,47 @@ def _resolve_kv_page_size(configurator):
         or getattr(configurator.server_args, "page_size", None)
         or 1
     )
+
+
+# DSV4 aligns each compressed sub-pool page to this many bytes.
+DSV4_PAGE_ALIGNMENT = 576
+
+
+def _dsv4_kv_bytes_per_token(pool) -> Optional[float]:
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+    if not isinstance(pool, DeepSeekV4TokenToKVPool):
+        return None
+    c4, c128, indexer = pool.c4_kv_pool, pool.c128_kv_pool, pool.c4_indexer_kv_pool
+    if c4 is None or c128 is None or indexer is None:
+        return None
+
+    def padded_page_bytes(sub):
+        raw = sub.page_size * sub.get_bytes_per_token()
+        aligned = -(-raw // DSV4_PAGE_ALIGNMENT) * DSV4_PAGE_ALIGNMENT
+        return aligned * sub.layer_num
+
+    bytes_per_page = (
+        padded_page_bytes(c4)
+        + padded_page_bytes(c128)
+        + indexer.page_size * indexer.get_bytes_per_token() * indexer.layer_num
+    )
+    return bytes_per_page / pool.page_size
+
+
+def record_kv_cache_geometry(pool) -> None:
+    """Size KV from a DSV4 pool, whose padded sub-pools the config cannot describe.
+
+    Other pools keep the config-derived size: the runtime runs with tp=pp=1, so
+    they hold every KV head and layer rather than one modelled rank's share.
+    """
+    composite = _dsv4_kv_bytes_per_token(pool)
+    if composite is None:
+        return
+    # Latent KV is replicated across TP ranks; layers are split across PP.
+    measured = composite / max(ConfigManager.get_scheduler_config().pp_size, 1)
+    ConfigManager.set_measured_kv_cache_bytes_per_token(measured)
+    logger.info("DSV4 KV cache: %.2f bytes/token per rank from pool.", measured)
 
 
 class C_ModelRunnerHook(BaseHook):
@@ -248,9 +294,24 @@ class C_KVCacheConfiguratorHook(BaseHook):
                     setattr(self.model_config, name, value)
 
             token_pool = pools.token_to_kv_pool
-            for name, value in original_attrs.items():
-                if hasattr(token_pool, name):
-                    setattr(token_pool, name, value)
+
+            # DSV4 builds its per-ratio KV and indexer pools while the dimensions
+            # are compacted, so they report the stub geometry unless restored.
+            geometry_objects = [token_pool, getattr(token_pool, "swa_kv_pool", None)]
+            for collection_name in ("kv_pools", "index_pools"):
+                collection = getattr(token_pool, collection_name, None)
+                if isinstance(collection, dict):
+                    geometry_objects.extend(collection.values())
+
+            restore_values = dict(original_attrs)
+            # model_config calls it index_head_dim; the composite outer pool
+            # calls the same dimension indexer_head_dim.
+            if "index_head_dim" in original_attrs:
+                restore_values["indexer_head_dim"] = original_attrs["index_head_dim"]
+            for obj in geometry_objects:
+                for name, value in restore_values.items():
+                    if obj is not None and hasattr(obj, name):
+                        setattr(obj, name, value)
 
             # Some pools derive their physical row widths while the dimensions
             # above are compacted. Restore that derived geometry before host

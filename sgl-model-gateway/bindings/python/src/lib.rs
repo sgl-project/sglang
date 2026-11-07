@@ -4,6 +4,8 @@ use once_cell::sync::OnceCell;
 use pyo3::prelude::*;
 use smg::*;
 
+mod policy;
+
 // Define the enums with PyO3 bindings
 #[pyclass(eq)]
 #[derive(Clone, PartialEq, Debug)]
@@ -1077,6 +1079,8 @@ fn sglang_router_rs(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyPostgresConfig>()?;
     m.add_class::<PyRedisConfig>()?;
     m.add_class::<Router>()?;
+    m.add_class::<policy::PyPolicy>()?;
+    m.add_class::<policy::PyWorkerInfo>()?;
     m.add_function(wrap_pyfunction!(get_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_verbose_version_string, m)?)?;
     m.add_function(wrap_pyfunction!(get_available_tool_call_parsers, m)?)?;

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,8 @@ class ConfigManager:
     _platform_config: Optional[PlatformConfig] = None
     _scheduler_config: Optional[SchedulerConfig] = None
     _raw_config: Optional[dict] = None
+    _ignore_cpu_overhead: Optional[bool] = None
+    _measured_kv_cache_bytes_per_token: Optional[float] = None
 
     @classmethod
     def _get_raw_config(cls) -> dict:
@@ -58,6 +61,8 @@ class ConfigManager:
         cls._model_info = None
         cls._platform_config = None
         cls._scheduler_config = None
+        cls._ignore_cpu_overhead = None
+        cls._measured_kv_cache_bytes_per_token = None
 
     @classmethod
     def set_model_info(cls, model: ModelInfo):
@@ -146,7 +151,14 @@ class ConfigManager:
         cls._scheduler_config = config
 
     @classmethod
-    def get_kv_cache_bytes(cls) -> int:
+    def set_measured_kv_cache_bytes_per_token(cls, bytes_per_token: float):
+        """Override the config-derived size with a modelled rank's measured bytes."""
+        cls._measured_kv_cache_bytes_per_token = bytes_per_token
+
+    @classmethod
+    def get_kv_cache_bytes(cls) -> float:
+        if cls._measured_kv_cache_bytes_per_token is not None:
+            return cls._measured_kv_cache_bytes_per_token
         model = cls._model_info
         scheduler_config = cls._scheduler_config
         return (
@@ -157,9 +169,12 @@ class ConfigManager:
         )
 
     @classmethod
-    def get_kv_cache_bytes_per_layer(cls) -> int:
+    def get_kv_cache_bytes_per_layer(cls) -> float:
         model = cls._model_info
         scheduler_config = cls._scheduler_config
+        if cls._measured_kv_cache_bytes_per_token is not None:
+            layers = model.num_hidden_layers // scheduler_config.pp_size
+            return cls._measured_kv_cache_bytes_per_token / max(layers, 1)
         return (
             calc_kv_cache_per_layer_elems(
                 model, scheduler_config.tp_size, scheduler_config.pp_size
@@ -170,6 +185,16 @@ class ConfigManager:
     @classmethod
     def get_scheduler_config(cls):
         return cls._scheduler_config
+
+    @classmethod
+    def get_kv_transfer_config(cls) -> dict:
+        config = dict(cls._get_raw_config().get("kv_transfer_config", {}))
+        profiles = config.get("network_profiles")
+        if isinstance(profiles, str):
+            config["network_profiles"] = cls.resolve_config_relative_path(
+                os.path.expandvars(os.path.expanduser(profiles))
+            )
+        return config
 
     @classmethod
     def _parse_server_args(cls, server_args: dict, backend: str) -> SchedulerConfig:
@@ -187,9 +212,31 @@ class ConfigManager:
         else:
             raise RuntimeError(f"Unsupported backend[{backend}] server args parser.")
 
+    @staticmethod
+    def select_ml_database_path(
+        predictor_config: dict, disaggregation_mode: Optional[str] = None
+    ) -> Optional[str]:
+        if disaggregation_mode == "prefill" and predictor_config.get(
+            "prefill_database_path"
+        ):
+            return predictor_config["prefill_database_path"]
+        return predictor_config.get("database_path")
+
+    @classmethod
+    def ignore_cpu_overhead(cls) -> bool:
+        """Whether host CPU time between iterations stays off the simulated clock."""
+        if cls._ignore_cpu_overhead is None:
+            scheduler = cls._get_raw_config().get("scheduler", {})
+            cls._ignore_cpu_overhead = bool(scheduler.get("ignore_cpu_overhead", False))
+        return cls._ignore_cpu_overhead
+
     @classmethod
     def get_inference_time_predictor(
-        cls, model: ModelInfo, hw: AcceleratorInfo, sched_config: SchedulerConfig
+        cls,
+        model: ModelInfo,
+        hw: AcceleratorInfo,
+        sched_config: SchedulerConfig,
+        disaggregation_mode: Optional[str] = None,
     ) -> InferTimePredictor:
         config = cls._get_raw_config()
         predictor_config = config.get("predictor", {})
@@ -220,14 +267,17 @@ class ConfigManager:
         elif predictor_config.get("name") == "ml":
             from sglang_simulator.time_predictor.ml import MLTimePredictor
 
+            database_path = cls.select_ml_database_path(
+                predictor_config, disaggregation_mode
+            )
             return MLTimePredictor(
                 model,
                 hw=hw,
                 config=sched_config,
-                database_path=cls.resolve_config_relative_path(
-                    predictor_config.get("database_path")
-                ),
+                database_path=cls.resolve_config_relative_path(database_path),
                 latency_scale=predictor_config.get("latency_scale", 1.0),
+                prefill_scale_factor=predictor_config.get("prefill_scale_factor", 1.0),
+                decode_scale_factor=predictor_config.get("decode_scale_factor", 1.0),
             )
         elif predictor_config.get("name") == "replay":
             from sglang_simulator.time_predictor.replay import ReplayTimePredictor
