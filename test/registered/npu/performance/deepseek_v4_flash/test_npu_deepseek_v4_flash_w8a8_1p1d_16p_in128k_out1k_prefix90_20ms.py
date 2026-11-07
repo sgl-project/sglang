@@ -3,9 +3,9 @@ from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK,
-    AISBENCHMARK_DATASET_GSM8K,
+    BENCHMARK_TOOL_DEFAULT,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    TestNpuPerfMultiNodePdSepTestCaseBase,
+    TestNpuPerfMultiNodePdSepTestCaseBase, AISBENCHMARK_DATASET_GSM8K,
 )
 from sglang.test.ci.ci_register import register_npu_ci
 
@@ -15,7 +15,7 @@ register_npu_ci(
     nightly=True,
 )
 
-# Common environment variables for DSV4-Flash PD-Sep 128k1k deployment
+# Common environment variables for DSV4-Flash PD-Sep 128k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "PYTHONUNBUFFERED": "1",
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -50,7 +50,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
-# Prefill node environment variables for DSV4-Flash PD-Sep 128k1k deployment
+# Prefill node environment variables for DSV4-Flash PD-Sep 128k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS = {
     **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS,
     # deepep
@@ -66,7 +66,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS = {
     "SGLANG_PROFILE_WITH_STACK": "False",
 }
 
-# Decode node environment variables for DSV4-Flash PD-Sep 128k1k deployment
+# Decode node environment variables for DSV4-Flash PD-Sep 128k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     **DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS,
     # deepep
@@ -80,7 +80,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
 }
 
-# Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
+# Prefill node launch arguments for DSV4-Flash PD-Sep 128k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--page-size",
     128,
@@ -147,7 +147,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     512,
 ]
 
-# Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
+# Decode node launch arguments for DSV4-Flash PD-Sep 128k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "--page-size",
     128,
@@ -214,7 +214,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     5,
 ]
 
-# Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k1k deployment
+# Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k deployment
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "model_path": DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     "prefill_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS,
@@ -224,9 +224,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "router_args": ["--policy", "cache_aware"],
     "router_envs": {},
 }
-
-
-class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
+class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
     """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k prefix90."""
@@ -241,13 +239,39 @@ class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
     max_concurrency = 54
     repeat_rate = 0.9
     request_rate = 3
+    warmup_requests = 16
+    # Keep the shared-prefix warmup cache: SGLANG_IS_IN_CI would otherwise make
+    # bench_serving flush the cache right after warmup.
+    pop_sglang_is_in_ci_for_gsp = True
+    tpot = 20
+    output_token_throughput = 964.864
+    ttft = 7000
+
+    # def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
+    #     """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
+    #     self.run_throughput()
+
+class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(TestNpuPerfMultiNodePdSepTestCaseBase):
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
+    model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
+    benchmark_tool = AISBENCHMARK
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
+    dataset_path = None
+    input_len = 131072
+    output_len = 1024
+    num_prompts = 90
+    max_concurrency = 54
+    # num_prompts = 20
+    # max_concurrency = 10
+    repeat_rate = 0.9
+    request_rate = 3
     dp = 16
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
 
-    def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
-        """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k prefix90."""
+    def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_20ms(self):
+        """Run the 128k pure-decode low-latency TPOT acceptance test."""
         self.run_throughput()
 
 
