@@ -42,8 +42,6 @@ class HierarchyBlock(DllmAlgorithm):
         cfg = resolving_view(server_args)
         if cfg.device != "cuda":
             raise ValueError("HierarchyBlock supports CUDA GPU execution only")
-        if cfg.dllm_fdfo:
-            raise ValueError("HierarchyBlock does not support --dllm-fdfo")
         # The checkpoint's vision sub-config would make it multimodal, but the
         # dLLM path does not handle image inputs yet.
         if cfg.enable_multimodal:
@@ -53,11 +51,13 @@ class HierarchyBlock(DllmAlgorithm):
         graph_config = cfg.cuda_graph_config
         for phase in Phase.ALL:
             graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
+        # FDFO is on by default, but each block here is decoded in one run.
         declare_resolution(
             server_args,
             cls.__name__,
             cuda_graph_config=graph_config,
             enable_multimodal=False,
+            dllm_fdfo=False,
         )
 
     def __init__(self, config: DllmConfig):

@@ -5,6 +5,8 @@ from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.arg_groups.fields.exec_ import ExecDllm
+from sglang.srt.arg_groups.fields.mm import Mm
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import _dllm_attention_backend
 from sglang.srt.dllm.algorithm import get_algorithm_cls
@@ -222,8 +224,9 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
     def _server_args(self, **overrides):
         args = dict(
             device="cuda",
-            dllm_fdfo=False,
-            enable_multimodal=None,
+            # Upstream defaults, so a changed default cannot hide behind the test.
+            dllm_fdfo=ExecDllm().dllm_fdfo,
+            enable_multimodal=Mm().enable_multimodal,
             cuda_graph_config=CudaGraphConfig(
                 decode=PhaseConfig(backend=Backend.FULL),
                 prefill=PhaseConfig(backend=Backend.FULL),
@@ -255,9 +258,12 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
                 self._server_args(enable_multimodal=True)
             )
 
-    def test_rejects_fdfo_and_non_cuda_devices(self):
-        with self.assertRaises(ValueError):
-            HierarchyBlock.configure_server_args(self._server_args(dllm_fdfo=True))
+    def test_default_launch_runs_blocks_synchronously(self):
+        server_args = self._server_args()
+        HierarchyBlock.configure_server_args(server_args)
+        self.assertFalse(resolving_view(server_args).dllm_fdfo)
+
+    def test_rejects_non_cuda_devices(self):
         with self.assertRaises(ValueError):
             HierarchyBlock.configure_server_args(self._server_args(device="cpu"))
 
