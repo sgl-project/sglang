@@ -62,6 +62,11 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.server_utils import (
+    launch_dummy_health_check_server,
+    set_prometheus_multiproc_dir,
+    start_follower_grpc_server,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
@@ -147,13 +152,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_mnnvl_fabric_device,
     kill_process_tree,
-    launch_dummy_health_check_server,
     maybe_reindex_device_id,
     normalize_serialized_named_tensor_payloads,
     numa_utils,
-    set_prometheus_multiproc_dir,
     set_ulimit,
-    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -1992,7 +1994,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                "0.7.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",

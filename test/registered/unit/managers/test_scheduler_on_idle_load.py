@@ -52,6 +52,7 @@ class TestOnIdleStallPublish(CustomTestCase):
         )
         s.scheduler_stage_metrics = None
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.disaggregation_mode = DisaggregationMode.NULL
         s.enable_lmcache = False
         s.maybe_send_health_check_signal = MagicMock()
@@ -134,6 +135,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.hisparse_coordinator = None
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_hicache_storage = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.dp_attn_adapter = MagicMock()
         scheduler._engine_paused = False
@@ -146,7 +148,6 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.load_inquirer = MagicMock()
         scheduler.enable_unified_memory = False
         scheduler.invariant_checker = MagicMock()
-        scheduler.invariant_checker._check_all_pools.return_value = (False, [])
         scheduler.pool_stats_observer = MagicMock()
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.token_to_kv_pool_allocator.verify_byte_accounting.return_value = []
