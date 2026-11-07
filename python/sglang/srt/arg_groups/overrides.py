@@ -467,7 +467,38 @@ def _mamba_radix_cache_resolution(view: Any) -> dict:
         return {}
 
     declared: Dict[str, Any] = {"uses_mamba_radix_cache": True}
+    if (
+        view.enable_deterministic_inference
+        and not view.disable_radix_cache
+        and view.mamba_radix_cache_strategy in ("extra_buffer", "extra_buffer_lazy")
+    ):
+        # Reusing a donated Mamba checkpoint makes the output depend on the
+        # request that produced it: the restored recurrent state came from a
+        # different prefill batch shape, and its FP32 internal state was
+        # persisted through a BF16 boundary (see #47213 / #33515). Deterministic
+        # inference cannot honour its contract on this path, so warn loudly
+        # instead of silently drifting.
+        logger.warning(
+            "Deterministic inference with %s restores hybrid recurrent state from "
+            "the radix cache (mamba extra_buffer). Cold and cache-hit logprobs can "
+            "differ even at temperature 0 (issue #47213); use "
+            "--mamba-radix-cache-strategy no_buffer for bit-exact cold/hit runs.",
+            hf_config.architectures[0],
+        )
     if view.mamba_radix_cache_strategy == "auto":
+        # Hybrid linear-attention state restore (extra_buffer) cannot be made
+        # bit-exact between a cold prefill and a radix-cache hit: the restored
+        # recurrent state was produced by a different prefill batch shape, so
+        # greedy decoding can flip near-tie tokens and logprobs drift even with
+        # --enable-deterministic-inference. Deterministic output must not depend
+        # on what ran before the request, so replay the prefix instead of
+        # restoring donated Mamba state.
+        if view.enable_deterministic_inference and supports_mamba_cache_extra_buffer(
+            view, hf_config
+        ):
+            declared["mamba_radix_cache_strategy"] = "no_buffer"
+            declared["disable_overlap_schedule"] = True
+            return declared
         wants_overlap = not view.disable_overlap_schedule
         wants_paging = view.page_size is not None and view.page_size > 1
         if (wants_overlap or wants_paging) and supports_mamba_cache_extra_buffer(
