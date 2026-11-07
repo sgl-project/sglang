@@ -36,17 +36,17 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.kvcache import dsa_index_k_cache
+from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.layers.cp.utils import get_layer_owner, get_layer_shard_range
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.srt.mem_cache.memory_pool import (
-    GPU_MEMORY_TYPE_KV_CACHE,
     DSATokenToKVPool,
-    RadixAttention,
     get_tensor_size_bytes,
-    maybe_detect_oob,
     unwrap_write_loc,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.async_probe import maybe_detect_oob
 
 if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
@@ -306,32 +306,22 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
 
     # ---- buffer allocation (owned-only + remote scratch) ------------------
 
+    def layer_buffer_rows(self, layer_index: int) -> int:
+        # Non-owned layers allocate a 0-row placeholder so ``kv_buffer`` stays
+        # index-aligned by layer.
+        if not self._is_layer_owned(self.start_layer + layer_index):
+            return 0
+        return super().layer_buffer_rows(layer_index)
+
     def _create_buffers(self):
         self._log_layer_shard_plan()
+        super()._create_buffers()
         with self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(self.custom_mem_pool)
                 if self.custom_mem_pool
                 else nullcontext()
             ):
-                # Owned layers get the full buffer; non-owned layers allocate a
-                # 0-row placeholder so ``kv_buffer`` stays index-aligned by layer.
-                self.kv_buffer = [
-                    torch.zeros(
-                        (
-                            (
-                                (self.size + self.page_size)
-                                if self._is_layer_owned(self.start_layer + i)
-                                else 0
-                            ),
-                            1,
-                            self.kv_cache_dim,
-                        ),
-                        dtype=self.store_dtype,
-                        device=self.device,
-                    )
-                    for i in range(self.layer_num)
-                ]
                 self.remote_kv_buffer = torch.empty(
                     (self.size + self.page_size, 1, self.kv_cache_dim),
                     dtype=self.store_dtype,
@@ -428,10 +418,13 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         loc_info,
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
+        layer_id_override: Optional[int] = None,
     ):
         loc, _, _ = unwrap_write_loc(loc_info)
         maybe_detect_oob(loc, 0, self.size + self.page_size, "set_mla_kv_buffer (MLA)")
-        layer_id = layer.layer_id
+        layer_id = (
+            layer_id_override if layer_id_override is not None else layer.layer_id
+        )
         if self.pending_remote_kv_layer_id == layer_id:
             self._finalize_pending_kv_broadcast(set_remote_layer_id=True)
         remote_kv_updatable = self.remote_kv_layer_id == layer_id
@@ -556,7 +549,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
     # ---- HiCache CPU offload: skip empty (non-owned) layers ---------------
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
-        from sglang.srt.utils import current_platform
+        from sglang.srt.platforms import current_platform
 
         current_platform.synchronize()
         kv_cache_cpu = []
@@ -585,7 +578,7 @@ class LayerSplitDSATokenToKVPool(DSATokenToKVPool):
         mamba_indices=None,
         req_pool_index=None,
     ):
-        from sglang.srt.utils import current_platform
+        from sglang.srt.platforms import current_platform
 
         kv_cache_cpu = kv_cache_cpu_dict["kv"]
         current_platform.synchronize()

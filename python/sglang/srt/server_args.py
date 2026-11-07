@@ -34,15 +34,18 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
-    DeprecatedStoreConstAction,
+    DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
-from sglang.srt.arg_groups.model_override_base import ep_joiner_of, ep_scale_joiner_of
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
+    ep_joiner_of,
+    ep_scale_joiner_of,
     model_config_of,
+    resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
     remote_instance_transfer_engine_of,
     resolution_result,
-    resolving_view,
 )
 from sglang.srt.arg_groups.validation_hook import (
     validate_mps_model_config,
@@ -94,10 +97,6 @@ def _real_kv_hash_modes():
 
     return list(RealKvHashMode)
 
-
-# Compatibility re-exports for callers importing through server_args.
-from sglang.srt.arg_groups.arg_utils import NS, A, Arg  # noqa: F401
-from sglang.srt.arg_groups.argparse_actions import LoRAPathAction  # noqa: F401
 
 # Public choice lists and plugin registration helpers.
 from sglang.srt.arg_groups.choices import (  # noqa: F401
@@ -181,18 +180,7 @@ from sglang.srt.arg_groups.fields.serving import (
 from sglang.srt.arg_groups.fields.spec import (
     Spec,
 )
-from sglang.srt.lora.lora_registry import LoRARef  # noqa: F401
-from sglang.srt.model_executor.cuda_graph_config import (  # noqa: F401
-    CudaGraphConfig,
-    parse_cuda_graph_config_arg,
-)
-from sglang.srt.utils.common import (  # noqa: F401
-    LORA_TARGET_ALL_MODULES,
-    SUPPORTED_LORA_TARGET_MODULES,
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 
 # Re-exported like the imports above, but resolved on first use: importing them
 # eagerly is what the choices helpers avoid, and most processes never read them.
@@ -422,18 +410,17 @@ class ServerArgs:
             help="Deprecated. Use --attn-dp-size <dp-size> instead of "
             "--dp-size <dp-size> --enable-dp-attention.",
         )
-        # amd was the only monokernel backend the flag could name.
         parser.add_argument(
             "--monokernel-backend",
-            action=DeprecatedStoreConstAction,
-            dest="enable_amd_monokernel",
-            nargs=None,
-            choices=["amd"],
-            const_value=True,
-            default=False,
-            new_flag="--enable-amd-monokernel",
+            action=DeprecatedChoiceToFlagAction,
+            dest="monokernel_backend",
+            flags={
+                "amd": ("enable_amd_monokernel", "--enable-amd-monokernel"),
+                "msa": ("enable_nvidia_megakernel", "--enable-nvidia-megakernel"),
+            },
             help="Deprecated. Use --enable-amd-monokernel instead of "
-            "--monokernel-backend amd.",
+            "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
+            "--monokernel-backend msa.",
         )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
@@ -451,9 +438,9 @@ class ServerArgs:
         return cls(**{attr: getattr(args, attr) for attr in attrs})
 
     def get_tokenizer_worker_class(self):
-        from sglang.srt.managers.multi_tokenizer_mixin import TokenizerWorker
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
 
-        return TokenizerWorker
+        return TokenizerManager
 
     def url(self, port: int | None = None):
         scheme = "https" if self.ssl_certfile else "http"
@@ -540,6 +527,7 @@ _INPUT_NAMESPACES = [
     Schedule,
     ExecFeatures,
     Mm,
+    UocrDocumentConfig,
     Serving,
 ]
 
@@ -573,7 +561,11 @@ def resolve_encoder_transfer_backend(
 ) -> str:
     if backend != "auto":
         return backend
-    if model_arch == "KimiK3ForConditionalGeneration" and tp_size > 1:
+    if (
+        model_arch
+        in ("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
+        and tp_size > 1
+    ):
         return "zmq_to_tokenizer"
     return "zmq_to_scheduler"
 
@@ -747,7 +739,7 @@ class PortArgs:
     # The ipc filename for Scheduler to send metrics
     metrics_ipc_name: str
 
-    # The ipc filename for MultiTokenizerRouter to receive inputs from TokenizerWorker processes (zmq)
+    # The ipc filename for MultiTokenizerRouter to receive inputs from tokenizer worker processes (zmq)
     tokenizer_worker_ipc_name: str | None
 
     # The ipc endpoints between verifier scheduler and drafter scheduler

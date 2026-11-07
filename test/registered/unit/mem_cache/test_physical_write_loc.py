@@ -30,20 +30,23 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
-from sglang.srt.mem_cache.kv_loc_plan import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec, MHAView
 from sglang.srt.mem_cache.memory_pool import (
     KVWriteLoc,
     MHATokenToKVPool,
+    unwrap_write_loc,
     write_loc_is_physical,
 )
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MHASubPoolSpec,
-    UnifiedKVPool,
-    UnifiedMHATokenToKVPool,
-    init_unified_swa_pools,
-)
+from sglang.srt.runtime_context import reset_context
+from sglang.srt.speculative.eagle_utils import per_step_draft_out_cache_loc
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    build_test_unified_pools,
+    setup_allocator_context,
+)
 
 register_cpu_ci(est_time=38, suite="base-a-test-cpu")
 
@@ -55,10 +58,12 @@ _DTYPE = torch.float16
 
 
 def _plain_translator():
-    return KVIndexTranslator(
+    return RunnerIds(
         req_to_token=torch.zeros((1, 4), dtype=torch.int64),
-        token_to_kv_pool_allocator=SimpleNamespace(),
-        token_to_kv_pool=SimpleNamespace(),
+        token_to_kv_pool_allocator=SimpleNamespace(hands_out_virtual_ids=False),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )
@@ -100,15 +105,19 @@ def _unified_mha_pool(ps=1):
         store_dtype=_DTYPE,
         grow_direction="up",
     )
-    kv = UnifiedKVPool(
+    kv = arena_of(
         total_bytes=full.entry_bytes() * 32 + swa.entry_bytes() * 16,
         sub_pool_specs=[full, swa],
         device=_DEV,
         enable_memory_saver=False,
         page_size=ps,
     )
-    return UnifiedMHATokenToKVPool(
-        unified_buffer=kv, sub_pool_name="full", page_size=ps, enable_alt_stream=False
+    return MHAView(
+        arena=kv,
+        spec=kv.spec("full"),
+        page_size=ps,
+        model_layer_ids=tuple(range(full.layer_num)),
+        enable_alt_stream=False,
     )
 
 
@@ -160,7 +169,35 @@ class TestKVWriteLocCarriesTheMark(unittest.TestCase):
         )
 
 
+class TestWriteLocIsDense(unittest.TestCase):
+    def test_strided_loc_is_refused(self):
+        strided = torch.arange(6).view(2, 3)[:, 0]
+        with self.assertRaises(ValueError):
+            KVWriteLoc(strided)
+        with self.assertRaises(ValueError):
+            KVWriteLoc(torch.tensor([1, 2]), swa_loc=strided)
+        with self.assertRaises(ValueError):
+            unwrap_write_loc(strided)
+
+    def test_each_draft_step_row_is_dense(self):
+        bs, topk, num_steps = 2, 2, 3
+        loc = torch.arange(bs * topk * num_steps)
+        per_step = per_step_draft_out_cache_loc(loc, bs, topk, num_steps)
+        for step in range(num_steps):
+            self.assertTrue(per_step[step].is_contiguous())
+            self.assertEqual(
+                per_step[step].tolist(),
+                loc.view(bs, topk, num_steps)[:, :, step].reshape(-1).tolist(),
+            )
+            KVWriteLoc(per_step[step])
+
+
 class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
+    def setUp(self):
+        # The pool fixtures read the published server args and parallel config.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+
     def _kv(self, n=2):
         k = torch.ones((n, _H, _D), dtype=_DTYPE, device=_DEV)
         return k, k * 2
@@ -195,7 +232,7 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
         self.assertTrue(torch.all(pool.k_buffer[0][2] == 1))
 
     def test_swa_composite_forwards_the_mark(self):
-        b = init_unified_swa_pools(
+        b = build_test_unified_pools(
             device=_DEV,
             kv_cache_dtype=_DTYPE,
             head_num=_H,
@@ -230,6 +267,9 @@ class TestUnifiedDoorsRefuseUnmarkedLocs(unittest.TestCase):
 
 _SRT = pathlib.Path(__file__).resolve().parents[4] / "python/sglang/srt"
 _WRITE_DOORS = ("set_kv_buffer", "set_mla_kv_buffer")
+# A layer router's per-layer handle (`KVLayer`) writes through these; a call is one
+# when made on `<router>.layer(...)`, since other classes have a `store` too.
+_LAYER_WRITE_DOORS = ("store", "store_mla")
 _MARKED_CONSTRUCTORS = ("for_batch", "for_layer")
 # The attention backends --enable-unified-memory admits, by resolved name.
 _UNIFIED_BACKEND_FILES = {
@@ -283,7 +323,7 @@ class _WriteLocCensus:
                     continue
                 name = _callee_name(node)
                 self.calls[name].append(node)
-                if name in _WRITE_DOORS:
+                if _is_door_call(node):
                     self.doors.append((where, node))
 
     def unmarked(self):
@@ -374,6 +414,18 @@ def _callee_name(call) -> str:
     return f.id if isinstance(f, ast.Name) else ""
 
 
+def _is_door_call(call) -> bool:
+    name = _callee_name(call)
+    if name in _WRITE_DOORS:
+        return True
+    receiver = getattr(call.func, "value", None)
+    return (
+        name in _LAYER_WRITE_DOORS
+        and isinstance(receiver, ast.Call)
+        and _callee_name(receiver) == "layer"
+    )
+
+
 def _loc_argument(call):
     for k in call.keywords:
         if k.arg in ("loc_info", "loc"):
@@ -429,7 +481,7 @@ def _door_takes_a_write_loc(fn) -> bool:
         name = _callee_name(node)
         if name == "unwrap_write_loc" and node.args and _is_name(node.args[0], loc):
             return True
-        if name in _WRITE_DOORS and not reassigned:
+        if _is_door_call(node) and not reassigned:
             if _is_name(_loc_argument(node), loc):
                 return True
     return False
@@ -442,7 +494,10 @@ def _pool_doors_taking_a_bare_loc(sources):
             if not isinstance(cls, ast.ClassDef):
                 continue
             for fn in cls.body:
-                if isinstance(fn, ast.FunctionDef) and fn.name in _WRITE_DOORS:
+                names = _WRITE_DOORS + (
+                    _LAYER_WRITE_DOORS if cls.name == "KVLayer" else ()
+                )
+                if isinstance(fn, ast.FunctionDef) and fn.name in names:
                     doors += 1
                     if not _door_takes_a_write_loc(fn):
                         bad.append(f"{where}:{cls.name}.{fn.name}")
