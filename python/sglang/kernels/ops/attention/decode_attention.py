@@ -33,12 +33,14 @@ from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
     is_gfx95_supported,
+    is_gfx115_supported,
     is_gfx1250_supported,
     is_hip,
 )
 
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
+_is_gfx115 = _is_hip and is_gfx115_supported()
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +58,31 @@ def _rotate_batch(batch: int, uneven_batch: Optional[torch.Tensor]) -> bool:
 
 # heads per stage-1 tile, shared so the budget's head_tiles cannot drift from the launch
 _GROUPED_BLOCK_H = 16
+
+
+def _gfx115_grouped_num_warps(
+    block_dmodel: int,
+    block_dpe: int,
+    kv_dtype: torch.dtype,
+    batch: int,
+    head_tiles: int,
+) -> Optional[int]:
+    """num_warps for stage 1 on RDNA3.5 without the CDNA hints, or None to keep them.
+
+    The hints cap waves in flight, so the memory-bound GQA decode reads KV 1.4-2.7x slower
+    at batch. Measured on gfx1151, they still win for MLA, fp8 KV (dequant is emulated) and
+    grids under 8 programs per split, and dropping them is neutral at head_dim 256.
+    """
+    if block_dpe > 0 or block_dmodel > 128:
+        return None
+    if kv_dtype not in (torch.bfloat16, torch.float16):
+        return None
+    # Under CUDA graphs batch is the captured (padded) size, so this is decided per graph.
+    if batch * head_tiles < 8:
+        return None
+    # Batch-dependent, yet deterministic inference stays batch-invariant on this path: a request
+    # alone vs in batches of 2-16 was bitwise identical on gfx1151 with Triton 3.6.
+    return 2
 
 
 # gfx950 wants 32 where the HIP path otherwise takes 16. That is the model it was picked
@@ -843,6 +870,17 @@ def _decode_grouped_att_m_fwd(
         # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
         extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
         num_stages = 1
+        if _is_gfx115:
+            gfx115_warps = _gfx115_grouped_num_warps(
+                block_dmodel=BLOCK_DMODEL,
+                block_dpe=BLOCK_DPE,
+                kv_dtype=k_buffer.dtype,
+                batch=batch,
+                head_tiles=head_tiles,
+            )
+            if gfx115_warps is not None:
+                extra_kargs = {}
+                num_warps = gfx115_warps
 
     if tune_mla:
         # num_warps reorders the fp32 accumulation, so whoever declined the batch-wide
