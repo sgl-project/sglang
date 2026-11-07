@@ -690,6 +690,7 @@ _EXPORTS: dict[str, str] = {
     "fused_layernorm_modulate": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_layernorm_modulate_fp8_quant_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_layernorm_modulate_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
+    "fused_layernorm_modulate_strided_raw": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "fused_qk_head_layernorm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "is_plain_layer_norm": "sglang.kernels.kda_kernels.layernorm_modulate_triton",
     "can_defer_xpu_gated_residual": "norm.layernorm_modulate_xpu_triton",

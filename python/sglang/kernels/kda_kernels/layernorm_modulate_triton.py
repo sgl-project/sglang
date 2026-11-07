@@ -193,11 +193,21 @@ def _layernorm_modulate_kernel(
     QUANTIZE_FP8: tl.constexpr,
     HAS_SHIFT: tl.constexpr = True,
     POST_OP: tl.constexpr = "bf16_modulate",
+    STRIDED_X: tl.constexpr = False,
+    X_STRIDE_B: tl.constexpr = 0,
+    X_STRIDE_S: tl.constexpr = 0,
+    X_STRIDE_D: tl.constexpr = 1,
 ):
     pid = tl.program_id(0).to(tl.int64)
     row_offs = pid * ROWS + tl.arange(0, ROWS)
     row_mask = row_offs < n_rows
     row_base = row_offs * D
+    if STRIDED_X:
+        x_row_base = (
+            (row_offs // seq_len) * X_STRIDE_B + (row_offs % seq_len) * X_STRIDE_S
+        )
+    else:
+        x_row_base = row_base
 
     lanes = tl.arange(0, 128)
     mean = tl.zeros((ROWS, 128), dtype=tl.float32)
@@ -210,7 +220,9 @@ def _layernorm_modulate_kernel(
         cols = i * 512 + lanes[:, None] * 4 + tl.arange(0, 4)[None, :]
         if (i + 1) * 512 <= D:
             x4 = tl.load(
-                x_ptr + row_base[:, None, None] + cols[None, :, :],
+                x_ptr
+                + x_row_base[:, None, None]
+                + cols[None, :, :] * X_STRIDE_D,
                 mask=row_mask[:, None, None],
                 other=0.0,
             ).to(tl.float32)
@@ -223,7 +235,9 @@ def _layernorm_modulate_kernel(
             # Welford state untouched.
             vec_valid = (i * 128 + lanes < D // 4)[None, :]
             x4 = tl.load(
-                x_ptr + row_base[:, None, None] + cols[None, :, :],
+                x_ptr
+                + x_row_base[:, None, None]
+                + cols[None, :, :] * X_STRIDE_D,
                 mask=row_mask[:, None, None] & vec_valid[:, :, None],
                 other=0.0,
             ).to(tl.float32)
@@ -254,7 +268,7 @@ def _layernorm_modulate_kernel(
         if (i + 1) * 512 > D:
             mask = mask & (cols < D)[None, :]
         x = tl.load(
-            x_ptr + row_base[:, None] + cols[None, :],
+            x_ptr + x_row_base[:, None] + cols[None, :] * X_STRIDE_D,
             mask=mask,
             other=0.0,
         ).to(tl.float32)
@@ -443,6 +457,44 @@ def _validate_layernorm_modulate(x, scale, shift) -> tuple[int, int, int, int]:
     return batch, seq_len, hidden, stride
 
 
+def _validate_strided_layernorm_modulate(
+    x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None
+) -> tuple[int, int, int, int]:
+    shape = x.shape
+    if not (
+        _is_bf16_cuda(x)
+        and len(shape) == 3
+        and x.numel() > 0
+        and 0 < shape[-1] <= 8192
+        and shape[-1] % 4 == 0
+    ):
+        raise RuntimeError(
+            "Strided LayerNorm modulation expects BF16 CUDA [B, S, D], D divisible by 4 and <= 8192"
+        )
+    batch, seq_len, hidden = shape
+    if not (
+        x.stride(1) == 1
+        and x.stride(2) == seq_len
+        and (batch <= 1 or x.stride(0) == seq_len * hidden)
+    ):
+        raise RuntimeError(
+            "Strided LayerNorm modulation expects a dense [B, S, D] view of [B, D, S]"
+        )
+
+    stride = _mod_row_stride(scale, batch, hidden)
+    if not (
+        stride is not None and scale.dtype is torch.bfloat16 and scale.device == x.device
+    ):
+        raise RuntimeError("scale must have packed BF16 [B, D] rows on x's device")
+    if shift is not None and not (
+        shift.dtype is torch.bfloat16
+        and shift.device == x.device
+        and _mod_row_stride(shift, batch, hidden) == stride
+    ):
+        raise RuntimeError("shift must match scale's row layout and dtype/device")
+    return batch, seq_len, hidden, stride
+
+
 def _fake_ln_modulate(
     x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor | None, eps: float
 ) -> torch.Tensor:
@@ -551,6 +603,49 @@ def fused_layernorm_modulate_raw(
             # chain, 14.3us at Sana's (2, 1024, 2240) vs 43.1us.  ROWS=1 +
             # 4 warps triggers pathological Triton layout conversions in
             # the fold stage (47-58us).
+            num_warps=4 if hidden >= 2048 else 2,
+        )
+    return out
+
+
+@replay_launches
+def fused_layernorm_modulate_strided_raw(
+    x: torch.Tensor,
+    scale: torch.Tensor,
+    shift: torch.Tensor | None,
+    eps: float,
+) -> torch.Tensor:
+    """Fused LayerNorm + modulation for dense transposed ``[B, S, D]`` views."""
+    batch, seq_len, hidden, stride = _validate_strided_layernorm_modulate(
+        x, scale, shift
+    )
+    n_rows = batch * seq_len
+    rows = 2
+    out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+    with torch.cuda.device(x.device):
+        _layernorm_modulate_kernel[(triton.cdiv(n_rows, rows),)](
+            out,
+            out,
+            x,
+            scale,
+            shift,
+            scale,
+            seq_len,
+            n_rows,
+            stride,
+            eps,
+            D=hidden,
+            ROWS=rows,
+            FP8_DTYPE=fp8_dtype_to_triton(fp8_dtype),
+            FP8_MIN=fp8_min,
+            FP8_MAX=fp8_max,
+            STORE_BF16=True,
+            QUANTIZE_FP8=False,
+            HAS_SHIFT=shift is not None,
+            STRIDED_X=True,
+            X_STRIDE_B=x.stride(0),
+            X_STRIDE_S=x.stride(1),
+            X_STRIDE_D=x.stride(2),
             num_warps=4 if hidden >= 2048 else 2,
         )
     return out
