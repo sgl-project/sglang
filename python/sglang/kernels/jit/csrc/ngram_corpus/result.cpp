@@ -31,10 +31,10 @@ Result fillResult(int last_token, int draft_token_num, std::vector<Node>& tree, 
     }
   }
 
-  // zero padding to length
+  // zero padding to length; pads get no parent so tree verify never reaches them
   while (info.token.size() < static_cast<size_t>(draft_token_num)) {
     info.token.emplace_back(0);
-    prevs.emplace_back(0);
+    prevs.emplace_back(-1);
   }
 
   int n = info.token.size();
@@ -70,7 +70,7 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
 
   std::vector<std::vector<int32_t>> paths;
   for (int leaf = 1; leaf < n; ++leaf) {
-    if (has_child[leaf]) {
+    if (has_child[leaf] || parent[leaf] == -1) {
       continue;
     }
     std::vector<int32_t> path;
@@ -78,9 +78,6 @@ std::vector<std::vector<int32_t>> extractLeafPaths_(const Result& result) {
       path.emplace_back(result.token[cursor]);
     }
     std::reverse(path.begin(), path.end());
-    if (path.size() == 1 && path.front() == 0) {
-      continue;
-    }
     paths.emplace_back(std::move(path));
   }
   return paths;
