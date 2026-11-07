@@ -728,7 +728,7 @@ class DeepseekMLAForwardMixin:
                     q_fp8, q_nope, self.w_kc, q_pe, self.num_local_heads
                 )
             born_q_backend.q8kv8_stash_born_q(
-                padded_extend_real_tokens(q_nope, forward_batch) or num_tokens,
+                padded_extend_real_tokens(q_nope.shape[0], forward_batch) or num_tokens,
                 self.attn_mqa.layer_id,
             )
             q_nope_out = born_q_backend.q8kv8_born_q_sentinel(

@@ -1776,13 +1776,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
     def _glues_draft_metadata(self) -> bool:
         """Whether this draft runner's metadata prep runs through the glue graph: a
-        static-verify draft runner whose backend accepts it."""
+        draft runner whose backend accepts it."""
         if not self.model_runner.is_draft_worker:
             return False
-        if envs.SGLANG_RAGGED_VERIFY_MODE.get() != "static":
-            why = "ragged verify"
-        else:
-            why = self.attn_backend.glue_draft_metadata()
+        why = self.attn_backend.glue_draft_metadata()
         if why:
             logger.info("Draft metadata glue graph off: %s.", why)
             return False

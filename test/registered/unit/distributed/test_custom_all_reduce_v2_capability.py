@@ -80,6 +80,28 @@ def test_topology_capability(monkeypatch, same_node, has_fabric_clique, expected
 
 
 @pytest.mark.parametrize(
+    ("hip_version", "expected"),
+    [((7, 0, 51831), False), ((7, 1, 0), False), ((7, 2, 0), True), ((7, 17, 0), True)],
+)
+def test_rocm_runtime_gate(monkeypatch, hip_version, expected):
+    """On ROCm a HIP runtime older than MIN_HIP_VERSION disables v2 up front."""
+    from sglang.srt.utils import hip_vmm_utils
+
+    group, device = _patch_group(monkeypatch, world_size=8, same_node=True)
+    monkeypatch.setattr(custom_all_reduce_v2, "_is_hip", True)
+    monkeypatch.setattr(hip_vmm_utils, "hip_runtime_version", lambda: hip_version)
+    topology_check = Mock(return_value=True)
+    monkeypatch.setattr(
+        custom_all_reduce_v2,
+        "can_use_custom_all_reduce_with_nvlink",
+        topology_check,
+    )
+
+    assert custom_all_reduce_v2.can_use_custom_all_reduce_v2(group, device) is expected
+    assert topology_check.called is expected
+
+
+@pytest.mark.parametrize(
     ("disabled", "has_multicast", "nbytes", "num_blocks", "expected"),
     [
         (False, True, 1024, 4, True),

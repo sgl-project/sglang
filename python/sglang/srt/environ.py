@@ -502,6 +502,9 @@ class Envs:
     SGLANG_DEBUG_REVERT_PR = EnvInt(0)
     SGLANG_PHASE_CHECKER_DEBUG = EnvBool(False)
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
+    # Scheduler state checks. BUSY runs the busy pool check (its value also sets
+    # the log verbosity). IDLE runs no check of its own: it picks whether a leak
+    # found by the idle pool checks or the KV page check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # The explicit environment variable still takes precedence over this CI
@@ -509,7 +512,8 @@ class Envs:
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
     # Check each schedule that the running requests equal the ones batches hold.
     SGLANG_ENABLE_RUNNING_REQS_CHECK = EnvBool(_default_on_in_ci)
-    # Physical KV-page checks: committed<=allocated + no page alias.
+    # Physical KV-page checks: committed<=allocated + no page alias. Runs them at
+    # every busy iteration, with or without the BUSY flag.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
     SGLANG_TBO_DEBUG = EnvBool(False)
     # Timing probe: run the swap-in fully but skip the host->device KV bytes,
@@ -1012,6 +1016,9 @@ class Envs:
     # is a diagnostic switch, not a supported off-ramp -- to actually stop
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
+    # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
+    # attention, GDN prefill); each also falls back to the generic path where it does not apply.
+    SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -2269,6 +2276,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # TP-shard the K3 MoE front's router + latent-down rows (KimiK3MoE._front_shard)
+    # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
+    # gemm_ag_up_fits). Online weight updates are rejected while on.
+    SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
