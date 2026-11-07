@@ -344,6 +344,16 @@ def get_schema_properties(schema: Any) -> Dict[str, Any]:
     return merged
 
 
+def _unify_scalar_types(types) -> Optional[str]:
+    non_null = set(types) - {"null"}
+    # Every JSON Schema integer is also a number, so number covers both.
+    if non_null == {"integer", "number"}:
+        return "number"
+    if len(non_null) == 1:
+        return non_null.pop()
+    return None
+
+
 def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
     """
     Infer the primary type of a parameter from JSON Schema.
@@ -374,7 +384,7 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
             # Handle type arrays: return first non-null type
             non_null_types = [t for t in type_value if t != "null"]
             if non_null_types:
-                return non_null_types[0]
+                return _unify_scalar_types(non_null_types) or non_null_types[0]
             return "string"  # If only null, default to string
 
     # Priority 2: Handle anyOf/oneOf
@@ -389,6 +399,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
                     types.append(inferred_type)
 
             if types:
+                unified = _unify_scalar_types(types)
+                if unified:
+                    return unified
                 # If all types are the same, return unified type
                 if len(set(types)) == 1:
                     return types[0]
@@ -427,6 +440,9 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
         # If type is uniform, return that type
         if len(enum_types) == 1:
             return enum_types.pop()
+        unified = _unify_scalar_types(enum_types)
+        if unified:
+            return unified
         # Mixed types, prioritize string
         return "string"
 

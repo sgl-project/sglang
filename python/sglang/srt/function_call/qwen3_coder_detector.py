@@ -176,7 +176,12 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 maybe_convert = (
                     False if "." in param_value or "e" in param_value.lower() else True
                 )
-                param_value: float = float(param_value)
+                if maybe_convert:
+                    try:
+                        return int(param_value)  # float() rounds above 2**53
+                    except ValueError:
+                        pass
+                param_value: float = self._parse_finite_float(param_value)
                 if maybe_convert and param_value.is_integer():
                     param_value = int(param_value)
             except Exception:
