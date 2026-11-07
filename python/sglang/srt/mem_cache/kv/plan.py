@@ -54,26 +54,43 @@ class SubPoolExternal(msgspec.Struct, frozen=True, kw_only=True):
     """The names a sub-pool goes by outside this process, at the values peers,
     host stores, the radix tree and metrics already use: its HiCache host pool
     (also the suffix of its L3 keys), its radix tree component, the family its
-    usage is reported under, and the PD state type it travels as (None for the
-    sub-pool whose token KV PD registers as the transfer's KV entries)."""
+    usage is reported under and the label within it, the PD state type it
+    travels as (None for the sub-pool whose token KV PD registers as the
+    transfer's KV entries), and the key PD peers tell its entries apart by.
+    Renaming a sub-pool inside this process changes none of them unless they
+    are derived from its name."""
 
     host_pool: str
     tree_component: str
     metrics: str
+    label: str
     wire: Optional[str] = None
+    wire_key: Optional[str] = None
 
 
 _EXTERNAL: Dict[Type, SubPoolExternal] = {
     FullLifetime: SubPoolExternal(
-        host_pool="kv", tree_component="FULL", metrics="full"
-    ),
-    WindowLifetime: SubPoolExternal(
-        host_pool="swa", tree_component="SWA", metrics="swa", wire="swa"
+        host_pool="kv",
+        tree_component="FULL",
+        metrics="full",
+        label="full",
+        wire_key="full",
     ),
     StateLifetime: SubPoolExternal(
-        host_pool="mamba", tree_component="MAMBA", metrics="mamba", wire="mamba"
+        host_pool="mamba",
+        tree_component="MAMBA",
+        metrics="mamba",
+        label="mamba",
+        wire="mamba",
+        wire_key="mamba",
     ),
 }
+
+# A window's prefix tree component and host pool are named by its sub-pool.
+
+# The PD state type every window travels as: its trailing pages. A peer tells
+# one window's entry from another's by the entry's sub-pool.
+WINDOW_WIRE = "swa"
 
 
 def window_tree_component(name: str) -> str:
@@ -81,12 +98,22 @@ def window_tree_component(name: str) -> str:
     return name.upper()
 
 
+def _window_external(name: str) -> SubPoolExternal:
+    return SubPoolExternal(
+        host_pool=name,
+        tree_component=window_tree_component(name),
+        metrics="window",
+        label=name,
+        wire=WINDOW_WIRE,
+        wire_key=name,
+    )
+
+
 # The order PD peers list state entries in: a window's before recurrent state.
 _WIRE_ORDER = (
     "minimax_index_k",
     "minimax_dense_kv",
-    "swa",
-    "auxiliary_swa",
+    WINDOW_WIRE,
     "block_scale",
     "block_scale_swa",
     "swa_ring",
@@ -133,11 +160,13 @@ class TreeSlot(msgspec.Struct, frozen=True, kw_only=True):
 
 
 class WireEntry(msgspec.Struct, frozen=True, kw_only=True):
-    """One PD state entry: the sub-pool part it carries and its state type."""
+    """One PD state entry: the sub-pool part it carries, its state type, and
+    the key peers tell entries of one type apart by (the sub-pool's)."""
 
     sub_pool: str
     part: str
     state_type: str
+    key: Optional[str] = None
 
 
 class PlannedSubPool(msgspec.Struct, frozen=True, kw_only=True):
@@ -190,7 +219,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
 
     def of_lifetime(self, lifetime_type: Type) -> Optional[PlannedSubPool]:
         """The plan's one sub-pool of a lifetime type; windows can be several,
-        see `primary_window`."""
+        see `windows` and `primary_window`."""
         assert lifetime_type is not WindowLifetime, "a plan may hold several windows"
         found = [s for s in self.sub_pools if isinstance(s.lifetime, lifetime_type)]
         assert len(found) <= 1, f"more than one {lifetime_type.__name__} sub-pool"
@@ -289,13 +318,16 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
         )
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
-        """The PD state entries, in the order peers list them. The owner's
-        token KV is the transfer's KV entries, not a state entry."""
+        """The PD state entries, in the order peers list them: by state type,
+        then by sub-pool name, so entries of one type (every window travels
+        as one) line up on both peers. The owner's token KV is the transfer's
+        KV entries, not a state entry."""
         entries = [
             WireEntry(
                 sub_pool=s.name,
                 part=STATE_PART if isinstance(s.lifetime, StateLifetime) else KV_PART,
                 state_type=s.external.wire,
+                key=s.external.wire_key,
             )
             for s in self.sub_pools
             if s.external.wire is not None
@@ -310,6 +342,7 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=declared.sub_pool,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.sub_pool(declared.sub_pool).external.wire_key,
                     ),
                 )
         for declared in self.request_parts:
@@ -321,10 +354,19 @@ class KVStoragePlan(msgspec.Struct, frozen=True, kw_only=True):
                         sub_pool=self.owner().name,
                         part=declared.wire,
                         state_type=declared.wire,
+                        key=self.owner().external.wire_key,
                     ),
                 )
         entries.extend(groups.values())
-        return tuple(sorted(entries, key=lambda e: _WIRE_ORDER.index(e.state_type)))
+        unknown = [e.state_type for e in entries if e.state_type not in _WIRE_ORDER]
+        if unknown:
+            raise ValueError(f"PD transfers have no state type for {unknown}")
+        return tuple(
+            sorted(
+                entries,
+                key=lambda e: (_WIRE_ORDER.index(e.state_type), e.key),
+            )
+        )
 
 
 def _unit(lifetime: KVLifetime, page_size: int) -> int:
@@ -432,10 +474,6 @@ def plan_kv_storage(
     if len({lt for lt, _ in groups if isinstance(lt, WindowLifetime)}) > 1:
         raise ValueError("multiple target windows require named model declarations")
     names_by_key = {key: _sub_pool_name(key[0]) for key in groups}
-    # A draft's own window beside the target's goes by the second window entry
-    # of the host pools and PD peers; the prefix tree names every window by its
-    # sub-pool.
-    auxiliary_windows = set()
     if fused_draft is not None:
         for name, band in fused_draft.new_bands.items():
             region = fused_draft.region(name)
@@ -470,13 +508,10 @@ def plan_kv_storage(
                 raise ValueError(f"draft band {name!r} duplicates a target lifetime")
             if name in names_by_key.values():
                 raise ValueError(f"draft band {name!r} takes a target sub-pool's name")
-            if band.kind == LAYER_WINDOW and any(
-                isinstance(lt, WindowLifetime) for lt, _ in groups
-            ):
-                auxiliary_windows.add(name)
             groups[key] = ([], geometry)
             names_by_key[key] = name
     chain = sorted(groups, key=lambda key: (*_chain_key(key), names_by_key[key]))
+
     sub_pools = []
     for i, key in enumerate(chain):
         lifetime, unit = key
@@ -498,17 +533,7 @@ def plan_kv_storage(
                     fused_draft=fused_draft,
                 ),
                 external=(
-                    SubPoolExternal(
-                        host_pool="auxiliary_swa",
-                        tree_component=window_tree_component(name),
-                        metrics="swa",
-                        wire="auxiliary_swa",
-                    )
-                    if name in auxiliary_windows
-                    else msgspec.structs.replace(
-                        _EXTERNAL[WindowLifetime],
-                        tree_component=window_tree_component(name),
-                    )
+                    _window_external(name)
                     if isinstance(lifetime, WindowLifetime)
                     else _EXTERNAL[type(lifetime)]
                 ),

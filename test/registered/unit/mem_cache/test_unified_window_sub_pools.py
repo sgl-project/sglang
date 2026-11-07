@@ -1,10 +1,10 @@
 """Each window sub-pool is named by its own length.
 
 The target's window and a draft's window of another length are sub-pools named
-by the window they keep. The names they go by outside this process (prefix
-tree component, host pool, PD state type, metrics) are unchanged, and
-consumers that ask for "the window" by the sliding-window role find the
-target's window whatever it is named.
+by the window they keep. Each window's prefix tree component, host pool and PD
+entry key are named by its sub-pool, and every window travels to PD peers as
+the window state type. Consumers that ask for "the window" by the
+sliding-window role find the target's window whatever it is named.
 """
 
 import unittest
@@ -20,7 +20,11 @@ from sglang.srt.mem_cache.kv.decl import (
     primary_window,
     window_sub_pool_name,
 )
-from sglang.srt.mem_cache.kv.plan import plan_kv_storage, sub_pool_names
+from sglang.srt.mem_cache.kv.plan import (
+    SubPoolExternal,
+    plan_kv_storage,
+    sub_pool_names,
+)
 from sglang.srt.mem_cache.kv.sizing import KVSizingInputs, size_plan
 from sglang.srt.mem_cache.layout.fused_draft import (
     DraftKVGeometry,
@@ -137,23 +141,24 @@ class TestWindowNames(CustomTestCase):
         with self.assertRaises(AssertionError):
             plan.of_lifetime(WindowLifetime)
 
-    def test_external_names_are_unchanged(self):
-        # The target's window keeps the names the prefix tree, host pools, PD
-        # peers and metrics use for a model's window.
+    def test_external_names_follow_the_sub_pool(self):
+        # A window's prefix tree slot, host pool and PD entry key are named by
+        # its sub-pool; PD peers carry it as the window state type.
         plan = plan_kv_storage(_decls(16), page_size=4)
-        external = plan.sub_pool("window_16").external
         self.assertEqual(
-            (
-                external.host_pool,
-                external.tree_component,
-                external.metrics,
-                external.wire,
+            plan.sub_pool("window_16").external,
+            SubPoolExternal(
+                host_pool="window_16",
+                tree_component="WINDOW_16",
+                metrics="window",
+                label="window_16",
+                wire="swa",
+                wire_key="window_16",
             ),
-            ("swa", "WINDOW_16", "swa", "swa"),
         )
-        self.assertEqual(
-            [slot.component for slot in plan.tree_slots()], ["FULL", "WINDOW_16"]
-        )
+        slots = plan.tree_slots()
+        self.assertEqual([slot.component for slot in slots], ["FULL", "WINDOW_16"])
+        self.assertEqual([slot.host_pool for slot in slots], ["kv", "window_16"])
         self.assertEqual(
             [(e.sub_pool, e.state_type) for e in plan.wire_entries()],
             [("window_16", "swa")],
@@ -180,17 +185,22 @@ class TestDraftWindowNames(CustomTestCase):
         self.assertEqual(
             {s.name for s in plan.sub_pools}, {"full", "window_16", "window_32"}
         )
-        # The target's window stays the primary one; the draft's goes by the
-        # second window entry of the host pools and PD peers, and the prefix
-        # tree names each window by its sub-pool.
+        # The target's window stays the primary one, and the tree's first
+        # window slot; each window goes by its own sub-pool's names, and PD
+        # peers list both window entries by sub-pool name.
         self.assertEqual(plan.primary_window().name, "window_16")
         external = plan.sub_pool("window_32").external
         self.assertEqual(
             (external.host_pool, external.tree_component, external.wire),
-            ("auxiliary_swa", "WINDOW_32", "auxiliary_swa"),
+            ("window_32", "WINDOW_32", "swa"),
         )
         self.assertEqual(
-            plan.sub_pool("window_16").external.tree_component, "WINDOW_16"
+            [slot.component for slot in plan.tree_slots()],
+            ["FULL", "WINDOW_16", "WINDOW_32"],
+        )
+        self.assertEqual(
+            [(e.sub_pool, e.state_type, e.key) for e in plan.wire_entries()],
+            [("window_16", "swa", "window_16"), ("window_32", "swa", "window_32")],
         )
 
     def test_a_draft_window_without_a_target_window_takes_the_window_names(self):

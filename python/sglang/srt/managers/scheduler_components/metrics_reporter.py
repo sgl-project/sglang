@@ -1448,17 +1448,29 @@ class SchedulerMetricsReporter:
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
-        full_tokens, swa_tokens = (
-            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts()
-        )
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        full_tokens, window_tokens = (
+            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts(
+                tuple(window.sub_pool for window in pool_stats.windows)
+            )
+        )
         self.stats.prealloc_full_token_usage = (
             full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
         )
+        # Each window's pending rows, by that window's own cursor.
+        self.stats.prealloc_window_token_usage = {
+            window.name: (
+                window_tokens[window.sub_pool] / window.capacity
+                if window.capacity
+                else 0.0
+            )
+            for window in pool_stats.windows
+        }
+        target = pool_stats.target_window_stats()
         self.stats.prealloc_swa_token_usage = (
-            swa_tokens / pool_stats.swa_capacity
-            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
-            else 0.0
+            0.0
+            if target is None
+            else self.stats.prealloc_window_token_usage[target.name]
         )
 
     def _maybe_log_idle_metrics(self):

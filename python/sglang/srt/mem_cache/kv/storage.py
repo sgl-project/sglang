@@ -86,10 +86,12 @@ class StorageSubPool(msgspec.Struct, frozen=True, kw_only=True):
 class SubPoolUsage(msgspec.Struct, frozen=True, kw_only=True):
     """A sub-pool's occupancy as observers report it, in its own units: tokens,
     or slots for a sub-pool that holds state. ``metrics`` is the family its
-    numbers are published under."""
+    numbers are published under (``full``, ``window`` or ``mamba``), and
+    ``label`` the name that tells one window's numbers from another's."""
 
     name: str
     metrics: str
+    label: str
     capacity: int
     available: int
 
@@ -747,6 +749,7 @@ class KVStorage:
             SubPoolUsage(
                 name=s.name,
                 metrics=s.external.metrics,
+                label=s.external.label,
                 capacity=units[s.name][0],
                 available=units[s.name][1],
             )
@@ -763,6 +766,18 @@ class KVStorage:
 
     def wire_entries(self) -> Tuple[WireEntry, ...]:
         return self._plan.wire_entries()
+
+    def entry_sub_pool(self, entry: WireEntry) -> Optional[str]:
+        """The sub-pool a transfer entry carries here."""
+        return entry.sub_pool
+
+    def entry_sub_pools(self) -> Tuple[Optional[str], ...]:
+        """The sub-pool each transfer entry carries, in wire order."""
+        return tuple(self.entry_sub_pool(entry) for entry in self.wire_entries())
+
+    def entry_wire_key(self, entry: WireEntry) -> Optional[str]:
+        """The key PD peers tell entries of one state type apart by."""
+        return entry.key
 
     def host_pool_name(self, sub_pool: str) -> str:
         """The host pool a sub-pool's rows back up to and load from."""
