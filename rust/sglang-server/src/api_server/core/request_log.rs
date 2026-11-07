@@ -613,6 +613,9 @@ fn media_item(item: &MmItem) -> Value {
             if let Some(fps) = hints.fps {
                 item.insert("fps".into(), fps.into());
             }
+            if let Some(detail) = &hints.detail {
+                item.insert("detail".into(), detail.as_str().into());
+            }
             Value::Object(item)
         }
     }
