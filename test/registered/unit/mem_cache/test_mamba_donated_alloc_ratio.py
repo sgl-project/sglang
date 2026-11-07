@@ -659,6 +659,10 @@ class TestExtraMambaCacheSizing(CustomTestCase):
             pp_size=pp_size,
             model_config=SimpleNamespace(num_hidden_layers=4),
             _calculate_mamba_ratio=lambda: 2,
+            _linear_lossless_verify_enabled=lambda: False,
+        )
+        fake._spec_intermediate_bytes = MethodType(
+            KVCacheConfigurator._spec_intermediate_bytes, fake
         )
         args = dict(
             disable_radix_cache=False,
