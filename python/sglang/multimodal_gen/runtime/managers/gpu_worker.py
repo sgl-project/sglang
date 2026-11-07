@@ -253,6 +253,15 @@ def fit_auto_residency_probe(
         fitted, steps = lighter, steps + 1
 
 
+def _releases_cache_after(output_batch: OutputBatch, req: Req) -> bool:
+    """Whether the decoded tensor left ``output`` (saved to files) so the pool can shrink."""
+    return (
+        output_batch.output is None
+        and not output_batch.generated_output_skipped
+        and not req.return_raw_frames
+    )
+
+
 def _probe_workload_units(req: Req) -> int:
     return (
         max(1, int(req.width or 1))
@@ -918,11 +927,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
         ):
             self.do_mem_analysis(output_batch)
 
-        if (
-            not current_platform.is_cpu()
-            and output_batch.output is None
-            and not req.return_raw_frames
-        ):
+        if not current_platform.is_cpu() and _releases_cache_after(output_batch, req):
             if self.defer_cache_release:
                 # Between back-to-back requests a release only makes the next
                 # one grow the pool back, so wait until the scheduler idles.
