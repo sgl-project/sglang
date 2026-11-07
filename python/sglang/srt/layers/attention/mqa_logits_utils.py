@@ -57,12 +57,25 @@ def mqa_logits_static_budget_bytes(*, device_index: int) -> int:
 
 
 def mqa_logits_budget_bytes(*, device_index: int, allow_sync: bool) -> int:
-    """Static budget capped by current free memory; mem_get_info syncs, so
-    callers pass allow_sync=False under CUDA graph capture."""
+    """Static budget capped by driver-free and unused allocator memory.
+
+    mem_get_info syncs, so callers pass allow_sync=False under CUDA graph capture.
+    """
     budget = mqa_logits_static_budget_bytes(device_index=device_index)
     if allow_sync and not is_xpu():
         free_mem, _ = torch.cuda.mem_get_info(device_index)
-        budget = min(int(free_mem * mqa_logits_free_mem_fraction()), budget)
+        # The allocator can reuse cached blocks even when the driver reports no
+        # free memory. Ignoring them can force one-row chunks after a large
+        # forward fills the cache. This is an estimate (blocks can be fragmented),
+        # so retain the free-memory fraction and the static budget cap.
+        cached_mem = max(
+            0,
+            torch.cuda.memory_reserved(device_index)
+            - torch.cuda.memory_allocated(device_index),
+        )
+        budget = min(
+            int((free_mem + cached_mem) * mqa_logits_free_mem_fraction()), budget
+        )
     if is_hip():
         budget = min(budget, MQA_LOGITS_MAX_BYTES_ROCM)
     return max(1, budget)
