@@ -22,6 +22,13 @@ class ReqDllmMixin:
         self.dllm_phase: Optional[DllmReqPhase] = None
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
+        # Lifetime total, including prefill and recomputation after retraction.
+        self.dllm_forward_count = 0
+        self.dllm_prompt_forward_count = 0
+        self.dllm_generation_forward_count = 0
+        self.dllm_recompute_forward_count = 0
+        self.dllm_computed_end = 0
+        self.dllm_recompute_until = 0
         self.dllm_block_offset = 0
         self.dllm_config = dllm_config
         self.dllm_has_literal_mask = False
@@ -42,6 +49,16 @@ class ReqDllmMixin:
             DllmReqPhase.STAGING_PREFILL,
             DllmReqPhase.INCOMING_PREFILL,
         ]
+
+    def get_dllm_forward_phase(self: Req) -> str:
+        if not self.is_dllm_prefill():
+            return "generation"
+        if self.prefix_len < self.dllm_recompute_until:
+            return "recompute"
+        if self.extend_end <= len(self.origin_input_ids):
+            return "prompt"
+        # Separate context encoding of already generated tokens is generation work.
+        return "generation"
 
     def determine_dllm_phase(self: Req):
         if self.dllm_incomplete_ids:

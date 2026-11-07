@@ -226,11 +226,19 @@ class Gemma4Renoise(DllmAlgorithm):
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]] = None,
     ) -> DllmRunOutput:
+        self._forward_count = 0
         if not forward_batch.forward_mode.is_dllm_extend():
             if forward_batch.input_ids.numel() == 0:
-                return None, [], None, None, False
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
-            return out.logits_output, [], None, None, out.can_run_graph
+                return DllmRunOutput(None, [], None, None, False, self._forward_count)
+            out = self._forward(model_runner, forward_batch)
+            return DllmRunOutput(
+                out.logits_output,
+                [],
+                None,
+                None,
+                out.can_run_graph,
+                self._forward_count,
+            )
 
         self.vocab_size = model_runner.model_config.hf_config.text_config.vocab_size
         self.embed_tokens = model_runner.model.get_input_embeddings()

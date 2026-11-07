@@ -2774,6 +2774,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         "cached_tokens": request_stats.cached_tokens,
                     }
                 )
+                if recv_obj.dllm_forward_counts is not None:
+                    generation_forwards = recv_obj.dllm_generation_forward_counts[i]
+                    meta_info["dllm_metrics"] = {
+                        "forward_count": recv_obj.dllm_forward_counts[i],
+                        "prompt_forward_count": recv_obj.dllm_prompt_forward_counts[i],
+                        "generation_forward_count": generation_forwards,
+                        "recompute_forward_count": recv_obj.dllm_recompute_forward_counts[
+                            i
+                        ],
+                        "completion_tokens": recv_obj.completion_tokens[i],
+                        "tokens_per_forward": (
+                            recv_obj.completion_tokens[i] / generation_forwards
+                            if generation_forwards
+                            else 0.0
+                        ),
+                    }
                 if (
                     recv_obj.weight_versions is not None
                     and (spans := recv_obj.weight_versions[i]) is not None
