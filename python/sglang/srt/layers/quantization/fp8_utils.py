@@ -375,6 +375,10 @@ if _is_cuda:
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
 
+if _is_xpu:
+    from sgl_kernel import sgl_per_token_group_quant_8bit
+
+
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
 # Input scaling factors are no longer optional in _scaled_mm starting
@@ -752,6 +756,8 @@ def dispatch_w8a8_block_fp8_linear(
 
     # Other non-128 layouts still require Triton or the separate MXFP8 route.
     if weight_block_size is not None and weight_block_size[1] != 128:
+        if _is_xpu and weight_block_size == [1, 32]:
+            return torch_w8a8_block_fp8_linear
         if backend.is_deep_gemm():
             print_warning_once(
                 f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
@@ -787,10 +793,20 @@ def torch_w8a8_block_fp8_linear(
             f"but got {block_size}"
         )
     block_n, block_k = block_size
+    if block_n == 1 and block_k == 32:
+        return xpu_mxfp8_scaled_mm_linear(
+            input=input,
+            weight=weight,
+            weight_scale=weight_scale,
+            input_scale=input_scale,
+            bias=bias,
+        )
+
     if block_k != 128 or block_n not in (1, 128):
         raise ValueError(
-            "XPU block-FP8 scaled_mm supports weight_block_size [1, 128] or "
-            f"[128, 128], but got {block_size}"
+            "XPU FP8 scaled_mm supports weight_block_size [1, 128], [128, 128], "
+            "or [1, 32], "
+            f"but got {block_size}"
         )
 
     scale_b_recipe = (
@@ -830,15 +846,25 @@ def prepare_xpu_block_scale_for_scaled_mm(
     linear_fn: Callable,
 ) -> torch.Tensor:
     """Materialize the XPU block scale layout consumed by scaled_mm once."""
+    if (
+        linear_fn is not torch_w8a8_block_fp8_linear
+        or not isinstance(block_size, (list, tuple))
+        or weight_scale.ndim != 2
+    ):
+        return weight_scale
+
+    # For MXFP8 [1, 32], scaled_mm consumes row-major contiguous ue8m0 bytes.
+    if tuple(block_size) == (1, 32):
+        if not weight_scale.is_contiguous():
+            return weight_scale.contiguous()
+        return weight_scale
+
     # Keep logical [N-blocks, K-blocks] shape, but use
     # transpose-contiguous storage. For [1, 128], scaled_mm transposes
     # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
     # This avoids a per-forward contiguous/copy in either path.
     if (
-        linear_fn is not torch_w8a8_block_fp8_linear
-        or not isinstance(block_size, (list, tuple))
-        or tuple(block_size) not in ((1, 128), (128, 128))
-        or weight_scale.ndim != 2
+        tuple(block_size) not in ((1, 128), (128, 128))
         or weight_scale.t().is_contiguous()
     ):
         return weight_scale
@@ -1084,20 +1110,46 @@ def xpu_mxfp8_scaled_mm_linear(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
     """MXFP8 dense linear on Intel XPU via torch scaled_mm BlockWise1x32: weight is
     [N, K] e4m3, weight_scale is row-major [N, K // 32] ue8m0 bytes."""
     group_size = 32
+    if weight.dtype != torch.float8_e4m3fn:
+        raise TypeError(f"MXFP8 weight must be float8_e4m3fn, got {weight.dtype}")
+    if weight.ndim != 2:
+        raise ValueError(f"MXFP8 weight must be 2D [N, K], got {weight.ndim}D")
+    if weight_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise TypeError(
+            "MXFP8 weight_scale must be uint8 or float8_e8m0fnu, "
+            f"got {weight_scale.dtype}"
+        )
+    expected_weight_scale = (weight.shape[0], weight.shape[1] // group_size)
+    if tuple(weight_scale.shape) != expected_weight_scale:
+        raise ValueError(
+            f"MXFP8 weight_scale must have shape {expected_weight_scale}, "
+            f"got {tuple(weight_scale.shape)}"
+        )
     input_2d = input.reshape(-1, input.shape[-1]).contiguous()
     m, k = input_2d.shape
+    if k != weight.shape[1]:
+        raise ValueError(f"Input K={k} does not match weight K={weight.shape[1]}.")
     if k % group_size != 0:
         raise ValueError(f"K={k} must be divisible by {group_size} for MXFP8.")
 
     if input_scale is None:
-        output_dtype = input.dtype
-        if input_2d.dtype not in (torch.bfloat16, torch.float16):
+        if output_dtype is None:
+            output_dtype = (
+                input.dtype
+                if input_2d.dtype in (torch.bfloat16, torch.float16, torch.float32)
+                else torch.bfloat16
+            )
+        if input_2d.dtype not in (
+            torch.bfloat16,
+            torch.float16,
+            torch.float32,
+        ):
             input_2d = input_2d.to(torch.bfloat16)
-        from sgl_kernel import sgl_per_token_group_quant_8bit
 
         fp8_info = torch.finfo(torch.float8_e4m3fn)
         q_input = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=input.device)
@@ -1115,18 +1167,45 @@ def xpu_mxfp8_scaled_mm_linear(
             fp8_min=fp8_info.min,
             fp8_max=fp8_info.max,
             scale_ue8m0=True,
-            enable_v2=True,
+            enable_v2=input_2d.dtype != torch.float32,
         )
     else:
-        output_dtype = torch.bfloat16
+        if output_dtype is None:
+            output_dtype = torch.bfloat16
         q_input = input_2d
-        x_scale = input_scale.view(torch.float8_e8m0fnu)
+        if q_input.dtype != torch.float8_e4m3fn:
+            raise TypeError(
+                f"Pre-quantized MXFP8 input must be float8_e4m3fn, got {q_input.dtype}"
+            )
+        if input_scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+            raise TypeError(
+                "MXFP8 input_scale must be uint8 or float8_e8m0fnu, "
+                f"got {input_scale.dtype}"
+            )
+        x_scale = (
+            input_scale.reshape(-1, input_scale.shape[-1])
+            .contiguous()
+            .view(torch.float8_e8m0fnu)
+        )
+        expected_input_scale = (m, k // group_size)
+        if tuple(x_scale.shape) != expected_input_scale:
+            raise ValueError(
+                f"MXFP8 input_scale must have shape {expected_input_scale}, "
+                f"got {tuple(x_scale.shape)}"
+            )
 
     # A reinterpreting view: the bytes are already e8m0 exponents.
-    weight_scale_e8m0 = weight_scale.contiguous().view(torch.float8_e8m0fnu)
+    weight_scale_e8m0 = (
+        weight_scale.view(torch.float8_e8m0fnu)
+        if weight_scale.is_contiguous()
+        else weight_scale.contiguous().view(torch.float8_e8m0fnu)
+    )
+    weight_2d = weight if weight.is_contiguous() else weight.contiguous()
+    if bias is not None and bias.dtype != output_dtype:
+        bias = bias.to(output_dtype)
     output = torch.nn.functional.scaled_mm(
         q_input,
-        weight.t(),
+        weight_2d.t(),
         x_scale,
         torch.nn.functional.ScalingType.BlockWise1x32,
         weight_scale_e8m0,
@@ -2139,6 +2218,23 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         )
 
         return mxfp8_e4m3_quantize(x)
+    if _is_xpu:
+        q_input = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+        scale_u8 = torch.empty(
+            (x.shape[0], k // 32), device=x.device, dtype=torch.uint8
+        )
+        sgl_per_token_group_quant_8bit(
+            x,
+            q_input,
+            scale_u8,
+            32,
+            1e-10,
+            fp8_min,
+            fp8_max,
+            scale_ue8m0=True,
+            enable_v2=x.dtype != torch.float32,
+        )
+        return q_input, scale_u8
     downcast_to_mxfp = _get_triton_mxfp8_downcast()
     q_input, scale_u8 = downcast_to_mxfp(x, torch.float8_e4m3fn, axis=1)
     return q_input.contiguous(), scale_u8.contiguous()

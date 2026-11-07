@@ -441,9 +441,21 @@ class TestXpuMxfp8ScaledMmOperands(CustomTestCase):
         weight = torch.zeros(self.N, self.K, dtype=torch.float8_e4m3fn)
         scale = torch.zeros(self.N, self.K // MXFP8_GROUP_SIZE, dtype=torch.uint8)
         x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
-        with mock.patch.dict(
-            "sys.modules",
-            {"sgl_kernel": mock.MagicMock(sgl_per_token_group_quant_8bit=fake_quant)},
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {
+                    "sgl_kernel": mock.MagicMock(
+                        sgl_per_token_group_quant_8bit=fake_quant
+                    )
+                },
+            ),
+            mock.patch.object(
+                fp8_utils,
+                "sgl_per_token_group_quant_8bit",
+                fake_quant,
+                create=True,
+            ),
         ):
             out, got = self._capture_scaled_mm(
                 input=x, weight=weight, weight_scale=scale
