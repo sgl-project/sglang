@@ -1,10 +1,15 @@
 """HIP virtual-memory (VMM) buffers shared across the ranks of one host.
 
 Every rank allocates one VMM allocation with ``hipMemCreate``, exports it as a
-POSIX fd, exchanges the fds over UNIX sockets (``SCM_RIGHTS``), and maps every
-peer's allocation into its own address space. This is the ROCm counterpart of
-torch symmetric memory for the JIT custom all-reduce: it needs only the HIP
-runtime already loaded by torch, no FABRIC handle and no multicast object.
+shareable handle, and maps every peer's allocation into its own address space.
+This is the ROCm counterpart of torch symmetric memory for the JIT custom
+all-reduce: it needs only the HIP runtime already loaded by torch and no
+multicast object.
+
+Two handle types are supported. A FABRIC handle is a 64-byte value exchanged
+with ``all_gather_object``; a POSIX fd is exchanged over UNIX sockets
+(``SCM_RIGHTS``). ``SGLANG_HIP_VMM_HANDLE_TYPE`` picks one (``auto``, the
+default, uses FABRIC when the device supports it).
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ import torch
 import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.cuda_vmm_utils import exchange_posix_fds
 
 logger = logging.getLogger(__name__)
@@ -28,6 +34,9 @@ hipError_t = ctypes.c_int
 _HIP_MEM_ALLOCATION_TYPE_PINNED = 0x1
 _HIP_MEM_ALLOCATION_TYPE_UNCACHED = 0x40000000
 _HIP_MEM_HANDLE_TYPE_POSIX_FD = 0x1
+_HIP_MEM_HANDLE_TYPE_FABRIC = 0x8
+_HIP_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED = 95
+_HIP_FABRIC_HANDLE_BYTES = 64
 _HIP_MEM_LOCATION_TYPE_DEVICE = 1
 _HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE = 3
 _HIP_MEM_ALLOC_GRANULARITY_RECOMMENDED = 0x1
@@ -61,10 +70,18 @@ class _HipMemAccessDesc(ctypes.Structure):
     _fields_ = [("location", _HipMemLocation), ("flags", ctypes.c_int)]
 
 
+class _HipMemFabricHandle(ctypes.Structure):
+    _fields_ = [("data", ctypes.c_ubyte * _HIP_FABRIC_HANDLE_BYTES)]
+
+
 _PROTOTYPES = {
     "hipGetErrorString": (ctypes.c_char_p, [hipError_t]),
     "hipGetLastError": (hipError_t, []),
     "hipRuntimeGetVersion": (hipError_t, [ctypes.POINTER(ctypes.c_int)]),
+    "hipDeviceGetAttribute": (
+        hipError_t,
+        [ctypes.POINTER(ctypes.c_int), ctypes.c_int, ctypes.c_int],
+    ),
     "hipMemGetAllocationGranularity": (
         hipError_t,
         [
@@ -170,6 +187,34 @@ def is_hip_runtime_supported() -> bool:
     return hip_runtime_version()[:2] >= MIN_HIP_VERSION
 
 
+def is_fabric_handle_supported(device_index: int) -> bool:
+    supported = ctypes.c_int(0)
+    err = _hip().hipDeviceGetAttribute(
+        ctypes.byref(supported),
+        _HIP_DEVICE_ATTRIBUTE_HANDLE_TYPE_FABRIC_SUPPORTED,
+        device_index,
+    )
+    if err != 0:
+        _hip().hipGetLastError()
+        return False
+    return supported.value != 0
+
+
+def _resolve_handle_type(device_index: int) -> int:
+    choice = envs.SGLANG_HIP_VMM_HANDLE_TYPE.get().lower()
+    if choice == "posix_fd":
+        return _HIP_MEM_HANDLE_TYPE_POSIX_FD
+    if choice == "fabric":
+        return _HIP_MEM_HANDLE_TYPE_FABRIC
+    if choice != "auto":
+        raise ValueError(
+            f"SGLANG_HIP_VMM_HANDLE_TYPE={choice!r}; expected auto, fabric or posix_fd"
+        )
+    if is_fabric_handle_supported(device_index):
+        return _HIP_MEM_HANDLE_TYPE_FABRIC
+    return _HIP_MEM_HANDLE_TYPE_POSIX_FD
+
+
 class _DeviceArray:
     """`__cuda_array_interface__` over a mapped range; keeps its buffer alive."""
 
@@ -221,7 +266,9 @@ class HipSymmetricBuffer:
             if uncached
             else _HIP_MEM_ALLOCATION_TYPE_PINNED
         )
-        prop.requestedHandleTypes = _HIP_MEM_HANDLE_TYPE_POSIX_FD
+        self.handle_type = _resolve_handle_type(self.device.index)
+        use_fabric = self.handle_type == _HIP_MEM_HANDLE_TYPE_FABRIC
+        prop.requestedHandleTypes = self.handle_type
         prop.location.type = _HIP_MEM_LOCATION_TYPE_DEVICE
         prop.location.id = self.device.index
         granularity = ctypes.c_size_t()
@@ -236,46 +283,61 @@ class HipSymmetricBuffer:
         gran = granularity.value
         self.size = (nbytes + gran - 1) // gran * gran
 
-        # Every rank learns every rank's outcome before the fd exchange, so a
-        # failure raises everywhere instead of leaving the peers blocked in it.
+        # Every rank learns every rank's outcome before the handle exchange, so
+        # a failure raises everywhere instead of leaving the peers blocked in it.
         local_fds: List[int] = []
+        local_fabric: List[bytes] = []
         try:
             local, chunk_sizes = self._create(prop, gran)
             for handle in local:
-                fd = ctypes.c_int(-1)
-                _check(
-                    lib.hipMemExportToShareableHandle(
-                        ctypes.byref(fd), handle, _HIP_MEM_HANDLE_TYPE_POSIX_FD, 0
-                    ),
-                    "hipMemExportToShareableHandle(POSIX_FD)",
-                )
-                local_fds.append(fd.value)
-            outcome = chunk_sizes
+                if use_fabric:
+                    fabric = _HipMemFabricHandle()
+                    _check(
+                        lib.hipMemExportToShareableHandle(
+                            ctypes.byref(fabric), handle, self.handle_type, 0
+                        ),
+                        "hipMemExportToShareableHandle(FABRIC)",
+                    )
+                    local_fabric.append(bytes(fabric.data))
+                else:
+                    fd = ctypes.c_int(-1)
+                    _check(
+                        lib.hipMemExportToShareableHandle(
+                            ctypes.byref(fd), handle, self.handle_type, 0
+                        ),
+                        "hipMemExportToShareableHandle(POSIX_FD)",
+                    )
+                    local_fds.append(fd.value)
+            outcome = (self.handle_type, chunk_sizes, local_fabric)
         except RuntimeError as e:
             outcome = str(e)
         outcomes: List[object] = [None] * self.world_size
         dist.all_gather_object(outcomes, outcome, group=group)
         errors = {r: o for r, o in enumerate(outcomes) if isinstance(o, str)}
-        totals = {sum(o) for o in outcomes if not isinstance(o, str)}
-        if errors or len(totals) != 1:
+        ok = [o for o in outcomes if not isinstance(o, str)]
+        if errors or len({sum(o[1]) for o in ok}) != 1 or len({o[0] for o in ok}) != 1:
             for fd in local_fds:
                 os.close(fd)
             self.close()
             raise RuntimeError(
-                f"VMM allocation of {self.size} bytes failed: {errors or outcomes}"
+                f"VMM allocation of {self.size} bytes failed: "
+                f"{errors or [o[:2] for o in ok]}"
             )
+        peer_sizes = [o[1] for o in outcomes]
 
-        try:
-            peer_fds = exchange_posix_fds(
-                group,
-                self.rank,
-                self.world_size,
-                local_fds,
-                [len(o) for o in outcomes],
-            )
-        finally:
-            for fd in local_fds:
-                os.close(fd)
+        peer_fds = {}
+        if not use_fabric:
+            try:
+                peer_fds = exchange_posix_fds(
+                    group,
+                    self.rank,
+                    self.world_size,
+                    local_fds,
+                    [len(s) for s in peer_sizes],
+                )
+            finally:
+                for fd in local_fds:
+                    os.close(fd)
 
         ptrs: List[int] = []
         try:
@@ -284,23 +346,36 @@ class HipSymmetricBuffer:
                     ptrs.append(self._map(local, chunk_sizes))
                     continue
                 handles = []
-                for idx in range(len(outcomes[peer])):
+                for idx in range(len(peer_sizes[peer])):
                     handle = ctypes.c_void_p()
-                    peer_fd = peer_fds.pop((peer, idx))
-                    try:
+                    if use_fabric:
+                        fabric = _HipMemFabricHandle.from_buffer_copy(
+                            outcomes[peer][2][idx]
+                        )
                         _check(
                             lib.hipMemImportFromShareableHandle(
                                 ctypes.byref(handle),
-                                ctypes.c_void_p(peer_fd),
-                                _HIP_MEM_HANDLE_TYPE_POSIX_FD,
+                                ctypes.cast(ctypes.byref(fabric), ctypes.c_void_p),
+                                self.handle_type,
                             ),
-                            f"hipMemImportFromShareableHandle(rank={peer})",
+                            f"hipMemImportFromShareableHandle(FABRIC, rank={peer})",
                         )
-                    finally:
-                        os.close(peer_fd)
+                    else:
+                        peer_fd = peer_fds.pop((peer, idx))
+                        try:
+                            _check(
+                                lib.hipMemImportFromShareableHandle(
+                                    ctypes.byref(handle),
+                                    ctypes.c_void_p(peer_fd),
+                                    self.handle_type,
+                                ),
+                                f"hipMemImportFromShareableHandle(rank={peer})",
+                            )
+                        finally:
+                            os.close(peer_fd)
                     self._handles.append(handle)
                     handles.append(handle)
-                ptrs.append(self._map(handles, outcomes[peer]))
+                ptrs.append(self._map(handles, peer_sizes[peer]))
         except BaseException:
             for leftover in peer_fds.values():
                 os.close(leftover)
@@ -318,6 +393,13 @@ class HipSymmetricBuffer:
                     f"expected {self.device} @ {ptr:#x}"
                 )
             self.buffers.append(view[:nbytes])
+        if self.rank == 0:
+            logger.info(
+                "HIP VMM symmetric buffer: %d bytes x %d ranks, %s handles",
+                self.size,
+                self.world_size,
+                "FABRIC" if use_fabric else "POSIX_FD",
+            )
 
     def _create(
         self, prop: _HipMemAllocationProp, gran: int

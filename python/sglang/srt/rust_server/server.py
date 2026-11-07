@@ -10,7 +10,9 @@ and delegates to it.
 
 from __future__ import annotations
 
+import dataclasses
 import ipaddress
+import json
 import logging
 import operator
 import os
@@ -28,18 +30,26 @@ import psutil
 
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
 from sglang.srt.environ import envs
-from sglang.srt.managers.io_struct import ShutdownReq
+from sglang.srt.managers.io_struct import GenerateReqInput, ShutdownReq
 from sglang.srt.managers.scheduler_components.dp_attn import DRAIN_STATE_NO_LISTENER
 from sglang.srt.managers.utils import (
     MsgpackDecodeError,
     msgpack_decode_explained,
 )
 from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
+from sglang.srt.observability.request_dump import (
+    CRASH_DUMP_GRACE_SECS,
+    crash_dump_hostname,
+    dumping,
+    write_crash_dump,
+)
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.runtime_context import (
+    get_context,
     get_device,
     get_exec,
     get_mm,
+    get_observability,
     get_parallel,
     get_serving,
 )
@@ -71,6 +81,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import MmSpec, Server
+    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +142,55 @@ def claim_sigterm_before_compiles() -> None:
     signal.signal(signal.SIGTERM, terminate)
 
 
+def _is_plain_dp() -> bool:
+    """DP over replicas, each its own TP group, rather than attention DP."""
+    parallel = get_parallel()
+    return not parallel.attn_dp_enabled and parallel.dp_size > 1
+
+
+def listener_port_offset(tp_rank: int, dp_rank: Optional[int]) -> int:
+    """The offset from ``--port`` of the listener that global TP rank
+    ``tp_rank`` (of replica ``dp_rank`` under plain DP) hosts: a node's
+    listeners bind consecutive ports, one per DP group led there."""
+    if _is_plain_dp():
+        # One TP group per replica, every leader on the same node.
+        return dp_rank
+    parallel = get_parallel()
+    if get_exec().moe.is_ep_scale_joiner:
+        # The joining TP group is entirely local to this node.
+        tp_size_per_node = parallel.tp_size
+    else:
+        nnodes_per_pp_rank = max(parallel.nnodes // parallel.pp_size, 1)
+        tp_size_per_node = parallel.tp_size // nnodes_per_pp_rank
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    return (tp_rank % tp_size_per_node) // dp_group_width
+
+
+def node_listener_ports() -> List[int]:
+    """The ports this node's Rust listeners bind, ascending, assuming Rust
+    mode: one per DP group led on this node, none on a node that leads none.
+    Callable from the launching process, before any scheduler starts."""
+    from sglang.srt.entrypoints.engine import (
+        _calculate_rank_ranges,
+        _rank_hosts_rust_listener,
+    )
+
+    parallel = get_parallel()
+    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
+    if 0 not in pp_rank_range:
+        return []
+    if get_exec().moe.is_ep_scale_joiner:
+        # Scale joiners launch their full TP group on this node.
+        tp_rank_range = range(parallel.tp_size)
+    dp_ranks = range(parallel.dp_size) if _is_plain_dp() else [None]
+    return sorted(
+        get_serving().port + listener_port_offset(tp_rank, dp_rank)
+        for tp_rank in tp_rank_range
+        if _rank_hosts_rust_listener(0, tp_rank)
+        for dp_rank in dp_ranks
+    )
+
+
 class RustServer:
     """Owns the embedded multi-threaded Rust server (``sglang_server.Server``).
 
@@ -154,6 +214,11 @@ class RustServer:
         # The engine-level startup timings `/server_info` reports, set once
         # the scheduler finishes initializing (see `set_startup_time`).
         self.startup_time: Optional[Dict[str, Any]] = None
+        # Set by `launch`: the launch state a crash dump carries.
+        self.server_args: Optional[ServerArgs] = None
+        # Once per process: the exception path and a watchdog may both try.
+        self._crash_dump_lock = threading.Lock()
+        self._crash_dump_performed = False
         # Whether this listener's rank broadcasts to every scheduler rank
         # (global TP rank 0), and so stops them once its drain completes.
         self._broadcasts_shutdown = False
@@ -170,6 +235,18 @@ class RustServer:
         # Batches whose customized_info could not be sent (see
         # `_customized_info_json`).
         self._dropped_customized_info = 0
+
+    @classmethod
+    def _request_input_class(cls) -> type:
+        """The request class Python's ``/generate`` admits: the object the
+        request log prints and a crash dump holds for each request."""
+        return GenerateReqInput
+
+    @classmethod
+    def _server_added_custom_params(cls) -> Tuple[str, ...]:
+        """``sampling_params.custom_params`` keys this server adds to a request
+        itself, which the request log and crash dumps leave out."""
+        return ()
 
     @classmethod
     def _health_generate_headers(cls, scheduler: Scheduler) -> Dict[str, str]:
@@ -264,17 +341,8 @@ class RustServer:
     @classmethod
     def _port_offset(cls) -> int:
         """This listener's offset from the base port based on per-node DP rank."""
-        if get_exec().moe.is_ep_scale_joiner:
-            # The joining TP group is entirely local to this node.
-            tp_size_per_node = get_parallel().tp_size
-        else:
-            nnodes_per_pp_rank = max(get_parallel().nnodes // get_parallel().pp_size, 1)
-            tp_size_per_node = get_parallel().tp_size // nnodes_per_pp_rank
-        dp_group_width = get_parallel().attn_tp_size * get_parallel().attn_cp_size
-        if not get_parallel().attn_dp_enabled and get_parallel().dp_size > 1:
-            # Plain DP: one TP group per replica, every leader on this node.
-            return get_parallel().dp_rank
-        return (get_parallel().tp_rank % tp_size_per_node) // dp_group_width
+        dp_rank = get_parallel().dp_rank if _is_plain_dp() else None
+        return listener_port_offset(get_parallel().tp_rank, dp_rank)
 
     @classmethod
     def _advertised_host(cls) -> str:
@@ -371,6 +439,14 @@ class RustServer:
         creates. A model the server cannot serve is refused before the port
         is bound.
         """
+        # The Rust server has generation routes only, and its /model_info
+        # reports every model as generative.
+        if not scheduler.model_config.is_generation:
+            raise RuntimeError(
+                "SGLANG_RUST_SERVER=1 serves generation models only; this is an "
+                "embedding or reward model. Unset SGLANG_RUST_SERVER to serve it."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
@@ -420,6 +496,9 @@ class RustServer:
                 extension=extension,
                 health_generate_headers=cls._health_generate_headers(scheduler),
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
+                request_class=cls._request_input_class(),
+                server_added_custom_params=cls._server_added_custom_params(),
+                port_offset=port_offset,
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
@@ -428,6 +507,7 @@ class RustServer:
         )
         instance = cls(server, http_port=listen_port)
         instance._mm_cache_namespace = mm_cache_namespace
+        instance.server_args = scheduler.server_args
         instance._broadcasts_shutdown = get_parallel().tp_rank == 0
 
         if scheduler.model_config.is_multimodal:
@@ -469,7 +549,31 @@ class RustServer:
             dp_note,
         )
 
+        instance._watch_startup_failure()
         return instance
+
+    def _watch_startup_failure(self) -> threading.Thread:
+        """Take the server down when its startup warmup fails, as Python's
+        HTTP server does (``_execute_server_warmup``): signal the parent
+        process the way a crashed scheduler does (``run_scheduler_process``),
+        and the parent kills the process tree. A watcher thread, so a hung
+        scheduler loop cannot hold the server up."""
+        parent = psutil.Process().parent()
+
+        def watch() -> None:
+            error = self.server.wait_startup_failure()
+            if error is None:
+                # Shut down, after a warmup that succeeded, was skipped, or
+                # never finished.
+                return
+            logger.error("Rust server startup warmup failed: %s", error)
+            parent.send_signal(signal.SIGQUIT)
+
+        thread = threading.Thread(
+            target=watch, name="rust-server-startup-watch", daemon=True
+        )
+        thread.start()
+        return thread
 
     def install_sigterm_drain(
         self, notify: Optional[str] = None, hold_drain_end: bool = False
@@ -600,6 +704,66 @@ class RustServer:
         self.startup_time = build_engine_startup_time(
             [scheduler_startup_time],
             tokenizer_e2e=time.time() - psutil.Process().create_time(),
+        )
+
+    def dump_requests_before_crash(self) -> None:
+        """Write the ``--crash-dump-folder`` file ``TokenizerManager`` writes
+        before a crash: the finished requests of the last five minutes and the
+        unfinished ones, as the Rust server kept them. Once per process, and it
+        never raises: the scheduler calls it on its way down (an exception, a
+        watchdog timeout). It returns within ``CRASH_DUMP_GRACE_SECS`` even
+        if the dump stalls, so the caller's ``SIGQUIT`` still goes out; the
+        main process waits no longer than that for the dump anyway."""
+        folder = get_observability().crash_dump_folder
+        if not folder:
+            return
+        with self._crash_dump_lock:
+            if self._crash_dump_performed:
+                return
+            self._crash_dump_performed = True
+        dumper = threading.Thread(
+            target=self._dump_requests, args=(folder,), name="crash-dump", daemon=True
+        )
+        dumper.start()
+        dumper.join(CRASH_DUMP_GRACE_SECS)
+
+    def _dump_requests(self, folder: str) -> None:
+        try:
+            # The request lines logged so far reach stdout before the process dies.
+            self.server.flush_request_log()
+            with dumping(folder, crash_dump_hostname()):
+                self._write_crash_dump(folder)
+        except BaseException:  # a Rust panic is a BaseException
+            logger.exception("rust server: failed to write the crash dump")
+
+    def _write_crash_dump(self, folder: str) -> None:
+        logger.error(f"Dumping requests before crash. {folder=}")
+        snapshot = json.loads(self.server.crash_dump_snapshot())
+        rebuilt = _CrashDumpRequests(self._request_input_class(), snapshot["bodies"])
+        finished = [rebuilt.record(r, finished=True) for r in snapshot["finished"]]
+        unfinished = [rebuilt.record(r, finished=False) for r in snapshot["unfinished"]]
+        if not finished and not unfinished:
+            return
+        try:
+            resolved_config = get_context().resolved_server_args_dict(
+                self.server_args.resolved_dict()
+            )
+        except Exception as e:
+            logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
+            resolved_config = None
+        filename = write_crash_dump(
+            folder,
+            crash_dump_hostname(),
+            finished + unfinished,
+            server_args=self.server_args,
+            resolved_config=resolved_config,
+            watermark_config=self.server_args.watermark_config,
+            # Every process that hosts a listener dumps its own requests.
+            filename_suffix=f"_{os.getpid()}",
+        )
+        logger.error(
+            f"Dumped {len(finished)} finished and {len(unfinished)} unfinished "
+            f"requests before crash to {filename}"
         )
 
     def mm_transport_stats(self) -> Dict[str, int]:
@@ -1054,4 +1218,62 @@ class RustServer:
             image_mean=spec.image_mean,
             image_std=spec.image_std,
             resample=resample,
+        )
+
+
+class _CrashDumpRequests:
+    """Rebuilds the request objects ``TokenizerManager`` would hold from the
+    Rust server's crash-dump snapshot (``Server.crash_dump_snapshot``): each
+    request JSON it received (``bodies``), normalized by Python's own code
+    once per body, then the batch item a request was and the rid its client
+    sees."""
+
+    def __init__(self, request_class: type, bodies: Dict[str, Dict[str, Any]]):
+        self.request_class = request_class
+        self.bodies = bodies
+        self.names = {f.name for f in dataclasses.fields(request_class) if f.init}
+        self.normalized: Dict[str, Any] = {}
+
+    def record(self, record: Dict[str, Any], finished: bool) -> tuple:
+        """One ``(request, out, created_time, finished_time)`` tuple."""
+        return (
+            self.request(
+                str(record["body"]), record["batch_index"], record["rid"], finished
+            ),
+            record["out"],
+            record["created_time"],
+            record["finished_time"],
+        )
+
+    def request(
+        self, body_id: str, batch_index: Optional[int], rid: str, finished: bool
+    ):
+        fields = self.bodies[body_id]
+        try:
+            if body_id not in self.normalized:
+                obj = self._construct(fields)
+                obj.normalize_batch_and_arguments()
+                self.normalized[body_id] = obj
+            obj = self.normalized[body_id]
+            if batch_index is not None:
+                obj = obj[batch_index]
+        except Exception as e:
+            logger.warning(f"crash dump: request {rid} kept as received: {e!r}")
+            try:
+                obj = self._construct(fields)
+            except Exception:
+                return dict(fields, rid=rid)
+        obj.rid = rid
+        if finished and isinstance(obj.input_ids, list):
+            # As `record_request_for_crash_dump` keeps a finished request's ids.
+            obj.input_ids = (
+                tuple(tuple(row) for row in obj.input_ids)
+                if obj.input_ids and isinstance(obj.input_ids[0], list)
+                else tuple(obj.input_ids)
+            )
+        return obj
+
+    def _construct(self, fields: Dict[str, Any]):
+        return self.request_class(
+            **{name: value for name, value in fields.items() if name in self.names}
         )
