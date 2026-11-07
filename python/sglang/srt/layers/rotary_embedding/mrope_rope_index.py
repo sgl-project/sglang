@@ -111,11 +111,11 @@ def get_rope_index(
             st = 0
             remain_images, remain_videos = image_nums, video_nums
             for _ in range(image_nums + video_nums):
-                if image_token_id in input_tokens and remain_images > 0:
+                if remain_images > 0 and image_token_id in input_tokens:
                     ed_image = input_tokens.index(image_token_id, st)
                 else:
                     ed_image = len(input_tokens) + 1
-                if video_token_id in input_tokens and remain_videos > 0:
+                if remain_videos > 0 and video_token_id in input_tokens:
                     ed_video = input_tokens.index(video_token_id, st)
                 else:
                     ed_video = len(input_tokens) + 1
@@ -286,17 +286,17 @@ def get_rope_index_qwen3_omni(
                 ed_vision_start = (
                     input_tokens.index(vision_start_token_id, st)
                     if (
-                        (
+                        (remain_videos > 0 or remain_images > 0)
+                        and (
                             image_token_id in input_tokens
                             or video_token_id in input_tokens
                         )
-                        and (remain_videos > 0 or remain_images > 0)
                     )
                     else len(input_tokens) + 1
                 )
                 ed_audio_start = (
                     input_tokens.index(audio_start_token_id, st)
-                    if (audio_token_id in input_tokens and remain_audios > 0)
+                    if (remain_audios > 0 and audio_token_id in input_tokens)
                     else len(input_tokens) + 1
                 )
                 min_ed = min(ed_vision_start, ed_audio_start)
