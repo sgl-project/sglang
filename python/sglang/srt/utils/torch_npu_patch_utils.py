@@ -9,7 +9,7 @@ def apply_torch_npu_patches(torch_npu: Any, patches: Sequence[Sequence[Any]]) ->
         return
 
     if hasattr(torch_npu, "_apply_all_patches"):
-        torch_npu._apply_all_patches()
+        torch_npu._init.patches.monkey_patches._apply_patches(patches)
         return
 
     raise AttributeError(
