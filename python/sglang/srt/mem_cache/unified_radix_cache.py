@@ -800,6 +800,12 @@ class UnifiedRadixCache(BasePrefixCache):
                 params, allocation_reclaim_satisfied=allocation_reclaim_satisfied
             )
 
+        headroom = envs.SGLANG_HICACHE_EVICT_HEADROOM_TOKENS.get()
+        if self.is_write_back and 0 < params.num_tokens < headroom:
+            # A write_back eviction waits for the running forward (write fence) before it
+            # can copy victims to host, so free one larger batch per call instead of many
+            # small ones. The extra victims are demoted to the host pool.
+            params = replace(params, num_tokens=headroom)
         request_by_type = self._evict_request_by_type(params)
         available_size_targets = {
             ct: (ct, self._component_available_size(ct) + request_cnt)

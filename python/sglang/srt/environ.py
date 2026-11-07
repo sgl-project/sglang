@@ -877,6 +877,10 @@ class Envs:
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Minimum tokens one write_back eviction call frees (0 = off). A write_back eviction waits
+    # for the running forward to finish before copying its victims to host, so one larger
+    # batch is cheaper than many small ones; the extra victims stay in the host pool.
+    SGLANG_HICACHE_EVICT_HEADROOM_TOKENS = EnvInt(0)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
