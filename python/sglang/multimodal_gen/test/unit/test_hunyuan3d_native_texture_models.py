@@ -326,9 +326,7 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
         )
         nv = 8
         edges = np.sort(
-            np.concatenate(
-                [faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]
-            ),
+            np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]),
             axis=1,
         )
         expected_keys, expected_counts = np.unique(
