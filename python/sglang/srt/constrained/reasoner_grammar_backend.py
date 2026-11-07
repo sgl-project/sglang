@@ -259,6 +259,14 @@ class ReasonerGrammarObject(BaseGrammarObject):
         if (int(vocab_mask[idx, token // 32]) >> (token % 32)) & 1:
             self._do_token_filter(vocab_mask, [token], idx, is_allowed=True)
 
+    def needs_vocab_mask(self) -> bool:
+        # An inner grammar may apply within a draft tree that crosses the think
+        # end, so it always counts; without one only the thinking token filter
+        # constrains anything, and only while thinking.
+        return self.grammar is not None or (
+            self._is_thinking() and self.enable_token_filter
+        )
+
     def fill_vocab_mask(self, vocab_mask: torch.Tensor, idx: int) -> None:
         if self.reasoning_in_grammar and self.grammar is not None:
             self.grammar.fill_vocab_mask(vocab_mask, idx)

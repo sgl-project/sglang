@@ -32,6 +32,66 @@ def _get_allowed_tokens(vocab_mask, batch_idx, max_token_id):
 class TestSetTokenFilterTorch(unittest.TestCase):
     """Tests for the Torch token filter implementation."""
 
+    @staticmethod
+    def _reference(vocab_mask, token_ids, batch_idx, is_allowed, reset_vocab_mask):
+        """Bit-by-bit reference for the cached implementation."""
+        row = vocab_mask[batch_idx]
+        if reset_vocab_mask:
+            row.fill_(-1 if not is_allowed else 0)
+        for token_id in token_ids:
+            elem, bit = token_id // 32, token_id % 32
+            val = int(row[elem].item()) & 0xFFFFFFFF
+            val = (val | (1 << bit)) if is_allowed else (val & ~(1 << bit))
+            if val >= 2**31:
+                val -= 2**32
+            row[elem] = val
+
+    def test_repeated_calls_match_reference(self):
+        # The cached template and index/bitmask arrays must give the same rows as
+        # a bit-by-bit update, on first use and on cache hits, with and without
+        # a reset, including tokens in the int32 sign bit and duplicates.
+        torch.manual_seed(0)
+        lists = [[1, 128815], [31, 63, 31], [0], [5, 7, 9, 200, 201], [4095]]
+        for token_ids in lists:
+            for is_allowed in (True, False):
+                for reset in (True, False):
+                    for _ in range(2):  # second pass is a cache hit
+                        # 4096 words cover a 131k vocabulary, so 128815 fits.
+                        base = torch.randint(
+                            -(2**31), 2**31 - 1, (3, 4096), dtype=torch.int32
+                        )
+                        got, want = base.clone(), base.clone()
+                        set_token_filter_torch(
+                            got,
+                            token_ids,
+                            1,
+                            is_allowed=is_allowed,
+                            reset_vocab_mask=reset,
+                        )
+                        self._reference(want, token_ids, 1, is_allowed, reset)
+                        self.assertTrue(
+                            torch.equal(got, want),
+                            f"{token_ids=} {is_allowed=} {reset=}",
+                        )
+                        # Other rows are untouched.
+                        self.assertTrue(torch.equal(got[0], base[0]))
+                        self.assertTrue(torch.equal(got[2], base[2]))
+
+    def test_cached_template_is_not_aliased_by_the_row(self):
+        vocab_mask = torch.zeros((2, 4), dtype=torch.int32)
+        set_token_filter_torch(vocab_mask, [3, 5], 0, is_allowed=False)
+        vocab_mask[0].fill_(0)  # caller scribbles over its row
+        set_token_filter_torch(vocab_mask, [3, 5], 1, is_allowed=False)
+        allowed = _get_allowed_tokens(vocab_mask, 1, 128)
+        self.assertEqual(allowed, [t for t in range(128) if t not in (3, 5)])
+
+    def test_pinned_host_row(self):
+        if not torch.cuda.is_available():
+            self.skipTest("pinned memory needs CUDA")
+        vocab_mask = torch.zeros((1, 4), dtype=torch.int32, pin_memory=True)
+        set_token_filter_torch(vocab_mask, [0, 5, 31, 32, 63], 0, is_allowed=True)
+        self.assertEqual(_get_allowed_tokens(vocab_mask, 0, 64), [0, 5, 31, 32, 63])
+
     def test_allow_tokens_from_blank_mask(self):
         vocab_mask = torch.zeros((1, 4), dtype=torch.int32)  # 128 tokens
         set_token_filter_torch(vocab_mask, [0, 5, 31, 32, 63], 0, is_allowed=True)

@@ -11,7 +11,12 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.speculative.spec_utils import GrammarTree, traverse_tree
+from sglang.srt.speculative.spec_utils import (
+    GrammarTree,
+    build_grammar_vocab_mask,
+    generate_token_bitmask,
+    traverse_tree,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -105,6 +110,101 @@ class TestTraverseTreePassesIntsToGrammar(unittest.TestCase):
         # Node 1 accepted+filled; node 2 rejected -> node 2 and node 3 skipped.
         self.assertEqual(accept_calls, [5])
         self.assertEqual(fill_calls, [0, 1])
+
+    def test_sign_bit_token_passes_parent_check(self):
+        # Token 31 of a word lives in the int32 sign bit; the host-side check must
+        # still read it as allowed when the parent row permits it.
+        rnt, rns, draft_tokens = self._chain(torch.tensor([[100, 31, 63]]))
+        bitmask = torch.zeros((3, 4), dtype=torch.int32)
+        bitmask[0, 0] = -(2**31)  # only token 31 allowed after the root
+        bitmask[1, 1] = -(2**31)  # only token 63 allowed after node 1
+
+        grammar, accept_calls, fill_calls = self._record_grammar()
+        traverse_tree(rnt, rns, draft_tokens, grammar, bitmask)
+
+        self.assertEqual(accept_calls, [31, 63])
+        self.assertEqual(fill_calls, [0, 1, 2])
+
+
+class TestGenerateTokenBitmaskSkipsUnconstrained(unittest.TestCase):
+    """Grammars that cannot constrain the step keep their rows all-allowed
+    without walking the draft tree."""
+
+    def _req(self, needs_mask, vocab_size=64):
+        grammar = MagicMock()
+        grammar.needs_vocab_mask.return_value = needs_mask
+        grammar.is_terminated.return_value = False
+        grammar.allocate_vocab_mask.side_effect = (
+            lambda vocab_size, batch_size, device: torch.full(
+                (batch_size, (vocab_size + 31) // 32), -1, dtype=torch.int32
+            )
+        )
+        # fill marks its row so a walk is visible in the mask; bit 0 cleared only,
+        # so the chain's draft tokens (11, 22) still pass the parent check.
+        grammar.fill_vocab_mask.side_effect = lambda mask, idx: mask[idx].fill_(-2)
+        req = MagicMock()
+        req.grammar = grammar
+        return req
+
+    def _chain(self, bs, n=3):
+        ids = torch.tensor([[100, 11, 22]] * bs)
+        return GrammarTree.from_linear_chain(ids).resolve()
+
+    def test_all_unconstrained_returns_no_mask(self):
+        reqs = [self._req(False), self._req(False)]
+        rnt, rns, tokens = self._chain(2)
+        mask, grammar = generate_token_bitmask(reqs, rnt, rns, tokens, 64)
+        self.assertIsNone(mask)
+        self.assertIsNone(grammar)
+        for req in reqs:
+            req.grammar.fill_vocab_mask.assert_not_called()
+            req.grammar.accept_token.assert_not_called()
+
+    def test_mixed_batch_walks_only_constrained_rows(self):
+        reqs = [self._req(False), self._req(True), self._req(False)]
+        rnt, rns, tokens = self._chain(3)
+        mask, grammar = generate_token_bitmask(reqs, rnt, rns, tokens, 64)
+        self.assertIs(grammar, reqs[1].grammar)
+        # Rows of the walked request were filled; the others stay all-allowed.
+        self.assertTrue(torch.all(mask[3:6] == -2))
+        self.assertTrue(torch.all(mask[0:3] == -1))
+        self.assertTrue(torch.all(mask[6:9] == -1))
+        reqs[0].grammar.fill_vocab_mask.assert_not_called()
+        reqs[2].grammar.fill_vocab_mask.assert_not_called()
+
+    def test_build_clears_leftover_mask_when_nothing_constrains(self):
+        reqs = [self._req(False)]
+        sampling_info = MagicMock()
+        sampling_info.vocab_size = 64
+        sampling_info.grammar_mask = object()  # the extend stage's mask
+        ids = torch.tensor([[100, 11, 22]])
+        result = build_grammar_vocab_mask(
+            reqs=reqs,
+            tree=GrammarTree.from_linear_chain(ids),
+            sampling_info=sampling_info,
+            device="cpu",
+            barrier=None,
+        )
+        self.assertIsNone(result)
+        self.assertIsNone(sampling_info.grammar_mask)
+
+    def test_build_without_grammars_leaves_sampling_info_alone(self):
+        req = MagicMock()
+        req.grammar = None
+        sampling_info = MagicMock()
+        sampling_info.vocab_size = 64
+        leftover = object()
+        sampling_info.grammar_mask = leftover
+        ids = torch.tensor([[100, 11, 22]])
+        result = build_grammar_vocab_mask(
+            reqs=[req],
+            tree=GrammarTree.from_linear_chain(ids),
+            sampling_info=sampling_info,
+            device="cpu",
+            barrier=None,
+        )
+        self.assertIsNone(result)
+        self.assertIs(sampling_info.grammar_mask, leftover)
 
 
 if __name__ == "__main__":
