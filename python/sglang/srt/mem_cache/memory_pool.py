@@ -4173,6 +4173,7 @@ class HybridLinearKVPool(KVCache):
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
+        v_head_dim: Optional[int] = None,
         # When provided (shared-KV-pool path), use this pool for the
         # full-attention layers instead of constructing one internally.
         full_kv_pool: Optional[KVCache] = None,
@@ -4214,6 +4215,7 @@ class HybridLinearKVPool(KVCache):
                 dtype=dtype,
                 head_num=head_num,
                 head_dim=head_dim,
+                v_head_dim=v_head_dim,
                 layer_num=self.full_layer_nums,
                 device=device,
                 enable_memory_saver=enable_memory_saver,
