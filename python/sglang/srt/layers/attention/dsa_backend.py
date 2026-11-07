@@ -442,6 +442,34 @@ def _resolve_dsa_triton_union(*, union: int, deterministic: bool) -> int:
     return union
 
 
+def _small_heads_prefill_enabled(
+    device_sm_major,
+    kv_cache_dtype,
+    num_heads,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    prefill_impl,
+) -> bool:
+    if not (
+        device_sm_major == 10
+        and kv_cache_dtype == torch.bfloat16
+        and 0 < num_heads <= 32
+        and kv_lora_rank == 512
+        and kv_lora_rank + qk_rope_head_dim in (512, 576)
+        and prefill_impl in ("flashmla_sparse", "flashmla_auto")
+    ):
+        return False
+    from sglang.kernels.ops.attention.flash_mla_interface import has_small_heads_prefill
+
+    if not has_small_heads_prefill():
+        print_warning_once(
+            "FlashMLA small-head prefill is unavailable; using native sparse prefill. "
+            "Install a FlashMLA build with has_small_heads_prefill support to enable it."
+        )
+        return False
+    return True
+
+
 def _validate_flashmla_sparse_q8_backend(
     *,
     prefill_impl: str,
@@ -530,6 +558,13 @@ class DeepseekSparseAttnBackend(
     # init_cuda_graph_state sizes this for every backend, but only the TRT-LLM
     # branch of __init__ allocates one.
     _multi_ctas_kv_counter_buffer: Optional[torch.Tensor] = None
+
+    def _call_flash_mla_sparse_fwd_small_heads(self, *args):
+        from sglang.kernels.ops.attention.flash_mla_interface import (
+            flash_mla_sparse_fwd_small_heads,
+        )
+
+        return flash_mla_sparse_fwd_small_heads(*args)
 
     def _call_flash_mla_sparse_fwd(self, **kwargs):
         from sglang.kernels.ops.attention.flash_mla_interface import (
@@ -742,7 +777,14 @@ class DeepseekSparseAttnBackend(
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
         self.kv_cache_dtype = model_runner.kv_cache_dtype
-
+        self.sparse_prefill_small_heads = _small_heads_prefill_enabled(
+            self.device_sm_major,
+            self.kv_cache_dtype,
+            self.num_q_heads,
+            self.kv_lora_rank,
+            self.qk_rope_head_dim,
+            self.dsa_prefill_impl,
+        )
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
         _validate_flashmla_sparse_q8_backend(
             prefill_impl=self.dsa_prefill_impl,
@@ -2607,6 +2649,7 @@ class DeepseekSparseAttnBackend(
                 v_head_dim=layer.v_head_dim,
                 topk_length=metadata.dsa_cache_seqlens_int32,
                 attn_sink=attn_sink,
+                allow_small_heads=True,
             )
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_rope is not None:
@@ -2975,18 +3018,33 @@ class DeepseekSparseAttnBackend(
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        allow_small_heads: bool = False,
     ) -> torch.Tensor:
-        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        # FlashMLA sparse kernels are instantiated at 64 heads (Hopper and
+        # Blackwell) and 128 heads (Blackwell); with TP the local head count may
+        # be smaller (e.g., 64 // 4 = 16) and is padded up.
         num_tokens, num_heads, head_dim = q_all.shape
+        use_small_heads = (
+            allow_small_heads
+            and self.sparse_prefill_small_heads
+            and 0 < num_heads <= 32
+            and head_dim in (512, 576)
+            and kv_cache.dtype == torch.bfloat16
+            and q_all.dtype == torch.bfloat16
+            and v_head_dim == 512
+            and page_table_1.shape[-1] >= 128
+            and page_table_1.shape[-1] % 64 == 0
+        )
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
+        # Compact calls use Q64; native calls retain their existing padding.
+        required_padding = (
+            64 if use_small_heads else (128 if self.device_sm_major >= 10 else 64)
+        )
 
         need_padding = num_heads % required_padding != 0
 
         if need_padding:
-            assert required_padding % num_heads == 0, (
+            assert use_small_heads or required_padding % num_heads == 0, (
                 f"num_heads {num_heads} cannot be padded to {required_padding}. "
                 f"TP size may be too large for this model."
             )
@@ -3022,15 +3080,26 @@ class DeepseekSparseAttnBackend(
             # they ever diverge.
             topk_length = None
 
-        o, _, _ = self._call_flash_mla_sparse_fwd(
-            q=q_input,
-            kv=kv_cache,
-            indices=indices_input,
-            sm_scale=sm_scale,
-            d_v=v_head_dim,
-            attn_sink=sink_input,
-            topk_length=topk_length,
-        )
+        if use_small_heads:
+            o, _, _ = self._call_flash_mla_sparse_fwd_small_heads(
+                q_input,
+                kv_cache,
+                indices_input,
+                sm_scale,
+                8 if num_heads <= 8 else 32,
+                sink_input,
+                topk_length,
+            )
+        else:
+            o, _, _ = self._call_flash_mla_sparse_fwd(
+                q=q_input,
+                kv=kv_cache,
+                indices=indices_input,
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=sink_input,
+                topk_length=topk_length,
+            )
 
         # Trim output back to original num_heads if we padded
         if need_padding:

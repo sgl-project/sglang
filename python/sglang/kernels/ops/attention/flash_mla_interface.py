@@ -236,3 +236,25 @@ def flash_mla_mega_decode(
         use_legacy=use_legacy,
         **_MEGA_FIXED_PARAMS,
     )
+
+
+def has_small_heads_prefill() -> bool:
+    """Probe the optional public capability API, including legacy-wheel fallback."""
+    probe = getattr(flash_mla, "has_small_heads_prefill", None)
+    if not callable(probe) or not callable(
+        getattr(flash_mla, "flash_mla_sparse_fwd_small_heads", None)
+    ):
+        return False
+    try:
+        return bool(probe())
+    except (ImportError, OSError, RuntimeError, AttributeError):
+        return False
+
+
+def flash_mla_sparse_fwd_small_heads(
+    q, kv, indices, sm_scale, active_heads, attn_sink=None, topk_length=None
+):
+    """Compact, output-only prefill; Q/sink are padded to 64 heads."""
+    return flash_mla.flash_mla_sparse_fwd_small_heads(
+        q, kv, indices, sm_scale, active_heads, attn_sink, topk_length
+    )
