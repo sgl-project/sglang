@@ -674,6 +674,12 @@ class ChatCompletionMessageContentImagePart(BaseModel):
     image_url: ChatCompletionMessageContentImageURL
     modalities: Optional[Literal["image", "multi-images", "video"]] = "image"
 
+    @field_validator("image_url", mode="before")
+    @classmethod
+    def _accept_bare_url(cls, value: Any) -> Any:
+        # Some clients send "image_url": "<url>" instead of {"url": "<url>"}.
+        return {"url": value} if isinstance(value, str) else value
+
 
 class ChatCompletionMessageContentVideoPart(BaseModel):
     type: Literal["video_url"]
@@ -926,6 +932,32 @@ ReasoningEffortType = Optional[
 ]
 
 
+class ThinkingParam(BaseModel):
+    """K3-style thinking control, as Kimi K3 and compatible surfaces send it.
+
+    ``type`` gates reasoning and ``effort`` outranks ``reasoning_effort``.
+
+    ``keep`` selects how much earlier reasoning is replayed; "all" is the only
+    mode implemented here, and any other value is normalized to it rather than
+    rejected. A deployment is expected to force "all" this way -- rejecting the
+    request would fail one the reference service answers. ``adaptive`` is
+    accepted as an alias for enabled so an Anthropic-shaped value reaching this
+    surface does not 400.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    type: Optional[Literal["enabled", "disabled", "adaptive"]] = None
+    # Accepted and normalized to "all"; see the class docstring.
+    keep: Optional[str] = None
+    effort: ReasoningEffortType = None
+
+    @property
+    def enabled(self) -> bool:
+        """Absent or "adaptive" both mean reasoning is on; only "disabled" is off."""
+        return self.type != "disabled"
+
+
 def _message_tools_indices(messages: Any) -> List[int]:
     if not isinstance(messages, list):
         return []
@@ -1033,8 +1065,12 @@ class ChatCompletionRequest(PDRoutingFields):
     )
     thinking: Optional[Any] = Field(
         default=None,
-        description="Thinking config such as {'type': 'adaptive'}; read only by "
-        "models whose chat template defines a thinking mode, ignored otherwise.",
+        description="Thinking control. K3 form: {type: enabled|disabled|adaptive, "
+        "keep: all, effort: low|high|max}; 'effort' takes precedence over "
+        "reasoning_effort, 'type: disabled' turns reasoning off, 'keep' is "
+        "normalized to 'all'. Other models whose chat template defines a thinking "
+        "mode read it as a plain dict (e.g. {'type': 'adaptive'}). Kept as a dict; "
+        "the K3 serving path validates it against ThinkingParam.",
     )
     task: Optional[
         Literal["action", "query", "authority", "domain", "title", "read_url"]
@@ -1194,9 +1230,26 @@ class ChatCompletionRequest(PDRoutingFields):
             if enabled:
                 thinking = True
 
+        # thinking.effort outranks reasoning.effort and the top-level field.
+        # chat_template_kwargs stays above all three: the renderers only fill
+        # thinking_effort when the caller has not set it themselves.
+        thinking_type = None
+        thinking_config = values.get("thinking")
+        if isinstance(thinking_config, dict):
+            thinking_effort = thinking_config.get("effort")
+            if thinking_effort is not None:
+                values["reasoning_effort"] = thinking_effort
+            thinking_type = thinking_config.get("type")
+
         effort = values.get("reasoning_effort")
         if effort is not None:
             thinking = effort != "none"
+        if thinking_type is not None:
+            thinking = thinking_type != "disabled"
+        elif thinking_config is not None and thinking is None:
+            # A thinking object with no explicit type still means "reasoning on",
+            # but never contradicts an effort that already resolved it.
+            thinking = True
 
         if thinking is not None:
             ctk = values.get("chat_template_kwargs")

@@ -172,6 +172,41 @@ class TestChatCompletionRequest(unittest.TestCase):
         )
         self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
 
+    def test_image_url_may_be_a_bare_string(self):
+        """A bare-string image_url parses like {"url": ...} in user and tool messages."""
+        url = "https://example.com/a.png"
+        request = ChatCompletionRequest(
+            model="test-model",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [{"type": "image_url", "image_url": url}],
+                },
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "call_1",
+                            "type": "function",
+                            "function": {"name": "screenshot", "arguments": "{}"},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_1",
+                    "content": [
+                        {"type": "text", "text": "result:"},
+                        {"type": "image_url", "image_url": url},
+                    ],
+                },
+            ],
+        )
+        self.assertEqual(request.messages[0].content[0].image_url.url, url)
+        self.assertEqual(request.messages[0].content[0].image_url.detail, "auto")
+        self.assertEqual(request.messages[2].content[1].image_url.url, url)
+
     def test_sampling_param_build(self):
         req = ChatCompletionRequest(
             model="x",
@@ -792,6 +827,59 @@ class TestValidationEdgeCases(unittest.TestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+
+class TestThinkingParam(unittest.TestCase):
+    """`thinking` is the K3 spelling of the reasoning controls."""
+
+    MESSAGES = [{"role": "user", "content": "hi"}]
+
+    def _request(self, **kwargs):
+        return ChatCompletionRequest(model="m", messages=self.MESSAGES, **kwargs)
+
+    def test_disabled_turns_reasoning_off(self):
+        request = self._request(thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+        self.assertIs(request.chat_template_kwargs["enable_thinking"], False)
+
+    def test_enabled_is_the_default_type(self):
+        request = self._request(thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_effort_outranks_reasoning_effort(self):
+        request = self._request(
+            reasoning_effort="max", thinking={"type": "enabled", "effort": "low"}
+        )
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_effort_outranks_reasoning_object(self):
+        request = self._request(reasoning={"effort": "max"}, thinking={"effort": "low"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_reasoning_effort_survives_without_thinking_effort(self):
+        request = self._request(reasoning_effort="low", thinking={"type": "enabled"})
+        self.assertEqual(request.reasoning_effort, "low")
+
+    def test_disabled_wins_over_an_effort_derived_toggle(self):
+        request = self._request(reasoning_effort="high", thinking={"type": "disabled"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_adaptive_is_treated_as_enabled(self):
+        request = self._request(thinking={"type": "adaptive"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
+
+    def test_explicit_none_effort_survives_a_thinking_object(self):
+        # A thinking object with no explicit type must not turn reasoning back on.
+        request = self._request(reasoning_effort="none", thinking={"keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_effort_none_inside_thinking_disables_reasoning(self):
+        request = self._request(thinking={"effort": "none"})
+        self.assertIs(request.chat_template_kwargs["thinking"], False)
+
+    def test_null_type_is_treated_as_absent(self):
+        request = self._request(thinking={"type": None, "keep": "all"})
+        self.assertIs(request.chat_template_kwargs["thinking"], True)
 
 
 if __name__ == "__main__":
