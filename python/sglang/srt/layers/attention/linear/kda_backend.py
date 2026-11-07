@@ -1165,13 +1165,13 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         track_ssm = self.forward_metadata.has_mamba_track_mask
         track_chunk_idx = self.forward_metadata.track_chunk_idx
+        # Aligned-only tracking copies the final pool state;
+        # only an interior boundary needs per-chunk h, so final-state kernels can run.
+        track_h_src = self.forward_metadata.track_ssm_h_src if track_ssm else None
+        # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
+        needs_h = track_h_src is not None and track_h_src.numel() > 0
         h_track_buf = None
-        if (
-            track_ssm
-            and track_chunk_idx is not None
-            # Same rows as track_ssm_h_batch_src, but known without a GPU sync.
-            and self.forward_metadata.track_ssm_h_src.numel() > 0
-        ):
+        if needs_h and track_chunk_idx is not None:
             # fp32 scratch the kernel snapshots the tracked chunk-boundary
             # states into (rows follow the batch; untracked rows stay unread).
             # A kernel that does not declare support would leave the buffer
@@ -1211,13 +1211,11 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # draft_extend_v2 must stay rollback-able, so kernels that commit state
             # in place (e.g. FlashKDA) must not run for it.
             is_spec_decode=forward_batch.forward_mode.is_draft_extend_v2(),
-            return_intermediate_states=track_ssm,
+            return_intermediate_states=needs_h,
             # Which global chunk rows of h the track snapshot will read; lets
             # kernels that cannot materialize per-chunk states (NVIDIA KDA) take the
             # fast path when the snapshot only needs the final state.
-            track_ssm_h_src=(
-                self.forward_metadata.track_ssm_h_src if track_ssm else None
-            ),
+            track_ssm_h_src=track_h_src,
             track_state=h_track_buf,
             track_chunk_idx=(track_chunk_idx if h_track_buf is not None else None),
             state_checkpoint_cu_starts=self.forward_metadata.state_checkpoint_cu_starts,
@@ -1232,7 +1230,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # Snapshot the SSM state at the last track-aligned chunk boundary
             # from the kernel's per-chunk states (h) / final states into the
             # ping-pong track slots (see _init_track_ssm_indices).
-            core_attn_out, h = core_attn_out
+            if needs_h:
+                core_attn_out, h = core_attn_out
+            else:
+                h = None
             self._track_mamba_state_extend(
                 forward_batch,
                 h,

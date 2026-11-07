@@ -166,9 +166,7 @@ class CuteDSLKDAKernel(LinearAttnKernelBase):
             h0_indices=ssm_cache_indices,
         )
 
-        # CuTeDSL does not emit intermediate chunk states; pairing with None
-        # keeps the upstream extra-buffer radix track contract.
-        return o.unsqueeze(0), None
+        return o.unsqueeze(0)
 
     def target_verify(self, *args, **kwargs):
         raise NotImplementedError("CuteDSLKDAKernel does not support target_verify")

@@ -1121,8 +1121,8 @@ class MambaAttnBackendBase(AttentionBackend):
         stream once per layer); otherwise they fall back to the per-chunk
         states ``h`` (already rounded to the activation dtype)."""
         if forward_metadata.has_mamba_track_mask:
-            # Triton always returns h; FlashInfer returns it only when checkpoints
-            # were requested. Aligned-only tracking reads the final state below.
+            # Kernels return h only when an interior boundary is tracked;
+            # aligned-only tracking reads the final state below.
             if forward_metadata.track_ssm_h_src.numel() > 0:
                 if h_track_buf is not None:
                     ssm_states[forward_metadata.track_ssm_h_dst] = h_track_buf[
