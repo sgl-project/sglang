@@ -103,7 +103,7 @@ from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
 )
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.kv_events import uses_dynamo_format
-from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
@@ -3233,6 +3233,12 @@ class Scheduler(
         )
         if recv_req.bootstrap_port is None:
             recv_req.bootstrap_port = get_disagg().disaggregation_bootstrap_port
+        if (
+            recv_req.bootstrap_host is None
+            and self.disaggregation_mode == DisaggregationMode.DECODE
+            and self.transfer_backend == TransferBackend.FAKE
+        ):
+            recv_req.bootstrap_host = FAKE_BOOTSTRAP_HOST
         # Radix-native sessions use only the top-level session_id.
         radix_native_session = (
             recv_req.session_id is not None and self.enable_session_radix_cache
@@ -3323,9 +3329,7 @@ class Scheduler(
                 elif (
                     recv_req.bootstrap_host is None
                     and self.disaggregation_mode == DisaggregationMode.DECODE
-                    and self.transfer_backend != TransferBackend.FAKE
                 ):
-                    # Decode connects to the prefill's bootstrap server at this host.
                     error_msg = (
                         f"Invalid request: Disaggregated decode request received "
                         f"without bootstrap host. {req.rid=}"
