@@ -22,6 +22,7 @@ struct Param {
   size_t max_trie_depth;
   size_t draft_token_num;
   size_t external_sam_budget = 0;
+  size_t prompt_sam_budget = 0;
   size_t external_corpus_max_tokens = 10000000;
   std::string match_type;
 
