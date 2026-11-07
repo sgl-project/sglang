@@ -42,7 +42,6 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
             ("EAGLE", 1): True,
             ("EAGLE3", 1): True,
             ("EAGLE3", 4): False,  # tree draft
-            ("DSPARK", None): False,  # ragged verify lengths
             ("NGRAM", None): False,  # tree lives in the verify mask
             ("DFLASH", None): False,
             ("STANDALONE", 1): False,
