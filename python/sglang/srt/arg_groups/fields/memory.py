@@ -148,6 +148,15 @@ class Memory(msgspec.Struct):
             ],
         ),
     ] = "page_first"
+    disable_hicache_async_ready_sync: A[
+        bool,
+        "Disable the asynchronous HiCache ready-count sync and use a blocking "
+        "all-reduce in every scheduler step. By default the sync across attention "
+        "TP ranks runs asynchronously on its own gloo group and its result is "
+        "consumed one step later. The async sync applies to the host-cache path "
+        "without a storage backend, pipeline parallelism or attention context "
+        "parallelism.",
+    ] = False
     hicache_storage_backend: A[
         Optional[str],
         Arg(
