@@ -1960,6 +1960,10 @@ def _set_envs_and_config(server_args: ServerArgs):
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    if cfg.device == "xpu":
+        # Workaround: the torch XPU static Triton launcher segfaults loading inductor kernels
+        # (compiled repetition penalty); drop once torch XPU fixes it. Must be set before workers spawn.
+        os.environ.setdefault("TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER", "0")
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels

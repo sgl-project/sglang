@@ -8,6 +8,7 @@ from typing import ClassVar, Literal, Optional
 
 from sglang.srt.kv_canary.config import CanaryMode
 from sglang.srt.kv_canary.runner.swa_divergence import SwaDivergenceLog
+from sglang.srt.utils import is_xpu
 from sglang.test.kv_canary.mode_config import _MODE_CONFIGS, _ModeConfig
 from sglang.test.kv_canary.utils import build_canary_server_args, post_parallel_generate
 from sglang.test.kv_canary.violation_assert_mixin import CanaryViolationAssertMixin
@@ -103,15 +104,20 @@ class CanaryE2EBase(CapturedServerE2EBase):
         cls._stdout_buf = io.StringIO()
         cls._stderr_buf = io.StringIO()
 
+        extra_server_args = (
+            "--max-total-tokens",
+            "65536",
+            "--skip-server-warmup",
+            *cls.extra_server_args,
+        )
+        # XPU's default triton backend is too slow for the ~7k-token workload to fit the
+        # request timeouts; intel_xpu is the backend the XPU docs recommend.
+        if is_xpu() and "--attention-backend" not in extra_server_args:
+            extra_server_args += ("--attention-backend", "intel_xpu")
         server_args = build_canary_server_args(
             kv_canary_mode=cls.kv_canary_mode,
             mode_cfg=cls._cfg,
-            extra_server_args=(
-                "--max-total-tokens",
-                "65536",
-                "--skip-server-warmup",
-                *cls.extra_server_args,
-            ),
+            extra_server_args=extra_server_args,
         )
         cls.process = popen_launch_server(
             cls._cfg.model_path,
