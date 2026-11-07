@@ -116,6 +116,14 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
 
     def get_think_end_token_ids(self, tokenizer: PreTrainedTokenizerBase) -> List[int]:
+        # A marker that is a single vocabulary entry must resolve to that id:
+        # tokenizer.encode splits special tokens into ordinary ids under
+        # split_special_tokens, and the model emits the native id, so the
+        # grammar gate would wait for a sequence that never arrives.
+        native_id = tokenizer.convert_tokens_to_ids(self.think_end_token)
+        unk = tokenizer.unk_token_id
+        if native_id is not None and (unk is None or native_id != unk):
+            return [native_id]
         return tokenizer.encode(self.think_end_token, add_special_tokens=False)
 
     def get_self_opened_think_start_token_ids(
