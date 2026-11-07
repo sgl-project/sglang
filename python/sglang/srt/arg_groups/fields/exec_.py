@@ -1053,6 +1053,12 @@ class ExecMoe(msgspec.Struct):
             type_parser=_paged_experts_num_resident,
         ),
     ] = None
+    paged_experts_enable_disk: A[
+        bool,
+        "Let Paged Experts write to disk under $SGLANG_CACHE_DIR/paged_experts: each MoE "
+        "layer's experts are kept there (about the size of the experts), so that later starts "
+        "read them instead of loading and repacking them. Requires --enable-paged-experts.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

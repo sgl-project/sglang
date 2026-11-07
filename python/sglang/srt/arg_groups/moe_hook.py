@@ -73,6 +73,11 @@ def handle_moe_kernel_config(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.paged_experts_enable_disk and not cfg.enable_paged_experts:
+        raise ValueError(
+            "The argument paged-experts-enable-disk requires --enable-paged-experts."
+        )
+
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
