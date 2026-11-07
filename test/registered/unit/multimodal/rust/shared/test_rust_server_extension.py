@@ -722,6 +722,7 @@ class TestRustServerExtension(CustomTestCase):
             default_max_new_tokens=128,
             request_class=GenerateReqInput,
             server_added_custom_params=(),
+            port_offset=1,
         )
         # What a crash dump carries.
         self.assertIs(instance.server_args, sentinel.server_args)
