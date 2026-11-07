@@ -174,9 +174,10 @@ impl RequestLog {
                             omit_custom_params(&mut value, &self.server_added_custom_params);
                         }
                         value
-                    } else if name == "image_data" {
-                        // Its layout, for a batch's `modalities`.
-                        image_layout(value)
+                    } else if MEDIA_FIELDS.contains(&name.as_str()) {
+                        // Its layout, for the `multimodal` summary and a
+                        // batch's `modalities`.
+                        media_layout(value)
                     } else {
                         return None;
                     };
@@ -239,7 +240,7 @@ impl RequestLog {
             ReceivedAs::Typed(headers) => self.typed_views(requests, batch, headers),
         };
         if let Some(logger) = &self.logger {
-            logger.received(&obj.into(), &headers);
+            logger.received(&obj, &headers);
         }
         items
             .into_iter()
@@ -323,14 +324,16 @@ impl RequestLog {
                 }
                 self.normalize(&mut item, request);
             }
+            let multimodal = MediaSummary::of(&item);
             items.push(PyObj {
                 own: item,
                 shared: shared.clone(),
+                multimodal,
             });
             dumps.push(dump.clone().map(|body| (body, batch.then_some(i))));
         }
         let obj = if !logging {
-            Map::new()
+            PyObj::default()
         } else if batch {
             // Python's batch object holds these as per-item lists.
             let mut obj = fields;
@@ -344,9 +347,16 @@ impl RequestLog {
                 let column = items.iter().map(|item| item.own[name].clone()).collect();
                 obj.insert(name.into(), Value::Array(column));
             }
-            obj
+            PyObj {
+                own: obj,
+                shared: Arc::default(),
+                // Python's normalization gives every item its media (one
+                // image for all of them included), so the batch's summary is
+                // the items' put together.
+                multimodal: MediaSummary::sum(items.iter().map(|item| &item.multimodal)),
+            }
         } else {
-            items[0].own.clone()
+            items[0].clone()
         };
         (obj, items, dumps, headers)
     }
@@ -402,22 +412,19 @@ impl RequestLog {
                 })
             })
             .collect();
+        let items: Vec<PyObj> = items.into_iter().map(PyObj::from).collect();
         let obj = if batch {
             let mut obj = items.first().cloned().unwrap_or_default();
-            obj.insert(
+            obj.own.insert(
                 "rid".into(),
-                Value::Array(items.iter().map(|item| item["rid"].clone()).collect()),
+                Value::Array(items.iter().map(|item| item.own["rid"].clone()).collect()),
             );
+            obj.multimodal = MediaSummary::sum(items.iter().map(|item| &item.multimodal));
             obj
         } else {
             items.first().cloned().unwrap_or_default()
         };
-        (
-            obj,
-            items.into_iter().map(PyObj::from).collect(),
-            dumps,
-            headers,
-        )
+        (obj, items, dumps, headers)
     }
 
     /// The crash dump's requests as JSON (see `CrashRecorder::snapshot`);
@@ -432,7 +439,7 @@ impl RequestLog {
 /// `(Receive object, per-request Finish objects, per-request dump sources,
 /// headers)`.
 type Views = (
-    Map<String, Value>,
+    PyObj,
     Vec<PyObj>,
     Vec<Option<(Arc<DumpBody>, Option<usize>)>>,
     LoggedHeaders,
@@ -440,10 +447,12 @@ type Views = (
 
 /// A request's Python object: its own fields over the ones its batch shares,
 /// which every item references as Python's `obj[i]` does.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct PyObj {
     own: Map<String, Value>,
     shared: Arc<Map<String, Value>>,
+    /// Python `_summarize_multimodal` of its media fields.
+    multimodal: MediaSummary,
 }
 
 impl PyObj {
@@ -455,6 +464,7 @@ impl PyObj {
 impl From<Map<String, Value>> for PyObj {
     fn from(own: Map<String, Value>) -> Self {
         Self {
+            multimodal: MediaSummary::of(&own),
             own,
             shared: Arc::default(),
         }
@@ -484,13 +494,82 @@ fn batch_images(images: &Value, i: usize) -> Option<(Value, Value)> {
     })
 }
 
-/// What [`batch_images`] reads of `image_data` (nesting, lengths, `None`s)
-/// without the images, for a level that does not show them.
-fn image_layout(images: &Value) -> Value {
-    match images {
-        Value::Array(items) => Value::Array(items.iter().map(image_layout).collect()),
+/// The media fields, in the order Python's `_summarize_multimodal` reads
+/// them.
+const MEDIA_FIELDS: [&str; 3] = ["image_data", "video_data", "audio_data"];
+
+/// What the log reads of a media field at a level that does not show it: its
+/// nesting (`None`s included) with each item replaced by its payload length,
+/// for the `multimodal` summary and a batch's `modalities`.
+fn media_layout(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.iter().map(media_layout).collect()),
         Value::Null => Value::Null,
-        _ => Value::Bool(true),
+        item => payload_len(item).into(),
+    }
+}
+
+/// Python `_media_payload_len`: the characters of an item's data URI, URL or
+/// path, bare or under `url` (else `data`); a layout holds the length.
+fn payload_len(item: &Value) -> u64 {
+    match item {
+        Value::String(s) => s.chars().count() as u64,
+        Value::Object(map) => map
+            .get("url")
+            .or_else(|| map.get("data"))
+            .and_then(Value::as_str)
+            .map_or(0, |s| s.chars().count() as u64),
+        Value::Number(len) => len.as_u64().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// Python `_summarize_multimodal`: per media field, the item count and the
+/// total payload length (zero items for a field the request leaves out).
+#[derive(Clone, Default)]
+struct MediaSummary([(u64, u64); 3]);
+
+impl MediaSummary {
+    fn of(fields: &Map<String, Value>) -> Self {
+        let mut summary = Self::default();
+        for (slot, name) in summary.0.iter_mut().zip(MEDIA_FIELDS) {
+            if let Some(value) = fields.get(name) {
+                count_media(value, 0, slot);
+            }
+        }
+        summary
+    }
+
+    fn sum<'a>(summaries: impl Iterator<Item = &'a Self>) -> Self {
+        let mut total = Self::default();
+        for summary in summaries {
+            for (slot, (count, len)) in total.0.iter_mut().zip(summary.0) {
+                slot.0 += count;
+                slot.1 += len;
+            }
+        }
+        total
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.iter().all(|(count, _)| *count == 0)
+    }
+}
+
+/// Python counts a field's items and, for a batch, each item's leaves; a
+/// `None` at either level is skipped, and anything deeper is one item.
+fn count_media(value: &Value, depth: usize, slot: &mut (u64, u64)) {
+    match value {
+        Value::Null => {}
+        Value::Array(items) if depth < 2 => {
+            for item in items {
+                count_media(item, depth + 1, slot);
+            }
+        }
+        item => {
+            slot.0 += 1;
+            slot.1 += payload_len(item);
+        }
     }
 }
 
@@ -773,6 +852,7 @@ impl RequestLogger {
     fn received_line(&self, obj: &PyObj, headers: &[(String, String)]) -> String {
         let mut line = String::from("Receive: obj=");
         self.write_obj(&mut line, obj);
+        write_multimodal(&mut line, &obj.multimodal);
         write_headers(&mut line, headers);
         line
     }
@@ -786,6 +866,7 @@ impl RequestLogger {
     ) -> String {
         let mut line = String::from("Finish: obj=");
         self.write_obj(&mut line, obj);
+        write_multimodal(&mut line, &obj.multimodal);
         write_headers(&mut line, headers);
         line.push_str(", out=");
         write_dict(
@@ -821,6 +902,27 @@ impl RequestLogger {
         }
         line.push(')');
     }
+}
+
+/// `, multimodal={...}` when the request carries media: Python's summary
+/// dict, a modality's item count and payload length for each with any.
+fn write_multimodal(line: &mut String, summary: &MediaSummary) {
+    if summary.is_empty() {
+        return;
+    }
+    line.push_str(", multimodal={");
+    let mut first = true;
+    for (name, (count, len)) in ["image", "video", "audio"].into_iter().zip(summary.0) {
+        if count == 0 {
+            continue;
+        }
+        if !first {
+            line.push_str(", ");
+        }
+        first = false;
+        let _ = write!(line, "'{name}': {{'count': {count}, 'payload_len': {len}}}");
+    }
+    line.push('}');
 }
 
 /// `, headers={...}` when any whitelisted header is present.

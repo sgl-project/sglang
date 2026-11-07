@@ -191,6 +191,20 @@ _CASES = [
         "out": {"text": "", "output_ids": [1], "meta_info": {"id": "s1"}},
     },
     {
+        # Media is summarized per modality at every level; the items
+        # themselves show from level 2.
+        "name": "single_media",
+        "body": {
+            "rid": "rid-7",
+            "text": "What is this?",
+            "image_data": "data:image/png;base64,iVBORw0KGgo=",
+            "video_data": {"url": "file:///tmp/clip.mp4", "fps": 2},
+            "audio_data": ["a.wav", "é中🙂.wav"],
+        },
+        "headers": {},
+        "out": {"text": "", "output_ids": [1], "meta_info": {"id": "rid-7"}},
+    },
+    {
         # Watermark keys are redacted, nested ones included.
         "name": "watermark_keys",
         "body": {
