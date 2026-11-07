@@ -24,6 +24,8 @@ class _MambaPool:
 
 
 class _Allocator:
+    retraction_draft_pools = ()
+
     def __init__(self, carries_mamba: bool, state):
         self.cpu_copy_carries_mamba = carries_mamba
         self.state = state

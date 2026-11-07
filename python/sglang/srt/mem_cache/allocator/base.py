@@ -50,6 +50,13 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # Draft KV pools with tensors of their own, indexed by this allocator's ids.
+    # PD CPU retraction backs them up with the target KV. Class-level: some
+    # allocators do not call the base __init__.
+    retraction_draft_pools: tuple[KVCache, ...] = ()
+
+    def register_retraction_draft_pools(self, pools: tuple[KVCache, ...]) -> None:
+        self.retraction_draft_pools = pools
 
     @property
     def state_slots(self):
