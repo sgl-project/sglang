@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
@@ -36,11 +38,16 @@ class BatchedFrequencyPenalizer(_BatchedPenalizer):
             .unsqueeze_(1)
         )
 
-    def _cumulate_output_tokens(self, output_ids: torch.Tensor):
+    def _cumulate_output_tokens(
+        self, output_ids: torch.Tensor, valid: Optional[torch.Tensor] = None
+    ):
+        src = self.frequency_penalties
+        if valid is not None:
+            src = src * valid.unsqueeze(1)
         self.cumulated_frequency_penalties.scatter_add_(
             dim=1,
             index=output_ids.unsqueeze(1),
-            src=self.frequency_penalties,
+            src=src,
         )
 
     def _apply(self, logits: torch.Tensor) -> torch.Tensor:

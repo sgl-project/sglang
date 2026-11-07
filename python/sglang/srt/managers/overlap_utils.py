@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.speculative.gather_spec_extras import gather_spec_extras
 from sglang.srt.environ import envs
+from sglang.srt.managers.repetition_penalty_relay import RepetitionPenaltyRelay
 from sglang.srt.runtime_context import (
     get_exec,
     get_spec,
@@ -200,6 +201,8 @@ class RelayPayload:
     # ngram delays the draft extend (ngram update)
     accept_tokens: Optional[torch.Tensor] = None
     accept_lens: Optional[torch.Tensor] = None
+    repetition_penalty_tokens: Optional[torch.Tensor] = None
+    repetition_penalty_lens: Optional[torch.Tensor] = None
 
     @classmethod
     def from_ngram(cls, draft_input: NgramVerifyInput) -> RelayPayload:
@@ -368,6 +371,9 @@ class FutureMap:
         # ngram-only relay bufs
         self.accept_tokens_buf: Optional[torch.Tensor] = None
         self.accept_lens_buf: Optional[torch.Tensor] = None
+        self.repetition_penalty_relay = RepetitionPenaltyRelay(
+            self.req_pool_size, self.device
+        )
 
         self.publish_ready = None  # lazy device.Event(); only spec_v2 needs it
         # Debug consume-once state: armed by a recording publish, consumed by
@@ -556,6 +562,11 @@ class FutureMap:
         )
 
     def _resolve_spec_extras(self, batch: ScheduleBatch) -> None:
+        if self.spec_algo.is_dflash_family() and batch.sampling_info is not None:
+            (
+                batch.sampling_info.repetition_penalty_tokens,
+                batch.sampling_info.repetition_penalty_lens,
+            ) = self.repetition_penalty_relay.resolve(batch.req_pool_indices)
         if self.spec_algo.is_ngram():
             draft_input = batch.spec_info
             if draft_input is None or draft_input.future_indices is None:
@@ -781,6 +792,12 @@ class FutureMap:
         if indices.shape[0] == 0:
             # DP idle: payload is empty stub; lazy-init shape peek would IndexError.
             return
+        if self.spec_algo.is_dflash_family():
+            self.repetition_penalty_relay.stash(
+                indices,
+                payload.repetition_penalty_tokens,
+                payload.repetition_penalty_lens,
+            )
         if self.spec_algo.is_ngram():
             self._maybe_init_ngram_bufs(payload)
             self.accept_tokens_buf[indices] = payload.accept_tokens
