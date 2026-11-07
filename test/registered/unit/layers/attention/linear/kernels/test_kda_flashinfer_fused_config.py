@@ -234,11 +234,13 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
 
     def _state_pool(self, args):
         self.export_env(args)
+        # Match production KimiLinearConfig.mamba2_cache_params: it does not
+        # pass a dtype, so the field default factory resolves env/default only.
+        # Supplying an hf_config-derived dtype here would hide a real mismatch.
         params = self.params["KimiLinearCacheParams"](
             shape=self.params["KimiLinearStateShape"].create(
                 tp_world_size=8, num_heads=96, head_dim=128
             ),
-            dtype=self.params["mamba2_state_dtype"](args._model_config.hf_config),
             layers=[0],
         )
         return self.pool(
@@ -380,6 +382,10 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
             dict(dtype="float16"),
             dict(architecture="Qwen3NextForCausalLM"),
             dict(architecture="KimiLinearForCausalLM"),
+            # Production KimiLinearCacheParams ignores the HF dtype; with no
+            # CLI/env value the actual pool is FP32, so this must be rejected
+            # instead of being admitted as BF16.
+            dict(architecture="KimiLinearForCausalLM", dtype=None),
             dict(speculative_algorithm="DSPARK"),
             dict(linear_attn_verify_backend="flashinfer"),
         )
@@ -406,12 +412,14 @@ class TestFlashInferFusedKDAConfig(CustomTestCase):
                 self.views["resolving_view"](defaults).linear_attn_decode_backend
             )
             with self.envs.SGLANG_MAMBA_SSM_DTYPE.override(None):
-                # HF-config BF16 without the CLI flag must keep the normal FI
-                # route instead of being rejected as "got None".
+                # An HF-config BF16 value is not propagated into the Kimi cache
+                # params; the actual pool is FP32, so K3 must take the FP32
+                # fused route rather than the BF16 recurrent FI route.
                 hf_bf16 = self._args(dtype=None)
                 self.resolve(hf_bf16)
-                self.assertIsNone(
-                    self.views["resolving_view"](hf_bf16).linear_attn_verify_backend
+                self.assertEqual(
+                    self.views["resolving_view"](hf_bf16).linear_attn_verify_backend,
+                    "triton",
                 )
                 # The default FP32 pool (no CLI flag, no HF value) must reach
                 # the explicit FP32 Kimi fused route.

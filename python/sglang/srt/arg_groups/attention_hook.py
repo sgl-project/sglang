@@ -351,7 +351,9 @@ def handle_linear_attn_backend(server_args: Any):
     # The opt-in Kimi fused consumer owns an FP32 pool. Its uncovered
     # shapes use Triton; the separate recurrent FlashInfer API stays BF16.
     # Resolve the pool dtype here: the CLI flag only reaches the dtype env in a
-    # later hook, so testing the raw string would miss the default FP32 pool.
+    # later hook, and KimiLinearCacheParams is constructed without a dtype, so
+    # its default factory resolves env/default only (not the HF config value).
+    # Mirror that construction rather than trusting hf_config.mamba_ssm_dtype.
     fp32_kimi_fused_decode = False
     ssm_dtype = None
     capability = None
@@ -359,7 +361,7 @@ def handle_linear_attn_backend(server_args: Any):
         hf_config = model_config_of(server_args).hf_config
         configured_ssm_dtype = cfg.mamba_ssm_dtype
         if configured_ssm_dtype is None:
-            ssm_dtype = mamba2_state_dtype(hf_config).temporal
+            ssm_dtype = mamba2_state_dtype(None).temporal
         else:
             ssm_dtype = {
                 "float32": torch.float32,
