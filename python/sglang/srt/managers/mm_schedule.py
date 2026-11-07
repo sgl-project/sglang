@@ -1,5 +1,6 @@
 """Multimodal embedding scheduling and cache coordination."""
 
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Tuple
@@ -13,7 +14,8 @@ from sglang.srt.multimodal.transport.cuda_ipc import BORROW_CUDA_IPC_FEATURE_KEY
 from sglang.srt.runtime_context import get_schedule
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 from sglang.srt.utils.async_probe import maybe_assert_sum
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()

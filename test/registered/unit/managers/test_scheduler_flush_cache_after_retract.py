@@ -66,6 +66,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.grammar_manager = MagicMock()
         scheduler.grammar_manager.grammar_queue = []
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.enable_hisparse = False
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
@@ -86,6 +87,7 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator = MagicMock()
         scheduler.draft_worker = None
         scheduler.metrics_reporter = MagicMock()
+        scheduler.invariant_checker = MagicMock()
         return scheduler
 
     def test_flush_cache_succeeds_when_only_retracted_reqs_are_waiting(self):

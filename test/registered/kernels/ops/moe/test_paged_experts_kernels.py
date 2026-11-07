@@ -151,12 +151,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_pins_its_exact_size_and_the_gather_reads_it(self):
         """The host store pins exactly its size (torch's pinned allocator rounds up to a power
         of two), and the gather kernel reads it through the GPU."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host["w"]
+        host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         host.copy_(torch.randn(E, 3, 1000, dtype=torch.bfloat16))
         self.assertTrue(host.is_pinned())
         self.assertEqual(host.untyped_storage().nbytes(), E * 3 * 1000 * 2)
@@ -172,15 +170,10 @@ class TestPagedExpertsKernels(CustomTestCase):
     def test_store_is_on_the_host_under_a_default_cuda_device(self):
         """Models are constructed under ``torch.device("cuda")``; a store created there (by
         a format that pages its loaded rows as they are) is still pinned host memory."""
-        from types import SimpleNamespace
-
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
-        gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
         with torch.device("cuda"):
-            host = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E).host[
-                "w"
-            ]
+            host = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E).host["w"]
         self.assertEqual(host.device.type, "cpu")
         self.assertTrue(host.is_pinned())
 
@@ -188,12 +181,11 @@ class TestPagedExpertsKernels(CustomTestCase):
         """The pinned pages stay registered while any tensor on them lives (here a slice that
         outlives the store and its tensor), and are unregistered once the last one is freed."""
         import gc
-        from types import SimpleNamespace
 
         from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
 
         gpu = torch.zeros(K, 3, 1000, dtype=torch.bfloat16, device="cuda")
-        store = HostExpertStore(SimpleNamespace(w=gpu), ["w"], num_experts=E)
+        store = HostExpertStore({"w": ((3, 1000), torch.bfloat16)}, E)
         ptr = store.host["w"].data_ptr()
         expert = store.host["w"][5]
         gpu[0].copy_(expert, non_blocking=True)  # a read still queued when it is freed
