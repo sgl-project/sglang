@@ -5,9 +5,12 @@ import torch
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.utils.device import get_device
+from sglang.srt.runtime_context import get_context
+from sglang.srt.utils.device import get_device, is_hip
 from sglang.test.test_utils import CustomTestCase
 
+# HIP checks the "rocm" tables, the packed layout of forward_batch_deepseek_mha_rocm.py,
+# where packing saves chunks; the others keep the request-major layout.
 TEST_CASES = [
     # Sequence with same prefix lens
     {
@@ -60,6 +63,26 @@ TEST_CASES = [
             ],
             dtype=torch.int32,
         ),
+        "rocm": {
+            "prefix_chunk_len": 64,
+            "num_prefix_chunks": 3,
+            "prefix_chunk_starts": torch.tensor(
+                [
+                    [0, 0, 0, 0],
+                    [16, 32, 16, 0],
+                    [16, 32, 48, 32],
+                ],
+                dtype=torch.int32,
+            ),
+            "prefix_chunk_seq_lens": torch.tensor(
+                [
+                    [16, 32, 16, 0],
+                    [0, 0, 32, 32],
+                    [0, 0, 0, 32],
+                ],
+                dtype=torch.int32,
+            ),
+        },
     },
     # Sequence with irregular shapes
     {
@@ -88,6 +111,26 @@ TEST_CASES = [
             ],
             dtype=torch.int32,
         ),
+        "rocm": {
+            "prefix_chunk_len": 31,
+            "num_prefix_chunks": 3,
+            "prefix_chunk_starts": torch.tensor(
+                [
+                    [0, 0],
+                    [1, 30],
+                    [1, 61],
+                ],
+                dtype=torch.int32,
+            ),
+            "prefix_chunk_seq_lens": torch.tensor(
+                [
+                    [1, 30],
+                    [0, 31],
+                    [0, 3],
+                ],
+                dtype=torch.int32,
+            ),
+        },
     },
 ]
 
@@ -137,6 +180,10 @@ def check_kv_indices(forward_batch, req_to_token_pool):
 )
 class TestPrefixChunkInfo(CustomTestCase):
     def setUp(self):
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
         # Common test parameters
         self.num_local_heads = 128
         self.kv_lora_rank = 512
@@ -208,6 +255,7 @@ class TestPrefixChunkInfo(CustomTestCase):
             # attn_backend that carries the pools (Pattern A invariant).
             from types import SimpleNamespace
 
+            from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
             from sglang.srt.model_executor.forward_context import (
                 ForwardContext,
                 set_forward_context,
@@ -216,20 +264,28 @@ class TestPrefixChunkInfo(CustomTestCase):
             mock_backend = SimpleNamespace(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool=self.token_to_kv_pool,
+                runner_ids=RunnerIds(
+                    req_to_token=self.req_to_token_pool.req_to_token,
+                    token_to_kv_pool_allocator=None,
+                    token_to_kv_pool=self.token_to_kv_pool,
+                    page_size=1,
+                    device=self.device,
+                ),
             )
             set_forward_context(ForwardContext(attn_backend=mock_backend))
 
             forward_batch.prepare_chunked_prefix_cache_info(self.device)
+            expected = test_case.get("rocm", test_case) if is_hip() else test_case
             assert forward_batch.get_max_chunk_capacity() == max_chunk_capacity
-            assert forward_batch.prefix_chunk_len == test_case["prefix_chunk_len"]
-            assert forward_batch.num_prefix_chunks == test_case["num_prefix_chunks"]
+            assert forward_batch.prefix_chunk_len == expected["prefix_chunk_len"]
+            assert forward_batch.num_prefix_chunks == expected["num_prefix_chunks"]
             assert torch.allclose(
                 forward_batch.prefix_chunk_starts,
-                test_case["prefix_chunk_starts"].to(self.device),
+                expected["prefix_chunk_starts"].to(self.device),
             )
             assert torch.allclose(
                 forward_batch.prefix_chunk_seq_lens,
-                test_case["prefix_chunk_seq_lens"].to(self.device),
+                expected["prefix_chunk_seq_lens"].to(self.device),
             )
 
             check_kv_indices(forward_batch, self.req_to_token_pool)
