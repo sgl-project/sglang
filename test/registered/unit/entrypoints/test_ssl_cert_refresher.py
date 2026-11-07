@@ -1,6 +1,7 @@
 import asyncio
 import os
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock
 
@@ -48,6 +49,32 @@ class TestSSLCertRefresher(CustomTestCase):
         finally:
             loop.close()
 
+    async def _modify_until_reload(
+        self, path: str, contents: str, reload_call, deadline_s: float = 15.0
+    ) -> None:
+        """Rewrite ``path`` until ``reload_call`` fires, or fail after a deadline.
+
+        ``SSLCertRefresher`` observes files through ``watchfiles.awatch()``, whose
+        inotify watch is only registered once the watcher task first runs. A
+        modification written before that is lost permanently -- it is never
+        replayed -- and readiness takes several hundred milliseconds, so a fixed
+        ``asyncio.sleep()`` before the write races the watcher and makes the test
+        flaky. Rewriting until the callback fires waits on the condition instead
+        of on a guessed delay.
+        """
+        deadline = time.monotonic() + deadline_s
+        while not reload_call.called and time.monotonic() < deadline:
+            with open(path, "w") as f:
+                f.write(contents)
+            for _ in range(25):
+                if reload_call.called:
+                    return
+                await asyncio.sleep(0.02)
+        self.assertTrue(
+            reload_call.called,
+            f"reload was not triggered within {deadline_s}s of rewriting {path}",
+        )
+
     def test_reload_cert_key_on_file_change(self):
         """SSLCertRefresher calls load_cert_chain when cert/key files change."""
         mock_ctx = MagicMock()
@@ -56,12 +83,9 @@ class TestSSLCertRefresher(CustomTestCase):
 
         async def _test():
             refresher = SSLCertRefresher(mock_ctx, key_path, cert_path)
-            await asyncio.sleep(0.3)
-
-            with open(cert_path, "w") as f:
-                f.write("CERT_V2")
-
-            await asyncio.sleep(1.5)
+            await self._modify_until_reload(
+                cert_path, "CERT_V2", mock_ctx.load_cert_chain
+            )
             refresher.stop()
             return mock_ctx
 
@@ -77,12 +101,9 @@ class TestSSLCertRefresher(CustomTestCase):
 
         async def _test():
             refresher = SSLCertRefresher(mock_ctx, key_path, cert_path, ca_path)
-            await asyncio.sleep(0.3)
-
-            with open(ca_path, "w") as f:
-                f.write("CA_V2")
-
-            await asyncio.sleep(1.5)
+            await self._modify_until_reload(
+                ca_path, "CA_V2", mock_ctx.load_verify_locations
+            )
             refresher.stop()
             return mock_ctx
 
