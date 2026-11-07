@@ -40,8 +40,7 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         raise ValueError(
             "--moe-a2a-backend megamoe needs a CUDA SM90 GPU (block-FP8 experts) "
             "or an SM100-class GPU (MXFP4 / NVFP4 experts); it runs DeepGEMM "
-            "kernels over CUDA symmetric memory. On ROCm, set "
-            "SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 to select aiter MegaMoEv2 instead."
+            "kernels over CUDA symmetric memory. On ROCm it runs aiter MegaMoEv2."
         )
 
 
@@ -126,7 +125,7 @@ def flydsl_decode_tokens_per_rank(cfg) -> int | None:
 
 
 def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
-    if not (get_platform().is_hip and envs.SGLANG_AMD_USE_FLYDSL_MEGA_MOE.get()):
+    if not get_platform().is_hip:
         return
     decode_mtpr = envs.SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR.get()
     if decode_mtpr <= 0 or decode_mtpr >= envs.SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR.get():

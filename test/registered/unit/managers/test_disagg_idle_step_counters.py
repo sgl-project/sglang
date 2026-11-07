@@ -296,6 +296,8 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             reqs=batch.reqs[:],
         )
         scheduler.result_queue = deque([pending])
+        # The partial scheduler has none of the lists request_lists() reads.
+        scheduler.request_lists = lambda: {}
 
         self.assertEqual(scheduler.collect_inflight_reqs(), {req})
 
@@ -550,6 +552,11 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.running_reqs = KeyedReqList(ListKind.DECODING)
         scheduler.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         scheduler.tp_size = get_parallel().tp_size
+        scheduler.dp_tp_group = SimpleNamespace(
+            world_size=get_parallel().attn_tp_size
+            if get_parallel().attn_dp_enabled
+            else get_parallel().tp_size
+        )
         scheduler.gracefully_exit = False
         scheduler._engine_paused = False
         scheduler._deferred_input_requests = []
@@ -648,6 +655,36 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         scheduler.disagg_decode_transfer_queue = SimpleNamespace(
             queue=[], staging_handler=None
         )
+
+
+class TestPrefillOverlapShutdownVote(CustomTestCase):
+    """On shutdown the overlap prefill loop launches nothing new, yet still runs
+    the one batch selection whose MLP-sync gather carries a group-local
+    ShutdownReq to the other attention-DP ranks."""
+
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology(role="scheduler"))
+
+    def _selections_after_shutdown(self, vote_pending: bool) -> int:
+        scheduler = TestSchedulerIdleStepCounters.make_scheduler(self, [None])
+
+        def honor_shutdown(**kwargs):
+            scheduler.gracefully_exit = True
+            return True
+
+        scheduler.ingest_requests = Mock(side_effect=honor_shutdown)
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            shutdown_vote_pending=lambda: vote_pending
+        )
+        Scheduler.event_loop_overlap_disagg_prefill(scheduler)
+        return scheduler.get_next_disagg_prefill_batch_to_run.call_count
+
+    def test_unsent_vote_still_reaches_the_gather(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=True), 1)
+
+    def test_no_new_selection_without_a_vote_to_send(self):
+        self.assertEqual(self._selections_after_shutdown(vote_pending=False), 0)
 
 
 if __name__ == "__main__":

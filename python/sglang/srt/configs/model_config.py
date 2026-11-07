@@ -500,15 +500,16 @@ def is_minimax_sparse(config: PretrainedConfig) -> bool:
 
 
 def uses_minimax_m3_nvfp4_native_stack(quantization: Optional[str]) -> bool:
-    """Whether an NVFP4 checkpoint runs its native Blackwell stack.
+    """Whether an NVFP4 checkpoint runs its native MSA-v1 stack.
 
     The attention backend, the KV pool class and the KV cell-size budget must
     all agree on this answer; sizing the pool for one layout while allocating
-    the other runs out of memory at startup.
+    the other runs out of memory at startup. The MSA-v1 kernels are built for
+    SM10x only, so SM11x/SM12x Blackwell is excluded.
     """
     from sglang.srt.runtime_context import get_platform
 
-    return quantization == "minimax_m3_nvfp4" and get_platform().is_blackwell
+    return quantization == "minimax_m3_nvfp4" and get_platform().is_sm100
 
 
 # v2 checkpoints reuse the v1 arch name; the DASH training stage selects this arch.

@@ -8,13 +8,13 @@ namespace sglang {
 
 static_assert(
     kNumExperts_ == 896 && kTopK_ == 16 && kQuantHidden_ == 3584,
-    "kimi_k31_fused_routing assumes Kimi-K3.1: 896 experts, top-16, hidden 3584");
+    "kimi_k3_fused_routing assumes the Kimi-K3 / K3.1 MoE: 896 experts, top-16, hidden 3584");
 
-inline constexpr uint32_t kK31RoutingMaxTokens = 256;
-inline constexpr uint32_t kK31RoutingMaxExpanded = kK31RoutingMaxTokens * kTopK_;
-inline constexpr uint32_t kK31RoutingExpertsPerThread = kNumExperts_ / LargeRouterRadixTrait::kBlockSize;
+inline constexpr uint32_t kKimiK3RoutingMaxTokens = 256;
+inline constexpr uint32_t kKimiK3RoutingMaxExpanded = kKimiK3RoutingMaxTokens * kTopK_;
+inline constexpr uint32_t kKimiK3RoutingExpertsPerThread = kNumExperts_ / LargeRouterRadixTrait::kBlockSize;
 
-struct K31RoutingMetaParams {
+struct KimiK3RoutingMetaParams {
   void* __restrict__ expert_weights;
   int32_t* __restrict__ expanded_idx_to_permuted_idx;
   int32_t* __restrict__ permuted_idx_to_token_idx;
@@ -34,25 +34,25 @@ struct K31RoutingMetaParams {
   int32_t weights_fp32;
 };
 
-struct K31FusedRoutingParams {
+struct KimiK3FusedRoutingParams {
   RouteRadixParams route;
   QuantKernelParams quant;
-  K31RoutingMetaParams meta;
+  KimiK3RoutingMetaParams meta;
 };
 
-struct K31RoutingSmem {
+struct KimiK3RoutingSmem {
   uint32_t warp_sum[LargeRouterRadixTrait::kNumWarps];
   int32_t num_ctas;
   int32_t expert_count[kNumExperts_];
   int32_t expert_offset[kNumExperts_];
-  int32_t entry[kK31RoutingMaxExpanded];
+  int32_t entry[kKimiK3RoutingMaxExpanded];
 };
 
-SGL_DEVICE void
-k31_build_routing_metadata(const RouteRadixParams& route, const K31RoutingMetaParams& meta, K31RoutingSmem& smem) {
+SGL_DEVICE void kimi_k3_build_routing_metadata(
+    const RouteRadixParams& route, const KimiK3RoutingMetaParams& meta, KimiK3RoutingSmem& smem) {
   using T = LargeRouterRadixTrait;
   constexpr uint32_t kThreads = T::kBlockSize;
-  constexpr uint32_t kEPT = kK31RoutingExpertsPerThread;
+  constexpr uint32_t kEPT = kKimiK3RoutingExpertsPerThread;
   const uint32_t tx = threadIdx.x;
   const uint32_t lane_id = tx % device::kWarpThreads;
   const uint32_t warp_id = tx / device::kWarpThreads;
@@ -66,7 +66,7 @@ k31_build_routing_metadata(const RouteRadixParams& route, const K31RoutingMetaPa
   }
   __syncthreads();
 
-  constexpr uint32_t kIdsPerThread = (kK31RoutingMaxExpanded + kThreads - 1) / kThreads;
+  constexpr uint32_t kIdsPerThread = (kKimiK3RoutingMaxExpanded + kThreads - 1) / kThreads;
   int32_t ids[kIdsPerThread];
 #pragma unroll
   for (uint32_t j = 0; j < kIdsPerThread; ++j) {
@@ -143,14 +143,14 @@ k31_build_routing_metadata(const RouteRadixParams& route, const K31RoutingMetaPa
 
 template <bool kUsePDL, typename TScore, typename TX>
 __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
-    void k31_fused_routing_kernel(const __grid_constant__ K31FusedRoutingParams params) {
+    void kimi_k3_fused_routing_kernel(const __grid_constant__ KimiK3FusedRoutingParams params) {
   using T = LargeRouterRadixTrait;
   const auto M = static_cast<uint32_t>(params.route.M);
   const uint32_t tx = threadIdx.x;
   if (blockIdx.x < M) {
     __shared__ union {
       typename T::Smem route;
-      K31RoutingSmem meta;
+      KimiK3RoutingSmem meta;
     } smem;
     __shared__ bool is_last;
     const auto& meta = params.meta;
@@ -181,7 +181,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
     }
     __syncthreads();
     if (!is_last) return;
-    k31_build_routing_metadata(params.route, meta, smem.meta);
+    kimi_k3_build_routing_metadata(params.route, meta, smem.meta);
     if (tx == 0) *meta.counter = 0u;
   } else {
     device::PDLWaitPrimary<kUsePDL>();
@@ -192,7 +192,7 @@ __global__ __launch_bounds__(LargeRouterRadixTrait::kBlockSize)  //
 }
 
 template <bool kUsePDL>
-struct K31FusedRoutingKernel {
+struct KimiK3FusedRoutingKernel {
   static void
   run(const tvm::ffi::TensorView scores,
       const tvm::ffi::TensorView bias,
@@ -251,25 +251,25 @@ struct K31FusedRoutingKernel {
 
     RuntimeCheck(
         N_.unwrap() == kNumExperts_ && K_.unwrap() == kTopK_ && topk == kTopK_,
-        "k31_fused_routing is specialized for N=896, K=16");
-    RuntimeCheck(scores.stride(0) % 4 == 0, "k31_fused_routing: scores row stride must be a multiple of 4");
+        "kimi_k3_fused_routing is specialized for N=896, K=16");
+    RuntimeCheck(scores.stride(0) % 4 == 0, "kimi_k3_fused_routing: scores row stride must be a multiple of 4");
     const auto M = static_cast<uint32_t>(M_.unwrap());
-    RuntimeCheck(M <= kK31RoutingMaxTokens, "k31_fused_routing: at most 256 rows");
+    RuntimeCheck(M <= kKimiK3RoutingMaxTokens, "kimi_k3_fused_routing: at most 256 rows");
     RuntimeCheck(
         expanded_idx_to_permuted_idx.size(0) == static_cast<int64_t>(M) * kTopK_,
-        "k31_fused_routing: expanded_idx_to_permuted_idx must hold M * 16 entries");
+        "kimi_k3_fused_routing: expanded_idx_to_permuted_idx must hold M * 16 entries");
     RuntimeCheck(
         0 <= local_expert_offset && 0 < num_local_experts &&
             local_expert_offset + num_local_experts <= static_cast<int64_t>(kNumExperts_),
-        "k31_fused_routing: the local expert range must lie within the 896 experts");
-    RuntimeCheck(0 < tile_tokens && tile_tokens <= 256, "k31_fused_routing: tile_tokens must be in [1, 256]");
+        "kimi_k3_fused_routing: the local expert range must lie within the 896 experts");
+    RuntimeCheck(0 < tile_tokens && tile_tokens <= 256, "kimi_k3_fused_routing: tile_tokens must be in [1, 256]");
 
     const int32_t* num_valid_ptr = nullptr;
     if (num_valid.has_value()) {
       const auto& nv = num_valid.value();
       RuntimeCheck(
           nv.numel() == 1 && nv.device().device_type == kDLCUDA && is_type<int32_t>(nv.dtype()),
-          "k31_fused_routing: num_valid must be a CUDA int32 scalar");
+          "kimi_k3_fused_routing: num_valid must be a CUDA int32 scalar");
       num_valid_ptr = static_cast<const int32_t*>(nv.data_ptr());
     }
 
@@ -279,10 +279,10 @@ struct K31FusedRoutingKernel {
         x_dtype.is_type<fp32_t>()
             ? build_quant_context<RouteQuantTraitT<fp32_t>, /*kMasked=*/false>(x, out_q, out_s).params
             : build_quant_context<RouteQuantTraitT<bf16_t>, /*kMasked=*/false>(x, out_q, out_s).params;
-    RuntimeCheck(quant_params.hidden_size == kQuantHidden_, "k31_fused_routing: activation row must be 3584 wide");
+    RuntimeCheck(quant_params.hidden_size == kQuantHidden_, "kimi_k3_fused_routing: activation row must be 3584 wide");
     if (M == 0) return;
 
-    const auto params = K31FusedRoutingParams{
+    const auto params = KimiK3FusedRoutingParams{
         .route =
             {scores.data_ptr(),
              static_cast<const fp32_t*>(bias.data_ptr()),
@@ -317,24 +317,24 @@ struct K31FusedRoutingKernel {
              w_dtype.is_type<fp32_t>() ? 1 : 0},
     };
 
-#define SGL_K31_ROUTING_LAUNCH(TS, TX)                                    \
+#define SGL_KIMI_K3_ROUTING_LAUNCH(TS, TX)                                \
   LaunchKernel(2 * M, LargeRouterRadixTrait::kBlockSize, device.unwrap()) \
-      .enable_pdl(kUsePDL)(k31_fused_routing_kernel<kUsePDL, TS, TX>, params)
+      .enable_pdl(kUsePDL)(kimi_k3_fused_routing_kernel<kUsePDL, TS, TX>, params)
 
     if (score_dtype.is_type<fp32_t>()) {
       if (x_dtype.is_type<fp32_t>()) {
-        SGL_K31_ROUTING_LAUNCH(fp32_t, fp32_t);
+        SGL_KIMI_K3_ROUTING_LAUNCH(fp32_t, fp32_t);
       } else {
-        SGL_K31_ROUTING_LAUNCH(fp32_t, bf16_t);
+        SGL_KIMI_K3_ROUTING_LAUNCH(fp32_t, bf16_t);
       }
     } else {
       if (x_dtype.is_type<fp32_t>()) {
-        SGL_K31_ROUTING_LAUNCH(bf16_t, fp32_t);
+        SGL_KIMI_K3_ROUTING_LAUNCH(bf16_t, fp32_t);
       } else {
-        SGL_K31_ROUTING_LAUNCH(bf16_t, bf16_t);
+        SGL_KIMI_K3_ROUTING_LAUNCH(bf16_t, bf16_t);
       }
     }
-#undef SGL_K31_ROUTING_LAUNCH
+#undef SGL_KIMI_K3_ROUTING_LAUNCH
   }
 };
 

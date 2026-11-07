@@ -1009,12 +1009,9 @@ class DeepseekSparseAttnBackend(
         # the gather kernel fuses that in.  Same single-stream reuse
         # argument as `_q8kv8_qpad_buf`.
         self._q8kv8_kv_buf: Optional[torch.Tensor] = None
-        # Per-row valid-topk early-exit (SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH):
-        # rows whose topk indices end in a -1 pad run skip whole topk blocks
-        # in-kernel.
-        self._q8kv8_topk_length_enabled: bool = (
-            envs.SGLANG_ENABLE_DSA_Q8KV8_TOPK_LENGTH.get()
-        )
+        # Per-row valid-topk early-exit: rows whose topk indices end in a -1
+        # pad run skip whole topk blocks in-kernel.
+        self._q8kv8_topk_length_enabled: bool = True
         # Persistent (grow-only) kernel-output buffers (out/max_logits/lse).
         self._q8kv8_out_bufs: Optional[tuple] = None
         # Fused non-prefix KV prep (cast-concat k/k_rope directly into the
@@ -1063,7 +1060,7 @@ class DeepseekSparseAttnBackend(
         # These come from flashinfer, which is CUDA-only, so the SM major alone
         # cannot gate them: ROCm gfx1250 also reports compute capability (12, 5).
         elif _is_cuda and (
-            self.device_sm_major >= 10 or self.dsa_decode_impl == "trtllm"
+            self.device_sm_major == 10 or self.dsa_decode_impl == "trtllm"
         ):
             self.workspace_buffer = get_buffer(
                 "dsa_trtllm_workspace",
