@@ -49,6 +49,18 @@ def _clone(inputs):
     return {name: value.clone() for name, value in inputs.items()}
 
 
+def _bf16_state(inputs):
+    inputs = _clone(inputs)
+    inputs["ssm_states"] = inputs["ssm_states"].bfloat16()
+    return inputs
+
+
+def _fp32_state(inputs):
+    inputs = _clone(inputs)
+    inputs["ssm_states"] = inputs["ssm_states"].float()
+    return inputs
+
+
 def _args(inputs):
     return (inputs[name] for name in ("q", "k", "v", "g", "beta"))
 
@@ -211,6 +223,92 @@ class TestGfx950KDAPrefill(CustomTestCase):
                 )
                 torch.testing.assert_close(
                     actual_track, expected_track, rtol=2e-2, atol=3e-2
+                )
+
+    @torch.inference_mode()
+    def test_bf16_state_pool_runs_the_hip_kernel(self):
+        inputs = _bf16_state(_inputs((193, 137)))
+        with patch.object(
+            kda_triton,
+            "chunk_kda",
+            side_effect=AssertionError("unexpected fallback to Triton chunk_kda"),
+        ):
+            result = kda_triton.TritonKDAKernel().extend(
+                *_args(inputs),
+                ssm_states=inputs["ssm_states"],
+                cache_indices=inputs["cache_indices"],
+                query_start_loc=inputs["query_start_loc"],
+                A_log=inputs["A_log"],
+                dt_bias=inputs["dt_bias"],
+                lower_bound=-5.0,
+                beta_is_raw=True,
+            )
+        self.assertIsInstance(result, torch.Tensor)
+
+    @torch.inference_mode()
+    def test_bf16_state_matches_the_fp32_kernel_rounded(self):
+        for lengths, heads in (
+            ((40, 63, 1), 12),  # fused
+            ((8192,), 12),  # grp
+            ((4096,) * 4, 12),  # ws4
+            ((2048,) * 8, 12),  # ws2
+            ((1024,) * 12, 12),  # vs1
+        ):
+            for seed in (42, 7):
+                with self.subTest(lengths=lengths[:4], heads=heads, seed=seed):
+                    inputs = _bf16_state(_inputs(lengths, heads, seed))
+                    actual_inputs = _clone(inputs)
+                    fp32_inputs = _fp32_state(inputs)
+                    triton_inputs = _clone(inputs)
+                    actual = _hip(actual_inputs)
+                    expected = _hip(fp32_inputs)
+                    reference = _reference(triton_inputs)
+                    torch.cuda.synchronize()
+                    self.assertTrue(torch.equal(actual, expected))
+                    self.assertTrue(
+                        torch.equal(
+                            actual_inputs["ssm_states"],
+                            fp32_inputs["ssm_states"].bfloat16(),
+                        )
+                    )
+                    self.assertTrue(
+                        torch.isfinite(actual_inputs["ssm_states"].float()).all()
+                    )
+                    self._assert_close(
+                        actual, reference, inputs, actual_inputs, triton_inputs
+                    )
+
+    @torch.inference_mode()
+    def test_bf16_state_track_snapshot_matches_the_fp32_kernel(self):
+        for lengths, chunks, heads in (
+            ((193, 137), (2, 1), 4),  # vs2
+            ((4000,), (40,), 4),  # grp
+            ((256,) * 24, (1,) * 24, 12),  # vs1
+        ):
+            with self.subTest(lengths=lengths[:4], chunks=chunks[:4], heads=heads):
+                inputs = _bf16_state(_inputs(lengths, heads))
+                actual_inputs, fp32_inputs = _clone(inputs), _fp32_state(inputs)
+                track_chunk_idx = torch.tensor(chunks, device="cuda", dtype=torch.int64)
+                actual_track = torch.zeros(len(lengths), heads, 128, 128, device="cuda")
+                expected_track = torch.zeros_like(actual_track)
+                actual, _ = _hip(
+                    actual_inputs,
+                    track_state=actual_track,
+                    track_chunk_idx=track_chunk_idx,
+                )
+                expected, _ = _hip(
+                    fp32_inputs,
+                    track_state=expected_track,
+                    track_chunk_idx=track_chunk_idx,
+                )
+                torch.cuda.synchronize()
+                self.assertTrue(torch.equal(actual, expected))
+                self.assertTrue(torch.equal(actual_track, expected_track))
+                self.assertTrue(
+                    torch.equal(
+                        actual_inputs["ssm_states"],
+                        fp32_inputs["ssm_states"].bfloat16(),
+                    )
                 )
 
 

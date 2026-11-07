@@ -31,10 +31,45 @@ _CONFIGS = (
 )
 
 
+# (max batch, (rows, row groups, num_warps, num_stages)) for a bf16 state pool,
+# measured on MI355X per local KDA head count: 16 at GLM-5.3 TP4, 8 at TP8.
+# None keeps the generic kernel, which wins at those batches.
+_BF16_CONFIGS = {
+    16: (
+        (4, (8, 16, 1, 1)),
+        (22, (16, 8, 1, 1)),
+        (31, None),
+        (32, (16, 4, 1, 1)),
+        (40, (16, 8, 1, 1)),
+        (72, (32, 4, 1, 3)),
+        (80, (16, 4, 1, 1)),
+        (None, (32, 4, 2, 3)),
+    ),
+    8: (
+        (8, (8, 16, 1, 1)),
+        (48, (16, 8, 1, 1)),
+        (56, (32, 4, 1, 1)),
+        (64, (16, 4, 1, 1)),
+        (80, (16, 8, 1, 1)),
+        (160, (32, 4, 1, 1)),
+        (192, (16, 8, 1, 3)),
+        (320, (32, 4, 2, 1)),
+        (None, (8, 8, 2, 3)),
+    ),
+}
+
+
 def _config(batch: int):
     for max_batch, rows, groups, warps, stages in _CONFIGS:
         if max_batch is None or batch <= max_batch:
             return rows, groups, warps, stages
+
+
+def _bf16_config(num_v_heads: int, batch: int):
+    for max_batch, config in _BF16_CONFIGS.get(num_v_heads, ()):
+        if max_batch is None or batch <= max_batch:
+            return config
+    return None
 
 
 @triton.jit
@@ -124,14 +159,20 @@ def covered(
     ssm_state_indices: torch.Tensor,
 ) -> bool:
     HV, V, K = initial_state.shape[-3:]
+    if initial_state.dtype == torch.float32:
+        state_ok = True
+    elif initial_state.dtype == torch.bfloat16:
+        state_ok = _bf16_config(HV, mixed_qkv.shape[0]) is not None
+    else:
+        state_ok = False
     return (
         _is_gfx95
+        and state_ok
         and K == 128
         and V == 128
         and a.dim() == 2
         and a.shape[1] == HV * K
         and mixed_qkv.dtype == torch.bfloat16
-        and initial_state.dtype == torch.float32
         and initial_state.stride(-1) == 1
         and initial_state.stride(-2) == K
         and initial_state.stride(-3) == V * K
@@ -158,7 +199,10 @@ def kda_packed_decode_rowstream(
     if B == 0:
         return
     HV, V, K = initial_state.shape[-3:]
-    rows, groups, num_warps, num_stages = _config(B)
+    if initial_state.dtype == torch.bfloat16:
+        rows, groups, num_warps, num_stages = _bf16_config(HV, B)
+    else:
+        rows, groups, num_warps, num_stages = _config(B)
     kda_packed_decode_rowstream_kernel[(B * HV, groups)](
         mixed_qkv,
         a,
