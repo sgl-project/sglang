@@ -80,3 +80,14 @@ Data parallelism is better for throughput. When there is enough GPU memory, alwa
 - Try other quantization (e.g. FP8 quantization with `--quantization fp8`)
 - Try other parallelism strategies (e.g. [expert parallelism](https://lmsys.org/blog/2025-05-05-large-scale-ep/)) or DP attention for deepseek models (with `--attn-dp-size 8`).
 - If the workload has many shared prefixes, try `--schedule-policy lpm`. Here, `lpm` stands for longest prefix match. It reorders requests to encourage more cache hits but introduces more scheduling overhead.
+
+
+### Bounded LPM matching window
+
+With `--schedule-policy lpm --lpm-window-size 128`, only the first 128 waiting requests are matched and reordered on each scheduling pass. The remaining requests retain their order, and admission still performs the necessary prefix matching. This opt-in mode bypasses LPM's large-queue FCFS fallback. The default value, zero, preserves existing behavior.
+
+A bounded window can help when queued requests compete for a limited prefix cache. It can add overhead without useful reuse and delay cache-cold requests when cached requests are prioritized. It does not guarantee a maximum waiting time. Compare throughput and cold-request tail latency on your workload before enabling it. Priority scheduling is not supported with a positive window. Disabling prefix caching retains the existing FCFS fallback.
+
+For cache-constrained bursts with shared prefixes, try a window of 128 and measure throughput together with cold-request mean and tail latency. In a single-GPU RTX 4090 test with Qwen3-4B, 512 synthetic requests, an 8192-token KV pool, a running-request limit of 32, and 16 output tokens, 128 gave the highest throughput among windows of 16, 32, 64, and 128 across three repetitions of the same input seed. This is an empirical starting point for similar workloads, not a universal optimum.
+
+If you need a smaller scheduling budget or less impact on cold requests, start with 32 and compare it with 64 and 128. With a 32768-token pool, the same test showed little throughput change, while cold-request mean TTFT increased by about 6%, 14%, and 19% for those windows. Keep the default of 0 unless measurements on your workload justify enabling a window.

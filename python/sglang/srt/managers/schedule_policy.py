@@ -192,7 +192,15 @@ class SchedulePolicy:
         enable_hierarchical_cache: bool,
         enable_priority_scheduling: bool,
         schedule_low_priority_values_first: bool,
+        lpm_window_size: int = 0,
     ):
+        if lpm_window_size < 0:
+            raise ValueError("lpm_window_size must be non-negative")
+        if lpm_window_size and policy != "lpm":
+            raise ValueError("lpm_window_size requires the lpm schedule policy")
+        if lpm_window_size and enable_priority_scheduling:
+            raise ValueError("Bounded LPM does not support priority scheduling")
+        self.lpm_window_size = lpm_window_size
         self.policy = self._validate_and_adjust_policy(policy, tree_cache)
         self.tree_cache = tree_cache
         self.enable_hierarchical_cache = enable_hierarchical_cache
@@ -214,6 +222,15 @@ class SchedulePolicy:
     ) -> List[Req]:
         """The waiting requests in the order the policy admits them."""
         waiting_queue = list(waiting)
+        if self.lpm_window_size and self.policy == CacheAwarePolicy.LPM:
+            # Only the leading window participates in matching and reordering.
+            # Admission must still match requests: the remaining tail is untouched.
+            window = waiting_queue[: self.lpm_window_size]
+            deprioritized = self._compute_prefix_matches(window, CacheAwarePolicy.LPM)
+            self._sort_by_longest_prefix(window, deprioritized)
+            waiting_queue[: len(window)] = window
+            return waiting_queue
+
         policy = self._determine_active_policy(waiting_queue)
 
         # Cache-agnostic policies sort without matching; match anyway so the load
@@ -323,6 +340,8 @@ class SchedulePolicy:
         return self.policy
 
     def waiting_queue_prefix_matched(self, waiting_queue: List[Req]) -> bool:
+        if self.lpm_window_size and self.policy == CacheAwarePolicy.LPM:
+            return False
         policy = self._determine_active_policy(waiting_queue)
         return (
             isinstance(policy, CacheAwarePolicy)

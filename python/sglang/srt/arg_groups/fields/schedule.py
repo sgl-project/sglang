@@ -83,6 +83,10 @@ class Schedule(msgspec.Struct):
         Optional[int],
         "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
     ] = None
+    lpm_window_size: A[
+        int,
+        "Match and reorder only the first N waiting requests under LPM. Zero preserves the existing LPM behavior. A positive window bypasses the large-queue FCFS fallback; it does not guarantee a waiting-time bound.",
+    ] = 0
     schedule_policy: A[
         str,
         Arg(
