@@ -91,8 +91,8 @@ class TestRouteQuant(CustomTestCase):
         # afford atol=0; a real oracle cannot.
         torch.testing.assert_close(weights, ref_weights, rtol=1e-5, atol=1e-6)
 
-        if not moe_route_quant_fused.available():
-            self.skipTest("fused route+quant kernel unavailable")
+        # Compile errors must fail this registered CUDA test, not silently skip
+        # the fused consumer of the shared quantization trait.
         hidden = torch.randn(8, 3584, device="cuda", dtype=torch.bfloat16)
         ref_weights, ref_ids = route_radix(*args, sorted=False)
         ref_packed = _pack_topk_oracle(ref_ids, ref_weights)
