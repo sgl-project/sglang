@@ -123,7 +123,7 @@ def init_state_to_jump_forward(regex_string):
             elif len(c) > 1:
                 # FIXME: This logic is due to the leading \x00
                 # https://github.com/outlines-dev/outlines/pull/930
-                byte_ = int(symbols[0][1:], 16)
+                byte_ = int(c[1:], 16)
 
             if byte_ is not None:
                 outgoings_ct[state] += 1
