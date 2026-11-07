@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -17,6 +18,8 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -672,7 +675,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.index_head_dim = index_head_dim
         self.enable_sparsity_driven_kv_offload = (
-            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get() and not is_draft_worker
         )
         if self.enable_sparsity_driven_kv_offload and self.index_head_dim is None:
             raise ValueError("Sparsity-driven KV offload requires an index KV cache.")
@@ -860,6 +863,24 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if self.index_k_scale_buffer is not None:
             kv_size_bytes += get_tensor_size_bytes(self.index_k_scale_buffer)
         return kv_size_bytes
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Mirror accepted-token moves for the NPU sparse host-KV pool."""
+        manager = getattr(self, "sparse_kv_manager", None)
+        if manager is None:
+            return super().move_kv_cache(tgt_loc, src_loc)
+
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+        if tgt_loc.numel() == 0:
+            return
+        target = tgt_loc.view(-1).long()
+        source = src_loc.view(-1).long()
+        manager.move_host_kv(target, source)
+        for kv_cache in getattr(self, "kv_buffer", ()):
+            if kv_cache.shape[0] != 0:
+                kv_cache[target] = kv_cache[source]
 
     def _raise_if_native_kv_cache_disabled(self):
         if (

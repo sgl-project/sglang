@@ -269,8 +269,9 @@ class DSANPUIndexerMixin:
                         device=k.device,
                     )
                 else:
-                    actual_seq_lengths_q = torch.tensor(
-                        [1 + i * 1 for i in range(bs)],
+                    actual_seq_lengths_q = torch.arange(
+                        1,
+                        bs + 1,
                         dtype=torch.int32,
                         device=k.device,
                     )
@@ -308,6 +309,27 @@ class DSANPUIndexerMixin:
                 if is_prefill
                 else block_table
             )
+
+            backend = get_attn_backend()
+            manager = getattr(backend, "sparse_kv_manager", None)
+            if (
+                manager is not None
+                and getattr(backend, "use_fused_sparse_kv", False)
+                and not is_prefill
+            ):
+                if use_quant_indexer:
+                    raise ValueError("Native LIM requires BF16 index keys.")
+                plan = manager.lim_adapter.select(
+                    manager,
+                    query=q.view(-1, self.n_heads, self.head_dim),
+                    weights=weights,
+                    key=past_key_states,
+                    block_table=block_table,
+                    forward_batch=forward_batch,
+                    layer_id=layer_id,
+                )
+                backend.forward_metadata.sparse_kv_lim_plan = plan
+                return plan.source_ids
 
             if use_quant_indexer:
                 query, query_scale = _quantize_npu_indexer_activation(

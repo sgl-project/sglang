@@ -1,0 +1,125 @@
+Ascend LIM profiling and independent decode timing
+================================================
+
+Run profile_lim_model.py in the server's filesystem namespace, with a shared
+writable results directory. The profiler output_dir is a server-side path.
+Use the normal sgl-kernel-npu wheel containing the native LIM operator.
+This client does not install operators, launch servers, or stop other jobs.
+
+Prepare frozen native-chat token-ID inputs once and reuse the same file across
+all modes. Input length, output length, batch, capture steps and warmup are
+configurable. Existing fixtures and capture tags are never overwritten.
+Use --disable-radix-cache, allow enough context for input plus output, and check
+the actual token-pool capacity. Keep graphs enabled for formal captures. Raw
+logit and miss diagnostics also require --enable-custom-logit-processor.
+
+  python profile_lim_model.py prepare --model /models/GLM-5.2-w4a8 \
+    --fixtures /task/results/profile-fixtures.json \
+    --input-lengths 512 8192 16000 64000 --variants 16
+
+After each server is healthy, run the smoke check. This is a retrieval smoke
+test, not a general accuracy benchmark or a full-vocabulary precision check.
+When switching servers, also wait for every former worker to disappear and for
+all device HBM watermarks to return to their idle range. Process exit can precede
+device memory release; starting immediately can trip the TP memory-balance guard.
+
+  python profile_lim_model.py smoke --url http://127.0.0.1:30000 \
+    --fixtures /task/results/profile-fixtures.json --tag baseline-smoke
+
+Use three controls to separate storage capacity and batch computation:
+  1. Long context, smaller batch, original full-HBM storage.
+  2. Short context, larger batch, original full-HBM storage.
+  3. Same long context as (1), same larger batch as (2), LIM offload.
+
+Check the actual admitted token pool after startup. max-total-tokens is a
+requested upper limit and can be clamped. Do not call a queued/retracted batch
+a full-batch decode measurement. Choose capacities from the actual KV dtype;
+W4A8 model weights do not imply an 8-bit KV cache.
+
+For each separately configured server, select the matching length and batch:
+
+  python profile_lim_model.py capture --url http://127.0.0.1:30000 \
+    --workdir /task/results --fixtures /task/results/profile-fixtures.json \
+    --tag lim-64k-b12 --length 64000 --batch 12 --tokens 512 \
+    --warmup-tokens 10 --steps 10 --followup-rounds 2
+
+The client starts concurrent streaming requests, waits until every request has
+generated at least warmup-tokens, then arms CPU/NPU profiling. An early finish,
+HTTP failure, incomplete output, or missed barrier invalidates the capture.
+Cleanup aborts only the request IDs created by this client.
+
+Formal captures use graphs enabled, with_stack=False, record_shapes=False and
+detailed iteration annotations. Raw CANN ascend_pt directories, including
+PROF_* data and ASCEND_PROFILER_OUTPUT, remain under profiles/<tag>/decode.
+with-stack can be enabled separately for a source mapping capture. A graph-off
+mapping capture and a graph-on formal capture have different purposes.
+
+Profiled request latency is diagnostic. followup-rounds creates separate HTTP
+requests with profiling disabled. --no-profile performs just such a measurement.
+Streaming throughput is computed over the common active decode window after
+the full-batch barrier and before the first request ends. Prefill and batch
+drain are excluded. Output token counters supply the numerator; there is no
+assumption that a model step emits three tokens. Preserve individual repeats;
+two measured repeats do not establish a maximum-throughput or tail-latency claim.
+Keep full client batch elapsed time separately when considering request-level
+benefit. A faster stable decode window does not measure prefill, first fill or
+TTFT. Record concurrent CPU analysis and exclude it from any prefill timing claim.
+
+Analyze each rank independently, identified by its scheduler PID:
+
+  python analyze_lim_profile.py /path/ASCEND_PROFILER_OUTPUT/trace_view.json \
+    --output rank0-analysis.json --layers 78
+
+The analyzer preserves the raw trace hash, normalizes large decimal timestamps,
+reports cumulative time separately from interval unions, and accepts a graph
+replay window only when it contains the expected SFA layer count. Graph spans
+include other captured model work, such as the LM head; they are not a measured
+78-layer-only span or end-to-end ITL. HCCL task spans can contain waiting.
+
+Five-copy direction attribution applies only to the audited current BF16 LIM
+adapter and complete serial groups: new-token D2H, miss H2D to resident, resident
+to selected D2D, short-row H2D, tail H2D. A long row can still launch a masked
+short-row copy. Ambiguous groups are rejected rather than assigned directions.
+Never estimate cache hit rate or copied bytes from a copy kernel's duration.
+
+The current integration has LIM metadata fusion plus separate copy and SFA.
+CopySFA, grouped SharedCopy, C8 and framework MTP are separate capabilities.
+CopySFA hiding percentage requires matched split/fused inputs and cache states;
+it is unavailable when no fused implementation was measured.
+
+CPU diagnostic checks:
+  python test/manual/ascend/test_lim_profile_analysis.py -v
+  python test/registered/unit/hardware_backend/test_npu_sparse_host_callback.py -v
+
+For aligned raw-logit checks, use check_lim_decode_precision.py separately from
+timing. Capture untouched logits before forcing reference tokens, verify exact
+histories, and repeat both modes to quantify same-mode variability.
+For fixed chunked prefill, pass the actual --prefill-chunk-size and use
+--concurrency 1. Disable radix reuse, mixed chunks and dynamic chunking.
+Intermediate chunks can invoke the sampling processor even though their token
+is discarded. The helper skips ceil(input_length/chunk_size)-1 such calls,
+preserves untouched logits before forcing, and verifies raw-call indices against
+the HTTP output IDs. Do not use an unchunked capture helper on a chunked server.
+
+  python check_lim_decode_precision.py capture --fixtures boundary-inputs.json \
+    --tag lim-free --samples 4 --tokens 64 --concurrency 1 \
+    --prefill-chunk-size 4096 --workdir /task
+
+  python check_lim_decode_precision.py capture \
+    --fixtures /task/results/lim-free-teacher-fixtures.json \
+    --tag baseline-forced --force --samples 4 --tokens 64 --concurrency 1 \
+    --prefill-chunk-size 4096 --workdir /task
+
+For a separate last-owner miss-counter diagnostic (also excluded from timing):
+
+  python check_lim_last_owner_misses.py --url http://127.0.0.1:30000 \
+    --fixtures /task/results/profile-fixtures.json --case L64000-v0 \
+    --output /task/results/last-owner-misses.json --tokens 128 \
+    --prefill-chunk-size 4096
+
+The adapter reuses outputs across IndexShare owners. This request can observe
+only the final owner after a model forward. It excludes sampling step zero
+(prefill), checks cold copy_count=C versus query misses=K, and reports Q1 steady
+prefix misses with denominator K. It also records actual index-buffer geometry.
+Full-tail tokens and graph padding are excluded. This is not a 21-owner average
+or a workload-wide cache-hit estimate; collecting those needs per-owner counters.

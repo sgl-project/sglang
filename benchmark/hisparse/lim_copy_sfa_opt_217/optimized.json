@@ -1,0 +1,26 @@
+{
+  "scope": "fixed-input full-visible Q1 indexer/manager/attention; no model throughput claim",
+  "batch": 4,
+  "context": 8192,
+  "layers": 2,
+  "graph_us_per_step_samples": [
+    704.3116760253906,
+    704.5168050130209,
+    704.1318766276041,
+    704.3601481119791,
+    704.2678833007812
+  ],
+  "graph_us_per_step_median": 704.3116760253906,
+  "manager_allocated_bytes": 40116224,
+  "manager_budget_bytes": 37506172,
+  "topk_and_resident_payload": "pass",
+  "attention_cpu_oracle": "pass",
+  "selected_ids_sha256": "ae6af6abb20d89a99b6a1442b011f2bd9195bfabcb8f9816f0d0e31972c7ad43",
+  "dispatcher_counts_per_step": {
+    "aten::where": 16,
+    "aten::copy_": 16,
+    "npu::fused_lightning_indexer_manage": 1,
+    "aten::masked_fill_": 5,
+    "npu::fused_scatter_copy_sparse_flash_attention": 2
+  }
+}

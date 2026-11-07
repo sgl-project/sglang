@@ -275,6 +275,9 @@ def _pp_local_per_request_bytes(
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
+    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+        BudgetPlan,
+    )
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.model_executor.model_runner_components.layer_setup import (
@@ -415,6 +418,8 @@ class KVCacheConfigurator:
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
     dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
+    sparse_kv_budget_plan: Optional[BudgetPlan] = field(default=None, init=False)
+    _dsa_indexer_layer_ids: Optional[tuple[int, ...]] = field(default=None, init=False)
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
     mambaish_config: Optional[Any] = field(init=False)
@@ -862,6 +867,10 @@ class KVCacheConfigurator:
             req_to_token_pool=req_to_token_pool,
             state=state,
         )
+
+        if self.sparse_kv_budget_plan is not None and not self.is_draft_worker:
+            self.sparse_kv_budget_plan.bind_native_pool(token_to_kv_pool)
+            token_to_kv_pool.sparse_kv_budget_plan = self.sparse_kv_budget_plan
 
         if self.kv_shard_rank is not None:
             if not isinstance(token_to_kv_pool, PageInterleaveKVPoolMixin):
@@ -2146,21 +2155,7 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        # Shared layers never access the indexer; pool sizing uses the same gate
-        # so the saved indexer memory can be used for additional KV tokens.
-        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
-            is_draft_worker=self.is_draft_worker
-        )
-        indexer_layer_ids = None
-        if use_compact_indexer_layout:
-            indexer_layer_ids = tuple(
-                layer_id
-                for layer_id in range(
-                    self.layer_info.start_layer,
-                    self.layer_info.end_layer,
-                )
-                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-            )
+        indexer_layer_ids = self.get_dsa_indexer_layer_ids() if is_dsa_model else None
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
@@ -2190,6 +2185,27 @@ class KVCacheConfigurator:
             modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
+
+    def get_dsa_indexer_layer_ids(self) -> tuple[int, ...]:
+        """Use the same physical indexer layers for Ascend sizing and allocation."""
+        if self._dsa_indexer_layer_ids is None:
+            if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+                self._dsa_indexer_layer_ids = tuple(
+                    layer_id
+                    for layer_id in range(
+                        self.layer_info.start_layer, self.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                )
+            else:
+                self._dsa_indexer_layer_ids = tuple(
+                    range(
+                        self.layer_info.start_layer,
+                        self.layer_info.start_layer
+                        + self.layer_info.num_effective_layers,
+                    )
+                )
+        return self._dsa_indexer_layer_ids
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (

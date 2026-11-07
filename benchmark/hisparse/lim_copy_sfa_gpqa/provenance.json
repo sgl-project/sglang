@@ -1,0 +1,46 @@
+{
+  "status": "Native/framework tests passed; GPQA not started, awaiting exclusive NPU access on 209",
+  "sglang_lim_head": "1944b647f72cd5bb1f9c64fbfc5c18989f800028",
+  "sglang_community_base": "4b83f215f498bc0371587bfae4a9470f24e77737",
+  "copysfa_sglang_head": "69a1de8817a8b4de8b24d17e03757d7c2e8a7631",
+  "copysfa_sglang_diff_base": "c0d18c0254487068e423def336dd32dc99a6c1a0",
+  "copysfa_sglang_import_method": "Pinned 12-file feature diff, verified base blobs, three-way port; full fork fetch stalled",
+  "copysfa_sglang_diff_sha256": "6e4b252bc4df6575afa692a62dedf35cbf962267796f4d2e8f40c8b2e93d5f70",
+  "kernel_lim_head": "6d830514a7b062b1fd8498e1eff6c9b646be0a1b",
+  "copysfa_kernel_head": "88561ae566b5cde9293c86cf7e3c881bbd353f7e",
+  "merged_kernel_commit": "86034b44f84edd0542a283a9aa3e9dde4205db3a",
+  "loaded_library_sha256": {
+    "/usr/local/python3.12.13/lib/python3.12/site-packages/sgl_kernel_npu/_C.cpython-312-aarch64-linux-gnu.so": "fb146766c1087d74a77fcf04c3005468baf341d4de1ef8fede6ca14173c97fe1",
+    "/usr/local/python3.12.13/lib/python3.12/site-packages/sgl_kernel_npu/lib/libsgl_kernel_npu.so": "fbc1f3865525d9c46b5d0969bef0227c3c492bd4a1c9665d5254b75423c9a59a"
+  },
+  "weight_transfer": {
+    "source": "root@192.168.25.217:/home/weights/GLM-5.2-w4a8",
+    "destination": "/home/weights/GLM-5.2-w4a8",
+    "started_unix": 1792679533.5319738,
+    "pid": 2919481,
+    "rsync_finished_unix": 1792680633.3663664,
+    "phase": "verified",
+    "files": 108,
+    "bytes": 405008278302,
+    "finished_unix": 1792681000.7503998
+  },
+  "dataset": {
+    "local_source": "/home/hanwlax/datasets/gpqa/gpqa_diamond.csv",
+    "rows": 198,
+    "sha256": "41d1213cd7a4998605a26c2798500652572007161b3a92817ba46b35befcd305"
+  },
+  "framework_validation": {
+    "scope": "fixed projections, real manager/allocator/attention; no model score or timing claim",
+    "eager_topk": "pass",
+    "resident_payload_bitwise": "pass",
+    "attention_cpu_oracle": "pass",
+    "graph_reset_padding_and_reuse": "pass",
+    "mixed_fallback_to_graph": "pass",
+    "operator_calls": {
+      "npu::fused_lightning_indexer_manage": 1,
+      "fused_lightning_indexer_manage": 1,
+      "npu::fused_scatter_copy_sparse_flash_attention": 2,
+      "fused_scatter_copy_sparse_flash_attention_combined": 2
+    }
+  }
+}

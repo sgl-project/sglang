@@ -1,0 +1,98 @@
+GLM-5.2 W4A8, native LIM + Copy-SFA: hang investigation on 217
+2026-10-23
+
+STATUS
+The corrected communication configuration passed with overlap scheduling both
+disabled and enabled on the full 78-layer model. Each run completed 10 alternating
+short/long rounds: 160/160 requests and 5,120 generated tokens, with zero request
+errors or timeouts. The default launcher passed with overlap scheduling and
+PrefillDelayer enabled (max_delay_passes=100). Total: 320 completed requests and
+10,240 generated tokens. Both runs used production source without probes.
+No GPQA accuracy score was run.
+
+CONFIGURATION CHANGE
+Keep DeepEP auto. On the installed Ascend DeepEP runtime, use:
+  DEEPEP_HYBRID_DEPLOYMENT=1
+  SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=32
+  HCCL_BUFFSIZE=1000
+
+The installed vendor window_layout.h documents that the legacy layout is safe
+only when normal and V2 low-latency operators do not share an HCCL window.
+DeepEP auto alternates normal prefill and low-latency decode on a shared buffer.
+Hybrid deployment isolates their synchronization state and reserves its own
+payload offset. The per-rank low-latency capacity is explicitly bounded for this
+launcher's maximum 16 requests; it is not TopK or max_total_tokens. Recalculate
+this capacity before using a larger decode or speculative token batch.
+
+With hybrid deployment and the default capacity 128, the 1000 MB configuration
+failed V2 combine tiling at startup. A dedicated DeepEP HCCL buffer of 2500 MB
+passed startup, mixed warmup, and eight short requests. Lowering the capacity
+to 32 allowed retaining HCCL_BUFFSIZE=1000 in the completed 160-request run.
+The installed native library was not replaced during this investigation. No synchronization probes are
+included in the final configuration or framework source.
+
+EVIDENCE AND LIMITS
+  hang-auto-original-01:
+    Original configuration stalls in the mixed-request warmup. All 16 ranks
+    reach normal dispatch 677 times, with only 676 completed calls.
+  hang-auto-presync-02 / hang-auto-stage-03:
+    Temporary stream probes move the visible wait before the next dispatch;
+    other ranks then wait in dispatch. The Python stack alone does not prove
+    that dispatch is the first failing device operation. Probes were removed.
+  idle-dp-async-v2:
+    Standalone normal dispatch/combine passed 100 iterations on all 16 ranks,
+    alternating three tokens on one attention-DP group and zero on the other.
+    This excludes a general normal-communication failure for those shapes.
+  hang-auto-hybrid-04:
+    Hybrid layout, capacity128, HCCL1000: V2 combine tiling failure at startup.
+  hang-auto-hybrid-buffer-05:
+    Hybrid layout, capacity128, dedicated HCCL2500: warmup and eight short
+    requests pass. Its first long case was rejected BEFORE model execution:
+    the original diagnostic requested 4224+32768=36992 tokens, exceeding 36864.
+    This harness error was corrected; this run is not a full liveness pass.
+  hang-auto-hybrid-dispatch-clean-06:
+    Hybrid layout, capacity32, HCCL1000, no source instrumentation: PASS.
+    Overlap scheduling and PrefillDelayer disabled. Ten short/long rounds,
+    160 completed requests, exactly 32 generated tokens each. Server logs show
+    short eager decode and long NPU graph replay.
+  hang-auto-overlap-final-07:
+    The repository's default launcher and check_liveness.py: PASS.
+    Same hybrid layout, capacity32 and HCCL1000. server_info confirms overlap
+    scheduling enabled, PrefillDelayer enabled with max_delay_passes=100,
+    DeepEP auto and no speculative algorithm. Ten short/long rounds,
+    160 completed requests, exactly 32 generated tokens each, zero errors.
+    Eager decode and NPU graph replay are both present in the server log.
+
+COMMON FULL-MODEL SETTINGS
+Model: /models/GLM-5.2-w4a8; modelslim W4A8; BF16 KV/index keys.
+16 Ascend A3 dies; TP16/EP16; attention DP2; no MTP/speculative model.
+Native LIM and Copy-SFA enabled, C=K=2048, page128, static memory fraction0.82.
+max_total_tokens131072; max_running_requests16; context_length36864.
+CLI chunked_prefill_size2048 resolves to1024 per attention-DP rank.
+Decode graph bucket8; shared-expert fusion and radix cache disabled.
+CPU affinity enabled; HCCL_OP_EXPANSION_MODE=AIV; 32 streams per device.
+
+LIVENESS WORKLOAD
+Client concurrency 8. Each round sends eight GPQA-formatted short prompts with
+lengths [142,152,177,152,384,201,191,465], then eight natural-language long
+prompts of 3864 tokens. Inputs are tokenizer-encoded text, not random token IDs.
+The 32768-token output allowance is preserved for scheduler admission. The
+client aborts only its own UUID-tagged requests after 32 generated tokens.
+This verifies progress, eager/graph transitions, and request-state reuse;
+it does not measure completed-answer accuracy, long-generation stability,
+maximum serving concurrency, or a throughput improvement.
+
+REPRODUCTION IN THE EXISTING /task CONTAINER
+First prepare the frozen seed42 fixture with prepare_gpqa.py. The validated
+217 container launcher is /task/launch_server.sh (the exact final07 script,
+overlap enabled), matching the repository launch_server.sh. Start it with
+LIM_EVAL_MODE=lim_copy_sfa and a new LIM_EVAL_TAG. The separate
+/task/hang-auto-hybrid-dispatch-clean-06.launch.sh preserves the verified
+overlap-disabled configuration.
+The following sends requests only to that server at127.0.0.1:8810:
+  python3 /task/src/benchmark/hisparse/lim_copy_sfa_gpqa/check_liveness.py \
+    --tag NEW_UNIQUE_TAG --rounds 10
+Use --prepare-only with a different new tag to validate input lengths without
+sending inference requests. Results are /task/results/TAG.requests.json.
+Do not run run_gpqa_ab.py to reproduce this check; it performs accuracy scoring.
+Do not stop unrelated containers or processes to obtain the cards.

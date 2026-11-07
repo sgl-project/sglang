@@ -1,0 +1,169 @@
+217 / GLM-5.2 W4A8 / 三路径精度与同模式重复验证，2026-10-22
+
+本轮为用户“测下精度”的新采集，使用同一runtime与标准native kernel。
+三条路径：全HBM原始LI；prefix TopK+tail策略的LI reference；同策略的原生LIM。
+数学任务得分和固定历史logits分别报告，不通过调整阈值把非零差异标成精度无损。
+自由答题实测：全HBM 29/32；LI reference 29/32；原生LIM 30/32。
+同策略LI reference→LIM：mean KL 0.01028256，top1一致率97.797%；LIM自身重复：mean KL 0.01036212，top1一致率97.821%。
+关键未解决项：同策略32K边界组mean KL 0.13769843，p99 4.51716358，max 9.33487506，top1一致率95.312%。
+结论：本32题未观察到LIM答对数下降；固定历史下存在非零分布差异，特别是32K边界组，尚不能确认与同策略LI reference数值等价。
+32题自定义子集和本轮数值诊断的结论范围有限，不构成通用精度无损证明。
+
+配置与范围
+runtime8961cc3689aa9ba4f476ee133f29fb43eb5dc51c；公开分支原始头e4ca7390。
+kernel b5a45667efb377b0312108c01bbd0a730c1f9e78，正常库SHA256 ff93127d1294ef50b848816ba4710d44ef950ad54e4dc6498e88f4805be827a8。
+TP16/EP16，DeepEP auto，graph batch16，max-running-requests16，ctx36864，token pool147456，
+unchunked prefill，radix禁用，BF16主KV/index KV，K2048/C4096，MTP关闭，seed42。
+K=2048是索引TopK个数；C=4096是每请求每层主KV的HBM resident token容量，不是TopK也不是C8量化。
+主测试复用冻结的32条40-shot GSM8K提示，长度6507–6589；每条512预测位置，每份16384位置。
+每模式两份capture，baseline首份自由greedy产生锚定历史，其余全部强制相同token历史；强制前保存完整词表原始logits。
+补充4条32767/32768/32895/32896输入、各128位置的边界诊断，三模式共1536位置；从此前64K原生chat retrieval提示删除重复filler得到，保留聊天和查询后缀。
+6份主capture+3份边界capture，共99840份完整词表原始logits；所有有效采集和自由生成窗口均通过NPU独占审计。
+主capture并发16，边界并发1，自由生成任务客户端并发4；实际processor行数直方图另列。
+固定历史capture设置ignore_eos=true以采满512位置，包含自然停止后的延续；自由答题另用自然停止，不用固定历史结果冒充任务得分。
+与此前graph16/chunk4096/64K的4×64诊断是不同配置，不能混用其KL数值或性能。
+
+自由生成任务：固定32题自定义40-shot GSM8K子集，非标准榜单分数
+| 路径 | 答对/总数 | 答对率 | 输出触及512上限 | 独占审计 |
+|---|---:|---:|---:|---|
+| 全HBM | 29/32 | 90.625% | 0 | True |
+| LI reference | 29/32 | 90.625% | 0 | True |
+| 原生LIM | 30/32 | 93.750% | 0 | True |
+评分沿用现有eval_lim_long_gsm8k.py：取响应最后一个数字，与冻结gold字符串比较；完整输出、预测数字与gold均保留，便于检查格式影响。
+全HBM：Decimal归一化后29/32；错误题号 gsm8k-12, gsm8k-13, gsm8k-15。
+LI reference：Decimal归一化后29/32；错误题号 gsm8k-12, gsm8k-13, gsm8k-15。
+原生LIM：Decimal归一化后30/32；错误题号 gsm8k-12, gsm8k-13。
+
+主测试：全词表 KL(p_reference || p_candidate)，CPU float64；每行16384个固定历史位置
+| reference→candidate | mean KL | p99 KL | max KL | KL>0.01比例 | top1一致率 | 整向量逐位一致位置比例 |
+|---|---:|---:|---:|---:|---:|---:|
+| 全HBM-main-a2→全HBM-repeat-a1 | 0.00842651 | 0.17121563 | 1.61088135 | 12.073% | 98.279% | 18.750% |
+| LI reference-main-a1→LI reference-repeat-a1 | 0.00671625 | 0.14758153 | 1.98562673 | 9.576% | 98.517% | 40.625% |
+| 全HBM-main-a2→LI reference-main-a1 | 0.01011665 | 0.18067442 | 2.01791404 | 15.161% | 97.742% | 0.043% |
+| 原生LIM-main-a1→原生LIM-repeat-a1 | 0.01036212 | 0.18240875 | 1.78293569 | 15.021% | 97.821% | 1.483% |
+| 全HBM-main-a2→原生LIM-main-a1 | 0.01050684 | 0.18644351 | 1.56977138 | 15.466% | 97.729% | 0.061% |
+| LI reference-main-a1→原生LIM-main-a1 | 0.01028256 | 0.18419464 | 2.18401910 | 15.204% | 97.797% | 0.061% |
+解释顺序：先看同模式重复，再看LI reference→LIM的同策略差异，最后看全HBM→卸载路径的跨策略差异。
+固定形状下的确定性不等于batch-invariant。某条历史的数值可能受同批其他请求影响，不能把自重复差异直接说成缓存错误。
+逐位置保存完整logits需要CPU拷贝和文件写入，会影响请求调度；此采集用于数值诊断，不用于性能计时。
+两个比较的KL不能直接相减得到“LIM净误差”；各对照用于判断差异来源与量级，未设置事后通过阈值。
+同模式重复首次不一致位置：
+全HBM-main-a2-vs-全HBM-repeat-a1：首次不一致step→题数{0: 26}；整条512位置逐位相同6/32。
+LI reference-main-a1-vs-LI reference-repeat-a1：首次不一致step→题数{0: 19}；整条512位置逐位相同13/32。
+原生LIM-main-a1-vs-原生LIM-repeat-a1：首次不一致step→题数{0: 18, 3: 12, 87: 1, 120: 1}；整条512位置逐位相同0/32。
+step0是prefill输出；若重复差异已从step0开始，后续decode差异同时包含prefill数值路径变化的影响，不能由该对照单独归因到LIM。
+
+补充分组：仅选择两份capture的prefill输出logits逐位一致的题目，再统计它们的step1..511
+| comparison | prefill相同题数 | decode位置数 | mean KL | p99 KL | max KL | top1一致率 | 整向量逐位一致位置比例 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 全HBM-main-a2-vs-全HBM-repeat-a1 | 6 | 3066 | 0.00000000 | 0.00000000 | 0.00000000 | 100.000% | 100.000% |
+| LI reference-main-a1-vs-LI reference-repeat-a1 | 13 | 6643 | 0.00000000 | 0.00000000 | 0.00000000 | 100.000% | 100.000% |
+| 全HBM-main-a2-vs-LI reference-main-a1 | 7 | 3577 | 0.00948893 | 0.16002371 | 0.94042499 | 97.596% | 0.000% |
+| 原生LIM-main-a1-vs-原生LIM-repeat-a1 | 14 | 7154 | 0.00933601 | 0.17078784 | 1.04737335 | 97.903% | 3.201% |
+| 全HBM-main-a2-vs-原生LIM-main-a1 | 10 | 5110 | 0.00904604 | 0.16785909 | 0.62060637 | 98.023% | 0.000% |
+| LI reference-main-a1-vs-原生LIM-main-a1 | 10 | 5110 | 0.01017186 | 0.18075608 | 2.18401910 | 97.828% | 0.000% |
+这是按已观测prefill结果分组的诊断，不是总体误差估计；prefill最后logits相同也不能保证每层KV都相同，不能替代同输入算子参考测试。
+
+主测试实际采样processor行数与独占审计
+| capture | 行数→位置数 | 扫描数 | 最大扫描间隔s | 外部任务扫描数 |
+|---|---|---:|---:|---:|
+| 全HBM-main-a2 | {'3': 30, '16': 16352, '1': 2} | 43 | 5.239 | 0 |
+| 全HBM-repeat-a1 | {'1': 2, '16': 16352, '3': 30} | 41 | 5.235 | 0 |
+| LI reference-main-a1 | {'3': 30, '16': 16352, '1': 2} | 75 | 5.256 | 0 |
+| LI reference-repeat-a1 | {'3': 30, '16': 16352, '1': 2} | 75 | 5.176 | 0 |
+| 原生LIM-main-a1 | {'1': 2, '16': 16352, '3': 30} | 63 | 5.239 | 0 |
+| 原生LIM-repeat-a1 | {'1': 2, '16': 16352, '3': 30} | 62 | 5.213 | 0 |
+
+同一预测位置、两份capture均实际16行的子集；用于查看主要稳定batch区间，不能替代全量结果
+| comparison | 对齐位置数 | mean KL | p99 KL | max KL | top1一致率 |
+|---|---:|---:|---:|---:|---:|
+| 全HBM-main-a2-vs-全HBM-repeat-a1 | 16352 | 0.00838162 | 0.17020940 | 1.61088135 | 98.300% |
+| LI reference-main-a1-vs-LI reference-repeat-a1 | 16352 | 0.00666621 | 0.14690549 | 1.98562673 | 98.538% |
+| 全HBM-main-a2-vs-LI reference-main-a1 | 16352 | 0.01009126 | 0.18067442 | 2.01791404 | 97.743% |
+| 原生LIM-main-a1-vs-原生LIM-repeat-a1 | 16352 | 0.01032537 | 0.18166475 | 1.78293569 | 97.835% |
+| 全HBM-main-a2-vs-原生LIM-main-a1 | 16352 | 0.01045946 | 0.18563010 | 1.56977138 | 97.743% |
+| LI reference-main-a1-vs-原生LIM-main-a1 | 16352 | 0.01024283 | 0.18377425 | 2.18401910 | 97.805% |
+
+32K边界补充诊断：每行4×128=512位置，不作为总体质量证明
+| reference→candidate | mean KL | p99 KL | max KL | top1一致率 |
+|---|---:|---:|---:|---:|
+| 全HBM-boundary-a1→LI reference-boundary-a1 | 0.06806639 | 1.39569787 | 9.38738671 | 97.461% |
+| 全HBM-boundary-a1→原生LIM-boundary-a1 | 0.13789043 | 4.55565362 | 9.91980816 | 95.117% |
+| LI reference-boundary-a1→原生LIM-boundary-a1 | 0.13769843 | 4.51716358 | 9.33487506 | 95.312% |
+同策略LI reference→LIM边界组逐条结果：
+| 输入token数 | mean KL | p99 KL | max KL | top1一致率 | prefill整向量相同 | 首次非逐位相同步数 |
+|---|---:|---:|---:|---:|---|---:|
+| 32767 | 0.18452188 | 7.31148857 | 9.33487506 | 93.750% | True | 1 |
+| 32768 | 0.03125171 | 0.27885463 | 0.64188897 | 96.094% | True | 1 |
+| 32895 | 0.30701157 | 6.47040211 | 8.22495165 | 92.969% | True | 1 |
+| 32896 | 0.02800853 | 0.34555637 | 1.66044253 | 98.438% | True | 1 |
+四条边界输入的prefill最后输出logits均逐位相同，且都从第一个decode位置开始出现差异；不能只用prefill最后输出波动解释此组结果。最后输出相同仍不保证每层KV状态相同。
+首个decode位置的差异很小：4条合计mean KL 2.63327957e-07，max KL 4.99423865e-07，top1一致率100.000%；较大KL出现在后续位置，不能据此判定是直接KV搬错。
+每个比较另保存prefill、first_decode、decode、相同/不同processor行数以及逐题统计，见precision-summary.json/pair_breakdown。
+边界组只运行了一份每模式capture，没有边界组同模式重复；不能用6.5K主测试的自重复数值充当32K误差基线。
+尚待定位：在相同层Q/K/weights输入下记录TopK集合及排序，逐位核对selected KV，再比较SFA输入/输出；覆盖新页进入、miss回填和请求复用。
+本轮没有执行上述真实模型中间张量oracle，不能把边界组差异确定归因到TopK、H2D、LRU或SFA中的某一项。
+
+逐题答案
+| 题号 | 全HBM答案/正确 | LI reference答案/正确 | 原生LIM答案/正确 |
+|---|---|---|---|
+| gsm8k-0 | 18 / True | 18 / True | 18 / True |
+| gsm8k-1 | 3 / True | 3 / True | 3 / True |
+| gsm8k-2 | 70000 / True | 70000 / True | 70000 / True |
+| gsm8k-3 | 540 / True | 540 / True | 540 / True |
+| gsm8k-4 | 20 / True | 20 / True | 20 / True |
+| gsm8k-5 | 64 / True | 64 / True | 64 / True |
+| gsm8k-6 | 260 / True | 260 / True | 260 / True |
+| gsm8k-7 | 160 / True | 160 / True | 160 / True |
+| gsm8k-8 | 45 / True | 45 / True | 45 / True |
+| gsm8k-9 | 460 / True | 460 / True | 460 / True |
+| gsm8k-10 | 366 / True | 366 / True | 366 / True |
+| gsm8k-11 | 694 / True | 694 / True | 694 / True |
+| gsm8k-12 | 12 / False | 12 / False | 12 / False |
+| gsm8k-13 | 36 / False | 36 / False | 36 / False |
+| gsm8k-14 | 60 / True | 60 / True | 60 / True |
+| gsm8k-15 | 29 / False | 96 / False | 125 / True |
+| gsm8k-16 | 230 / True | 230 / True | 230 / True |
+| gsm8k-17 | 57500 / True | 57500 / True | 57500 / True |
+| gsm8k-18 | 7 / True | 7 / True | 7 / True |
+| gsm8k-19 | 6 / True | 6 / True | 6 / True |
+| gsm8k-20 | 15 / True | 15 / True | 15 / True |
+| gsm8k-21 | 14 / True | 14 / True | 14 / True |
+| gsm8k-22 | 7 / True | 7 / True | 7 / True |
+| gsm8k-23 | 8 / True | 8 / True | 8 / True |
+| gsm8k-24 | 26 / True | 26 / True | 26 / True |
+| gsm8k-25 | 2 / True | 2 / True | 2 / True |
+| gsm8k-26 | 243 / True | 243 / True | 243 / True |
+| gsm8k-27 | 16 / True | 16 / True | 16 / True |
+| gsm8k-28 | 25 / True | 25 / True | 25 / True |
+| gsm8k-29 | 104 / True | 104 / True | 104 / True |
+| gsm8k-30 | 109 / True | 109 / True | 109 / True |
+| gsm8k-31 | 80 / True | 80 / True | 80 / True |
+
+有效性与失败记录
+原始logits在强制token之前保存，输出HTTP token IDs与每步保存记录逐项一致；无chunked中间采样计数。
+同模式重复和跨模式比较均使用完全相同的输入与continuation IDs；全部原始张量已逐文件SHA256校验后归档。
+初次启动遇到其他Qwen3 TP4与AFS占用，未采纳任何样本；按用户此前明确授权停止持有NPU的其他容器后重新测试。
+首份baseline-main-a1虽采满32×512，但窗口内有两次外部AFS扫描，整份排除；正式基线使用独占重采的baseline-main-a2。
+graph8试配不满足TP16/DeepEP对齐约束，未进入采样；正式配置统一改回graph16/maxreq16，失败记录保留。
+验证期间guard先按进程/cgroup/启动时间确认并停止外部NPU占用；为避免任务反复重启，随后临时暂停两个已确认的竞争容器。
+守护进程的恢复完成回执缺失；结束后独立读取Docker状态核验两个容器均running=true/paused=false，本任务容器已停止、控制进程与NPU进程均无残留。未据此推断恢复由谁执行或具体时刻。
+本轮未修改SRT或native kernel，也未实现全序列TopK、CopySFA、C8或MTP；是对现有实现的新精度测量。
+
+复现和证据
+控制器、实际launcher、冻结输入、完整HTTP输出、每位置KL/argmax数据、同模式重复、源文件哈希和占用扫描均保留。
+远端任务根：/home/y00970600/personal/hisparse-lim-precision-217-20261022/
+完整原始logits已压缩保存在上述archives/下，各包名、文件数、SHA256与逐张量清单见results/evidence-archive.json。
+原始.pt在归档逐张量校验及所有比较完成后清理，压缩包完整保留；这是控制共享磁盘水位的存储整理。
+compact evidence: lim-precision-217-evidence-20261022.tar.gz, 19525441 bytes, SHA256 8cd2fc12d835cf5024938c70f60ff3db28317745e28a6baa93b9f58c0b43a75e
+compact包不含数十GB的全部原始logits；其完整包留在217，可按清单复现全量float64比较。
+post-freeze cleanup companion: cleanup-audit.json, SHA256 9c1dd270d1dc26a16365c6cbec0129b2b561722fab559d4dc15acf2de2832e10
+该清理核验文件在compact冻结后独立保存；compact原包及其SHA256保持不变。
+本地再次校验compact全部659文件哈希，并从逐位置KL记录复算9组标量汇总，全部聚合差值为0；未在本地重新计算全部原始词表KL。
+- Custom frozen 32-question 40-shot GSM8K subset; not a standard benchmark score or general quality-parity certificate.
+- Primary fixed-history captures are 32 x 512 positions per mode/repeat; boundary diagnostics are four 32K inputs x 128 positions.
+- Greedy baseline continuations are forced in other captures; untouched logits are saved before forcing.
+- Same-shape determinism does not establish batch invariance; active sampling row histograms and matched-row subsets are reported.
+- Baseline and offload policy differ: full visible TopK versus prefix TopK plus visible tail. LI reference and LIM share the latter policy.
+- This run uses graph16, unchunked prefill and context36864, and must not be mixed with the earlier graph16 chunked 64K results.
+- All reported capture and quality windows must pass the exclusive NPU process audit; retries remain separately identified.

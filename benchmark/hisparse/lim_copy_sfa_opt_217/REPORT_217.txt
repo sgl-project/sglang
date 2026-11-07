@@ -1,0 +1,129 @@
+LIM Copy-SFA optimization validation on Ascend 217
+2026-10-23, Asia/Shanghai
+
+Source and scope
+---------------
+Both repositories use feat/hisparse-lim-copysfa-opt-217, based on the user's
+feat/hisparse-lim-copysfa-gpqa branches:
+  SGLang base: 9f77288b2c76da09c794951848296ea4169e2de8
+  Kernel base: 86034b44f84edd0542a283a9aa3e9dde4205db3a
+  Validated SGLang runtime: bbb72a632302500529a2cf3fe362231ef2a879fc
+  Validated kernel: 632971ef8d337e3f797e38f6636f7351e69ece3a
+
+The attention policy remains full-visible Q1 TopK with C=K=2048 when
+Copy-SFA is enabled. Native partial-vector eviction fixes, manager HBM
+reservation, CPU prefill metadata and existing callback fixes are preserved.
+The integration does not enable model-level MTP or switch to prefix-tail.
+
+Adapted from JinyanYi's feature/npu-lim-copysfa-20261022 branches:
+  SGLang head: 9a60d5d9d9844575265fd736ba37a006b94734b9
+  Kernel head: e74d7dfff432725ecccbc58149c7fd2e228c6b6c
+
+Changes
+-------
+1. Copy-SFA consumes contiguous native LIM [B,32768] miss rows directly.
+   TopK sources/slots and miss metadata share the native plan buffers;
+   there is no second residency planner and no six-buffer repacking.
+2. Graph batch scratch capacity is independent of request-ID capacity.
+   Batch outputs, selected KV and metadata are charged to the HBM budget
+   using the padded capacity; persistent per-request residency stays bounded
+   by the real request pool.
+3. Full-visible mode skips unused combined_kv/combined_ids tail workspaces.
+4. Empty fallback attention rows are explicitly zeroed. The vendor SFA
+   kernel may leave skipped-row output unwritten; padding must not publish it.
+5. Native Copy-SFA gains dynamic TND, combined-tail row-stride handling and
+   the dense C=0 miss-count guard. Framework dispatch remains Q1.
+6. Native direct-plan/dynamic-TND tests and padded-graph framework validation
+   cover the new contracts. A fixed-input Copy-SFA benchmark is included.
+
+Validation environment
+----------------------
+Ascend A3 host 217, CANN 9.1, torch 2.10.0+cpu, torch_npu 2.10.0.post6.
+A full normal kernel-wheel build completed in an isolated task container.
+The previously installed baseline library was preserved for the A/B run.
+Another service that started during the build was allowed to finish on its
+own; this validation did not stop it. NPU tests started after cards were idle.
+
+Baseline libsgl_kernel_npu.so SHA256:
+  fbc1f3865525d9c46b5d0969bef0227c3c492bd4a1c9665d5254b75423c9a59a
+Optimized libsgl_kernel_npu.so SHA256:
+  0bbcb79d39e54ce42b80f08dfad5706bf39164790e8c569a7fb0ca0a16ab7e1d
+
+Correctness and integration
+--------------------------
+53 native tests passed: LIM, cache planner, combined Copy-SFA, direct native
+miss plans and dynamic TND. No cases were skipped.
+11 registered LIM CPU tests and 14 manual cache CPU tests passed.
+Registered-test validation, selected Ruff checks/formatting and git diff
+whitespace checks passed.
+
+Real manager + registered host allocator + attention validation passed for:
+  - Standard B=2, request-row storage=3.
+  - Padded graph B=16, request-row storage=3, scratch capacity=16.
+Both cover eager TopK, bitwise resident KV, attention vs CPU reference
+(rtol=0.02, atol=0.002), graph reset/padding/request reuse, short/long fallback
+then graph reentry, and ragged prefill KV gathering.
+All six metadata tensors share their native plan storage. Dispatcher traces
+show one npu::fused_lightning_indexer_manage and two
+npu::fused_scatter_copy_sparse_flash_attention calls per two-layer step.
+
+Fixed-input A/B measurement
+--------------------------
+This measures the indexer/manager/attention subpath, without checkpoint model
+projections, scheduler or sampling. It is not an end-to-end serving speedup.
+B=4, context parameter=8192 (one visible decode token), two attention layers,
+32 index heads, 8 query heads, BF16, C=K=2048, alternating 1024-miss hotsets.
+The same script, inputs, full-visible policy and environment were used with
+the base source/wheel pair and optimized source/wheel pair in separate
+processes. Each reports five graph timing samples after warmup.
+
+                                      Baseline          Optimized
+Median graph microseconds per step    773.6131          704.3117
+Manager tensor allocation bytes       52,740,608        40,116,224
+Manager budget bytes                  49,343,612        37,506,172
+aten::copy_ calls per step             28                16
+aten::where calls per step             36                16
+aten::masked_fill_ calls per step       1                 5
+Native LIM / Copy-SFA dispatches        1 / 2             1 / 2
+
+Latency decreased 8.9581%. The manager's torch.npu.memory_allocated() delta
+decreased by 12,624,384 bytes (12.0391 MiB) in this fixture. This allocation
+snapshot is not the whole model's HBM usage.
+Selected IDs match between runs, and both pass bitwise resident-payload and
+CPU attention checks. Raw samples and counts are in baseline.json and
+optimized.json.
+
+Checkpoint validation
+---------------------
+GLM-5.2 W4A8 startup and decode smoke passed with TP16/EP16, attention DP2,
+BF16 KV, page128, context36864, max_running_requests=4 and decode graph bs=[8].
+All 16 ranks completed graph capture; the log confirms three request storage
+rows per attention-DP rank while the captured graph has eight batch rows. Speculation was disabled.
+
+Input tokens   Generated tokens   Expected needle present
+512            32                 yes
+8192           32                 yes
+32768          32                 yes
+
+Requests used greedy sampling and ignore_eos=True to exercise 32 decode
+steps, so text may continue after the expected answer. These generated needle
+checks are smoke coverage, not GPQA or a general accuracy evaluation.
+The task-owned server shut down normally after validation; no other service
+was stopped. No checkpoint-level speedup is claimed. Full model and raw
+subpath records plus verified source/library hashes are in validation.json.
+
+Reproduction
+------------
+Build/install the matching new kernel branch before using the new SGLang
+branch. The old Q1 kernel host does not accept 32768-wide miss rows.
+
+Kernel:
+  bash build.sh -a kernels Ascend910_9382
+  python3 -m pytest tests/python/sgl_kernel_npu/test_fused_lightning_indexer_manage.py tests/test_sparsity_driven_kv_cache_planner.py tests/test_copy_sfa_combined.py tests/test_lim_copy_sfa.py tests/test_copy_sfa_dynamic_tnd.py -q
+
+SGLang:
+  python3 test/registered/unit/hardware_backend/test_npu_lim_state.py -v
+  python3 test/manual/npu/test_sparse_kv_offload_cache.py -v
+  python3 benchmark/hisparse/check_lim_copy_sfa.py --output /tmp/framework.json
+  python3 benchmark/hisparse/check_lim_copy_sfa.py --padded-batch --output /tmp/padded.json
+  python3 benchmark/hisparse/bench_lim_copy_sfa.py --output /tmp/bench.json

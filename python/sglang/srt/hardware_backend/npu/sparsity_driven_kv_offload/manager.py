@@ -12,7 +12,21 @@ from sgl_kernel_npu.sparsity_driven_kv_offload import (
     unidex_copy_inplace,
 )
 
+from sglang.kernels.ops.attention.npu_copy_sfa import (
+    load_copy_sfa_operator,
+)
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.block_tables import (
+    prepare_prefill_gather_rows,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.copy_sfa_buffers import (
+    copy_sfa_host_row_stride,
+)
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+    is_sparse_mtp_batch,
+    prepare_mtp_rows,
+)
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
@@ -75,6 +89,9 @@ class SparseKVCacheManager:
         req_to_token_pool: ReqToTokenPool,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_context_len: int,
+        copy_sfa_padded_query_heads: Optional[int] = None,
+        graph_batch_capacity: int = 0,
+        paged_kv_cache: Optional[MLATokenToKVPool] = None,
     ) -> None:
         enable_memory_saver = False
         memory_saver_adapter = TorchMemorySaverAdapter.create(
@@ -84,7 +101,17 @@ class SparseKVCacheManager:
         # Include the padding row because real request IDs can equal the
         # configured capacity when row 0 is reserved for graph padding.
         self.size = int(req_to_token_pool.req_to_token.shape[0])
-        self.max_context_len = req_to_token_pool.max_context_len
+        self.batch_capacity = max(
+            self.size,
+            graph_batch_capacity,
+            get_eager_max_batch_size(self.size - 1),
+        )
+        self.last_decode_path = "unselected"
+        self.logical_max_context_len = int(req_to_token_pool.max_context_len)
+        self.copy_sfa_enabled = False
+        self.max_context_len = copy_sfa_host_row_stride(
+            self.logical_max_context_len, self.copy_sfa_enabled
+        )
         self.sparse_context_len = int(sparse_context_len)
         if self.sparse_context_len <= 0:
             raise ValueError(
@@ -92,7 +119,10 @@ class SparseKVCacheManager:
                 f"got {self.sparse_context_len}."
             )
         self.device = req_to_token_pool.device
-        paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
+        # EAGLE shares the target allocator's token IDs while owning a
+        # separate draft KV pool. The allocator's pool is not the draft pool.
+        if paged_kv_cache is None:
+            paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         if not isinstance(paged_kv_cache, MLATokenToKVPool):
             raise TypeError(
                 "SparseKVCacheManager requires an MLATokenToKVPool, "
@@ -110,15 +140,52 @@ class SparseKVCacheManager:
         )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self._materialize_d2d_hit_stream = torch.npu.Stream()
-        self._materialize_h2d_miss_stream = torch.npu.Stream()
-        self._materialize_refill_stream = torch.npu.Stream()
-        self._materialize_slot_map_stream = torch.npu.Stream()
+        self.device_cache_size = self.sparse_context_len
+        self.indexer_impl = "legacy"
+        self._slot_map_width = (
+            (self.max_context_len + 127) // 128 * 128
+            if self.indexer_impl == "lim"
+            else (self.max_context_len // 8 + 1) * 8
+        )
+        logger.info(
+            "Sparse KV per rank: K=%d C=%d",
+            self.sparse_context_len,
+            self.device_cache_size,
+        )
+        self.cache_capacity = self.device_cache_size
+        if self.copy_sfa_enabled and (
+            not 2048 <= self.cache_capacity <= 32640
+            or self.cache_capacity % 128
+            or copy_sfa_padded_query_heads is None
+        ):
+            raise ValueError(
+                "Copy-SFA requires C in [2048,32640], aligned to 128, and a padded query head count."
+            )
+        if self.copy_sfa_enabled:
+            if (self.kv_lora_rank, self.qk_rope_head_dim) != (512, 64):
+                raise ValueError(
+                    "Copy-SFA supports only MLA KV dimensions CKV=512 and KPE=64; "
+                    f"got CKV={self.kv_lora_rank}, KPE={self.qk_rope_head_dim}."
+                )
+            if self.store_dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "Copy-SFA supports only BF16 or FP16 KV storage; "
+                    f"got {self.store_dtype}."
+                )
+            from sgl_kernel_npu.sparsity_driven_kv_offload import plan_sparse_kv_cache
 
+            self._plan_sparse_kv_cache = plan_sparse_kv_cache
+            self._copy_sfa_operator = load_copy_sfa_operator()
+        else:
+            self._plan_sparse_kv_cache = None
+            self._copy_sfa_operator = None
+        # Main stream handles hits and attention. One side stream handles host
+        # misses, cache refill and publication; refill overlaps attention.
+        self._materialize_h2d_miss_stream = torch.npu.Stream()
+        self.copy_ready = torch.npu.Event()
         self.hit_done = torch.npu.Event()
         self.miss_done = torch.npu.Event()
         self.refill_done = torch.npu.Event()
-        self.slot_map_done = torch.npu.Event()
 
         # device KV buffer
         try:
@@ -129,7 +196,7 @@ class SparseKVCacheManager:
                     torch.empty(
                         (
                             self.size,
-                            self.sparse_context_len,
+                            self.device_cache_size,
                             self.head_num,
                             self.head_dim,
                         ),
@@ -150,7 +217,7 @@ class SparseKVCacheManager:
                     torch.full(
                         (
                             self.size + 1,
-                            (self.max_context_len // 8 + 1) * 8,
+                            self._slot_map_width,
                         ),
                         -1,
                         dtype=torch.int32,
@@ -158,11 +225,93 @@ class SparseKVCacheManager:
                     )
                     for _ in range(self.layer_num)
                 ]
-                # Pre-filled all-(-1) template used to reset the slot map with a
-                # fast device-to-device copy instead of an indexed fill.
-                self._device_slot_map_minus_one = torch.full_like(
-                    self.device_slot_map[0], -1
+                # One compact workspace is reused across layers and steps. The
+                # attention path joins refill_done before the next reuse.
+                self.selected_kv_buffer = torch.empty(
+                    (
+                        self.batch_capacity,
+                        self.sparse_context_len,
+                        self.head_num,
+                        self.head_dim,
+                    ),
+                    dtype=self.store_dtype,
+                    device=self.device,
                 )
+                if self.copy_sfa_enabled:
+                    self.device_slot_owner: list[torch.Tensor] = [
+                        torch.full(
+                            (self.size + 1, self.cache_capacity),
+                            -1,
+                            dtype=torch.int32,
+                            device=self.device,
+                        )
+                        for _ in range(self.layer_num)
+                    ]
+                    self.planner_topk_src_ids = torch.full(
+                        (self.batch_capacity, 1, self.sparse_context_len),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_topk_dst_slots = torch.full_like(
+                        self.planner_topk_src_ids, -1
+                    )
+                    self.planner_topk_miss_counts = torch.zeros(
+                        (self.batch_capacity,), dtype=torch.int32, device=self.device
+                    )
+                    self.planner_miss_src_ids = torch.full(
+                        (self.batch_capacity, self.cache_capacity),
+                        -1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_miss_dst_slots = torch.full_like(
+                        self.planner_miss_src_ids, -1
+                    )
+                    self.planner_miss_counts = torch.zeros(
+                        (self.batch_capacity,), dtype=torch.int32, device=self.device
+                    )
+                    self.planner_actual_seq_lengths_query = torch.arange(
+                        1,
+                        self.batch_capacity + 1,
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_actual_seq_lengths_kv = torch.empty_like(
+                        self.planner_actual_seq_lengths_query
+                    )
+                    self.planner_num_cache_tokens = torch.empty_like(
+                        self.planner_actual_seq_lengths_query
+                    )
+                    self.planner_hbm_block_table = torch.empty(
+                        (self.batch_capacity, self.cache_capacity // 128),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    self.planner_dram_block_table = torch.empty(
+                        (self.batch_capacity, self.max_context_len // 128),
+                        dtype=torch.int32,
+                        device=self.device,
+                    )
+                    if self.copy_sfa_enabled:
+                        self.mtp_attn_out = torch.empty(
+                            (
+                                self.batch_capacity * 4,
+                                copy_sfa_padded_query_heads,
+                                self.kv_lora_rank,
+                            ),
+                            dtype=self.store_dtype,
+                            device=self.device,
+                        )
+                    self.planner_attn_out = torch.empty(
+                        (
+                            self.batch_capacity,
+                            copy_sfa_padded_query_heads,
+                            self.kv_lora_rank,
+                        ),
+                        dtype=self.store_dtype,
+                        device=self.device,
+                    )
         except Exception as e:
             self._raise_buffer_allocation_error("device_slot_map", e)
 
@@ -188,7 +337,7 @@ class SparseKVCacheManager:
                     shape=host_kv_shape,
                     dtype=self.store_dtype,
                     device_id=device_id,
-                    name=f"host_kv_layer_{layer_idx}_rank_{device_id}",
+                    name=f"host_kv_pool_{id(paged_kv_cache)}_layer_{layer_idx}_rank_{device_id}",
                 )
                 self.host_kv_buffer.append(shm_cpu_tensor)
                 self.host_ptr_list.append(host_ptr)
@@ -206,7 +355,13 @@ class SparseKVCacheManager:
         self._device_cache_slot_ids = torch.arange(
             self.sparse_context_len, dtype=torch.long, device=self.device
         )
-        self._slot_map_width = (self.max_context_len // 8 + 1) * 8
+        self.lim_adapter = None
+        if self.indexer_impl != "legacy":
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.lim import (
+                LIMDecodeAdapter,
+            )
+
+            self.lim_adapter = LIMDecodeAdapter(self)
 
         self._install_req_alloc_hook(req_to_token_pool)
 
@@ -225,9 +380,9 @@ class SparseKVCacheManager:
         ) from exc
 
     def init_req(self, req: Req) -> None:
-        if req.is_chunked > 0:
+        if req.inflight_middle_chunks > 0:
             return
-        rid = req.req_pool_idx
+        rid = req.kv.req_pool_idx
         if rid is None:
             raise RuntimeError(
                 "Cannot initialize sparse KV state before allocating a request pool slot"
@@ -245,15 +400,27 @@ class SparseKVCacheManager:
         ).contiguous()
         for layer_idx in range(self.layer_num):
             self.device_slot_map[layer_idx].index_fill_(0, req_ids_tensor, -1)
+            if self.copy_sfa_enabled:
+                self.device_slot_owner[layer_idx].index_fill_(0, req_ids_tensor, -1)
+        if self.lim_adapter is not None:
+            self.lim_adapter.reset_requests(req_ids_tensor)
+
+    def invalidate_mtp_cache(self, layer, request_slots):
+        """Discard residency before publishing a potentially rewritten draft."""
+        layer_index = layer.layer_id - self.start_layer
+        slots = request_slots.long().clamp(0, self.size - 1)
+        self.device_slot_map[layer_index].index_fill_(0, slots, -1)
+        if self.copy_sfa_enabled:
+            self.device_slot_owner[layer_index].index_fill_(0, slots, -1)
+        if self.lim_adapter is not None:
+            self.lim_adapter.last_prefix[layer_index].index_fill_(0, slots, -1)
 
     def _install_req_alloc_hook(self, req_to_token_pool: ReqToTokenPool) -> None:
-        original_alloc = getattr(
-            req_to_token_pool, "_sparse_kv_original_alloc", req_to_token_pool.alloc
-        )
-        setattr(req_to_token_pool, "_sparse_kv_original_alloc", original_alloc)
+        # Preserve the target manager's hook when adding the draft manager.
+        original_alloc = req_to_token_pool.alloc
 
         def alloc_with_sparse_reset(reqs: list[Req]) -> Optional[List[int]]:
-            newly_allocated = [req.req_pool_idx is None for req in reqs]
+            newly_allocated = [not req.kv.holds_kv for req in reqs]
             req_pool_indices = original_alloc(reqs)
             if req_pool_indices is not None:
                 self.reset_requests(
@@ -411,7 +578,17 @@ class SparseKVCacheManager:
         src_index = torch.arange(src_tensor.shape[0], device=device, dtype=torch.long)
         num_src_rows = int(src_tensor.shape[0])
 
-        if forward_batch.forward_mode.is_decode():
+        if is_sparse_mtp_batch(forward_batch):
+            req_ids, token_pos, valid_mask = prepare_mtp_rows(
+                forward_batch, num_src_rows, self.size, self.logical_max_context_len
+            )
+            dst_index = (req_ids * self.max_context_len + token_pos).reshape(-1)
+            valid_mask = valid_mask.reshape(-1).contiguous()
+            # TP token padding is a suffix, independent of the request window.
+            padding = num_src_rows - dst_index.numel()
+            dst_index = torch.nn.functional.pad(dst_index, (0, padding), value=0)
+            valid_mask = torch.nn.functional.pad(valid_mask, (0, padding), value=False)
+        elif forward_batch.forward_mode.is_decode():
             req_ids = forward_batch.req_pool_indices.to(torch.long)
             token_pos = (forward_batch.seq_lens - 1).to(torch.long)
             cache_loc = forward_batch.out_cache_loc.to(torch.long)
@@ -620,11 +797,17 @@ class SparseKVCacheManager:
                 f"{int(seq_lens.numel())}."
             )
 
-        valid_reqs = (seq_lens > 0) & (req_ids >= 0)
-        req_ids = req_ids[valid_reqs].contiguous()
-        seq_lens = seq_lens[valid_reqs].contiguous()
-
-        if int(seq_lens.numel()) == 0:
+        keep_cpu, total_tokens = prepare_prefill_gather_rows(
+            forward_batch.req_pool_indices_cpu,
+            forward_batch.seq_lens_cpu,
+            self.size,
+            self.max_context_len,
+        )
+        if forward_batch.req_pool_indices_cpu.numel() != req_ids.numel():
+            raise RuntimeError(
+                "Prefill CPU and device metadata must have matching sizes"
+            )
+        if total_tokens == 0:
             empty_nope = torch.empty(
                 (0, self.head_num, self.kv_lora_rank),
                 dtype=self.store_dtype,
@@ -637,17 +820,11 @@ class SparseKVCacheManager:
             )
             return empty_nope, empty_pe
 
-        if bool((req_ids >= self.size).any().item()):
-            raise RuntimeError(
-                f"get_forward_kv got req id outside sparse pool size {self.size}."
-            )
-        if bool((seq_lens > self.max_context_len).any().item()):
-            raise RuntimeError(
-                "get_forward_kv got seq_len larger than max_context_len "
-                f"{self.max_context_len}."
-            )
+        if keep_cpu.numel() != req_ids.numel():
+            keep = keep_cpu.to(device=device, dtype=torch.long, non_blocking=True)
+            req_ids = req_ids.index_select(0, keep)
+            seq_lens = seq_lens.index_select(0, keep)
 
-        total_tokens = int(seq_lens.sum().item())
         kv_cat = torch.empty(
             (total_tokens, self.head_num, self.head_dim),
             dtype=self.store_dtype,
@@ -693,7 +870,11 @@ class SparseKVCacheManager:
         selected_kv_buffer: torch.Tensor,
         stream: torch.npu.Stream,
     ) -> None:
-        """Materialize top-k KV entries and refresh the device cache metadata."""
+        """Gather current selections, then refill and publish on one side stream.
+
+        The caller waits for miss_done before attention and refill_done after
+        attention, protecting the shared workspace and the next cache lookup.
+        """
         layer_idx = layer.layer_id - self.start_layer
         stream = stream if stream is not None else torch.npu.current_stream()
 
@@ -703,7 +884,11 @@ class SparseKVCacheManager:
             # device_cache_row_indices: invalid -> 0 (masked by valid_topk_mask)
             req_pool_indices = forward_batch.req_pool_indices
             req_pool_indices = req_pool_indices.to(torch.long).contiguous()
-            valid_req_mask = (req_pool_indices >= 0) & (req_pool_indices < self.size)
+            valid_req_mask = (
+                (req_pool_indices > 0)
+                & (req_pool_indices < self.size)
+                & (forward_batch.seq_lens[: req_pool_indices.numel()] > 0)
+            )
             slot_map_row_indices = torch.where(
                 valid_req_mask,
                 req_pool_indices,
@@ -718,6 +903,10 @@ class SparseKVCacheManager:
             # Normalize top-k indices and mask invalid requests and token IDs.
             topk_indices = normalize_batch_topk_indices(topk_indices)
             batch_size, topk_len = topk_indices.shape
+            if selected_kv_buffer.shape[:2] != (batch_size, topk_len):
+                raise ValueError(
+                    "Selected KV workspace must match padded [batch, top_k]."
+                )
             if topk_len > self.sparse_context_len:
                 raise RuntimeError(
                     "DSA top-k length exceeds sparse KV device cache capacity: "
@@ -733,7 +922,11 @@ class SparseKVCacheManager:
             slot_lookup_req_indices = slot_map_row_indices.to(
                 dtype=torch.int32
             ).contiguous()
-            slot_lookup_topk_indices = topk_indices.to(dtype=torch.int32).contiguous()
+            slot_lookup_topk_indices = (
+                torch.where(valid_topk_mask, topk_indices, self.max_context_len)
+                .to(dtype=torch.int32)
+                .contiguous()
+            )
             token_on_device, device_token_pos = slot_map_lookup(
                 self.device_slot_map[layer_idx],
                 slot_lookup_req_indices,
@@ -747,7 +940,7 @@ class SparseKVCacheManager:
                 token_on_device,
                 device_token_pos,
                 device_cache_row_indices,
-                self.sparse_context_len,
+                self.device_cache_size,
             )
 
             host_miss_mask = (~token_on_device) & valid_topk_mask
@@ -759,8 +952,11 @@ class SparseKVCacheManager:
             )
 
             cache_slot_ids = self._device_cache_slot_ids[:topk_len]
+            # Refill the K-entry cache in the current TopK order.
+            refill_slots = cache_slot_ids.expand(batch_size, -1)
+            refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
             request_cache_offsets = (
-                device_cache_row_indices.unsqueeze(1) * self.sparse_context_len
+                device_cache_row_indices.unsqueeze(1) * self.device_cache_size
             )
             refill_src_index = torch.arange(
                 batch_size * topk_len,
@@ -768,16 +964,28 @@ class SparseKVCacheManager:
                 device=topk_indices.device,
             )
             refill_dst_index = (
-                (request_cache_offsets + cache_slot_ids).reshape(-1).contiguous()
+                (request_cache_offsets + refill_slots).reshape(-1).contiguous()
             )
-            refill_valid_mask = valid_topk_mask.reshape(-1).contiguous()
-
-            copy_ready = torch.npu.Event()
-            _record_stream_event(stream, copy_ready)
+            # These tensors were allocated on the producer stream. Keep their
+            # storage alive until the side stream has finished using them.
+            side_inputs = [
+                topk_indices,
+                slot_map_row_indices,
+                host_miss_mask,
+                miss_src_index,
+                miss_dst_index,
+                miss_valid_mask,
+                refill_src_index,
+                refill_dst_index,
+                refill_slots,
+                refill_valid_mask,
+            ]
+            for tensor in side_inputs:
+                tensor.record_stream(self._materialize_h2d_miss_stream)
+            _record_stream_event(stream, self.copy_ready)
 
         # Copy device-cache hits into the selected KV buffer.
-        with torch.npu.stream(self._materialize_d2d_hit_stream):
-            _wait_stream_event(self._materialize_d2d_hit_stream, copy_ready)
+        with torch.npu.stream(stream):
             unidex_copy_inplace(
                 self.device_kv_buffer[layer_idx],
                 selected_kv_buffer,
@@ -788,11 +996,11 @@ class SparseKVCacheManager:
                 2,  #
                 block_dim=24,
             )
-            _record_stream_event(self._materialize_d2d_hit_stream, self.hit_done)
+            _record_stream_event(stream, self.hit_done)
 
         # Copy host shared-memory misses into the selected KV buffer.
         with torch.npu.stream(self._materialize_h2d_miss_stream):
-            _wait_stream_event(self._materialize_h2d_miss_stream, copy_ready)
+            _wait_stream_event(self._materialize_h2d_miss_stream, self.copy_ready)
             unidex_copy_inplace(
                 self.host_kv_buffer[layer_idx],
                 selected_kv_buffer,
@@ -806,11 +1014,9 @@ class SparseKVCacheManager:
             )
             _record_stream_event(self._materialize_h2d_miss_stream, self.miss_done)
 
-        # Refill the device cache with the current top-k after hit and miss
-        # copies complete, so the next step can reuse these entries.
-        with torch.npu.stream(self._materialize_refill_stream):
-            _wait_stream_event(self._materialize_refill_stream, self.hit_done)
-            _wait_stream_event(self._materialize_refill_stream, self.miss_done)
+            # miss_done deliberately precedes refill and metadata publication:
+            # attention can consume the workspace while this stream refills.
+            _wait_stream_event(self._materialize_h2d_miss_stream, self.hit_done)
             unidex_copy_inplace(
                 selected_kv_buffer,
                 self.device_kv_buffer[layer_idx],
@@ -821,23 +1027,18 @@ class SparseKVCacheManager:
                 2,
                 block_dim=24,
             )
-            _record_stream_event(self._materialize_refill_stream, self.refill_done)
-
-        # Replace the slot-map row with the current top-k mapping. Invalid
-        # entries use the max_context_len sentinel column to preserve shape.
-        with torch.npu.stream(self._materialize_slot_map_stream):
-            _wait_stream_event(self._materialize_slot_map_stream, copy_ready)
-            self.device_slot_map[layer_idx].copy_(self._device_slot_map_minus_one)
+            # No full-pool reset: inactive requests keep their resident mappings.
+            self.device_slot_map[layer_idx].index_fill_(0, slot_map_row_indices, -1)
 
             slot_map_token_indices = torch.where(
-                valid_topk_mask,
+                refill_valid_mask.view(batch_size, topk_len),
                 topk_indices.to(torch.long),
                 torch.full_like(topk_indices, self.max_context_len, dtype=torch.long),
             )
             slot_map_slot_values = torch.where(
-                valid_topk_mask,
-                cache_slot_ids.to(torch.int32),
-                torch.full_like(cache_slot_ids, -1, dtype=torch.int32),
+                refill_valid_mask.view(batch_size, topk_len),
+                refill_slots.to(torch.int32),
+                -1,
             )
             slot_map_flat_indices = (
                 slot_map_row_indices.unsqueeze(1) * self._slot_map_width
@@ -852,12 +1053,12 @@ class SparseKVCacheManager:
                     device=topk_indices.device,
                 ),
                 slot_map_flat_indices,
-                valid_topk_mask.reshape(-1),
+                refill_valid_mask,
                 1,
                 1,
                 block_dim=48,
             )
-            _record_stream_event(self._materialize_slot_map_stream, self.slot_map_done)
+            _record_stream_event(self._materialize_h2d_miss_stream, self.refill_done)
 
 
 _global_sparse_kv_manager: Optional[SparseKVCacheManager] = None

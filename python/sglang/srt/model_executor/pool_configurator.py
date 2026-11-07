@@ -253,6 +253,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     """
 
     def __init__(self, kvc: KVCacheConfigurator):
+        self._sparse_budget = None
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
@@ -285,6 +286,71 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             kvc,
             include_mtp=not kvc.is_draft_worker and kvc.spec_algorithm.is_eagle(),
         )
+        if (
+            envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get()
+            and envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+        ):
+            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+                get_sparse_kv_budget,
+                get_sparsity_driven_kv_offload_sparse_context_len,
+                is_sparsity_driven_kv_offload_enabled,
+            )
+            from sglang.srt.mem_cache.allocation_sizing import (
+                get_req_to_token_extra_context_len,
+            )
+
+            if is_sparsity_driven_kv_offload_enabled(
+                model_config=kvc.model_config,
+                use_mla_backend=kvc.use_mla_backend,
+                is_draft_worker=kvc.is_draft_worker,
+            ):
+                # The variable-sized native pool contains only indexer KV. The
+                # separate sparse manager is allocated later by AscendAttnBackend
+                # and must be charged before that indexer pool fills HBM.
+                if kvc.sparse_kv_budget_plan is None:
+                    disagg = get_disagg()
+                    extra_rows = (
+                        disagg.disaggregation_decode_extra_slots or 0
+                        if disagg.disaggregation_mode == "decode"
+                        or disagg.enable_pd_role_switch
+                        else 0
+                    )
+                    max_running_requests_per_worker = max(
+                        1, get_schedule().max_running_requests // kvc.attn_dp_size
+                    )
+                    budget_options = dict(
+                        model_config=kvc.model_config,
+                        request_rows=max_running_requests_per_worker + extra_rows + 1,
+                        context_len=kvc.model_config.context_len
+                        + get_req_to_token_extra_context_len(),
+                        top_k=get_sparsity_driven_kv_offload_sparse_context_len(
+                            model_config=kvc.model_config
+                        ),
+                        kv_bytes_per_token=(
+                            kvc.model_config.kv_lora_rank
+                            + kvc.model_config.qk_rope_head_dim
+                        )
+                        * torch._utils._element_size(kvc.kv_cache_dtype),
+                    )
+                    kvc.sparse_kv_budget_plan = get_sparse_kv_budget(
+                        num_layers=num_layers,
+                        kv_dtype=kvc.kv_cache_dtype,
+                        **budget_options,
+                    )
+                budget = kvc.sparse_kv_budget_plan
+                self._sparse_budget = budget
+                self._sparse_min_tokens = get_schedule().max_total_tokens or max(
+                    budget.context_len, 2 * (budget.request_rows - 1)
+                )
+                self._fixed_overhead_bytes += budget.managed_hbm_bytes
+                # One FP32 dequant-scale workspace shared across indexer
+                # layers, with a row for every physical indexer token.
+                self._cell_size += budget.scale_element_size
+                # The native index pool retains one dummy page in addition to
+                # its token capacity. Its shared scale workspace covers it too.
+                self._fixed_overhead_bytes += (
+                    budget.scale_element_size * get_schedule().page_size
+                )
 
         # EAGLE/STANDALONE: assumes the draft shares the target's per-layer KV size,
         # which holds for EAGLE/MTP drafts that reuse the target's attention config.
@@ -310,13 +376,6 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # address space that KVCacheConfigurator allocates below.
                     draft_loc_space_scale = parse_hisparse_config().host_to_device_ratio
                 if is_deepseek_dsa(kvc.model_config.hf_config):
-                    target_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=num_layers,
-                    )
-                    if not dsa_shards_index_k():
-                        target_indexer_size *= dcp_size
-                    target_kv_size = self._cell_size - target_indexer_size
                     from sglang.srt.layers.cp.utils import (
                         get_glm_dsa_layer_split_effective_num_layers,
                     )
@@ -324,6 +383,28 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(
                         kvc, num_layers
                     )
+                    if envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
+                        from sglang.srt.mem_cache.kv_cache_configurator import (
+                            calculate_mla_kv_cache_dim,
+                        )
+
+                        # Restore the native attention-KV price for draft sizing.
+                        target_kv_size = (
+                            calculate_mla_kv_cache_dim(
+                                model_config=kvc.model_config,
+                                kv_cache_dtype=kvc.kv_cache_dtype,
+                            )
+                            * torch._utils._element_size(kvc.kv_cache_dtype)
+                            * target_kv_num_layers
+                        )
+                    else:
+                        target_indexer_size = self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=num_layers,
+                        )
+                        if not dsa_shards_index_k():
+                            target_indexer_size *= dcp_size
+                        target_kv_size = self._cell_size - target_indexer_size
                     draft_kv_size = (
                         int(target_kv_size * draft_num_layers / target_kv_num_layers)
                         * draft_loc_space_scale
@@ -419,9 +500,15 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     element_size=kv_size,
                     start_layer=kvc.layer_info.start_layer,
                     is_draft_worker=kvc.is_draft_worker,
+                    indexer_layer_ids=(
+                        kvc.get_dsa_indexer_layer_ids()
+                        if is_deepseek_dsa(model_config.hf_config)
+                        else None
+                    ),
+                    kv_cache_dtype=kv_cache_dtype,
                 )
                 if offload_cell_size is not None:
-                    return offload_cell_size
+                    return offload_cell_size * dcp_size
 
             from sglang.srt.mem_cache.kv_cache_configurator import (
                 calculate_mla_kv_cache_dim,
@@ -707,6 +794,25 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
     def calculate_pool_sizes(
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
+        budget = self._sparse_budget
+        if budget is not None and not budget.prefill_workspace_sizing_finalized:
+            min_tokens = (
+                (self._sparse_min_tokens + page_size - 1) // page_size * page_size
+            )
+            required = self._fixed_overhead_bytes + min_tokens * self._cell_size
+            if budget.prefill_workspace_tokens and required > available_bytes:
+                logger.warning(
+                    "Disabling sparse prefill workspace (%d tokens): "
+                    "fixed allocations and %d native tokens require %d bytes, "
+                    "but only %d bytes are available.",
+                    budget.prefill_workspace_tokens,
+                    min_tokens,
+                    required,
+                    available_bytes,
+                )
+                self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
+                budget.disable_prefill_workspace()
+            budget.prefill_workspace_sizing_finalized = True
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size

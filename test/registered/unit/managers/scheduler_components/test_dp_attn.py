@@ -27,6 +27,67 @@ register_cpu_ci(est_time=61, suite="base-a-test-cpu")
 
 
 class TestDPAttnSchedulerMetadata(CustomTestCase):
+    def test_short_and_long_replicas_both_admit_decode_graph(self):
+        """A short row must not disable graph admission on another replica."""
+        long_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, seq_lens_cpu=torch.tensor([4096])
+        )
+        short_batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE, seq_lens_cpu=torch.tensor([128])
+        )
+        votes = [
+            dp_attn._local_decode_cuda_graph_vote(
+                local_batch=batch, disable_cuda_graph=False
+            )
+            for batch in (long_batch, short_batch)
+        ]
+        infos = [
+            dp_attn.MLPSyncBatchInfo(
+                num_dp_ranks=2,
+                tp_size=1,
+                cp_size=1,
+                num_tokens=1,
+                num_tokens_for_logprob=1,
+                can_run_decode_cuda_graph=vote,
+                can_run_draft_cuda_graph=True,
+                can_run_prefill_cuda_graph=False,
+                is_extend_in_batch=False,
+                local_can_run_tbo=True,
+                local_forward_mode=ForwardMode.DECODE.value,
+            )
+            for vote in votes
+        ]
+        rows = torch.stack([info._get_local_tensor("cpu") for info in infos])
+        with (
+            dp_attn.get_parallel().override(
+                tp_group=SimpleNamespace(
+                    active_ranks_cpu=torch.ones(2, dtype=torch.int64)
+                )
+            ),
+            patch.object(
+                dp_attn,
+                "exchange_sync_rows",
+                side_effect=lambda output, local, group: output.copy_(rows.flatten()),
+            ),
+        ):
+            for info in infos:
+                info.all_gather(device="cpu", group=object())
+                self.assertTrue(info.can_run_decode_cuda_graph)
+                self.assertEqual(info.global_num_tokens, [1, 1])
+        self.assertEqual(votes, [True, True])
+        self.assertTrue(
+            dp_attn._local_decode_cuda_graph_vote(
+                local_batch=None, disable_cuda_graph=False
+            )
+        )
+
+    def test_skip_all_gather_policy(self):
+        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(False):
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=1))
+            self.assertFalse(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
+        with envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(True):
+            self.assertTrue(dp_attn.should_skip_scheduler_all_gather(num_dp_ranks=2))
+
     def test_dp1_skip_preserves_local_tbo_metadata(self):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.DECODE,
