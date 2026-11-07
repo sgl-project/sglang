@@ -1682,6 +1682,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Physical Ascend NPU id used for Mooncake transfers. <code>-1</code> auto-detects.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>-1</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_MOONCAKE_ASCEND_USE_DEVICE_SUFFIX</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Append <code>:npu_&lt;id&gt;</code> to Ascend Mooncake initialization endpoints. Set to <code>false</code> for Ascend Direct wheels that accept <code>host:port</code> and select the device from the bound ACL context. This avoids malformed peer names during metadata refresh. The init thread must be bound to the intended NPU; <code>ASCEND_NPU_PHY_ID</code> must remain <code>-1</code> in this mode.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
   </tbody>
 </table>
 
