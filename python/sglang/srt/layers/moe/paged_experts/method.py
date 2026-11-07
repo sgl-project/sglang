@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from typing import Optional
 
 import torch
 
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.layers.moe.paged_experts.executor import DeviceExecutor, EagerExecutor
 from sglang.srt.layers.moe.paged_experts.formats import (
     FORMATS,
     ExpertFormat,
-    after_loading,
+    PostLoad,
+    build_store,
     expert_params,
     format_for,
 )
@@ -21,7 +24,7 @@ from sglang.srt.layers.moe.paged_experts.runners import (
     runner_config,
     runner_of,
 )
-from sglang.srt.layers.moe.paged_experts.store import HostExpertStore
+from sglang.srt.layers.moe.paged_experts.store import ExpertLoads
 from sglang.srt.layers.moe.topk import TopKOutputChecker
 from sglang.srt.layers.parameter import BasevLLMParameter
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
@@ -74,7 +77,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self._slot_pool = None  # holds the K = top_k tables until sizing frees them
         self.checkpoint_params = ()  # found once the base method has created them
         self.contract = None  # follows from the runner the base method builds
-        self.store = None  # built once the contract is known
+        self.loads = None  # the checkpoint's loads, until the post-load step
+        self.store = None  # built by the post-load step
         self.executor = None  # built once the store holds the paged layout
         # Some steps may run inside a CUDA graph: decide one-wave steps on the device, so
         # the graph can capture them.
@@ -121,23 +125,11 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 param.weight_loader = loader
 
     def _make_host_loader(self, layer, name):
-        def weight_loader(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
-            expert_id = kwargs.get("expert_id", rest[0] if rest else None)
-            if expert_id is None:
-                # A stacked checkpoint tensor (e.g. gpt-oss) holds every expert at once: the
-                # call goes as made to the layer's native loader, on the whole host store.
-                stacked = torch.nn.Parameter(self.store.host[name], requires_grad=False)
-                stacked.__dict__.update(param.__dict__)
-                self.native_loader(
-                    stacked, loaded_weight, weight_name, shard_id, *rest, **kwargs
-                )
-                return
+        def load_row(param, loaded_weight, weight_name, shard_id, dest) -> None:
             # Reuse the native per-expert loader (sharding, w1/w3 placement, scale layout)
-            # on a one-row view of the host store, so host rows have exactly the native GPU
-            # layout. The row carries the parameter's loader tags (e.g. ``quant_method``).
-            row = torch.nn.Parameter(
-                self.store.host[name][expert_id : expert_id + 1], requires_grad=False
-            )
+            # on a one-row tensor, so host rows have exactly the native GPU layout. The row
+            # carries the parameter's loader tags (e.g. ``quant_method``).
+            row = torch.nn.Parameter(dest, requires_grad=False)
             row.__dict__.update(param.__dict__)
             layer._weight_loader_impl(
                 param=row,
@@ -147,6 +139,27 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 expert_id=0,
             )
 
+        def weight_loader(param, loaded_weight, weight_name, shard_id, *rest, **kwargs):
+            loads = self.loads
+            expert_id = kwargs.get("expert_id", rest[0] if rest else None)
+            if expert_id is None:
+                # A stacked checkpoint tensor (e.g. gpt-oss) holds every expert at once: the
+                # call goes as made to the layer's native loader, on a table of every expert.
+                stacked = torch.nn.Parameter(loads.table[name], requires_grad=False)
+                stacked.__dict__.update(param.__dict__)
+                self.native_loader(
+                    stacked, loaded_weight, weight_name, shard_id, *rest, **kwargs
+                )
+                return
+            write = functools.partial(
+                load_row, param, loaded_weight, weight_name, shard_id
+            )
+            if _can_defer(loaded_weight) and loads.defer(
+                int(expert_id), name, write, loaded_weight
+            ):
+                return
+            write(loads.table[name][expert_id : expert_id + 1])
+
         return weight_loader
 
     def create_moe_runner(self, layer, moe_runner_config):
@@ -154,27 +167,28 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
         self._create_runner(layer)
         self.contract = contract_for(self.runner)
         self.routed_scaling_factor = moe_runner_config.routed_scaling_factor or 1.0
-        # A store that only stages the checkpoint layout for a repack need not be pinned.
-        self.store = HostExpertStore(
-            layer=layer,
-            names=self.checkpoint_params,
-            num_experts=self.num_experts,
-            pin=not self.contract.repacks,
+        # Loads wait as views of the mapped checkpoint: the post-load step replays them K
+        # experts at a time.
+        self.loads = ExpertLoads(
+            layer,
+            self.checkpoint_params,
+            self.num_experts,
+            self.num_resident,
+            wait=_loads_mapped_files(),
         )
-        # What a loader leaves unwritten (e.g. padding for a kernel) keeps the values the base
-        # method created, as on the GPU.
-        for name, host in self.store.host.items():
-            host.copy_(getattr(layer, name).data[:1].cpu().expand_as(host))
 
     def process_weights_after_loading(self, layer):
-        self.store = after_loading(
-            layer=layer,
-            base_method=self.base_method,
-            store=self.store,
-            num_slots=self.num_resident,
-            repacks=self.contract.repacks,
-            unpaged=self.format.unpaged,
+        step = PostLoad(
+            layer,
+            self.base_method,
+            self.loads,
+            self.contract.repacks,
+            self.format.unpaged,
         )
+        self.store = build_store(step)
+        step.finish(self.store)
+        self.loads.drop()  # the checkpoint views the loads held
+        self.loads = None
         if not self.auto_size:
             self._build(layer)
             return
@@ -417,9 +431,10 @@ def check_paged_experts_compat(layer, expert_format) -> None:
         or check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
     ):
         problems.append("decode CUDA graphs must use the full backend or be disabled")
-    if get_model().load_format == "dummy":
+    load_format = _load_format()
+    if load_format not in _LOAD_FORMATS:
         problems.append(
-            "--load-format dummy is not supported: the host store needs real weights"
+            f"--load-format {load_format} is not supported: {_refusal(load_format)}"
         )
     num_resident = _requested_num_resident()
     top_k = _router_top_k(layer)
@@ -461,3 +476,64 @@ def _router_top_k(layer) -> int:
     if layer.top_k is not None:
         return layer.top_k
     return process_model_config().hf_text_config.num_experts_per_tok
+
+
+# Load formats whose loader fills the weights once, through model.load_weights (the host
+# loader below), and then runs the post-load step: DefaultModelLoader's formats and the RunAI
+# streamer's. The others bypass load_weights (dummy, sharded_state, presharded,
+# remote_instance, ipc_cache; layered on the meta device; remote restores a key-value store's
+# tensors), skip the post-load step (bitsandbytes), write the weights again (flash_rl), or are
+# not known to fill them this way (jax, rdma, local_cached, private, expert_pack). GGUF's
+# loader would, but its experts are GGUF-quantized, which no expert format pages.
+_LOAD_FORMATS = tuple(
+    f.value
+    for f in (
+        LoadFormat.AUTO,
+        LoadFormat.SAFETENSORS,
+        LoadFormat.PT,
+        LoadFormat.NPCACHE,
+        LoadFormat.MISTRAL,
+        LoadFormat.FASTSAFETENSORS,
+        LoadFormat.INSTANTTENSOR,
+        LoadFormat.RUNAI_STREAMER,
+    )
+)
+# Of those, the ones whose expert tensors are views of the mapped safetensors files (with
+# mmap): their loads can wait without holding memory. Other loaders' tensors may be copies,
+# GPU tensors or buffers reused for the next tensor (the RunAI streamer's).
+_MAPPED_LOAD_FORMATS = tuple(
+    f.value for f in (LoadFormat.AUTO, LoadFormat.SAFETENSORS, LoadFormat.MISTRAL)
+)
+
+
+def _refusal(load_format: str) -> str:
+    """Why Paged Experts refuses ``load_format``."""
+    if load_format == LoadFormat.DUMMY.value:
+        return "Paged Experts needs the real weights"
+    if load_format == LoadFormat.GGUF.value:
+        return "Paged Experts does not support GGUF-quantized experts"
+    return (
+        "it loads the weights without Paged Experts' loader and post-load step "
+        f"(supported: {', '.join(_LOAD_FORMATS)})"
+    )
+
+
+def _load_format() -> str:
+    load_format = get_model().load_format
+    return getattr(load_format, "value", load_format)
+
+
+def _loads_mapped_files() -> bool:
+    """Whether the checkpoint loads as views of mapped safetensors files, which a waiting
+    load can keep without holding memory."""
+    return (
+        _load_format() in _MAPPED_LOAD_FORMATS
+        and not get_model().weight_loader_disable_mmap
+    )
+
+
+def _can_defer(tensor) -> bool:
+    """A view of a mapped file, as the safetensors loaders give: on the CPU, on a storage
+    torch did not allocate (a copy, e.g. of a ``.bin`` checkpoint's tensor, would hold its
+    memory while it waits)."""
+    return tensor.device.type == "cpu" and not tensor.untyped_storage().resizable()

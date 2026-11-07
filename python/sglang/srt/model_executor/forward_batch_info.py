@@ -64,13 +64,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_cpu,
     is_hip,
     is_npu,
     support_triton,
 )
-from sglang.srt.utils.common import ceil_align, is_pin_memory_available
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -550,6 +550,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # True for synthetic capture batches; init_new snapshots real request ranges.
     # Running decode rows do not complete a prefill.
     contains_last_prefill_chunk: bool = True
+    # Per-request completion of an extend (including resumed/retracted prompts).
+    # None for decode and synthetic capture batches. Running decode requests in
+    # a mixed batch also end at a prediction boundary.
+    extend_is_final_cpu: Optional[List[bool]] = None
     # For LoRA
     lora_ids: Optional[List[str]] = None
     # For dumper: request IDs for cross-step sequence tracking
@@ -949,11 +953,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
         contains_last_prefill_chunk = False
+        extend_is_final_cpu = None
         if batch.forward_mode.is_extend_without_speculative():
             decoding_req_ids = {id(req) for req in (batch.decoding_reqs or ())}
-            contains_last_prefill_chunk = any(
-                req.extend_end == len(req.full_untruncated_fill_ids)
+            extend_is_final_cpu = [
+                id(req) in decoding_req_ids
+                or req.extend_end == len(req.full_untruncated_fill_ids)
                 for req in batch.reqs
+            ]
+            contains_last_prefill_chunk = any(
+                final
+                for req, final in zip(batch.reqs, extend_is_final_cpu)
                 if id(req) not in decoding_req_ids
             )
 
@@ -1017,6 +1027,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             global_forward_mode=batch.global_forward_mode,
             is_prefill_only=batch.is_prefill_only,
             contains_last_prefill_chunk=contains_last_prefill_chunk,
+            extend_is_final_cpu=extend_is_final_cpu,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,
@@ -1339,7 +1350,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         A replicated (``sharded=False``) forward keeps the full DP-group count.
         """
-        from sglang.srt.utils.common import require_mlp_tp_gather
+        from sglang.srt.layers.dp_attention import require_mlp_tp_gather
 
         if self.global_num_tokens_cpu is not None:
             # DP / MLP-sync path: per-DP padded width.
@@ -2249,10 +2260,7 @@ def _dp_tp_moe_masks_pad_rows() -> bool:
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 
     return (
-        _is_hip
-        and get_bool_env_var("SGLANG_DP_MASK_PAD_ROWS", default="true")
-        and get_parallel().attn_dp_size > 1
-        and get_moe_a2a_backend().is_none()
+        _is_hip and get_parallel().attn_dp_size > 1 and get_moe_a2a_backend().is_none()
     )
 
 

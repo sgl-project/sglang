@@ -11,14 +11,16 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
     ListKind,
-    _RequestList,
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestHandle
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
@@ -39,6 +41,9 @@ class _Req:
         self.to_finish = FINISH_ABORT() if allocated else None
         self.finished_reason = None if allocated else FINISH_ABORT()
         self.discard_output_reason = None
+        self.session = None
+        self.get_mm_token_counts = Mock()
+        self.release_mm_inputs_on_abort = Mock()
         self.return_logprob = False
         self.return_sampling_mask = False
         self.grammar = None
@@ -61,7 +66,7 @@ class _Req:
 
 class _Scheduler(SchedulerDisaggregationPrefillMixin):
     def __init__(self):
-        self.prefill_launched_reqs = _RequestList(ListKind.PREFILL_LAUNCHED)
+        self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.batch_result_processor = SimpleNamespace(
             snapshot_auxiliary_output_starts=Mock(return_value=[]),
             move_logprobs_to_cpu=Mock(),
@@ -70,7 +75,8 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         )
         self.spec_algorithm = SimpleNamespace(is_eagle=lambda: False)
         self.tree_cache = Mock()
-        self.disagg_prefill_transfer_queue = _RequestList(ListKind.PD_SENDING)
+        self.request_retirer = release_only_retirer(self.tree_cache)
+        self.disagg_prefill_transfer_queue = IndexedReqList(ListKind.PD_SENDING)
         self.disagg_prefill_pending_chunk_rids = {"aborted-prefill"}
         self.send_kv_chunk = Mock()
         self.output_streamer = Mock()
@@ -220,7 +226,10 @@ class TestPrefillCompleteResult(CustomTestCase):
         self.assertTrue(req.pending_bootstrap)
         scheduler.send_kv_chunk.assert_not_called()
 
-    @patch("sglang.srt.disaggregation.prefill.release_kv_cache", side_effect=_free_req)
+    @patch(
+        "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+        side_effect=_free_req,
+    )
     def test_aborted_final_result_never_publishes_ready(self, release):
         scheduler = _Scheduler()
         req = _Req()
