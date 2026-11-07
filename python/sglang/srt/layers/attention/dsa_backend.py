@@ -17,6 +17,8 @@ import torch
 
 from sglang.srt.configs.model_config import (
     dsa_draft_shards_under_dcp,
+    dsa_shared_kv_providers,
+    dsa_supports_dense_attention,
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_kimi_k31,
@@ -149,6 +151,8 @@ def prepare_kv_for_attention(
     """Materialize KV needed before attention for the active layout."""
     if (
         defer_materialization
+        # A layer that reads another layer's cache has no KV of its own to gather.
+        or not attn_mla.save_kv_cache
         or not dsa_use_prefill_cp(forward_batch)
         or not is_cp_active(forward_batch)
     ):
@@ -625,6 +629,7 @@ class DeepseekSparseAttnBackend(
         hf_config = model_runner.model_config.hf_config
         self.use_dsa = is_deepseek_dsa(hf_config)
         assert self.use_dsa, "DSA backend only supports DeepSeek DSA"
+        self.has_shared_kv_consumers = bool(dsa_shared_kv_providers(hf_config))
         self.dsa_kv_cache_store_fp8 = (
             model_runner.token_to_kv_pool.dsa_kv_cache_store_fp8
         )
@@ -675,8 +680,10 @@ class DeepseekSparseAttnBackend(
         # Dense MHA expands prefix KV outside the DSA metadata path. Keep
         # sharded prefill on the sparse kernels with explicit scratch addresses.
         self.supports_mha_one_shot: bool = (
-            self.attn_dcp_size == 1 or self.dsa_shards_index_k
-        ) and self._kv_shard_pool is None
+            dsa_supports_dense_attention(hf_config)
+            and (self.attn_dcp_size == 1 or self.dsa_shards_index_k)
+            and self._kv_shard_pool is None
+        )
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
         if (
@@ -797,6 +804,11 @@ class DeepseekSparseAttnBackend(
         else:
             self.device_capability = torch.cuda.get_device_capability()
         self.device_sm_major = self.device_capability[0]
+        self.flashmla_sparse_head_padding = self._flashmla_sparse_head_padding(
+            device_sm_major=self.device_sm_major,
+            head_dim=self.kv_lora_rank + self.qk_rope_head_dim,
+            num_heads=self.num_q_heads,
+        )
         self.kv_cache_dtype = model_runner.kv_cache_dtype
 
         # Unsupported flashmla_sparse_q8 configs must fail at launch, not mid-forward.
@@ -2577,17 +2589,32 @@ class DeepseekSparseAttnBackend(
             "triton_sparse_mla",
         ):
             if topk_transform_method == TopkTransformMethod.RAGGED:
-                _has_prefix = any(forward_batch.extend_prefix_lens_cpu)
+                # A shared-KV consumer's provider has already written the current rows.
+                _has_prefix = any(forward_batch.extend_prefix_lens_cpu) or (
+                    not save_kv_cache and self.has_shared_kv_consumers
+                )
                 page_table_1 = topk_indices
+                page_table_1_flattened = self.forward_metadata.page_table_1_flattened
+                if (
+                    not save_kv_cache
+                    and self.has_shared_kv_consumers
+                    and page_table_1_flattened is None
+                ):
+                    metadata = self.forward_metadata
+                    page_table_1_flattened = torch.cat(
+                        [
+                            metadata.page_table_1[i, :length]
+                            for i, length in enumerate(
+                                metadata.indexer_seq_lens_cpu.tolist()
+                            )
+                        ]
+                    )
 
                 # flashmla_sparse_q8: FP8 compute on SM90 over a bf16 or fp8_e4m3 KV
                 # cache. The helper fuses the q concat with the bf16->fp8 cast; prefix
                 # batches hand over the paged cache as-is, others pass fresh bf16 KV.
                 if dsa_impl == "flashmla_sparse_q8":
                     if _has_prefix:
-                        page_table_1_flattened = (
-                            self.forward_metadata.page_table_1_flattened
-                        )
                         assert page_table_1_flattened is not None
                         return self._forward_flashmla_sparse_q8kv8(
                             q_nope=q_nope,
@@ -2634,9 +2661,6 @@ class DeepseekSparseAttnBackend(
                 # same inputs (concatenated q, dequantized bf16 KV, top-k list
                 # as the slot table) and differ only in the kernel they call.
                 if _has_prefix:
-                    page_table_1_flattened = (
-                        self.forward_metadata.page_table_1_flattened
-                    )
                     assert page_table_1_flattened is not None
                     kv_cache = dequantize_k_cache_paged_dsa(
                         kv_cache, page_table_1_flattened
@@ -3024,6 +3048,15 @@ class DeepseekSparseAttnBackend(
         )
         return o  # type: ignore
 
+    @staticmethod
+    def _flashmla_sparse_head_padding(
+        device_sm_major: int, head_dim: int, num_heads: int
+    ) -> int:
+        # TODO: Validate head64 at d_qk=512 before widening this guard.
+        if device_sm_major == 10 and head_dim == 576 and num_heads <= 64:
+            return 64
+        return 128 if device_sm_major >= 10 else 64
+
     def _forward_flashmla_sparse(
         self,
         q_all: torch.Tensor,
@@ -3034,13 +3067,10 @@ class DeepseekSparseAttnBackend(
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # FlashMLA sparse kernel requires num_heads to be a multiple of 64 (Hopper) or 128 (Blackwell)
-        # When using TP, num_heads might be smaller (e.g., 256//8=32)
+        # FlashMLA requires a supported query-head tile; TP can leave fewer heads.
         num_tokens, num_heads, head_dim = q_all.shape
 
-        # Determine required padding based on GPU architecture (use cached value)
-        required_padding = 128 if self.device_sm_major >= 10 else 64
-
+        required_padding = self.flashmla_sparse_head_padding
         need_padding = num_heads % required_padding != 0
 
         if need_padding:

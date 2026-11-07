@@ -368,11 +368,16 @@ class EagerRunner(BaseRunner):
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
-            body = model.model
-            if hasattr(body, "logits_processor"):
-                # A multimodal wrapper exposes its causal LM as `.model`; run
-                # that LM's text body, as the gather/logits tail below does.
-                body = body.model
+            # Wrappers whose decoder is not ``model.model`` name it explicitly;
+            # exposing ``model`` would change how other runners resolve them.
+            if hasattr(model, "get_cp_language_model"):
+                body = model.get_cp_language_model()
+            else:
+                body = model.model
+                if hasattr(body, "logits_processor"):
+                    # A multimodal wrapper exposes its causal LM as `.model`; run
+                    # that LM's text body, as the gather/logits tail below does.
+                    body = body.model
             hidden_states = body(
                 model_input_ids,
                 sharded_positions,

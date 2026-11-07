@@ -22,6 +22,7 @@ from sglang.srt.runtime_context import get_parallel, get_serving
 from sglang.srt.sampling.sampling_params import (
     get_request_reasoning_end_token_ids,
     get_request_reasoning_in_grammar,
+    get_request_reasoning_open,
 )
 
 if TYPE_CHECKING:
@@ -147,6 +148,8 @@ class GrammarManager:
             req.grammar.set_request_think_end_ids(think_end_ids)
         if get_request_reasoning_in_grammar(req.sampling_params.custom_params):
             req.grammar.set_reasoning_in_grammar()
+        if get_request_reasoning_open(req.sampling_params.custom_params):
+            req.grammar.continue_open_reasoning()
         thinking_budget = self._get_request_thinking_budget(req)
         if thinking_budget is not None:
             req.grammar.max_think_tokens = thinking_budget

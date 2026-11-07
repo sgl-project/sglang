@@ -43,7 +43,7 @@ from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
     MESSAGE_MODEL,
 )
-from sglang.srt.parser.reasoning_parser import InklingDetector
+from sglang.srt.parser.reasoning_parser import InklingDetector, MistralDetector
 from sglang.srt.runtime_context import (
     SpawnRanks,
     get_context,
@@ -54,6 +54,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
     REQUEST_REASONING_IN_GRAMMAR_KEY,
+    REQUEST_REASONING_OPEN_KEY,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -145,10 +146,33 @@ def _make_strict_inkling_backend(max_think_tokens):
         )
 
 
-def _token_allowed(grammar, token_id):
-    mask = grammar.allocate_vocab_mask(_INKLING_VOCAB_SIZE, 1, "cpu")
+def _token_allowed(grammar, token_id, vocab_size=_INKLING_VOCAB_SIZE):
+    mask = grammar.allocate_vocab_mask(vocab_size, 1, "cpu")
     grammar.fill_vocab_mask(mask, 0)
     return bool((int(mask[0, token_id // 32]) >> (token_id % 32)) & 1)
+
+
+# Mistral's [THINK] and [/THINK] are single control tokens after the ASCII range.
+_MISTRAL_VOCAB = [chr(token_id) for token_id in range(128)] + [
+    "[THINK]",
+    "[/THINK]",
+    "</s>",
+]
+_MISTRAL_THINK, _MISTRAL_END_THINK, _MISTRAL_EOS = 128, 129, 130
+
+
+def _make_mistral_backend():
+    info = TokenizerInfo(_MISTRAL_VOCAB, stop_token_ids=[_MISTRAL_EOS])
+    tokenizer = SimpleNamespace(
+        init_xgrammar=lambda: (info, None),
+        convert_tokens_to_ids=_MISTRAL_VOCAB.index,
+        convert_ids_to_tokens=_MISTRAL_VOCAB.__getitem__,
+    )
+    return ReasonerGrammarBackend(
+        XGrammarGrammarBackend(tokenizer, len(_MISTRAL_VOCAB)),
+        SimpleNamespace(detector=MistralDetector()),
+        tokenizer,
+    )
 
 
 class TestGrammarManagerInit(unittest.TestCase):
@@ -1059,6 +1083,56 @@ class TestStrictReasoningPaths(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertIsInstance(result[0].grammar, InvalidGrammarObject)
         req.set_finish_with_abort.assert_called_once()
+
+
+class TestContinuedReasoningGrammar(unittest.TestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+
+    def _serve_json(self, mgr, continued):
+        params = {REQUEST_REASONING_OPEN_KEY: True} if continued else None
+        req = _make_req(json_schema='{"type": "object"}', custom_params=params)
+        req.require_reasoning = True
+        req.origin_input_ids = []
+        if mgr.process_req_with_grammar(req):
+            mgr.get_ready_grammar_requests()
+        return req.grammar
+
+    def _allowed(self, grammar, token):
+        token_id = token if isinstance(token, int) else ord(token)
+        return _token_allowed(grammar, token_id, vocab_size=len(_MISTRAL_VOCAB))
+
+    def test_continued_reasoning_runs_until_its_closer(self):
+        """Bug regression: continuing an assistant message whose [THINK] block is
+        still open was constrained like a fresh turn, which must open reasoning or
+        start the JSON answer, so the reasoning could neither continue nor close."""
+        scheduler = _make_scheduler()
+        enter_override(
+            self, get_context().override_server_args(skip_tokenizer_init=True)
+        )
+        mgr = GrammarManager(scheduler)
+        mgr.grammar_backend = _make_mistral_backend()
+        mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 5
+        # Compiled for a continued request, then served from the cache to both kinds.
+        for continued in (True, False, True):
+            with self.subTest(continued=continued):
+                grammar = self._serve_json(mgr, continued)
+                if not continued:
+                    self.assertTrue(self._allowed(grammar, _MISTRAL_THINK))
+                    self.assertTrue(self._allowed(grammar, "{"))
+                    self.assertFalse(self._allowed(grammar, "x"))
+                    self.assertFalse(self._allowed(grammar, _MISTRAL_END_THINK))
+                    continue
+                self.assertTrue(self._allowed(grammar, "x"))
+                self.assertTrue(self._allowed(grammar, _MISTRAL_END_THINK))
+                for token in (ord("x"), _MISTRAL_END_THINK):
+                    grammar.accept_token(token)
+                self.assertFalse(self._allowed(grammar, "x"))
+                self.assertTrue(self._allowed(grammar, "{"))
+                grammar.rollback(2)
+                self.assertTrue(self._allowed(grammar, "x"))
+                self.assertTrue(self._allowed(grammar, _MISTRAL_END_THINK))
 
 
 if __name__ == "__main__":

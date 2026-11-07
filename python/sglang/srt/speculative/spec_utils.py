@@ -358,6 +358,43 @@ def resolve_draft_decode_window(model_runner) -> Tuple[int, int]:
     return window_size, int(cfg.speculative_draft_sink_size or 0)
 
 
+def check_draft_window_honored(model_runner, draft_decode_backend) -> None:
+    """Reject an explicit draft window / sink that this draft path would ignore.
+    The draft model (native window equal to the flag) or the draft-decode
+    backend applies the window; only the backend applies sinks."""
+    spec = get_spec()
+    window_size = int(spec.speculative_draft_window_size or 0)
+    if window_size <= 0:
+        return
+    sink_size = int(spec.speculative_draft_sink_size or 0)
+    native_window = getattr(model_runner, "sliding_window_size", None) or 0
+    backend_name = (
+        "none at --speculative-num-steps <= 1"
+        if draft_decode_backend is None
+        else type(draft_decode_backend).__name__
+    )
+    # A native window of a different size overrides the flag, and
+    # resolve_draft_decode_window reports it; sinks are still checked below.
+    if native_window == 0 and (
+        getattr(draft_decode_backend, "draft_window_size", 0) != window_size
+    ):
+        raise ValueError(
+            f"--speculative-draft-window-size={window_size} is not applied by this "
+            f"draft (draft-decode backend {backend_name}, "
+            f"{type(model_runner.model).__name__}); it is honored by DFLASH, "
+            "LlamaForCausalLMEagle3, and the Triton/FlashInfer MHA draft-decode "
+            "backends with --speculative-num-steps > 1."
+        )
+    if sink_size > 0 and getattr(draft_decode_backend, "draft_sink_size", 0) != (
+        sink_size
+    ):
+        raise ValueError(
+            f"--speculative-draft-sink-size={sink_size} is not applied by this "
+            f"draft (draft-decode backend {backend_name}); sinks are honored only "
+            "by the Triton/FlashInfer MHA draft-decode backends."
+        )
+
+
 def fill_draft_window_rail(
     runner_ids,
     forward_batch,

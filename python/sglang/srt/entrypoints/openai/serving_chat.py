@@ -112,6 +112,12 @@ from sglang.srt.function_call.utils import (
     strip_structural_tag_excludes,
     without_schema_identifiers,
 )
+from sglang.srt.hf_transformers.mistral_utils import (
+    attach_mistral_common_image_urls,
+    check_mistral_common_reasoning_effort,
+    mistral_common_default_reasoning_effort,
+    to_mistral_common_response_format,
+)
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.srt.models.unlimited_ocr_v2_support.chat import ChatDocSplitter
 from sglang.srt.parser.conversation import generate_chat_conv
@@ -126,6 +132,7 @@ from sglang.srt.parser.jinja_template_utils import (
 )
 from sglang.srt.parser.python_chat_template import render_chat_segments
 from sglang.srt.parser.reasoning_parser import (
+    BaseReasoningFormatDetector,
     IQuestQ1ReasoningDetector,
     ReasoningParser,
 )
@@ -143,6 +150,7 @@ from sglang.srt.parser.template_detection import detect_inline_system_support
 from sglang.srt.sampling.sampling_params import (
     set_request_reasoning_end_token_ids,
     set_request_reasoning_in_grammar,
+    set_request_reasoning_open,
 )
 from sglang.srt.utils.weight_versions import build_endpoint_weight_version_metadata
 
@@ -510,6 +518,9 @@ class OpenAIServingChat(OpenAIServingBase):
         except Exception:
             self._tokenizer_auto_adds_specials = True
         self._prompt_text_round_trip_is_lossy = self._probe_prompt_text_round_trip()
+        self._uses_mistral_common_tokenizer = (
+            "MistralCommon" in type(self.tokenizer_manager.tokenizer).__name__
+        )
         self._template_reads_reasoning_content = (
             self._chat_template_reads_reasoning_content()
         )
@@ -590,11 +601,31 @@ class OpenAIServingChat(OpenAIServingBase):
                 if request.continue_final_message:
                     # Extract content and remove the assistant message
                     assistant_prefix = last_content
+                    request._continuation_prefix = assistant_prefix
                     messages = messages[:-1]
                 else:
                     # Convert the last assistant message to user message
                     messages[-1] = {"role": "user", "content": last_content}
         return messages, assistant_prefix
+
+    def _continues_open_reasoning(self, request: ChatCompletionRequest) -> bool:
+        """Whether the continued assistant prefix ends inside a reasoning block,
+        as the output's reasoning parser reads it."""
+        if not (
+            self.reasoning_parser
+            and request.continue_final_message
+            and request.messages
+            and request.messages[-1].role == "assistant"
+        ):
+            return False
+        detector = ReasoningParser(
+            model_type=self.reasoning_parser,
+            request=request,
+            tokenizer=self.tokenizer_manager.tokenizer,
+        ).detector
+        return (
+            isinstance(detector, BaseReasoningFormatDetector) and detector.in_reasoning
+        )
 
     def _append_assistant_prefix_to_prompt_ids(
         self, prompt_ids: list[int], assistant_prefix: str
@@ -1288,17 +1319,24 @@ class OpenAIServingChat(OpenAIServingBase):
         pre-rendered input_ids with single placeholder ids and leave the text
         empty; pass those through rather than re-tokenizing an empty prompt.
         """
-        # A lossy text round-trip makes the rendered prompt unusable, so send the
-        # ids instead. Only when nothing needs placeholder expansion: with media
-        # attached the MM processor still has to tokenize the text itself.
+        # Lossy tokenizers must preserve control-token IDs. Media usually needs text
+        # expansion; mistral-common image placeholders can be expanded from IDs.
+        has_media = (
+            processed_messages.image_data
+            or processed_messages.video_data
+            or processed_messages.audio_data
+        )
         prefers_prompt_ids = (
             self._prompt_text_round_trip_is_lossy
             and isinstance(processed_messages.prompt_ids, list)
             and processed_messages.prompt_ids
-            and not (
-                processed_messages.image_data
-                or processed_messages.video_data
-                or processed_messages.audio_data
+            and (
+                not has_media
+                or self._uses_mistral_image_placeholders(
+                    image_data=processed_messages.image_data,
+                    video_data=processed_messages.video_data,
+                    audio_data=processed_messages.audio_data,
+                )
             )
         )
         if (
@@ -1310,6 +1348,19 @@ class OpenAIServingChat(OpenAIServingBase):
         if isinstance(processed_messages.prompt_ids, str):
             return "text", processed_messages.prompt_ids
         return "input_ids", processed_messages.prompt_ids
+
+    def _uses_mistral_image_placeholders(
+        self, *, image_data, video_data, audio_data
+    ) -> bool:
+        # mistral-common places images and frames them with control tokens that a
+        # text round trip loses; it renders one [IMG] per image for the processor.
+        return bool(
+            self._prompt_text_round_trip_is_lossy
+            and self._uses_mistral_common_tokenizer
+            and image_data
+            and not video_data
+            and not audio_data
+        )
 
     def _can_reuse_text_only_prompt_ids(
         self, processed_messages: MessageProcessingResult, is_multimodal: bool
@@ -1351,12 +1402,18 @@ class OpenAIServingChat(OpenAIServingBase):
                 request.return_output_ids_in_sglext = True
 
         reasoning_effort = None
-        if not uses_hunyuan_reasoning_effort(
-            self.reasoning_parser, self.template_manager.reasoning_config
+        # mistral-common resolves the field and kwargs together in _process_messages,
+        # which rejects a conflict that copying the kwargs value here would hide.
+        if (
+            not self._uses_mistral_common_tokenizer
+            and not uses_hunyuan_reasoning_effort(
+                self.reasoning_parser, self.template_manager.reasoning_config
+            )
         ):
             reasoning_effort = (
                 request.chat_template_kwargs.pop("reasoning_effort", None)
                 if request.chat_template_kwargs
+                and not self._template_renders_null_effort(request)
                 else None
             )
 
@@ -1399,6 +1456,11 @@ class OpenAIServingChat(OpenAIServingBase):
         )
         set_request_reasoning_end_token_ids(
             sampling_params, processed_messages.reasoning_end_token_ids
+        )
+        set_request_reasoning_open(
+            sampling_params,
+            processed_messages.require_reasoning
+            and self._continues_open_reasoning(request),
         )
 
         # Handle single vs multiple requests
@@ -1860,6 +1922,10 @@ class OpenAIServingChat(OpenAIServingBase):
         output_constrained: bool = False,
     ) -> MessageProcessingResult:
         """Process chat messages and apply chat template"""
+        requested_efforts = (
+            request.reasoning_effort,
+            (request.chat_template_kwargs or {}).get("reasoning_effort"),
+        )
         if self.is_minimax_m3:
             # Settle the request's own thinking and effort first; server defaults
             # only fill what it left unset.
@@ -1869,9 +1935,11 @@ class OpenAIServingChat(OpenAIServingBase):
             for k, v in self.default_chat_template_kwargs.items():
                 ctk.setdefault(k, v)
             request.chat_template_kwargs = ctk
-            effort = ctk.get("reasoning_effort")
-            if effort is not None and request.reasoning_effort is None:
-                request.reasoning_effort = effort
+        # Responses reaches here with its kwargs effort unpromoted; the template
+        # renders it, so the checkpoint fallback below must not replace it.
+        effort = (request.chat_template_kwargs or {}).get("reasoning_effort")
+        if effort is not None and request.reasoning_effort is None:
+            request.reasoning_effort = effort
 
         if self.is_minimax_m3:
             _normalize_minimax_m3_request(request)
@@ -1879,6 +1947,19 @@ class OpenAIServingChat(OpenAIServingBase):
         normalize_hunyuan_reasoning_effort(
             request, self.reasoning_parser, self.template_manager.reasoning_config
         )
+        if self._uses_mistral_common_tokenizer:
+            self._resolve_mistral_common_reasoning_effort(request, *requested_efforts)
+        default_effort = self._mistral_default_reasoning_effort()
+        if default_effort is not None and not self._template_renders_null_effort(
+            request
+        ):
+            ctk = request.chat_template_kwargs or {}
+            # A null kwargs effort would override the field at render time; the
+            # field or the default it falls back to is what the template sees.
+            if "reasoning_effort" in ctk and ctk["reasoning_effort"] is None:
+                del ctk["reasoning_effort"]
+            if request.reasoning_effort is None:
+                request.reasoning_effort = default_effort
 
         # GptOss model needs to keep special tokens for harmony parsing
         if self.is_gpt_oss or self.is_gemma4:
@@ -2235,12 +2316,23 @@ class OpenAIServingChat(OpenAIServingBase):
                         openai_compatible_messages, request
                     )
                 )
+            uses_image_placeholders = self._uses_mistral_image_placeholders(
+                image_data=image_data, video_data=video_data, audio_data=audio_data
+            )
+            if uses_image_placeholders:
+                attach_mistral_common_image_urls(openai_compatible_messages, image_data)
 
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
+            if self._uses_mistral_common_tokenizer:
+                response_format = to_mistral_common_response_format(
+                    request.response_format
+                )
+                if response_format is not None:
+                    extra_template_kwargs["response_format"] = response_format
 
             rc = self.template_manager.reasoning_config
             if rc is not None and rc.effort_kwarg is not None:
@@ -2276,7 +2368,7 @@ class OpenAIServingChat(OpenAIServingBase):
                     tools=tools,
                     template_kwargs=extra_template_kwargs,
                     encode_kwargs=encode_kwargs,
-                    use_cache=is_multimodal,
+                    use_cache=is_multimodal and not uses_image_placeholders,
                     add_generation_prompt=add_generation_prompt is not False,
                 )
             except Exception:
@@ -2293,7 +2385,7 @@ class OpenAIServingChat(OpenAIServingBase):
                         tools=tools,
                         template_kwargs=extra_template_kwargs,
                         encode_kwargs=encode_kwargs,
-                        use_cache=is_multimodal,
+                        use_cache=is_multimodal and not uses_image_placeholders,
                         add_generation_prompt=add_generation_prompt is not False,
                     )
                 except _CHAT_TEMPLATE_CLIENT_ERRORS as template_error:
@@ -2444,6 +2536,8 @@ class OpenAIServingChat(OpenAIServingBase):
             # Remove the auto-added blank assistant turn, if present.
             if conv.messages and conv.messages[-1][1] is None:
                 conv.messages.pop()
+            if conv.messages and isinstance(conv.messages[-1][1], str):
+                request._continuation_prefix = conv.messages[-1][1]
             # Rebuild the prompt from the conversation.
             prompt = conv.get_prompt()
             # Strip trailing stop tokens or separators that indicate end-of-assistant.
@@ -3432,6 +3526,65 @@ class OpenAIServingChat(OpenAIServingBase):
                 idx += len(list(tool_calls)) if tool_calls is not None else 0  # noqa
         return idx
 
+    def _resolve_mistral_common_reasoning_effort(
+        self,
+        request: ChatCompletionRequest,
+        field_effort: Any,
+        template_effort: Any,
+    ) -> None:
+        """One effort drives rendering, marker retention and parser state; an
+        explicit request value beats the server default."""
+        check_mistral_common_reasoning_effort(field_effort)
+        check_mistral_common_reasoning_effort(template_effort)
+        if (
+            field_effort is not None
+            and template_effort is not None
+            and field_effort != template_effort
+        ):
+            raise ValueError(
+                f"reasoning_effort={field_effort} conflicts with "
+                f"chat_template_kwargs.reasoning_effort={template_effort}."
+            )
+        default_effort = (self.default_chat_template_kwargs or {}).get(
+            "reasoning_effort"
+        )
+        effort = next(
+            (
+                e
+                for e in (field_effort, template_effort, default_effort)
+                if e is not None
+            ),
+            None,
+        )
+        check_mistral_common_reasoning_effort(effort)
+        request.reasoning_effort = effort
+        if request.chat_template_kwargs:
+            request.chat_template_kwargs.pop("reasoning_effort", None)
+
+    def _mistral_default_reasoning_effort(self) -> str | None:
+        if self._uses_mistral_common_tokenizer:
+            return mistral_common_default_reasoning_effort(
+                self.tokenizer_manager.tokenizer
+            )
+        config = self.template_manager.reasoning_config
+        return config.default_effort if config is not None else None
+
+    def _template_renders_null_effort(self, request: ChatCompletionRequest) -> bool:
+        """A null kwargs effort with no explicit field, which the Jinja template's
+        omission guard leaves as null, so it renders, and must parse, without
+        the default."""
+        config = self.template_manager.reasoning_config
+        ctk = request.chat_template_kwargs or {}
+        return (
+            request.reasoning_effort is None
+            and not self._uses_mistral_common_tokenizer
+            and config is not None
+            and config.default_effort is not None
+            and not config.default_effort_covers_null
+            and "reasoning_effort" in ctk
+            and ctk["reasoning_effort"] is None
+        )
+
     def _patch_reasoning_skip_special_tokens(
         self, request: ChatCompletionRequest
     ) -> None:
@@ -3448,10 +3601,8 @@ class OpenAIServingChat(OpenAIServingBase):
             request.skip_special_tokens = False
 
         if (
-            self.reasoning_parser in ["mistral"]
-            and request.reasoning_effort is not None
-            and request.reasoning_effort != "none"
-        ):
+            self.reasoning_parser == "mistral" or self._uses_mistral_common_tokenizer
+        ) and request.reasoning_effort not in (None, "none"):
             request.skip_special_tokens = False
         elif self.reasoning_parser == "inkling":
             request.skip_special_tokens = False
@@ -3561,7 +3712,9 @@ class OpenAIServingChat(OpenAIServingBase):
             config is None and self._reasoning_default_mode() == "mistral"
         )
         if is_mistral:
-            request.reasoning_effort = "medium" if enabled else "none"
+            # mistral-common accepts only none/high; other Mistral templates keep medium.
+            on_effort = "high" if self._uses_mistral_common_tokenizer else "medium"
+            request.reasoning_effort = on_effort if enabled else "none"
             return
 
         is_always_on = (config is not None and config.special_case == "always") or (

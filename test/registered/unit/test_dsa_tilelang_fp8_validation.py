@@ -43,7 +43,8 @@ class TestDsaTilelangFp8Validation(CustomTestCase):
 
     def test_cuda_fp8_non_tilelang_allowed(self):
         # fp8-capable backends must pass
-        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "trtllm", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "flashmla_kv", "flashmla_kv", hip=False)
+        _check_tilelang_dsa_fp8_kv("fp8_e4m3", "trtllm", "trtllm", hip=False)
 
 
 if __name__ == "__main__":

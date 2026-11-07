@@ -21,6 +21,7 @@ def _cfg(**kw):
         enable_hierarchical_cache=False,
         disaggregation_mode="null",
         speculative_eagle_topk=1,
+        speculative_algorithm=None,
         dsa_prefill_backend=None,
         dsa_decode_backend=None,
         dcp_replicate_q_proj=None,
