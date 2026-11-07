@@ -84,7 +84,11 @@ class LLaDAImagePipelineConfig(SpatialImagePipelineConfig):
         ):
             raise ValueError("LLaDA-Image currently supports single-GPU serving")
         if server_args.quantization is not None:
-            raise ValueError("LLaDA-Image currently supports BF16 checkpoints")
+            raise ValueError(
+                "LLaDA-Image does not support --quantization. Serve the FP8 "
+                "checkpoint inclusionAI/LLaDA-Image-Turbo-FP8 instead, which needs "
+                "no flag."
+            )
         if envs.SGLANG_CACHE_DIT_ENABLED:
             raise ValueError("LLaDA-Image does not support cache-dit")
         if server_args.text_encoder_cpu_offload:
