@@ -287,3 +287,29 @@ Average estimated memory bandwidth in GB/s:
 - These metrics are estimates intended for observability and trend analysis.
 - Estimated memory bytes reflect modeled traffic and are not a direct hardware
   counter from GPU profilers.
+
+## HiCache pending work and backup outcomes
+
+With HiCache storage metrics enabled, these per-rank gauges distinguish queued
+backup work from completed operations awaiting scheduler acknowledgement.
+
+| Metric | Meaning |
+| --- | --- |
+| `sglang:hicache_d2h_pending_ops` | In-flight write-through D2H operations |
+| `sglang:hicache_d2h_ack_queue_depth` | D2H acknowledgements awaiting device-event confirmation |
+| `sglang:hicache_l3_pending_ops` | In-flight L3 backups, including buffer-mode staging |
+| `sglang:hicache_l3_backup_queue_depth` | Operations waiting for the backup worker |
+| `sglang:hicache_l3_ack_queue_depth` | L3 acknowledgements awaiting the scheduler |
+| `sglang:hicache_l3_backup_worker_alive` | Backup worker liveness, 1 or 0 |
+
+Gauges clear on reset or storage detach. They refresh when state changes. An unchanged state refreshes on the next
+scheduler sample after one second.
+
+`sglang:hicache_l3_backup_submitted_tokens_total` counts tokens submitted for
+backup. Controllers that publish `failed`, `unwritten_pages` and
+`sidecar_unwritten_by_pool` outcomes also populate
+`sglang:hicache_l3_backup_failed_ops_total`,
+`sglang:hicache_l3_backup_unwritten_pages_total`,
+`sglang:hicache_l3_backup_unwritten_tokens_total`, and
+`sglang:hicache_l3_backup_sidecar_unwritten_pages_total{pool_name}`.
+The primary-pool and sidecar counts use their own page units.

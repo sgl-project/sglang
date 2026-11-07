@@ -1177,6 +1177,11 @@ class BufferModePipeline:
             extra_pools=storage_xfers or None,
         )
         self.ongoing_backup[operation_id] = entry
+        cache = self._cache
+        if cache.enable_storage_metrics and cache.storage_metrics_collector is not None:
+            cache.storage_metrics_collector.log_backup_submitted_tokens(
+                len(snapshot.key.token_ids)
+            )
 
     @staticmethod
     def _storage_transfers(staged: list[PoolTransfer]) -> list[PoolTransfer]:

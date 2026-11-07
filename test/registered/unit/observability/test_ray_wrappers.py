@@ -44,6 +44,17 @@ class TestRayWrapperBase(unittest.TestCase):
         clear_fake_ray_modules()
 
 
+class TestStorageGauges(TestRayWrapperBase):
+    def test_storage_gauges_use_the_ray_backend(self):
+        collector = self.rw.RayStorageMetricsCollector(labels={"rank": "0"})
+        collector.set_hicache_gauges(1, 2, 3, 4, 5, 1)
+        gauge = collector.hicache_l3_pending_ops
+        self.assertIsInstance(gauge, self.rw.RayGaugeWrapper)
+        self.assertEqual(
+            gauge.metric.calls[-1], ("set", 3, {"rank": "0", "ReplicaId": "rep-001"})
+        )
+
+
 class TestNameSanitization(TestRayWrapperBase):
     def test_replaces_all_punctuation(self):
         sanitized = self.rw.RayPrometheusMetric._get_sanitized_opentelemetry_name(
