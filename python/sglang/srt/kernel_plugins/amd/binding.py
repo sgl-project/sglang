@@ -83,6 +83,12 @@ def selected_monokernel(cfg: Any) -> Optional[tuple[str, str]]:
     return None
 
 
+# What a backend's plugin does when an in-kernel wait for a peer fails.
+_FAILED_WAIT = {
+    BACKEND: "a failed wait stops every rank with a GPU fault at address 0x0",
+    XPU_BACKEND: "a failed wait makes the step's outputs NaN and the plugin stops the server",
+}
+
 # Leave time for peers to abort before the process watchdog fires.
 MAX_DEADLINE_S, MIN_DEADLINE_S = 60.0, 5.0
 
@@ -97,7 +103,11 @@ def deadline_s(watchdog_timeout: Optional[float]) -> float:
 def _device_module():
     """The torch module of this server's accelerator: torch.xpu on Intel GPUs,
     else torch.cuda (CUDA and ROCm)."""
-    if not torch.cuda.is_available() and hasattr(torch, "xpu") and torch.xpu.is_available():
+    if (
+        not torch.cuda.is_available()
+        and hasattr(torch, "xpu")
+        and torch.xpu.is_available()
+    ):
         return torch.xpu
     return torch.cuda
 
@@ -258,7 +268,9 @@ def handle_monokernel(server_args: ServerArgs) -> None:
     backend, flag = selected
     if cfg.enable_amd_monokernel and getattr(cfg, "enable_xpu_monokernel", False):
         # both replace the model's forward
-        raise ValueError(f"{XPU_FLAG}: --enable-amd-monokernel is also set; use one of the two")
+        raise ValueError(
+            f"{XPU_FLAG}: --enable-amd-monokernel is also set; use one of the two"
+        )
     model_config = model_config_of(server_args)
     if backend == MSA_BACKEND and not msa_serves(model_config.hf_config.architectures):
         return  # sgl-nvidia-mega serves this model
@@ -455,6 +467,9 @@ def install_monokernel_forward(
     mode, tokens = _server_step()
     if spec.tokens_per_request is not None:
         tokens = spec.tokens_per_request(model)
+        if tokens == 1 and _chain_draft():
+            # an EAGLE / NEXTN draft's loop runs decode steps of one token
+            mode = "decode"
     capture_keys = _capture_keys(mode=mode, tokens=tokens)
     capture_rows = {k.rows for k in capture_keys}
     # Eager execution can use every supported width.
@@ -487,14 +502,14 @@ def install_monokernel_forward(
     )
     logger.info(
         "monokernel %s on %s: widths %s built in %.1f s, %.1f MiB; wait deadline "
-        "%.0f s (a failed wait stops every rank with a GPU fault at address 0x0); "
-        "weight copies: %s",
+        "at most %.0f s (%s); weight copies: %s",
         spec.name,
         isa,
         list(widths),
         time.perf_counter() - build_start,
         (device.memory_allocated() - memory_before) / 2**20,
         build_context.deadline_s,
+        _FAILED_WAIT.get(backend, "a failed wait stops every rank"),
         _format_weight_copies(copies),
     )
     if capture_keys:
@@ -644,6 +659,13 @@ def _format_weight_copies(copies: dict[tuple, torch.Tensor]) -> str:
         f"{kind} ({count} tensor{'' if count == 1 else 's'}, {nbytes / 2**20:.1f} MiB)"
         for kind, (count, nbytes) in sorted(totals.items())
     )
+
+
+def _chain_draft() -> bool:
+    """Whether the server's drafter steps through its draft loop in decode steps
+    (EAGLE / NEXTN chains); other drafters (e.g. DSPARK) run verify steps."""
+    algorithm = (get_spec().speculative_algorithm or "").upper()
+    return algorithm in ("EAGLE", "EAGLE3", "NEXTN")
 
 
 def _server_step() -> tuple[str, int]:

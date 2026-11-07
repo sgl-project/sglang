@@ -164,6 +164,10 @@ class TestMonokernelFramework(CustomTestCase):
         registry_patch = patch.dict(registry._REGISTRY, clear=True)
         registry_patch.start()
         self.addCleanup(registry_patch.stop)
+        # the tests stub torch.cuda: keep the binding on it on hosts with an XPU
+        device_patch = patch.object(binding, "_device_module", return_value=torch.cuda)
+        device_patch.start()
+        self.addCleanup(device_patch.stop)
         registry.register(backend=BACKEND, architecture=ARCH, path=f"{__name__}:SPEC")
 
     def test_find_spec_refuses_with_a_reason(self):
@@ -358,6 +362,30 @@ class TestMonokernelFramework(CustomTestCase):
         self.addCleanup(reset_context)
         lm = install(archs=["Draft"], is_load_observed=True)
         self.assertEqual(lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "mono")
+
+    def test_an_eagle_chain_draft_runs_decode_steps(self):
+        # an EAGLE / NEXTN drafter's loop runs decode steps of one token a request
+        registry.register(
+            backend=BACKEND, architecture="Draft", path=f"{__name__}:ONE_TOKEN_DRAFT"
+        )
+        publish(
+            ServerArgs(
+                model_path="dummy",
+                enable_amd_monokernel=True,
+                speculative_algorithm="EAGLE",
+                speculative_num_steps=3,
+                speculative_eagle_topk=1,
+                speculative_num_draft_tokens=4,
+                disable_cuda_graph=True,
+            ),
+            role="test",
+        )
+        self.addCleanup(reset_context)
+        lm = install(archs=["Draft"], is_load_observed=True)
+        self.assertEqual(lm(torch.zeros(1), None, batch("decode", 2, 2)), "mono")
+        self.assertEqual(
+            lm(torch.zeros(1), None, batch("target_verify", 2, 2)), "normal"
+        )
 
     def test_every_rank_takes_the_same_lookup_branch(self):
         # every rank refuses together: one returning alone would hang its peers
