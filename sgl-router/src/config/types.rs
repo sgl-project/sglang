@@ -548,6 +548,8 @@ pub struct CacheAwareConfig {
     /// Max requests one pending stake may attract before later requests fall
     /// through to the confirmed tree and the load policy; 0 = unlimited.
     pub pending_prefix_max_followers: u64,
+    /// `--cache-media-affinity-ttl-ms`; 0 disables media affinity.
+    pub media_affinity_ttl_ms: u64,
     /// Confirmed-first mode when set: consult and stake pending prefixes only
     /// where a stake is strictly deeper than the confirmed match and while that
     /// match covers less than this share of the prompt. `None` keeps the
@@ -565,6 +567,7 @@ impl Default for CacheAwareConfig {
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
             pending_prefix_max_followers: 0,
+            media_affinity_ttl_ms: 0,
             pending_prefix_consult_below: None,
         }
     }
