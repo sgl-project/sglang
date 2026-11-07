@@ -22,6 +22,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
 
@@ -136,6 +137,27 @@ class SRTPlatform(DeviceMixin):
 
     def get_full_graph_backend_cls(self) -> type[Any]:
         """Return the full device-graph backend class for this platform."""
+        return None
+
+    def get_moe_expert_executor_cls(
+        self, context: MoeExpertExecutorContext
+    ) -> Optional[type[torch.nn.Module]]:
+        """Return a platform-specific MoE expert executor class.
+
+        Returning ``None`` keeps SGLang's built-in MoE implementation. The
+        returned class must accept the model's standard expert constructor
+        arguments, expose a ``runner_backend`` attribute compatible with
+        ``MoeRunnerBackendLike`` (or ``None``), and support the
+        ``forward(hidden_states, topk_output)`` call. The model binds that
+        backend to its ``TopK`` instance and remains responsible for producing
+        ``topk_output``. Existing model loaders remain responsible for
+        checkpoint loading, so the class must preserve the ``FusedMoE`` expert
+        parameter ABI (``w13_*``/``w2_*`` names and their ``weight_loader``
+        callbacks).
+
+        Models opt into this hook individually; Gemma4 is currently the only
+        caller that supplies ``MoeExpertExecutorContext``.
+        """
         return None
 
     def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
