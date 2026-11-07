@@ -237,6 +237,9 @@ class HipSymmetricBuffer:
     Uncached (``hipMemAllocationTypeUncached``) memory is the default because
     kernels poll it for peer writes within a launch, which the non-coherent L2
     would otherwise hide; RCCL allocates its VMM transport buffers the same way.
+
+    ``require_fabric`` forces FABRIC handles regardless of
+    ``SGLANG_HIP_VMM_HANDLE_TYPE``: a group spanning hosts cannot pass POSIX fds.
     """
 
     def __init__(
@@ -246,6 +249,7 @@ class HipSymmetricBuffer:
         group: ProcessGroup,
         *,
         uncached: bool = True,
+        require_fabric: bool = False,
     ) -> None:
         if not is_hip_runtime_supported():
             raise RuntimeError(
@@ -266,7 +270,11 @@ class HipSymmetricBuffer:
             if uncached
             else _HIP_MEM_ALLOCATION_TYPE_PINNED
         )
-        self.handle_type = _resolve_handle_type(self.device.index)
+        self.handle_type = (
+            _HIP_MEM_HANDLE_TYPE_FABRIC
+            if require_fabric
+            else _resolve_handle_type(self.device.index)
+        )
         use_fabric = self.handle_type == _HIP_MEM_HANDLE_TYPE_FABRIC
         prop.requestedHandleTypes = self.handle_type
         prop.location.type = _HIP_MEM_LOCATION_TYPE_DEVICE
@@ -340,6 +348,7 @@ class HipSymmetricBuffer:
                     os.close(fd)
 
         ptrs: List[int] = []
+        map_error: Optional[str] = None
         try:
             for peer in range(self.world_size):
                 if peer == self.rank:
@@ -376,11 +385,22 @@ class HipSymmetricBuffer:
                     self._handles.append(handle)
                     handles.append(handle)
                 ptrs.append(self._map(handles, peer_sizes[peer]))
+        except RuntimeError as e:
+            map_error = str(e)
         except BaseException:
-            for leftover in peer_fds.values():
-                os.close(leftover)
             self.close()
             raise
+        finally:
+            for leftover in peer_fds.values():
+                os.close(leftover)
+        # An import can fail on some ranks only (e.g. a peer outside this rank's
+        # fabric clique); agree so no rank waits on a torn-down peer.
+        map_errors: List[Optional[str]] = [None] * self.world_size
+        dist.all_gather_object(map_errors, map_error, group=group)
+        if any(error is not None for error in map_errors):
+            self.close()
+            failed = {r: e for r, e in enumerate(map_errors) if e is not None}
+            raise RuntimeError(f"VMM peer mapping failed: {failed}")
 
         self.buffers: List[torch.Tensor] = []
         for ptr in ptrs:

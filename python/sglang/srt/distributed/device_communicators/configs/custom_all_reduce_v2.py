@@ -353,7 +353,9 @@ def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
         num_pull_blocks=32,
         num_mc_blocks=None,
     )
-    return {world_size: default for world_size in range(2, 9)}
+    # 9-16 ranks only span hosts (one UALink fabric clique); they reuse the TP8
+    # tuning until measured
+    return {world_size: default for world_size in range(2, 17)}
 
 
 @cache

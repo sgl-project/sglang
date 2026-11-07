@@ -25,6 +25,8 @@ for expandable segments) and written into a device-side pointer table
 replay time. Multi-node (MNNVL) groups skip direct graph-input registration
 and use the torch symmetric-memory workspace during capture and replay too.
 Their input tensors therefore do not require a VMM-backed caching allocator.
+On ROCm the workspace is a HIP VMM allocation (``HipSymmetricBuffer``); a group
+spanning the hosts of one gfx1250 UALink clique shares it by FABRIC handle.
 """
 
 import logging
@@ -67,6 +69,7 @@ from .custom_all_reduce_utils import (
     is_one_nvlink_clique,
     is_weak_contiguous,
 )
+from .gfx1250_fabric import probe_fabric_clique
 
 logger = logging.getLogger(__name__)
 
@@ -90,13 +93,13 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(
-    nbytes: int, device: torch.device, group: ProcessGroup
+    nbytes: int, device: torch.device, group: ProcessGroup, multinode: bool = False
 ) -> Tuple[object, List[torch.Tensor], int]:
     """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
     if _is_hip:
         from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
 
-        buffer = HipSymmetricBuffer(nbytes, device, group)
+        buffer = HipSymmetricBuffer(nbytes, device, group, require_fabric=multinode)
         return buffer, buffer.buffers, 0
 
     from torch._C._distributed_c10d import _SymmetricMemory
@@ -223,6 +226,7 @@ class CustomAllReduceV2:
         # buffers, which XGMI does not keep coherent; stage through the
         # uncached workspace inside graphs instead.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        self._is_multinode = is_multinode
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = (
             not tms_cudagraph and not is_multinode and not _is_hip
@@ -306,7 +310,10 @@ class CustomAllReduceV2:
         sem_offset = push_bytes + pull_bytes
 
         self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
-            total_bytes, device=self.device, group=self.group
+            total_bytes,
+            device=self.device,
+            group=self.group,
+            multinode=self._is_multinode,
         )
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
@@ -620,6 +627,10 @@ def can_use_custom_all_reduce_v2(
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
+        if _is_hip:
+            # NVML cliques do not exist on ROCm; only a gfx1250 UALink fabric
+            # clique can host a multi-node workspace
+            return probe_fabric_clique(group, device)
         return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
