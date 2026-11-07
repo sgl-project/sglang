@@ -984,10 +984,6 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         )
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestStrategyLoaders(unittest.TestCase):
     """The IO path decodes every source with the strategy's loaders, the shared ones by default."""
 
@@ -1038,3 +1034,7 @@ class TestStrategyLoaders(unittest.TestCase):
             asyncio.run(processor.process(["bad"], input_ids=[1, IMAGE]))
         with self.assertRaises(RuntimeError):
             asyncio.run(processor.process(["io"], input_ids=[1, IMAGE]))
+
+
+if __name__ == "__main__":
+    unittest.main()
