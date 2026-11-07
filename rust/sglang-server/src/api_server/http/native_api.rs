@@ -18,7 +18,7 @@ use super::generate_hook::{
 use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, ReceivedAs,
+    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
 #[cfg(test)]
@@ -593,10 +593,10 @@ async fn generate(
     start: Option<Extension<crate::RequestStart>>,
     held: Option<Extension<HeldGeneration>>,
     headers: HeaderMap,
-    body: Result<Json<serde_json::Value>, JsonRejection>,
+    request: axum::extract::Request,
 ) -> Response {
-    let mut body = match body {
-        Ok(Json(body)) => body,
+    let (mut body, raw_body) = match json_body(&state, request).await {
+        Ok(body) => body,
         // A body that fails to parse has no readable `stream` flag, so this one
         // can only answer unary -- as Python's does (FastAPI rejects before its
         // handler runs).
@@ -604,22 +604,32 @@ async fn generate(
             return native_error(StatusCode::BAD_REQUEST, &rejection.body_text(), false);
         }
     };
-    if state.server_args.enable_request_header_overrides
-        && let Err(error) = apply_header_overrides(&mut body, &headers)
-    {
-        return native_error(StatusCode::BAD_REQUEST, &error, false);
-    }
+    let overrides = if state.server_args.enable_request_header_overrides {
+        match apply_header_overrides(&mut body, &headers) {
+            Ok(applied) => Some(applied),
+            Err(error) => return native_error(StatusCode::BAD_REQUEST, &error, false),
+        }
+    } else {
+        None
+    };
     // What the client sent as `sampling_params` (an object, or one per batch
     // item), for a package's hook, before anything fills in beneath it.
     let client_sampling_params = state
         .generate_hook
         .as_ref()
         .and_then(|_| body.get("sampling_params").cloned());
-    // The request log shows the body as the client sent it: the defaults
-    // merged below go into a copy, as Python does.
-    let snapshot = state.core.snapshot_body(&body, &headers).map(|snapshot| {
-        snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
-    });
+    // The request log and crash dump show the body as the client sent it:
+    // the defaults merged below go into a copy, as Python does.
+    let raw_body = RawBody {
+        bytes: raw_body,
+        overrides,
+    };
+    let snapshot = state
+        .core
+        .snapshot_body(&body, Some(raw_body), &headers)
+        .map(|snapshot| {
+            snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
+        });
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -678,6 +688,35 @@ fn item_sampling_params(
         serde_json::Value::Array(items) => items.get(item)?.as_object(),
         sent => sent.as_object(),
     }
+}
+
+/// The body exactly as axum's `Json<Value>` extracts it (the same content-type
+/// check, body limit and rejections), with its raw bytes, which a crash dump
+/// keeps as they came rather than serializing the body again.
+async fn json_body<S: Send + Sync>(
+    state: &S,
+    request: axum::extract::Request,
+) -> Result<(serde_json::Value, bytes::Bytes), JsonRejection> {
+    use axum::extract::FromRequest;
+
+    if !json_content_type(request.headers()) {
+        return Err(axum::extract::rejection::MissingJsonContentType::default().into());
+    }
+    let raw = bytes::Bytes::from_request(request, state).await?;
+    let Json(body) = Json::<serde_json::Value>::from_bytes(&raw)?;
+    Ok((body, raw))
+}
+
+/// axum's `Json` content-type rule: `application/json` or `application/*+json`.
+fn json_content_type(headers: &HeaderMap) -> bool {
+    headers
+        .get(http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<mime::Mime>().ok())
+        .is_some_and(|mime| {
+            mime.type_() == "application"
+                && (mime.subtype() == "json" || mime.suffix().is_some_and(|name| name == "json"))
+        })
 }
 
 /// Decode a `/generate` body under the launch-time defaults into its requests and
@@ -2713,6 +2752,50 @@ mod tests {
                 v["meta_info"]["completion_tokens"], n,
                 "count stays cumulative"
             );
+        }
+    }
+
+    /// `json_body` accepts and rejects exactly what `Json<Value>` does, with
+    /// the same rejection text, and hands back the bytes it was sent.
+    #[tokio::test]
+    async fn json_body_matches_the_json_extractor() {
+        use axum::extract::FromRequest;
+
+        let request = |content_type: Option<&str>, body: &'static str| {
+            let mut builder = http::Request::builder().method("POST").uri("/generate");
+            if let Some(content_type) = content_type {
+                builder = builder.header(http::header::CONTENT_TYPE, content_type);
+            }
+            builder.body(axum::body::Body::from(body)).unwrap()
+        };
+        let body = "{ \"text\": \"hi\",  \"rid\": \"r\" }";
+        for (content_type, body) in [
+            (Some("application/json"), body),
+            (Some("application/json; charset=utf-8"), body),
+            (Some("application/vnd.api+json"), body),
+            (Some("text/plain"), body),
+            (None, body),
+            (Some("application/json"), "{\"text\": "),
+            (Some("application/json"), "[1, 2"),
+        ] {
+            let ours = json_body(&(), request(content_type, body)).await;
+            let axums =
+                Json::<serde_json::Value>::from_request(request(content_type, body), &()).await;
+            match (ours, axums) {
+                (Ok((value, raw)), Ok(Json(expected))) => {
+                    assert_eq!(value, expected);
+                    assert_eq!(raw, body.as_bytes(), "the bytes as sent");
+                }
+                (Err(ours), Err(axums)) => {
+                    assert_eq!(ours.status(), axums.status(), "{content_type:?} {body}");
+                    assert_eq!(ours.body_text(), axums.body_text());
+                }
+                (ours, axums) => panic!(
+                    "{content_type:?} {body}: ours ok={}, axum ok={}",
+                    ours.is_ok(),
+                    axums.is_ok()
+                ),
+            }
         }
     }
 }

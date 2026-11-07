@@ -3,7 +3,7 @@
 //! overrides the body field of the same name before the body is decoded.
 
 use axum::http::HeaderMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 #[derive(Clone, Copy)]
 enum Kind {
@@ -28,12 +28,16 @@ const HEADER_OVERRIDES: &[(&str, &str, Kind)] = &[
     ("x-override-priority", "priority", Kind::Int),
 ];
 
-/// Write each present override header into `body`. An unparsable value fails
-/// the request (Python answers 400). A non-object body is left alone; decoding
-/// rejects it.
-pub(super) fn apply_header_overrides(body: &mut Value, headers: &HeaderMap) -> Result<(), String> {
+/// Write each present override header into `body` and return the fields
+/// written, in that order. An unparsable value fails the request (Python
+/// answers 400). A non-object body is left alone; decoding rejects it.
+pub(super) fn apply_header_overrides(
+    body: &mut Value,
+    headers: &HeaderMap,
+) -> Result<Map<String, Value>, String> {
+    let mut applied = Map::new();
     let Some(fields) = body.as_object_mut() else {
-        return Ok(());
+        return Ok(applied);
     };
     for &(header, field, kind) in HEADER_OVERRIDES {
         let Some(value) = headers.get(header) else {
@@ -49,9 +53,10 @@ pub(super) fn apply_header_overrides(body: &mut Value, headers: &HeaderMap) -> R
                 .map(Value::from)
                 .map_err(|e| format!("invalid {header} header {text:?}: {e}"))?,
         };
-        fields.insert(field.to_owned(), value);
+        fields.insert(field.to_owned(), value.clone());
+        applied.insert(field.to_owned(), value);
     }
-    Ok(())
+    Ok(applied)
 }
 
 #[cfg(test)]
@@ -72,7 +77,7 @@ mod tests {
     #[test]
     fn headers_override_body_fields() {
         let mut body = serde_json::json!({"text": "hi", "rid": "client", "routed_dp_rank": 0});
-        apply_header_overrides(
+        let applied = apply_header_overrides(
             &mut body,
             &headers(&[
                 ("x-override-rid", "router"),
@@ -95,6 +100,12 @@ mod tests {
                 "disagg_prefill_dp_rank": 1, "priority": -2,
             })
         );
+        // What was written: a crash dump writes it into the received body
+        // again, and must get the same JSON, key order included.
+        let mut overridden =
+            serde_json::json!({"text": "hi", "rid": "client", "routed_dp_rank": 0});
+        overridden.as_object_mut().unwrap().extend(applied);
+        assert_eq!(overridden.to_string(), body.to_string());
         let (requests, _) = into_requests(
             serde_json::from_value(body.clone()).unwrap(),
             &GenerationPolicy::default(),

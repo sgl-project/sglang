@@ -17,8 +17,8 @@ use super::handle::{
     CoreHandle, ExpectedResponse, LastOutput, RuntimeCall, translate_runtime_error,
 };
 use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, ReceivedAs, RequestMetrics,
-    RequestRecord, prefetch,
+    BodySnapshot, CoreError, CoreEvent, InFlight, LoggedHeaders, RawBody, ReceivedAs,
+    RequestMetrics, RequestRecord, prefetch,
 };
 
 impl CoreHandle {
@@ -38,18 +38,20 @@ impl CoreHandle {
             .await
     }
 
-    /// A native `/generate` body as the request log sees it, captured before
-    /// the adapter merges launch-time defaults into it; `None` when not
-    /// logging.
+    /// A native `/generate` body as the request log and the crash dump see
+    /// it, captured before the adapter merges launch-time defaults into it;
+    /// `None` when neither is on.
+    /// `raw` is the body as received, for a body that came over HTTP.
     pub(crate) fn snapshot_body(
         &self,
         body: &serde_json::Value,
+        raw: Option<RawBody>,
         headers: &http::HeaderMap,
     ) -> Option<BodySnapshot> {
         self.inner
             .request_log
             .as_ref()?
-            .snapshot_body(body, headers)
+            .snapshot_body(body, raw, headers)
     }
 
     /// The whitelisted headers a built request's log lines carry.
@@ -58,6 +60,13 @@ impl CoreHandle {
             Some(log) => log.logged_headers(headers),
             None => LoggedHeaders::default(),
         }
+    }
+
+    /// The crash dump's requests (see
+    /// [`RequestLog::crash_dump_snapshot`](crate::api_server::core::RequestLog::crash_dump_snapshot));
+    /// `None` without `--crash-dump-folder`.
+    pub(crate) fn crash_dump_snapshot(&self) -> Option<Vec<u8>> {
+        self.inner.request_log.as_ref()?.crash_dump_snapshot()
     }
 
     /// Register a generation under the public ID `rid` before its request
@@ -101,7 +110,7 @@ impl CoreHandle {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
         let record = self
-            .receive(std::slice::from_ref(&request), received, false)
+            .receive(std::slice::from_ref(&request), received, false, true)
             .pop();
         tokio::select! {
             biased;
@@ -133,7 +142,7 @@ impl CoreHandle {
         let created_at = Instant::now();
         self.set_default_priority(&mut request);
         let record = self
-            .receive(std::slice::from_ref(&request), received, false)
+            .receive(std::slice::from_ref(&request), received, false, log_metrics)
             .pop();
         // Counted from admission, media prefetch included: the drain waits
         // for it. The health probe is not a client request; the drain never
@@ -156,9 +165,10 @@ impl CoreHandle {
         requests: &[GenerateRequest],
         received: ReceivedAs,
         batch: bool,
+        log_metrics: bool,
     ) -> Vec<RequestRecord> {
         match &self.inner.request_log {
-            Some(log) => log.receive(requests, received, batch),
+            Some(log) => log.receive(requests, received, batch, log_metrics),
             None => Vec::new(),
         }
     }
@@ -183,7 +193,7 @@ impl CoreHandle {
         // requests are one only when they are several.
         let batch = matches!(received, ReceivedAs::Body(_)) || requests.len() > 1;
         let mut records = self
-            .receive(&requests, received, batch)
+            .receive(&requests, received, batch, true)
             .into_iter()
             .map(Some)
             .collect::<Vec<_>>();
@@ -317,7 +327,7 @@ pub(crate) struct CoreCall {
     weight_version: Option<Arc<str>>,
     /// Observes every runtime item as the call receives it.
     metrics: Option<RequestMetrics>,
-    /// Logs the request's `Finish`.
+    /// Logs the request's `Finish` and keeps its crash-dump entry.
     record: Option<RequestRecord>,
     /// Holds the drain open while this client request is alive.
     _in_flight: Option<InFlight>,
@@ -328,9 +338,12 @@ impl CoreCall {
         runtime: RuntimeCall,
         weight_version: Option<Arc<str>>,
         metrics: Option<RequestMetrics>,
-        record: Option<RequestRecord>,
+        mut record: Option<RequestRecord>,
         in_flight: Option<InFlight>,
     ) -> Self {
+        if let Some(record) = &mut record {
+            record.admit();
+        }
         Self {
             runtime,
             events_finished: false,
@@ -1124,6 +1137,47 @@ mod tests {
         ));
         assert!(intake_rx.try_recv().is_err());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    /// A call dropped after TM intake accepted it keeps its request for a
+    /// crash dump: `CoreCall::new` admits the record.
+    #[tokio::test]
+    async fn dropped_call_keeps_its_request_for_the_crash_dump() {
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, _abort_rx) = flume::unbounded();
+        let handle = CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: false,
+                mm_limits: Vec::new(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: CoreMetadata::default(),
+                metrics: None,
+                request_log: Some(crate::api_server::core::RequestLog::for_test(None, true)),
+            },
+        );
+        let call = handle
+            .generate(
+                GenerateRequest {
+                    rid: Rid::from_client("gone"),
+                    text: Some("hi".into()),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            )
+            .await
+            .unwrap();
+        let _request = accept_intake(intake_rx.recv().unwrap());
+        drop(call);
+        let snapshot: serde_json::Value =
+            serde_json::from_slice(&handle.crash_dump_snapshot().unwrap()).unwrap();
+        assert_eq!(snapshot["unfinished"], serde_json::json!([]));
+        assert_eq!(snapshot["finished"][0]["rid"], "gone");
     }
 
     fn public_request(rid: &str) -> GenerateRequest {

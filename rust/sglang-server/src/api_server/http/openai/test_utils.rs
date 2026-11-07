@@ -501,8 +501,8 @@ async fn streaming_submit_failure_answers_inside_the_stream() {
 /// HTTP request, as Python's tokenizer manager does.
 #[tokio::test]
 async fn openai_request_lines_carry_whitelisted_headers() {
-    let log =
-        crate::api_server::core::RequestLog::for_test(crate::message::config::RequestLogConfig {
+    let log = crate::api_server::core::RequestLog::for_test(
+        Some(crate::message::config::RequestLogConfig {
             max_length: 1 << 30,
             skip_names: vec!["text".into()],
             out_skip_names: vec!["text".into(), "output_ids".into()],
@@ -512,8 +512,9 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             batch_shared_fields: Vec::new(),
             headers: vec!["x-smg-routing-key".into()],
             exceeded_ms: -1,
-            omit_custom_params: Vec::new(),
-        });
+        }),
+        false,
+    );
     let app = routes().with_state(answering_app_state_logged(log.clone()));
     let messages = json!([{"role": "user", "content": "hi"}]);
     for (path, body) in [

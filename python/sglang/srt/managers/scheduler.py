@@ -497,6 +497,9 @@ class Scheduler(
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
+    # Set by maybe_init_rust_server; a watchdog timeout reads it to dump. A
+    # class-level default, so it reads as None before __init__ gets that far.
+    rust_server: Optional[RustServer] = None
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -2036,6 +2039,9 @@ class Scheduler(
             "startup_time": self.startup_time,
         }
 
+        if self.rust_server is not None:
+            # The main process waits for this process's crash dump.
+            result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
         if get_serving().grpc_port is not None and not (
@@ -2570,6 +2576,13 @@ class Scheduler(
         self.idle_sleeper = RustServerIdleSleeper(
             rust_server, can_empty_cache=lambda: not self._engine_paused
         )
+
+    def dump_requests_before_crash(self) -> None:
+        """The embedded Rust server's ``--crash-dump-folder`` dump, written
+        before this process goes down (the Python ``TokenizerManager`` writes
+        its own when the parent gets ``SIGQUIT``)."""
+        if self.rust_server is not None:
+            self.rust_server.dump_requests_before_crash()
 
     def _holds_rust_drain_end(self) -> bool:
         """Whether this listener's drain ends only once every attention-DP
@@ -6715,6 +6728,8 @@ def run_scheduler_process(
 
     except Exception:
         logger.error(f"Scheduler hit an exception: {traceback.format_exc()}")
+        if scheduler is not None:
+            scheduler.dump_requests_before_crash()
         parent_process.send_signal(signal.SIGQUIT)
         # Opt-in: SIGKILL the pgroup so sibling ranks don't spew thousands
         # of NCCL/TCPStore tracebacks before they finally die.

@@ -123,6 +123,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
     tokenizer_metric_labels,
 )
+from sglang.srt.observability.request_dump import CrashDumpGrace
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -1063,6 +1064,39 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs,
         )
 
+    @staticmethod
+    def _wait_for_rust_crash_dumps_on_sigquit(
+        server_args: ServerArgs,
+        scheduler_init_result: SchedulerInitResult,
+        subprocess_watchdog: SubprocessWatchdog,
+    ) -> None:
+        """With ``--crash-dump-folder`` set, give the schedulers that embed the
+        Rust server time to write their crash dumps before a child's
+        ``SIGQUIT`` kills the process tree (see ``CrashDumpGrace``), which
+        the launch-phase handler then does as before."""
+        folder = get_observability().crash_dump_folder
+        if (
+            not folder
+            or resolving_view(server_args).custom_sigquit_handler is not None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return
+        previous = signal.getsignal(signal.SIGQUIT)
+        if not callable(previous):
+            previous = lambda signum, frame: kill_process_tree(os.getpid())  # noqa: E731
+        grace = CrashDumpGrace(
+            folder,
+            # Absent in DP-controller layouts, which then are not waited for.
+            writer_pids=[
+                info["rust_server_pid"]
+                for info in scheduler_init_result.scheduler_infos
+                if "rust_server_pid" in info
+            ],
+            previous=previous,
+            before_wait=subprocess_watchdog.stop,
+        )
+        signal.signal(signal.SIGQUIT, grace.handle_sigquit)
+
     @classmethod
     def _launch_detokenizer_subprocesses(
         cls,
@@ -1352,6 +1386,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 processes=processes, process_names=names
             )
             subprocess_watchdog.start()
+            cls._wait_for_rust_crash_dumps_on_sigquit(
+                server_args, scheduler_init_result, subprocess_watchdog
+            )
 
             return (
                 None,
