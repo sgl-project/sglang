@@ -21,13 +21,26 @@ Import torch_npu only when an NPU operation actually needs it.
 from __future__ import annotations
 
 from collections import deque
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, NamedTuple
 
 import torch
 import torch.distributed as dist
 
 if TYPE_CHECKING:
     from sglang.srt.eplb.expert_location import ExpertLocationMetadata
+
+# ACL format IDs, kept here so importing this module does not load torch_npu.
+_FORMAT_NCHW = 0
+_FORMAT_ND = 2
+_FORMAT_FRACTAL_NZ = 29
+_FORMAT_FRACTAL_NZ_C0_16 = 50
+_FORMAT_FRACTAL_NZ_C0_32 = 51
+_BASE_FORMATS = (_FORMAT_NCHW, _FORMAT_ND)
+_NZ_FORMATS = (
+    _FORMAT_FRACTAL_NZ,
+    _FORMAT_FRACTAL_NZ_C0_16,
+    _FORMAT_FRACTAL_NZ_C0_32,
+)
 
 
 def update_expert_weights_with_staging(
@@ -40,15 +53,22 @@ def update_expert_weights_with_staging(
     log_metrics: bool,
     update_layer_fn: Callable[..., None],
 ) -> dict[int, list[int]]:
-    """Migrate each participating layer through ND storage, preserving model addresses."""
+    """Prepare, migrate and write back expert weights without changing model addresses."""
     changed_layer_ids, local_update_plan = _select_expert_weight_updates(
         old_metadata, new_metadata, layer_ids, rank
     )
     if not changed_layer_ids:
         return {}
 
+    from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
     _validate_migration_topology()
-    staging = _ExpertWeightStaging(weights_by_layer, changed_layer_ids, rank)
+    # Both Ascend 950PR and 950DT use ARCH35. Their NZ copy/cast paths do not
+    # accept the transposed expert views used by MXFP4/MXFP8 inference.
+    staging_type = (
+        _PhysicalExpertWeightStaging if is_npu_arch35() else _ExpertWeightStaging
+    )
+    staging = staging_type(weights_by_layer, changed_layer_ids, rank)
     world_size = dist.get_world_size()
     temp_buffers = []
     missing_experts_by_layer = {}
@@ -74,7 +94,7 @@ def update_expert_weights_with_staging(
         # Unchanged local slots may still send, but need no writeback.
         if local_changed:
             staging.store(weights, migration_weights)
-        # Release this layer's ND references before preparing the next layer.
+        # Release this layer's migration views before preparing the next layer.
         del migration_weights
         if missing_experts:
             missing_experts_by_layer[layer] = missing_experts
@@ -146,7 +166,8 @@ def _validate_migration_weights(
                 tuple(t.shape),
                 t.dtype,
                 t.device,
-                torch_npu.get_npu_format(t) not in (0, 2) or not t.is_contiguous(),
+                torch_npu.get_npu_format(t) not in _BASE_FORMATS
+                or not t.is_contiguous(),
             )
             for t in weights
         ]
@@ -192,19 +213,24 @@ class _ExpertWeightStaging:
             for weight in weights
         ]
 
-    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
-        # Bound queued work before allocating this layer's ND tensors.
+    def _begin_layer(self) -> None:
+        # Bound queued work before allocating this layer's staging storage.
         # Each event follows the preceding layer's P2P waits and writeback.
         # With two saved events, the fourth load waits for the first layer.
-        # The allocator can then reuse that layer's released ND storage.
+        # The allocator can then reuse that layer's released storage.
         if len(self._completion_events) == self._completion_events.maxlen:
             self._completion_events.popleft().synchronize()
         previous_layer_done = torch.npu.Event()
         previous_layer_done.record()
         self._completion_events.append(previous_layer_done)
+
+    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        self._begin_layer()
         # Keep the conversion result; copy_ would add another ND-to-ND copy.
         return [
-            torch.ops.npu.npu_format_cast(weight, 2).contiguous() if needed else weight
+            torch.ops.npu.npu_format_cast(weight, _FORMAT_ND).contiguous()
+            if needed
+            else weight
             for weight, needed in zip(weights, self._needs_staging)
         ]
 
@@ -221,3 +247,167 @@ class _ExpertWeightStaging:
             )
             # Keep the storage addresses referenced by captured graphs.
             weight.copy_(restored)
+
+
+class _ExpertStorageLayout(NamedTuple):
+    """Physical storage of the full tensor, including shared experts and NZ padding."""
+
+    total_experts: int
+    storage_elements: int
+    npu_format: int
+
+    def expert_byte_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+        """Return [routed experts, physical bytes per expert] for uint8 transport."""
+        elements_per_expert = self.storage_elements // self.total_experts
+        bytes_per_expert = elements_per_expert * weight.element_size()
+        return weight.shape[0], bytes_per_expert
+
+
+def _validated_weight_owner(weight: torch.Tensor) -> torch.Tensor:
+    """Validate the routed-expert prefix and return its complete backing tensor."""
+    # get_moe_weights returns parameter.data[:routed_experts]. Its base retains
+    # the complete expert axis, including fused shared experts at the end.
+    owner = weight if weight._base is None else weight._base
+    if (
+        weight.ndim == 0
+        or weight.storage_offset() != 0
+        or owner.storage_offset() != 0
+        or weight.shape[1:] != owner.shape[1:]
+        or weight.stride() != owner.stride()
+        or not 0 < weight.shape[0] <= owner.shape[0]
+    ):
+        raise ValueError("A5 EPLB requires a full expert tensor or its expert prefix.")
+    # Expert rows must occupy independent contiguous blocks. Inner transposes
+    # are allowed, but selecting/stepping elements within an expert is not.
+    expert_elements = 1
+    for stride, size in sorted(zip(owner.stride()[1:], owner.shape[1:])):
+        if size > 1:
+            if stride != expert_elements:
+                raise ValueError("A5 EPLB requires dense storage within each expert.")
+            expert_elements *= size
+    if owner.stride(0) != expert_elements:
+        raise ValueError("A5 EPLB requires an outermost, contiguous expert axis.")
+    return owner
+
+
+def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
+    """Check that raw storage can be split into equal, complete expert blocks."""
+    import torch_npu
+
+    owner = _validated_weight_owner(weight)
+    storage_elements = torch_npu.get_storage_size(owner)
+    npu_format = torch_npu.get_npu_format(owner)
+    # Inspect the tensor's actual format, independently of the model name.
+    # This implementation accepts base formats and 3D batched NZ.
+    if npu_format not in _BASE_FORMATS + _NZ_FORMATS:
+        raise ValueError(f"A5 EPLB does not support storage format {npu_format}.")
+    if npu_format not in _BASE_FORMATS and owner.ndim != 3:
+        raise ValueError("A5 EPLB requires 3D batched NZ expert weights.")
+    # copy_memory_ copies destination-sized storage without checking source
+    # capacity and uses signed int element counts. Validate before any transfer.
+    if (
+        not 0 < storage_elements <= 2**31 - 1
+        or storage_elements < owner.numel()
+        or storage_elements * owner.element_size() > owner.untyped_storage().nbytes()
+    ):
+        raise ValueError(
+            f"A5 EPLB has invalid storage capacity: {storage_elements} elements "
+            f"for shape {tuple(owner.shape)} and "
+            f"{owner.untyped_storage().nbytes()} allocated bytes."
+        )
+    if storage_elements % owner.shape[0]:
+        raise ValueError(
+            f"A5 EPLB cannot divide {storage_elements} storage elements evenly "
+            f"among {owner.shape[0]} experts."
+        )
+    if npu_format in _BASE_FORMATS and storage_elements != owner.numel():
+        raise ValueError("A5 EPLB requires base-format storage without padding.")
+    if weight._base is None and storage_elements != owner.numel():
+        raise ValueError(
+            "A5 EPLB padded NZ weights must "
+            "retain their full parameter base through the routed-expert slice."
+        )
+    return _ExpertStorageLayout(owner.shape[0], storage_elements, npu_format)
+
+
+class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
+    """Move A5 expert storage unchanged, including NZ padding and packed bytes.
+
+    Contiguous ND weights use byte views of the routed prefix. Other layouts
+    use full-storage snapshots to preserve padding and shared-expert suffixes.
+    Model tensors retain their dtype, format, strides and addresses.
+
+    load() replaces the pending snapshots; store() writes back that layer before
+    the next load(). Sender-only layers may skip store().
+    """
+
+    def __init__(
+        self,
+        weights_by_layer: dict[int, list[torch.Tensor]],
+        layer_ids: list[int],
+        rank: int,
+    ):
+        super().__init__(weights_by_layer, layer_ids, rank)
+        self._layouts: list[_ExpertStorageLayout] = []
+        for layer_index, layer in enumerate(layer_ids):
+            for weight_index, weight in enumerate(weights_by_layer[layer]):
+                try:
+                    layout = _expert_storage_layout(weight)
+                except ValueError as error:
+                    raise ValueError(
+                        f"[NPU EPLB] rank={rank} layer={layer} "
+                        f"weight_index={weight_index}: {error}"
+                    ) from error
+                if layer_index == 0:
+                    self._layouts.append(layout)
+                elif layout != self._layouts[weight_index]:
+                    raise ValueError(
+                        f"[NPU EPLB] rank={rank} layer={layer} "
+                        f"weight_index={weight_index}: storage layout {layout} "
+                        f"does not match layer {layer_ids[0]}: "
+                        f"{self._layouts[weight_index]}"
+                    )
+
+    def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        return [
+            torch.empty(
+                layout.expert_byte_shape(weight),
+                dtype=torch.uint8,
+                device=weight.device,
+            )
+            for weight, layout in zip(weights, self._layouts, strict=True)
+        ]
+
+    def load(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
+        self._begin_layer()
+        self._storage_snapshots: list[tuple[torch.Tensor, torch.Tensor]] = []
+        migration_weights = []
+        for weight, layout, needs_staging in zip(
+            weights, self._layouts, self._needs_staging, strict=True
+        ):
+            if not needs_staging:
+                # Keep byte transport for FP8 scales, without copying ND storage.
+                migration_weights.append(
+                    weight.view(torch.uint8).view(layout.expert_byte_shape(weight))
+                )
+                continue
+            # Snapshot the full backing tensor: [routed experts | shared experts].
+            # Only the routed rows below are passed to the migration algorithm.
+            owner = weight if weight._base is None else weight._base
+            snapshot = torch.empty(
+                layout.storage_elements, dtype=weight.dtype, device=weight.device
+            )
+            torch.ops.npu.copy_memory_(snapshot, owner, non_blocking=True)
+            self._storage_snapshots.append((owner, snapshot))
+            # Reinterpret bytes; a dtype conversion would alter FP4/FP8 values.
+            expert_bytes = snapshot.view(torch.uint8).view(layout.total_experts, -1)
+            migration_weights.append(expert_bytes[: weight.shape[0]])
+        return migration_weights
+
+    def store(
+        self, weights: list[torch.Tensor], migration_weights: list[torch.Tensor]
+    ) -> None:
+        # Direct ND views already updated model storage. Snapshots also retain
+        # the shared-expert suffix, which is outside migration_weights.
+        for owner, snapshot in self._storage_snapshots:
+            torch.ops.npu.copy_memory_(owner, snapshot, non_blocking=True)
