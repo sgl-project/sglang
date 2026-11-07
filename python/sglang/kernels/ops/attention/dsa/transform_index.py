@@ -157,12 +157,12 @@ def transform_index_page_table_decode_kernel(
     tl.store(result_ptr + offset, -1, mask=~mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["page_table_row_stride"])
 def transform_index_page_table_decode_tiled_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
-    page_table_row_stride: tl.constexpr,
+    page_table_row_stride,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
     result_stride_0: tl.constexpr,
