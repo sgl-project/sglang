@@ -35,7 +35,6 @@ fetch_wheel() {
     # Unique per pod, so an override that points PATCH_CACHE_DIR at shared
     # storage still cannot interleave writes between pods.
     local tmp="${dest}.part.${HOSTNAME:-$$}"
-    rm -f "${tmp}"
     if command -v wget >/dev/null 2>&1; then
         wget -q -O "${tmp}" "${url}"
     else
