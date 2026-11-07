@@ -4,7 +4,11 @@
 //! request and response primitives. [`CoreOutput`] remains the one backend
 //! output type for both unary and streaming responses.
 
-use axum::{Router, http::StatusCode, response::Response};
+use axum::{
+    Router,
+    http::{HeaderMap, StatusCode},
+    response::Response,
+};
 use futures::StreamExt;
 use sglang_processor::ChatFormatterOptions;
 use std::sync::Arc;
@@ -22,7 +26,7 @@ pub(super) use lowered::OpenAiChat;
 pub(super) use template::{ChatFormatter, ChatTemplateKwargs};
 
 use super::app::AppState;
-use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, ReceivedAs};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::ServerArgs;
 use crate::message::request::GenerateRequest;
@@ -143,10 +147,12 @@ async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, S
 
 async fn submit_generation(
     state: &AppState,
+    headers: &HeaderMap,
     request: GenerateRequest,
     stream: bool,
 ) -> Result<CoreCall, Response> {
-    match state.core.generate(request).await {
+    let received = ReceivedAs::Typed(state.core.logged_headers(headers));
+    match state.core.generate(request, received).await {
         Ok(call) => Ok(call),
         // Same `error_response` rule: a committed stream gets 200 plus an
         // SSE error frame + `[DONE]`, not a unary 503 — but with the OpenAI
@@ -156,6 +162,12 @@ async fn submit_generation(
             "service unavailable",
             stream,
         )),
+        // Admission refused the request (the launch's `GenerateValidator`, or
+        // a media client error) before any frame: Python answers the
+        // tokenizer manager's `ValueError` with a unary 400, for a stream too.
+        Err(CoreError::InvalidArgument(message)) => {
+            Err(openai_error(StatusCode::BAD_REQUEST, message, false))
+        }
         Err(error) => Err(openai_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             error.to_string(),

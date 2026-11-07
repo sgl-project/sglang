@@ -9,10 +9,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -35,6 +32,7 @@ use sglang_processor::{
     tool_call_stream,
 };
 
+use super::super::dp_relay::HintRoute;
 use super::completions::completion_usage;
 use super::lowered;
 use super::pd_routing::PDRoutingFields;
@@ -55,6 +53,7 @@ use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -262,10 +261,17 @@ async fn chat_completions(
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
     let choices_per_prompt = request.n.unwrap_or(1) as usize;
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::ChatCompletions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     // Chat normalizes one prompt, so each bootstrap column has one entry.
     let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
     let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
@@ -327,7 +333,7 @@ async fn chat_completions(
             }),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(&state, &headers, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -359,7 +365,7 @@ async fn chat_completions(
             service_tier,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        sse_response(event_stream)
     } else {
         unary_chat(
             submitted,
@@ -1746,6 +1752,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             let state = Arc::new(super::super::AppState {
