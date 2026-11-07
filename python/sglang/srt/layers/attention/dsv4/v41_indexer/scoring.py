@@ -22,6 +22,11 @@ from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.srt.environ import envs
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_row_bytes,
+    mqa_logits_rows_per_chunk,
+)
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.device import async_h2d
 
@@ -304,7 +309,7 @@ def score_tiles(
         starts=data.request_starts,
         lengths=data.compress_lens,
         context_lengths=data.lens_per_request,
-        budget_bytes=_DEEP_GEMM_SCORE_BUDGET_BYTES,
+        budget_bytes=_prefill_score_budget_bytes(_DEEP_GEMM_SCORE_BUDGET_BYTES),
     )
 
 
@@ -371,6 +376,15 @@ def sharded_dense_prefill_topk(
 
 # Arbitrary cap on one bf16 [rows, heads, lc] score chunk; transients run ~3x this.
 _TORCH_SCORE_BUDGET_BYTES = 1 << 30
+
+
+def _prefill_score_budget_bytes(default: int) -> int:
+    budget = envs.SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB.get()
+    if budget is None:
+        return default
+    if budget <= 0:
+        raise ValueError("SGLANG_DSV41_PREFILL_SCORE_BUDGET_MIB must be positive")
+    return budget << 20
 
 
 class RequestScores(msgspec.Struct, frozen=True):
@@ -470,7 +484,9 @@ def _score_chunks(
     lc, j = request.lc, request.columns
     # Chunk rows so the [rows, heads, lc] bf16 scores stay under the budget.
     rows_per_chunk = max(
-        1, _TORCH_SCORE_BUDGET_BYTES // (q.shape[1] * index_k.shape[0] * 2)
+        1,
+        _prefill_score_budget_bytes(_TORCH_SCORE_BUDGET_BYTES)
+        // (q.shape[1] * index_k.shape[0] * 2),
     )
     for start in range(0, request.tok.numel(), rows_per_chunk):
         rows = slice(start, start + rows_per_chunk)
@@ -513,6 +529,42 @@ class PagedDecodeScores(msgspec.Struct, frozen=True):
     ratio: int
     plan: Optional[torch.Tensor]  # None when the caller skips the top-k v2 plan
     has_candidate_mask: bool
+
+
+def decode_input_chunks(inputs: DecodeInputs):
+    """Slice Hopper score rows using only graph-stable shapes."""
+    num_rows = inputs.positions.numel()
+    budget = envs.SGLANG_DSV41_DECODE_SCORE_BUDGET_MIB.get()
+    if budget is None or not get_platform().is_sm90 or not num_rows:
+        yield slice(None), inputs
+        return
+    if budget <= 0:
+        raise ValueError("SGLANG_DSV41_DECODE_SCORE_BUDGET_MIB must be positive")
+    metadata = inputs.paged_metadata
+    step = mqa_logits_rows_per_chunk(
+        num_rows=num_rows,
+        row_bytes=mqa_logits_row_bytes(metadata.max_compressed_seq_len),
+        budget_bytes=budget << 20,
+    )
+    if step is None:
+        yield slice(None), inputs
+        return
+    group = metadata.rows_per_request
+    step = max(group, step // group * group)
+    inputs.reset_outputs()
+    for start in range(0, num_rows, step):
+        rows = slice(start, min(start + step, num_rows))
+        yield (
+            rows,
+            msgspec.structs.replace(
+                inputs,
+                x=inputs.x[rows],
+                q_lora=inputs.q_lora[rows],
+                positions=inputs.positions[rows],
+                req_rows=inputs.req_rows[rows],
+                out_page_indices=inputs.out_page_indices[rows],
+            ),
+        )
 
 
 def decode_scores(
