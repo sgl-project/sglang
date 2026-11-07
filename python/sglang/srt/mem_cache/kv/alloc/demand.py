@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 import math
-from typing import Callable, Iterable, Mapping, Optional
+from typing import Callable, Iterable, Mapping, Optional, Tuple
 
 
 @dataclasses.dataclass(frozen=True)
@@ -270,6 +270,23 @@ def decode_estimate_tokens(max_new_tokens: int) -> int:
     from sglang.srt.environ import envs
 
     return min(max_new_tokens, envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get())
+
+
+def window_retirement(*, shares_prefixes: bool) -> Tuple[int, int]:
+    """When the scheduler retires a request's window rows, as
+    `request_demand` takes it: ``(prefill_retire_lag, eviction_interval)``.
+    Without prefix sharing, the overlap scheduler retires a prefill's rows a
+    configured chunk behind its frontier, which the prefill still running
+    reads (`ScheduleBatch.maybe_evict_swa`); decode retires once
+    SGLANG_SWA_EVICTION_INTERVAL rows fell out of the window."""
+    from sglang.srt.environ import envs
+    from sglang.srt.runtime_context import get_schedule
+
+    schedule = get_schedule()
+    chunk = schedule.chunked_prefill_size or 0
+    overlap = not schedule.disable_overlap_schedule
+    lag = chunk if overlap and not shares_prefixes and chunk > 0 else 0
+    return lag, max(1, envs.SGLANG_SWA_EVICTION_INTERVAL.get())
 
 
 @dataclasses.dataclass(frozen=True)

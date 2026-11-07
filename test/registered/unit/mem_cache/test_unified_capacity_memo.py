@@ -31,8 +31,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.token_demand import demand_windows
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -53,13 +55,27 @@ def _build(lazy: bool):
     return inst, allocator, kvcache
 
 
+def _assert_read_fresh(test, allocator):
+    """The memoized capacity reads must equal the same reads recomputed with
+    every memo dropped (the snapshot and the largest-fit memos)."""
+    names = [b.sub_pool_name for b in allocator.bands]
+    memoized = (
+        allocator.available_size(),
+        [allocator.units_available(n) for n in names],
+    )
+    allocator._fit_memo.clear()
+    allocator._snapshot_key = None
+    fresh = (
+        allocator.available_size(),
+        [allocator.units_available(n) for n in names],
+    )
+    test.assertEqual(memoized, fresh)
+
+
 class TestCapacityMemoCoherence(unittest.TestCase):
     def _assert_memos_fresh(self, allocator):
         """Every memoized capacity view must equal a fresh recompute."""
-        self.assertEqual(
-            allocator.available_size(),
-            allocator._policy._compute_available_size(allocator),
-        )
+        _assert_read_fresh(self, allocator)
         for band in (
             allocator.full_attn_allocator,
             allocator.swa_attn_allocator,
@@ -68,13 +84,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                 band.available_size(),
                 band._available_tokens(),
                 msg=f"stale available_size memo on {band.sub_pool_name!r}",
-            )
-            self.assertEqual(
-                band.schedulable_available_size(),
-                band._available_tokens(
-                    extra_gap_bytes=band._peer_drainable_hole_bytes()
-                ),
-                msg=f"stale schedulable memo on {band.sub_pool_name!r}",
             )
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
@@ -144,7 +153,6 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         # Prime every memo at the current epoch.
         allocator.available_size()
         fa.available_size()
-        fa.schedulable_available_size()
         # Mutate capacity state BYPASSING the _CapacityField descriptor -- the
         # epoch does not move, so the memos go stale undetectably for readers...
         fa.__dict__["watermark_physical"] = fa.watermark_physical + 2
@@ -209,10 +217,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
         return inst, allocator
 
     def _assert_memos_fresh(self, allocator):
-        self.assertEqual(
-            allocator.available_size(),
-            allocator._policy._compute_available_size(allocator),
-        )
+        _assert_read_fresh(self, allocator)
         for band in (
             allocator.full_attn_allocator,
             allocator.swa_attn_allocator,
@@ -248,12 +253,24 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
 
                     def check_boundary():
                         capacity = allocator.available_size()
-                        self.assertTrue(allocator.can_reserve(capacity, capacity))
-                        self.assertFalse(
-                            allocator.can_reserve(
-                                capacity + page_size, capacity + page_size
+                        self.assertTrue(
+                            allocator.admits(
+                                KVDemand(
+                                    capacity,
+                                    demand_windows(allocator, capacity, capacity),
+                                )
                             )
                         )
+                        # Admission may see room past the advertised capacity
+                        # (a relayout opens it); whatever it admits, the take
+                        # serves.
+                        more = capacity + page_size
+                        if allocator.admits(
+                            KVDemand(more, demand_windows(allocator, more, more))
+                        ):
+                            taken = allocator.alloc(more)
+                            self.assertIsNotNone(taken)
+                            allocator.free(taken)
 
                     check_boundary()  # empty float is frontier-transparent
                     states = allocator.mamba_allocator.alloc(3)
@@ -354,9 +371,7 @@ class TestPagedStepKeepsTheEpoch(unittest.TestCase):
                 self.assertEqual(owner._chain_capacity_epoch(), epoch)
             with (
                 patch.object(
-                    allocator._policy,
-                    "_compute_available_size",
-                    wraps=allocator._policy._compute_available_size,
+                    allocator, "units_fit", wraps=allocator.units_fit
                 ) as joint,
                 patch.object(
                     owner, "_available_tokens", wraps=owner._available_tokens

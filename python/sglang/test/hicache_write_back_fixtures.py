@@ -175,19 +175,22 @@ def write_back_cache(
     device_tokens: int,
     host_tokens: int,
     enable_kv_cache_events: bool = False,
+    allocator=None,
 ):
     """A Full-only write-back UnifiedRadixCache on ``tree_core_backend``:
-    ``device_tokens`` of paged device KV, a slot-only host pool of
-    ``host_tokens`` and an InstantWriteBackController. Returns the cache, its
-    device allocator and its host pool."""
-    allocator = PagedTokenToKVPoolAllocator(
-        size=device_tokens,
-        page_size=PAGE,
-        dtype=torch.float16,
-        device="cpu",
-        kvcache=None,
-        need_sort=False,
-    )
+    ``device_tokens`` of paged device KV (or the given device ``allocator``),
+    a slot-only host pool of ``host_tokens`` and an
+    InstantWriteBackController. Returns the cache, its device allocator and
+    its host pool."""
+    if allocator is None:
+        allocator = PagedTokenToKVPoolAllocator(
+            size=device_tokens,
+            page_size=PAGE,
+            dtype=torch.float16,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
     cache = UnifiedRadixCache(
         params=CacheInitParams(
             req_to_token_pool=None,

@@ -295,7 +295,7 @@ class TestAllocationIntegration(CustomTestCase):
         queue._resolve_pending_reqs = Mock()
         queue._uses_swa_tail_prealloc = Mock(return_value=False)
         queue.token_to_kv_pool_allocator = SimpleNamespace(
-            prealloc_fits_assumes_reclaim=Mock(return_value=False)
+            pools_share_memory=False, window_pool_names=lambda: ()
         )
         queue._allocatable_token_budgets = Mock(return_value=100000)
         queue._hicache_pending_restore_tokens = Mock(return_value=0)

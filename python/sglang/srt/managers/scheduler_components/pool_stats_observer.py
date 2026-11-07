@@ -301,7 +301,9 @@ class SchedulerPoolStatsObserver:
         full_num_used = full_capacity - (full_available_size + full_evictable_size)
         mamba_num_used = mamba.capacity - (mamba_available_size + mamba_evictable_size)
         full_token_usage = full_num_used / full_capacity
-        mamba_usage = mamba_num_used / mamba.capacity
+        # Unified memory reports the state slots held plus those free now:
+        # zero while no slot is held and other sub-pools hold the bytes.
+        mamba_usage = mamba_num_used / mamba.capacity if mamba.capacity else 0.0
 
         return PoolStats(
             is_hybrid_ssm=True,

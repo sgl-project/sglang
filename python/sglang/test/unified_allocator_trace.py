@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
     forward_steps_of,
@@ -242,11 +243,16 @@ class BuilderAdapter:
 
     def ensure(self, full: int, window: int) -> bool:
         self._sync_hold()
-        return bool(self.allocator.ensure_capacity(full, window))
+        names = self.allocator.window_pool_names()
+        return bool(
+            self.allocator.ensure_capacity(KVDemand(full, dict.fromkeys(names, window)))
+        )
 
     def prepare_state(self, n: int) -> None:
         self._sync_hold()
-        self.allocator.prepare_mamba_allocation(n)
+        # Lay the chain out so ``n`` state slots then fit in place.
+        state = self.allocator.mamba_allocator.sub_pool_name
+        self.allocator.lay_out_for({state: n})
 
     def gate(self, open_: bool) -> None:
         self.gate_open = open_
@@ -299,7 +305,9 @@ class BuilderAdapter:
 
     def evict(self, n: int) -> bool:
         self._sync_hold()
-        return bool(self.allocator.evict_to_free_tokens(self.tree, n))
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return bool(evict_to_free_tokens(self.tree, self.allocator, n))
 
     def _member(self, name: str):
         return next(m for m in self.members() if m.sub_pool_name == name)
@@ -318,12 +326,11 @@ class BuilderAdapter:
                 out[f"{p}.edges"] = [m.watermark_physical]
             out[f"{p}.allocated_pages"] = m._allocated_pages()
             out[f"{p}.holes"] = sorted(m._free_phys_pages.tolist())
-            out[f"{p}.pending"] = sorted(m._pending_reuse_pages_cpu)
+            out[f"{p}.pending"] = sorted(m.usage.pending_pages)
             out[f"{p}.free_vids"] = (
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
             out[f"{p}.available"] = m.available_size()
-            out[f"{p}.schedulable"] = m.schedulable_available_size()
         a = self.allocator
         out["available"] = a.available_size()
         if self.config.chain in WINDOW_CHAINS:

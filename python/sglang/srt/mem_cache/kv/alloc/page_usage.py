@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.kv.alloc.signals import (
     TransferRelease,
     keys_of,
     signal_fired,
+    unreleased_transfers,
 )
 
 FORWARD = "forward"
@@ -723,6 +724,34 @@ class PageUsage:
             and not self.ended(use.signal)
             for use in self.uses
         )
+
+    def network_held_pending(self) -> Set[int]:
+        """Pending pages a network transfer still reads, until its logical
+        release: they return to the free list only after the release, so a
+        layout that does not need them treats them as occupied."""
+        held: Set[int] = set()
+        for use in self.uses:
+            if use.kind == VACATED and use.pages is not None:
+                keys = use.signal if isinstance(use.signal, tuple) else (use.signal,)
+                if any(isinstance(k, TransferRelease) and not k.released for k in keys):
+                    held.update(use.pages)
+        return held
+
+    def network_fences(self, lo: int = 0, hi: Optional[int] = None) -> List[PageUse]:
+        """The fences an unreleased network transfer holds that meet bytes
+        ``[lo, hi)`` (every one without ``hi``): bytes a move took out of the
+        band while a send still read them. A write into them waits on the host
+        until the engine is done with the send, so a layout that serves its
+        demand without them leaves them alone. Logical releases only, alike on
+        every rank."""
+        return [
+            use
+            for use in self.uses
+            if use.kind == VACATED
+            and use.pages is None
+            and (hi is None or (use.lo < hi and lo < use.hi))
+            and unreleased_transfers(use.signal)
+        ]
 
     def has_fences(self) -> bool:
         return any(use.kind == VACATED and use.pages is None for use in self.uses)

@@ -18,6 +18,7 @@ from sglang.test.unified_allocator_fixtures import (
     FakeKVCache,
     FakeUnifiedSWAKVPool,
     arena_of,
+    open_float_side,
     setup_allocator_context,
     stand_in_views,
     tri_sub_pool_specs,
@@ -96,7 +97,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
         with torch.cuda.stream(schedule):
             # Recorded on the stream moves run on, as the storage requires.
             flt.record_transfer(done, live, writes=True)
-            opened = flt.make_room(side="low", min_bytes=ask)
+            opened = open_float_side(flt, "low", ask)
             self.assertFalse(done.query(), "the move blocked the host on the load")
         torch.cuda.synchronize()
         self.assertGreaterEqual(opened, ask)
@@ -128,7 +129,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
             done.record()
         with torch.cuda.stream(schedule):
             flt.record_transfer(done, live, writes=False)
-            flt.make_room(side="low", min_bytes=self._ask(flt))
+            open_float_side(flt, "low", self._ask(flt))
             copied = torch.cuda.Event()
             copied.record()
         copied.synchronize()
@@ -172,7 +173,7 @@ class TestMovesAgainstRunningCopies(CustomTestCase):
             flt.record_transfer(
                 transfer, live, writes=True, release=transfer, unit_tokens=None
             )
-            opened = flt.make_room(side="low", min_bytes=ask)
+            opened = open_float_side(flt, "low", ask)
         self.assertEqual(waited.calls, [["receive"]])
         self.assertTrue(transfer.released)
         torch.cuda.synchronize()

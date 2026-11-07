@@ -1,6 +1,7 @@
 import logging
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -12,6 +13,16 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+def setUpModule():
+    # Window rows retire at once here; the scheduler's window retirement is
+    # priced in test_request_demand.py.
+    patcher = patch(
+        "sglang.srt.managers.scheduler.window_retirement", return_value=(0, 1)
+    )
+    patcher.start()
+    unittest.addModuleCleanup(patcher.stop)
 
 
 class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
@@ -63,6 +74,10 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.max_new_tokens_limit = envs.SGLANG_MAX_NEW_TOKENS_LIMIT.get()
         scheduler.sliding_window_size = None
         scheduler.chunked_prefill_size = None
+        scheduler.tree_cache = SimpleNamespace(
+            supports_prefix_sharing=lambda: True,
+            window_checkpoint_interval=lambda: 0,
+        )
         scheduler.token_to_kv_pool_allocator = TokenToKVPoolAllocator(
             size=max_total_num_tokens,
             dtype=torch.int64,
@@ -213,7 +228,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
             end_layer=2,
             swa_attention_layer_ids=[1],
             full_attention_layer_ids=[0],
-            total_bytes=768,
+            # Eight pages: a prompt of up to two pages, its decode token and the
+            # one page of allocation rounding admission charges per sub-pool.
+            total_bytes=1024,
             enable_memory_saver=False,
             need_sort=False,
             lazy_compaction=True,

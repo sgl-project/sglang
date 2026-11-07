@@ -129,6 +129,7 @@ def _swa_cache_params(*, sliding_window_size, draft_swa_window):
     allocator = SimpleNamespace(
         storage=None,
         window_pool_names=lambda: ("swa",),
+        target_window_pool=lambda: "swa",
         get_kvcache=lambda: SimpleNamespace(request_window=None),
     )
     kv_storage_of(None, allocator).bind_window_retention(
@@ -221,7 +222,7 @@ class TestDraftBindingDispatch(CustomTestCase):
             forward_stream=None,
         )
         # The target's KV storage, as far as draft binding reads it.
-        alloc.storage = SimpleNamespace(plan=plan_stand_in(pool, placement))
+        alloc.plan = plan_stand_in(pool, placement)
         return alloc
 
     def _run(

@@ -336,6 +336,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv.alloc.demand import window_retirement
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
     forward_steps_of,
@@ -495,6 +496,8 @@ class Scheduler(
 
     # Logical-to-physical KV capacity ratio; defaults to 1 before pool init.
     kv_shard_widening: int = 1
+    # The alignment a truncated prefill chunk is cut to; None leaves it free.
+    truncation_align_size: Optional[int] = None
 
     # Class-level default so on_idle's stall gate works even if a fork
     # overrides init_load_publisher (which would otherwise not set it).
@@ -2914,12 +2917,20 @@ class Scheduler(
             extra_padding = group_padding - page_padding
             extra_headroom = group_size - self.page_size
             token_capacity -= extra_padding + extra_headroom
+        prefill_retire_lag, eviction_interval = window_retirement(
+            shares_prefixes=self.tree_cache.supports_prefix_sharing()
+        )
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,
             token_capacity=token_capacity,
             sliding_window_size=self.sliding_window_size,
             chunk_size=self.chunked_prefill_size,
+            prefill_retire_lag=prefill_retire_lag,
+            eviction_interval=eviction_interval,
+            checkpoint_interval=self.tree_cache.window_checkpoint_interval(),
+            # Admission cuts a chunk on this alignment, so no smaller chunk runs.
+            chunk_align=self.truncation_align_size,
         )
         if max_new_tokens is None:
             req.set_finish_with_abort(

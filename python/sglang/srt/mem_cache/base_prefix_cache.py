@@ -24,6 +24,7 @@ from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.observability.metrics_collector import (
@@ -182,11 +183,12 @@ def retained_target_window(
 
 
 def window_sub_pool_of(allocator) -> str:
-    """The sub-pool the model's sliding-window layers write: a unified
-    pool's target window, else the static pools' window pool."""
-    storage = getattr(allocator, "storage", None)
-    window = None if storage is None else storage.plan.primary_window()
-    return "swa" if window is None else window.name
+    """The window pool a reader that sizes one window by reads
+    (`target_window_pool`), or the static window pools' name for a pool that
+    keeps none."""
+    from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+    return allocator.target_window_pool() or BaseSWAKVPool.WINDOW_SUB_POOL
 
 
 @dataclasses.dataclass
@@ -197,6 +199,22 @@ class EvictParams:
     num_tokens: int = 0
     mamba_num: int = 0
     window_num_tokens: dict[str, int] = dataclasses.field(default_factory=dict)
+
+
+def evictable_by_sub_pool(tree_cache, allocator=None) -> dict[str, int]:
+    """What ``tree_cache`` could evict per sub-pool of ``allocator`` (by
+    default its own): tokens, or slots for the state sub-pool."""
+    if allocator is None:
+        allocator = tree_cache.token_to_kv_pool_allocator
+    owner, windows, state = allocator.sub_pool_roles()
+    evictable = {owner: tree_cache.full_evictable_size()}
+    for name in windows:
+        evictable[name] = tree_cache.window_evictable_size(name)
+    if state is not None:
+        evictable[state] = (
+            tree_cache.mamba_evictable_size() if tree_cache.supports_mamba() else 0
+        )
+    return evictable
 
 
 @dataclasses.dataclass
@@ -579,27 +597,48 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(
-        self,
-        params: EvictParams,
-        *,
-        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    def evict_for_alloc(self, demand: KVDemand) -> EvictResult:
+        """Evict so that an allocation of ``demand`` (what it will take, not
+        what to evict) can be served, by the pool's reclaim discipline
+        (`mem_cache/capacity.py`)."""
+        from sglang.srt.mem_cache.capacity import evict_for_alloc
+
+        return evict_for_alloc(self, demand)
+
+    def reclaim_jointly(
+        self, demand: KVDemand, *, windows_first: bool = False
     ) -> EvictResult:
-        """Evict for allocation using shortfalls or joint-reclaim quotas.
+        """Evict until the allocator can take all of ``demand`` at once, its
+        pools sharing one memory, window entries before token entries when
+        ``windows_first``. A cache that does not reclaim so evicts each
+        pool's shortfall instead."""
+        return self.evict_pool_shortfalls(demand)
 
-        Without ``allocation_reclaim_satisfied``, callers pass component
-        shortfalls in ``params``. The default implementation forwards these
-        counts to :meth:`evict`; multi-component caches may stop earlier when
-        collateral frees satisfy the requested allocation.
-
-        With ``allocation_reclaim_satisfied``, ``params`` instead contains
-        cumulative reclaim quotas. Supporting caches may stop at the pure
-        predicate before reaching those quotas. The allocator still owns
-        preparation and the actual capacity check after the walk.
-        """
-        if allocation_reclaim_satisfied is not None:
-            raise NotImplementedError("This cache does not support joint reclaim")
-        return self.evict(params)
+    def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
+        """Evict each pool's shortfall for ``demand``, as counts. A cache that
+        keeps no window sub-pools of its own keeps a single pool, which serves
+        the demand's tokens and windows alike."""
+        allocator = self.token_to_kv_pool_allocator
+        shortfall = EvictParams(mamba_num=demand.state_slots)
+        if demand.full_tokens > 0:
+            shortfall.num_tokens = max(
+                0, demand.full_tokens - allocator.owner_available_size()
+            )
+        if self.window_sub_pools():
+            for name, tokens in demand.window_tokens.items():
+                if tokens > 0:
+                    short = max(0, tokens - self.window_available_size(name))
+                    if short:
+                        shortfall.window_num_tokens[name] = short
+        elif any(t > 0 for t in demand.window_tokens.values()):
+            name, tokens = max(demand.window_tokens.items(), key=lambda kv: kv[1])
+            available = allocator.window_available_size(name)
+            shortfall.num_tokens = max(shortfall.num_tokens, tokens - available)
+        if not (
+            shortfall.num_tokens or shortfall.window_num_tokens or shortfall.mamba_num
+        ):
+            return EvictResult()
+        return self.evict(shortfall)
 
     def window_available_size(self, sub_pool: str) -> int:
         """What window sub-pool ``sub_pool`` can serve now."""
@@ -617,6 +656,19 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Each window sub-pool this cache keeps a slot for, with the history
         it retains (what a request is charged at most in it)."""
         return ()
+
+    def reclaim(self, units: dict[str, int]) -> bool:
+        """Evict cached entries until the allocator can take ``units`` (pages
+        per sub-pool, slots for state); return whether it can."""
+        raise NotImplementedError("This cache does not reclaim a joint demand")
+
+    def evict_until(
+        self, params: EvictParams, satisfied: Callable[[], bool]
+    ) -> EvictResult:
+        """Evict up to ``params`` per component, stopping once ``satisfied``
+        holds; only caches whose allocator reclaims one joint demand over
+        shared memory support it."""
+        raise NotImplementedError("This cache does not support joint reclaim")
 
     @abstractmethod
     def inc_lock_ref(self, node: Any) -> IncLockRefResult:
@@ -776,6 +828,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # the last checkpoint. Those caches override this. Everyone else has
         # nothing deeper than the tail to protect.
         return None
+
+    def window_checkpoint_interval(self) -> int:
+        """The interval of the state checkpoints `swa_retain_floor` keeps a
+        window behind: a decode holds up to one row less past its window. 0
+        for a cache without them."""
+        return 0
 
     def window_lengths(self) -> tuple[tuple[str, int], ...]:
         """Each window sub-pool and the history a running request keeps

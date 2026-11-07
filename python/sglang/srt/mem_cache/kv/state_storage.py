@@ -97,6 +97,13 @@ class StateStorage:
 
     # -- slot lifecycle --
 
+    def fresh_request_slots(self, table) -> int:
+        """Slots acquire allocates for a request that holds no state yet: its
+        working slot and, with extra buffers, its initial tracking slots."""
+        return 1 + (
+            table.mamba_initial_tracking_slots if table.enable_mamba_extra_buffer else 0
+        )
+
     def pending_request_slots(self, table, req: Req) -> int:
         """Slots acquire will allocate for this request's working/tracking state."""
         return int(not req.kv.holds_mamba) + (

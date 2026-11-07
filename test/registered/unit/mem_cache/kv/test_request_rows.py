@@ -1,8 +1,8 @@
 """Who holds each request row of a unified pool, and what a reset leaves.
 
 The request table keeps one state per row (free, active, parked by a streaming
-session between turns, held by no request), and a reset frees every row and
-ends what is keyed by a row or a request.
+session between turns, held by no request), and the memory-pressure
+predicates count rows by state rather than by the free list's length.
 """
 
 import unittest
@@ -20,6 +20,9 @@ from sglang.srt.managers.scheduler_components.invariant_checker import (
 )
 from sglang.srt.mem_cache.kv.alloc.signals import NetworkTransfer, ReceiveHold
 from sglang.srt.mem_cache.kv.requests import RequestTable, RowState
+from sglang.srt.models.unlimited_ocr_v2_support.retained_window import (
+    RetainedWindow,
+)
 from sglang.srt.session.streaming_session import SessionSlot, StreamingSession
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -152,6 +155,62 @@ class TestRowStates(CustomTestCase):
         self.assertEqual(storage.requests.free_slots.count(row), 1)
 
 
+class TestHeldRowPredicates(CustomTestCase):
+    def setUp(self):
+        setup_allocator_context()
+
+    def test_preallocation_rows_do_not_hide_held_rows(self):
+        """BUG REGRESSION. The free list spans the preallocation rows too, so
+        reading held rows off its length read them `pre_alloc_size` low: two
+        live rows looked like none, and a mix of parked and active rows like
+        parked rows only. Same live work, same answer, with or without
+        preallocation rows."""
+        for pre_alloc_size in (0, 8):
+            with self.subTest(pre_alloc_size=pre_alloc_size):
+                storage = _storage(pre_alloc_size=pre_alloc_size)
+                first, second = _active(storage, "a"), _active(storage, "b")
+                self.assertTrue(storage.others_hold_rows(None))
+                self.assertTrue(storage.others_hold_rows(first))
+                storage.release_row(second)
+                self.assertFalse(storage.others_hold_rows(first))
+                self.assertTrue(storage.others_hold_rows(None))
+                _parked(storage)
+                self.assertFalse(storage.only_parked_rows_held())
+                storage.release_row(first)
+                self.assertTrue(storage.only_parked_rows_held())
+
+    def test_pd_decode_preallocated_rows_count_as_held(self):
+        """A PD decode node's preallocated receive row is memory its request
+        gives back when the transfer ends or fails: waiting for it makes
+        progress, so it counts as held, beside parked rows or alone."""
+        storage = _storage(max_num_reqs=2, pre_alloc_size=4)
+        receiving = [_active(storage, f"recv-{i}") for i in range(3)]
+        self.assertTrue(storage.others_hold_rows(None))
+        slot = _parked(storage)
+        self.assertFalse(storage.only_parked_rows_held())
+        for req in receiving:
+            storage.release_row(req)
+        self.assertTrue(storage.only_parked_rows_held())
+        self.assertFalse(storage.others_hold_rows(None))
+        storage.release_row(slot)
+        self.assertFalse(storage.only_parked_rows_held())
+
+    def test_beam_and_retained_window_rows_count_as_held(self):
+        storage = _storage()
+        (beam,) = storage.take_rows(1)
+        self.assertIs(storage.requests.state_of(beam), RowState.HELD)
+        self.assertTrue(storage.others_hold_rows(None))
+        storage.release_rows([beam])
+        window = RetainedWindow()
+        window.kv = _active(storage, "window").kv
+        storage.hold_row(window)
+        self.assertTrue(storage.others_hold_rows(None))
+        # A retained window is no request: its release ends no transfer.
+        storage.release_row(window)
+        self.assertFalse(storage.others_hold_rows(None))
+        self.assertEqual(storage.requests.count(RowState.FREE), 4)
+
+
 class TestResets(CustomTestCase):
     def setUp(self):
         setup_allocator_context()
@@ -167,6 +226,7 @@ class TestResets(CustomTestCase):
             session.take(turn)
             self.assertTrue(session.try_cache_finished_req(turn))
         self.assertEqual(storage.requests.count(RowState.PARKED), 2)
+        self.assertTrue(storage.only_parked_rows_held())
 
         # The flush: the tree reset forgets the slots, then the table clears.
         session.slots.clear()
@@ -177,6 +237,8 @@ class TestResets(CustomTestCase):
         rows = {_active(storage, f"new-{i}").kv.req_pool_idx for i in range(4)}
         self.assertEqual(len(rows), 4)
         self.assertEqual(storage.requests.count(RowState.ACTIVE), 4)
+        self.assertTrue(storage.others_hold_rows(None))
+        self.assertFalse(storage.only_parked_rows_held())
 
     def test_role_switch_reset_ends_transfers_and_receive_holds(self):
         """The reset a role switch (as a flush) runs frees every row, so every
@@ -201,6 +263,8 @@ class TestResets(CustomTestCase):
         self.assertEqual(storage._network_transfers, {})
         self.assertEqual(storage._receive_holds, {})
         self.assertEqual(storage.requests.count(RowState.FREE), 8)
+        self.assertFalse(storage.others_hold_rows(None))
+        self.assertFalse(storage.only_parked_rows_held())
 
     def test_closing_a_parked_session_frees_its_row(self):
         """A session slot is no request: releasing its parked row ends no
