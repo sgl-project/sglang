@@ -184,13 +184,21 @@ class TestServerInfoTransportParity(CustomTestCase):
         )
 
     def test_http_and_both_grpc_roles_share_startup_metadata(self):
+        secrets = {
+            "api_key": "api-secret",
+            "admin_api_key": "admin-secret",
+            "ssl_keyfile_password": "ssl-secret",
+        }
         for config in (None, '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'):
             with self.subTest(kv_events_config=config):
                 args = ServerArgs(
-                    model_path="dummy", kv_events_config=config, page_size=64
+                    model_path="dummy", kv_events_config=config, page_size=64, **secrets
                 )
                 http_info = _call_server_info_with(args)
                 self.assertEqual(http_info["frontend"], "python")
+                # Every transport below reports the same fields.
+                for name in secrets:
+                    self.assertEqual(http_info[name], "<redacted>")
                 for field in ("startup_time", "internal_states", "version", "frontend"):
                     self.assertIn(field, http_info)
                     http_info.pop(field)
@@ -267,6 +275,68 @@ class TestServerInfoTransportParity(CustomTestCase):
                 )
             )
         load.return_value.start_metadata_server.assert_not_called()
+
+
+class TestServerInfoInternalStatesRedaction(CustomTestCase):
+    """`internal_states` is the scheduler's readback of the resolved config,
+    which `/server_info` and `Engine.get_server_info` report next to the
+    redacted top-level fields: the credentials must not reach it either."""
+
+    # Every word is distinctive, so a value split at its space cannot hide.
+    SECRETS = {
+        "api_key": "api-secret tail-api",
+        "admin_api_key": "admin-secret tail-admin",
+        "ssl_keyfile_password": "ssl-secret tail-ssl",
+    }
+
+    def _scheduler_readback(self, server_args: ServerArgs) -> dict:
+        from sglang.srt.managers.io_struct import GetInternalStateReq
+        from sglang.srt.managers.scheduler_components.internal_state import (
+            SchedulerInternalStateController,
+        )
+
+        # The contributors read the live scheduler; the config part is under test.
+        contributors = {
+            name: MagicMock()
+            for name in vars(SchedulerInternalStateController)
+            if name.startswith("_add_")
+        }
+        controller = SchedulerInternalStateController(
+            scheduler=SimpleNamespace(), record_step_time=False
+        )
+        publish(server_args, role="scheduler")
+        self.addCleanup(reset_context)
+        with patch.multiple(SchedulerInternalStateController, **contributors):
+            return controller.get_internal_state(GetInternalStateReq()).internal_state
+
+    def _assert_redacted(self, payload: dict) -> None:
+        text = json.dumps(payload, default=str)
+        for secret in self.SECRETS.values():
+            for word in secret.split():
+                self.assertNotIn(word, text)
+        for state in payload["internal_states"]:
+            for name in self.SECRETS:
+                self.assertEqual(state[name], "<redacted>")
+
+    def test_http_and_engine_server_info(self):
+        from sglang.srt.entrypoints.engine import Engine
+
+        server_args = ServerArgs(model_path="dummy", **self.SECRETS)
+        readback = self._scheduler_readback(server_args)
+
+        self._assert_redacted(_call_server_info_with(server_args, [readback]))
+
+        async def _internal_state():
+            return [readback]
+
+        engine = Engine.__new__(Engine)
+        engine.tokenizer_manager = _stub_tokenizer_manager(server_args, _internal_state)
+        engine.loop = asyncio.new_event_loop()
+        self.addCleanup(engine.loop.close)
+        engine._scheduler_init_result = SimpleNamespace(
+            scheduler_infos=[{"max_req_input_len": 1024}]
+        )
+        self._assert_redacted(engine.get_server_info())
 
 
 class TestModelInfoTransportParity(CustomTestCase):

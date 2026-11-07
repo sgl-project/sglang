@@ -67,7 +67,6 @@ from sglang.srt.rust_server.multimodal import (
     settle_shm_buffers,
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.flatten import (
     FlatPairColumns,
     NestedRowColumns,
@@ -705,18 +704,8 @@ class RustServer:
         if not finished and not unfinished:
             return
         try:
-            # Redact even with watermarking off, as the Python writer does:
-            # Rust mode refuses `--enable-watermark`, but the Python API
-            # accepts a server key without it.
-            server_args = redact_watermark_secrets(self.server_args.resolved_dict())
-        except Exception as e:
-            logger.error(f"Failed to snapshot server_args for the dump: {e!r}")
-            server_args = None
-        try:
-            resolved_config = redact_watermark_secrets(
-                get_context().resolved_server_args_dict(
-                    self.server_args.resolved_dict()
-                )
+            resolved_config = get_context().resolved_server_args_dict(
+                self.server_args.resolved_dict()
             )
         except Exception as e:
             logger.error(f"Failed to snapshot the resolved config for the dump: {e!r}")
@@ -725,7 +714,7 @@ class RustServer:
             folder,
             crash_dump_hostname(),
             finished + unfinished,
-            server_args=server_args,
+            server_args=self.server_args,
             resolved_config=resolved_config,
             watermark_config=self.server_args.watermark_config,
             # Every process that hosts a listener dumps its own requests.
