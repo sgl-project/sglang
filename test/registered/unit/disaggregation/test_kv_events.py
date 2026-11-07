@@ -28,6 +28,7 @@ from sglang.srt.disaggregation.kv_events import (
     kv_event_namespace_seed,
     namespaced_block_hash,
     resolve_load_pub_range,
+    select_kv_publisher_dp_rank,
 )
 from sglang.srt.runtime_context import describe_kv_events_publisher
 from sglang.srt.server_args import ServerArgs
@@ -232,6 +233,63 @@ class TestReplay(CustomTestCase):
             self.assertEqual(batch.events, [AllBlocksCleared()])
             self.assertEqual(batch.attn_dp_rank, 0)
         self.assertEqual(frames[2][3], b"")
+
+
+class TestSelectKvPublisherDpRank(CustomTestCase):
+    def test_attention_dp_selects_attn_dp_rank(self):
+        rank = select_kv_publisher_dp_rank(attn_dp_size=4, attn_dp_rank=2, dp_rank=None)
+        self.assertEqual(rank, 2)
+
+    def test_pure_dp_selects_dp_rank(self):
+        rank = select_kv_publisher_dp_rank(attn_dp_size=1, attn_dp_rank=0, dp_rank=3)
+        self.assertEqual(rank, 3)
+
+    def test_single_replica_defaults_to_zero(self):
+        rank = select_kv_publisher_dp_rank(attn_dp_size=1, attn_dp_rank=0, dp_rank=None)
+        self.assertEqual(rank, 0)
+
+
+class TestSchedulerKvMetricsPublisher(CustomTestCase):
+    def test_emit_kv_metrics_uses_attention_dp_rank(self):
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from sglang.srt.managers.scheduler_components.kv_events_publisher import (
+            SchedulerKvEventsPublisher,
+        )
+        from sglang.srt.runtime_context import _PARALLEL
+
+        sent_metrics = []
+        sock = SimpleNamespace(closed=False)
+        stats = SimpleNamespace(
+            num_running_reqs=SimpleNamespace(total=5),
+            num_queue_reqs=SimpleNamespace(total=2),
+            token_usage=0.4,
+            cache_hit_rate=0.8,
+        )
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.kv_events_publisher.sock_send",
+            lambda _, m: sent_metrics.append(m),
+        ):
+            with patch.object(
+                _PARALLEL,
+                "_overrides",
+                {"attn_dp_size": 4, "attn_dp_rank": 3, "dp_rank": None},
+            ):
+                publisher = SchedulerKvEventsPublisher(
+                    kv_events_config=None,
+                    tree_cache=None,
+                    send_metrics_from_scheduler=sock,
+                    max_running_requests=10,
+                    max_total_num_tokens=1000,
+                    get_stats=lambda: stats,
+                )
+                publisher.enable_kv_cache_events = True
+                publisher.emit_kv_metrics()
+
+        self.assertEqual(len(sent_metrics), 1)
+        self.assertEqual(sent_metrics[0].data_parallel_rank, 3)
 
 
 if __name__ == "__main__":
