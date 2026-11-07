@@ -45,9 +45,21 @@ _GRAPH_PHASES = {
 class TestEnableMetrics(CustomTestCase):
     def test_metrics_1gpu(self):
         """Test that metrics endpoint returns data when enabled"""
+
+        def _verify_effective_request_limit(metrics):
+            response = requests.get(f"{DEFAULT_URL_FOR_TEST}/server_info")
+            self.assertEqual(response.status_code, 200)
+            effective_limit = response.json()["internal_states"][0][
+                "effective_max_running_requests_per_dp"
+            ]
+            samples = metrics["sglang:max_running_requests_effective"]
+            self.assertEqual(len(samples), 1)
+            self.assertEqual(samples[0].value, effective_limit)
+            self.assertGreater(effective_limit, 0)
+
         self._execute_core(
             other_args=[],
-            verify_metrics_extra=None,
+            verify_metrics_extra=_verify_effective_request_limit,
             expect_mfu_metrics=True,
             enable_mfu_metrics=True,
         )
