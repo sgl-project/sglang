@@ -3629,8 +3629,16 @@ def _gather_late_layer_ids(
     return gathered.squeeze(-1)
 
 
+def _needs_cp_tail_scatter(
+    tail: Optional[LateLayerTail], forward_batch: ForwardBatch
+) -> bool:
+    """CUDA prefill CP with a replay tail: the CP gather reads this rank's full
+    layout, so the tail rows go back even when DSpark captures."""
+    return _is_cuda and tail is not None and is_cp_active(forward_batch)
+
+
 def _scatter_tail_rows(
-    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int
+    tail: LateLayerTail, rows: torch.Tensor, num_tokens: int, zero: bool = False
 ) -> torch.Tensor:
     # Rows outside the tail are never read (see _check_late_layer_tail_readers).
     if tail.scatter_indices is not None:
@@ -3639,12 +3647,37 @@ def _scatter_tail_rows(
         full = rows.new_zeros((num_tokens + 1, rows.shape[1]))
         full.index_copy_(0, tail.scatter_indices, rows)
         return full[:num_tokens]
-    full = rows.new_empty((num_tokens, rows.shape[1]))
+    # CP gathers this rank's whole layout. The rows outside the tail are never
+    # read (see _check_late_layer_tail_readers); zeroing is defensive so the
+    # all-gather buffer stays finite.
+    full = (
+        rows.new_zeros((num_tokens, rows.shape[1]))
+        if zero
+        else rows.new_empty((num_tokens, rows.shape[1]))
+    )
     if tail.contiguous_start is not None:
         full[tail.contiguous_start : tail.contiguous_start + rows.shape[0]].copy_(rows)
     else:
         full[tail.token_indices] = rows[: tail.token_indices.shape[0]]
     return full
+
+
+def _finalize_dspark_aux(
+    aux: AuxHiddenStatePacker,
+    tail: Optional[LateLayerTail],
+    num_tokens: int,
+    cuda_cp_tail: bool,
+) -> torch.Tensor:
+    """Finalize the packed DSpark captures, then move them with the tail rows.
+
+    The packer is not iterable: every capture lands in one
+    ``[tokens, K * hidden]`` buffer, so the CP scatter has to run on the
+    finalized payload instead of a per-capture list.
+    """
+    packed = aux.finalize()
+    if not cuda_cp_tail:
+        return packed
+    return _scatter_tail_rows(tail=tail, rows=packed, num_tokens=num_tokens, zero=True)
 
 
 class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
@@ -4699,18 +4732,29 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        if tail is not None and not capture_dspark:
+        # CUDA prefill CP: the runner gathers every output, DSpark captures
+        # included, by this rank's full shard layout, so the tail rows go back
+        # into that layout before the gather.
+        cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        num_tokens = input_ids.shape[0]
+        if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
-            num_tokens = input_ids.shape[0]
             hidden_states = _scatter_tail_rows(
-                tail=tail, rows=hidden_states, num_tokens=num_tokens
+                tail=tail,
+                rows=hidden_states,
+                num_tokens=num_tokens,
+                zero=cuda_cp_tail,
             )
             pre_hc_head = _scatter_tail_rows(
-                tail=tail, rows=pre_hc_head, num_tokens=num_tokens
+                tail=tail,
+                rows=pre_hc_head,
+                num_tokens=num_tokens,
+                zero=cuda_cp_tail,
             )
-
         if capture_dspark:
-            return (hidden_states, pre_hc_head), dspark_aux_hidden_states.finalize()
+            return (hidden_states, pre_hc_head), _finalize_dspark_aux(
+                dspark_aux_hidden_states, tail, num_tokens, cuda_cp_tail
+            )
 
         return hidden_states, pre_hc_head
 
