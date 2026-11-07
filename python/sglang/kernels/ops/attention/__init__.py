@@ -646,3 +646,17 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+for _op, _module in (
+    ("finish_prefill_indexer_topk", "fp4_indexer"),
+    ("select_candidate_block_ids_triton", "candidate_blocks"),
+):
+    register_kernel(
+        KernelSpec(
+            op=f"attention.{_op}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.attention.dsv4.{_module}:{_op}",
+            capabilities=CUDA_ONLY,
+        )
+    )
+del _op, _module
