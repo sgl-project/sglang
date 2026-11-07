@@ -550,10 +550,22 @@ fn built_request_keeps_its_media() {
         rid: Rid::from_client("with-media"),
         text: Some("look".into()),
         mm: Some(Box::new(MmData {
-            image_data: vec![MmItem::Source("data:image/png;base64,AAAA".into())],
+            image_data: vec![
+                MmItem::Source("data:image/png;base64,AAAA".into()),
+                MmItem::Ref {
+                    url: "file:///i.png".into(),
+                    hints: MediaHints {
+                        detail: Some("low".into()),
+                        ..Default::default()
+                    },
+                },
+            ],
             video_data: vec![MmItem::Ref {
                 url: "file:///v.mp4".into(),
-                hints: MediaHints { fps: Some(2.0) },
+                hints: MediaHints {
+                    fps: Some(2.0),
+                    ..Default::default()
+                },
             }],
             ..Default::default()
         })),
@@ -566,7 +578,10 @@ fn built_request_keeps_its_media() {
     let body = &snapshot["bodies"][snapshot["unfinished"][0]["body"].to_string()];
     assert_eq!(
         body["image_data"],
-        serde_json::json!(["data:image/png;base64,AAAA"])
+        serde_json::json!([
+            "data:image/png;base64,AAAA",
+            {"url": "file:///i.png", "detail": "low"}
+        ])
     );
     assert_eq!(
         body["video_data"],
