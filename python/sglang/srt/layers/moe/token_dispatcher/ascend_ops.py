@@ -13,6 +13,9 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.environ import envs
+from sglang.srt.hardware_backend.npu.moe.prefill_graph import (
+    get_moe_prefill_graph_state,
+)
 from sglang.srt.hardware_backend.npu.moe.routing import (
     INT8_QUANT_MODE,
     MXFP8_QUANT_MODE,
@@ -176,6 +179,17 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
+        # Must precede the extend check: the prefill runner forces
+        # is_extend_in_batch False while capturing, so only the capture marker
+        # keeps this on allgather instead of the decode MC2 path.
+        if get_moe_prefill_graph_state() is not None:
+            return self._dispatch_allgather(
+                hidden_states,
+                topk_weights,
+                topk_ids,
+                self.tp_group,
+                capacity=hidden_states.shape[0],
+            )
         if get_is_extend_in_batch():
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
@@ -426,22 +440,33 @@ class AscendOpsDispatcher(BaseDispatcher):
         dist.all_gather(gathered_rows, local_rows_tensor, group=group)
         return [int(rows.item()) for rows in gathered_rows]
 
-    def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
-        """Gather the full batch on every TP rank."""
+    def _dispatch_allgather(
+        self, hidden_states, topk_weights, topk_ids, group, *, capacity=None
+    ):
+        """Gather the full batch on every TP rank.
+
+        ``capacity`` is the captured bucket width: the graph runs every rank at
+        that width, so the host row-count exchange is skipped.
+        """
         input_dtype = hidden_states.dtype
         quant_mode = self._quant_mode("routing")
         if quant_mode not in (-1, INT8_QUANT_MODE, MXFP8_QUANT_MODE):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
-        # CP and DP can split a batch unevenly (for example with interleaved or
-        # zigzag schedules).  Deriving row counts from DP metadata assumes an
-        # equal split and becomes incorrect as soon as CP is enabled.  Exchange
-        # the actual local row count so the subsequent padded all-gather and
-        # reduce-scatter use the exact layout produced by the attention path.
-        row_sizes = self._allgather_row_sizes(
-            hidden_states.shape[0], group, hidden_states.device
-        )
+        if capacity is not None:
+            # Captured graph: every rank runs the same bucket width, and a
+            # captured segment cannot read live row counts.
+            row_sizes = [capacity] * dist.get_world_size(group)
+        else:
+            # CP and DP can split a batch unevenly (for example with interleaved or
+            # zigzag schedules).  Deriving row counts from DP metadata assumes an
+            # equal split and becomes incorrect as soon as CP is enabled.  Exchange
+            # the actual local row count so the subsequent padded all-gather and
+            # reduce-scatter use the exact layout produced by the attention path.
+            row_sizes = self._allgather_row_sizes(
+                hidden_states.shape[0], group, hidden_states.device
+            )
         world_size = len(row_sizes)
         max_rows = max(row_sizes)
         if max_rows == 0:
