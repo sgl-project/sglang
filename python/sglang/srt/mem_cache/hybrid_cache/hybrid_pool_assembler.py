@@ -78,6 +78,12 @@ def _evict_swa_for_device_alloc(cache: UnifiedRadixCache, required_size: int) ->
 def _evict_mamba_for_device_alloc(cache: UnifiedRadixCache, required_size: int) -> None:
     from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
+    checkpoint_pool = cache.token_to_kv_pool_allocator.state.ckpt_pool
+    if checkpoint_pool is not None:
+        shortfall = max(0, required_size - checkpoint_pool.available_size())
+        if shortfall > 0:
+            cache.evict(EvictParams(mamba_num=shortfall))
+        return
     available_size = (
         cache.token_to_kv_pool_allocator.state_slots.schedulable_available_size()
     )
@@ -1100,6 +1106,17 @@ def _state_host_layout() -> str:
     return "page_first_direct" if layout == "page_first_kv_split" else layout
 
 
+def _mamba_checkpoint_host_inputs(params, mamba_pool):
+    state = params.token_to_kv_pool_allocator.state
+    if state.ckpt_pool is None:
+        return mamba_pool, params.token_to_kv_pool_allocator.state_slots
+    from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointDevicePool
+
+    if params.mtp_draft_mamba_pools:
+        raise ValueError("INT8 Mamba HiCache does not support packed MTP draft pools.")
+    return MambaCheckpointDevicePool(mamba_pool, state.ckpt_pool), state.ckpt_pool
+
+
 def build_mamba_host_pool(
     mamba_pool,
     pool_info: DevicePoolInfo,
@@ -1139,6 +1156,7 @@ def _mamba_entry(
     *,
     params: CacheInitParams,
     mamba_pool: Any,
+    allocator: Any,
     info: DevicePoolInfo,
     layer_mapping: dict[int, int],
     transfer_layer_id_max: int,
@@ -1147,7 +1165,6 @@ def _mamba_entry(
     device_evict_fn: Optional[Callable[[int], Any]],
 ) -> PoolEntry:
     drafts = params.mtp_draft_mamba_pools
-    allocator = params.token_to_kv_pool_allocator.state_slots
     return build_pool_entry(
         name=PoolName.MAMBA,
         host_pool=build_mamba_host_pool(
@@ -1193,6 +1210,7 @@ def build_hybrid_mamba_stack(
     then the Mamba state pool, which keeps its own host path.
 
     ``kv_pool`` is the hybrid pool or its full-attention KV child."""
+    mamba_pool, mamba_allocator = _mamba_checkpoint_host_inputs(params, mamba_pool)
     mamba_info = _mamba_info(mamba_pool)
     mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
     transfer_layer_id_max = (
@@ -1225,6 +1243,7 @@ def build_hybrid_mamba_stack(
         _mamba_entry(
             params=params,
             mamba_pool=mamba_pool,
+            allocator=mamba_allocator,
             info=mamba_info,
             layer_mapping=mamba_layer_mapping,
             transfer_layer_id_max=transfer_layer_id_max,
@@ -1268,6 +1287,7 @@ def build_hybrid_mamba_swa_stack(
     storage_backend_extra_config: Optional[dict] = None,
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
+    mamba_pool, mamba_allocator = _mamba_checkpoint_host_inputs(params, mamba_pool)
     mamba_info = _mamba_info(mamba_pool)
     mamba_layer_mapping = _mamba_layer_mapping(mamba_info, start_layer)
     transfer_layer_id_max = (
@@ -1304,6 +1324,7 @@ def build_hybrid_mamba_swa_stack(
         _mamba_entry(
             params=params,
             mamba_pool=mamba_pool,
+            allocator=mamba_allocator,
             info=mamba_info,
             layer_mapping=mamba_layer_mapping,
             transfer_layer_id_max=transfer_layer_id_max,

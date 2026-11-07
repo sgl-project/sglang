@@ -58,7 +58,7 @@ from sglang.test.kits.unified_radix_cache.load_back import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -1243,6 +1243,112 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertIsNotNone(node_device_value(cache, leaf, ComponentType.FULL))
         self._release_ongoing_load_back_locks(cache)
         cache.sanity_check()
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.version.hip is None, "NVIDIA CUDA required"
+)
+class TestInt8MambaLoadBack(UnifiedRadixCacheLoadBackFixtures, CustomTestCase):
+    cfg = CacheConfig(
+        components=(ComponentType.FULL, ComponentType.MAMBA),
+        num_layers=3,
+        full_attention_layer_ids=(0,),
+        enable_int8_mamba_checkpoint=True,
+    )
+
+    def test_compressed_round_trip_and_deferred_restore_wait(self):
+        """H2D targets checkpoint IDs; whole-state CoW waits before decoding."""
+        from types import SimpleNamespace
+
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        cache, allocator, requests = self._build_hicache_fixture()
+        ckpt = allocator.state.ckpt_pool
+        active = allocator.state.pool
+        req = self._make_req(requests)
+        src = req.kv.mamba_pool_idx.unsqueeze(0)
+        active.mamba_cache.temporal[:, src] = torch.randn_like(
+            active.mamba_cache.temporal[:, src]
+        )
+        for c in active.mamba_cache.conv:
+            c[:, src] = torch.randn_like(c[:, src])
+        checkpoint = ckpt.alloc(1)
+        ckpt.store_from_active(active, src, checkpoint)
+        q = ckpt.temporal.qdata[:, checkpoint].clone()
+        scale = ckpt.temporal.scale[:, checkpoint].clone()
+        conv = [c[:, checkpoint].clone() for c in ckpt.conv]
+        ckpt.load_to_active(active, checkpoint, src)
+        expected = active.mamba_cache.temporal[:, src].clone()
+        tokens = list(range(64))
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", tokens)),
+                value=allocator.alloc(64),
+                mamba_value=checkpoint,
+            )
+        )
+        node = match_prefix(cache, tokens).last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(mamba_num=1))
+        self.assertIsNone(node_device_value(cache, node, ComponentType.MAMBA))
+        self.assertIsNotNone(node_host_value(cache, node, ComponentType.MAMBA))
+        checkpoint_free = ckpt.available_size()
+        active_free = allocator.state_slots.available_size()
+        # Reuse and overwrite the old checkpoint so stale GPU contents cannot
+        # accidentally satisfy the round-trip comparison.
+        ckpt.temporal.qdata.zero_()
+        ckpt.temporal.scale.zero_()
+        for c in ckpt.conv:
+            c.zero_()
+        self.assertTrue(cache.load_back(node, req=req))
+        restored = node_device_value(cache, node, ComponentType.MAMBA)
+        self.assertEqual(ckpt.available_size(), checkpoint_free - 1)
+        self.assertEqual(allocator.state_slots.available_size(), active_free)
+        self.assertTrue(torch.equal(req.kv.mamba_cow_src_index, restored))
+        self._finish_pending_loads(cache)
+        self.assertTrue(torch.equal(ckpt.temporal.qdata[:, restored], q))
+        self.assertTrue(torch.equal(ckpt.temporal.scale[:, restored], scale))
+        for c, ref in zip(ckpt.conv, conv):
+            self.assertTrue(torch.equal(c[:, restored], ref))
+
+        # Model a transfer whose contents become visible at the router fence.
+        # Missing the fence makes the real codec restore zeros, deterministically.
+        ckpt.temporal.qdata[:, restored] = 0
+
+        def complete_transfer(_layer):
+            ckpt.temporal.qdata[:, restored] = q
+
+        kv_pool = allocator.get_kvcache()
+        # The fixture skips the model memory planner, which normally binds
+        # state routes before the host stack is attached.
+        from sglang.srt.mem_cache.kv.router import STATE_PART
+
+        kv_pool.layer_router.bind_part(
+            sub_pool="mamba",
+            part=STATE_PART,
+            view=active,
+            indices=allocator.state.layer_map,
+        )
+        previous_counter = kv_pool.layer_transfer_counter
+        self.addCleanup(setattr, kv_pool, "layer_transfer_counter", previous_counter)
+        kv_pool.layer_transfer_counter = SimpleNamespace(wait_until=complete_transfer)
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            mamba_clear_indices=None,
+            mamba_cow_src_indices=restored,
+            mamba_cow_dst_indices=src,
+        )
+        runner = SimpleNamespace(
+            req_to_token_pool=requests,
+            token_to_kv_pool_allocator=allocator,
+            token_to_kv_pool=kv_pool,
+            is_draft_worker=False,
+        )
+        ModelRunner._maybe_execute_deferred_mamba_cow_and_clear(runner, batch)
+        self.assertTrue(torch.equal(active.mamba_cache.temporal[:, src], expected))
+        self.assertIsNone(batch.mamba_cow_src_indices)
+        self._release_ongoing_load_back_locks(cache)
 
 
 class TestInflightAnchorStillLoads(CustomTestCase):

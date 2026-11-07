@@ -723,19 +723,28 @@ class MambaComponent(TreeComponent):
         storage, sub_pool = self._state()
         return storage.quantizes_checkpoints(sub_pool)
 
-    def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
+    def _alloc_int8_ckpt_slot(self) -> Optional[torch.Tensor]:
         storage, sub_pool = self._state()
         slot = storage.take_checkpoint_slot(sub_pool)
         if slot is None:
             self.cache.evict(EvictParams(num_tokens=0, mamba_num=1))
             slot = storage.take_checkpoint_slot(sub_pool)
-            assert slot is not None, "Can not alloc int8 mamba checkpoint slot"
+        # In-flight backups may pin every checkpoint. Skip caching rather
+        # than aborting the request or donating its tracking slot first.
         return slot
 
-    def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
+    def _commit_int8_checkpoint(
+        self, active_slots: torch.Tensor
+    ) -> Optional[torch.Tensor]:
         ckpt_slot = self._alloc_int8_ckpt_slot()
+        if ckpt_slot is None:
+            return None
         storage, sub_pool = self._state()
-        storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
+        try:
+            storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
+        except Exception:
+            storage.free_checkpoints(sub_pool, ckpt_slot)
+            raise
         return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
@@ -807,6 +816,8 @@ class MambaComponent(TreeComponent):
                 return cache_len
             if self.quantizes_checkpoints:
                 insert_params.mamba_value = self._commit_int8_checkpoint(active_value)
+                if insert_params.mamba_value is None:
+                    return 0
             else:
                 insert_params.mamba_value = active_value
             return cache_len
@@ -828,17 +839,42 @@ class MambaComponent(TreeComponent):
             # Donate the mamba index to the radix cache instead of copying.
             if self.quantizes_checkpoints:
                 if self.cache.enable_mamba_extra_buffer:
-                    new_slot = self._try_alloc_mamba_slot(req)
-                    if new_slot is None:
+                    ckpt_slot = self._alloc_int8_ckpt_slot()
+                    if ckpt_slot is None:
                         return 0
                     storage, sub_pool = self._state()
+                    new_slot = None
+                    try:
+                        new_slot = self._try_alloc_mamba_slot(req)
+                        if new_slot is None:
+                            storage.free_checkpoints(sub_pool, ckpt_slot)
+                            return 0
+                        keep_idx = (
+                            self.cache.req_to_token_pool.get_mamba_ping_pong_keep_idx(
+                                req
+                            )
+                        )
+                        src_active = (
+                            req.kv.mamba_ping_pong_track_buffer[keep_idx]
+                            .unsqueeze(0)
+                            .clone()
+                        )
+                        # Encode before donation: failure preserves request ownership.
+                        storage.store_checkpoint(sub_pool, src_active, ckpt_slot)
+                    except Exception:
+                        storage.free_checkpoints(sub_pool, ckpt_slot)
+                        if new_slot is not None:
+                            storage.free_state_slots(sub_pool, new_slot)
+                        raise
                     src_active = storage.donate_tracking_slot(sub_pool, req, new_slot)
-                    mamba_value_donated = self._commit_int8_checkpoint(src_active)
+                    mamba_value_donated = ckpt_slot
                     storage.free_state_slots(sub_pool, src_active)
                 else:
                     mamba_value_donated = self._commit_int8_checkpoint(
                         req.kv.mamba_pool_idx.view(-1)
                     )
+                    if mamba_value_donated is None:
+                        return 0
             elif self.cache.enable_mamba_extra_buffer:
                 new_slot = self._try_alloc_mamba_slot(req)
                 if new_slot is None:

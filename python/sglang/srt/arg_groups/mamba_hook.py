@@ -71,19 +71,11 @@ def handle_mamba_backend(server_args: Any):
 
 
 def handle_int8_mamba_checkpoint(server_args: Any):
-    # The host-offload path (enabled by --enable-hierarchical-cache) and
-    # custom radix-cache backends are NOT int8-aware: they would read int8
-    # checkpoint slots as bf16 active slots (wrong pool / out-of-range).
-    # Reject the combination up front rather than silently corrupting state.
     cfg = resolving_view(server_args)
     if not cfg.enable_int8_mamba_checkpoint:
         return
     if cfg.enable_hierarchical_cache:
-        raise ValueError(
-            "--enable-int8-mamba-checkpoint is not supported together with "
-            "--enable-hierarchical-cache: the host-offload path "
-            "is not int8-aware. Disable one of them."
-        )
+        _validate_int8_mamba_hicache(cfg)
     if cfg.radix_cache_backend is not None:
         raise ValueError(
             "--enable-int8-mamba-checkpoint only supports the built-in mamba "
@@ -101,6 +93,47 @@ def handle_int8_mamba_checkpoint(server_args: Any):
             "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
             "pool, so the flag would have no effect. Disable one of them."
         )
+
+
+def _validate_int8_mamba_hicache(cfg):
+    """Only enable checkpoint-aware, lossless L1/L2 transport combinations."""
+    from sglang.srt.environ import envs
+
+    if not get_platform().is_cuda:
+        raise ValueError("INT8 Mamba HiCache currently requires NVIDIA CUDA.")
+    if cfg.hicache_io_backend != "kernel" or cfg.hicache_mem_layout != "page_first":
+        raise ValueError("INT8 Mamba HiCache requires kernel IO and page_first layout.")
+    if (
+        cfg.hicache_host_memory_mode != "cache"
+        or cfg.hicache_write_policy != "write_through"
+    ):
+        raise ValueError("INT8 Mamba HiCache requires cache mode and write_through.")
+    if cfg.hicache_storage_backend is not None:
+        raise ValueError("INT8 Mamba HiCache supports L1/L2 only; L3 is unsupported.")
+    if cfg.enable_linear_replayssm or cfg.enable_linear_replayssm_spec:
+        raise ValueError("INT8 Mamba HiCache does not support ReplaySSM.")
+    if cfg.mamba_radix_cache_strategy != "extra_buffer_lazy":
+        raise ValueError("INT8 Mamba HiCache requires extra_buffer_lazy.")
+    if cfg.mamba_ssm_dtype != "bfloat16":
+        raise ValueError("INT8 Mamba HiCache requires BF16 SSM state.")
+    if cfg.disaggregation_mode != "null" or cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "INT8 Mamba HiCache does not support PD or speculative decoding."
+        )
+    if envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get():
+        raise ValueError("INT8 Mamba HiCache does not support host-only checkpoints.")
+    if any(
+        (getattr(cfg, key) or 1) != 1
+        for key in (
+            "pp_size",
+            "dp_size",
+            "attn_dp_size",
+            "attn_cp_size",
+            "dcp_size",
+            "nnodes",
+        )
+    ):
+        raise ValueError("INT8 Mamba HiCache currently supports single-node TP only.")
 
 
 def _platform_supports_mamba_cache_extra_buffer() -> bool:
