@@ -432,6 +432,7 @@ class TestDeadRows(CustomTestCase):
             return_logprob=True,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             batch_size=lambda: 2,
+            forward_iter=1,
         )
         result = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(
@@ -463,7 +464,9 @@ class TestDeadRows(CustomTestCase):
         args, kwargs = append.call_args
         self.assertEqual(args, (live, 8, -2.0))
         self.assertEqual(kwargs["row"], 1)
-        processor.beam_coordinator.commit_decode.assert_called_once_with(batch, [live])
+        processor.beam_coordinator.commit_decode.assert_called_once_with(
+            [live], batch.forward_iter
+        )
         processor.output_streamer.stream_output.assert_called_once_with([live], True)
 
 
@@ -618,6 +621,7 @@ class TestSamplingMaskStatusErrors(CustomTestCase):
             return_logprob=False,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             batch_size=lambda: 1,
+            forward_iter=1,
         )
         result = GenerationBatchResult(
             logits_output=LogitsProcessorOutput(

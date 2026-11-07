@@ -376,22 +376,23 @@ class BeamCoordinator(msgspec.Struct, kw_only=True):
             )
             self._apply_survivors(group, next_tokens, parent_idx, batch.forward_iter)
 
-    def commit_decode(self, batch: ScheduleBatch, reqs_in_batch: List[Req]) -> None:
+    def commit_decode(self, reqs: List[Req], forward_iter: int) -> None:
         """Deferred half: fold staged selections into the DAG and apply
-        finish/abort, on the requests still in the batch only."""
+        finish/abort, on ``reqs``, the requests the step at ``forward_iter``
+        commits on."""
         if self._num_live_groups == 0:
             return
-        for req in reqs_in_batch:
+        for req in reqs:
             group = req.beam_group
             if group is None:
                 continue
             # Reclaim even if the DAG commit is discarded: the launch path
             # already mutated req_to_token, so the orphans are real either way.
-            self._reclaim_orphans(group, batch.forward_iter)
+            self._reclaim_orphans(group, forward_iter)
             if req.to_finish is not None:
                 self._abort_group(group)
                 continue
-            if group.commit_pending(batch.forward_iter):
+            if group.commit_pending(forward_iter):
                 self._finish_group(group)
 
     def _select_group(
