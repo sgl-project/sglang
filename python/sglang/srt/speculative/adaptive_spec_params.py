@@ -12,10 +12,7 @@ import math
 from functools import cached_property
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
-    resolved_view,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.runtime_context import attn_dp_enabled_of
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import log_info_on_rank0

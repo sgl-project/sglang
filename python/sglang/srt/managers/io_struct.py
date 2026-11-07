@@ -58,18 +58,18 @@ from sglang.srt.lora.lora_registry import LoRARef
 from sglang.srt.managers.embed_types import PositionalEmbeds
 from sglang.srt.managers.incremental_detokenize import DetokenizeHeader
 from sglang.srt.managers.kv_hints import KvHintsEnvelope, decode_kv_hints_envelope
-from sglang.srt.managers.schedule_batch import (
-    Modality,
+from sglang.srt.managers.req_types import (
     MultimodalProcessorOutput,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.mm_utils import has_valid_data
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.req_time_stats import SchedulerOutputTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.field_validators import validate_optional_list_i64_1d_2d
 from sglang.srt.utils.msgpack_utils import (
     dec_hook,
@@ -215,17 +215,12 @@ class GenerateReqInput:
     # Optional per-image hashes the caller has already computed (hex strings).
     # Single request: one hash per image. Batch request: either one hash per
     # request when each request has one image, or one list of hashes per request.
-    # When supplied, each MultimodalDataItem's
-    # `hash` is initialised from this list and `set_pad_value` skips the
-    # internal `hash_feature()` recompute, so the resulting `pad_value` is
-    # deterministic from the caller's hash. Intended for external KV routers
-    # that compute their own per-image hash for routing decisions and need
-    # sglang's prefix-cache key to align. When unset, behavior is unchanged
-    # (sglang hashes the processor feature tensor).
+    # Legacy routing hints, ignored for cache identity. The server identifies
+    # actual content, shape, dtype, and processor configuration independently;
+    # identical caller hashes cannot authorize sharing between different media.
     mm_hashes: Optional[Union[List[str], List[List[str]]]] = None
-    # Optional `sha256:<64-hex>` identities for the original media contents. Unlike
-    # mm_hashes, these identify processor inputs and never replace the
-    # processor-output feature hash used by the embedding/prefix cache.
+    # Optional `sha256:<64-hex>` identities verified against original media
+    # contents. They do not replace the embedding/prefix-cache identity.
     mm_content_hashes: Optional[
         Union[List[Optional[str]], List[List[Optional[str]]]]
     ] = None
@@ -565,6 +560,18 @@ class GenerateReqInput:
                 self.input_ids = [self.input_ids]
             if self.input_embeds is not None:
                 self.input_embeds = [self.input_embeds]
+            # A single request's media list holds all of its items; batch fields hold one entry per request.
+            # A list that is already one entry per request (e.g. [["a.png", "b.png"]]) is kept as is.
+            for field_name in (
+                "image_data",
+                "video_data",
+                "audio_data",
+                "mm_hashes",
+                "mm_content_hashes",
+            ):
+                value = getattr(self, field_name)
+                if isinstance(value, list) and value and not isinstance(value[0], list):
+                    setattr(self, field_name, [value])
 
     def _normalize_single_inputs(self):
         """Normalize inputs for a single example."""
@@ -2013,7 +2020,7 @@ class ContinueGenerationReqInput(BaseReq, kw_only=True):
 
 
 class TokenizerWorkerRegistrationReq(BaseReq, kw_only=True):
-    """Sent by each TokenizerWorker on startup to register its IPC name with the router."""
+    """Sent by each tokenizer worker on startup to register its IPC name with the router."""
 
     worker_ipc_name: str
 
@@ -2271,6 +2278,47 @@ class EndWeightUpdateReqOutput(BaseReq, kw_only=True):
     message: str
 
 
+class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
+    """Receive weights through a platform transport and load them, as
+    UpdateWeightsFromDistributedReqInput does over a torch.distributed group."""
+
+    # a key of SRTPlatform.get_weight_update_handlers()
+    handler: str
+    # what the transport needs to receive this bucket, e.g. names, dtypes, shapes, sources
+    payload: Dict[str, Any] = {}
+    # Whether to flush the cache after updating weights
+    flush_cache: bool = True
+    # Whether to abort all requests before updating weights
+    abort_all_requests: bool = False
+    # Optional: Update weight version along with weights
+    weight_version: Optional[str] = None
+    # which runners the op applies to
+    selector: Literal["target", "draft", "all"] = "all"
+    # Whether to call torch.cuda.empty_cache() during flush
+    torch_empty_cache: bool = False
+
+
+class PluginWeightUpdateReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str
+    # how many tensors each TP rank received, in rank order; load_weights skips names the
+    # model does not know, so this is not a count of parameters written
+    received_tensor_counts: List[int] = []
+
+    @classmethod
+    def merged(cls, replies: List[PluginWeightUpdateReqOutput]):
+        """One reply per attention-DP leader; all must succeed.
+
+        Every leader gathered the same TP-wide counts, so the first reply's stand.
+        """
+        success = all(reply.success for reply in replies)
+        return cls(
+            success=success,
+            message=" | ".join(reply.message for reply in replies),
+            received_tensor_counts=replies[0].received_tensor_counts if success else [],
+        )
+
+
 class CheckWeightsReqInput(BaseReq, kw_only=True):
     action: str = "checksum"
     allow_quant_error: bool = False
@@ -2282,7 +2330,7 @@ class CheckWeightsReqInput(BaseReq, kw_only=True):
 
 
 # Wire versions of the pydantic ParallelismInfo/ChecksumInfo in
-# sglang.srt.utils.weight_checker. Not array_like: the payload is read by field
+# sglang.srt.model_executor.weight_checker. Not array_like: the payload is read by field
 # name and re-serialized to JSON, so it must stay a {field: value} map.
 class ParallelismInfo(msgspec.Struct, kw_only=True):
     # "target", or a draft role such as "draft" / "draft_step_0"
@@ -2353,6 +2401,10 @@ class AbortReq(BaseReq, kw_only=True):
         # FIXME: This is a hack to keep the same with the old code
         if self.rid is None:
             self.rid = ""
+
+    def matches(self, rid: str) -> bool:
+        """Whether this abort targets the request `rid`."""
+        return self.abort_all or rid.startswith(self.rid)
 
 
 class EncoderDispatchErrorReq(BaseReq, kw_only=True):
@@ -2494,6 +2546,12 @@ class OpenSessionReqInput(BaseReq, kw_only=True):
 
 class CloseSessionReqInput(BaseReq, kw_only=True):
     session_id: str
+
+
+class ReleaseUocrDocReqInput(BaseReq, kw_only=True):
+    """Free the KV a split document retained for its next window."""
+
+    doc_id: str
 
 
 class OpenSessionReqOutput(BaseReq, kw_only=True):

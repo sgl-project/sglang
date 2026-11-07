@@ -28,7 +28,7 @@ import logging
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_available_gpu_memory
+from sglang.srt.utils.device import get_available_gpu_memory
 
 logger = logging.getLogger(__name__)
 

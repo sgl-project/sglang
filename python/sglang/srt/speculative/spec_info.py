@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Tuple, Type, Union
 
 import torch
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.runtime_context import get_spec as get_spec_config
 from sglang.srt.speculative.spec_registry import (
     _RESERVED_ALIASES,
@@ -268,7 +268,7 @@ class SpeculativeAlgorithm(Enum):
         self, server_args: ServerArgs
     ) -> Optional[int]:
         """Return the largest draft-token width this algorithm may use."""
-        from sglang.srt.arg_groups.overrides import resolving_view
+        from sglang.srt.arg_groups.model_override_base import resolving_view
 
         cfg = resolving_view(server_args)
         if cfg.speculative_num_draft_tokens is None:
@@ -482,7 +482,7 @@ def create_dummy_verify_input(
     being captured; adaptive spec captures each candidate with that config's
     leaves overridden.
     """
-    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
     spec = get_spec_config()
 
