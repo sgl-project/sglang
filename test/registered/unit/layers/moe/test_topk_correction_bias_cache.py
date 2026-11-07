@@ -39,7 +39,7 @@ def _routing_inputs(bias_dtype, device, *, num_tokens=4, radix4=False):
     with (
         get_context().override_server_args(),
         topk_module.envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
-        topk_module.envs.SGLANG_K3_RADIX4_TOPK.override(radix4),
+        topk_module.envs.SGLANG_OPT_HIP_K3_RADIX4_TOPK.override(radix4),
         patch.object(topk_module, "_use_aiter", True),
         patch.object(topk_module, "_is_cuda", False),
         patch.object(

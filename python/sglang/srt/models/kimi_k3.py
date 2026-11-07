@@ -153,7 +153,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
+from sglang.srt.utils.common import BumpAllocator
 from sglang.srt.utils.log_utils import rank0_log
 
 logger = logging.getLogger(__name__)
@@ -163,7 +163,7 @@ logger = logging.getLogger(__name__)
 _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
-_aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+_aiter_k3_opt = envs.SGLANG_OPT_HIP_K3_AITER.get()
 
 
 def _cdiv(a: int, b: int) -> int:

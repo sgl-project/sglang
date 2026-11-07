@@ -1124,6 +1124,16 @@ class Envs:
     # output columns ride along nearly free.
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ = EnvBool(True)
     SGLANG_ROCM_K3_FUSE_KDA_INPROJ_MAX_TOKENS = EnvInt(256)
+    # Pad the AITER MXFP4 MoE intermediate to 128, not 256 (Quark W4A4 keeps the
+    # checkpoint width), and skip the router-logits contiguous copy on HIP.
+    SGLANG_OPT_HIP_K3_AITER = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_AITER_K3_OPT"
+    )
+    # Use the radix-4 HIP router for K3 top-k on the AITER path; other routing
+    # shapes keep AITER's kernel.
+    SGLANG_OPT_HIP_K3_RADIX4_TOPK = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_K3_RADIX4_TOPK"
+    )
     # Kimi-K3 fused KDA decode on ROCm: "gfx950" (in-tree kernel) or "aiter";
     # any other value keeps the unfused decode.
     SGLANG_ROCM_K3_KDA_FUSED_BACKEND = EnvStr("gfx950")
@@ -2276,8 +2286,6 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
-    # Use the ROCm radix-4 router for covered K3 top-k workloads.
-    SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MIN_HITS = EnvInt(2)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_MAX_SEQLEN = EnvInt(6144)
