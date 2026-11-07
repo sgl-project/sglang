@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use sglang_mm::driver::{self, Output};
-use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
-use sglang_mm::registry::build_pipeline;
+use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_processor::MmOutput;
+use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
@@ -19,9 +19,8 @@ use crate::utils::error::Error;
 use crate::utils::fsm::Event;
 use crate::utils::runtime::Runnable;
 
-/// Python parity: caller hashes override the computed ones so an external
-/// router's keys align with the prefix cache. A length mismatch or malformed
-/// entry warns and keeps the computed hash — never blocks the request.
+/// Preserve legacy routing hints for observers. These do not override the
+/// full content identity computed by `make_buffers` for cache equality.
 fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, caller: &[String]) {
     if caller.is_empty() {
         return;
@@ -43,8 +42,7 @@ fn apply_caller_hashes<'a>(hashes: impl ExactSizeIterator<Item = &'a mut u64>, c
 }
 
 /// Hex of any width, as Python's `int(hex_hash, 16)` takes it (a full SHA-256
-/// being the common case), keeping the low 64 bits — only the low 30 are
-/// observable, through `_compute_pad_value`.
+/// being the common case), keeping the low 64 bits in this legacy field only.
 fn parse_caller_hash(entry: &str) -> Option<u64> {
     let hex = entry.strip_prefix("0x").unwrap_or(entry);
     if hex.is_empty() || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -130,33 +128,41 @@ pub trait MmProcessor: Send + Sync {
     fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
 }
 
-struct QwenMmProcessor {
-    family: Box<dyn MmFamilyProcessor>,
+/// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
+/// request's resolved media bytes.
+struct ImageMmProcessor {
+    pipeline: sglang_processor::MmProcessor,
 }
 
-impl QwenMmProcessor {
-    fn new(spec: MmSpec) -> Result<Self, String> {
-        Ok(Self {
-            family: build_pipeline(spec.pipeline)?,
-        })
-    }
-}
-
-impl MmProcessor for QwenMmProcessor {
+impl MmProcessor for ImageMmProcessor {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
-        let input = super::payload::to_mm_input(input_ids, mm)?;
-        // The driver fails on the request's sources, images, and prompt layout.
-        let output = driver::process(self.family.as_ref(), input).map_err(MediaError::Client)?;
-        encode_driver_output(output).map_err(MediaError::Server)
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(MediaError::Client(
+                "unsupported modality: video/audio input".into(),
+            ));
+        }
+        let media = super::payload::resolve_media_work(input_ids, mm)?;
+        let input_ids = (media.input_ids.iter())
+            .map(|&id| {
+                i32::try_from(id)
+                    .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
+        // The pipeline fails on the request's images and prompt layout.
+        let output = (self.pipeline)
+            .process(&input_ids, &images)
+            .map_err(|error| MediaError::Client(error.to_string()))?;
+        encode_output(output).map_err(MediaError::Server)
     }
 }
 
-/// Map the driver's output straight onto the common encoded result: each
+/// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
 /// and hash ride along, and every auxiliary tensor is translated once into
 /// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
-    let Output {
+fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+    let MmOutput {
         input_ids,
         items,
         offsets,
@@ -175,28 +181,44 @@ fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
         .map(|(item, span)| {
             Ok(MmEncodedItem {
                 modality: MmModality::Image,
-                feature: item.feature,
+                feature: tensor(item.feature)?,
                 hash: item.hash,
                 offsets: vec![span],
                 model_specific_data: item
                     .aux
                     .into_iter()
-                    .map(|(name, tensor)| Ok((name.clone(), aux_meta(&name, tensor)?)))
+                    .map(|(name, aux)| {
+                        let meta = aux_meta(&name, tensor(aux)?)?;
+                        Ok((name, meta))
+                    })
                     .collect::<Result<_, String>>()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mrope = match positions {
-        PositionOutput::Rope1D => None,
         PositionOutput::MRope { positions, delta } => Some(MRope { positions, delta }),
+        _ => None,
     };
     Ok(MmProcessOutput {
-        input_ids,
+        input_ids: input_ids.into_iter().map(i64::from).collect(),
         result: MmEncodedEntry {
             items,
             token_ids: None,
             mrope,
         },
+    })
+}
+
+/// Dynamo's tensor as the one every processor hands the worker.
+fn tensor(tensor: dynamo::Tensor) -> Result<Tensor, String> {
+    let data = match tensor.data {
+        dynamo::TensorData::F32(values) => TensorData::F32(values),
+        dynamo::TensorData::I64(values) => TensorData::I64(values),
+        _ => return Err("mm: unsupported tensor dtype from dynamo-multimodal".into()),
+    };
+    Ok(Tensor {
+        shape: tensor.shape,
+        data,
     })
 }
 
@@ -227,10 +249,11 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let feature_shm = spec.feature_shm;
+        let pipeline =
+            sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
-            feature_shm,
+            processor: Arc::new(ImageMmProcessor { pipeline }),
+            feature_shm: spec.feature_shm,
             limits: None,
         })
     }
@@ -307,7 +330,7 @@ fn place_features(
 /// [`place_features`]), the M-RoPE positions, and the `mm.meta` sidecar --
 /// always last, so a reader that finds it knows the rest is present.
 fn make_buffers(entry: MmEncodedEntry, feature_shm: bool) -> Result<Vec<Buffer>, String> {
-    let meta = MmMeta::of(&entry).encode()?;
+    let meta = MmMeta::of(&entry)?.encode()?;
     let MmEncodedEntry { items, mrope, .. } = entry;
     let features = items.into_iter().map(|item| item.feature).collect();
     let mut buffers = place_features(features, feature_shm, |_| {
@@ -453,8 +476,10 @@ impl Runnable for MmWorker {
 
 #[cfg(test)]
 mod tests {
-    use sglang_mm::driver::OutputItem;
     use std::collections::BTreeMap;
+
+    use sglang_processor::MmOutputItem;
+    use sglang_processor::dynamo_multimodal::processor as dynamo;
 
     use super::*;
     use crate::message::buffers::find;
@@ -492,36 +517,31 @@ mod tests {
         }
     }
 
-    /// The driver's output maps onto the encoded result without any
+    fn dynamo_tensor(shape: Vec<usize>, data: dynamo::TensorData) -> dynamo::Tensor {
+        dynamo::Tensor { shape, data }
+    }
+
+    /// The pipeline's output maps onto the encoded result without any
     /// reconstruction: feature tensors keep their shape and dtype, spans and
     /// hashes ride per item, integer aux tensors become metadata, and M-RoPE
     /// carries over; 1-D positions leave `mrope` empty.
     #[test]
-    fn driver_output_maps_directly() {
-        let item = |shape: Vec<usize>, hash| OutputItem {
-            feature: Tensor {
-                shape,
-                data: TensorData::F32(vec![0.5; 12]),
-            },
+    fn pipeline_output_maps_directly() {
+        let item = |shape: Vec<usize>, hash| MmOutputItem {
+            feature: dynamo_tensor(shape, dynamo::TensorData::F32(vec![0.5; 12])),
             aux: vec![
                 (
                     "image_grid_thw".into(),
-                    Tensor {
-                        shape: vec![3],
-                        data: TensorData::I64(vec![1, 2, 3]),
-                    },
+                    dynamo_tensor(vec![3], dynamo::TensorData::I64(vec![1, 2, 3])),
                 ),
                 (
                     "clip_index".into(),
-                    Tensor {
-                        shape: vec![],
-                        data: TensorData::I64(vec![7]),
-                    },
+                    dynamo_tensor(vec![], dynamo::TensorData::I64(vec![7])),
                 ),
             ],
             hash,
         };
-        let output = Output {
+        let output = MmOutput {
             input_ids: vec![1, 2, 2, 3],
             items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
             offsets: vec![(1, 2), (3, 3)],
@@ -530,7 +550,7 @@ mod tests {
                 delta: -2,
             },
         };
-        let encoded = encode_driver_output(output).unwrap();
+        let encoded = encode_output(output).unwrap();
         assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
         let items = &encoded.result.items;
         assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
@@ -549,34 +569,28 @@ mod tests {
         let mrope = encoded.result.mrope.as_ref().unwrap();
         assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
 
-        let plain = Output {
+        let plain = MmOutput {
             input_ids: vec![1],
             items: vec![],
             offsets: vec![],
             positions: PositionOutput::Rope1D,
         };
-        assert!(encode_driver_output(plain).unwrap().result.mrope.is_none());
+        assert!(encode_output(plain).unwrap().result.mrope.is_none());
 
-        let bad = Output {
+        let bad = MmOutput {
             input_ids: vec![1],
-            items: vec![OutputItem {
-                feature: Tensor {
-                    shape: vec![1],
-                    data: TensorData::F32(vec![1.0]),
-                },
+            items: vec![MmOutputItem {
+                feature: dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 aux: vec![(
                     "scale".into(),
-                    Tensor {
-                        shape: vec![1],
-                        data: TensorData::F32(vec![1.0]),
-                    },
+                    dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 )],
                 hash: 1,
             }],
             offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
         };
-        let Err(err) = encode_driver_output(bad) else {
+        let Err(err) = encode_output(bad) else {
             panic!("an f32 aux tensor must be rejected");
         };
         assert!(err.contains("no metadata form"), "{err}");
