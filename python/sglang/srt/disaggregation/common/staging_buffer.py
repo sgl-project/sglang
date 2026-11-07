@@ -20,13 +20,43 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
+from sglang.srt.utils import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
 
 # TODO(yangminl): remove torch fallback implementations once the Triton kernels
 # have been validated in production across all configurations.
 _USE_TRITON_STAGING = not envs.SGLANG_STAGING_USE_TORCH.get()
+
+# CUDA (including ROCm, which reports "cuda") is the original staging target;
+# XPU is the only other device validated on this path.
+_STAGING_SUPPORTED_DEVICE_TYPES = ("cuda", "xpu")
+
+
+def _device_ptr_type_str(ptr: int, device_type: str) -> str:
+    """XPU kernel-space pointers set bit 63; empty string off XPU."""
+    if device_type != "xpu":
+        return ""
+    if ptr & (1 << 63):
+        return ", ptr_type=XPU-kernel-space"
+    else:
+        return ", ptr_type=XPU-user-space"
+
+
+def _check_kv_on_staging_device(
+    k_buffers: list, v_buffers: list, staging_device: torch.device
+) -> None:
+    assert k_buffers, "k_buffers must not be empty"
+    assert v_buffers, "v_buffers must not be empty"
+    device = k_buffers[0].device
+    # The kernels read KV pointers and write staging in one launch, so a
+    # cross-device pair would fault inside the kernel rather than here.
+    assert device == staging_device, (
+        f"KV buffers are on {device} but staging is on {staging_device}; "
+        f"both must be the same device."
+    )
 
 
 @triton.jit
@@ -115,6 +145,175 @@ def _fused_scatter_from_staging_kernel(
     tl.store(layer_ptr + dst_offsets, vals, mask=mask)
 
 
+@triton.jit
+def _scatter_from_staging_persistent_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    n_blocks,
+    n_items,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    NPROG: tl.constexpr,
+):
+    """Scatter strided blocks using at most NPROG CTAs."""
+    per_rank_elems = per_layer_elems.to(tl.int64) * NUM_LAYERS_X2
+    for item in range(tl.program_id(0), n_items, NPROG):
+        prog_id = item // n_blocks
+        block_id = item % n_blocks
+        writer_id = prog_id // NUM_LAYERS_X2
+        layer_kv_id = prog_id % NUM_LAYERS_X2
+        layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+        head_offset = tl.load(writer_head_offsets + writer_id)
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < per_layer_elems
+        t_idx = offsets // ELEMS_PER_TOKEN
+        e_idx = offsets % ELEMS_PER_TOKEN
+        page_val = tl.load(page_indices + t_idx // PAGE_SIZE, mask=mask, other=0)
+        pool_token = page_val * PAGE_SIZE + t_idx % PAGE_SIZE
+        src = (
+            writer_id.to(tl.int64) * per_rank_elems
+            + layer_kv_id.to(tl.int64) * per_layer_elems.to(tl.int64)
+            + offsets
+        )
+        vals = tl.load(staging + src, mask=mask)
+        dst = (
+            pool_token * stride_pool_token.to(tl.int64)
+            + head_offset.to(tl.int64)
+            + e_idx
+        )
+        tl.store(layer_ptr + dst, vals, mask=mask)
+
+
+@triton.jit
+def _scatter_staging_pages_kernel(
+    layer_ptrs,
+    page_indices,
+    staging,
+    writer_head_offsets,
+    stride_pool_token,
+    per_layer_elems,
+    ELEMS_PER_TOKEN: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    NUM_LAYERS_X2: tl.constexpr,
+):
+    """Move one page for one writer and layer K/V per program."""
+    page_id = tl.program_id(0)
+    program_id = tl.program_id(1)
+    writer_id = program_id // NUM_LAYERS_X2
+    layer_kv_id = program_id % NUM_LAYERS_X2
+
+    layer_ptr = tl.load(layer_ptrs + layer_kv_id).to(staging.dtype)
+    head_offset = tl.load(writer_head_offsets + writer_id).to(tl.int64)
+    page = tl.load(page_indices + page_id).to(tl.int64)
+    token_offset = tl.arange(0, PAGE_SIZE)[:, None]
+    element_offset = tl.arange(0, ELEMS_PER_TOKEN)[None, :]
+    source = (
+        (writer_id.to(tl.int64) * NUM_LAYERS_X2 + layer_kv_id)
+        * per_layer_elems.to(tl.int64)
+        + (page_id.to(tl.int64) * PAGE_SIZE + token_offset) * ELEMS_PER_TOKEN
+        + element_offset
+    )
+    destination = (
+        (page * PAGE_SIZE + token_offset) * stride_pool_token.to(tl.int64)
+        + head_offset
+        + element_offset
+    )
+    tl.store(layer_ptr + destination, tl.load(staging + source))
+
+
+def _launch_scatter(
+    layer_ptrs,
+    page_idx,
+    staging_typed,
+    head_offsets,
+    num_tokens,
+    stride_pool_token,
+    per_layer_elems,
+    elems_per_token,
+    page_size,
+    num_layers_x2,
+    num_writers,
+    ctas,
+):
+    """Select the default, bounded-CTA, or per-page scatter kernel."""
+    if (
+        ctas < 0
+        and page_size > 0
+        and page_size & (page_size - 1) == 0
+        and elems_per_token > 0
+        and elems_per_token & (elems_per_token - 1) == 0
+    ):
+        _scatter_staging_pages_kernel[
+            (num_tokens // page_size, num_writers * num_layers_x2)
+        ](
+            layer_ptrs,
+            page_idx,
+            staging_typed,
+            head_offsets,
+            stride_pool_token,
+            per_layer_elems,
+            ELEMS_PER_TOKEN=elems_per_token,
+            PAGE_SIZE=page_size,
+            NUM_LAYERS_X2=num_layers_x2,
+            num_warps=8,
+        )
+        return
+    if ctas <= 0:
+        grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, 1024))
+        _fused_scatter_from_staging_kernel[grid](
+            layer_ptrs,
+            page_idx,
+            staging_typed,
+            head_offsets,
+            num_tokens,
+            stride_pool_token,
+            per_layer_elems,
+            elems_per_token,
+            page_size,
+            num_layers_x2,
+            1024,
+        )
+        return
+    BLOCK = 16384
+    n_blocks = triton.cdiv(per_layer_elems, BLOCK)
+    n_items = num_writers * num_layers_x2 * n_blocks
+    _scatter_from_staging_persistent_kernel[(min(ctas, n_items),)](
+        layer_ptrs,
+        page_idx,
+        staging_typed,
+        head_offsets,
+        stride_pool_token,
+        per_layer_elems,
+        n_blocks,
+        n_items,
+        ELEMS_PER_TOKEN=elems_per_token,
+        PAGE_SIZE=page_size,
+        NUM_LAYERS_X2=num_layers_x2,
+        BLOCK_SIZE=BLOCK,
+        NPROG=min(ctas, n_items),
+        num_warps=16,
+    )
+
+
+_SCATTER_I64_CACHE: dict[tuple, torch.Tensor] = {}
+
+
+def _cached_scatter_i64(key: tuple, values: list[int], device) -> torch.Tensor:
+    tensor = _SCATTER_I64_CACHE.get(key)
+    if tensor is None:
+        # Keep pageable pointer-table copies off the in-flight forward stream.
+        with device_stream_context(create_device_stream(device)):
+            tensor = make_ptr_table(values, device=device)
+        _SCATTER_I64_CACHE[key] = tensor
+    return tensor
+
+
 class StagingBuffer:
     """Pre-allocated GPU staging buffer for bulk KV transfer.
 
@@ -131,24 +330,76 @@ class StagingBuffer:
         custom_mem_pool=None,
     ):
         self.size_bytes = size_bytes
+        if isinstance(device, str):
+            device = torch.device(device)
+
+        # An explicit index on the device string wins over gpu_id, so a caller
+        # passing "xpu:3" cannot end up allocating on a different device.
+        if device.index is not None and device.index != gpu_id:
+            logger.warning(
+                f"Device index mismatch: device={device} (index={device.index}) "
+                f"but gpu_id={gpu_id}. Using device.index={device.index}."
+            )
+            gpu_id = device.index
+        elif device.index is None:
+            device = torch.device(device.type, gpu_id)
+
         self.device = device
         self.gpu_id = gpu_id
-        self._gather_stream: Optional[torch.cuda.Stream] = None
 
-        torch.cuda.set_device(gpu_id)
-        if custom_mem_pool is not None:
+        if device.type not in _STAGING_SUPPORTED_DEVICE_TYPES:
+            raise RuntimeError(
+                f"Staging buffer is not supported on device type '{device.type}' "
+                f"(supported: {', '.join(_STAGING_SUPPORTED_DEVICE_TYPES)}). "
+                f"Unset SGLANG_DISAGG_STAGING_BUFFER to disable it."
+            )
+
+        if device.type != "cuda" and custom_mem_pool is not None:
+            logger.warning(
+                f"Custom memory pools are a CUDA construct and are ignored on "
+                f"{device.type}. Using the default allocator instead; memory may "
+                f"not be RDMA-compatible."
+            )
+
+        self.device_module = torch.get_device_module(device)
+        self.device_module.set_device(gpu_id)
+
+        if device.type == "cuda" and custom_mem_pool is not None:
             with torch.cuda.use_mem_pool(custom_mem_pool):
                 self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "custom_mem_pool (cuMemCreate)"
-        else:
+        elif device.type == "cuda":
             self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
             alloc_method = "cudaMalloc"
+        else:
+            # XPU has no equivalent of use_mem_pool, so its default caching
+            # allocator backs the buffer.
+            self.buffer = torch.empty(size_bytes, dtype=torch.uint8, device=device)
+            alloc_method = "default allocator"
+
         self.data_ptr = self.buffer.data_ptr()
 
+        # Created on first gather; the decode-side allocator's buffer never
+        # gathers, so eager creation would leak one device stream per rank.
+        self._gather_stream: Optional[torch.Stream] = None
+
+        ptr_type_str = _device_ptr_type_str(self.data_ptr, device.type)
         logger.info(
             f"StagingBuffer allocated: {size_bytes / (1024 * 1024):.1f} MB "
-            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}"
+            f"on {device}, method={alloc_method}, ptr=0x{self.data_ptr:x}{ptr_type_str}"
         )
+
+    def producer_stream(self) -> torch.Stream:
+        """The calling thread's current stream, for the gather to order against.
+
+        Resolved per call: the current stream is thread-local and the transfer
+        workers run on their own threads. This edge does not order the gather
+        after the prefill forward that wrote the KV rows. Under overlap, the
+        early-send path queues a chunk while that forward may still be running,
+        and TransferKVChunk.wait_event, synchronized before the gather, provides
+        the ordering; every other send runs after the forward has resolved.
+        """
+        return self.device_module.current_stream(self.device)
 
     def get_ptr(self) -> int:
         return self.data_ptr
@@ -159,9 +410,12 @@ class StagingBuffer:
     def fits(self, required_bytes: int) -> bool:
         return required_bytes <= self.size_bytes
 
-    def get_gather_stream(self) -> torch.cuda.Stream:
+    def create_stream(self) -> torch.Stream:
+        return create_device_stream(self.device)
+
+    def get_gather_stream(self) -> torch.Stream:
         if self._gather_stream is None:
-            self._gather_stream = torch.cuda.Stream(device=self.device)
+            self._gather_stream = self.create_stream()
         return self._gather_stream
 
 
@@ -182,6 +436,8 @@ class StagingAllocator:
 
     # Permanent alloc failure: chunk exceeds ring buffer total size.
     ALLOC_OVERSIZED = -2
+    # Chunk already scattered; a late duplicate STAGING_REQ must not reallocate.
+    CHUNK_SCATTERED = -3
 
     def __init__(
         self,
@@ -205,10 +461,11 @@ class StagingAllocator:
         # until then so release_room can drain it without a defensive check.
         self._scatter_stream = None
 
+        ptr_type_str = _device_ptr_type_str(self.base_ptr, self.buffer.device.type)
         logger.info(
             f"StagingAllocator (ring+overcommit): "
             f"{total_size_bytes / (1024 * 1024):.1f} MB "
-            f"on {device}, ptr=0x{self.base_ptr:x}"
+            f"on {device}, ptr=0x{self.base_ptr:x}{ptr_type_str}"
         )
 
     def assign(self, required_bytes: int) -> Optional[Tuple[int, int, int]]:
@@ -337,7 +594,6 @@ def _gather_all_layers_torch(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """torch.gather path: zero per-layer allocation, one kernel per layer."""
     import numpy as np
@@ -348,8 +604,10 @@ def _gather_all_layers_torch(
     num_tokens = len(page_indices_np) * page_size
     per_layer_bytes = num_tokens * num_heads * head_dim * dtype_size
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
     if page_size == 1:
@@ -361,11 +619,11 @@ def _gather_all_layers_torch(
     gather_idx = token_indices.view(-1, 1, 1).expand(num_tokens, num_heads, head_dim)
 
     gather_stream = staging_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+    gather_stream.wait_stream(staging_buffer.producer_stream())
 
     staging_view = staging_buffer.buffer
     offset = 0
-    with torch.cuda.stream(gather_stream):
+    with device_stream_context(gather_stream):
         for layer_id in range(num_layers):
             dst = (
                 staging_view[offset : offset + per_layer_bytes]
@@ -407,7 +665,6 @@ def _gather_all_layers_triton(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """Triton fused kernel path: single kernel launch for all layers."""
     import numpy as np
@@ -422,13 +679,14 @@ def _gather_all_layers_triton(
     per_layer_bytes = per_layer_elems * dtype_size
     total_bytes = per_layer_bytes * num_layers * 2
 
-    device = f"cuda:{gpu_id}"
-    torch.cuda.set_device(gpu_id)
+    device = k_buffers[0].device
+    device_module = staging_buffer.device_module
+
+    device_module.set_device(device.index)
     page_idx_tensor = torch.from_numpy(page_indices_np.astype(np.int64)).to(device)
 
-    layer_ptrs = torch.tensor(
+    layer_ptrs = make_ptr_table(
         [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64,
         device=device,
     )
     # Use integer dtype matching element size for bit-preserving copy
@@ -437,12 +695,12 @@ def _gather_all_layers_triton(
     staging_typed = staging_buffer.buffer[:total_bytes].view(int_dtype)
 
     gather_stream = staging_buffer.get_gather_stream()
-    gather_stream.wait_stream(torch.cuda.default_stream(torch.device(device)))
+    gather_stream.wait_stream(staging_buffer.producer_stream())
 
     BLOCK_SIZE = 1024
     grid = (2 * num_layers, triton.cdiv(per_layer_elems, BLOCK_SIZE))
 
-    with torch.cuda.stream(gather_stream):
+    with device_stream_context(gather_stream):
         _fused_gather_to_staging_kernel[grid](
             layer_ptrs,
             page_idx_tensor,
@@ -468,13 +726,13 @@ def gather_all_layers_to_staging(
     src_head_start: int,
     num_heads: int,
     page_size: int,
-    gpu_id: int,
 ) -> int:
     """Gather all layers' K and V head slices into a staging buffer.
 
     Returns total bytes written.
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
+    _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer.device)
     if _USE_TRITON_STAGING:
         return _gather_all_layers_triton(
             k_buffers,
@@ -484,7 +742,6 @@ def gather_all_layers_to_staging(
             src_head_start,
             num_heads,
             page_size,
-            gpu_id,
         )
     return _gather_all_layers_torch(
         k_buffers,
@@ -494,7 +751,6 @@ def gather_all_layers_to_staging(
         src_head_start,
         num_heads,
         page_size,
-        gpu_id,
     )
 
 
@@ -600,27 +856,33 @@ def _scatter_staging_to_kv_triton(
     elems_per_token = num_heads * head_dim
     per_layer_elems = num_tokens * elems_per_token
 
-    layer_ptrs = torch.tensor(
-        [buf.data_ptr() for buf in k_buffers] + [buf.data_ptr() for buf in v_buffers],
-        dtype=torch.int64,
-        device=device,
-    )
-
-    writer_head_offsets = torch.tensor(
-        [
-            compute_head_slice_params(
-                prefill_attn_tp_size,
-                decode_attn_tp_size,
-                wr,
-                dst_tp_rank,
-                total_kv_heads,
-            )[2]
-            * head_dim
-            for wr in range(num_writers)
-        ],
-        dtype=torch.int64,
-        device=device,
-    )
+    pointers = [buf.data_ptr() for buf in k_buffers] + [
+        buf.data_ptr() for buf in v_buffers
+    ]
+    head_offsets = [
+        compute_head_slice_params(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            writer,
+            dst_tp_rank,
+            total_kv_heads,
+        )[2]
+        * head_dim
+        for writer in range(num_writers)
+    ]
+    if envs.SGLANG_PLB_SCATTER_DEFER.get():
+        device_key = (device.type, device.index)
+        layer_ptrs = _cached_scatter_i64(
+            ("pointers", device_key, *pointers), pointers, device
+        )
+        writer_head_offsets = _cached_scatter_i64(
+            ("offsets", device_key, *head_offsets), head_offsets, device
+        )
+    else:
+        layer_ptrs = make_ptr_table(pointers, device=device)
+        writer_head_offsets = torch.tensor(
+            head_offsets, dtype=torch.int64, device=device
+        )
 
     int_dtype_map = {1: torch.int8, 2: torch.int16, 4: torch.int32}
     int_dtype = int_dtype_map.get(dtype_size, torch.int16)
@@ -629,11 +891,7 @@ def _scatter_staging_to_kv_triton(
     )
     staging_typed = staging_buffer_view[:total_staging_bytes].view(int_dtype)
 
-    BLOCK_SIZE = 1024
-    num_layers_x2 = 2 * num_layers
-    grid = (num_writers * num_layers_x2, triton.cdiv(per_layer_elems, BLOCK_SIZE))
-
-    _fused_scatter_from_staging_kernel[grid](
+    _launch_scatter(
         layer_ptrs,
         page_idx_tensor,
         staging_typed,
@@ -643,8 +901,9 @@ def _scatter_staging_to_kv_triton(
         per_layer_elems,
         elems_per_token,
         page_size,
-        num_layers_x2,
-        BLOCK_SIZE,
+        2 * num_layers,
+        num_writers,
+        envs.SGLANG_PLB_SCATTER_CTAS.get(),
     )
 
 
@@ -660,6 +919,7 @@ def scatter_staging_to_kv(
     total_kv_heads: int,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
+    _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer_view.device)
     if _USE_TRITON_STAGING:
         return _scatter_staging_to_kv_triton(
             staging_buffer_view,
