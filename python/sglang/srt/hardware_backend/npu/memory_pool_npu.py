@@ -720,12 +720,17 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
-        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache;
-        # hierarchical cache and the FP8 DSA packed store keep the default
-        # indexer cache instead.
+        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
+        if (
+            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
+            and get_memory().enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "--indexer-kv-cache-dtype=int8 is not supported with "
+                "--enable-hierarchical-cache"
+            )
         self.indexer_kv_store_int8 = (
             indexer_quant_mode == QUANT_MODE_TOKEN_INT8
-            and not get_memory().enable_hierarchical_cache
             and not self.dsa_kv_cache_store_fp8
             and index_head_dim is not None
         )

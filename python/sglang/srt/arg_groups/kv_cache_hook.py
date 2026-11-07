@@ -330,6 +330,13 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
     if cfg.indexer_kv_cache_dtype is None:
         return
 
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
+            "supported with --enable-hierarchical-cache. Disable hierarchical "
+            "cache or use the default BF16 indexer cache."
+        )
+
     if not get_platform().is_npu:
         raise RuntimeError(
             "--indexer-kv-cache-dtype is only supported on Ascend NPU "

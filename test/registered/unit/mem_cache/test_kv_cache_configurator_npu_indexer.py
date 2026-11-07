@@ -89,9 +89,13 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
 class TestNPUIndexerInt8Cache(CustomTestCase):
     """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
 
-    def _build_pool(self, dtype, kv_cache_dim=None, indexer_quant_mode=None):
+    def _build_pool(
+        self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
+    ):
         with (
-            get_context().override_server_args(enable_hierarchical_cache=False),
+            get_context().override_server_args(
+                enable_hierarchical_cache=hierarchical
+            ),
             patch.object(
                 memory_pool_npu,
                 "get_parallel",
@@ -110,6 +114,26 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 index_head_dim=128,
                 kv_cache_dim=kv_cache_dim,
                 indexer_quant_mode=indexer_quant_mode,
+            )
+
+    def test_int8_mode_rejects_hierarchical_cache_in_server_args(self):
+        from sglang.srt.arg_groups import kv_cache_hook
+
+        cfg = SimpleNamespace(
+            indexer_kv_cache_dtype="int8", enable_hierarchical_cache=True
+        )
+        with (
+            patch.object(kv_cache_hook, "resolving_view", return_value=cfg),
+            self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"),
+        ):
+            kv_cache_hook.handle_indexer_kv_cache_compatibility(object())
+
+    def test_int8_mode_rejects_hierarchical_cache_in_pool(self):
+        with self.assertRaisesRegex(ValueError, "enable-hierarchical-cache"):
+            self._build_pool(
+                torch.bfloat16,
+                indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+                hierarchical=True,
             )
 
     def test_int8_mode_swaps_only_the_bf16_indexer_cache(self):
