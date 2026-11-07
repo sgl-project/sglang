@@ -5,10 +5,14 @@ import struct
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 import jinja2
+import msgspec
 from fastapi import Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.entrypoints.openai.protocol import (
+    ChatCompletionRequest,
+    EmbeddingChatMessage,
+    EmbeddingMessages,
     EmbeddingObject,
     EmbeddingRequest,
     EmbeddingResponse,
@@ -19,12 +23,70 @@ from sglang.srt.entrypoints.openai.protocol import (
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.utils import convert_embeds_to_tensors
 from sglang.srt.managers.io_struct import EmbeddingReqInput
-from sglang.srt.parser.conversation import generate_embedding_convs
+from sglang.srt.parser.conversation import (
+    generate_chat_conv,
+    generate_embedding_convs,
+)
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
+
+_MEDIA_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
+_MEDIA_PART_MODALITY = {
+    "image_url": "image",
+    "video_url": "video",
+    "audio_url": "audio",
+}
+_EMBEDDING_PART_TYPES = _MEDIA_PART_TYPES | {"text"}
+# The roles generate_chat_conv renders; it rejects any other role.
+_CONVERSATION_TEMPLATE_ROLES = frozenset({"system", "user", "assistant"})
+
+
+class _RenderedConversation(msgspec.Struct, frozen=True, kw_only=True):
+    prompt: str
+    # Media in content-part order, matching the placeholders in `prompt`.
+    image_data: List[Any]
+    video_data: List[Any]
+    audio_data: List[Any]
+
+
+def _split_conversations(
+    messages: EmbeddingMessages,
+) -> tuple[bool, List[List[EmbeddingChatMessage]]]:
+    batched = len(messages) > 0 and isinstance(messages[0], list)
+    return batched, (messages if batched else [messages])
+
+
+def _has_media(conversation: List[EmbeddingChatMessage]) -> bool:
+    return any(
+        part.type in _MEDIA_PART_TYPES
+        for message in conversation
+        if isinstance(message.content, list)
+        for part in message.content
+    )
+
+
+def _render_with_conversation_template(
+    conversation: List[EmbeddingChatMessage], *, template_name: str
+) -> _RenderedConversation:
+    for message in conversation:
+        if message.role not in _CONVERSATION_TEMPLATE_ROLES:
+            raise ValueError(
+                f"role {message.role!r} is not supported by the "
+                f"{template_name!r} conversation template"
+            )
+    chat_request = ChatCompletionRequest(
+        messages=[message.model_dump(exclude_none=True) for message in conversation]
+    )
+    conv = generate_chat_conv(chat_request, template_name)
+    return _RenderedConversation(
+        prompt=conv.get_prompt(),
+        image_data=conv.image_data,
+        video_data=conv.video_data,
+        audio_data=conv.audio_data,
+    )
 
 
 class OpenAIServingEmbedding(OpenAIServingBase):
@@ -48,6 +110,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 "encoding_format must be either 'float' or 'base64', "
                 f"got {request.encoding_format!r}"
             )
+
+        if request.messages is not None:
+            return self._validate_messages(request.messages)
 
         if not (input := request.input):
             return "Input cannot be empty"
@@ -82,6 +147,43 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                         return f"Token ID at index {i} must be non-negative"
         return None
 
+    def _validate_messages(self, messages: EmbeddingMessages) -> Optional[str]:
+        _, conversations = _split_conversations(messages)
+        for conversation in conversations:
+            if not conversation:
+                return "Each conversation in messages needs at least one message"
+            for message in conversation:
+                if not isinstance(message.content, list):
+                    continue
+                for part in message.content:
+                    if part.type not in _EMBEDDING_PART_TYPES:
+                        return (
+                            f"Content part type {part.type!r} is not supported "
+                            "for embeddings"
+                        )
+                    if part.type not in _MEDIA_PART_TYPES:
+                        continue
+                    model_config = self.tokenizer_manager.model_config
+                    if not model_config.is_multimodal:
+                        return (
+                            "Model only supports text input; "
+                            f"received unsupported content type {part.type!r}."
+                        )
+                    # The model's processor would drop media it has no encoder for.
+                    supported = (
+                        model_config.is_audio_understandable_model
+                        if part.type == "audio_url"
+                        # Video goes through the vision tower.
+                        else model_config.is_image_understandable_model
+                    )
+                    if not supported:
+                        return (
+                            f"Model does not support "
+                            f"{_MEDIA_PART_MODALITY[part.type]} input; "
+                            f"received unsupported content type {part.type!r}."
+                        )
+        return None
+
     def _convert_to_internal_request(
         self,
         request: EmbeddingRequest,
@@ -90,7 +192,9 @@ class OpenAIServingEmbedding(OpenAIServingBase):
         """Convert OpenAI embedding request to internal format"""
         prompt = request.input
 
-        if isinstance(prompt, str):
+        if request.messages is not None:
+            prompt_kwargs = self._chat_prompt_kwargs(request)
+        elif isinstance(prompt, str):
             # Single string input
             prompt_kwargs = {"text": prompt}
         elif isinstance(prompt, list):
@@ -115,11 +219,7 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                     )
                     for conv in convs:
                         generate_prompts.append(conv.get_prompt())
-                elif (
-                    self.tokenizer_manager.tokenizer is not None
-                    and getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
-                    is not None
-                ):
+                elif self._has_jinja_chat_template():
                     generate_prompts = self._apply_jinja_template_to_embedding_inputs(
                         texts, images, videos
                     )
@@ -224,26 +324,160 @@ class OpenAIServingEmbedding(OpenAIServingBase):
                 audio_data=[],
                 modalities=[],
             )
-            try:
-                prompt = self.tokenizer_manager.tokenizer.apply_chat_template(
-                    [processed_msg],
-                    tokenize=False,
-                    add_generation_prompt=True,
+            prompts.append(
+                self._apply_chat_template(
+                    [processed_msg], add_generation_prompt=True, template_kwargs={}
                 )
-            except jinja2.TemplateError as template_error:
-                location = getattr(template_error, "lineno", None)
-                name = getattr(template_error, "name", None)
-                suffix = ""
-                if name or location:
-                    suffix = f" (template={name or '<unknown>'}, line={location})"
-                raise ValueError(f"{template_error}{suffix}") from template_error
-            except (TypeError, KeyError, AttributeError) as template_error:
-                raise ValueError(
-                    f"Failed to render chat template for embedding input: {template_error}"
-                ) from template_error
-            prompts.append(prompt)
+            )
 
         return prompts
+
+    def _has_jinja_chat_template(self) -> bool:
+        return (
+            self.tokenizer_manager.tokenizer is not None
+            and getattr(self.tokenizer_manager.tokenizer, "chat_template", None)
+            is not None
+        )
+
+    def _apply_chat_template(
+        self,
+        messages: List[Dict[str, Any]],
+        *,
+        add_generation_prompt: bool,
+        template_kwargs: Dict[str, Any],
+    ) -> str:
+        """Render `messages` with the tokenizer's Jinja chat template.
+
+        Jinja failures are re-raised as ``ValueError`` so the caller returns
+        HTTP 400 instead of 500.
+        """
+        # Request options win over chat_template_kwargs with the same name, as in vLLM.
+        render_kwargs = {
+            **template_kwargs,
+            "tokenize": False,
+            "add_generation_prompt": add_generation_prompt,
+        }
+        try:
+            return self.tokenizer_manager.tokenizer.apply_chat_template(
+                messages, **render_kwargs
+            )
+        except jinja2.TemplateError as template_error:
+            location = getattr(template_error, "lineno", None)
+            name = getattr(template_error, "name", None)
+            suffix = ""
+            if name or location:
+                suffix = f" (template={name or '<unknown>'}, line={location})"
+            raise ValueError(f"{template_error}{suffix}") from template_error
+        except (TypeError, KeyError, AttributeError) as template_error:
+            raise ValueError(
+                f"Failed to render chat template for embedding input: {template_error}"
+            ) from template_error
+
+    def _chat_prompt_kwargs(self, request: EmbeddingRequest) -> Dict[str, Any]:
+        """Render each conversation in `request.messages` into one engine prompt."""
+        batched, conversations = _split_conversations(request.messages)
+        rendered = [
+            self._render_conversation(
+                conversation,
+                add_generation_prompt=request.add_generation_prompt,
+                template_kwargs=request.chat_template_kwargs or {},
+            )
+            for conversation in conversations
+        ]
+        prompts = [conversation.prompt for conversation in rendered]
+
+        if not self.tokenizer_manager.model_config.is_multimodal:
+            # Chat templates write their own special tokens, so none are added here.
+            input_ids = [
+                self.tokenizer_manager.tokenizer.encode(
+                    prompt, add_special_tokens=False
+                )
+                for prompt in prompts
+            ]
+            return {"input_ids": input_ids if batched else input_ids[0]}
+
+        # The MM processor tokenizes the text so it can expand the placeholders.
+        media = {
+            "image_data": [conversation.image_data for conversation in rendered],
+            "video_data": [conversation.video_data for conversation in rendered],
+            "audio_data": [conversation.audio_data for conversation in rendered],
+        }
+        prompt_kwargs: Dict[str, Any] = {"text": prompts if batched else prompts[0]}
+        for key, per_conversation in media.items():
+            if not any(per_conversation):
+                continue
+            if batched:
+                prompt_kwargs[key] = [items or None for items in per_conversation]
+            else:
+                prompt_kwargs[key] = per_conversation[0]
+        return prompt_kwargs
+
+    def _render_conversation(
+        self,
+        conversation: List[EmbeddingChatMessage],
+        *,
+        add_generation_prompt: bool,
+        template_kwargs: Dict[str, Any],
+    ) -> _RenderedConversation:
+        # Same precedence as the multimodal `input` path above.
+        template_name = self.template_manager.chat_template_name
+        if template_name is not None:
+            return _render_with_conversation_template(
+                conversation, template_name=template_name
+            )
+        if not self._has_jinja_chat_template():
+            raise ValueError(
+                "messages input needs a chat template, and this model has none; "
+                "start the server with --chat-template"
+            )
+        return self._render_with_jinja_template(
+            conversation,
+            add_generation_prompt=add_generation_prompt,
+            template_kwargs=template_kwargs,
+        )
+
+    def _render_with_jinja_template(
+        self,
+        conversation: List[EmbeddingChatMessage],
+        *,
+        add_generation_prompt: bool,
+        template_kwargs: Dict[str, Any],
+    ) -> _RenderedConversation:
+        content_format = self.template_manager.jinja_template_content_format
+        # A "string" template keeps only the text parts, which would drop the media.
+        if content_format == "string" and _has_media(conversation):
+            raise ValueError(
+                "This model's chat template renders text only, so messages with "
+                "image, video or audio content cannot be embedded"
+            )
+        image_data: List[Any] = []
+        video_data: List[Any] = []
+        audio_data: List[Any] = []
+        messages = []
+        for message in conversation:
+            msg_dict = message.model_dump()
+            if msg_dict["content"] is None:
+                msg_dict["content"] = ""
+            messages.append(
+                process_content_for_template_format(
+                    msg_dict,
+                    content_format,
+                    image_data=image_data,
+                    video_data=video_data,
+                    audio_data=audio_data,
+                    modalities=[],
+                )
+            )
+        return _RenderedConversation(
+            prompt=self._apply_chat_template(
+                messages,
+                add_generation_prompt=add_generation_prompt,
+                template_kwargs=template_kwargs,
+            ),
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+        )
 
     async def _handle_non_streaming_request(
         self,
