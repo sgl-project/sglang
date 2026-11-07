@@ -76,7 +76,7 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
+        get_last_batch=lambda: None,
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -329,6 +329,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
+            done.exit_via = "release"
             s._on_step_processed(batch)
 
         s.run_batch = run_batch

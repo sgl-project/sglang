@@ -262,6 +262,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import SchedulerDPAttnAdap
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -2348,6 +2349,7 @@ class Scheduler(
     def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
         """Report a request the scheduler ends outside the output stream
         (aborted while queued, preempted, retracted or rejected)."""
+        record_send(req, "abort")
         if self.rust_server is not None:
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)
@@ -2692,6 +2694,10 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
+            is_offloading=lambda req: (
+                self.decode_offload_manager is not None
+                and self.decode_offload_manager.has_inflight_offload(req)
+            ),
             # Hisparse pool counters diverge during host backup (see the
             # _get_swa_token_info clamp), and pending deferred KV releases hold
             # pages out of the allocator by design.

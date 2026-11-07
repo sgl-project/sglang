@@ -27,6 +27,11 @@ class FakeReq(SimpleNamespace):
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
+    # Req's defaults for the exit ledger (CI only) and the step counter.
+    exit_via = None
+    send_via = None
+    inflight_steps = 0
+
 
 def release_only_retirer(
     tree_cache=None, hisparse_coordinator=None, beam_coordinator=None

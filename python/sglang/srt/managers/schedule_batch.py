@@ -586,6 +586,10 @@ class Req(ReqDllmMixin):
         self.finished_len = None
         # Whether this request has finished output
         self.finished_output = None
+        # Written by the exit ledger (CI only): how the request's resources went
+        # back, and how its final output was sent.
+        self.exit_via: Optional[str] = None
+        self.send_via: Optional[str] = None
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # If we want to abort the request in the middle of the event loop,

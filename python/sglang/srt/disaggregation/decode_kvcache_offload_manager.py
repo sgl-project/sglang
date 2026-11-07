@@ -12,6 +12,7 @@ import torch
 from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
+from sglang.srt.managers.scheduler_components.exit_ledger import record_exit
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -146,7 +147,7 @@ class DecodeKVCacheOffloadManager:
         else:
             self.offload_inflight[req] = count - 1
 
-    def _has_inflight_offload(self, req: Req):
+    def has_inflight_offload(self, req: Req):
         return self.offload_inflight.get(req, 0) > 0
 
     def _prefill_offloaded_len(self, req: Req) -> int:
@@ -325,7 +326,7 @@ class DecodeKVCacheOffloadManager:
                 if req in self.offloaded_state:
                     self.offloaded_state[req].last_hash = last_hash
 
-                if req.finished() and not self._has_inflight_offload(req):
+                if req.finished() and not self.has_inflight_offload(req):
                     self._release_finished_req(req)
             finish_count -= 1
 
@@ -333,6 +334,10 @@ class DecodeKVCacheOffloadManager:
         # Defensive guard: ReqToTokenPool.free sets req_pool_idx to None,
         # so a previously-released request must be skipped here to avoid
         # non-idempotent side effects (double free, double unlock).
+        # Recorded before the guard: a finished request whose row is already
+        # gone (never allocated, freed elsewhere) still exits here, once.
+        if req.exit_via is None:
+            record_exit(req, "offload")
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
@@ -412,6 +417,6 @@ class DecodeKVCacheOffloadManager:
 
     def finalize_release_on_finish(self, req: Req):
         """Free any remaining tail KV that was not offloaded due to non-aligned length."""
-        if self._has_inflight_offload(req):
+        if self.has_inflight_offload(req):
             return
         self._release_finished_req(req)
