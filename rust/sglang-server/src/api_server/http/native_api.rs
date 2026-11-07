@@ -726,6 +726,9 @@ pub(super) fn generate_requests(
     // Read before the fills below: only a `max_new_tokens` the client sent is
     // checked against the context window.
     let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
+    if let Some(fields) = body.as_object_mut() {
+        crate::message::request::move_deprecated_dp_rank(fields);
+    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
@@ -1410,6 +1413,64 @@ mod tests {
         let response = routes().with_state(state).oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         responder.await.unwrap()
+    }
+
+    /// `/generate` checks the DP rank a body names as Python does: the
+    /// deprecated `data_parallel_rank` when `routed_dp_rank` is unset, and a
+    /// rank outside the deployment is a 400 with Python's message.
+    #[tokio::test]
+    async fn generate_refuses_a_routed_dp_rank_out_of_range() {
+        let state = Arc::new(AppState {
+            core: crate::api_server::handlers::CoreHandle::new(
+                flume::unbounded().0,
+                flume::unbounded().0,
+                crate::api_server::handlers::CoreConfig {
+                    response_capacity: 8,
+                    response_activity: Default::default(),
+                    startup_ready: true,
+                    is_disaggregation: false,
+                    mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
+                    metadata: crate::api_server::handlers::CoreMetadata::default(),
+                    metrics: None,
+                    request_log: None,
+                    generate_validator: None,
+                },
+            ),
+            generation_policy: GenerationPolicy::default(),
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        for (body, rank) in [
+            (r#"{"input_ids": [1], "data_parallel_rank": 3}"#, 3),
+            (
+                r#"{"input_ids": [1], "routed_dp_rank": 2, "data_parallel_rank": 0}"#,
+                2,
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri("/generate")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+            let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
+                format!("routed_dp_rank={rank} out of range [0, 1)")
+            );
+        }
     }
 
     /// An item whose `sampling_params` name no `max_new_tokens` is marked

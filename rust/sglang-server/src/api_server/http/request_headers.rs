@@ -40,23 +40,40 @@ pub(super) fn apply_header_overrides(
         return Ok(applied);
     };
     for &(header, field, kind) in HEADER_OVERRIDES {
-        let Some(value) = headers.get(header) else {
-            continue;
-        };
-        let text = value
-            .to_str()
-            .map_err(|_| format!("invalid {header} header: not visible ASCII"))?;
         let value = match kind {
-            Kind::Str => Value::from(text),
-            Kind::Int => text
-                .parse::<i64>()
-                .map(Value::from)
-                .map_err(|e| format!("invalid {header} header {text:?}: {e}"))?,
+            Kind::Str => str_header(headers, header)?.map(Value::from),
+            Kind::Int => int_header(headers, header)?.map(Value::from),
+        };
+        let Some(value) = value else {
+            continue;
         };
         fields.insert(field.to_owned(), value.clone());
         applied.insert(field.to_owned(), value);
     }
     Ok(applied)
+}
+
+/// Override header `name`'s text, `None` when absent.
+fn str_header<'a>(headers: &'a HeaderMap, name: &str) -> Result<Option<&'a str>, String> {
+    headers
+        .get(name)
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| format!("invalid {name} header: not visible ASCII"))
+        })
+        .transpose()
+}
+
+/// Integer override header `name`, `None` when absent; an unparsable value
+/// is Python's 400.
+pub(super) fn int_header(headers: &HeaderMap, name: &str) -> Result<Option<i64>, String> {
+    str_header(headers, name)?
+        .map(|text| {
+            text.parse()
+                .map_err(|e| format!("invalid {name} header {text:?}: {e}"))
+        })
+        .transpose()
 }
 
 #[cfg(test)]
