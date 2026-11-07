@@ -287,17 +287,35 @@ class Qwen3CoderDetector(BaseFormatDetector):
     def parse_streaming_increment(
         self, new_text: str, tools: List[Tool]
     ) -> StreamingParseResult:
-        """
-        Robust cursor-based streaming parser.
-        """
+        parts = self._parse_streaming_parts(new_text, tools)
+        return StreamingParseResult(
+            normal_text="".join(part.normal_text for part in parts),
+            calls=[call for part in parts for call in part.calls],
+        )
+
+    def _parse_streaming_parts(
+        self, new_text: str, tools: List[Tool]
+    ) -> List[StreamingParseResult]:
+        """Parse ordered text/tool parts without regrouping across boundaries."""
         self._buffer += new_text
 
         # Guard against empty buffer
         if not self._buffer:
-            return StreamingParseResult()
+            return []
 
+        parts = []
         calls = []
         normal_text_chunks = []
+
+        def flush_part():
+            nonlocal calls, normal_text_chunks
+            if calls or normal_text_chunks:
+                parts.append(
+                    StreamingParseResult(
+                        calls=calls, normal_text="".join(normal_text_chunks)
+                    )
+                )
+                calls, normal_text_chunks = [], []
 
         while True:
             # Working text slice
@@ -306,6 +324,11 @@ class Qwen3CoderDetector(BaseFormatDetector):
             # Optimization: If almost empty, wait for more
             if not current_slice:
                 break
+
+            if normal_text_chunks and current_slice.startswith(
+                (self.tool_call_prefix, self.parameter_prefix, self.function_end_token)
+            ):
+                flush_part()
 
             # -------------------------------------------------------
             # 1. Priority detection: check if it's the start of Tool Call
@@ -468,6 +491,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             if next_open_angle == -1:
                 # This entire segment is plain text
                 if not self.is_inside_tool_call:
+                    if calls:
+                        flush_part()
                     normal_text_chunks.append(current_slice)
                 # [FIX] If inside tool call, discard this text (usually \n), don't append
                 self.parsed_pos += len(current_slice)
@@ -496,6 +521,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 else:
                     # Just a plain '<' symbol
                     if not self.is_inside_tool_call:
+                        if calls:
+                            flush_part()
                         normal_text_chunks.append("<")
                     self.parsed_pos += 1
                     continue
@@ -504,6 +531,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
                 # '<' is in the middle
                 text_segment = current_slice[:next_open_angle]
                 if not self.is_inside_tool_call:
+                    if calls:
+                        flush_part()
                     normal_text_chunks.append(text_segment)
                 # [FIX] If inside tool call, discard whitespace/text before Tag
                 self.parsed_pos += next_open_angle
@@ -515,8 +544,8 @@ class Qwen3CoderDetector(BaseFormatDetector):
             self._buffer = self._buffer[self.parsed_pos :]
             self.parsed_pos = 0
 
-        normal_text = "".join(normal_text_chunks) if normal_text_chunks else ""
-        return StreamingParseResult(calls=calls, normal_text=normal_text)
+        flush_part()
+        return parts
 
     def supports_structural_tag(self) -> bool:
         return True
