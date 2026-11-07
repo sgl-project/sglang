@@ -34,6 +34,16 @@ ARGS_REGEX = re.compile(
 )
 
 
+END_TOKEN = "</s>"
+MARKER_FUNCTION_CALL = "function call<|role_sep|>\n"
+MARKER_FUNCTION_CALL_INLINE = "<|function_call|>"
+MARKER_MESSAGE_SEP = "<|message_sep|>"
+
+# Upper bound for the end-of-stream drain: each round releases at most one pending
+# unit (a tool name or one argument diff).
+_MAX_FINISH_DRAIN_ROUNDS = 1024
+
+
 class GigaChat3Detector(BaseFormatDetector):
     def __init__(self) -> None:
         super().__init__()
@@ -42,6 +52,10 @@ class GigaChat3Detector(BaseFormatDetector):
         self.end_content: bool = False
         self._buffer: str = ""
         self.prev_tool_call_arr: list[dict] = []
+        # Length of the assistant text already streamed, so the pre-marker
+        # portion is emitted exactly once even when the marker is split across
+        # deltas.
+        self._content_sent: int = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if text contains a tool call marker"""
@@ -102,24 +116,41 @@ class GigaChat3Detector(BaseFormatDetector):
         Streaming parser for incremental text chunks.
         Maintains state across calls to build complete tool calls.
         """
-        if not new_text:
+        if not new_text and not self._buffer:
+            # Keep processing an empty delta while something is buffered: this is
+            # what lets finish() release state the last delta left pending.
             return StreamingParseResult()
         logger.debug(f"[GigaChat3] parse_streaming_increment: '{new_text}'")
         self._buffer += new_text
         current_text = self._buffer
-        delta_text = new_text
         content = None
         func_name = None
         cur_args = None
         m_func = REGEX_FUNCTION_CALL.search(current_text)
         if not self.tool_started:
-            m_content = REGEX_CONTENT_PATTERN.search(delta_text)
+            # Derive the visible text from the accumulated buffer rather than
+            # from this delta: a marker can straddle a delta boundary, and
+            # emitting the delta verbatim would print the protocol tokens
+            # themselves ("<|message_sep|>function call<|role_sep|>") to the
+            # user. Only the portion before the marker is content, and a suffix
+            # that could still become a marker is held until it is decided.
+            m_content = REGEX_CONTENT_PATTERN.search(current_text)
             if m_content:
-                content = m_content.group(1)
+                before_marker = m_content.group(1)
+                content = before_marker[self._content_sent :]
+                self._content_sent = len(before_marker)
                 self.end_content = True
-            else:
-                if not self.end_content:
-                    content = delta_text
+            elif not self.end_content:
+                held = max(
+                    self._ends_with_partial_token(current_text, MARKER_FUNCTION_CALL),
+                    self._ends_with_partial_token(
+                        current_text, MARKER_FUNCTION_CALL_INLINE
+                    ),
+                    self._ends_with_partial_token(current_text, MARKER_MESSAGE_SEP),
+                )
+                safe_end = len(current_text) - held if held else len(current_text)
+                content = current_text[self._content_sent : safe_end]
+                self._content_sent = safe_end
             if m_func:
                 self.tool_started = True
                 logger.debug("[GigaChat3] Tool call started")
@@ -134,8 +165,14 @@ class GigaChat3Detector(BaseFormatDetector):
         args_match = ARGS_REGEX.search(json_tail)
         if args_match:
             cur_args = args_match.group(1).strip()
-            if cur_args.endswith("</s>"):
-                cur_args = cur_args[: -len("</s>")]
+            if cur_args.endswith(END_TOKEN):
+                cur_args = cur_args[: -len(END_TOKEN)]
+            elif self._ends_with_partial_token(cur_args, END_TOKEN):
+                # The end token is still arriving. Emitting now would send an
+                # argument prefix that includes part of "</s>" (and possibly the
+                # outer closing brace), and no later delta can repair a string
+                # the client has already concatenated, so wait for it.
+                return StreamingParseResult()
             if cur_args.endswith("}"):
                 try:
                     candidate = cur_args[:-1].strip()
@@ -189,6 +226,29 @@ class GigaChat3Detector(BaseFormatDetector):
                 parameters=delta_args,
             )
         )
+        return StreamingParseResult(calls=calls)
+
+    def finish(self, tools: List[Tool]) -> StreamingParseResult:
+        """Release tool-call state the last delta left pending.
+
+        parse_streaming_increment emits the tool name first and its arguments on
+        a later call. When the delta that completes the call is the last one
+        (multi-token deltas from speculative decoding / MTP,
+        ``stream_interval > 1``, or a call short enough to be generated in one
+        step) nothing picks the arguments up, so the client received the call
+        with empty arguments or, for a call still incomplete, no call at all --
+        while detect_and_parse returned it in full.
+
+        Re-running the parser with an empty delta drains that queue. Only calls
+        can be pending: this detector emits content as it arrives and keeps no
+        text back waiting for a marker, so nothing else has to be released.
+        """
+        calls: List[ToolCallItem] = []
+        for _ in range(_MAX_FINISH_DRAIN_ROUNDS):
+            result = self.parse_streaming_increment("", tools)
+            if not result.calls:
+                break
+            calls.extend(result.calls)
         return StreamingParseResult(calls=calls)
 
     def supports_structural_tag(self) -> bool:
