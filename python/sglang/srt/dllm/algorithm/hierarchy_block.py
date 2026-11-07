@@ -33,17 +33,23 @@ class HierarchyBlock(DllmAlgorithm):
 
     supported_architectures = ("Fast_dVLMForConditionalGeneration",)
     carries_block_state = True
+    # Backends that read each layer's attn_type on every forward, which the
+    # switch between denoising and the final causal forward relies on.
+    supported_attention_backends = ("flashinfer", "triton", "fa3")
+    required_attention_backend = "flashinfer"
 
     @classmethod
     def configure_server_args(cls, server_args: ServerArgs) -> None:
         cfg = resolving_view(server_args)
+        if cfg.device != "cuda":
+            raise ValueError("HierarchyBlock supports CUDA GPU execution only")
         if cfg.dllm_fdfo:
             raise ValueError("HierarchyBlock does not support --dllm-fdfo")
         # Denoise and the final KV write use different block masks; a graph
         # captured with one mask cannot replay the other.
-        graph_config = with_phase(
-            cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-        )
+        graph_config = cfg.cuda_graph_config
+        for phase in Phase.ALL:
+            graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
         declare_resolution(server_args, cls.__name__, cuda_graph_config=graph_config)
 
     @classmethod
@@ -77,6 +83,9 @@ class HierarchyBlock(DllmAlgorithm):
         algo_states: Optional[List[Optional[int]]] = None,
     ) -> DllmRunOutput:
         batch_size = forward_batch.batch_size
+        if batch_size == 0:
+            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            return out.logits_output, [], None, [], out.can_run_graph
         start_list = self._block_start_list(forward_batch)
         if algo_states is not None:
             self._seed_inherited_tokens(forward_batch, algo_states)

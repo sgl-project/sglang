@@ -1,13 +1,26 @@
 import unittest
+from array import array
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import torch
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import _dllm_attention_backend
 from sglang.srt.dllm.algorithm import get_algorithm_cls
 from sglang.srt.dllm.algorithm.hierarchy_block import HierarchyBlock
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.base_prefix_cache import InsertParams
+from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.model_executor.cuda_graph_config import (
+    Backend,
+    CudaGraphConfig,
+    PhaseConfig,
+)
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -186,42 +199,202 @@ class TestHierarchyBlockRun(unittest.TestCase):
         with self.assertRaises(ValueError):
             _algorithm(block_size=8, sub_block_size=3)
 
-
-class TestHierarchyBlockScheduling(unittest.TestCase):
-    def _req(self, committed_len, state, carries=True):
-        dllm_config = SimpleNamespace(
-            block_size=4,
-            requires_separate_context_encoding=False,
-            carries_block_state=carries,
+    def test_empty_batch_does_not_read_logits(self):
+        runner = SimpleNamespace(
+            model=_Model(),
+            forward=lambda fb, pp_proxy_tensors=None: SimpleNamespace(
+                logits_output=None, can_run_graph=False
+            ),
         )
+        batch = SimpleNamespace(
+            batch_size=0,
+            input_ids=torch.empty(0, dtype=torch.long),
+            dllm_prompt_mask=None,
+        )
+
+        _, next_ids, _, states, _ = _algorithm().run(runner, batch, [])
+
+        self.assertEqual((next_ids, states), ([], []))
+
+
+class TestHierarchyBlockLaunch(unittest.TestCase):
+    def _server_args(self, **overrides):
+        args = dict(
+            device="cuda",
+            dllm_fdfo=False,
+            cuda_graph_config=CudaGraphConfig(
+                decode=PhaseConfig(backend=Backend.FULL),
+                prefill=PhaseConfig(backend=Backend.FULL),
+            ),
+        )
+        args.update(overrides)
+        return SimpleNamespace(**args)
+
+    def test_cuda_graphs_are_disabled_in_both_phases(self):
+        """Graphs bake the attention mask in at capture, but denoising and the
+        final KV write need different masks in the same block."""
+        server_args = self._server_args()
+
+        HierarchyBlock.configure_server_args(server_args)
+
+        resolved = resolving_view(server_args).cuda_graph_config
+        self.assertEqual(resolved.decode.backend, Backend.DISABLED)
+        self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
+
+    def test_rejects_fdfo_and_non_cuda_devices(self):
+        with self.assertRaises(ValueError):
+            HierarchyBlock.configure_server_args(self._server_args(dllm_fdfo=True))
+        with self.assertRaises(ValueError):
+            HierarchyBlock.configure_server_args(self._server_args(device="cpu"))
+
+    def test_only_backends_that_read_attn_type_per_forward_are_kept(self):
+        def view(backend):
+            return SimpleNamespace(
+                dllm_algorithm="HierarchyBlock",
+                attention_backend=backend,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                cuda_graph_config=CudaGraphConfig(),
+            )
+
+        for backend in ("flashinfer", "triton", "fa3"):
+            self.assertEqual(_dllm_attention_backend(view(backend)), {})
+        self.assertEqual(
+            _dllm_attention_backend(view("trtllm_mha")),
+            {
+                "attention_backend": "flashinfer",
+                "prefill_attention_backend": "flashinfer",
+                "decode_attention_backend": "flashinfer",
+            },
+        )
+
+
+def _req(prompt, algorithm="HierarchyBlock", carries=True):
+    sampling_params = SamplingParams(max_new_tokens=16, temperature=0)
+    sampling_params.normalize(None)
+    return Req(
+        rid="hierarchy-block",
+        origin_input_text="",
+        origin_input_ids=array("q", prompt),
+        sampling_params=sampling_params,
+        vocab_size=VOCAB,
+        dllm_config=DllmConfig(algorithm, {}, 4, MASK, 4, carries_block_state=carries),
+    )
+
+
+def _cache_with(tokens):
+    cache = RadixCache.create_simulated(page_size=4)
+    cache.insert(
+        InsertParams(key=RadixKey(array("q", tokens)), value=torch.arange(len(tokens)))
+    )
+    return cache
+
+
+class TestHierarchyBlockPrefixReuse(unittest.TestCase):
+    def test_new_request_recomputes_its_last_cached_block(self):
+        """The carried token comes from the causal forward over the last
+        committed block, so a new request cannot take that block from cache."""
+        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+        req = _req(prompt)
+
+        req.init_next_round_input(_cache_with(prompt))
+
+        self.assertEqual(req.prefix_len, 4)
+        self.assertTrue(req.is_dllm_prefill())
+
+    def test_request_with_carried_state_reuses_the_whole_prefix(self):
+        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+        req = _req(prompt)
+        req.dllm_algo_state = 42  # e.g. kept across a retraction
+
+        req.init_next_round_input(_cache_with(prompt))
+
+        self.assertEqual(req.prefix_len, 8)
+        self.assertFalse(req.is_dllm_prefill())
+
+    def test_algorithms_without_carried_state_keep_upstream_reuse(self):
+        prompt = [1, 2, 3, 4, 5, 6, 7, 8]
+        req = _req(prompt, algorithm="LowConfidence", carries=False)
+
+        req.init_next_round_input(_cache_with(prompt))
+
+        self.assertEqual(req.prefix_len, 8)
+
+
+class TestHierarchyBlockResultProcessing(unittest.TestCase):
+    def _scheduler(self, carries):
         return SimpleNamespace(
-            dllm_config=dllm_config,
-            return_logprob=False,
-            logprob_start_len=-1,
-            is_dllm=lambda: True,
-            origin_input_ids=list(range(committed_len)),
-            output_ids=[],
-            dllm_algo_state=state,
+            dllm_config=SimpleNamespace(
+                block_size=4,
+                requires_separate_context_encoding=False,
+                first_done_first_out_mode=False,
+                carries_block_state=carries,
+            ),
+            token_to_kv_pool_allocator=Mock(),
+            metrics_reporter=SimpleNamespace(
+                num_generated_tokens=0, report_prefill_stats=Mock()
+            ),
+            output_streamer=Mock(),
+            _store_dllm_block_state=SchedulerDllmMixin._store_dllm_block_state,
+            _finish_dllm_request_if_needed=Mock(),
         )
 
-    def _max_prefix_len(self, req):
-        input_len = len(req.origin_input_ids) + req.dllm_config.block_size
-        return Req._compute_max_prefix_len(req, input_len)
+    def _batch(self, reqs):
+        return SimpleNamespace(
+            reqs=reqs,
+            batch_size=lambda: len(reqs),
+            forward_mode=ForwardMode.DLLM_EXTEND,
+            prefill_stats=None,
+            dp_cooperation_info=None,
+            return_logprob=False,
+        )
 
-    def test_prefix_match_recomputes_last_block_when_state_is_missing(self):
-        # Block-aligned commit, no carried token: reuse stops one block early.
-        self.assertEqual(self._max_prefix_len(self._req(8, None)), 4)
-        self.assertEqual(self._max_prefix_len(self._req(8, 7)), 8)
-        self.assertEqual(self._max_prefix_len(self._req(8, None, carries=False)), 8)
-        # A partial last block is recomputed anyway.
-        self.assertEqual(self._max_prefix_len(self._req(10, None)), 8)
+    def _result(self, next_token_ids, states):
+        return SimpleNamespace(
+            copy_done=None,
+            next_token_ids=next_token_ids,
+            dllm_algo_state=states,
+            accept_length_per_req_cpu=None,
+            can_run_cuda_graph=False,
+        )
 
-    def test_block_state_is_stored_on_every_request(self):
-        reqs = [SimpleNamespace(dllm_algo_state=None) for _ in range(2)]
-        SchedulerDllmMixin._store_dllm_block_state(reqs, [3, 4])
-        self.assertEqual([r.dllm_algo_state for r in reqs], [3, 4])
-        with self.assertRaises(AssertionError):
-            SchedulerDllmMixin._store_dllm_block_state(reqs, None)
+    def _staged(self, prompt):
+        req = _req(prompt)
+        req.init_next_round_input()
+        req.extend_end = len(req.full_untruncated_fill_ids)
+        return req
+
+    def test_prompt_only_block_stores_state_without_emitting(self):
+        reqs = [self._staged([1, 2, 3, 4]), self._staged([5, 6, 7, 8])]
+
+        SchedulerDllmMixin.process_batch_result_dllm(
+            self._scheduler(True), self._batch(reqs), self._result([], [40, 41])
+        )
+
+        self.assertEqual([r.dllm_algo_state for r in reqs], [40, 41])
+        self.assertEqual([list(r.output_ids) for r in reqs], [[], []])
+
+    def test_generated_block_stores_state_and_emits(self):
+        req = self._staged([1, 2])
+        tokens = torch.tensor([20, 21])
+
+        SchedulerDllmMixin.process_batch_result_dllm(
+            self._scheduler(True), self._batch([req]), self._result([tokens], [22])
+        )
+
+        self.assertEqual(req.dllm_algo_state, 22)
+        self.assertEqual(list(req.output_ids), [20, 21])
+
+    def test_other_algorithms_leave_request_state_alone(self):
+        req = self._staged([1, 2])
+
+        SchedulerDllmMixin.process_batch_result_dllm(
+            self._scheduler(False),
+            self._batch([req]),
+            self._result([torch.tensor([20, 21])], None),
+        )
+
+        self.assertIsNone(req.dllm_algo_state)
 
 
 if __name__ == "__main__":
