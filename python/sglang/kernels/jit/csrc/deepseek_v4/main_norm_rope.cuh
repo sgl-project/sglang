@@ -10,6 +10,7 @@
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/deepseek_v4/kv_layout.cuh>
+#include <sgl_kernel/dsa/indexer_rope.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -214,7 +215,7 @@ struct FusedQNormRopeKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_q_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, H, kHeadDim})  //
         .with_strides({-1, kHeadDim, 1})
@@ -444,6 +445,15 @@ constexpr uint32_t kFusedKV41WarpsPerCTA = 4;
 // Below this many tokens the block-per-token kernel is as fast (decode, short prefill).
 constexpr uint32_t kFusedKV41MinTokens = 2048;
 
+// HIP's __shfl_xor_sync traps if a masked lane has returned, and a returned warp idles half a wave64
+SGL_DEVICE float shfl_xor_in_warp(float value, uint32_t lane_mask) {
+#ifndef USE_ROCM
+  return __shfl_xor_sync(0xffffffffu, value, lane_mask);
+#else
+  return __shfl_xor(value, lane_mask);
+#endif
+}
+
 template <
     typename DType,
     int64_t kHeadDim,
@@ -510,7 +520,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   for (uint32_t mask = 2; mask >= 1; mask >>= 1) {
 #pragma unroll
     for (uint32_t p = 0; p < kPairs; ++p)
-      sums[p] += __shfl_xor_sync(0xffffffffu, sums[p], mask);
+      sums[p] += shfl_xor_in_warp(sums[p], mask);
   }
 #pragma unroll
   for (uint32_t half = kPairs / 2; half >= 1; half >>= 1) {
@@ -521,7 +531,7 @@ __global__ __launch_bounds__(kFusedKV41WarpsPerCTA* device::kWarpThreads) void f
   float sum_of_squares = sums[0];
 #pragma unroll
   for (uint32_t mask = 16; mask >= 4; mask >>= 1)
-    sum_of_squares += __shfl_xor_sync(0xffffffffu, sum_of_squares, mask);
+    sum_of_squares += shfl_xor_in_warp(sum_of_squares, mask);
   const auto norm_factor = math::rsqrt(sum_of_squares / kHeadDim + params.eps);
 
   // As in the reference: round the normed values, rotate the RoPE tail, round again.
@@ -614,7 +624,7 @@ struct FusedKNormRopeFlashMLAKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, kHeadDim})  //
         .with_strides({-1, 1})
@@ -713,8 +723,16 @@ struct FusedQIndexerRopeHadamardQuantParams {
   uint32_t num_heads;
 };
 
-template <typename DType, typename PosT, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+// kNeoxStyle pairs dim d with d + 32 instead of adjacent dims (leading-dim rope only).
+template <
+    typename DType,
+    typename PosT,
+    bool kUsePDL,
+    bool kRopeFirst = false,
+    bool kHadamard = true,
+    bool kNeoxStyle = false>
 Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQIndexerRopeHadamardQuantParams params) {
+  static_assert(!kNeoxStyle || kRopeFirst, "NeoX rope is implemented for the leading-dim layout only");
   using namespace device;
 
   constexpr int64_t kHeadDim = 128;
@@ -750,7 +768,7 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   // is known (part 4).
 
   PDLWaitPrimary<kUsePDL>();
-  Float4 data, freq;
+  Float4 data, freq, freq_sin;
   const uint32_t head_id = work_id - batch_id * params.num_heads;
   const auto weight_val =
       cast<float>(static_cast<const DType*>(params.weight)[batch_id * params.weight_stride_batch + head_id]);
@@ -760,7 +778,9 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     Storage input_vec;
     input_vec.load(input_ptr, lane_id);
     if (is_rope_lane) {
-      if constexpr (kRopeFirst) {
+      if constexpr (kNeoxStyle) {
+        dsa_indexer::load_neox_cos_sin<kRopeDim>(rope_cache, lane_id, freq, freq_sin);
+      } else if constexpr (kRopeFirst) {
         freq = load_rope_first_cos_sin<kRopeDim>(rope_cache, lane_id);
       } else {
         freq.load(rope_cache, lane_id - (kWarpThreads - kRopeSize));
@@ -772,8 +792,10 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
     }
   }
 
-  // part 2: rope on rope lanes only (4 elems / lane = 2 (real, imag) pairs).
-  if (is_rope_lane) {
+  // part 2: rope
+  if constexpr (kNeoxStyle) {
+    dsa_indexer::apply_neox_rope<kRopeSize>(data, freq, freq_sin, lane_id, is_rope_lane);
+  } else if (is_rope_lane) {
     const auto x_real = data[0];
     const auto x_imag = data[1];
     const auto y_real = data[2];
@@ -844,10 +866,11 @@ Q_KERNEL void fused_q_indexer_rope_hadamard_quant(const __grid_constant__ FusedQ
   }
 }
 
-template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true>
+template <typename DType, bool kUsePDL, bool kRopeFirst = false, bool kHadamard = true, bool kNeoxStyle = false>
 struct FusedQIndexerRopeHadamardQuantKernel {
   template <typename PosT>
-  static constexpr auto kernel = fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard>;
+  static constexpr auto kernel =
+      fused_q_indexer_rope_hadamard_quant<DType, PosT, kUsePDL, kRopeFirst, kHadamard, kNeoxStyle>;
 
   static void forward(
       const tvm::ffi::TensorView q_input,
@@ -864,7 +887,7 @@ struct FusedQIndexerRopeHadamardQuantKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     // Caller path is `wq_b(q_lora).view(-1, H, D)` -> contiguous; the kernel
     // assumes a flat `(B*H, kHeadDim)` layout for both q_input and q_fp8.
@@ -1088,7 +1111,7 @@ struct FusedQIndexerRopeHadamardFp4QuantKernel {
     auto B = SymbolicSize{"batch_size"};
     auto H = SymbolicSize{"num_heads"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({B, H, kHeadDim})
         .with_strides({-1, kHeadDim, 1})

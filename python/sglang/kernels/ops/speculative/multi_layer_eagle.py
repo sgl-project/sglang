@@ -83,7 +83,7 @@ def rotate_input_ids(
     if batch_size == 0 and _is_npu:
         return input_ids
 
-    BLOCK_SIZE = 4096 if select_index is not None else 8
+    BLOCK_SIZE = 4096
     grid = (batch_size,)
 
     rotate_input_ids_kernel[grid](

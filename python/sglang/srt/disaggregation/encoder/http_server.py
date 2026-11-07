@@ -40,13 +40,14 @@ from sglang.srt.disaggregation.encoder.server import (
     MMEncoder,
     MMError,
 )
+from sglang.srt.entrypoints.server_utils import add_prometheus_middleware
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     sock_send,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -56,10 +57,7 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    add_prometheus_middleware,
-    configure_logger,
-)
+from sglang.srt.utils import configure_logger
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)

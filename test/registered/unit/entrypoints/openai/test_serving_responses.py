@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 
 import orjson
 import pytest
+from fastapi.responses import ORJSONResponse
 from openai.types.responses import (
     ResponseOutputMessage,
     ResponseOutputText,
@@ -24,6 +25,8 @@ from utils import (
     event_payloads,
     make_serving,
 )
+from xgrammar import Grammar
+from xgrammar.testing import _is_grammar_accept_string
 
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
@@ -41,17 +44,24 @@ from sglang.srt.entrypoints.openai.serving_responses import (
     _build_output_text_logprobs,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
+from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.parser.response_template import ResponseTemplateReasoningDetector
 from sglang.srt.parser.template_detection import ReasoningToggleConfig
-from sglang.srt.runtime_context import get_serving, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_serving,
+    publish,
+    reset_context,
+)
 from sglang.srt.sampling.sampling_params import (
     REQUEST_REASONING_END_TOKEN_IDS_KEY,
+    get_request_reasoning_in_grammar,
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.test_utils import CustomTestCase, enter_override
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 
 class InputMessageConstructionTestCase(CustomTestCase):
@@ -286,19 +296,45 @@ class InputMessageConstructionTestCase(CustomTestCase):
             self.assertEqual(item.phase, phase)
             self.assertEqual(item.content[0].text, "answer")
 
-    def test_replay_preserves_different_assistant_phases(self):
+    def test_replay_preserves_reasoning_and_assistant_phases(self):
         serving = make_serving()
         request = ResponsesRequest(
             model="x",
             input=[
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "plan"}],
+                },
                 {"role": "assistant", "content": "working", "phase": "commentary"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "conclusion"}],
+                },
                 {"role": "assistant", "content": "answer", "phase": "final_answer"},
+                {
+                    "type": "reasoning",
+                    "summary": [{"type": "summary_text", "text": "lookup"}],
+                },
+                {
+                    "type": "function_call",
+                    "call_id": "call_weather",
+                    "name": "get_weather",
+                    "arguments": "{}",
+                },
             ],
             store=False,
         )
         messages = serving._construct_input_messages(request)
-        self.assertEqual([m["phase"] for m in messages], ["commentary", "final_answer"])
-        self.assertEqual([m["content"] for m in messages], ["working", "answer"])
+        self.assertEqual(
+            [m.get("phase") for m in messages], ["commentary", "final_answer", None]
+        )
+        self.assertEqual(
+            [m.get("content") for m in messages], ["working", "answer", None]
+        )
+        self.assertEqual(
+            [m["reasoning_content"] for m in messages], ["plan", "conclusion", "lookup"]
+        )
+        self.assertEqual(messages[-1]["tool_calls"][0]["id"], "call_weather")
 
     def test_input_parts_normalized_for_chat_templates(self):
         serving = make_serving()
@@ -373,7 +409,7 @@ class ChatToolForwardingTestCase(CustomTestCase):
         serving = make_serving()
         seen = {}
 
-        def fake_process(chat_request, is_multimodal):
+        def fake_process(chat_request, is_multimodal, **_):
             seen["tools"] = chat_request.tools
             seen["tool_choice"] = chat_request.tool_choice
             seen["parallel_tool_calls"] = chat_request.parallel_tool_calls
@@ -691,6 +727,12 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         },
     }
 
+    # A call after the reasoning, closed by the tool closer detokenization keeps.
+    _CALL = (
+        '<think>Check the forecast.</think><call:get_weather>{"city": "Paris"}</call>'
+    )
+    _BEAM = {"reasoning_parser": "beam", "tool_call_parser": "beam"}
+
     @staticmethod
     def _output(text, matched):
         return {
@@ -704,18 +746,28 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         }
 
     def _respond(
-        self, stream, *, output, tool_call_parser="response_template", **request_fields
+        self,
+        stream,
+        *,
+        output,
+        reasoning_parser="response_template",
+        tool_call_parser="response_template",
+        **request_fields,
     ):
         serving = make_serving()
         serving.default_chat_template_kwargs = None
-        serving.reasoning_parser = "response_template"
+        serving.reasoning_parser = reasoning_parser
         serving.tool_call_parser = tool_call_parser
-        serving._reasoning_detector = ResponseTemplateReasoningDetector(
-            response_template=self.TEMPLATE
+        serving._reasoning_detector = (
+            ReasoningParser.DetectorMap[reasoning_parser](
+                response_template=self.TEMPLATE
+            )
+            if reasoning_parser
+            else None
         )
         # Always-on reasoning: the output grammar starts after the reasoning.
-        serving.template_manager.reasoning_config = ReasoningToggleConfig(
-            special_case="always"
+        serving.template_manager.reasoning_config = (
+            ReasoningToggleConfig(special_case="always") if reasoning_parser else None
         )
         tokenizer = serving.tokenizer_manager.tokenizer
         tokenizer.response_template = self.TEMPLATE
@@ -727,14 +779,15 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
         async def fake_generate(
             request_id, request_prompt, adapted_request, sampling_params, context, **_
         ):
-            context.append_output(output)
-            yield context
+            self.sampling_params = sampling_params
+            for item in output if isinstance(output, list) else [output]:
+                context.append_output(item)
+                yield context
 
         serving._generate_with_builtin_tools = fake_generate
-        request = ResponsesRequest(
-            model="x",
-            input="Weather?",
-            tools=[
+        request_fields.setdefault(
+            "tools",
+            [
                 {
                     "type": "function",
                     "name": "get_weather",
@@ -744,6 +797,10 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     },
                 }
             ],
+        )
+        request = ResponsesRequest(
+            model="x",
+            input="Weather?",
             stream=stream,
             store=False,
             **request_fields,
@@ -760,6 +817,8 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
 
         async def respond():
             response = await serving.create_responses(request)
+            if isinstance(response, ORJSONResponse):
+                return response
             if stream:
                 events = [event async for event in response]
                 return event_payloads(events)[-1]["response"]
@@ -833,6 +892,208 @@ class ResponseTemplateRequiredToolTestCase(CustomTestCase):
                     ["reasoning", "message"],
                 )
                 self.assertEqual(response["output"][1]["content"][0]["text"], payload)
+
+    def test_unconstrained_turns_take_the_template_grammar(self):
+        """Under Beam's parser, a turn nothing else constrains takes the template's
+        framing, opening with the reasoning."""
+        self._respond(False, output=self._output(self._CALL, matched=7), **self._BEAM)
+        params = self.sampling_params
+
+        self.assertTrue(get_request_reasoning_in_grammar(params.get("custom_params")))
+        grammar = Grammar.from_structural_tag(params["structural_tag"])
+        call = '<call:get_weather>{"city": "Paris"}</call>'
+        for text, expected in (
+            ("<think>Plan</think>" + call, True),
+            (call, False),
+            ("<think>Plan</think><answer>Paris</answer>", True),
+            ('<think>Plan</think><answer>{"a": 1}', True),
+            ("Paris", False),
+        ):
+            with self.subTest(text=text):
+                self.assertIs(_is_grammar_accept_string(grammar, text), expected)
+
+    def test_call_ended_by_another_stop_token_is_complete(self):
+        """A complete call ended by a stop token other than its closer must not be
+        dropped."""
+        output = self._output(self._CALL.removesuffix("</call>"), matched=2)
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                response = self._respond(
+                    stream, output=output, **self._BEAM, tool_choice="required"
+                )
+
+                self.assertEqual(
+                    [item["type"] for item in response["output"]],
+                    ["reasoning", "function_call"],
+                )
+                call = response["output"][1]
+                self.assertEqual(orjson.loads(call["arguments"]), {"city": "Paris"})
+
+    def test_automatic_call_needs_a_grammar_from_the_message_start(self):
+        """A single automatic call must not go unenforced when output may skip the
+        reasoning."""
+        fields = {
+            **self.TEMPLATE["fields"],
+            "thinking": {"open_pattern": r"<think>\s*", "close": "</think>"},
+        }
+        self.TEMPLATE = {**self.TEMPLATE, "fields": fields}
+
+        response = self._respond(
+            False,
+            output=self._output(self._CALL, matched=7),
+            **self._BEAM,
+            parallel_tool_calls=False,
+        )
+
+        self.assertEqual(response.status_code, 400)
+
+    def test_json_answer_admits_only_declared_calls(self):
+        """Before a JSON answer, the grammar must admit only calls to declared
+        tools."""
+        constraint = {"text": {"format": {"type": "json_object"}}}
+        call = self._output(self._CALL, matched=7)
+        answer = self._output(
+            '<think>Check the forecast.</think><answer>{"a": 1}', matched=2
+        )
+        self._respond(
+            False,
+            output=answer,
+            reasoning_parser="beam",
+            tool_call_parser="response_template",
+            **constraint,
+        )
+        grammar = Grammar.from_structural_tag(self.sampling_params["structural_tag"])
+        self.assertTrue(_is_grammar_accept_string(grammar, call["text"]))
+        self.assertFalse(
+            _is_grammar_accept_string(
+                grammar, call["text"].replace("get_weather", "delete_all")
+            )
+        )
+        self.assertEqual(
+            self._respond(
+                False,
+                output=answer,
+                **self._BEAM,
+                parallel_tool_calls=False,
+                **constraint,
+            ).status_code,
+            400,
+        )
+
+    def test_kept_tool_closer_after_json_answer_is_trimmed_incrementally(self):
+        """A kept tool closer must not leak into a JSON answer opened in an earlier
+        increment."""
+        make_serving()
+        enter_override(
+            self, get_context().override_server_args(incremental_streaming_output=True)
+        )
+        last = self._output(": 1}</call>", matched=7)
+        first = {
+            **last,
+            "text": '<think>Check the forecast.</think><answer>{"a"',
+            "meta_info": {**last["meta_info"], "finish_reason": None},
+        }
+
+        response = self._respond(
+            True,
+            output=[first, last],
+            **self._BEAM,
+            text={"format": {"type": "json_object"}},
+        )
+
+        message = response["output"][-1]
+        self.assertEqual(message["type"], "message")
+        self.assertEqual(message["content"][0]["text"], '{"a": 1}')
+
+    def test_flat_tool_with_a_stray_function_field_is_served(self):
+        """A tool field the parser does not read must not fail the response."""
+        tool = {
+            "type": "function",
+            "name": "get_weather",
+            "parameters": {"type": "object", "properties": {}},
+            "function": False,
+        }
+        output = self._output(
+            "<think>Check the forecast.</think><answer>Sunny.", matched=2
+        )
+        response = self._respond(False, output=output, **self._BEAM, tools=[tool])
+
+        self.assertEqual(response["output"][-1]["type"], "message")
+        self.assertEqual(response["output"][-1]["content"][0]["text"], "Sunny.")
+
+    def test_tool_markup_inside_an_answer_is_answer_data(self):
+        """Tool markup inside a text or JSON answer must stay in the answer, never
+        become a call, whether the opener arrives split or together with the
+        answer and whether or not a reasoning parser separates the reasoning. A
+        call instead of the answer stays a call."""
+        reasoning = "<think>Check the forecast.</think>"
+        markup = self._CALL.removeprefix(reasoning)
+        payload = orjson.dumps({"note": markup}).decode()
+        call = self._output(self._CALL, matched=7)
+        text_answer = "A call looks like " + markup.removesuffix("</call>") + "."
+        for answer, response_format, reasoning_parsers in (
+            (text_answer, {}, ("beam", None)),
+            # Without a reasoning parser, JSON output starts at the first token.
+            (payload, {"text": {"format": {"type": "json_object"}}}, ("beam",)),
+        ):
+            text = reasoning + "<answer>" + answer
+            whole = self._output(text, matched=2)
+            cut = text.index("<answer>") + len("<ans")
+            first = {
+                **whole,
+                "text": text[:cut],
+                "meta_info": {**whole["meta_info"], "finish_reason": None},
+            }
+            split = [first, {**whole, "text": text[cut:]}]
+            for reasoning_parser in reasoning_parsers:
+                if reasoning_parser:
+                    answered = [("reasoning", None), ("message", answer)]
+                    called = [("reasoning", None), ("function_call", "get_weather")]
+                else:
+                    answered = [("message", text)]
+                    called = [("message", reasoning), ("function_call", "get_weather")]
+                for stream, output in (
+                    (False, whole),
+                    (True, whole),
+                    (True, split),
+                    (False, call),
+                    (True, call),
+                ):
+                    with self.subTest(
+                        answer=answer,
+                        reasoning_parser=reasoning_parser,
+                        stream=stream,
+                        split=output is split,
+                        call=output is call,
+                    ):
+                        if output is split:
+                            make_serving()
+                            enter_override(
+                                self,
+                                get_context().override_server_args(
+                                    incremental_streaming_output=True
+                                ),
+                            )
+                        response = self._respond(
+                            stream,
+                            output=output,
+                            reasoning_parser=reasoning_parser,
+                            tool_call_parser="beam",
+                            **response_format,
+                        )
+
+                        self.assertEqual(
+                            [
+                                (
+                                    item["type"],
+                                    item["content"][0]["text"]
+                                    if item["type"] == "message"
+                                    else item.get("name"),
+                                )
+                                for item in response["output"]
+                            ],
+                            called if output is call else answered,
+                        )
 
 
 class InputItemNormalizationTestCase(CustomTestCase):
