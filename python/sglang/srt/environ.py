@@ -1111,6 +1111,9 @@ class Envs:
     SGLANG_ROCM_KEEP_INHERITED_ROCPROFILER_REGISTER = EnvBool(False)
     SGLANG_ROCM_DISABLE_LINEARQUANT = EnvBool(False)
     USE_ROCM_AITER_ROPE_BACKEND = EnvStr("0")
+    # Kill-switch for the gfx95 MLA fusion of the absorbed FP8/MXFP4 w_kc projection,
+    # RoPE, and KV-cache write into one AITER kernel.
+    SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE = EnvBool(True)
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)

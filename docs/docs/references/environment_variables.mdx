@@ -1933,6 +1933,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_OPT_HIP_FUSE_MLA_PROJECTION_ROPE_CACHE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the absorbed MLA key projection, RoPE, and KV-cache write into one AITER launch on ROCm gfx95. FP8 <code>w_kc</code> fuses on the TileLang/Triton DSA path at decode-sized batches; MXFP4 <code>w_kc</code> (Kimi-K2.5, DeepSeek-V3/R1 MXFP4) fuses only during CUDA-graph capture of AITER-backend decode of up to 256 tokens, at kernel-supported head dims; eager decode and larger captured batches keep the split path. With an FP8 KV cache the fused and split MXFP4 paths are not bit-identical (FP8 rounding of Q). Set to <code>false</code> to keep the split path everywhere.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_DISABLE_LINEARQUANT</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Disable linear-layer quantization on ROCm.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
