@@ -366,8 +366,6 @@ The `model` argument in the examples below is the BF16 repo id. Every precision 
 
 ### 2.1 Reasoning
 
-Qwen3.8-Flash-Next **thinks by default**, but thinking can be turned off: the checkpoint's chat template implements `enable_thinking`, so the same weights also serve in instruct (non-thinking) mode. With `enable_thinking: true` (the default) the template pre-fills `<think>` and the turn's reasoning runs from there to the `</think>` the model generates before the answer; with `enable_thinking: false` it pre-fills an already-closed empty `<think></think>` block instead, so generation starts directly at the answer.
-
 Qwen3.8-Flash-Next **thinks by default**, but thinking can be turned off: set `"chat_template_kwargs": {"enable_thinking": false}` per request, or `--default-chat-template-kwargs '{"enable_thinking": false}'` server-wide. The template then pre-fills an empty `<think></think>` block, so generation starts directly at the answer.
 
 `--reasoning-parser auto` (toggle **Reasoning Parser** in the **Parsers** card of the [Playground above](#playground)) picks the matching parser from the chat template and splits the thinking into `reasoning_content`. Depth is requested with `reasoning_effort`: `xhigh` (the default), `medium`, or `low` — other values are rejected, and it has no effect while thinking is disabled. Thinking blocks are preserved by default (`preserve_thinking: true`); set `"chat_template_kwargs": {"preserve_thinking": false}` to keep only the latest turn's.
