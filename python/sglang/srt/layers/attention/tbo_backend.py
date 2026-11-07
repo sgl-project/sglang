@@ -217,6 +217,10 @@ class TboAttnBackend(AttentionBackend):
         # normal lookup succeeds with None and __getattr__ below never runs.
         return self.primary.verify_mask
 
+    def takes_fp8_dcp_verify_q(self) -> bool:
+        # The base defines this too, so __getattr__ below would never forward it.
+        return self.primary.takes_fp8_dcp_verify_q()
+
     def __getattr__(self, name):
         # Delegate backend-specific attributes/methods not explicitly wrapped
         # above (e.g. DSV4's get_unified_swa_loc / get_swa_out_cache_loc, which

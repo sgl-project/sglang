@@ -188,6 +188,9 @@ class HybridAttnBackend(AttentionBackend):
             ForwardMode.TARGET_VERIFY
         ).update_verify_buffers_to_fill_after_draft(spec_info, cuda_graph_bs)
 
+    def takes_fp8_dcp_verify_q(self) -> bool:
+        return self._select_backend(ForwardMode.TARGET_VERIFY).takes_fp8_dcp_verify_q()
+
     def validate_elastic_cuda_graph_recapture(self) -> None:
         backend = (
             self.prefill_backend
