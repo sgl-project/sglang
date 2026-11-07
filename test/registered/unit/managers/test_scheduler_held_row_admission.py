@@ -42,7 +42,9 @@ class _Adder(PrefillAdder):
         self.can_run_list = []
         self.preempt_list = []
         self.new_chunked_req = None
+        self.rem_input_tokens = 0
         self.rem_chunk_tokens = 0
+        self.kv_shard_granule = 0
 
     def add_chunked_req(self, req):
         self.can_run_list.append(req)
