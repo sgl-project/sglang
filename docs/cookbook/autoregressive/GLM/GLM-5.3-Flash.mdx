@@ -273,7 +273,7 @@ Install `torchcodec` for video and see the [encoder disaggregation guide](/docs/
 
 Use prefill context parallelism (CP) to distribute DSA prefill computation for long prompts, including multimodal inputs. This hybrid model uses **interleave CP for DSA layers** and **head-wise tensor parallelism for KDA layers**, sharing the same communication group. Layer boundaries all-gather the context shards before KDA and reduce-scatter its output back onto those shards. The mHC residual streams and their coefficients stay local, with each output's reduction completed before the residual update.
 
-In the Playground's **Attention** card, select **TP=8** and **CP=8** on B300 or B200 to add `--attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`. For CP4, set TP=4 and CP=4. With CP enabled, the **MoE** card restricts EP to **1** or the CP size; an incompatible EP selection falls back to 1. Choosing EP=CP also adds `--moe-dense-tp-size` with the CP size. Prefill CP and PD disaggregation cannot be enabled together for this model.
+In the Playground's **Attention** card, select **TP=8** and **CP=8** on B300 or B200 to add `--attn-cp-size 8 --enable-prefill-cp --cp-strategy interleave`. For CP4, set TP=4 and CP=4. With CP enabled, the **MoE** card restricts EP to **1** or the CP size; an incompatible EP selection falls back to 1. Choosing EP=CP also adds `--moe-dense-tp-size` with the CP size. With PD disaggregation, prefill CP runs only on the prefill worker and currently needs DFlash2; see section 3.6.
 
 <Accordion title="Example of launching with Prefill CP on Blackwell GPU">
 
@@ -306,7 +306,9 @@ sglang serve \
 
 PD splits prefill and decode into separate server groups behind a router. For this hybrid model, the transfer moves both the paged DSA KV and the KDA recurrent state.
 
-The Playground's **PD Disagg** card defaults to **Off**, with **Mooncake** as its only transfer backend. Select **Prefill** or **Decode** to add `--disaggregation-mode prefill` or `--disaggregation-mode decode`, respectively, together with `--disaggregation-transfer-backend mooncake`. Selecting either role disables prefill CP. The generated prefill and decode commands use ports 30000 and 30100, respectively.
+The Playground's **PD Disagg** card defaults to **Off**, with **Mooncake** as its only transfer backend. Select **Prefill** or **Decode** to add `--disaggregation-mode prefill` or `--disaggregation-mode decode`, respectively, together with `--disaggregation-transfer-backend mooncake`. Selecting either role removes the prefill CP flags, because the Playground does not generate prefill CP for PD roles yet. The generated prefill and decode commands use ports 30000 and 30100, respectively.
+
+The prefill worker can still run prefill CP if both workers use DFlash2 (the **Speculative** card) over Mooncake and the prefill worker keeps EP, DP and PP at 1. Add `--attn-cp-size <TP size> --enable-prefill-cp --cp-strategy interleave` to the prefill command. The decode worker cannot use prefill CP; run it at the same TP size.
 
 <Warning>
 PD serving is mechanically validated with dummy weights only — startup, bootstrap, state transfer, and request flow all work on 4x GB300. It has not been load- or accuracy-tested. Treat it as a preview until the real-weight gate completes.
