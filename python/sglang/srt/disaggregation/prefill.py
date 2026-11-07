@@ -735,6 +735,14 @@ class SchedulerDisaggregationPrefillMixin:
             )
             self.cur_batch_for_debug = batch
 
+            # Transfers can finish during preparation. Retire them before
+            # another forward delays their response and cache release.
+            if (
+                envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+                and get_parallel().pp_size == 1
+            ):
+                self.process_disagg_prefill_transfer_queue()
+
             # Launch the current batch
             if batch:
                 if self.enable_staging:
@@ -877,6 +885,13 @@ class SchedulerDisaggregationPrefillMixin:
                 self.cur_batch_for_debug = batch
                 # Skip batch creation next round to avoid repeated preparation failures.
                 skip_batch_creation = batch is None
+
+                # Keep the same completion boundary for active and idle ranks.
+                if (
+                    envs.SGLANG_DISAGG_PREFILL_POLL_TRANSFERS_BEFORE_FORWARD.get()
+                    and get_parallel().pp_size == 1
+                ):
+                    self.process_disagg_prefill_transfer_queue()
 
                 # Launch the current batch
                 if batch:
