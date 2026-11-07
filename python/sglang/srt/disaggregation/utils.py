@@ -1070,9 +1070,12 @@ def build_kv_layer_ids(
     Returns [] for pools that cannot report ids, leaving the peers on positional
     pairing.
     """
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if not isinstance(token_to_kv_pool, HybridLinearKVPool):
+    # NPU MLA registers separate K/V/index tensor groups. A PP-local slice
+    # must pair each group by global layer id, not by a single flat offset.
+    if not isinstance(token_to_kv_pool, (HybridLinearKVPool, NPUMLATokenToKVPool)):
         return []
     layer_ids = token_to_kv_pool.get_kv_layer_ids()
     if draft_token_to_kv_pool is None:
@@ -1090,9 +1093,10 @@ def _remap_draft_layer_ids(layer_ids: List[int], num_hidden_layers: int) -> List
 
 
 def _draft_entry_layer_ids(*, pool, num_entries: int) -> List[int]:
+    from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
-    if isinstance(pool, HybridLinearKVPool):
+    if isinstance(pool, (HybridLinearKVPool, NPUMLATokenToKVPool)):
         ids = pool.get_kv_layer_ids()
     else:
         # Pools register k0..k(L-1) then v0..v(L-1), so ids repeat once per

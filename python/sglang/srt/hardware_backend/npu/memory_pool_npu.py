@@ -867,8 +867,11 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         ]
 
     def get_kv_layer_ids(self):
+        # Packed FP8 KV has no separate V entry; keep ids in registration order.
+        num_kv_groups = 1 if getattr(self, "dsa_kv_cache_store_fp8", False) else 2
         return (
-            list(range(self.start_layer, self.start_layer + self.layer_num)) * 2
+            list(range(self.start_layer, self.start_layer + self.layer_num))
+            * num_kv_groups
             + self.get_state_layer_ids()
         )
 
