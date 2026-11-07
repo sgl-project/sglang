@@ -152,13 +152,32 @@ def pcg_dsa_indexer_prefill_split(
         enable_dual_stream=False,
         forward_batch=forward_batch,
     )
-    q_fp8, q_scale = indexer._quantize_query(query, act_quant)
-    # Reuse the compiled head-gate util shared with the eager path.
-    weights = (  # same head-gate choice as the eager CP branch
-        indexer._scale_head_gates(weights_raw, q_scale)
-        if indexer.use_dsa_indexer_fusion
-        else indexer._get_logits_head_gate(x, q_scale)
-    )
+    from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+
+    if (
+        _is_cuda
+        and indexer.bf16_head_gate
+        and indexer.skip_rope
+        and indexer.head_dim == indexer.block_size == 128
+        # The fused kernel writes the FP8 query; an FP4 indexer quantizes its own.
+        and type(indexer)._quantize_query is Indexer._quantize_query
+    ):
+        # Kimi's no-RoPE indexer: one kernel for the Q quantization and the
+        # BF16 head-gate scaling.
+        from sglang.kernels.ops.attention.dsa.head_gate import indexer_q_quant_head_gate
+
+        gate = indexer._project_head_gates(x)
+        q_fp8, weights = indexer_q_quant_head_gate(
+            query, gate, indexer.softmax_scale, indexer.scale_fmt
+        )
+    else:
+        q_fp8, q_scale = indexer._quantize_query(query, act_quant)
+        # Reuse the compiled head-gate util shared with the eager path.
+        weights = (  # same head-gate choice as the eager CP branch
+            indexer._scale_head_gates(weights_raw, q_scale)
+            if indexer.use_dsa_indexer_fusion
+            else indexer._get_logits_head_gate(x, q_scale)
+        )
     # Store K cache + ragged top-k, sliced to the unpadded count and writing into
     # the static padded topk_result buffer (the graph contract). Mirrors the eager
     # path's store + _get_topk_ragged.
