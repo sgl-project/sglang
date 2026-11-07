@@ -2307,6 +2307,7 @@ class TestTransferReadyEvents(CustomTestCase):
                 linker.mla_broadcaster = None
                 linker.gc_frozen = True
                 linker.pending_loads = {"rid": ["transfer"]}
+                linker.load_queued_at = {}
                 linker.stats = {"load": 0}
                 linker.load_queue = queue.Queue()
                 if prefetch:
@@ -2329,7 +2330,9 @@ class TestTransferReadyEvents(CustomTestCase):
                         (
                             call.load_all_layers(["transfer"])
                             if prefetch
-                            else call.load_layer_wise(3, [["transfer"]])
+                            else call.load_layer_wise(
+                                3, [["transfer"]], [("rid", None)]
+                            )
                         ),
                     ],
                 )
