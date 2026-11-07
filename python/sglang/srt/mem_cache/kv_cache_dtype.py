@@ -133,11 +133,11 @@ def resolve_indexer_quant_mode(
     if main_kv_cache_dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
+        torch.float8_e5m2,
     ):
         raise ValueError(
             f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
-            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16); the FP8 "
-            f"DSA packed main cache already stores the indexer cache "
-            f"quantized, got main KV cache dtype {main_kv_cache_dtype}."
+            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16), "
+            f"got {main_kv_cache_dtype}."
         )
     return quant_mode

@@ -221,6 +221,8 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
         with self.assertRaises(ValueError):
             resolve_indexer_quant_mode("int8", torch.float8_e4m3fn)
         with self.assertRaises(ValueError):
+            resolve_indexer_quant_mode("int8", torch.float8_e5m2)
+        with self.assertRaises(ValueError):
             resolve_indexer_quant_mode("fp8_e4m3", torch.bfloat16)
 
     def test_empty_input_scale_matches_int8_cache(self):
