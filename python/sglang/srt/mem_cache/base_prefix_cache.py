@@ -280,6 +280,8 @@ class InitLoadBackParams:
     host_hit_length: int
     mem_quota: Optional[int] = None
     req: Optional[Req] = None
+    # Decode receives full-prompt request state from Prefill.
+    restore_request_state: bool = True
 
 
 class MatchResult(NamedTuple):

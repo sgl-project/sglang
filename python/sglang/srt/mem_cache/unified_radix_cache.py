@@ -2405,6 +2405,37 @@ class UnifiedRadixCache(BasePrefixCache):
             return None
         return self.tree_core.rotation_base_of(node_id)
 
+    def _build_prefetch_component_transfers(
+        self,
+        last_host_node_id: NodeId,
+        prefetch_key: RadixKey,
+        last_hash: Optional[str],
+    ) -> dict[ComponentType, list[PoolTransfer]]:
+        """Describe the component state required to restore a storage prefix."""
+        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
+        for ct in self.tree_components:
+            if ct == BASE_COMPONENT_TYPE:
+                continue
+            # Size the component's staging now; it is allocated at hit time,
+            # next to the KV staging, so the query holds no host memory.
+            prep = self.components[ct].prepare_prefetch(
+                last_host_node_id, prefetch_tokens=len(prefetch_key)
+            )
+            if prep.staging_tokens == 0:
+                continue
+            transfers = self.tree_core.build_hicache_transfers(
+                ct,
+                last_host_node_id,
+                CacheTransferPhase.PREFETCH,
+                token_ids=prefetch_key.token_ids,
+                prefetch_tokens=len(prefetch_key),
+                staging_tokens=prep.staging_tokens,
+                last_hash=last_hash,
+            )
+            if transfers:
+                comp_xfers[ct] = transfers
+        return comp_xfers
+
     def query_storage_hit_length(
         self,
         last_host_node_id: NodeId,
@@ -2431,13 +2462,41 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        comp_xfers = self._build_prefetch_component_transfers(
+            last_host_node_id, prefetch_key, last_hash
+        )
+        aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
+        aux_xfers.extend(
+            self._build_sidecar_transfers(
+                CacheTransferPhase.PREFETCH,
+                PoolTransfer(name=PoolName.KV, host_indices=None),
+                comp_xfers,
+            )
+        )
         operation = PrefetchOperation(
             CacheRequestHandle("__storage_hit_query__", 0),
             prefetch_key,
             last_hash,
             prefix_keys,
+            pool_transfers=aux_xfers or None,
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
+        if any(t.hit_policy == PoolHitPolicy.TRAILING_PAGES for t in aux_xfers):
+            # Sparse checkpoints must exist on every rank at the same endpoint.
+            # MIN of the longest hits could select an endpoint absent on a peer.
+            # Keep the collective shape tied to the request, including on a miss.
+            hits = torch.zeros(len(prefetch_key) // self.page_size + 1, dtype=torch.int)
+            hits[0] = 1
+            pages = operation.pool_storage_result.restorable_prefix_pages
+            max_pages = storage_hit_count // self.page_size
+            if pages is None:
+                pages = range(1, max_pages + 1)
+            for page in pages:
+                if 0 < page <= max_pages:
+                    hits[page] = 1
+            self._all_reduce_attn_groups(hits, torch.distributed.ReduceOp.MIN)
+            return int(torch.nonzero(hits, as_tuple=False)[-1].item()) * self.page_size
+
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
         self._all_reduce_attn_groups(
             storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
@@ -2536,28 +2595,9 @@ class UnifiedRadixCache(BasePrefixCache):
             if buffer_mode
             else self.inc_host_lock_ref(last_host_node_id).to_dec_params()
         )
-        comp_xfers: dict[ComponentType, list[PoolTransfer]] = {}
-        for ct in self.tree_components:
-            if ct == BASE_COMPONENT_TYPE:
-                continue
-            # Size the component's staging now; it is allocated at hit time,
-            # next to the KV staging, so the query holds no host memory.
-            prep = self.components[ct].prepare_prefetch(
-                last_host_node_id, prefetch_tokens=len(prefetch_key)
-            )
-            if prep.staging_tokens == 0:
-                continue
-            transfers = self.tree_core.build_hicache_transfers(
-                ct,
-                last_host_node_id,
-                CacheTransferPhase.PREFETCH,
-                token_ids=prefetch_key.token_ids,
-                prefetch_tokens=len(prefetch_key),
-                staging_tokens=prep.staging_tokens,
-                last_hash=last_hash,
-            )
-            if transfers:
-                comp_xfers[ct] = transfers
+        comp_xfers = self._build_prefetch_component_transfers(
+            last_host_node_id, prefetch_key, last_hash
+        )
         if buffer_mode and self.slot_id(TREE_TOKEN) is not None:
             transfers = self.component_of(TREE_TOKEN).build_hicache_transfers(
                 None,
@@ -4042,7 +4082,10 @@ class UnifiedRadixCache(BasePrefixCache):
                 and best_match_node_id in self.ongoing_load_back
             ):
                 return None
-            if self.load_back(best_match_node_id, mem_quota, req=req):
+            # Restore cache-owned checkpoints without replacing state supplied
+            # by the PD transfer in the request slot.
+            load_req = req if params.restore_request_state else None
+            if self.load_back(best_match_node_id, mem_quota, req=load_req):
                 new_indices = self.tree_core.collect_full_device_indices(
                     best_match_node_id, last_best_match_device_node_id
                 )

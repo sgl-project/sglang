@@ -1461,6 +1461,80 @@ class UnifiedRadixCacheStorageSuite(UnifiedRadixCacheStorageFixtures):
 
     @requires_hicache
     @requires(
+        lambda cfg: cfg.has_mamba and cfg.page_size == 4,
+        "one Mamba page_size=4 fixture covers sparse decode L3 checkpoints",
+    )
+    def test_decode_l3_hit_requires_a_restorable_checkpoint(self):
+        """A shorter KV prefix cannot be promised before its first Mamba state."""
+        storage_dir = self._make_storage_dir()
+        prod, prod_alloc, prod_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            prod, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        seq = self._make_seq(1, 8)
+        for prefix in (seq[: 4 * self.cfg.page_size], seq):
+            self._insert(prod, prod_alloc, prod_rtp, prefix)
+            leaf = match_prefix(prod, prefix).last_device_node
+            self._backup_node(prod, leaf)
+            self._write_path_to_l3(prod, leaf)
+        self._flush_l3_backups(prod)
+
+        cons, _, cons_rtp = build_fixture(self.cfg)
+        self._init_hicache(
+            cons, storage_backend="file", storage_dir=storage_dir, prefetch_threshold=1
+        )
+        decode = SimpleNamespace(
+            scheduler=SimpleNamespace(enable_decode_hicache=True), tree_cache=cons
+        )
+        for pages, expected_pages in ((2, 0), (6, 4), (8, 8)):
+            with self.subTest(pages=pages):
+                req = self._make_req(cons_rtp)
+                req.origin_input_ids = array(
+                    "q", seq[: pages * self.cfg.page_size] + [5000]
+                )
+                result = match_kv_cache(req, cons, req.origin_input_ids)
+                match = DecodeHiCachePreallocMixin._build_decode_prefix_match(
+                    decode, req, result
+                )
+                self.assertEqual(
+                    match.l3_storage_hit_length, expected_pages * self.cfg.page_size
+                )
+
+        # Local checkpoints are at pages 4 and 8; the peer has pages 4 and 6.
+        # A scalar MIN would promise page 6, which has no local checkpoint.
+        def peer_checkpoint_vote(tensor, op):
+            if tensor.numel() == 1:
+                tensor.clamp_(max=6 * self.cfg.page_size)
+            else:
+                peer = torch.zeros_like(tensor)
+                peer[[0, 4, 6]] = 1
+                tensor.copy_(torch.minimum(tensor, peer))
+
+        with mock.patch.object(
+            cons, "_all_reduce_attn_groups", side_effect=peer_checkpoint_vote
+        ):
+            self.assertEqual(
+                cons.query_storage_hit_length(cons.root_node_handle(), seq),
+                4 * self.cfg.page_size,
+            )
+
+        # KV and Mamba are insufficient when an indexer sidecar is required.
+        cons.sidecar_pool_specs.append(SidecarPoolSpec(PoolName.INDEXER, PoolName.KV))
+        backend = cons.cache_controller.storage_backend
+        keys = self._all_page_hashes(prod, leaf)
+        for stored_pages in (0, 4, 8):
+            for key in keys[:stored_pages]:
+                backend.set(
+                    backend._log_key(PoolName.INDEXER, key),
+                    torch.zeros(1, dtype=torch.uint8),
+                )
+            self.assertEqual(
+                cons.query_storage_hit_length(cons.root_node_handle(), seq),
+                stored_pages * self.cfg.page_size,
+            )
+
+    @requires_hicache
+    @requires(
         lambda cfg: cfg.components == (ComponentType.FULL,) and cfg.page_size == 4,
         "one FULL page_size=4 fixture covers namespace routing",
     )
