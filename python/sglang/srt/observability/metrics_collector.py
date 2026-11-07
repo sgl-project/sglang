@@ -1056,6 +1056,19 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         # Pre-seed every mode at 0 so per-tier ratio charts get a complete operand set
         for mode in ("input", "device_hit", "host_hit", "storage_hit"):
             self.prefill_effective_tokens_total.labels(**labels, mode=mode)
+        self.prefill_state_miss_tokens_total = Counter(
+            name="sglang:prefill_state_miss_tokens_total",
+            documentation=(
+                "Prefill input tokens whose Full KV was cached on device or "
+                "host but could not be reused because another cache component "
+                "(e.g. the linear-attention state of a hybrid model) had no "
+                "state that deep, counted once per admitted request. The rest "
+                'of mode="input" in sglang:prefill_effective_tokens_total had '
+                "no cached KV."
+            ),
+            labelnames=list(labels.keys()),
+        )
+        self.prefill_state_miss_tokens_total.labels(**labels)
         self.forward_execution_seconds_total = Counter(
             name="sglang:forward_execution_seconds_total",
             documentation=(
@@ -1588,6 +1601,7 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         device_hit_tokens: int,
         host_hit_tokens: int,
         storage_hit_tokens: int,
+        state_miss_tokens: int = 0,
     ) -> None:
         for mode, delta in [
             ("input", input_tokens),
@@ -1599,6 +1613,10 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                 self.prefill_effective_tokens_total.labels(
                     **self.labels, mode=mode
                 ).inc(delta)
+        if state_miss_tokens > 0:
+            self.prefill_state_miss_tokens_total.labels(**self.labels).inc(
+                state_miss_tokens
+            )
 
     def increment_forward_execution_seconds(
         self,

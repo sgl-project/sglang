@@ -151,6 +151,8 @@ class TestPrefillAdder(CustomTestCase):
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
+        req.num_matched_prefix_tokens = 0
+        req.full_kv_hit_length = 0
         req.materialized_host_hit_len.return_value = 0
         req.fulfilled_storage_hit_len.return_value = 0
         req.finished.return_value = False
@@ -529,6 +531,30 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.log_device_hit_tokens, 8)
         self.assertEqual(adder.log_host_hit_tokens, 0)
         self.assertEqual(adder.log_storage_hit_tokens, 12)
+
+    def test_state_miss_tokens_are_counted_once_at_admission(self):
+        adder = self.create_adder(self.create_running_batch())
+        # Full KV is cached 256 tokens deep, but the deepest node with every
+        # component's state (e.g. a linear-attention state) is at 64.
+        req = self.create_mock_req("state-miss", priority=0, max_new_tokens=1)
+        req.num_matched_prefix_tokens = 64
+        req.full_kv_hit_length = 256
+        adder._account_prefill_cache_admission(req, prefix_len=64)
+        self.assertEqual(adder.log_state_miss_tokens, 192)
+
+        # Nothing is cached past the reusable prefix: a KV miss only.
+        req = self.create_mock_req("kv-miss", priority=0, max_new_tokens=1)
+        req.num_matched_prefix_tokens = 64
+        req.full_kv_hit_length = 64
+        adder._account_prefill_cache_admission(req, prefix_len=64)
+        self.assertEqual(adder.log_state_miss_tokens, 192)
+
+        # Retracted requests are not attributed, like the tier hit counters.
+        req = self.create_mock_req("retracted", priority=0, max_new_tokens=1)
+        req.retracted_stain = True
+        req.full_kv_hit_length = 512
+        adder._account_prefill_cache_admission(req, prefix_len=0)
+        self.assertEqual(adder.log_state_miss_tokens, 192)
 
     def test_retracted_storage_prefetch_accounting_is_omitted(self):
         adder = self.create_adder(self.create_running_batch())

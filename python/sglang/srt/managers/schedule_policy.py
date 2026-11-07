@@ -685,6 +685,7 @@ class PrefillAdder:
         self.log_device_hit_tokens = 0
         self.log_host_hit_tokens = 0
         self.log_storage_hit_tokens = 0
+        self.log_state_miss_tokens = 0
         self.log_input_tokens = 0
         self.log_replay_tokens = 0
         self.reprocessed_log_input_tokens = 0
@@ -967,6 +968,11 @@ class PrefillAdder:
             )
             return
 
+        # Full KV was cached past the reusable prefix, but another component's
+        # state (e.g. a hybrid model's linear-attention state) was not.
+        self.log_state_miss_tokens += max(
+            0, req.full_kv_hit_length - req.num_matched_prefix_tokens
+        )
         if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
