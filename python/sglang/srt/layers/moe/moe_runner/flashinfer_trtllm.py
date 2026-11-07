@@ -1599,7 +1599,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
     if runner_config.activation == "situ":
         from flashinfer import trtllm_fp4_block_scale_moe
         from flashinfer.fused_moe import trtllm_fp4_block_scale_routed_moe
-        from flashinfer.tllm_enums import ActivationType, RoutingMethodType
+        from flashinfer.tllm_enums import ActivationType, RoutingMethodType, SfLayout
 
         from sglang.srt.layers.moe import route_quant_handoff
 
@@ -1672,6 +1672,7 @@ def _fused_experts_flashinfer_mxfp4_sm100_trtllm_gen(
                 tune_max_num_tokens=next_power_of_2(x_quant.shape[0]),
                 output=symm_output,
                 do_finalize=not defer_finalize,
+                hidden_states_scale_layout=SfLayout.layout_linear,
                 enable_pdl=trtllm_moe_enable_pdl(x_quant.shape[0]),
             )
             if defer_finalize:

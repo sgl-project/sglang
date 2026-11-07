@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import weakref
 from itertools import accumulate
 from typing import TYPE_CHECKING, Optional
 
@@ -15,6 +16,58 @@ from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+
+
+def seed_cu_seqlens_contents(cu_seqlens: torch.Tensor, extend_seq_lens_cpu) -> None:
+    """Give FlashInfer the host contents of this forward's cu_seqlens.
+
+    FlashInfer's KDA prefill reads cu_seqlens to the host once per tensor
+    (kda_chunked_bt16._cu_seqlens_contents), a device-to-host copy that
+    synchronizes the stream on the first KDA layer of every forward. The
+    scheduler already has the lengths on the host, so fill FlashInfer's memo
+    for this tensor instead. Skipped when the shapes disagree or the memo is
+    absent (other FlashInfer versions).
+    """
+    if (
+        extend_seq_lens_cpu is None
+        or len(extend_seq_lens_cpu) + 1 != cu_seqlens.numel()
+    ):
+        return
+    try:
+        from flashinfer.kda_kernels import kda_chunked_bt16 as fi_kda
+    except ImportError:
+        return
+    memo = getattr(fi_kda, "_CU_CONTENTS_MEMO", None)
+    if memo is None:
+        return
+    contents = (0, *accumulate(int(n) for n in extend_seq_lens_cpu))
+    try:
+        version = cu_seqlens._version
+    except Exception:
+        version = None
+    memo[cu_seqlens.data_ptr()] = (weakref.ref(cu_seqlens), version, contents)
+
+    # FlashInfer's _plan builds its chunk-prefix tensor with torch.tensor(list,
+    # device=cuda) on a cache miss (new lengths every forward): a pageable copy
+    # that waits for the stream. Fill the same cache entry from pinned memory.
+    plan_cache = getattr(fi_kda, "_PLAN_CACHE", None)
+    bt = getattr(fi_kda, "BT", None)
+    if plan_cache is None or bt is None:
+        return
+    key = (contents, str(cu_seqlens.device))
+    if key in plan_cache:
+        return
+    cu_chunks = [0]
+    for start, end in zip(contents[:-1], contents[1:]):
+        cu_chunks.append(cu_chunks[-1] + (end - start + bt - 1) // bt)
+    host = torch.tensor(cu_chunks, dtype=torch.int32, pin_memory=True)
+    plan_cache[key] = {
+        "total_chunks": cu_chunks[-1],
+        "cu_chunks": host.to(cu_seqlens.device, non_blocking=True),
+        "cu_list": list(contents),
+        # Keeps the pinned source alive until the copy has run.
+        "_host_cu_chunks": host,
+    }
 
 
 def build_flashinfer_kda_checkpoint_plan(
