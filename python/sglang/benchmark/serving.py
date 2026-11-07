@@ -99,6 +99,7 @@ class RequestFuncInput:
     extra_request_body: Dict[str, Any]
     timestamp: Optional[float] = None
     routing_key: Optional[str] = None
+    audio_data: Optional[List[str]] = None
 
 
 @dataclass
@@ -456,6 +457,28 @@ async def async_request_openai_chat_completions(
                 "content": content_items,
             },
         ]
+    elif request_func_input.audio_data:
+        # Build multi-audio content: a list of inline audio entries followed by
+        # the text. Clips are synthesized as `data:audio/wav;base64,...` URIs,
+        # so strip the data-URI prefix for the OpenAI-style ``input_audio``
+        # part; the server normalizes it back into a data URI.
+        content_items = [
+            {
+                "type": "input_audio",
+                "input_audio": {
+                    "data": audio_url.split(",", 1)[1],
+                    "format": "wav",
+                },
+            }
+            for audio_url in request_func_input.audio_data
+        ]
+        content_items.append({"type": "text", "text": request_func_input.prompt})
+        messages = [
+            {
+                "role": "user",
+                "content": content_items,
+            },
+        ]
     else:
         messages = [{"role": "user", "content": request_func_input.prompt}]
 
@@ -722,6 +745,10 @@ async def async_request_sglang_generate(
         # Add image data if available (list of image urls/base64)
         if request_func_input.image_data:
             payload["image_data"] = request_func_input.image_data
+
+        # Add audio data if available (list of audio data URIs)
+        if request_func_input.audio_data:
+            payload["audio_data"] = request_func_input.audio_data
 
         headers = get_request_headers()
         if request_func_input.routing_key:
@@ -1481,6 +1508,7 @@ async def benchmark(
         output_len=min(test_request.output_len, 32),
         lora_name=lora_name,
         image_data=test_request.image_data,
+        audio_data=test_request.audio_data,
         extra_request_body=extra_request_body,
     )
 
@@ -1606,6 +1634,7 @@ async def benchmark(
             output_len=request.output_len,
             lora_name=lora_name,
             image_data=request.image_data,
+            audio_data=request.audio_data,
             extra_request_body=merged_extra_body,
             timestamp=request.timestamp,
             routing_key=request.routing_key,
@@ -1934,6 +1963,12 @@ async def benchmark(
                 f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
                 f"{args.random_output_len}_{args.image_count}imgs_"
                 f"{args.image_resolution}.jsonl"
+            )
+        elif args.dataset_name in ("audio", "random-audio"):
+            output_file_name = (
+                f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_"
+                f"{args.random_output_len}_{args.audio_count}auds_"
+                f"{args.audio_duration}s.jsonl"
             )
         elif args.dataset_name.startswith("random"):
             output_file_name = f"{args.backend}_{now}_{args.num_prompts}_{args.random_input_len}_{args.random_output_len}.jsonl"
@@ -2338,6 +2373,8 @@ def cli_main():
             "generated-shared-prefix",
             "mmmu",
             "image",
+            "audio",
+            "random-audio",
             "mooncake",
             "longbench_v2",
             "speed-bench",
@@ -2461,6 +2498,39 @@ def cli_main():
         type=str,
         default="random",
         help=("Content for images for image dataset. Supports random and blank."),
+    )
+    # audio dataset args
+    parser.add_argument(
+        "--audio-count",
+        type=int,
+        default=1,
+        help="Number of audio clips per request (only available with the audio dataset)",
+    )
+    parser.add_argument(
+        "--audio-duration",
+        type=float,
+        default=5.0,
+        help="Length in seconds of each synthetic audio clip for the audio dataset.",
+    )
+    parser.add_argument(
+        "--audio-sample-rate",
+        type=int,
+        default=16000,
+        help="Sample rate (Hz) of synthetic audio clips for the audio dataset.",
+    )
+    parser.add_argument(
+        "--random-audio-count",
+        action="store_true",
+        help="Enable random audio clip count per request for the audio dataset.",
+    )
+    parser.add_argument(
+        "--audio-content",
+        type=str,
+        default="random",
+        help=(
+            "Content for clips in the audio dataset. "
+            "Supports random (sine tone + noise) and silence."
+        ),
     )
     parser.add_argument(
         "--request-rate",
