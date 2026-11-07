@@ -51,3 +51,9 @@ def test_unreadable_header_returns_none(tmp_path):
     """None (fall back to the user/env default) when there is nothing to probe."""
     assert try_detect_fp4_experts(os.path.join(str(tmp_path), "does-not-exist")) is None
     assert try_detect_fp4_experts(str(tmp_path)) is None  # no safetensors shard
+
+
+if __name__ == "__main__":
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v"]))
