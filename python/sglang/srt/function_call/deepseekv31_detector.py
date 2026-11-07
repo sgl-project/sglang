@@ -55,7 +55,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains a deepseek format tool call."""
-        return self.bot_token in text
+        return self.bot_token in text or "<｜tool▁call▁begin｜>" in text
 
     def detect_and_parse(self, text: str, tools: List[Tool]) -> StreamingParseResult:
         """
@@ -65,9 +65,13 @@ class DeepSeekV31Detector(BaseFormatDetector):
         :param tools: List of available tools.
         :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
         """
-        idx = text.find(self.bot_token)
+        # Structural tags can emit individual calls without the section wrapper.
+        start_positions = [
+            text.find(token) for token in (self.bot_token, "<｜tool▁call▁begin｜>")
+        ]
+        idx = min((pos for pos in start_positions if pos != -1), default=-1)
         normal_text = text[:idx].strip() if idx != -1 else text
-        if self.bot_token not in text:
+        if idx == -1:
             return StreamingParseResult(normal_text=normal_text, calls=[])
         match_result_list = re.findall(self.func_call_regex, text, re.DOTALL)
         calls = []
@@ -97,9 +101,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
-        )
+        has_tool_call = self.has_tool_call(current_text)
 
         if not has_tool_call:
             self._buffer = ""
