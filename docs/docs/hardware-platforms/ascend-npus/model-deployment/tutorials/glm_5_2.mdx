@@ -196,6 +196,58 @@ identity, TTFT, TPOT, and peak memory. Target-A3 acceptance of the BF16/INT and
 SwiGLU/SiTU combinations remains pending; host matrix tests do not establish
 full-model quality.
 
+## MegaMoE on A5 with MXFP experts
+
+The same `--moe-a2a-backend ascend_fuseep --fuseep-mode 3` interface supports
+Ascend 950 MXFP experts through the existing DeepEP/CANN MegaMoE operator.
+This adapter builds on the A3 integration and reuses the MXFP quantizers; no
+additional native kernel or dependency patch is included. It requires a
+DeepEP build containing [sgl-kernel-npu #873](https://github.com/sgl-project/sgl-kernel-npu/pull/873),
+matching CANN 9.2 toolkit/operator packages exposing the A5 MegaMoE API, and
+compatible PyTorch/torch_npu with E8M0 and packed-FP4 support.
+
+| Expert format | Checkpoint/setting | DeepEP mode |
+| --- | --- | --- |
+| W8A8 MXFP8 E4M3 | ModelSlim offline or `--quantization mxfp8` online | `mx_fp8_e4m3` |
+| W4A8 MXFP4 | ModelSlim offline | `mx_fp8_e4m3_w4` |
+| W4A4 MXFP4 | ModelSlim offline | `mx_fp4_e2m1` |
+
+Use a checkpoint whose surrounding layers are also supported by its existing
+quantization configuration. E5M2, online FP4 conversion, mixed W13/W2 formats,
+expert biases and additional checkpoint formats are outside this adapter.
+SwiGLU and SiTU retain their model-configured semantics and the restrictions
+listed above. Shared experts must remain separate; MoE TP must be 1.
+
+A5 preparation retains `[E,N,K]` weights and ND E8M0 scales
+`[E,N,K/64,2]`, rather than the transpose views used by ordinary GMMs. MXFP8
+uses ND weights; packed FP4 uses the projection-specific NZ conversions required
+by CANN. `SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT=1` is rejected for FP4.
+A5 receives BF16 inputs at their actual local length; DeepEP owns quantization
+and dispatch. Set the same positive dispatch capacity on every rank, at least
+as large as the maximum local batch. A3's 4096-token limit does not apply to A5;
+installed CANN geometry/capacity constraints still apply.
+
+For example, adapt the A3 recipe to a compatible A5 checkpoint and node:
+
+```bash
+export MODEL_PATH=/path/to/a5-modelslim-mxfp-checkpoint
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=8192
+python3 -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --trust-remote-code \
+  --device npu --dtype bfloat16 --quantization modelslim \
+  --tp-size 8 --ep-size 8 \
+  --moe-a2a-backend ascend_fuseep --fuseep-mode 3 \
+  --disable-shared-experts-fusion \
+  --chunked-prefill-size 8192 --disable-cuda-graph
+```
+
+This is an eager validation starting point, not an established model-support or
+performance result. Before enabling graphs, compare the same checkpoint against
+the existing unfused A5 path for numerical quality, prefill/decode and repeated
+unequal rank-local batches. Record runtime identity, resolved flags, activation,
+TTFT, TPOT, throughput and peak memory. Changing-shape graph replay, memory
+stability and full-model A5 acceptance remain pending.
+
 ## Installation
 
 <Warning>
