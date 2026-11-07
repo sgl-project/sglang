@@ -1031,7 +1031,7 @@ class LowRatioCompressAscendBackendMixin:
     scope, and the two generations differ in kernels and cache row formats.
     The context-parallel and prefill-graph branches of the CUDA source are not
     modeled on NPU.
- 
+
     Deviation from CUDA: the compress step hands its pre-RoPE ``latent`` to the
     index step, because ``indexer_prologue_k`` projects the index K from that
     latent, while CUDA writes the index K inside its compress step.
@@ -1865,7 +1865,9 @@ class LowRatioCompressAscendBackendMixin:
         # (unused, empty) softmax-lse tensors explicitly.
         attn_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         lse = torch.empty((0,), dtype=torch.float32, device=q.device)
-        _ds41_ops().mixed_quant_sparse_flash_mla(q, out=attn_out, lse=lse, **attn_kwargs)
+        _ds41_ops().mixed_quant_sparse_flash_mla(
+            q, out=attn_out, lse=lse, **attn_kwargs
+        )
         return attn_out
 
     # ---- V4.1 metadata assembly ------------------------------------------------

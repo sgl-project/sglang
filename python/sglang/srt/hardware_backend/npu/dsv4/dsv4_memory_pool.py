@@ -288,9 +288,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
         packed fp4 with one uint8 scale per 32 values (see
         :class:`DSV41NPUIndexerPool`).
         """
-        layout = (
-            NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
-        )
+        layout = NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
         return layout.indexer_kv_info(self.index_head_dim)
 
     def indexer_buffer_info(self) -> DSV4IndexerBufferInfo:
@@ -416,23 +414,16 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         format: the V4.1 low ratios compress through epilog_v2's fp4 rows
         unconditionally (the shared layout option does not apply here), and
         the V4 ratios take the A5/A3 row by part."""
-        if (
-            compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS
-            and self._is_v41_model()
-        ):
+        if compress_ratio in NPUDSV4KVLayout.COMPRESSED_RATIOS and self._is_v41_model():
             return NPUDSV4KVLayout.V41_CMP_FP4
-        return (
-            NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
-        )
+        return NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
 
     def _window_kv_layout(self):
         """Row format of the non-compressed (full/swa/window) pools, resolved
         from the generation and the part; see the shared default."""
         if self._is_v41_model():
             return NPUDSV4KVLayout.V41_SWA_FP8
-        return (
-            NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
-        )
+        return NPUDSV4KVLayout.A5_FP8 if is_npu_arch35() else NPUDSV4KVLayout.A3_BF16
 
     def _make_kv_pool(
         self,

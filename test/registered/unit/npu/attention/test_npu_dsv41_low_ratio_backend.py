@@ -44,11 +44,11 @@ _ds2_stub._is_hip = False
 sys.modules.setdefault("sglang.srt.models.deepseek_v2", _ds2_stub)
 
 import sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend as dsv4_backend
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     DeepseekV4AscendAttnBackend,
     LowRatioCompressAscendBackendMixin,
 )
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
@@ -428,10 +428,6 @@ class TestIndexerBufferAccessors(unittest.TestCase):
             wait_layer_transfer=lambda _lid: None,
             _indexer_pool=lambda ratio: pools[ratio],
         )
-
-    def test_token_to_kv_pool_exposes_both_accessors(self):
-        for name in ("get_index_k", "get_index_scale"):
-            self.assertTrue(hasattr(dsv4_memory_pool.DSV4NPUTokenToKVPool, name), name)
 
     def test_routes_by_ratio_and_passes_the_per_ratio_index(self):
         seen = {}

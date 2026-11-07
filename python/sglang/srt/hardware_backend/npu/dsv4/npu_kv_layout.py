@@ -83,7 +83,9 @@ class NPUDSV4KVLayout(str, enum.Enum):
         data = head // 2 if self is NPUDSV4KVLayout.V41_CMP_FP4 else head
         raw = data + 2 * -(-head // self.quant_group)
         align = self.row_alignment
-        dtype = torch.uint8 if self is NPUDSV4KVLayout.V41_CMP_FP4 else torch.float8_e4m3fn
+        dtype = (
+            torch.uint8 if self is NPUDSV4KVLayout.V41_CMP_FP4 else torch.float8_e4m3fn
+        )
         return -(-raw // align) * align, dtype
 
     def indexer_kv_info(self, head_dim: int) -> tuple:
