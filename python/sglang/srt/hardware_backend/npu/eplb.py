@@ -256,14 +256,14 @@ class _ExpertStorageLayout(NamedTuple):
     storage_elements: int
     npu_format: int
 
-    def wire_shape(self, weight: torch.Tensor) -> tuple[int, int]:
+    def expert_byte_shape(self, weight: torch.Tensor) -> tuple[int, int]:
         """Return [routed experts, physical bytes per expert] for uint8 transport."""
         elements_per_expert = self.storage_elements // self.total_experts
         bytes_per_expert = elements_per_expert * weight.element_size()
         return weight.shape[0], bytes_per_expert
 
 
-def _full_expert_weight(weight: torch.Tensor) -> torch.Tensor:
+def _validated_weight_owner(weight: torch.Tensor) -> torch.Tensor:
     """Validate the routed-expert prefix and return its complete backing tensor."""
     # get_moe_weights returns parameter.data[:routed_experts]. Its base retains
     # the complete expert axis, including fused shared experts at the end.
@@ -294,11 +294,11 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     """Check that raw storage can be split into equal, complete expert blocks."""
     import torch_npu
 
-    owner = _full_expert_weight(weight)
+    owner = _validated_weight_owner(weight)
     storage_elements = torch_npu.get_storage_size(owner)
     npu_format = torch_npu.get_npu_format(owner)
     # Inspect the tensor's actual format, independently of the model name.
-    # Only base formats and 3D batched NZ support this per-expert storage split.
+    # This implementation accepts base formats and 3D batched NZ.
     if npu_format not in _BASE_FORMATS + _NZ_FORMATS:
         raise ValueError(f"A5 EPLB does not support storage format {npu_format}.")
     if npu_format not in _BASE_FORMATS and owner.ndim != 3:
@@ -308,15 +308,23 @@ def _expert_storage_layout(weight: torch.Tensor) -> _ExpertStorageLayout:
     if (
         not 0 < storage_elements <= 2**31 - 1
         or storage_elements < owner.numel()
-        or storage_elements % owner.shape[0]
         or storage_elements * owner.element_size() > owner.untyped_storage().nbytes()
-        # Base formats have no internal padding.
-        or (npu_format in _BASE_FORMATS and storage_elements != owner.numel())
-        # Padded storage needs the full parameter base, not a detached prefix.
-        or (weight._base is None and storage_elements != owner.numel())
     ):
         raise ValueError(
-            "A5 EPLB requires complete expert storage; padded NZ weights must "
+            f"A5 EPLB has invalid storage capacity: {storage_elements} elements "
+            f"for shape {tuple(owner.shape)} and "
+            f"{owner.untyped_storage().nbytes()} allocated bytes."
+        )
+    if storage_elements % owner.shape[0]:
+        raise ValueError(
+            f"A5 EPLB cannot divide {storage_elements} storage elements evenly "
+            f"among {owner.shape[0]} experts."
+        )
+    if npu_format in _BASE_FORMATS and storage_elements != owner.numel():
+        raise ValueError("A5 EPLB requires base-format storage without padding.")
+    if weight._base is None and storage_elements != owner.numel():
+        raise ValueError(
+            "A5 EPLB padded NZ weights must "
             "retain their full parameter base through the routed-expert slice."
         )
     return _ExpertStorageLayout(owner.shape[0], storage_elements, npu_format)
@@ -352,7 +360,9 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
     def create_temp_buffers(self, weights: list[torch.Tensor]) -> list[torch.Tensor]:
         return [
             torch.empty(
-                layout.wire_shape(weight), dtype=torch.uint8, device=weight.device
+                layout.expert_byte_shape(weight),
+                dtype=torch.uint8,
+                device=weight.device,
             )
             for weight, layout in zip(weights, self._layouts, strict=True)
         ]
@@ -367,7 +377,7 @@ class _PhysicalExpertWeightStaging(_ExpertWeightStaging):
             if not needs_staging:
                 # Keep byte transport for FP8 scales, without copying ND storage.
                 migration_weights.append(
-                    weight.view(torch.uint8).view(layout.wire_shape(weight))
+                    weight.view(torch.uint8).view(layout.expert_byte_shape(weight))
                 )
                 continue
             # Snapshot the full backing tensor: [routed experts | shared experts].
