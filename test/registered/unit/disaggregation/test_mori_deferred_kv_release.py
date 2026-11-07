@@ -1,6 +1,7 @@
-"""Deferred decode-side KV release on the Mori backend."""
+"""Deferred decode-side KV release and PP state pairing on the Mori backend."""
 
 import threading
+import types
 import unittest
 from collections import defaultdict
 from queue import Queue
@@ -317,6 +318,97 @@ class TestMoriAbortAck(DeferredAbortNotificationScenarios, CustomTestCase):
 
         self.assertEqual(manager._drain_transfer_statuses.call_count, 2)
         log.assert_called_once()
+
+
+# GLM-5.2 under PP4: 78 layers split 20/20/20/18, the MTP draft entry on the last stage.
+_DECODE_DSA_ENTRIES = 79
+_PP4_STAGES = ((0, 20), (20, 20), (40, 20), (60, 19))
+
+
+def _pp_stage_manager(
+    start_layer: int, *, hybrid: bool = False
+) -> tuple[MoriKVManager, list]:
+    """A PP4 prefill-stage manager whose engine records each batch write's descriptors."""
+    manager = _manager()
+    manager.pp_size = 4
+    manager.is_mla_backend = True
+    manager.is_hybrid_mla_backend = hybrid
+    manager.attn_tp_size = 1
+    manager.kv_args = types.SimpleNamespace(prefill_start_layer=start_layer)
+    writes = []
+
+    def batch_write(src_descs, local_offsets, dst_descs, *args):
+        writes.append((src_descs[0], dst_descs[0]))
+        return [MagicMock()]
+
+    manager.engine = MagicMock()
+    manager.engine.batch_write.side_effect = batch_write
+    return manager, writes
+
+
+def _send_unlabeled_state(
+    manager: MoriKVManager,
+    *,
+    state_type: str,
+    num_src: int,
+    num_dst: int = _DECODE_DSA_ENTRIES,
+) -> None:
+    """Send one request's state pages with no layer ids on either peer."""
+    manager._send_swa_dsa_state(
+        peer_info=types.SimpleNamespace(decode_tp_size=4),
+        src_state_indices=np.array([3, 4, 9], dtype=np.int32),
+        dst_state_indices=np.array([7, 8, 12], dtype=np.int32),
+        src_state_mem_descs=[f"P{i}" for i in range(num_src)],
+        src_state_item_lens=[64] * num_src,
+        dst_state_mem_descs=[f"D{j}" for j in range(num_dst)],
+        dst_state_item_lens=[64] * num_dst,
+        state_type=state_type,
+        src_layer_ids=[],
+        dst_layer_ids=[],
+    )
+
+
+class TestMoriPpDsaStatePairing(CustomTestCase):
+    def test_each_stage_writes_decode_entries_at_its_layer_offset(self):
+        """DSA state carries no layer ids, so a PP>1 prefill used to fail every state
+        send; each stage must write its entries from its first layer, draft included."""
+        for start_layer, num_src in _PP4_STAGES:
+            with self.subTest(start_layer=start_layer):
+                manager, writes = _pp_stage_manager(start_layer)
+
+                _send_unlabeled_state(manager, state_type="dsa", num_src=num_src)
+
+                self.assertEqual(
+                    writes,
+                    [(f"P{i}", f"D{start_layer + i}") for i in range(num_src)],
+                )
+
+    def test_unpairable_layouts_still_fail_before_any_write(self):
+        """Only plain DSA state pairs by stage offset: a hybrid linear+DSA pool,
+        whose entries skip its linear layers, would land on the wrong layers,
+        and a stage that would overrun the decode entries raises instead of
+        writing past them."""
+        for state_type, hybrid, start_layer, num_src, num_dst, error in (
+            ("swa", False, 40, 20, _DECODE_DSA_ENTRIES, "requires layer ids"),
+            ("dsa", False, 70, 19, _DECODE_DSA_ENTRIES, "do not match prefill pp"),
+            # Hybrid, half the layers full attention: decode lists 40 entries,
+            # the stage at layer 20 has 10.
+            ("dsa", True, 20, 10, 40, "requires layer ids"),
+        ):
+            with self.subTest(
+                state_type=state_type, hybrid=hybrid, start_layer=start_layer
+            ):
+                manager, writes = _pp_stage_manager(start_layer, hybrid=hybrid)
+
+                with self.assertRaisesRegex(RuntimeError, error):
+                    _send_unlabeled_state(
+                        manager,
+                        state_type=state_type,
+                        num_src=num_src,
+                        num_dst=num_dst,
+                    )
+
+                self.assertEqual(writes, [])
 
 
 if __name__ == "__main__":
