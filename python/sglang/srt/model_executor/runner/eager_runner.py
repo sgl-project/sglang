@@ -328,8 +328,9 @@ class EagerRunner(BaseRunner):
                 not get_parallel().enable_cp_tp_group_sharing
                 or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
-                # GLM delegates its CP boundary to this runner via prepare_cp_inputs.
-                # Other group-sharing models keep owning the layout in forward().
+                # GLM and Kimi-K3 delegate their CP boundary to this runner via
+                # prepare_cp_inputs. Other group-sharing models keep owning the
+                # layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -368,23 +369,23 @@ class EagerRunner(BaseRunner):
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
             model_kwargs["input_embeds"] = sharded_input_embeds
-            hidden_states = model.model(
+            body = model.model
+            if hasattr(body, "logits_processor"):
+                # A multimodal wrapper exposes its causal LM as `.model`; run
+                # that LM's text body, as the gather/logits tail below does.
+                body = body.model
+            hidden_states = body(
                 model_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,
             )
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
-        aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
         if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
+            # A middle stage may return a PP proxy rather than a tuple.
+            return hidden_states
+        aux_hidden_states = None
+        if getattr(model, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
 
         stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)

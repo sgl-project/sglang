@@ -17,6 +17,7 @@ mod multi_modality;
 mod tokenizer_manager;
 mod utils;
 
+pub use api_server::core::{ExtensionCounter, ExtensionHistogram};
 pub use api_server::handlers::{AbortEnding, Aborted};
 pub use api_server::http::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateMetaInfo,
@@ -30,7 +31,7 @@ pub use message::config::{
     ModelConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
-pub use message::request::{GenerateRequest, MmData};
+pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFetch};
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
