@@ -26,6 +26,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_post_permute,
     register_pre_permute,
 )
+from sglang.srt.layers.moe.moe_runner.humming_activation import get_humming_activation
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.utils.custom_op import register_custom_op
 
@@ -248,7 +249,7 @@ class HummingRunnerCore(MoeRunnerCore):
         # hidden_states
         # (-> quanted_gate_up_input) (if not BF16/FP16 activation)
         # -> gate_up_output
-        # -> activation_output
+        # -> activation_output (omitted when activation and quantization fuse)
         # (-> quanted_down_input) (if not BF16/FP16 activation)
         # -> down_output
         # (-> output) (if not is_grouped_masked)
@@ -311,7 +312,8 @@ class HummingRunnerCore(MoeRunnerCore):
         if gate_up_dtype.num_bits != 16:
             required_buffers.append("quanted_gate_up_input")
         required_buffers.append("gate_up_output")
-        required_buffers.append("activation_output")
+        if down_dtype.num_bits == 16:
+            required_buffers.append("activation_output")
         if down_dtype.num_bits != 16:
             required_buffers.append("quanted_down_input")
         required_buffers.append("down_output")
@@ -395,39 +397,14 @@ class HummingRunnerCore(MoeRunnerCore):
 
         return buffers
 
-    def apply_activation(self, inputs: torch.Tensor, outputs: torch.Tensor):
-        if self.activation == "silu" and self.swiglu_limit is not None:
-            from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
-                act_and_mul_triton,
-            )
-
-            in_2d = inputs.view(-1, inputs.shape[-1])
-            out_2d = outputs.view(-1, outputs.shape[-1])
-            act_and_mul_triton(
-                gateup_output=in_2d,
-                down_input=out_2d,
-                config={},
-                activation="silu",
-                swiglu_limit=float(self.swiglu_limit),
-            )
-            return
-        if self.activation == "silu":
-            from sgl_kernel import silu_and_mul
-
-            silu_and_mul(inputs, outputs)
-        elif self.activation == "gelu":
-            from sgl_kernel import gelu_and_mul
-
-            gelu_and_mul(inputs, outputs)
-        else:
-            raise ValueError(f"Unsupported activation: {self.activation}")
-
     def _prepare_input(
         self,
         inputs: torch.Tensor,
         sublayer_name: str,
         quanted_input: torch.Tensor | None = None,
         input_scale: torch.Tensor | None = None,
+        activation_type: str = "none",
+        activation_impl: str | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
         meta = self.layer.humming_metas[sublayer_name]
         hadamard_block_size = self._get_hadamard_block_size(sublayer_name)
@@ -455,6 +432,8 @@ class HummingRunnerCore(MoeRunnerCore):
             inputs=inputs,
             outputs=quanted_input,
             token_scales=token_scales,
+            activation_type=activation_type,
+            activation_impl=activation_impl,
             hadamard_block_size=hadamard_block_size,
             m_major_scale=False,
             sublayer_name=sublayer_name,
@@ -462,6 +441,18 @@ class HummingRunnerCore(MoeRunnerCore):
         input_scale = group_scales if quant_mode.has_group_scale else token_scales
         input_scale_2 = token_scales if quant_mode.has_secondary_scale else None
         return inputs, input_scale, input_scale_2
+
+    def _prepare_down_input(
+        self, buffers: dict[str, torch.Tensor]
+    ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None]:
+        inputs = buffers["gate_up_output"]
+        outputs = buffers.get("quanted_down_input", buffers.get("activation_output"))
+        return self._prepare_input(
+            inputs=inputs,
+            quanted_input=outputs,
+            sublayer_name="w2",
+            **get_humming_activation(self.config, inputs.dtype),
+        )
 
     def _get_hadamard_block_size(self, sublayer_name: str) -> int:
         weight_schemas = getattr(self.layer, "weight_schemas", {})
@@ -480,7 +471,10 @@ class HummingRunnerCore(MoeRunnerCore):
         groups = intermediate // 128
         num_threads = intermediate // 8
         use_fused_masked_act_quant = (
-            w2_meta.a_dtype == dtypes.float8e4m3
+            self.config.is_gated
+            and self.config.activation_type is None
+            and self.config.activation_impl is None
+            and w2_meta.a_dtype == dtypes.float8e4m3
             and w2_meta.input_quant_mode == InputQuantizationMode.DynamicGroup
             and w2_meta.as_dtype == dtypes.float32
             and w2_meta.input_scale_group_size == 128
@@ -516,15 +510,7 @@ class HummingRunnerCore(MoeRunnerCore):
             )
             return down_input.flatten(0, 1), down_scale.flatten(0, 1), None
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-        return self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
-        )
+        return self._prepare_down_input(buffers)
 
     def run(
         self,
@@ -640,16 +626,7 @@ class HummingRunnerCore(MoeRunnerCore):
             **moe_kwargs1,
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale, input_scale_2 = self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
-        )
+        inputs, input_scale, input_scale_2 = self._prepare_down_input(buffers)
 
         HummingMethod.forward_layer(
             layer=self.layer,
@@ -738,16 +715,7 @@ class HummingRunnerCore(MoeRunnerCore):
             sublayer_name="w13",
         )
 
-        self.apply_activation(
-            inputs=buffers["gate_up_output"],
-            outputs=buffers["activation_output"],
-        )
-
-        inputs, input_scale, input_scale_2 = self._prepare_input(
-            inputs=buffers["activation_output"],
-            quanted_input=buffers.get("quanted_down_input"),
-            sublayer_name="w2",
-        )
+        inputs, input_scale, input_scale_2 = self._prepare_down_input(buffers)
 
         HummingMethod.forward_layer(
             layer=self.layer,

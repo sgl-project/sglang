@@ -73,6 +73,10 @@ class MoeRunnerConfig:
     # Request FP32 SiLU/multiply intermediates until FP8 quantization.
     # False preserves backend defaults, including their existing FP32 paths.
     silu_mul_keep_fp32: bool = False
+    # Optional Humming CUDA C++ expression in float arguments a (gate), b (up).
+    # Custom expressions require an explicit binary_split/binary_interleaved layout.
+    activation_type: Optional[str] = None
+    activation_impl: Optional[str] = None
 
     # The MoE placement a fused func needs is the layer's own, not the
     # deployment's: DWDP's `FusedMoE.bind_full_expert_weights` collapses a

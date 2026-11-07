@@ -323,7 +323,6 @@ class Mxfp4Config(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config):
-
         quant_method = cls.get_from_keys(config, ["quant_method"])
         is_checkpoint_mxfp4_serialized = "mxfp4" in quant_method
 
@@ -362,7 +361,6 @@ class Mxfp4Config(QuantizationConfig):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
-
         from sglang.srt.layers.linear import LinearBase
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -391,6 +389,8 @@ class Mxfp4Config(QuantizationConfig):
 
 
 class Mxfp4MoEMethod(FusedMoEMethodBase):
+    use_humming = False
+
     def __init__(
         self,
         prefix: str,
@@ -403,6 +403,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
+        self.use_humming = get_moe_runner_backend().is_humming()
         # True W4A8: DeepGEMM fp8_fp4 grouped GEMM (SM100 MXF8F6F4 UMMA).
         # Weights stay MXFP4 (e2m1 + ue8m0 g32, zero requantization);
         # activations are quantized to fp8 per-token-group-128.
@@ -411,6 +412,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         # MoE runner, so it needs the same unpadded checkpoint layout and
         # DeepGEMM scale preparation even when the runner is flashinfer_mxfp4.
         self.use_mega_moe = get_moe_a2a_backend().is_megamoe()
+        if self.use_humming and self.use_mega_moe:
+            raise ValueError(
+                "MXFP4 MoE cannot combine --moe-runner-backend humming with "
+                "--moe-a2a-backend megamoe: MegaMoE calls DeepGEMM directly on "
+                "its own weight layout, which the Humming bridge cannot serve."
+            )
         self.flashinfer_mxfp4_moe_precision = (
             get_exec().moe.flashinfer_mxfp4_moe_precision
         )
@@ -477,9 +484,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 intermediate_size_per_partition_after_pad
                 - layer.intermediate_size_per_partition
             )
-        elif self.use_deep_gemm or self.use_mega_moe:
-            # DeepGEMM fp8_fp4 grouped GEMM consumes the checkpoint layout
-            # directly (packed e2m1 K-major + ue8m0 g32 scales); no padding.
+        elif self.use_deep_gemm or self.use_mega_moe or self.use_humming:
+            # These backends consume the unpadded MXFP4 checkpoint layout.
             pass
         elif get_platform().is_sm100:
             if self.use_flashinfer:
@@ -643,6 +649,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # Resolve MORI dtype overrides and build the EPv2 op before KV cache
             # sizing. No weight_dtype keeps bf16 dispatch, the validated default here.
             layer.dispatcher.set_quant_config({})
+
+        if self.use_humming:
+            if self.with_bias:
+                raise NotImplementedError(
+                    "The native MXFP4 Humming MoE bridge does not support bias."
+                )
+            if (
+                self.hidden_size != layer.hidden_size
+                or self.intermediate_size_per_partition
+                != layer.intermediate_size_per_partition
+            ):
+                raise RuntimeError(
+                    "The native MXFP4 Humming MoE bridge requires its allocated "
+                    "weight shapes to match the FusedMoE logical shapes."
+                )
+
+            from sglang.srt.layers.quantization.humming_utils import (
+                prepare_humming_moe_layer,
+            )
+
+            # Prepare native MXFP4 before the generic BF16 fallback.
+            prepare_humming_moe_layer(layer, {"quant_method": "mxfp4"})
+            layer._mxfp4_backend = "humming"
+            return
 
         if self.use_marlin and not self.use_mega_moe:
             from sglang.srt.layers.quantization.marlin_utils import (
@@ -1468,6 +1498,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or moe_runner_backend.is_triton()
             or moe_runner_backend.is_marlin()
             or moe_runner_backend.is_deep_gemm()
+            or moe_runner_backend.is_humming()
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         elif moe_runner_backend.is_flashinfer_mxfp4() and self._fi_kernel in (
@@ -1598,12 +1629,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer: torch.nn.Module,
         dispatch_output: StandardDispatchOutput,
     ) -> CombineInput:
-
         from sglang.srt.layers.moe.token_dispatcher import (
             DispatchOutputChecker,
             StandardCombineInput,
         )
         from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if self.use_humming:
+            # Non-standard dispatchers need MoeRunner's conversion first.
+            from sglang.srt.layers.moe.moe_runner.humming import (
+                HummingMoeQuantInfo,
+            )
+
+            return self.runner.run(
+                dispatch_output,
+                HummingMoeQuantInfo(layer=layer),
+            )
 
         if self.use_deep_gemm:
             # Handles standard AND deepep_ll/deepep_normal dispatch formats via
@@ -1823,7 +1864,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
 
         w13_weight = torch.nn.Parameter(

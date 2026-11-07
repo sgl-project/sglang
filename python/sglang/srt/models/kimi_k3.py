@@ -3444,8 +3444,13 @@ class KimiK3LinearForCausalLM(nn.Module):
                     continue
 
             # compressed-tensors MXFP4 stores as weight_packed; Mxfp4MoEMethod uses weight
-            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE).
-            if "weight_packed" in name and not _is_npu:
+            # (NPU keeps weight_packed for NPUCompressedTensorsW4A8mxfp4MoE). Routed
+            # experts keep the packed name and resolve the alias when mapped below.
+            if (
+                "weight_packed" in name
+                and not _is_npu
+                and not _EXPERT_WEIGHT_NAME.search(name)
+            ):
                 name = name.replace("weight_packed", "weight")
 
             # MLA: fuse q_a_proj + kv_a_proj_with_mqa → fused_qkv_a_proj_with_mqa
@@ -3520,11 +3525,14 @@ class KimiK3LinearForCausalLM(nn.Module):
                 )
                 if expert_entry is not None:
                     param_name, weight_name, expert_id, shard_id = expert_entry
-                    name = name.replace(weight_name, param_name)
-                    # Skip experts of layers outside a truncated config (e.g.
-                    # num_hidden_layers override), mirroring the non-expert
-                    # `name not in params_dict` guard below.
-                    if name in params_dict:
+                    # Prefer Humming's packed name, then the native MXFP4 alias.
+                    mapped_name = name.replace(weight_name, param_name)
+                    if mapped_name not in params_dict and mapped_name.endswith(
+                        "_weight_packed"
+                    ):
+                        mapped_name = mapped_name.removesuffix("_packed")
+                    if mapped_name in params_dict:
+                        name = mapped_name
                         param = params_dict[name]
                         weight_loader = param.weight_loader
                         weight_loader(
@@ -3533,6 +3541,11 @@ class KimiK3LinearForCausalLM(nn.Module):
                             name,
                             expert_id=expert_id,
                             shard_id=shard_id,
+                        )
+                    elif name.endswith((".weight_packed", ".weight_scale")):
+                        raise RuntimeError(
+                            "Unable to map required Kimi-K3 expert tensor "
+                            f"{name!r}; expected {mapped_name!r}"
                         )
                 else:
                     if (

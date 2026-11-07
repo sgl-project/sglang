@@ -3,6 +3,7 @@
 import json
 import math
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -22,6 +23,144 @@ class TestHummingRunnerGPU(CustomTestCase):
         if not torch.cuda.is_available():
             raise unittest.SkipTest("CUDA is not available")
 
+    def test_activation_input_processing(self):
+        from humming.config import LayerConfig
+
+        cases = [
+            ("silu", torch.bfloat16, "dynamic_group", {}),
+            ("silu", torch.bfloat16, "dynamic_group", {"hadamard_block_size": 32}),
+            ("clamped_silu", torch.bfloat16, "dynamic_token", {"swiglu_limit": 7.3}),
+            ("gelu", torch.float16, "dynamic_token", {}),
+            (
+                "situ",
+                torch.bfloat16,
+                "dynamic_group",
+                {"gemm1_alpha": 4.0, "gemm1_clamp_limit": 25.0},
+            ),
+            ("situ", torch.bfloat16, "none", {"gemm1_alpha": 4.0}),
+            (
+                "custom",
+                torch.bfloat16,
+                "dynamic_group",
+                {"activation_type": "binary_split", "activation_impl": "a + 2.0f * b"},
+            ),
+            (
+                "custom",
+                torch.bfloat16,
+                "dynamic_group",
+                {
+                    "activation_type": "binary_interleaved",
+                    "activation_impl": "a + 2.0f * b",
+                },
+            ),
+        ]
+        torch.manual_seed(17)
+        for name, dtype, mode, options in cases:
+            with self.subTest(activation=name, dtype=dtype, mode=mode, options=options):
+                options = options.copy()
+                hadamard_block_size = options.pop("hadamard_block_size", 0)
+                config = MoeRunnerConfig(
+                    num_experts=2,
+                    num_local_experts=2,
+                    params_dtype=dtype,
+                    activation="silu" if name == "clamped_silu" else name,
+                    **options,
+                )
+                runner = humming_runner.HummingRunnerCore(config)
+                runner.layer = torch.nn.Module()
+                meta = LayerConfig(
+                    shape_n=256,
+                    shape_k=256,
+                    num_experts=2,
+                    a_dtype=("bfloat16" if mode == "none" else "float8e4m3"),
+                    b_dtype="float4e2m1",
+                    bs_dtype="float8e8m0",
+                    weight_scale_group_size=32,
+                    c_dtype=str(dtype).removeprefix("torch."),
+                    input_quant_mode=mode,
+                    input_scale_group_size=128 if mode == "dynamic_group" else 0,
+                )
+                runner.layer.humming_metas = {"w2": meta}
+                runner.layer.weight_schemas = {
+                    "w2": SimpleNamespace(hadamard_block_size=hadamard_block_size)
+                }
+                inputs = (torch.randn(33, 512, device="cuda") * 12).to(dtype)
+                if options.get("activation_type") == "binary_interleaved":
+                    gate, up = inputs[:, 0::2], inputs[:, 1::2]
+                else:
+                    gate, up = inputs.chunk(2, dim=-1)
+                if name == "clamped_silu":
+                    gate = gate.clamp_max(options["swiglu_limit"])
+                    up = up.clamp(-options["swiglu_limit"], options["swiglu_limit"])
+                    reference = (
+                        torch.nn.functional.silu(gate.float()).to(dtype).float()
+                        * up.float()
+                    ).to(dtype)
+                elif name == "silu":
+                    reference = (
+                        torch.nn.functional.silu(gate.float()) * up.float()
+                    ).to(dtype)
+                elif name == "gelu":
+                    reference = (
+                        torch.nn.functional.gelu(gate.float(), approximate="none")
+                        * up.float()
+                    ).to(dtype)
+                elif name == "situ":
+                    gate = (
+                        4.0
+                        * torch.tanh(gate.float() / 4.0)
+                        * torch.sigmoid(gate.float())
+                    )
+                    if options.get("gemm1_clamp_limit") is not None:
+                        up = 25.0 * torch.tanh(up.float() / 25.0)
+                    reference = (gate * up.float()).to(dtype)
+                else:
+                    reference = (gate.float() + 2.0 * up.float()).to(dtype)
+                if hadamard_block_size:
+                    # Independent Sylvester matrix reference after activation rounding.
+                    matrix = torch.ones(1, 1, device="cuda")
+                    while matrix.shape[0] < hadamard_block_size:
+                        matrix = torch.cat(
+                            (
+                                torch.cat((matrix, matrix), 1),
+                                torch.cat((matrix, -matrix), 1),
+                            ),
+                            0,
+                        )
+                    reference = (
+                        reference.float().reshape(-1, hadamard_block_size)
+                        @ matrix
+                        / math.sqrt(hadamard_block_size)
+                    ).reshape_as(reference)
+                buffers = {"gate_up_output": inputs}
+                if mode == "none":
+                    buffers["activation_output"] = torch.empty_like(reference)
+                else:
+                    buffers["quanted_down_input"] = torch.empty_like(
+                        reference, dtype=torch.float8_e4m3fn
+                    )
+                actual, scale, scale2 = runner._prepare_down_input(buffers)
+                self.assertIsNone(scale2)
+                if mode == "none":
+                    self.assertIsNone(scale)
+                    torch.testing.assert_close(actual, reference, rtol=0.01, atol=0.02)
+                    continue
+                width = 128 if mode == "dynamic_group" else 256
+                grouped = reference.float().reshape(33, -1, width)
+                expected_scale = grouped.abs().amax(-1).clamp_min(1e-10) / 448.0
+                # Check the scale itself: FP8 maxima alone cannot expose a wrong
+                # clamp bound because either implementation quantizes them to 448.
+                torch.testing.assert_close(
+                    scale.reshape_as(expected_scale),
+                    expected_scale,
+                    rtol=1e-4,
+                    atol=1e-7,
+                )
+                dequantized = actual.float().reshape_as(grouped) * scale.reshape(
+                    33, -1, 1
+                )
+                torch.testing.assert_close(dequantized, grouped, rtol=0.13, atol=0.05)
+
     def test_indexed_two_gemms_with_different_m_tiles(self):
         if get_device_sm() != 90:
             self.skipTest("Distinct WGMMA M tiles require SM90")
@@ -39,7 +178,20 @@ class TestHummingRunnerGPU(CustomTestCase):
             self.skipTest("Secondary-scale UMMA regression requires SM100/SM110 family")
         self._check_indexed_two_gemms(static_scales=False, secondary_scales=True)
 
-    def _check_indexed_two_gemms(self, static_scales, secondary_scales=False):
+    def test_grouped_clamped_silu_two_gemms(self):
+        if get_device_sm() != 90:
+            self.skipTest("Clamped SiLU regression targets the Hopper serving path")
+        self._check_indexed_two_gemms(
+            static_scales=False, swiglu_limit=10.0, gemm_type="grouped_contiguous"
+        )
+
+    def _check_indexed_two_gemms(
+        self,
+        static_scales,
+        secondary_scales=False,
+        swiglu_limit=None,
+        gemm_type="indexed",
+    ):
         from humming.schema import HummingInputSchema, HummingWeightSchema
         from humming.utils.weight import dequantize_weight
 
@@ -130,11 +282,12 @@ class TestHummingRunnerGPU(CustomTestCase):
                 top_k=top_k,
                 params_dtype=torch.bfloat16,
                 activation="silu",
+                swiglu_limit=swiglu_limit,
                 gate_up_interleaved=False,
             )
         )
         runner.layer = layer
-        compute_config = {"gemm_type": "indexed", "use_f16_accum": False}
+        compute_config = {"gemm_type": gemm_type, "use_f16_accum": False}
         configs = {
             "compute_config": compute_config,
             "compute_config_str": json.dumps(compute_config),
@@ -147,7 +300,7 @@ class TestHummingRunnerGPU(CustomTestCase):
                 tuning = [
                     [lo, hi, {**selected, "use_stream_k": False}]
                     for lo, hi, selected in humming_runner.HummingMethod.get_default_tuning_configs(
-                        layer, gemm_type="indexed", sublayer_name=sublayer
+                        layer, gemm_type=gemm_type, sublayer_name=sublayer
                     )
                 ]
                 configs[f"{sublayer}_tuning_config"] = tuning
@@ -172,10 +325,12 @@ class TestHummingRunnerGPU(CustomTestCase):
                 tuning = [[0, 1 << 30, selected]]
                 configs[f"{sublayer}_tuning_config"] = tuning
                 configs[f"{sublayer}_tuning_config_str"] = json.dumps(tuning)
-        runner.humming_gemm_configs["indexed"] = configs
+        runner.humming_gemm_configs[gemm_type] = configs
         inputs = torch.randn(
             num_tokens, hidden_size, device="cuda", dtype=torch.bfloat16
         )
+        if swiglu_limit is not None:
+            inputs *= 16  # Exercise both gate and up clamping, not only small values.
         topk_ids = torch.randint(
             num_experts, (num_tokens, top_k), device="cuda", dtype=torch.int32
         )
@@ -232,15 +387,27 @@ class TestHummingRunnerGPU(CustomTestCase):
 
         quantized_inputs = quantize_reference(inputs, "w13")
         reference = torch.zeros_like(inputs, dtype=torch.float32)
+        clamped_elements = 0
         for expert in range(num_experts):
             tokens, slots = torch.where(topk_ids == expert)
             gate_up = (
                 quantized_inputs[tokens] @ reference_weights["w13"][expert].T
             ).to(torch.bfloat16)
             gate, up = gate_up.chunk(2, dim=-1)
-            activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
-                torch.bfloat16
-            )
+            if swiglu_limit is not None:
+                clamped_elements += (
+                    (gate > swiglu_limit).sum() + (up.abs() > swiglu_limit).sum()
+                ).item()
+                gate = gate.clamp_max(swiglu_limit)
+                up = up.clamp(-swiglu_limit, swiglu_limit)
+                activated_gate = torch.nn.functional.silu(gate.float()).to(
+                    torch.bfloat16
+                )
+                activated = (activated_gate.float() * up.float()).to(torch.bfloat16)
+            else:
+                activated = (torch.nn.functional.silu(gate.float()) * up.float()).to(
+                    torch.bfloat16
+                )
             down_input = quantize_reference(activated, "w2")
             down_output = (down_input @ reference_weights["w2"][expert].T).to(
                 torch.bfloat16
@@ -249,8 +416,15 @@ class TestHummingRunnerGPU(CustomTestCase):
                 0, tokens, down_output.float() * topk_weights[tokens, slots, None]
             )
         reference = reference.to(torch.bfloat16)
+        if swiglu_limit is not None:
+            self.assertGreater(clamped_elements, 0)
 
-        actual = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+        run = (
+            runner._run_indexed_gemm
+            if gemm_type == "indexed"
+            else runner._run_grouped_contiguous_gemm
+        )
+        actual = run(inputs, topk_weights, topk_ids)
         self.assertTrue(torch.isfinite(actual).all().item())
         relative_error = (
             actual.float() - reference.float()
@@ -260,7 +434,7 @@ class TestHummingRunnerGPU(CustomTestCase):
         graph = torch.cuda.CUDAGraph()
         torch.cuda.synchronize()
         with torch.cuda.graph(graph):
-            captured = runner._run_indexed_gemm(inputs, topk_weights, topk_ids)
+            captured = run(inputs, topk_weights, topk_ids)
         graph.replay()
         torch.testing.assert_close(captured, actual, rtol=0, atol=0)
 
