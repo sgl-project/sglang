@@ -120,6 +120,7 @@ from sglang.srt.runtime_context import (
     override_platform,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs, prepare_server_args
+from sglang.srt.utils.network import bind_port
 from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import (
@@ -2559,6 +2560,97 @@ class TestPortArgs(unittest.TestCase):
         self.assertTrue(port_args.tokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+
+    _SHARED_ENDPOINTS = (
+        "tokenizer_ipc_name",
+        "detokenizer_ipc_name",
+        "rpc_ipc_name",
+        "metrics_ipc_name",
+        "load_collector_ipc_name",
+    )
+
+    @staticmethod
+    def _single_node_dp_attention_args(port):
+        server_args = ServerArgs(model_path="dummy")
+        server_args.port = port
+        server_args.nccl_port = None
+        server_args.attn_dp_size = 2
+        server_args.nnodes = 1
+        server_args.dist_init_addr = None
+        return server_args
+
+    @classmethod
+    def _tcp_ports(cls, port_args):
+        names = cls._SHARED_ENDPOINTS + ("scheduler_input_ipc_name",)
+        return {int(getattr(port_args, name).rsplit(":", 1)[1]) for name in names}
+
+    def test_single_node_dp_attention_close_ports_do_not_collide(self):
+        # Two servers on one host, --port 30000 and 30001. The first one's ports
+        # are held as its live processes hold them; the second must get its own
+        # ports at once instead of waiting for the first one's. With the
+        # ephemeral range from 1024 nothing in the block range is below it.
+        for floor in (32768, 1024):
+            with (
+                self.subTest(ephemeral_floor=floor),
+                patch(
+                    "sglang.srt.utils.network._ephemeral_port_low",
+                    return_value=floor,
+                ),
+            ):
+                first = PortArgs.init_new(self._single_node_dp_attention_args(30000))
+                first_ports = self._tcp_ports(first) | {first.nccl_port}
+                held = [bind_port(port) for port in first_ports]
+                try:
+                    with patch.dict(os.environ, {"SGLANG_WAIT_PORT_TIMEOUT": "1"}):
+                        second = PortArgs.init_new(
+                            self._single_node_dp_attention_args(30001)
+                        )
+                finally:
+                    for sock in held:
+                        sock.close()
+
+                second_ports = self._tcp_ports(second) | {second.nccl_port}
+                self.assertEqual(len(second_ports), 7)
+                self.assertEqual(first_ports & second_ports, set())
+
+    def test_single_node_dp_attention_rank_takes_launcher_ports(self):
+        server_args = self._single_node_dp_attention_args(30000)
+        launcher = PortArgs.init_new(server_args)
+
+        rank = PortArgs.init_new(
+            server_args,
+            dp_rank=1,
+            worker_ports=[41000, 41001],
+            engine_port_args=launcher,
+        )
+
+        for name in self._SHARED_ENDPOINTS + ("nccl_port", "instance_id"):
+            self.assertEqual(getattr(rank, name), getattr(launcher, name), name)
+        self.assertEqual(rank.scheduler_input_ipc_name, "tcp://127.0.0.1:41001")
+
+    def test_single_node_dp_attention_rank_needs_launcher_ports(self):
+        server_args = self._single_node_dp_attention_args(30000)
+
+        with self.assertRaisesRegex(ValueError, "engine_port_args"):
+            PortArgs.init_new(server_args, dp_rank=0, worker_ports=[41000, 41001])
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_dist_init_addr_keeps_deterministic_ports(self, _):
+        # Peers on other nodes, or a joiner, compute these ports from
+        # --dist-init-addr without being told them.
+        server_args = self._single_node_dp_attention_args(30000)
+        server_args.dist_init_addr = "127.0.0.1:25000"
+
+        launcher = PortArgs.init_new(server_args)
+        rank = PortArgs.init_new(server_args, dp_rank=0, worker_ports=[41000, 41001])
+
+        self.assertEqual(
+            [getattr(launcher, name) for name in self._SHARED_ENDPOINTS],
+            [f"tcp://127.0.0.1:{port}" for port in (25001, 25002, 25003, 25004, 25006)],
+        )
+        self.assertEqual(launcher.scheduler_input_ipc_name, "tcp://127.0.0.1:25005")
+        for name in self._SHARED_ENDPOINTS:
+            self.assertEqual(getattr(rank, name), getattr(launcher, name), name)
 
     def test_init_new_with_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")

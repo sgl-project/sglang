@@ -64,6 +64,7 @@ from sglang.srt.speculative.decoupled_spec_io import DecoupledSpecIpcConfig
 from sglang.srt.utils.network import (
     NetworkAddress,
     get_free_port_below_ephemeral,
+    get_free_port_block,
     wait_port_available,
 )
 
@@ -721,6 +722,17 @@ ZMQ_TCP_PORT_DELTA = 233
 DP_ATTENTION_HANDSHAKE_PORT_DELTA = 13
 
 
+def _configured_ports(server_args: ServerArgs) -> set[int]:
+    """Ports named by this server's own options (`--port`, `--*-port`)."""
+    ports = set()
+    for field in msgspec.structs.fields(ServerArgs):
+        if field.name == "port" or field.name.endswith("_port"):
+            value = getattr(server_args, field.name)
+            if isinstance(value, int):
+                ports.add(value)
+    return ports
+
+
 @dataclasses.dataclass
 class PortArgs:
     # The ipc filename for tokenizer to receive inputs from detokenizer (zmq)
@@ -758,6 +770,7 @@ class PortArgs:
         server_args: ServerArgs,
         dp_rank: int | None = None,
         worker_ports: list[int] | None = None,
+        engine_port_args: PortArgs | None = None,
     ) -> PortArgs:
         cfg = resolving_view(server_args)
         if server_args.nccl_port is None:
@@ -808,7 +821,45 @@ class PortArgs:
             )
         else:
             # DP attention. Use TCP + port to handle both single-node and multi-node.
-            if server_args.nnodes == 1 and server_args.dist_init_addr is None:
+            is_rust_server = envs.SGLANG_RUST_SERVER.get()
+            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
+            single_node = server_args.nnodes == 1 and server_args.dist_init_addr is None
+            # On a single node no peer derives these ports by itself, so they
+            # come from a free block instead of from --port: blocks derived from
+            # --port collide for two servers on one host whose --port values are
+            # close (30000 and 30001, say). The launcher picks the block once
+            # and DP ranks take the launcher's ports. The Rust server and
+            # elastic EP keep the deterministic plan.
+            free_block = (
+                single_node
+                and not is_rust_server
+                and cfg.elastic_ep_backend is None
+                and not ep_joiner_of(cfg)
+            )
+            if free_block and dp_rank is not None:
+                if engine_port_args is None:
+                    raise ValueError(
+                        "A single-node DP-attention rank takes the launcher's "
+                        "ports; pass engine_port_args."
+                    )
+                assert worker_ports is not None
+                return dataclasses.replace(
+                    engine_port_args,
+                    scheduler_input_ipc_name=NetworkAddress(
+                        "127.0.0.1", worker_ports[dp_rank]
+                    ).to_tcp(),
+                )
+
+            block_base = None
+            if free_block:
+                # dist_init_port, then NUM_DERIVED_PORTS ports from port_base.
+                block_base = get_free_port_block(
+                    1 + NUM_DERIVED_PORTS,
+                    avoid=_configured_ports(server_args) | {nccl_port},
+                )
+            if block_base is not None:
+                na = NetworkAddress("127.0.0.1", block_base)
+            elif single_node:
                 derived_port = server_args.port + ZMQ_TCP_PORT_DELTA
                 if derived_port > 65535:
                     derived_port = server_args.port - ZMQ_TCP_PORT_DELTA
@@ -820,11 +871,9 @@ class PortArgs:
             dist_init_port = na.port
 
             # Reserve port_base+0..NUM_DERIVED_PORTS-1 (6 fixed ports + one
-            # rust-path slot per DP rank); derive from server_args only (never dp_rank) so
-            # every init_new call agrees, decrementing below dist_init_port on
-            # overflow.
-            is_rust_server = envs.SGLANG_RUST_SERVER.get()
-            NUM_DERIVED_PORTS = 6 if not is_rust_server else 6 + num_dp_ranks_of(cfg)
+            # rust-path slot per DP rank); outside the free block, derive from
+            # server_args only (never dp_rank) so every init_new call agrees,
+            # decrementing below dist_init_port on overflow.
             if ep_scale_joiner_of(resolving_view(server_args)):
                 port_base = server_args.port + ZMQ_TCP_PORT_DELTA
                 if port_base + NUM_DERIVED_PORTS > 65535:

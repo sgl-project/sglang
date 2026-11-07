@@ -49,6 +49,11 @@ def is_valid_ipv6_address(address: str) -> bool:
 def find_process_using_port(port: int) -> Optional[psutil.Process]:
     for conn in psutil.net_connections(kind="inet"):
         if conn.laddr.port == port:
+            if conn.pid is None:
+                # The owner is not visible from here (another PID namespace,
+                # e.g. a container on the host network, or another user), and
+                # psutil.Process(None) would name the calling process instead.
+                continue
             try:
                 return psutil.Process(conn.pid)
             except psutil.NoSuchProcess:
@@ -88,7 +93,8 @@ def wait_port_available(
             process = find_process_using_port(port)
             if process is None:
                 logger.warning(
-                    f"The port {port} is in use, but we could not find the process that uses it."
+                    f"The port {port} is in use, but we could not find the process that uses it "
+                    "(it may belong to another container or user)."
                 )
             else:
                 pid = process.pid
@@ -202,16 +208,20 @@ def get_free_port():
     return port
 
 
+def _ephemeral_port_low() -> int:
+    """First port of the kernel ephemeral range: bind(0) and connect() only
+    hand out ports from here up."""
+    try:
+        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
+            return int(f.read().split()[0])
+    except (OSError, ValueError, IndexError):
+        return 32768
+
+
 def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
     """Free port under the kernel ephemeral range (32768+ by default), for a
     port that a child process binds only later."""
-    try:
-        with open("/proc/sys/net/ipv4/ip_local_port_range") as f:
-            ephemeral_low = int(f.read().split()[0])
-    except (OSError, ValueError, IndexError):
-        ephemeral_low = 32768
-    # bind(0) and connect() only hand out ports from ephemeral_low up.
-    high = min(high, ephemeral_low - 1)
+    high = min(high, _ephemeral_port_low() - 1)
     if high - low + 1 < attempts:
         return get_free_port()
     for port in random.sample(range(low, high + 1), attempts):
@@ -222,6 +232,37 @@ def get_free_port_below_ephemeral(low=22000, high=29999, attempts=64):
         except OSError:
             continue
     return get_free_port()
+
+
+def get_free_port_block(
+    num_ports, avoid=(), low=22000, high=29999, attempts=64
+) -> Optional[int]:
+    """First port of `num_ports` consecutive free ports in [low, high], none of
+    them in `avoid`, for ports that child processes bind only later.
+
+    Prefers the part of [low, high] under the kernel ephemeral range, where no
+    outgoing connection can take a port before its child binds it. If that part
+    has no free block, or the ephemeral range covers all of [low, high]
+    (ip_local_port_range from 1024, say), the block comes from the whole range:
+    a port plan derived from a fixed port is inside the ephemeral range on such
+    a host as well. Returns None if no such block is found.
+    """
+    avoid = set(avoid)
+    below_ephemeral = min(high, _ephemeral_port_low() - 1)
+    tops = (below_ephemeral, high) if below_ephemeral < high else (high,)
+    for top in tops:
+        bases = range(low, top - num_ports + 2)
+        for base in random.sample(bases, min(attempts, len(bases))):
+            block = range(base, base + num_ports)
+            if not avoid.isdisjoint(block):
+                continue
+            try:
+                for port in block:
+                    try_bind_socket("0.0.0.0", port, reuse_addr=False).close()
+            except OSError:
+                continue
+            return base
+    return None
 
 
 def bind_port(port):
