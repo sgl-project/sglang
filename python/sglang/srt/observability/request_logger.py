@@ -203,6 +203,8 @@ class RequestLogger:
         self,
     ) -> Tuple[Optional[int], Optional[Set[str]], Optional[Set[str]]]:
         max_length: Optional[int] = None
+        # skip_names supports dotted entries at any depth (e.g. "parent.child")
+        # to skip nested fields; bare entries only match at top level.
         skip_names: Optional[Set[str]] = None
         out_skip_names: Optional[Set[str]] = None
         if self.log_requests:
@@ -217,6 +219,8 @@ class RequestLogger:
                     "video_data",
                     "lora_path",
                     "sampling_params",
+                    "video_config._question",
+                    "images_config.prefix",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 1:
@@ -229,6 +233,8 @@ class RequestLogger:
                     "audio_data",
                     "video_data",
                     "lora_path",
+                    "video_config._question",
+                    "images_config.prefix",
                 }
                 out_skip_names = {"text", "output_ids", "embedding"}
             elif self.log_requests_level == 2:
@@ -307,6 +313,21 @@ def _redact_field(name: str, value: Any) -> Any:
     return value
 
 
+def _child_skip_names(skip_names: Optional[Set[str]], key: Any) -> Optional[Set[str]]:
+    """Return the skip entries scoped to `key`'s subtree with the `key.`
+    prefix stripped, so nested fields can be skipped via dotted names
+    (e.g. "video_config._question"). Bare entries only match at the
+    level where they are named. None when the subtree has nothing to
+    skip."""
+    if not skip_names or not isinstance(key, str):
+        return None
+    prefix = key + "."
+    children = {
+        entry[len(prefix) :] for entry in skip_names if entry.startswith(prefix)
+    }
+    return children or None
+
+
 # TODO unify this w/ `_transform_data_for_logging` if we find performance enough
 def _dataclass_to_string_truncated(
     data: Any, max_length: int = 2048, skip_names: Optional[Set[str]] = None
@@ -334,7 +355,9 @@ def _dataclass_to_string_truncated(
         for k, v in data.items():
             if k in skip_names:
                 continue
-            rendered = _dataclass_to_string_truncated(_redact_field(k, v), max_length)
+            rendered = _dataclass_to_string_truncated(
+                _redact_field(k, v), max_length, _child_skip_names(skip_names, k)
+            )
             parts.append(f"'{k}': {rendered}")
         return "{" + ", ".join(parts) + "}"
     elif dataclasses.is_dataclass(data):
@@ -344,7 +367,7 @@ def _dataclass_to_string_truncated(
                 continue
             value = _redact_field(f.name, getattr(data, f.name))
             parts.append(
-                f"{f.name}={_dataclass_to_string_truncated(value, max_length)}"
+                f"{f.name}={_dataclass_to_string_truncated(value, max_length, _child_skip_names(skip_names, f.name))}"
             )
         return f"{data.__class__.__name__}(" + ", ".join(parts) + ")"
     else:
@@ -375,14 +398,18 @@ def _transform_data_for_logging(
         return [_transform_data_for_logging(v, max_length) for v in data]
     elif isinstance(data, dict):
         return {
-            k: _transform_data_for_logging(_redact_field(k, v), max_length)
+            k: _transform_data_for_logging(
+                _redact_field(k, v), max_length, _child_skip_names(skip_names, k)
+            )
             for k, v in data.items()
             if k not in skip_names
         }
     elif dataclasses.is_dataclass(data):
         return {
             f.name: _transform_data_for_logging(
-                _redact_field(f.name, getattr(data, f.name)), max_length
+                _redact_field(f.name, getattr(data, f.name)),
+                max_length,
+                _child_skip_names(skip_names, f.name),
             )
             for f in dataclasses.fields(data)
             if f.name not in skip_names
