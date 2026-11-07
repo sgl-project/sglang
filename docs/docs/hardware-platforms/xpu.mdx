@@ -389,6 +389,26 @@ the `cuda_graph` tag is a no-op there.
 > allocator accounting, and the second stays flat because torch keeps the freed block
 > cached. Query actual device memory via sysman (`ZES_ENABLE_SYSMAN=1`) instead.
 
+## Hierarchical Cache (HiCache) with Unified Memory on Intel XPU [Experimental]
+
+HiCache with `--enable-unified-memory` runs on Intel XPU for hybrid models with
+sliding-window attention (SWA), gated-delta-net (GDN) state, and MLA with KDA state.
+
+```bash
+python -m sglang.launch_server --model-path <hybrid model> --device xpu \
+    --enable-unified-memory --enable-hierarchical-cache --hicache-ratio 2 \
+    --attention-backend triton
+```
+
+- Use `--attention-backend triton`: the unified-memory pool needs a page-major KV
+  layout, which the `intel_xpu` backend does not provide.
+- Unified-memory pools store device KV rows a page envelope apart. The XPU KV transfer
+  kernels step over them with a row stride, which needs `sglang-kernel-xpu` with the
+  `src_row_stride` / `dst_row_stride` transfer ops; older wheels fail at the first
+  host transfer.
+- Tri-pool models (full attention, SWA and ShortConv state, such as Inkling) are not
+  tested on XPU.
+
 ## Prefill-Decode (P/D) Disaggregation on Intel XPU [Experimental]
 
 SGLang supports prefill-decode disaggregation on Intel XPU with the [Mooncake](https://github.com/kvcache-ai/Mooncake) and [NIXL](https://github.com/ai-dynamo/nixl) KV-transfer backends. Both are covered by the XPU nightly P/D test.

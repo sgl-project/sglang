@@ -187,7 +187,14 @@ def _set_kv_buffer_impl(
             size_limit=size_limit,
         )
 
-    if _is_xpu and v_row_dim == row_dim:
+    # store_cache_xpu needs contiguous caches; strided views (unified-memory pool)
+    # take the indexed-copy path below.
+    if (
+        _is_xpu
+        and v_row_dim == row_dim
+        and k_cache.is_contiguous()
+        and v_cache.is_contiguous()
+    ):
         return store_cache_xpu(
             k.view(-1, row_dim),
             v.view(-1, row_dim),
