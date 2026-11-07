@@ -424,6 +424,30 @@ class TestAudioUnderstandableFlag(CustomTestCase):
         )
 
 
+class TestDisableMultimodal(CustomTestCase):
+    """--disable-multimodal must make a multimodal-by-default checkpoint
+    text-only; the Rust server refuses to start a multimodal model it has no
+    pipeline for, so serving such a model there depends on this."""
+
+    def _build(self, **server_args):
+        with TemporaryDirectory() as checkpoint:
+            LlamaConfig(
+                architectures=["LlavaForConditionalGeneration"],
+                hidden_size=16,
+                intermediate_size=32,
+                num_attention_heads=2,
+                num_hidden_layers=2,
+                vocab_size=128,
+            ).save_pretrained(checkpoint)
+            return ModelConfig.from_server_args(
+                ServerArgs(model_path=checkpoint, **server_args)
+            )
+
+    def test_disable_turns_off_a_multimodal_checkpoint(self):
+        self.assertTrue(self._build().is_multimodal)
+        self.assertFalse(self._build(disable_multimodal=True).is_multimodal)
+
+
 class TestDefaultContextLength(CustomTestCase):
     """The default context sizes one window, never the document."""
 
