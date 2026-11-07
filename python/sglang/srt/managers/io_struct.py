@@ -268,8 +268,9 @@ class GenerateReqInput:
     # Whether to return captured routed experts
     return_routed_experts: bool = False
     # Absolute start position for returned routings; response covers
-    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens].
-    # 0 = full sequence.
+    # `[routed_experts_start_len, seqlen - 1)`. Must be in [0, prompt_tokens]
+    # or -1. 0 = full sequence. -1 = prompt_tokens - 1, i.e. one row per
+    # generated token, with prompt_tokens counted after multimodal expansion.
     routed_experts_start_len: int = 0
     return_indexer_topk: bool = False
 

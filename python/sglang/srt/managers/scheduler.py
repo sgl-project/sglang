@@ -3522,10 +3522,12 @@ class Scheduler(
 
         if recv_req.return_routed_experts:
             error_msg = None
-            if recv_req.routed_experts_start_len < 0:
+            if recv_req.routed_experts_start_len == -1:
+                req.routed_experts_start_len = max(len(req.origin_input_ids) - 1, 0)
+            elif recv_req.routed_experts_start_len < 0:
                 error_msg = (
-                    f"{recv_req.routed_experts_start_len=} is lower than 0. "
-                    "Please use a non-negative routed_experts_start_len."
+                    f"{recv_req.routed_experts_start_len=} is lower than -1. "
+                    "Please use -1 or a non-negative routed_experts_start_len."
                 )
 
             if recv_req.routed_experts_start_len > len(req.origin_input_ids):
@@ -3536,7 +3538,6 @@ class Scheduler(
                 )
 
             if error_msg is not None:
-                req.routed_experts_start_len = 0
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
