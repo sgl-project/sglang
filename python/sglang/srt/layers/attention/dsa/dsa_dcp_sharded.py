@@ -37,8 +37,8 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.dcp_kernels import _gather_candidate_prefix_kernel
 from sglang.kernels.ops.attention.dsa.dcp_fused_topk import (
     DCP_FUSED_TOPK_K,
     DCP_FUSED_TOPK_MAX_CONTEXT,

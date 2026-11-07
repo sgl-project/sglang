@@ -1120,12 +1120,15 @@ class DeepseekSparseAttnBackend(
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
 
     def _dcp_topk_length_buffer(
-        self, forward_mode: ForwardMode, cache_seqlens_int32: torch.Tensor
+        self, forward_mode: ForwardMode, seqlens_expanded: torch.Tensor
     ) -> Optional[torch.Tensor]:
-        # the sharded indexer writes each decode row's local top-k count here
-        if not (self.dsa_shards_index_k and forward_mode.is_decode_or_idle()):
+        # the sharded indexer writes each query row's local top-k count here
+        if not (
+            self.dsa_shards_index_k
+            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
+        ):
             return None
-        return cache_seqlens_int32.new_empty(cache_seqlens_int32.shape[0])
+        return seqlens_expanded.new_empty(seqlens_expanded.shape[0])
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -1617,7 +1620,7 @@ class DeepseekSparseAttnBackend(
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             dcp_topk_length=self._dcp_topk_length_buffer(
-                forward_batch.forward_mode, cache_seqlens_int32
+                forward_batch.forward_mode, seqlens_expanded
             ),
         )
         metadata = self._init_kpool_metadata(
@@ -1994,7 +1997,7 @@ class DeepseekSparseAttnBackend(
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             dcp_topk_length=self._dcp_topk_length_buffer(
-                forward_mode, cache_seqlens_int32
+                forward_mode, seqlens_expanded
             ),
         )
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
