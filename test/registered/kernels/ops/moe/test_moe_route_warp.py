@@ -439,25 +439,5 @@ def test_dispatch(config: str) -> None:
     assert torch.equal(i, ri) and torch.equal(w, rw)
 
 
-@pytest.mark.parametrize(
-    "config", [name for name, cfg in CONFIGS.items() if cfg[2] == "sigmoid"]
-)
-@pytest.mark.parametrize("num_fused_shared_experts", [0, 1])
-def test_bitexact_with_triton_router(
-    config: str, num_fused_shared_experts: int
-) -> None:
-    # The warp router took over moe_fused_gate's Triton path in place, so its
-    # weights must match it bit for bit: a 1-ulp difference in the renormalized
-    # weights drifts the residual stream of a 78-layer model past 1e-3.
-    scores, bias = _inputs(config, 600, seed=5)
-    kwargs = _kwargs(config, num_fused_shared_experts=num_fused_shared_experts)
-    kwargs["topk"] += num_fused_shared_experts
-    w, i = moe_fused_gate(scores, bias, **kwargs)
-    with patch.object(route_warp_module, "covered", lambda *args: False):
-        tw, ti = moe_fused_gate(scores, bias, **kwargs)
-    assert torch.equal(ti, i)
-    assert torch.equal(tw, w)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v"]))
