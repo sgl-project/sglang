@@ -45,6 +45,7 @@ if TYPE_CHECKING:
         FlashinferCombineInput,
         FlashinferDispatchOutput,
     )
+    from sglang.srt.layers.muse_spark.routed_moe_split import RoutedMoeSplit
 
 # 1 / (fp8_e4m3_max * 6)
 _NVFP4_PER_TOKEN_SCALE_INV = 1.0 / (448.0 * 6.0)
@@ -643,6 +644,7 @@ class MuseSpark1xFp4Experts(nn.Module):
             tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]
         ] = None,
         *,
+        moe_split: RoutedMoeSplit | None = None,
         ar_workspace: FinalizePushWorkspace | None = None,
     ) -> torch.Tensor:
         if self.use_marlin:
@@ -671,8 +673,14 @@ class MuseSpark1xFp4Experts(nn.Module):
                 topk_scores.to(torch.float32).contiguous(),
             )
 
+        # The split's routing metadata was built on the router stream; run only the expert body.
+        routed_moe_or_split_body = (
+            trtllm_fp4_block_scale_routed_moe
+            if moe_split is None
+            else moe_split.run_body
+        )
         gemm2_out, expert_weights, expanded_idx_to_permuted_idx = (
-            trtllm_fp4_block_scale_routed_moe(
+            routed_moe_or_split_body(
                 topk_ids=routing,
                 routing_bias=None,
                 hidden_states=hs_fp4,
