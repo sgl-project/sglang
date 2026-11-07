@@ -29,7 +29,7 @@ class _HoldingRustServer(RustServer):
             return
         super().wait_request(timeout_ms)
 
-    def install_sigterm_drain(self, notify=None) -> None:
+    def install_sigterm_drain(self, notify=None, hold_drain_end=False) -> None:
         # The real one installs a process-wide SIGTERM handler on the server's
         # wakeup fd; draining is not what this test checks.
         pass
