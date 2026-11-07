@@ -36,8 +36,6 @@ from sglang.srt.mem_cache.pool_host.common import (
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.srt.mem_cache.pool_host.npu_memfabric import (
     acl_host_memory_enabled,
-    alloc_with_acl,
-    alloc_with_memfabric,
     ensure_acl_capacity,
     ensure_memfabric_capacity,
     memfabric_host_memory_enabled,
@@ -474,11 +472,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 # MemFabric host-memory entry: GB-rounds every block on A3,
                 # so the reserve budget and accounting must round the same way.
                 ensure_memfabric_capacity(total_bytes, torch.npu.current_device())
-                alloc_func = alloc_with_memfabric
             else:
                 # aclrt registration: no fixed reserve, per-block accounting.
                 ensure_acl_capacity(total_bytes, torch.npu.current_device())
-                alloc_func = alloc_with_acl
         self.k_buffer = alloc_func(
             (*base_dims, k_width),
             dtype=self.dtype,
