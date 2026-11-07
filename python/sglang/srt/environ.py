@@ -1016,6 +1016,9 @@ class Envs:
     # is a diagnostic switch, not a supported off-ramp -- to actually stop
     # serving FP8, drop --quantization fp8.
     SGLANG_DISABLE_GFX1250_FP8_GEMM = EnvBool(False)
+    # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
+    # attention, GDN prefill); each also falls back to the generic path where it does not apply.
+    SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
     # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
     # pinned aiter still ships the pre-PR config (see
     # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
@@ -2273,6 +2276,10 @@ class Envs:
     # front reads hidden_states once, and run the top-k plus the bf16 cast in one
     # epilogue kernel. See kernels/ops/moe/moe_front.py. Default on.
     SGLANG_K3_FUSED_FRONT = EnvBool(True)
+    # TP-shard the K3 MoE front's router + latent-down rows (KimiK3MoE._front_shard)
+    # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
+    # gemm_ag_up_fits). Online weight updates are rejected while on.
+    SGLANG_K3_SHARDED_MOE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)
