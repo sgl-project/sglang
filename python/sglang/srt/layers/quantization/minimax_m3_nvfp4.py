@@ -14,7 +14,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A4Nvfp4MoE,
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.quantization.utils import (
+    is_layer_skipped,
+    replace_parameter,
+    swizzle_blockscale,
+)
 from sglang.srt.runtime_context import get_platform
 
 logger = logging.getLogger(__name__)
@@ -114,7 +118,7 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, Marlin W4A16 elsewhere."""
+    """MegaMoE, TRT-LLM and CuteDSL experts on Blackwell, Marlin W4A16 elsewhere."""
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
@@ -131,14 +135,22 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         self.use_mega_moe_prefill = (
             self.use_flashinfer_trtllm and get_moe_a2a_backend().is_megamoe()
         )
+        # DeepEP low-latency per-token NVFP4 dispatch into CuteDSL masked GEMMs.
+        self.use_flashinfer_cutedsl = (
+            not self.use_marlin
+            and get_moe_runner_backend().is_flashinfer_cutedsl()
+            and get_moe_a2a_backend().is_deepep()
+        )
         if (
             not self.use_marlin
             and not self.use_flashinfer_trtllm
+            and not self.use_flashinfer_cutedsl
             and not get_moe_a2a_backend().is_megamoe()
         ):
             raise ValueError(
-                "M3.1 NVFP4 experts require --moe-a2a-backend megamoe or "
-                "--moe-runner-backend flashinfer_trtllm_routed"
+                "M3.1 NVFP4 experts require --moe-a2a-backend megamoe, "
+                "--moe-runner-backend flashinfer_trtllm_routed, or "
+                "--moe-a2a-backend deepep with --moe-runner-backend flashinfer_cutedsl"
             )
 
     @classmethod
@@ -157,6 +169,13 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 
             self.runner = MoeRunner(MoeRunnerBackend.MARLIN, moe_runner_config)
+        elif self.use_flashinfer_cutedsl:
+            import sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl  # noqa: F401
+            from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
+
+            self.runner = MoeRunner(
+                MoeRunnerBackend.FLASHINFER_CUTEDSL, moe_runner_config
+            )
         elif self.use_flashinfer_trtllm:
             import sglang.srt.layers.moe.moe_runner.flashinfer_trtllm  # noqa: F401
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
@@ -260,12 +279,83 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         if self.use_mega_moe_prefill:
             _alias_mega_moe_to_trtllm_weights(layer)
 
+    def _process_cutedsl_weights(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.flashinfer_cutedsl_moe import (
+            supports_masked_gemm_fused_swiglu,
+        )
+        from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+            interleave_w13_halves,
+        )
+
+        w13 = layer.w13_weight_packed.data
+        if not supports_masked_gemm_fused_swiglu(w13.device):
+            raise RuntimeError(
+                "M3.1 NVFP4 on flashinfer_cutedsl requires SM100/SM103 and a "
+                "FlashInfer grouped_gemm_nt_masked with the fused SwiGLU and "
+                "NVFP4 output epilogue."
+            )
+        intermediate = w13.shape[1] // 2
+        if intermediate % 64 != 0:
+            raise ValueError(
+                "M3.1 NVFP4 CuteDSL requires the per-partition intermediate size "
+                f"to be a multiple of 64, got {intermediate}"
+            )
+        _check_nvfp4_scales(layer)
+
+        # Loaded as [gate; up]; the fused GEMM1 epilogue reads 64-row
+        # [up, gate] blocks.
+        def to_fused_swiglu_layout(t: torch.Tensor) -> torch.Tensor:
+            gate, up = t.chunk(2, dim=1)
+            return interleave_w13_halves(torch.cat((up, gate), dim=1), 64, dim=1)
+
+        layer.w13_weight = torch.nn.Parameter(
+            to_fused_swiglu_layout(w13), requires_grad=False
+        )
+        layer.w2_weight = torch.nn.Parameter(
+            layer.w2_weight_packed.data, requires_grad=False
+        )
+        layer.register_parameter("w13_weight_packed", None)
+        layer.register_parameter("w2_weight_packed", None)
+        replace_parameter(
+            layer,
+            "w13_weight_scale",
+            swizzle_blockscale(to_fused_swiglu_layout(layer.w13_weight_scale.data)),
+        )
+        replace_parameter(
+            layer, "w2_weight_scale", swizzle_blockscale(layer.w2_weight_scale.data)
+        )
+
+        # Checkpoints store encode scales. Activations carry their own per-token
+        # scale, so the GEMM1 alphas are the weight decode scales alone, with
+        # separate gate and up global scales.
+        w13_global_scale = layer.w13_weight_global_scale.data.float()
+        w2_global_scale = layer.w2_weight_global_scale.data.float()
+        w2_input_scale = layer.w2_input_global_scale.data.float()
+        layer.g1_alphas = w13_global_scale[:, 0].reciprocal().contiguous()
+        layer.g1_alphas_up = w13_global_scale[:, 1].reciprocal().contiguous()
+        layer.w2_input_scale_quant = w2_input_scale.contiguous()
+        layer.g2_alphas = (w2_global_scale * w2_input_scale).reciprocal().contiguous()
+        cfg = layer.moe_runner_config
+        swiglu_oai = layer._minimax_activation == "swigluoai"
+        limit = cfg.gemm1_clamp_limit or cfg.swiglu_limit
+        layer.cutedsl_swiglu_params = (
+            cfg.gemm1_alpha if swiglu_oai else 1.0,
+            cfg.gemm1_beta if swiglu_oai else 0.0,
+            torch.finfo(torch.float32).max if limit is None else float(limit),
+        )
+        layer.dispatcher.set_quant_config(
+            {"dispatcher_output_dtype": "nvfp4", "nvfp4_per_token_activation": True}
+        )
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.use_marlin:
             self._process_marlin_weights(layer)
             return
         if self.use_flashinfer_trtllm:
             self._process_trtllm_weights(layer)
+            return
+        if self.use_flashinfer_cutedsl:
+            self._process_cutedsl_weights(layer)
             return
         import deep_gemm
         from deep_gemm.utils.math import transform_ue4m3_sf_into_required_layout
@@ -300,6 +390,28 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
     def apply_weights(self, layer, dispatch_output):
         if self.use_marlin:
             return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
+        if self.use_flashinfer_cutedsl:
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                CuteDslFp4MoeQuantInfo,
+            )
+
+            quant_info = CuteDslFp4MoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_sf=layer.w13_weight_scale,
+                w2_weight_sf=layer.w2_weight_scale,
+                w1_alpha=layer.g1_alphas,
+                w2_alpha=layer.g2_alphas,
+                a1_scale=None,
+                a2_scale=layer.w2_input_scale_quant,
+                use_nvfp4_dispatch=True,
+                down_gemm_overlap_args=getattr(
+                    self.runner, "down_gemm_overlap_args", None
+                ),
+                w1_alpha_up=layer.g1_alphas_up,
+                swiglu_params=layer.cutedsl_swiglu_params,
+            )
+            return self.runner.run(dispatch_output, quant_info)
         if self.use_flashinfer_trtllm:
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
@@ -339,7 +451,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         raise RuntimeError("M3.1 NVFP4 experts must execute through the MegaMoE path")
 
 
-def _set_mega_moe_alphas(layer: torch.nn.Module) -> None:
+def _check_nvfp4_scales(layer: torch.nn.Module) -> tuple[torch.Tensor, ...]:
     scales = (
         layer.w13_weight_global_scale.data,
         layer.w2_weight_global_scale.data,
@@ -349,6 +461,11 @@ def _set_mega_moe_alphas(layer: torch.nn.Module) -> None:
         raise ValueError(
             "M3.1 NVFP4 weight and FC2 input scales must be finite and positive"
         )
+    return scales
+
+
+def _set_mega_moe_alphas(layer: torch.nn.Module) -> None:
+    scales = _check_nvfp4_scales(layer)
     # Checkpoints store encode scales. Apply each inverse before the
     # nonlinear FC1 activation, and the FC2 input inverse at its epilogue.
     layer.mega_l1_alphas = scales[0].float().reciprocal().contiguous()

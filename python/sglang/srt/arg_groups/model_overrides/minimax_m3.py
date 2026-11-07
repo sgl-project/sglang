@@ -115,6 +115,11 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
                     "M3.1 NVFP4 flashinfer_trtllm_routed requires "
                     "--moe-a2a-backend none or megamoe"
                 )
+        elif cfg.moe_runner_backend == "flashinfer_cutedsl":
+            if cfg.moe_a2a_backend != "deepep":
+                raise ValueError(
+                    "M3.1 NVFP4 flashinfer_cutedsl requires --moe-a2a-backend deepep"
+                )
         else:
             if cfg.moe_a2a_backend not in ("none", "megamoe"):
                 raise ValueError("M3.1 NVFP4 requires --moe-a2a-backend megamoe")
