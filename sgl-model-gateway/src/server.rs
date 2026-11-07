@@ -654,7 +654,8 @@ pub fn build_app(
     let admin_routes = apply_control_plane_auth(admin_routes);
     let worker_routes = apply_control_plane_auth(worker_routes);
 
-    // HA management routes
+    // HA management routes (control-plane authorization: Admin only when
+    // control-plane RBAC is configured, otherwise plain data-plane API key).
     let mesh_routes = Router::new()
         .route("/ha/status", get(get_cluster_status))
         .route("/ha/health", get(get_mesh_health))
@@ -667,11 +668,8 @@ pub fn build_app(
         .route("/ha/rate-limit", post(set_global_rate_limit))
         .route("/ha/rate-limit", get(get_global_rate_limit))
         .route("/ha/rate-limit/stats", get(get_global_rate_limit_stats))
-        .route("/ha/shutdown", post(trigger_graceful_shutdown))
-        .route_layer(axum::middleware::from_fn_with_state(
-            auth_config.clone(),
-            middleware::auth_middleware,
-        ));
+        .route("/ha/shutdown", post(trigger_graceful_shutdown));
+    let mesh_routes = apply_control_plane_auth(mesh_routes);
 
     Router::new()
         .merge(protected_routes)
