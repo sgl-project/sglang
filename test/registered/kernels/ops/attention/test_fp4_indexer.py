@@ -484,6 +484,31 @@ def test_fp4_paged_logits_replay(batch, ratio, width, masked):
                 )
 
 
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9,
+    reason="requires Hopper CUDA",
+)
+@pytest.mark.parametrize("ratio", [1, 2])
+def test_verify_reuses_key_tiles_under_replay(ratio):
+    batch, group, width = 12, 6, 261
+    q, weights, slots, lens, table = _make_logits_case(batch, 32, width)
+    req = torch.arange(batch, device=q.device, dtype=torch.int32) // group
+    req_table = torch.zeros((2, width * ratio), device=q.device, dtype=torch.int32)
+    req_table[:, ::ratio] = (slots[::group] * ratio).to(torch.int32)
+    args = (q, weights, req, req_table, lens, table, PAGE_SIZE, width, ratio)
+    fp4_index_logits_paged(*args, rows_per_request=group)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = fp4_index_logits_paged(*args, rows_per_request=group)
+    for offset in (0, 65, width):
+        lens.copy_((offset - torch.arange(batch, device=q.device) % group).clamp_min(0))
+        graph.replay()
+        expected = fp4_index_logits_paged(*args)
+        visible = torch.arange(width, device=q.device)[None, :] < lens[:, None]
+        torch.testing.assert_close(actual[visible], expected[visible], atol=0, rtol=0)
+
+
 @pytest.mark.skipif(_is_xpu, reason="Paged decode uses CUDA persistent kernels")
 @pytest.mark.parametrize("heads", [32, 64])
 @pytest.mark.parametrize("ratio,masked", [(1, False), (2, True)])
