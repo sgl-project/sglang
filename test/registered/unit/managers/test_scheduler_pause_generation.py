@@ -362,6 +362,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.dllm_manager.any_staging_reqs.return_value = False
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.enable_lmcache = False
         scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
