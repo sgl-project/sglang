@@ -140,18 +140,24 @@ class BaseLayerWithLoRA(nn.Module):
         lora_rank: int | None = None,
         lora_alpha: int | None = None,
         snapshot_base: bool = True,
+        merge_disabled: bool = False,
     ):
         super().__init__()
         self.base_layer: nn.Module = base_layer
 
         self.merged: bool = False
+        self.merge_disabled = merge_disabled
         # Immutable base-weight snapshot; `to("cpu")` may alias CPU storage.
         # Use `clone()` so in-place merge updates cannot mutate this backup.
         # With snapshot_base=False the snapshot is a zero-copy view instead:
         # valid only while every merge on this layer is a copy-merge (the
         # merged-store path), which never writes the base storage. H3's DiT
         # backup alone is 38 GB of anonymous memory under clone().
-        if snapshot_base:
+        self.cpu_weight: torch.Tensor | None
+        if merge_disabled:
+            self.cpu_weight = None
+            self._base_is_view = False
+        elif snapshot_base:
             self.cpu_weight = base_layer.weight.detach().to("cpu").clone()
             self._base_is_view = False
         else:
@@ -420,6 +426,8 @@ class BaseLayerWithLoRA(nn.Module):
                           If False, append to existing list (for multi-LoRA support).
             output_offset: Optional constant output term paired with this adapter
         """
+        if merge_weights:
+            self._check_merge_enabled()
         lora_A_param = torch.nn.Parameter(
             A
         )  # share storage with weights in the pipeline
@@ -511,9 +519,35 @@ class BaseLayerWithLoRA(nn.Module):
     def _ensure_base_snapshot_owned(self) -> None:
         """An in-place merge is about to write the base storage; if the
         snapshot is a zero-copy view into it, materialize the clone now."""
+        self._check_merge_enabled()
         if self._base_is_view:
             self.cpu_weight = self.cpu_weight.to("cpu", copy=True)
             self._base_is_view = False
+
+    def _check_merge_enabled(self) -> None:
+        if self.merge_disabled:
+            raise ValueError(
+                "LoRA merging is disabled; use set_lora with another merge_mode "
+                "before merging weights."
+            )
+
+    def set_merge_disabled(self, disabled: bool) -> None:
+        """Change the snapshot policy without changing the effective base weight."""
+        if self.merge_disabled == disabled:
+            return
+        if self.merged:
+            # Restore before dropping the only exact copy of the base.
+            self.unmerge_lora_weights()
+        if disabled:
+            self.cpu_weight = None
+        else:
+            # Offloaded parameters can be placeholders: snapshot the live store.
+            weight = self.weight
+            if not isinstance(weight, DTensor):
+                weight, _ = self._materialized_weight_src()
+            self.cpu_weight = weight.detach().to("cpu").clone()
+        self._base_is_view = False
+        self.merge_disabled = disabled
 
     @torch.no_grad()
     def _merge_lora_into_data(
@@ -601,6 +635,7 @@ class BaseLayerWithLoRA(nn.Module):
         when the policy says so, rounded back once — so the bytes are
         identical to what merge_lora_weights would have left in place.
         """
+        self._check_merge_enabled()
         base = self.weight.data
         target_dtype = base.dtype
         work = base.detach().to(get_local_torch_device())
@@ -654,6 +689,7 @@ class BaseLayerWithLoRA(nn.Module):
         unmerge snapshot is the untouched base view — zero-copy, because
         nothing wrote the base storage.
         """
+        self._check_merge_enabled()
         self.weight.data = merged
         self.merged = True
         self.cpu_weight = base_view.detach()
@@ -661,6 +697,7 @@ class BaseLayerWithLoRA(nn.Module):
 
     @torch.no_grad()
     def merge_lora_weights(self, strength: float | None = None) -> None:
+        self._check_merge_enabled()
         if strength is not None:
             self.strength = strength
             if self.lora_weights_list:
@@ -771,6 +808,7 @@ class BaseLayerWithLoRA(nn.Module):
         merge_in_fp32: bool | None = None,
     ) -> None:
         """Merge on GPU and write back to the layer store."""
+        self._check_merge_enabled()
         lora_list = lora_list if lora_list is not None else self._active_lora_list()
         if not lora_list:
             raise ValueError("LoRA weights not set. Please set them first.")
@@ -791,6 +829,9 @@ class BaseLayerWithLoRA(nn.Module):
             raise ValueError(
                 "LoRA weights not merged. Please merge them first before unmerging."
             )
+
+        if self.cpu_weight is None:
+            raise ValueError("Cannot unmerge LoRA weights without a base snapshot.")
 
         # avoid precision loss
         if isinstance(self.base_layer.weight, DTensor):
@@ -820,6 +861,7 @@ class BaseLayerWithLoRA(nn.Module):
         """
         if not self.merged:
             return
+        self._check_merge_enabled()
         if self._active_lora_output_offset() is not None:
             raise ValueError(
                 "A LoRA with a constant output offset cannot be committed as a "
@@ -830,6 +872,7 @@ class BaseLayerWithLoRA(nn.Module):
             weight = weight.to_local()
         # clone(): to("cpu") may alias storage; we must not mutate this backup.
         self.cpu_weight = weight.detach().to("cpu").clone()
+        self._base_is_view = False
         self.merged = False
         self.disable_lora = True
         self.lora_weights_list = []
@@ -1058,6 +1101,7 @@ def wrap_with_lora_layer(
     lora_rank: int | None = None,
     lora_alpha: int | None = None,
     snapshot_base: bool = True,
+    merge_disabled: bool = False,
 ) -> BaseLayerWithLoRA | None:
     """
     transform the given layer to its corresponding LoRA layer
@@ -1084,6 +1128,7 @@ def wrap_with_lora_layer(
                 lora_rank=lora_rank,
                 lora_alpha=lora_alpha,
                 snapshot_base=effective_snapshot_base,
+                merge_disabled=merge_disabled,
             )
             return ret
     return None

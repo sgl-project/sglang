@@ -102,7 +102,7 @@ LTX2_TWO_STAGE_DEVICE_MODE_CHOICES = LTX2_TWO_STAGE_DEVICE_MODES
 LTX2_TWO_STAGE_PIPELINE_NAMES = ("LTX2TwoStagePipeline", "LTX2TwoStageHQPipeline")
 # H200-class GPUs (>=130 GiB total) can usually keep both LTX2 DiTs resident.
 LTX2_RESIDENT_AUTO_ENABLE_MEM_GB = 130
-LORA_MERGE_MODES = ("auto", "merge", "dynamic")
+LORA_MERGE_MODES = ("auto", "merge", "dynamic", "disabled")
 MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
@@ -3215,7 +3215,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "dynamic LoRA for FSDP-sharded weights (to avoid a full gather) and "
                 "for adapters a merge would mostly round away (more than 50%% of "
                 "the update, e.g. distilled LoRAs); merge always merges into base "
-                "weights; dynamic always applies LoRA at forward time."
+                "weights; dynamic always applies LoRA at forward time; disabled "
+                "applies LoRA at forward time without retaining base-weight "
+                "snapshots or allowing merges until another mode is selected."
             ),
         )
         parser.add_argument(

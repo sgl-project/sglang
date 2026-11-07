@@ -380,7 +380,6 @@ class LoRAPipeline(ComposedPipelineBase):
         target_modules: list[tuple[str, dict[str, BaseLayerWithLoRA]]],
         merge_weights_by_module: dict[str, bool],
     ) -> bool:
-
         for module_name, lora_layers_dict in target_modules:
             if merge_weights_by_module[module_name]:
                 return True
@@ -403,6 +402,7 @@ class LoRAPipeline(ComposedPipelineBase):
         target_lora_layers: dict[str, BaseLayerWithLoRA],
         check_exclude: bool = True,
         snapshot_base: bool = True,
+        merge_disabled: bool = False,
     ) -> int:
         """
         Convert layers in a module to LoRA layers.
@@ -438,6 +438,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 lora_rank=self.lora_rank,
                 lora_alpha=self.lora_alpha,
                 snapshot_base=snapshot_base,
+                merge_disabled=merge_disabled,
             )
             if lora_layer is not None:
                 self._bind_lora_offload_view(
@@ -489,8 +490,9 @@ class LoRAPipeline(ComposedPipelineBase):
         if weight is None:
             return
         data = weight.detach()
-        lora_layer.cpu_weight = data.clone() if snapshot_base else data
-        lora_layer._base_is_view = not snapshot_base
+        if not lora_layer.merge_disabled:
+            lora_layer.cpu_weight = data.clone() if snapshot_base else data
+            lora_layer._base_is_view = not snapshot_base
         base = lora_layer.base_layer
         base._offload_root = module
         base._offload_param_prefix = name
@@ -521,7 +523,9 @@ class LoRAPipeline(ComposedPipelineBase):
                         "unquantized checkpoint to use LoRA."
                     )
 
-    def convert_to_lora_layers(self, snapshot_base: bool = True) -> None:
+    def convert_to_lora_layers(
+        self, snapshot_base: bool = True, merge_disabled: bool | None = None
+    ) -> None:
         """
         Unified method to convert the transformer to a LoRA transformer.
 
@@ -529,9 +533,13 @@ class LoRAPipeline(ComposedPipelineBase):
         views of the base weights instead of clones (38 GB of anonymous memory
         on H3's DiT). Resident accelerator layers still retain owned CPU
         snapshots because they cannot be rebound to the CPU merge cache.
+        With merge_disabled, no snapshot is retained on any device. By default,
+        this follows the server's merge mode, including IPC and startup loading.
         """
         if self.lora_initialized:
             return
+        if merge_disabled is None:
+            merge_disabled = self.server_args.lora_merge_mode == "disabled"
         self._reject_lora_on_packed_weights()
         self.lora_initialized = True
 
@@ -542,6 +550,7 @@ class LoRAPipeline(ComposedPipelineBase):
             self.lora_layers,
             check_exclude=True,
             snapshot_base=snapshot_base,
+            merge_disabled=merge_disabled,
         )
         logger.info("Converted %d layers to LoRA layers", converted_count)
 
@@ -555,6 +564,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 "transformer_2",
                 self.lora_layers_transformer_2,
                 snapshot_base=snapshot_base,
+                merge_disabled=merge_disabled,
                 check_exclude=True,
             )
             logger.info(
@@ -568,6 +578,7 @@ class LoRAPipeline(ComposedPipelineBase):
                 "fake_score_transformer",
                 self.lora_layers_critic,
                 snapshot_base=snapshot_base,
+                merge_disabled=merge_disabled,
                 check_exclude=False,
             )
             logger.info(
@@ -733,7 +744,7 @@ class LoRAPipeline(ComposedPipelineBase):
         lora_layers: dict[str, BaseLayerWithLoRA],
         merge_mode: str,
     ) -> bool:
-        if merge_mode == "dynamic":
+        if merge_mode in ("dynamic", "disabled"):
             return False
         uses_dtensor_weights = self._uses_dtensor_weights(lora_layers)
         has_unmergeable_weights = any(
@@ -1146,7 +1157,10 @@ class LoRAPipeline(ComposedPipelineBase):
 
         # Layerwise keeps manager views; do not load_all.
         if not self.lora_initialized:
-            self.convert_to_lora_layers(snapshot_base=not self._has_layerwise_offload())
+            self.convert_to_lora_layers(
+                snapshot_base=not self._has_layerwise_offload(),
+                merge_disabled=merge_mode == "disabled",
+            )
 
         # Check adapter presence and load missing adapters
         adapter_updated = False
@@ -1249,6 +1263,10 @@ class LoRAPipeline(ComposedPipelineBase):
                     ),
                     adapter_updated,
                 )
+                and all(
+                    layer.merge_disabled == (merge_mode == "disabled")
+                    for layer in lora_layers_dict.values()
+                )
                 for module_name, lora_layers_dict in target_modules
             ):
                 logger.info("LoRA configuration matches exactly, skipping")
@@ -1266,6 +1284,8 @@ class LoRAPipeline(ComposedPipelineBase):
             with weight_update_context:
                 # Apply LoRA to modules for this target
                 for module_name, lora_layers_dict in target_modules:
+                    for layer in lora_layers_dict.values():
+                        layer.set_merge_disabled(merge_mode == "disabled")
                     effective_merge_weights = merge_weights_by_module[module_name]
                     if (
                         effective_merge_weights
@@ -1523,7 +1543,9 @@ class LoRAPipeline(ComposedPipelineBase):
 
         with self._weight_update_context(target_modules):
             for module_name, lora_layers_dict in target_modules:
-                if not self._should_merge_lora_for_layers(
+                if any(
+                    layer.merge_disabled for layer in lora_layers_dict.values()
+                ) or not self._should_merge_lora_for_layers(
                     module_name, lora_layers_dict, self.server_args.lora_merge_mode
                 ):
                     for layer in lora_layers_dict.values():

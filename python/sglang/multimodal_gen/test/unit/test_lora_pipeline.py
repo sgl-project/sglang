@@ -8,6 +8,7 @@ import torch
 import torch.nn.functional as F
 from prometheus_client import CollectorRegistry
 from safetensors.torch import save_file
+from torch.multiprocessing.reductions import StorageWeakRef
 
 import sglang.multimodal_gen.runtime.layers.linear as linear
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
@@ -197,6 +198,152 @@ def test_zero_copy_snapshot_is_limited_to_cpu_backed_layers():
     )
     assert meta_layer is not None
     assert meta_layer._base_is_view
+
+
+@pytest.mark.parametrize("merge_disabled", [False, True])
+def test_disabled_merge_releases_rebound_base_storage(merge_disabled):
+    """An offload rebind must not leave old storage alive through a snapshot."""
+    base = torch.nn.Linear(4, 4, bias=False)
+    original = StorageWeakRef(base.weight.untyped_storage())
+    layer = wrap_with_lora_layer(
+        base, snapshot_base=False, merge_disabled=merge_disabled
+    )
+    base.weight.data = base.weight.detach().clone()
+    assert original.expired() == merge_disabled
+
+    # Entering disabled mode must also release an existing detached snapshot.
+    layer.set_merge_disabled(True)
+    assert original.expired()
+    assert layer.cpu_weight is None
+
+
+@pytest.mark.parametrize("snapshot_base", [False, True])
+def test_disabled_merge_offload_binding_and_reenable(snapshot_base):
+    layer = wrap_with_lora_layer(torch.nn.Linear(4, 4, bias=False), merge_disabled=True)
+    pipeline = _make_pipeline(layer)
+    module = pipeline.modules["transformer"]
+    layer.weight.data = torch.empty(1)
+    stored = torch.arange(16, dtype=torch.float32).reshape(4, 4)
+    pipeline._bind_lora_offload_view(
+        module, "linear", layer, {"linear.weight": stored}, snapshot_base
+    )
+    assert layer.cpu_weight is None
+    assert not layer._base_is_view
+    torch.testing.assert_close(layer.base_layer._packed_weight_cpu, stored)
+
+    # Re-enabling must snapshot the real offload weights, not the placeholder.
+    layer.set_merge_disabled(False)
+    stored.add_(1)
+    torch.testing.assert_close(layer.cpu_weight, stored - 1, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("initial_mode", ["dynamic", "merge"])
+def test_disabled_merge_mode_transitions_preserve_base_and_dynamic_output(initial_mode):
+    layer = wrap_with_lora_layer(torch.nn.Linear(2, 2, bias=False))
+    original = layer.weight.detach().clone()
+    pipeline = _make_pipeline(layer)
+    pipeline.server_args.lora_merge_mode = "merge"
+    pipeline._temporarily_disable_offload = lambda *a, **kw: nullcontext([])
+    x = torch.tensor([[1.0, 2.0]])
+    expected = x @ original.T + 0.5 * torch.full((1, 2), 3.0)
+    with (
+        patch(_RANK_PATCH, return_value=0),
+        patch(
+            "sglang.multimodal_gen.runtime.layers.lora.linear.get_local_torch_device",
+            return_value=torch.device("cpu"),
+        ),
+    ):
+        pipeline.set_lora("adapter", strength=0.5, merge_mode=initial_mode)
+        for _ in range(2):
+            pipeline.set_lora("adapter", strength=0.5, merge_mode="disabled")
+            assert layer.cpu_weight is None
+            assert not layer.merged
+            assert not pipeline.is_lora_merged["transformer"]
+            torch.testing.assert_close(layer.weight, original, rtol=0, atol=0)
+            torch.testing.assert_close(layer(x), expected)
+
+        # Manual activation must honor the per-target policy over server defaults.
+        pipeline.unmerge_lora_weights()
+        torch.testing.assert_close(layer(x), x @ original.T)
+        pipeline.merge_lora_weights(strength=0.5)
+        torch.testing.assert_close(layer(x), expected)
+        assert layer.cpu_weight is None
+        assert not layer.merged
+
+        pipeline.loaded_adapter_paths["second"] = "/second"
+        pipeline.loaded_adapter_alphas["second"] = None
+        pipeline.lora_adapters["second"] = {
+            "linear.lora_A": torch.ones(1, 2),
+            "linear.lora_B": 2 * torch.ones(2, 1),
+        }
+        pipeline.set_lora("second", strength=0.25, merge_mode="disabled")
+        torch.testing.assert_close(layer(x), expected)
+        torch.testing.assert_close(layer.weight, original, rtol=0, atol=0)
+        assert layer.cpu_weight is None
+
+        # An explicit mode change restores the normal merge/unmerge contract.
+        pipeline.set_lora("adapter", strength=0.5, merge_mode="dynamic")
+        torch.testing.assert_close(layer.cpu_weight, original, rtol=0, atol=0)
+        pipeline.set_lora("adapter", strength=0.5, merge_mode="merge")
+        assert layer.merged
+        pipeline.unmerge_lora_weights()
+        torch.testing.assert_close(layer.weight, original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("convert_first", [False, True])
+def test_disabled_merge_initial_conversion_covers_all_targets(convert_first):
+    pipeline = _make_pipeline(_make_layer())
+    pipeline.server_args.lora_merge_mode = "disabled"
+    pipeline.lora_initialized = False
+    pipeline.lora_layers = {}
+    pipeline.lora_rank = pipeline.lora_alpha = None
+    pipeline.lora_target_modules = None
+    pipeline.exclude_lora_layers = []
+    for target in ("transformer", "transformer_2", "fake_score_transformer"):
+        pipeline.modules[target] = torch.nn.Sequential()
+        pipeline.modules[target].add_module("linear", torch.nn.Linear(2, 2))
+        pipeline.modules[target].add_module("uncovered", torch.nn.Linear(2, 2))
+    if convert_first:
+        # Startup/IPC conversion inherits the server policy before set_lora.
+        pipeline.convert_to_lora_layers(snapshot_base=False)
+    with patch(_RANK_PATCH, return_value=0):
+        pipeline.set_lora("adapter", cache_merged=True)
+    for layers in (
+        pipeline.lora_layers,
+        pipeline.lora_layers_transformer_2,
+        pipeline.lora_layers_critic,
+    ):
+        assert len(layers) == 2
+        assert not layers["linear"].disable_lora
+        assert layers["uncovered"].disable_lora
+        assert all(
+            layer.cpu_weight is None and not layer.merged for layer in layers.values()
+        )
+
+
+def test_disabled_merge_rejects_direct_and_cached_merges_without_mutation():
+    layer = wrap_with_lora_layer(
+        torch.nn.Linear(2, 2, bias=False),
+        lora_rank=1,
+        lora_alpha=1,
+        merge_disabled=True,
+    )
+    original = layer.weight.detach().clone()
+    a, b = torch.ones(1, 2), torch.ones(2, 1)
+    layer.set_lora_weights(a, b, merge_weights=False)
+    for merge in (
+        lambda: layer.merge_lora_weights(strength=2.0),
+        lambda: layer.set_lora_weights(a, b, strength=2.0, clear_existing=True),
+        lambda: layer.install_merged_weight(original + 1, original),
+        layer.compute_merged_weight,
+    ):
+        with pytest.raises(ValueError, match="merging is disabled"):
+            merge()
+        assert layer.strength == 1.0
+        assert len(layer.lora_weights_list) == 1
+        assert layer.cpu_weight is None
+        assert not layer.merged
+        torch.testing.assert_close(layer.weight, original, rtol=0, atol=0)
 
 
 def test_quantized_base_uses_dynamic_lora_in_auto_mode():
