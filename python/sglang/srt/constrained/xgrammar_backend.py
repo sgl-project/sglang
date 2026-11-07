@@ -229,6 +229,10 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                 raise TokenizerNotSupportedError(
                     f"Tokenizer type {type(tokenizer).__name__} is not supported by XGrammar"
                 )
+            if model_eos_token_ids:
+                override_stop_tokens = sorted(
+                    set(override_stop_tokens or ()) | set(model_eos_token_ids)
+                )
         else:
             # Create TokenizerInfo with model's EOS tokens as the authoritative stop tokens
             # This ensures consistency between what the model considers EOS and what XGrammar uses
