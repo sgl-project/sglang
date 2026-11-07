@@ -35,6 +35,9 @@ class TransferKVChunk:
     wait_event: Optional[object] = None
     # Must complete before reading asynchronously copied host indices.
     indices_event: Optional[object] = None
+    # Room lifecycle generation captured at enqueue time so a reopened room
+    # does not process or conclude chunks left over from a previous request.
+    lifecycle_gen: Optional[int] = None
 
 
 def bind_thread_to_device(gpu_id: int) -> None:
