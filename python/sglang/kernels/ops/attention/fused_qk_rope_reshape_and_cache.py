@@ -1,6 +1,34 @@
+import os
+
 import torch
 import triton
 import triton.language as tl
+
+
+# Tiled prefill path (6004): one program per (BLOCK_T tokens, HB q heads) and one
+# per BLOCK_T tokens for K rope + KV cache write, instead of one 1-warp program per
+# (token, q head). Used for T >= _TILED_MIN_T; SGLANG_FUSED_ROPE_KV_TILED=0 disables it.
+_TILED_ENABLED = os.environ.get("SGLANG_FUSED_ROPE_KV_TILED", "1") != "0"
+_TILED_MIN_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_MIN_T", "256"))
+_TILED_BLOCK_T = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_BLOCK_T", "16"))
+_TILED_HB = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_HB", "8"))
+_TILED_WARPS = int(os.environ.get("SGLANG_FUSED_ROPE_KV_TILED_WARPS", "4"))
+
+
+def _use_tiled(
+    t, t_slot, qh, kh, d, flash_layout, is_neox, reuse_freqs_front_part,
+    zeros_out, q, k, v, q_out, k_out, key_cache, value_cache, cos_sin,
+):
+    if not (_TILED_ENABLED and t >= _TILED_MIN_T and t_slot == t):
+        return False
+    if not (flash_layout and is_neox and reuse_freqs_front_part and zeros_out is None):
+        return False
+    if kh & (kh - 1) or qh % kh:
+        return False
+    return all(
+        x.stride(-1) == 1
+        for x in (q, k, v, q_out, k_out, key_cache, value_cache, cos_sin)
+    )
 
 
 @triton.jit
@@ -543,6 +571,170 @@ def _fused_qk_rope_reshape_and_cache_kernel(
                 tl.store(v_out_ptrs, v.to(value_cache_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _rope_half(x, x_rot, cos, sin):
+    # fma on the cos product, as the per-(token, head) kernel compiles to: bit-equal output.
+    return tl.fma(x.to(tl.float32), cos, x_rot.to(tl.float32) * sin)
+
+
+@triton.jit
+def _fused_qk_rope_cache_tiled_kernel(
+    q_ptr,
+    k_ptr,
+    v_ptr,
+    pos_ptr,
+    cos_sin_ptr,
+    offs_ptr,
+    key_cache_ptr,
+    value_cache_ptr,
+    slot_mapping_ptr,
+    swa_slot_mapping_ptr,
+    q_out_ptr,
+    k_out_ptr,
+    T,
+    q_stride_t,
+    q_stride_h,
+    k_stride_t,
+    k_stride_h,
+    v_stride_t,
+    v_stride_h,
+    cos_sin_stride_t,
+    q_out_stride_t,
+    q_out_stride_h,
+    k_out_stride_t,
+    k_out_stride_h,
+    key_cache_stride_t,
+    key_cache_stride_b,
+    key_cache_stride_h,
+    value_cache_stride_t,
+    value_cache_stride_b,
+    value_cache_stride_h,
+    k_scale_ptr,
+    v_scale_ptr,
+    QH: tl.constexpr,
+    KH: tl.constexpr,
+    HB: tl.constexpr,
+    BLOCK_T: tl.constexpr,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HAVE_POS: tl.constexpr,
+    HAVE_K_SCALE: tl.constexpr,
+    HAVE_V_SCALE: tl.constexpr,
+    HAS_SWA: tl.constexpr,
+):
+    # Prefill/extend fast path of _fused_qk_rope_reshape_and_cache_kernel for
+    # NeoX RoPE, D/2 frequencies, flash (NHD paged) layout, unit last-dim strides.
+    # Program (t-block, g): g < QH // HB ropes HB query heads of BLOCK_T tokens;
+    # g == QH // HB ropes the KH key heads and writes K and V into the cache.
+    # Same arithmetic as the per-(token, head) kernel: x * cos + rot(x) * sin in fp32.
+    HALF: tl.constexpr = D // 2
+    pid_t = tl.program_id(0)
+    pid_g = tl.program_id(1)
+
+    t_offs = pid_t * BLOCK_T + tl.arange(0, BLOCK_T)
+    t_mask = t_offs < T
+    t64 = t_offs.to(tl.int64)
+    d_offs = tl.arange(0, HALF)
+
+    pos = tl.load(pos_ptr + t_offs, mask=t_mask, other=0).to(tl.int64)
+    if HAVE_POS:
+        pos = pos + tl.load(offs_ptr + t_offs, mask=t_mask, other=0).to(tl.int64)
+    cs_offs = pos[:, None] * cos_sin_stride_t + d_offs[None, :]
+    cos = tl.load(cos_sin_ptr + cs_offs, mask=t_mask[:, None], other=0.0)
+    sin = tl.load(cos_sin_ptr + cs_offs + HALF, mask=t_mask[:, None], other=0.0)
+    cos3 = cos[:, None, :]
+    sin3 = sin[:, None, :]
+
+    if pid_g < QH // HB:
+        h_offs = pid_g * HB + tl.arange(0, HB)
+        q_m3 = t_mask[:, None, None]
+        q_src = (
+            q_ptr
+            + t64[:, None, None] * q_stride_t
+            + h_offs[None, :, None] * q_stride_h
+            + d_offs[None, None, :]
+        )
+        q_x1 = tl.load(q_src, mask=q_m3, other=0.0)
+        q_x2 = tl.load(q_src + HALF, mask=q_m3, other=0.0)
+        q_o1 = _rope_half(q_x1, -q_x2, cos3, sin3)
+        q_o2 = _rope_half(q_x2, q_x1, cos3, sin3)
+        q_dst = (
+            q_out_ptr
+            + t64[:, None, None] * q_out_stride_t
+            + h_offs[None, :, None] * q_out_stride_h
+            + d_offs[None, None, :]
+        )
+        tl.store(q_dst, q_o1.to(q_out_ptr.dtype.element_ty), mask=q_m3)
+        tl.store(q_dst + HALF, q_o2.to(q_out_ptr.dtype.element_ty), mask=q_m3)
+    else:
+        slot = tl.load(slot_mapping_ptr + t_offs, mask=t_mask, other=-1).to(tl.int64)
+        if HAS_SWA:
+            slot = tl.load(
+                swa_slot_mapping_ptr + slot, mask=t_mask & (slot >= 0), other=-1
+            ).to(tl.int64)
+        s_mask = t_mask & (slot >= 0)
+        page = slot // BLOCK_SIZE
+        in_page = slot % BLOCK_SIZE
+        kh_offs = tl.arange(0, KH)
+        m3 = s_mask[:, None, None]
+        src = (
+            k_ptr
+            + t64[:, None, None] * k_stride_t
+            + kh_offs[None, :, None] * k_stride_h
+            + d_offs[None, None, :]
+        )
+        x1 = tl.load(src, mask=m3, other=0.0)
+        x2 = tl.load(src + HALF, mask=m3, other=0.0)
+        o1 = _rope_half(x1, -x2, cos3, sin3)
+        o2 = _rope_half(x2, x1, cos3, sin3)
+        dst = (
+            k_out_ptr
+            + t64[:, None, None] * k_out_stride_t
+            + kh_offs[None, :, None] * k_out_stride_h
+            + d_offs[None, None, :]
+        )
+        tl.store(dst, o1.to(k_out_ptr.dtype.element_ty), mask=m3)
+        tl.store(dst + HALF, o2.to(k_out_ptr.dtype.element_ty), mask=m3)
+        if HAVE_K_SCALE:
+            k_scale = tl.load(k_scale_ptr)
+        else:
+            k_scale = 1
+        k_rcp = 1 / k_scale
+        o1 = o1 * k_rcp
+        o2 = o2 * k_rcp
+        kc = (
+            key_cache_ptr
+            + page[:, None, None] * key_cache_stride_t
+            + in_page[:, None, None] * key_cache_stride_b
+            + kh_offs[None, :, None] * key_cache_stride_h
+            + d_offs[None, None, :]
+        )
+        tl.store(kc, o1.to(key_cache_ptr.dtype.element_ty), mask=m3)
+        tl.store(kc + HALF, o2.to(key_cache_ptr.dtype.element_ty), mask=m3)
+
+        if HAVE_V_SCALE:
+            v_scale = tl.load(v_scale_ptr)
+        else:
+            v_scale = 1
+        v_rcp = 1 / v_scale
+        d_full = tl.arange(0, D)
+        vsrc = (
+            v_ptr
+            + t64[:, None, None] * v_stride_t
+            + kh_offs[None, :, None] * v_stride_h
+            + d_full[None, None, :]
+        )
+        v = tl.load(vsrc, mask=m3, other=0.0) * v_rcp
+        vc = (
+            value_cache_ptr
+            + page[:, None, None] * value_cache_stride_t
+            + in_page[:, None, None] * value_cache_stride_b
+            + kh_offs[None, :, None] * value_cache_stride_h
+            + d_full[None, None, :]
+        )
+        tl.store(vc, v.to(value_cache_ptr.dtype.element_ty), mask=m3)
+
+
 def fused_qk_rope_reshape_and_cache(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -662,6 +854,30 @@ def fused_qk_rope_reshape_and_cache(
         zeros_out = torch.empty((t, qh, d), dtype=q.dtype, device=q.device)
     else:
         zeros_out = None
+
+    if _use_tiled(
+        t, t_slot, qh, kh, d, flash_layout, is_neox, reuse_freqs_front_part,
+        zeros_out, q, k, v, q_out, k_out, key_cache, value_cache, cos_sin,
+    ):
+        hb = _TILED_HB if qh % _TILED_HB == 0 else kh
+        grid = (triton.cdiv(t, _TILED_BLOCK_T), qh // hb + 1)
+        _fused_qk_rope_cache_tiled_kernel[grid](
+            q, k, v, pos, cos_sin, offs, key_cache, value_cache,
+            slot_mapping, swa_slot_mapping, q_out, k_out, t,
+            q.stride(0), q.stride(1), k.stride(0), k.stride(1),
+            v.stride(0), v.stride(1), cos_sin.stride(0),
+            q_out.stride(0), q_out.stride(1), k_out.stride(0), k_out.stride(1),
+            key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+            value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+            k_scale, v_scale,
+            QH=qh, KH=kh, HB=hb, BLOCK_T=_TILED_BLOCK_T, D=d, BLOCK_SIZE=block_size,
+            HAVE_POS=(offs is not None),
+            HAVE_K_SCALE=(k_scale is not None and apply_scale),
+            HAVE_V_SCALE=(v_scale is not None and apply_scale),
+            HAS_SWA=(swa_slot_mapping is not None),
+            num_warps=_TILED_WARPS,
+        )
+        return q_out.view(-1, qh * d), k_out, key_cache, value_cache
 
     n_pid = t * qh + (t_slot - t) * kh if t_slot >= t else t * qh
     grid = (n_pid, 1, 1)
