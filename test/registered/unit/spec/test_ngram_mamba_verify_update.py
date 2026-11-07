@@ -1,9 +1,14 @@
 import unittest
+from itertools import product
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
 import sglang.srt
+from sglang.srt.configs.lfm2 import Lfm2Config
+from sglang.srt.configs.mamba import MambaConfig
+from sglang.srt.configs.mamba2 import Mamba2Config
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -11,6 +16,106 @@ register_cpu_ci(est_time=34, suite="base-a-test-cpu")
 
 
 class TestNgramMambaVerifyUpdate(CustomTestCase):
+    def test_deterministic_scan_does_not_publish_verify_checkpoints(self):
+        from sglang.srt.speculative.spec_utils import prepare_mamba_track_for_verify
+
+        for config, deterministic, expected in (
+            (Mamba2Config(), True, False),
+            (Mamba2Config(), False, True),
+            (MambaConfig(), True, True),
+            (Lfm2Config(), True, True),
+        ):
+            for lazy, reuse in product((False, True), repeat=2):
+                with self.subTest(
+                    model=type(config).__name__,
+                    deterministic=deterministic,
+                    lazy=lazy,
+                    reuse=reuse,
+                ):
+                    batch = SimpleNamespace(
+                        model_config=SimpleNamespace(hf_config=config),
+                        reqs=[],
+                        mamba_track_indices=torch.tensor([7]),
+                        mamba_track_buffer_indices=[7],
+                        mamba_lazy_spec_track_positions_cpu=[],
+                    )
+                    execution = SimpleNamespace(
+                        deterministic=SimpleNamespace(
+                            enable_deterministic_inference=deterministic
+                        ),
+                        mamba=SimpleNamespace(
+                            enable_mamba_extra_buffer=True,
+                            enable_mamba_extra_buffer_lazy=lazy,
+                        ),
+                    )
+                    cached_indices = MagicMock()
+                    with (
+                        patch(
+                            "sglang.srt.speculative.spec_utils.get_exec",
+                            return_value=execution,
+                        ),
+                        patch(
+                            "sglang.srt.speculative.spec_utils.set_mamba_track_indices_from_reqs"
+                        ) as gather,
+                        patch(
+                            "sglang.srt.speculative.spec_utils._VERIFY_TRACK_INDICES",
+                            cached_indices if reuse else None,
+                        ),
+                    ):
+                        prepare_mamba_track_for_verify(batch)
+                    self.assertEqual(gather.called, expected and (lazy or not reuse))
+                    self.assertEqual(
+                        cached_indices.set_from_reqs.called,
+                        expected and reuse and not lazy,
+                    )
+                    if not expected:
+                        self.assertIsNone(batch.mamba_track_indices)
+                        self.assertEqual(batch.mamba_track_buffer_indices, [])
+                    self.assertIsNone(batch.mamba_track_mask)
+                    self.assertIsNone(batch.mamba_track_seqlens)
+
+    def test_deterministic_scan_does_not_allocate_lazy_verify_checkpoints(self):
+        from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
+
+        for config, deterministic, expected in (
+            (Mamba2Config(), True, False),
+            (Mamba2Config(), False, True),
+            (MambaConfig(), True, True),
+            (Lfm2Config(), True, True),
+        ):
+            with self.subTest(model=type(config).__name__, deterministic=deterministic):
+                batch = SimpleNamespace(
+                    model_config=SimpleNamespace(hf_config=config),
+                    tree_cache=SimpleNamespace(page_size=1),
+                    mamba_lazy_spec_prepare=MagicMock(),
+                    spec_algorithm=MagicMock(),
+                    spec_info=MagicMock(),
+                )
+                batch.spec_algorithm.is_dflash_family.return_value = True
+                execution = SimpleNamespace(
+                    deterministic=SimpleNamespace(
+                        enable_deterministic_inference=deterministic
+                    ),
+                    mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=True),
+                )
+                with (
+                    patch(
+                        "sglang.srt.speculative.spec_utils.get_exec",
+                        return_value=execution,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.mamba_track_grid",
+                        return_value=256,
+                    ),
+                    patch(
+                        "sglang.srt.speculative.spec_utils.max_speculative_num_draft_tokens",
+                        return_value=4,
+                    ),
+                ):
+                    spec_prepare_for_decode(batch)
+                self.assertEqual(batch.mamba_lazy_spec_prepare.called, expected)
+                batch.spec_info.prepare_for_decode.assert_called_once_with(batch)
+
     def _make_mock_target_worker(self):
         target_worker = MagicMock()
         target_worker.model_runner.model = MagicMock()

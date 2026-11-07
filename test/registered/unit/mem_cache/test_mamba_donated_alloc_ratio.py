@@ -388,7 +388,10 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                     patch(
                         "sglang.srt.mem_cache.unified_cache.components.mamba.get_exec",
                         return_value=SimpleNamespace(
-                            mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False)
+                            mamba=SimpleNamespace(enable_mamba_extra_buffer_lazy=False),
+                            deterministic=SimpleNamespace(
+                                enable_deterministic_inference=False
+                            ),
                         ),
                     ),
                 ):
