@@ -95,6 +95,7 @@ if is_flashinfer_available():
         fast_decode_plan,
     )
     from flashinfer.cascade import merge_state
+    from flashinfer.quantization import packbits
 
     from sglang.kernels.ops.attention.merge_state import merge_state_triton
 
@@ -2609,6 +2610,12 @@ class FlashInferIndicesUpdaterPrefill:
             and window.window_left >= 0
         ):
             paged_plan_kwargs["window_left"] = window.window_left
+
+        if sparse_query is not None and bs == 1:
+            # SegmentPackBits uses one CTA per request; parallelize a long mask.
+            paged_plan_kwargs["packed_custom_mask"] = packbits(
+                custom_mask, bitorder="little"
+            )
 
         wrapper_paged.begin_forward(
             qo_indptr,
