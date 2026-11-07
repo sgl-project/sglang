@@ -1,7 +1,9 @@
 import io
 import multiprocessing
 import os
+import queue
 import re
+import socket
 import sys
 import threading
 import time
@@ -3220,6 +3222,78 @@ class TestGrafterFilterMatching:
         assert grafter._pg is None
 
 
+# Generous upper bound for one grafter test's workers; the grafter's own
+# collectives time out after 30 s, so this only trips when a worker is stuck.
+_GRAFT_WORKER_TIMEOUT_S = 300
+
+
+def _distinct_free_ports(count: int, exclude=()) -> list[int]:
+    """Return `count` distinct free ports, none of them in `exclude`.
+
+    `find_available_port` checks one port at a time and reserves nothing, so
+    separate calls can return the same port; two processes then race to bind
+    it. Holding every socket open until all ports are chosen keeps them
+    distinct.
+    """
+    exclude = set(exclude)
+    sockets = []
+    ports = []
+    try:
+        while len(ports) < count:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sockets.append(sock)
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+            if port not in exclude:
+                ports.append(port)
+    finally:
+        for sock in sockets:
+            sock.close()
+    return ports
+
+
+def _graft_port_from(kwargs) -> set:
+    port = kwargs.get("graft_port", os.environ.get("DUMPER_GRAFTER_MASTER_PORT"))
+    return {int(port)} if port is not None else set()
+
+
+def _collect_graft_results(processes, result_queue, count: int) -> list:
+    """Collect one result per worker without blocking on a worker that died.
+
+    Read the queue before joining: a child does not exit until its queued
+    result is flushed.
+    """
+    results = []
+    deadline = time.monotonic() + _GRAFT_WORKER_TIMEOUT_S
+    while len(results) < count:
+        if time.monotonic() >= deadline:
+            reason = f"still running after {_GRAFT_WORKER_TIMEOUT_S}s"
+            break
+        try:
+            results.append(result_queue.get(timeout=5))
+        except queue.Empty:
+            if not any(p.is_alive() for p in processes):
+                reason = "exited without reporting"
+                break
+    while len(results) < count:
+        try:
+            results.append(result_queue.get(timeout=1))
+        except queue.Empty:
+            break
+    for p in processes:
+        p.join(timeout=10)
+        if p.is_alive():
+            p.terminate()
+            p.join(timeout=10)
+    if len(results) < count:
+        raise AssertionError(
+            f"{count - len(results)} of {count} grafter workers reported no result "
+            f"({reason}; exit codes {[p.exitcode for p in processes]}); "
+            f"reported: {results}"
+        )
+    return results
+
+
 def _run_graft_test(worker_func, **kwargs):
     """Spawn one GPU-using process per role (rank 0 = baseline, rank 1 = target).
 
@@ -3233,7 +3307,7 @@ def _run_graft_test(worker_func, **kwargs):
     """
     import torch.multiprocessing as mp
 
-    role_ports = [find_available_port(29700 + i * 100) for i in range(2)]
+    role_ports = _distinct_free_ports(2, exclude=_graft_port_from(kwargs))
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -3246,10 +3320,7 @@ def _run_graft_test(worker_func, **kwargs):
         p.start()
         processes.append(p)
 
-    for p in processes:
-        p.join()
-
-    errors = [result_queue.get() for _ in range(2)]
+    errors = _collect_graft_results(processes, result_queue, 2)
     errors = [e for e in errors if e]
     if errors:
         raise AssertionError("\n".join(errors))
@@ -3258,20 +3329,21 @@ def _run_graft_test(worker_func, **kwargs):
 def _graft_worker_entry(rank, role_port, worker_func, result_queue, kwargs):
     import traceback
 
-    get_device_module().set_device(rank)
-    dist.init_process_group(
-        backend=get_default_distributed_backend(get_device()),
-        init_method=f"tcp://127.0.0.1:{role_port}",
-        world_size=1,
-        rank=0,
-    )
     try:
+        get_device_module().set_device(rank)
+        dist.init_process_group(
+            backend=get_default_distributed_backend(get_device()),
+            init_method=f"tcp://127.0.0.1:{role_port}",
+            world_size=1,
+            rank=0,
+        )
         worker_func(rank=rank, **kwargs)
         result_queue.put(None)
     except Exception as e:
         result_queue.put(f"rank={rank}: {e}\n{traceback.format_exc()}")
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _run_graft_test_split(worker_baseline, worker_target, **kwargs) -> dict:
@@ -3285,10 +3357,10 @@ def _run_graft_test_split(worker_baseline, worker_target, **kwargs) -> dict:
     """
     import torch.multiprocessing as mp
 
-    role_ports = {
-        "baseline": find_available_port(29700),
-        "target": find_available_port(29800),
-    }
+    baseline_port, target_port = _distinct_free_ports(
+        2, exclude=_graft_port_from(kwargs)
+    )
+    role_ports = {"baseline": baseline_port, "target": target_port}
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -3303,13 +3375,9 @@ def _run_graft_test_split(worker_baseline, worker_target, **kwargs) -> dict:
         p.start()
         processes.append(p)
 
-    for p in processes:
-        p.join()
-
     outputs: dict = {}
     errors: list = []
-    for _ in range(2):
-        role, error, captured = result_queue.get()
+    for role, error, captured in _collect_graft_results(processes, result_queue, 2):
         outputs[role] = captured
         if error:
             errors.append(f"role={role}: {error}")
@@ -3355,16 +3423,15 @@ def _graft_split_worker_entry(
             world_size=1,
             rank=0,
         )
-        try:
-            worker_func(**kwargs)
-        except Exception as e:
-            error = f"{e}\n{traceback.format_exc()}"
-        finally:
+        worker_func(**kwargs)
+    except Exception as e:
+        error = f"{e}\n{traceback.format_exc()}"
+    finally:
+        if dist.is_initialized():
             try:
                 dist.destroy_process_group()
             except Exception:
                 pass
-    finally:
         sys.stdout = old_stdout
     result_queue.put((role, error, captured.getvalue()))
 
@@ -3385,10 +3452,10 @@ def _run_graft_test_cpu_multi(
 
     # One default-PG port per role (baseline-side ranks share one PG, target
     # ranks share another). Allocated up-front to avoid child races.
-    role_ports = {
-        "baseline": find_available_port(29800),
-        "target": find_available_port(29900),
-    }
+    baseline_port, target_port = _distinct_free_ports(
+        2, exclude=_graft_port_from(kwargs)
+    )
+    role_ports = {"baseline": baseline_port, "target": target_port}
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
@@ -3418,10 +3485,7 @@ def _run_graft_test_cpu_multi(
         p.start()
         processes.append(p)
 
-    for p in processes:
-        p.join()
-
-    errors = [result_queue.get() for _ in range(total)]
+    errors = _collect_graft_results(processes, result_queue, total)
     errors = [e for e in errors if e]
     if errors:
         raise AssertionError("\n".join(errors))
@@ -3432,13 +3496,13 @@ def _graft_cpu_worker_entry(
 ):
     import traceback
 
-    dist.init_process_group(
-        backend="gloo",
-        init_method=f"tcp://127.0.0.1:{port}",
-        world_size=local_world,
-        rank=local_rank,
-    )
     try:
+        dist.init_process_group(
+            backend="gloo",
+            init_method=f"tcp://127.0.0.1:{port}",
+            world_size=local_world,
+            rank=local_rank,
+        )
         worker_func(role=role, local_rank=local_rank, **kwargs)
         result_queue.put(None)
     except Exception as e:
@@ -3446,7 +3510,8 @@ def _graft_cpu_worker_entry(
             f"role={role} local_rank={local_rank}: {e}\n{traceback.format_exc()}"
         )
     finally:
-        dist.destroy_process_group()
+        if dist.is_initialized():
+            dist.destroy_process_group()
 
 
 def _make_grafter_test_config(
