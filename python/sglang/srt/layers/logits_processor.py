@@ -284,8 +284,9 @@ class LogitsProcessorOutput:
     # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
-    next_token_top_logprobs_val: Optional[List] = None
-    next_token_top_logprobs_idx: Optional[List] = None
+    # A per-row list, or one [#seq, k] tensor when every row has the same k.
+    next_token_top_logprobs_val: Optional[Union[List, torch.Tensor]] = None
+    next_token_top_logprobs_idx: Optional[Union[List, torch.Tensor]] = None
     # The logprobs and ids of the requested token ids in output positions. shape: [#seq, n] (n is the number of requested token ids)
     # Can contain either lists or GPU tensors (for delayed copy optimization in prefill-only requests)
     next_token_token_ids_logprobs_val: Optional[
