@@ -34,7 +34,8 @@ HIDDEN_SIZE = 128
 EMPTY_RANK = 1
 # One token short of the full ranks, so its block at the receiver ends in padding.
 SHORT_RANK = 2
-# bf16 holds integers up to 256 exactly; a mark travels back as two base-256 digits.
+# bf16 holds integers up to 256 exactly; a mark travels back as two base-256
+# digits, so marks stay distinct below MARK_RADIX ** 2.
 MARK_RADIX = 256
 # The rank each BF16 round sends to, as an offset from the sending rank; 0 is itself.
 ROUND_OFFSETS = (1, 2, 3, 1, 0)
@@ -62,6 +63,7 @@ def mark_columns(marks):
 
 def uneven_token_counts(world_size, num_tokens):
     """Token counts as DP ranks with uneven batches have them."""
+    assert world_size > SHORT_RANK
     counts = [num_tokens] * world_size
     counts[EMPTY_RANK] = 0
     counts[SHORT_RANK] = num_tokens - 1
@@ -278,13 +280,12 @@ class TestFlashinferDispatcher(CustomTestCase):
         )
 
     def check_bf16_dispatch(self, dispatcher, global_num_tokens):
-        """Five rounds, as serving runs one per MoE layer. The Lamport transport
-        alternates two expert-id sets, so rounds 2 and 3 reuse the sets of rounds
-        0 and 1, now filled from other sources. Round 3 also goes back to round
-        0's target, so it rereads the payload, weight and combine rows that round
-        0 used. Round 4 sends each rank's tokens to itself, which Lamport handles
-        without its landing rows. No two rounds send the same values, so a round
-        that reads another's leftovers fails."""
+        """Five rounds. On Lamport, the transport alternates two expert-id sets,
+        so rounds 2 and 3 reuse the sets of rounds 0 and 1, now filled from other
+        sources, and round 4, each rank sending to itself, takes the code that
+        skips the landing rows. Round 3 goes back to round 0's target, so it
+        rereads the rows round 0 used. No two rounds send the same payload or
+        marks, so a round that reads another's leftovers fails."""
         # Offsets 1, 2 and 3 must name three different peers.
         self.assertGreaterEqual(self.world_size, 4)
 
@@ -358,6 +359,10 @@ class TestFlashinferDispatcher(CustomTestCase):
         self.assertTrue(dispatcher.payload_in_workspace)
         # Without Lamport the limit is 0, so this would be a one-token round.
         self.assertTrue(dispatcher.moe_a2a.lamport_enabled)
+        # One token past the limit must still fit the workspace.
+        self.assertGreater(
+            dispatcher.max_num_tokens, dispatcher.moe_a2a.lamport_max_tokens
+        )
         num_tokens = dispatcher.moe_a2a.lamport_max_tokens + 1
         self.check_bf16_dispatch(
             dispatcher=dispatcher, global_num_tokens=[num_tokens] * self.world_size
