@@ -248,10 +248,17 @@ class ComponentOffloadStrategy(ComponentResidencyStrategy):
             # size of the component. On a shared pool that pins a second copy
             # of the weights next to the device copy still being read from
             # -- a 57 GiB DiT took 43 GiB of shared memory in under a minute
-            # and exhausted a GB10. Take the synchronous, pageable path there.
+            # and exhausted a GB10. NPU has the same problem under TP/SP: the
+            # pinned destination comes from aclrtMallocHostWithCfg per rank
+            # process, so a 4-NPU launch pins ~4 full component copies at
+            # once and fails with error 207001 even with free host RAM. Take
+            # the synchronous, pageable path in both cases.
             module.to(
                 "cpu",
-                non_blocking=not current_platform.device_shares_host_memory(),
+                non_blocking=not (
+                    current_platform.device_shares_host_memory()
+                    or current_platform.is_npu()
+                ),
             )
         self._ready_events.pop(use.component_name, None)
 
