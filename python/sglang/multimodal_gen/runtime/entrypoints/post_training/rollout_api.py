@@ -28,6 +28,9 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    SKIP_DECODE_UNSUPPORTED_ERROR,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
@@ -294,6 +297,11 @@ def _build_response(
     return responses
 
 
+def _engine_error(error: str) -> HTTPException:
+    status_code = 400 if error == SKIP_DECODE_UNSUPPORTED_ERROR else 500
+    return HTTPException(status_code=status_code, detail=error)
+
+
 def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     sampling_kwargs: dict = dict(
         prompt=request.prompt,
@@ -367,13 +375,7 @@ async def rollout_generate(request: RolloutRequest):
             status_code=500, detail=f"Generation failed: {exc}"
         ) from exc
     if output_batch.error:
-        raise HTTPException(status_code=500, detail=output_batch.error)
-    if not request.rollout_return_generated_output and output_batch.output is not None:
-        raise HTTPException(
-            status_code=400,
-            detail="rollout_return_generated_output=False is not supported by this "
-            "pipeline's decoding stage, which decoded the output anyway",
-        )
+        raise _engine_error(output_batch.error)
 
     def _serialize_response() -> list[bytes]:
         with stamps.span("build"):

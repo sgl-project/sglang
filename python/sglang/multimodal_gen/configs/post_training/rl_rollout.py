@@ -23,6 +23,7 @@ class RLRolloutArgs:
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
     rollout_debug_mode: bool = False
+    rollout_return_generated_output: bool = True
 
     def validate(self) -> None:
         noise = self.rollout_noise_level
@@ -39,6 +40,12 @@ class RLRolloutArgs:
                 f"got {self.rollout_sde_type!r}"
             )
 
+        if not self.rollout_return_generated_output and not self.rollout:
+            raise ValueError(
+                "rollout_return_generated_output=False requires rollout=True; "
+                "it is a /rollout/generate option"
+            )
+
     @classmethod
     def validate_sampling_params(cls, params: Any) -> None:
         """Validate rollout fields on a duck-typed object (e.g. ``SamplingParams``).
@@ -52,6 +59,7 @@ class RLRolloutArgs:
             rollout_noise_level=params.rollout_noise_level,
             rollout_log_prob_no_const=params.rollout_log_prob_no_const,
             rollout_debug_mode=params.rollout_debug_mode,
+            rollout_return_generated_output=params.rollout_return_generated_output,
         ).validate()
 
     @staticmethod
