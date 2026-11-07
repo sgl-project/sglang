@@ -12,11 +12,15 @@ import json
 import unittest
 from http import HTTPStatus
 from typing import Optional
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from fastapi import Request
 
-from sglang.srt.entrypoints.openai.protocol import CompletionRequest
+from sglang.srt.entrypoints.openai.protocol import (
+    CompletionRequest,
+    CompletionResponseStreamChoice,
+    CompletionStreamResponse,
+)
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -486,6 +490,94 @@ class ServingCompletionTestCase(unittest.TestCase):
                 self.assertEqual(choices[0]["prompt_token_ids"], [1, 2])
                 for choice in choices[1:]:
                     self.assertNotIn("prompt_token_ids", choice)
+
+    def test_streaming_text_chunks_match_pydantic_serialization(self):
+        texts = [
+            "",
+            "plain",
+            'quote" backslash\\ slash/',
+            "\n\t\r\b\f\x00\x1f\x7f",
+            "\u4e2d\u6587 \U0001f600 \u2028\u2029 \ufffd \u00a0",
+        ]
+        finishes = [
+            None,
+            {"type": "stop", "matched": "</s>"},
+            {"type": "stop", "matched": 151645},
+            {"type": "stop", "matched": 2**64},
+            {"type": "stop"},
+            {"type": "length", "length": 9},
+            {"type": "content_filter"},
+            {"type": "abort", "message": "client gone"},
+        ]
+        chunks = []
+        for i, text in enumerate(texts):
+            for j, finish in enumerate(finishes):
+                chunks.append(
+                    {
+                        "text": text,
+                        "meta_info": {
+                            "id": f"cmpl-{i}-{j}",
+                            "prompt_tokens": 2,
+                            "completion_tokens": 1,
+                            "finish_reason": finish,
+                        },
+                        "index": i % 2,
+                    }
+                )
+        req = CompletionRequest(
+            model="x",
+            prompt="Hi",
+            max_tokens=10,
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+        adapted_request, _ = self.sc._convert_to_internal_request(req)
+
+        async def _mock_generate(*args, **kwargs):
+            for chunk in chunks:
+                yield chunk
+
+        self.sc.tokenizer_manager.generate_request = _mock_generate
+
+        async def run_stream():
+            return [
+                chunk
+                async for chunk in self.sc._generate_completion_stream(
+                    adapted_request, req, self.fastapi_request
+                )
+            ]
+
+        with (
+            get_context().override_server_args(incremental_streaming_output=True),
+            patch(
+                "sglang.srt.entrypoints.openai.serving_completions.CompletionResponseStreamChoice",
+                wraps=CompletionResponseStreamChoice,
+            ) as choice_model,
+        ):
+            raw_chunks = get_or_create_event_loop().run_until_complete(run_stream())
+
+        # Only the chunks orjson rejects (a matched stop beyond 64 bits) build models.
+        self.assertEqual(choice_model.call_count, len(texts))
+        self.assertEqual(len(raw_chunks), len(chunks) + 2)
+        self.assertEqual(raw_chunks[-1], "data: [DONE]\n\n")
+        for raw, chunk in zip(raw_chunks, chunks):
+            finish = chunk["meta_info"]["finish_reason"]
+            expected = CompletionStreamResponse(
+                id=chunk["meta_info"]["id"],
+                created=json.loads(raw[len("data: ") :])["created"],
+                object="text_completion",
+                choices=[
+                    CompletionResponseStreamChoice(
+                        index=chunk["index"],
+                        text=chunk["text"],
+                        finish_reason=finish["type"] if finish else None,
+                        matched_stop=finish.get("matched") if finish else None,
+                    )
+                ],
+                model="x",
+            )
+            self.assertEqual(raw, f"data: {expected.model_dump_json()}\n\n")
 
     def test_non_streaming_cached_tokens_details_emits_sglext(self):
         """Test that non-streaming completion responses emit cached token details in sglext."""

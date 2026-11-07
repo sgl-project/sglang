@@ -6,6 +6,7 @@ from collections.abc import AsyncGenerator
 from http import HTTPStatus
 from typing import TYPE_CHECKING, Any
 
+import orjson
 from fastapi import Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
@@ -44,6 +45,53 @@ if TYPE_CHECKING:
     from sglang.srt.parser.template_manager import TemplateManager
 
 logger = logging.getLogger(__name__)
+
+
+_PLAIN_FINISH_REASONS = (None, "stop", "length", "content_filter", "abort")
+
+
+def _plain_stream_chunk_json(
+    chunk_id, created, model, index, text, finish_reason, matched_stop
+) -> str | None:
+    """JSON of a text-only stream chunk, the same as CompletionStreamResponse's
+    model_dump_json(), or None if a field needs pydantic's validation.
+
+    Building and dumping the pydantic models is a large share of the frontend
+    process's CPU time per streamed token at high concurrency.
+    """
+    if (
+        type(chunk_id) is not str
+        or type(created) is not int
+        or type(model) is not str
+        or type(index) is not int
+        or type(text) is not str
+        or finish_reason not in _PLAIN_FINISH_REASONS
+        or not (matched_stop is None or type(matched_stop) in (int, str))
+    ):
+        return None
+    try:
+        payload = orjson.dumps(
+            {
+                "id": chunk_id,
+                "object": "text_completion",
+                "created": created,
+                "model": model,
+                "choices": [
+                    {
+                        "index": index,
+                        "text": text,
+                        "logprobs": None,
+                        "finish_reason": finish_reason,
+                        "matched_stop": matched_stop,
+                    }
+                ],
+                "usage": None,
+            }
+        )
+    except TypeError:
+        # orjson rejects what pydantic may still accept, e.g. ints beyond 64 bits.
+        return None
+    return payload.decode()
 
 
 class OpenAIServingCompletion(OpenAIServingBase):
@@ -371,16 +419,37 @@ class OpenAIServingCompletion(OpenAIServingBase):
                     yield f"data: {error}\n\n"
                     break
 
+                matched_stop = (
+                    finish_reason["matched"]
+                    if finish_reason and "matched" in finish_reason
+                    else None
+                )
+                if (
+                    logprobs is None
+                    and chunk_token_ids is None
+                    and chunk_prompt_token_ids is None
+                    and not continuous_usage_stats
+                ):
+                    plain_chunk = _plain_stream_chunk_json(
+                        content["meta_info"]["id"],
+                        created,
+                        request.model,
+                        index,
+                        delta,
+                        finish_reason_type,
+                        matched_stop,
+                    )
+                    if plain_chunk is not None:
+                        yield f"data: {plain_chunk}\n\n"
+                        stream_started = True
+                        continue
+
                 choice_data = CompletionResponseStreamChoice(
                     index=index,
                     text=delta,
                     logprobs=logprobs,
                     finish_reason=finish_reason_type,
-                    matched_stop=(
-                        finish_reason["matched"]
-                        if finish_reason and "matched" in finish_reason
-                        else None
-                    ),
+                    matched_stop=matched_stop,
                     token_ids=chunk_token_ids,
                     prompt_token_ids=chunk_prompt_token_ids,
                 )
