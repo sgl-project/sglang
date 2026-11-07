@@ -5,7 +5,12 @@ Qwen3.8-Flash-Next) out of device memory and lets the Triton gather kernel read
 rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
-    ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    Page-locked host memory of exactly the table's size. On a discrete GPU this
+    frees VRAM. The buffer is allocated with ``mmap`` and registered with
+    ``cudaHostRegister`` rather than ``torch.empty(..., pin_memory=True)``:
+    PyTorch's caching host allocator rounds every pinned allocation up to a
+    power of two, so the 47.7 GiB fp8 table would lock 64 GiB (and a 95.4 GiB
+    bf16 table 128 GiB) of host memory.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -222,6 +227,49 @@ class PleFileRssTrimmer:
         self._stop.set()
 
 
+# Pinned tables live as long as the process (like the model weights), so their
+# mappings are kept alive here and never unregistered.
+_PINNED_TABLE_BUFFERS: list = []
+_CUDA_HOST_REGISTER_PORTABLE_MAPPED = 0x01 | 0x02
+
+
+def _table_nbytes(shape: Sequence[int], dtype: torch.dtype) -> int:
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    return numel * torch.empty(0, dtype=dtype).element_size()
+
+
+def _allocate_pinned_table(shape: Sequence[int], dtype: torch.dtype) -> torch.Tensor:
+    """Page-locked host tensor that locks exactly ``shape``/``dtype`` bytes.
+
+    ``torch.empty(..., pin_memory=True)`` goes through the caching host allocator,
+    which rounds the request up to the next power of two; for a multi-GiB table
+    that locks tens of GiB for nothing and can push a memory-limited container
+    over its limit. Map anonymous memory of the exact size and register it with
+    CUDA instead; the result is pinned and device-accessible the same way.
+    """
+    import mmap
+
+    shape = tuple(int(d) for d in shape)
+    nbytes = _table_nbytes(shape, dtype)
+    if nbytes == 0:
+        return torch.empty(shape, dtype=dtype, device="cpu", pin_memory=True)
+    buf = mmap.mmap(-1, nbytes, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    raw = torch.frombuffer(buf, dtype=torch.uint8)
+    err = torch.cuda.cudart().cudaHostRegister(
+        raw.data_ptr(), nbytes, _CUDA_HOST_REGISTER_PORTABLE_MAPPED
+    )
+    if int(err) != 0:
+        buf.close()
+        raise RuntimeError(
+            f"cudaHostRegister of the PLE table ({nbytes} bytes) failed: {err}"
+        )
+    _PINNED_TABLE_BUFFERS.append(buf)
+    logger.info("PLE table: pinned host memory (%.1f GiB, %s)", nbytes / 2**30, dtype)
+    return raw.view(dtype).view(shape)
+
+
 def allocate_ple_host_table(
     shape: Sequence[int],
     dtype: torch.dtype,
@@ -241,12 +289,9 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
-        return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
+        return _allocate_pinned_table(shape, dtype)
 
-    numel = 1
-    for d in shape:
-        numel *= int(d)
-    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    nbytes = _table_nbytes(shape, dtype)
     table_dir = os.path.expanduser(table_dir or envs.SGLANG_QWEN4_PLE_FILE_DIR.get())
     os.makedirs(table_dir, exist_ok=True)
     path = os.path.join(table_dir, ple_table_file_name(shape, dtype, tag))
