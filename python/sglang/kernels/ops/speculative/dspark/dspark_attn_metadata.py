@@ -7,7 +7,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 from sglang.srt.utils import ceil_align
 
 
@@ -23,7 +23,7 @@ class DsparkWindowGather(msgspec.Struct, frozen=True):
 class ComputeDsparkWindowGather:
     @classmethod
     def execute(cls, *args, **kwargs) -> DsparkWindowGather:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -67,7 +67,7 @@ class ComputeDsparkWindowGather:
 class BuildDsparkSwaPageIndices:
     @classmethod
     def execute(cls, *args, **kwargs) -> Tuple[torch.Tensor, torch.Tensor]:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
@@ -512,7 +512,7 @@ class BuildDsparkSwaRingIndices:
 class BuildBlockSeqLensCausal:
     @classmethod
     def execute(cls, *args, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 

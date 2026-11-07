@@ -19,7 +19,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 from sglang.kernels.ops.speculative.dspark.simulated_bonus import (
     simulated_bonus_select_partials,
 )
@@ -115,7 +115,7 @@ def static_accept_tail(
     ``bonus_parts`` (part_val [bs, NSPLIT], part_idx, vocab); outputs go to rows [:bs]."""
     fn = (
         _static_accept_tail_triton
-        if inputs_on_cuda(candidates)
+        if inputs_on_triton_device(candidates)
         else static_accept_tail_torch
     )
     fn(

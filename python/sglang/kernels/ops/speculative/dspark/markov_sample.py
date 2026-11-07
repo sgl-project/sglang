@@ -9,7 +9,7 @@ import triton
 import triton.language as tl
 from triton.language.extra import libdevice
 
-from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
+from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_triton_device
 from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
@@ -246,7 +246,7 @@ class MarkovSampleStep:
 
     @classmethod
     def execute(cls, **kwargs) -> torch.Tensor:
-        if inputs_on_cuda(**kwargs):
+        if inputs_on_triton_device(**kwargs):
             if _is_npu:
                 from sgl_kernel_npu.operators.sample import markov_sample_step_triton
 

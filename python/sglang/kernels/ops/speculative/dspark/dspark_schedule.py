@@ -7,7 +7,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.speculative.dspark.dispatch import (
-    inputs_on_cuda,
+    inputs_on_triton_device,
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
@@ -27,7 +27,7 @@ class ScheduleVerifyLensTopk:
         # patterns the backend cannot lower). CUDA keeps the fused kernel.
         if is_npu_arch35():
             return cls.torch(*args, **kwargs)
-        if inputs_on_cuda(*args, **kwargs):
+        if inputs_on_triton_device(*args, **kwargs):
             return cls.triton(*args, **kwargs)
         return cls.torch(*args, **kwargs)
 
