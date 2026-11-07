@@ -6,12 +6,9 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
-    extract::{State, rejection::JsonRejection},
-    http::StatusCode,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    extract::State,
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -21,12 +18,13 @@ use sglang_processor::dynamo_protocols::types::{
     CreateCompletionResponse, Logprobs, Prompt, Stop,
 };
 
+use super::super::dp_relay::HintRoute;
 use super::pd_routing::PDRoutingFields;
 use super::{
-    AppState, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
+    AppState, LoggedJson, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
     model_error, openai_error, submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreError, CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
@@ -34,6 +32,7 @@ use crate::message::request::GenerateRequest;
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/completions", post(completions))
@@ -72,7 +71,8 @@ pub(super) struct ChoiceExtensions {
 
 async fn completions(
     State(state): State<Arc<AppState>>,
-    body: Result<Json<CompletionRequest>, JsonRejection>,
+    headers: HeaderMap,
+    LoggedJson { body, raw }: LoggedJson<CompletionRequest>,
 ) -> Response {
     let CompletionRequest {
         request,
@@ -84,6 +84,16 @@ async fn completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    // Python logs the request once its model and `_validate_request` accept
+    // it, so only the checks this server shares with them come first.
+    if let Some(raw) = raw
+        && request.max_tokens != Some(0)
+        && !python_empty_prompt(&request.prompt)
+    {
+        state
+            .core
+            .log_openai_request(OpenAiRequest::Completion, &raw, &headers);
+    }
     let stream = request.stream.unwrap_or(false);
     let echo = request.echo.unwrap_or(false);
     let model = request.model.clone();
@@ -156,10 +166,17 @@ async fn completions(
             );
         }
     };
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::Completions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     let response_id = format!("cmpl-{}", uuid::Uuid::new_v4().simple());
     let created = unix_seconds_u32();
     let mut submitted = Vec::with_capacity(choice_count);
@@ -209,7 +226,7 @@ async fn completions(
                 disagg_prefill_dp_rank: routing.disagg_prefill_dp_rank,
                 ..Default::default()
             };
-            let call = match submit_generation(&state, native, stream).await {
+            let call = match submit_generation(&state, &headers, native, stream).await {
                 Ok(call) => call,
                 Err(response) => return response,
             };
@@ -244,7 +261,7 @@ async fn completions(
             continuous_usage,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(s).into_response()
+        sse_response(s)
     } else {
         unary_completion(
             submitted,
@@ -292,6 +309,18 @@ async fn decode_prompt_echo(state: &AppState, token_ids: TokenIds) -> Result<Str
                 false,
             ))
         }
+    }
+}
+
+/// Python `_validate_request`'s "Prompt cannot be empty": an empty prompt, or
+/// a list of empty prompts. (Python also takes token ids that are all 0 as
+/// empty; this server serves them, and logs them.)
+fn python_empty_prompt(prompt: &Prompt) -> bool {
+    match prompt {
+        Prompt::String(text) => text.is_empty(),
+        Prompt::StringArray(texts) => texts.iter().all(String::is_empty),
+        Prompt::IntegerArray(ids) => ids.is_empty(),
+        Prompt::ArrayOfIntegerArray(prompts) => prompts.iter().all(Vec::is_empty),
     }
 }
 

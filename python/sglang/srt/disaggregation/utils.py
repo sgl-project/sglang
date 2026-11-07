@@ -1651,6 +1651,23 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
     }
 
 
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """{} without injected draft KV; None when this rank has no draft KV entries."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return {}
+    if not kv_args.num_draft_entries:
+        return None
+    # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
+    return {
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
+    }
+
+
 def get_pd_kv_layout(token_to_kv_pool) -> Optional[str]:
     """The KV byte layout both PD roles must share, for pools that have more than one."""
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool

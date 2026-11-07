@@ -9,10 +9,7 @@ use axum::{
     body::Bytes,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Event},
     routing::post,
 };
 use futures::StreamExt;
@@ -35,6 +32,7 @@ use sglang_processor::{
     tool_call_stream,
 };
 
+use super::super::dp_relay::HintRoute;
 use super::completions::completion_usage;
 use super::lowered;
 use super::pd_routing::PDRoutingFields;
@@ -45,7 +43,7 @@ use super::{
     contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
     submit_generation, unix_seconds_u32,
 };
-use crate::api_server::core::{CoreEvent, CoreOutput};
+use crate::api_server::core::{CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
@@ -55,6 +53,7 @@ use crate::message::request::{GenerateRequest, MmData};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
+use crate::utils::response::sse_response;
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new().route("/v1/chat/completions", post(chat_completions))
@@ -113,6 +112,25 @@ async fn chat_completions(
             return openai_error(StatusCode::BAD_REQUEST, rejection.body_text(), false);
         }
     };
+    let tool_choice = dynamo_tool_choice(&request.tool_choice);
+    let tools =
+        sglang_processor::chat_tool_definitions(request.tools.as_deref(), &request.messages);
+    // Python logs the request once its `_validate_request` accepts it, so
+    // only the checks this server shares with it (messages, media for a
+    // text-only model, tool definitions, tool choice) come first; a request
+    // this server goes on to refuse, or to serve where Python would refuse
+    // it, is logged.
+    if state.core.logs_openai_requests()
+        && !request.messages.is_empty()
+        && (state.server_args.model_is_multimodal() || !has_media_part(&raw["messages"]))
+        && tools.as_ref().is_ok_and(|tools| {
+            sglang_processor::tool_constraint(None, &tool_choice, tools, None).is_ok()
+        })
+    {
+        state
+            .core
+            .log_openai_request(OpenAiRequest::ChatCompletion, &body, &headers);
+    }
     if let Some(message) = model_error(&request.model, &state.server_args.served_model_name) {
         return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
@@ -160,11 +178,7 @@ async fn chat_completions(
         );
     }
 
-    let tool_choice = dynamo_tool_choice(&request.tool_choice);
-    let tools = match sglang_processor::chat_tool_definitions(
-        request.tools.as_deref(),
-        &request.messages,
-    ) {
+    let tools = match tools {
         Ok(tools) => tools,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
@@ -262,10 +276,17 @@ async fn chat_completions(
     let stream = request.stream.unwrap_or(false);
     let prompt_count = 1;
     let choices_per_prompt = request.n.unwrap_or(1) as usize;
-    let routing = match routing.normalize(prompt_count, choices_per_prompt) {
+    let mut routing = match routing.normalize(prompt_count, choices_per_prompt) {
         Ok(routing) => routing,
         Err(error) => return openai_error(StatusCode::BAD_REQUEST, error.to_string(), false),
     };
+    if let Err(error) = routing.apply_header_rank(
+        HintRoute::ChatCompletions,
+        &headers,
+        state.server_args.enable_request_header_overrides,
+    ) {
+        return openai_error(StatusCode::BAD_REQUEST, error, false);
+    }
     // Chat normalizes one prompt, so each bootstrap column has one entry.
     let bootstrap_host = &routing.bootstrap.bootstrap_hosts[0];
     let bootstrap_port = routing.bootstrap.bootstrap_ports[0];
@@ -327,7 +348,7 @@ async fn chat_completions(
             }),
             ..Default::default()
         };
-        let call = match submit_generation(&state, native, stream).await {
+        let call = match submit_generation(&state, &headers, native, stream).await {
             Ok(call) => call,
             Err(response) => return response,
         };
@@ -359,7 +380,7 @@ async fn chat_completions(
             service_tier,
         )
         .map(|data| Ok::<_, Infallible>(Event::default().data(data)));
-        Sse::new(event_stream).into_response()
+        sse_response(event_stream)
     } else {
         unary_chat(
             submitted,
@@ -427,6 +448,24 @@ pub(super) async fn prepare_chat_request(
         )
     })?;
     Ok((request, rendered))
+}
+
+/// Python `_validate_media_content`'s test for a text-only model: a message
+/// content part of a media type, counting `input_audio`, which Python's
+/// request model turns into an `audio_url` part.
+fn has_media_part(messages: &Value) -> bool {
+    messages.as_array().is_some_and(|messages| {
+        messages.iter().any(|message| {
+            message["content"].as_array().is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part["type"].as_str(),
+                        Some("image_url" | "video_url" | "audio_url" | "input_audio")
+                    )
+                })
+            })
+        })
+    })
 }
 
 /// Full sampling resolution for an OpenAI request, mirroring the Python
@@ -1746,6 +1785,8 @@ mod tests {
                     peer_endpoints: Vec::new(),
                     metadata: CoreMetadata::from(args.as_ref()),
                     metrics: None,
+                    request_log: None,
+                    generate_validator: None,
                 },
             );
             let state = Arc::new(super::super::AppState {
