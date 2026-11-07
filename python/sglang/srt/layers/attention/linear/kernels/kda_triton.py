@@ -27,8 +27,8 @@ if not is_cpu():
 class TritonKDAKernel(LinearAttnKernelBase):
     """Triton-based kernel for KDA (Kimi Delta Attention) linear attention."""
 
-    # XPU has no tvm_ffi CUDA JIT kernel for KDA packed decode; route XPU to the
-    # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
+    # KDA packed decode is a CUDA-only JIT kernel that can't build on XPU; route
+    # XPU to the non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
