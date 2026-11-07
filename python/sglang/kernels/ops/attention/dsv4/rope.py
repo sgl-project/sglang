@@ -233,7 +233,7 @@ def apply_rotary_emb_flat_kernel(
     pid = tl.program_id(0)
     row = pid * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     rmask = row < n_rows
-    tok = row // n_heads
+    tok = (row // n_heads).to(tl.int64)
     head = row % n_heads
     d = tl.arange(0, RD)
     base = tok[:, None] * sx_tok + head[:, None] * sx_head
@@ -244,29 +244,22 @@ def apply_rotary_emb_flat_kernel(
         pos = tl.load(pos_ptr + tok, mask=rmask, other=0)
     else:
         pos = tok
-    cos_idx = (d // 2) * 2
-    cos = tl.load(
-        fr_ptr + pos[:, None] * sfr_pos + cos_idx[None, :] * sfr_d,
+    fr = tl.load(
+        fr_ptr + pos[:, None] * sfr_pos + d[None, :] * sfr_d,
         mask=rmask[:, None],
         other=0.0,
     )
-    sin = tl.load(
-        fr_ptr + pos[:, None] * sfr_pos + (cos_idx[None, :] + 1) * sfr_d,
-        mask=rmask[:, None],
-        other=0.0,
-    )
+    cos, sin = tl.split(tl.reshape(fr, (BLOCK_ROWS, RDH, 2)))
+    x_re, x_im = tl.split(tl.reshape(x, (BLOCK_ROWS, RDH, 2)))
 
-    x_sin = x * sin
-    even = (d % 2 == 0)[None, :]
+    # Same rounding as fused_q_norm_rope on HIP: round the sine product, then one fma.
     if IS_INVERSE:
-        x_neg = tl.where(even, -x_sin, x_sin)
+        out_re = tl.fma(x_re, cos, x_im * sin)
+        out_im = tl.fma(x_im, cos, -(x_re * sin))
     else:
-        x_neg = tl.where(even, x_sin, -x_sin)
-    x_neg = tl.reshape(x_neg, (BLOCK_ROWS, RDH, 2))
-    x_neg = tl.flip(x_neg, 2)
-    x_rot = tl.reshape(x_neg, (BLOCK_ROWS, RD))
-
-    out = x * cos + x_rot
+        out_re = tl.fma(x_re, cos, -(x_im * sin))
+        out_im = tl.fma(x_im, cos, x_re * sin)
+    out = tl.reshape(tl.join(out_re, out_im), (BLOCK_ROWS, RD))
     tl.store(x_ptr + xo, out.to(x_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
