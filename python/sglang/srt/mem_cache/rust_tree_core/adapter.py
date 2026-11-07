@@ -855,6 +855,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_value=params.mamba_value,
                 mamba_host_value=params.mamba_host_value,
                 allow_missing_mamba=params.allow_missing_mamba,
+                mamba_value_seqlen=params.mamba_value_seqlen,
                 prev_prefix_len=params.prev_prefix_len,
                 swa_evicted_seqlen=params.get_evicted_seqlen(self.slot_id(TREE_WINDOW)),
                 swa_branching_seqlen=params.swa_branching_seqlen,

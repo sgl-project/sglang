@@ -139,6 +139,7 @@ fn insert_overlap_default_consumes_nothing() {
             mamba_value: None,
             mamba_host_value: None,
             allow_missing_mamba: false,
+            mamba_value_seqlen: None,
             prev_prefix_len: 0,
             swa_evicted_seqlen: 0,
             swa_branching_seqlen: None,

@@ -205,6 +205,16 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
         result: &mut InsertResult,
         cache_actions: &mut CacheActions,
     ) {
+        // The state was produced at mamba_value_seqlen; a leaf truncated to a
+        // shorter component boundary (e.g. the SWA branch) is not that
+        // position, and stamping it would attach a later state to an earlier
+        // key (sgl-project/sglang#38815). Check before either value kind.
+        if let Some(seqlen) = params.mamba_value_seqlen {
+            let key_token_len = params.key.atom_len() + K::IS_BIGRAM as usize;
+            if key_token_len != seqlen {
+                return;
+            }
+        }
         assert!(
             params.mamba_value.is_none() || params.mamba_host_value.is_none(),
             "mamba insert sets both a device slot and a host checkpoint"
