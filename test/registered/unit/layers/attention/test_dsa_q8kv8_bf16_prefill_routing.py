@@ -214,6 +214,23 @@ def test_kpool_tail_guard_admits_q8_for_prefill_only():
         mixin._check_kpool_tail_backend(backend, indices, "flashmla_kv", "prefill")
 
 
+def test_kpool_tail_guard_admits_aiter_sparse_prefill_for_prefill_only():
+    backend = SimpleNamespace(
+        dsa_index_kpool=4,
+        device_sm_major=9,
+        dsa_kv_cache_store_fp8=False,
+        aiter_sparse_prefill=True,
+    )
+    indices = torch.full((2, 2051), -1, dtype=torch.int32)
+    check = DeepseekSparseAttnBackendKPoolMixin._check_kpool_tail_backend
+    check(backend, indices, "aiter", "prefill")
+    with pytest.raises(NotImplementedError):
+        check(backend, indices, "aiter", "decode")
+    backend.aiter_sparse_prefill = False
+    with pytest.raises(NotImplementedError):
+        check(backend, indices, "aiter", "prefill")
+
+
 def test_kpool_tail_guard_still_rejects_q8_over_a_packed_fp8_pool():
     """Gathering packed fp8 rows through kpool tail columns is untested, so the
     guard must stay in force there even though q8 prefill is admitted on bf16."""

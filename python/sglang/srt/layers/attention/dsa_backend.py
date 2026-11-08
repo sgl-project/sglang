@@ -43,6 +43,11 @@ from sglang.kernels.ops.attention.dsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
 )
+from sglang.kernels.ops.attention.dsv4.opus_sparse_prefill_hip import (
+    combined_to_csr,
+    opus_sparse_prefill,
+    opus_sparse_prefill_available,
+)
 from sglang.kernels.ops.attention.metadata import q8kv8_topk_length_from_indices
 from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_pad
 from sglang.kernels.ops.attention.pad import seqlens_expand_triton
@@ -443,6 +448,11 @@ _DSA_IMPL_T: TypeAlias = Literal[
 # makes the [BLOCK_H, 512] fp32 accumulator spill or miss SM120's smem budget.
 _TRITON_SPARSE_MLA_MAX_HEADS = 32
 
+# Below this many query rows x heads, TileLang beats aiter's sparse prefill on
+# MI355X: the CSR conversion and the OPUS kernel cost a near-fixed 0.15-0.3 ms
+# there, while TileLang's time grows with rows x heads.
+_AITER_SPARSE_PREFILL_MIN_ROW_HEADS = 4096
+
 
 def _validate_triton_sparse_mla_backend(
     *,
@@ -689,6 +699,21 @@ class DeepseekSparseAttnBackend(
         ) and self._kv_shard_pool is None
         self.dsa_prefill_impl: _DSA_IMPL_T = get_exec().kernel.dsa_prefill_backend
         self.dsa_decode_impl: _DSA_IMPL_T = get_exec().kernel.dsa_decode_backend
+        # A rope-free 512-wide bf16 pool (GLM-5.3-Flash) prefills with aiter's
+        # OPUS sparse prefill over CSR lists instead of per-token decode.
+        self.aiter_sparse_prefill: bool = (
+            _is_hip
+            and _IS_GFX95
+            and self.dsa_prefill_impl == "aiter"
+            and model_runner.kv_cache_dtype == torch.bfloat16
+            and not self.dsa_kv_cache_store_fp8
+            and self.qk_rope_head_dim == 0
+            and self.kv_lora_rank == 512
+            and self.attn_dcp_size == 1
+            and not self.dsa_shards_index_k
+            and self.hisparse_coordinator is None
+            and opus_sparse_prefill_available()
+        )
         if (
             not _is_hip
             and self.token_to_kv_pool.dtype == torch.float8_e4m3fn
@@ -2754,6 +2779,10 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
         elif dsa_impl == "aiter":
+            if self.aiter_sparse_prefill and phase == "prefill" and not layer.logit_cap:
+                return self._forward_aiter_sparse_prefill(
+                    q_nope, kv_cache, page_table_1, layer
+                )
             if q_rope is not None:
                 q_all = torch.cat([q_nope, q_rope], dim=-1)
             return self._forward_aiter_extend(
@@ -4077,6 +4106,32 @@ class DeepseekSparseAttnBackend(
             o = o_kernel[:, :: self.head_repeat_factor, :]
 
         return o
+
+    def _forward_aiter_sparse_prefill(
+        self,
+        q_nope: torch.Tensor,
+        kv_cache: torch.Tensor,
+        page_table_1: torch.Tensor,
+        layer: RadixAttention,
+    ) -> torch.Tensor:
+        """Every query row attends the pool slots in its row of page_table_1;
+        -1 entries, wherever they sit, are skipped. Calls with few rows run
+        TileLang, which is faster there."""
+        num_tokens, num_heads, _ = q_nope.shape
+        if num_tokens * num_heads < _AITER_SPARSE_PREFILL_MIN_ROW_HEADS:
+            # TileLang reads q token-major; q_nope can be head-major.
+            return self._forward_tilelang(
+                q_all=q_nope.contiguous(),
+                kv_cache=kv_cache,
+                v_head_dim=layer.v_head_dim,
+                page_table_1=page_table_1,
+                sm_scale=layer.scaling,
+            )
+        width = page_table_1.shape[1]
+        kv = kv_cache.view(-1, self.kv_lora_rank)
+        lens = torch.full((num_tokens,), width, dtype=torch.int32, device=kv.device)
+        csr = combined_to_csr(page_table_1, lens, 0, kv.shape[0])
+        return opus_sparse_prefill(q_nope, kv, csr, None, layer.scaling)
 
     def _forward_aiter_extend(
         self,
