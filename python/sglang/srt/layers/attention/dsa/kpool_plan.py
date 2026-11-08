@@ -19,7 +19,7 @@ from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_req_to_token_pool
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
@@ -90,16 +90,16 @@ class KPoolCpInfo:
 class KPoolExtendPlan:
     writes: PoolWriteRows
     tails: TailWriteRows
-    pooled_seq_lens_expanded: torch.Tensor
-    seq_lens_expanded: torch.Tensor
-    ragged_concat_page_table: torch.Tensor
-    ragged_q_ks: torch.Tensor
-    ragged_q_ke: torch.Tensor
-    ragged_total_k_rows: int
-    ragged_k_u8: Optional[torch.Tensor]
-    ragged_k_scale: Optional[torch.Tensor]
-    ragged_paged_page_table: Optional[torch.Tensor]
-    ragged_paged_page_table_row_index: Optional[torch.Tensor]
+    pooled_seq_lens_expanded: Optional[torch.Tensor] = None
+    seq_lens_expanded: Optional[torch.Tensor] = None
+    ragged_concat_page_table: Optional[torch.Tensor] = None
+    ragged_q_ks: Optional[torch.Tensor] = None
+    ragged_q_ke: Optional[torch.Tensor] = None
+    ragged_total_k_rows: int = 0
+    ragged_k_u8: Optional[torch.Tensor] = None
+    ragged_k_scale: Optional[torch.Tensor] = None
+    ragged_paged_page_table: Optional[torch.Tensor] = None
+    ragged_paged_page_table_row_index: Optional[torch.Tensor] = None
     cp: Optional[KPoolCpInfo] = None
 
 
@@ -121,7 +121,11 @@ class KPoolWritePlan:
 
 
 def _is_kpool_layout_enabled(kpool: int, physical_page_size: int) -> bool:
-    return kpool > 1 and physical_page_size == 64 and physical_page_size % kpool == 0
+    return (
+        kpool > 1
+        and physical_page_size == (128 if is_npu() else 64)
+        and physical_page_size % kpool == 0
+    )
 
 
 @dataclass
@@ -241,6 +245,7 @@ def _kpool_cpu_plan(
     *,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
+    build_ragged_metadata: bool = True,
 ) -> _KPoolCpuPlan:
     plan = _KPoolCpuPlan()
 
@@ -262,18 +267,116 @@ def _kpool_cpu_plan(
         req_pool_indices_cpu,
     )
 
-    if local_extend_seq_lens_cpu is None:
-        local_extend_seq_lens_cpu = extend_seq_lens_cpu
-        local_seq_lens_cpu = seq_lens_cpu
+    if build_ragged_metadata:
+        if local_extend_seq_lens_cpu is None:
+            local_extend_seq_lens_cpu = extend_seq_lens_cpu
+            local_seq_lens_cpu = seq_lens_cpu
 
-    _append_local_rows(
-        plan,
-        kpool,
-        index_page_size,
-        local_extend_seq_lens_cpu,
-        local_seq_lens_cpu,
-    )
+        _append_local_rows(
+            plan,
+            kpool,
+            index_page_size,
+            local_extend_seq_lens_cpu,
+            local_seq_lens_cpu,
+        )
     return plan
+
+
+def _kpool_plan_to_device(
+    cpu: _KPoolCpuPlan,
+    full_real_page_table: torch.Tensor,
+    kpool: int,
+    index_page_size: int,
+) -> KPoolExtendPlan:
+    """Materialize write rows and tails without ragged read-side metadata."""
+    device = full_real_page_table.device
+    n_pool = len(cpu.pool_pool_id)
+    n_tail = len(cpu.tail_req)
+    i64_total = 4 * n_pool + 2 * n_tail
+    if i64_total > 0:
+        i64_cpu = torch.tensor(
+            cpu.pool_req
+            + cpu.pool_pool_id
+            + cpu.pool_chunk_src
+            + cpu.pool_batch_idx
+            + cpu.tail_req
+            + cpu.tail_chunk_src,
+            dtype=torch.int64,
+            pin_memory=True,
+        )
+        i64_device = i64_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_req_t = i64_device[c : c + n_pool]
+        c += n_pool
+        pool_pool_id_t = i64_device[c : c + n_pool]
+        c += n_pool
+        pool_chunk_src_t = i64_device[c : c + n_pool]
+        c += n_pool
+        pool_batch_idx_t = i64_device[c : c + n_pool]
+        c += n_pool
+        tail_req_t = i64_device[c : c + n_tail]
+        c += n_tail
+        tail_chunk_src_t = i64_device[c : c + n_tail]
+    else:
+        empty_i64 = torch.empty((0,), dtype=torch.int64, device=device)
+        pool_req_t = pool_pool_id_t = pool_chunk_src_t = pool_batch_idx_t = empty_i64
+        tail_req_t = tail_chunk_src_t = empty_i64
+
+    i32_total = 2 * n_pool + 2 * n_tail
+    if i32_total > 0:
+        i32_cpu = torch.tensor(
+            cpu.pool_n_from_tail
+            + cpu.pool_tail_logical_base
+            + cpu.tail_dst_logical_start
+            + cpu.tail_n_write,
+            dtype=torch.int32,
+            pin_memory=True,
+        )
+        i32_device = i32_cpu.to(device, non_blocking=True)
+        c = 0
+        pool_n_from_tail_t = i32_device[c : c + n_pool]
+        c += n_pool
+        pool_tail_logical_base_t = i32_device[c : c + n_pool]
+        c += n_pool
+        tail_dst_logical_start_t = i32_device[c : c + n_tail]
+        c += n_tail
+        tail_n_write_t = i32_device[c : c + n_tail]
+    else:
+        empty_i32 = torch.empty((0,), dtype=torch.int32, device=device)
+        pool_n_from_tail_t = pool_tail_logical_base_t = empty_i32
+        tail_dst_logical_start_t = tail_n_write_t = empty_i32
+
+    if n_pool > 0:
+        pool_page_group = torch.div(
+            pool_pool_id_t, index_page_size, rounding_mode="floor"
+        )
+        token_page_row = pool_page_group * kpool
+        packed_page = (
+            full_real_page_table[pool_batch_idx_t, token_page_row].to(torch.int64)
+            // kpool
+        )
+        pool_write_locs = packed_page * index_page_size + torch.remainder(
+            pool_pool_id_t, index_page_size
+        )
+    else:
+        pool_write_locs = torch.empty((0,), dtype=torch.int64, device=device)
+
+    return KPoolExtendPlan(
+        writes=PoolWriteRows(
+            req=pool_req_t,
+            pool_id=pool_pool_id_t,
+            n_from_tail=pool_n_from_tail_t,
+            chunk_src=pool_chunk_src_t,
+            tail_logical_base=pool_tail_logical_base_t,
+            write_loc=pool_write_locs,
+        ),
+        tails=TailWriteRows(
+            req=tail_req_t,
+            dst_logical_start=tail_dst_logical_start_t,
+            chunk_src=tail_chunk_src_t,
+            n_write=tail_n_write_t,
+        ),
+    )
 
 
 def _kpool_plan_to_gpu(
@@ -493,14 +596,15 @@ def init_kpool_extend_metadata(
     kpool: int,
     physical_page_size: int,
     index_page_size: int,
-    topk_transform_method: TopkTransformMethod,
+    topk_transform_method: Optional[TopkTransformMethod],
     full_real_page_table: torch.Tensor,
-    full_seqlens_expanded: torch.Tensor,
+    full_seqlens_expanded: Optional[torch.Tensor] = None,
     local_real_page_table: Optional[torch.Tensor] = None,
     local_seqlens_expanded: Optional[torch.Tensor] = None,
     local_extend_seq_lens_cpu: Optional[List[int]] = None,
     local_seq_lens_cpu: Optional[List[int]] = None,
     local_req_pool_indices: Optional[torch.Tensor] = None,
+    build_ragged_metadata: bool = True,
 ) -> DSAMetadata:
     mode = forward_batch.forward_mode
     is_extend_like = mode.is_extend_without_speculative() or mode.is_draft_extend_v2()
@@ -525,18 +629,22 @@ def init_kpool_extend_metadata(
         index_page_size,
         local_extend_seq_lens_cpu=local_extend_seq_lens_cpu,
         local_seq_lens_cpu=local_seq_lens_cpu,
+        build_ragged_metadata=build_ragged_metadata,
     )
-    plan = _kpool_plan_to_gpu(
-        cpu,
-        forward_batch,
-        full_real_page_table,
-        local_real_page_table,
-        local_seqlens_expanded,
-        local_req_pool_indices,
-        kpool,
-        index_page_size,
-        topk_transform_method,
-    )
+    if build_ragged_metadata:
+        plan = _kpool_plan_to_gpu(
+            cpu,
+            forward_batch,
+            full_real_page_table,
+            local_real_page_table,
+            local_seqlens_expanded,
+            local_req_pool_indices,
+            kpool,
+            index_page_size,
+            topk_transform_method,
+        )
+    else:
+        plan = _kpool_plan_to_device(cpu, full_real_page_table, kpool, index_page_size)
     return dataclasses.replace(metadata, kpool_extend_plan=plan)
 
 
@@ -764,7 +872,7 @@ def update_kpool_write_plan(
     effective_n_per_batch: Optional[torch.Tensor] = None,
 ) -> None:
     if not _is_kpool_layout_enabled(kpool, physical_page_size) or not (
-        is_cuda() or is_hip()
+        is_cuda() or is_hip() or is_npu()
     ):
         return
     is_verify = forward_mode.is_target_verify()
@@ -775,6 +883,11 @@ def update_kpool_write_plan(
 
     plan = metadata.kpool_write_plan
     assert plan is not None, "kpool_write_plan must be allocated before update"
+    if is_npu():
+        real_page_table = torch.repeat_interleave(
+            real_page_table, num_draft_tokens, dim=0
+        ).contiguous()  # [B,P] -> [B*draft_token, P], expand as required
+
     update_kpool_write_plan_cuda_graph(
         write_start=write_start,
         req_pool_indices=req_pool_indices,

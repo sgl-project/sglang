@@ -1916,12 +1916,33 @@ class IndexerKPool(MultiPlatformOp):
                 device=x.device,
             )
 
-        # --- Write Phase ---
-        self._compress_write_npu(x, layer_id, metadata)
-
-        # --- Read Phase ---
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        gate_score = F.linear(x, self.index_kpool_compress_gate)
         query, _ = self.wq_b(q_lora)  # [T,H*D]
         query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)  # [T,H,D]
+        if self.rope_head_dim > 0 and not self.skip_rope:  # with RoPE
+            q_rope = query[..., : self.rope_head_dim]
+            k_rope = key[..., : self.rope_head_dim]
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+            query[..., : self.rope_head_dim] = q_rope
+            key[..., : self.rope_head_dim] = k_rope
+
+        # --- Write Phase ---
+        if mode.is_target_verify() or mode.is_draft_extend_v2():
+            self._compress_write_mtp_npu(
+                key, gate_score, forward_batch, layer_id, metadata
+            )
+        elif mode.is_decode_or_idle():
+            self._compress_write_decode_npu(
+                key, gate_score, positions, forward_batch, layer_id, metadata
+            )
+        elif mode.is_extend_without_speculative():
+            self._compress_write_extend_npu(key, gate_score, layer_id, metadata)
+        else:
+            raise NotImplementedError(f"NPU KPool does not support {mode}")
+
+        # --- Read Phase ---
         return self._get_topk_npu(
             layer_id,
             query,
@@ -1971,9 +1992,12 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         query = query.contiguous()
+        pool = get_token_to_kv_pool()
+        kv = pool.layer_router.read(layer_id)
+        pool, layer_id = kv.view, kv.view_layer_id
         indices = pool_key_indexer(
             query=query,
-            pool_key=get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id),
+            pool_key=pool.get_index_k_buffer(layer_id),
             weights=weights,
             pool_tail_k=tail_lens_padded,
             actual_seq_q=query_ends_padded,
@@ -1995,56 +2019,110 @@ class IndexerKPool(MultiPlatformOp):
             pool_size=self.index_kpool,
         )
 
-    def _compress_write_npu(self, x, layer_id, metadata: BaseIndexerMetadata):
-        from sgl_kernel_npu.operators.mem_cache import key_pool, key_pool_write_cache
-
-        from sglang.srt.hardware_backend.npu.attention.ascend_kpool_plan import (
-            pack_compressed_tail,
+    def _compress_write_mtp_npu(
+        self,
+        key: torch.Tensor,
+        gate_score: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+    ) -> None:
+        """Execute compress_write (target_verify / draft_extend_v2)"""
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_write_tail_and_maybe_compress,
         )
 
-        # 1. get model config / weights / hidden_states
-        # 2. get dsa metadata (write_plan)
-        write_plan = metadata.attn_metadata.kpool
-        assert write_plan is not None
-        # 3. get memory pool (compressed tail, index cache)
+        plan = metadata.attn_metadata.kpool_write_plan
+        assert plan is not None, "NPU DSA kpool MTP requires kpool_write_plan"
+
         pool = get_token_to_kv_pool()
-        tail_k, tail_gate = pool.get_compress_tail_buffers(layer_id)
-        state = pack_compressed_tail(
-            write_plan, tail_k, tail_gate
-        )  # batch-level tail buffer
-
-        pooled_key = key_pool(
-            hidden_states=x.contiguous(),
-            wk=self.wk.weight,
-            gate_weight=self.index_kpool_compress_gate,
-            ape=self.index_kpool_compress_ape,
-            state_cache=state,  # in/out
-            cache_block_table=write_plan.state_block_table,
-            start_pos=write_plan.state_start_pos,
-            norm_weight=self.k_norm.weight,
-            norm_bias=self.k_norm.bias,
-            cu_seqlens=write_plan.query_start_loc,
-            cmp_ratio=self.index_kpool,
-            norm_eps=self.k_norm.variance_epsilon,
-        )  # compressed keys [T//r,D]
-
-        is_mtp = write_plan.mode == "mtp"
-        key_pool_write_cache(
-            pooled_key=pooled_key,
-            state_cache=state,
-            pooled_slot_mapping=write_plan.pooled_slot_mapping,
-            tail_write_indices=write_plan.tail_write_indices,
-            tail_state_indices=write_plan.tail_state_indices,
-            tail_token_indices=write_plan.tail_token_indices,
-            index_cache=pool.get_index_k_with_scale_buffer(layer_id),
+        kv = pool.layer_router.read(layer_id)
+        pool, layer_id = kv.view, kv.view_layer_id
+        tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+        kpool_write_tail_and_maybe_compress(
+            index_k_cache=pool.get_index_k_buffer(layer_id),
+            key=key,
+            score=gate_score,
             tail_k=tail_k,
-            tail_gate=tail_gate,
-            hidden_states=x if is_mtp else None,
-            wk=self.wk.weight if is_mtp else None,
-            gate_weight=self.index_kpool_compress_gate if is_mtp else None,
-            norm_weight=self.k_norm.weight if is_mtp else None,
-            norm_bias=self.k_norm.bias if is_mtp else None,
-            mode=write_plan.mode,
-            cmp_ratio=self.index_kpool,
-            norm_eps=self.k_norm.variance_epsilon,
+            tail_score=tail_score,
+            ape=self.index_kpool_compress_ape,
+            req_pool_indices=plan.req,
+            write_start=plan.write_start,
+            tail_logical_start=plan.tail_logical_start,
+            write_loc=plan.write_loc,
+            out_cache_loc=forward_batch.out_cache_loc,
+            num_draft_tokens=plan.num_draft_tokens,
+            effective_n_per_batch=plan.effective_n_per_batch,
         )
+
+    def _compress_write_decode_npu(
+        self, key, gate_score, positions, forward_batch, layer_id, metadata
+    ):
+        """Execute compress_write (decode)"""
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_decode_update_and_maybe_write_cache,
+        )
+
+        pool = get_token_to_kv_pool()
+        kv = pool.layer_router.read(layer_id)
+        pool, layer_id = kv.view, kv.view_layer_id
+        tail_k, tail_score = pool.get_compress_tail_buffers(layer_id)
+        kpool_decode_update_and_maybe_write_cache(
+            buf=pool.get_index_k_buffer(layer_id),
+            tail_k=tail_k,
+            tail_score=tail_score,
+            key=key,
+            slot_score=gate_score,
+            ape=self.index_kpool_compress_ape,
+            block_tables=metadata.get_page_table_64(),
+            req_pool_indices=forward_batch.req_pool_indices,
+            positions=positions,
+            seq_lens=metadata.get_seqlens_int32(),
+            out_cache_loc=forward_batch.out_cache_loc,
+            pool_size=self.index_kpool,
+            slots_per_page=pool.index_page_size,
+        )
+
+    def _compress_write_extend_npu(self, key, gate_score, layer_id, metadata):
+        """Execute compress_write (extend)"""
+        pool = get_token_to_kv_pool()
+        kv = pool.layer_router.read(layer_id)
+        pool, layer_id = kv.view, kv.view_layer_id
+        tail_k_buf, tail_score_buf = pool.get_compress_tail_buffers(layer_id)
+        plan = metadata.attn_metadata.kpool_extend_plan
+        assert plan is not None, "NPU DSA extend requires kpool_extend_plan"
+
+        # The NPU index cache is BF16, so tail updates cannot reuse the GPU
+        # FP8 scatter implementation.
+        from sgl_kernel_npu.operators.mem_cache import (
+            kpool_assemble_softmax_rotate_write_cache,
+            scatter_kpool_tail_updates,
+        )
+
+        writes, tails = plan.writes, plan.tails
+        if not writes.is_empty:
+            kpool_assemble_softmax_rotate_write_cache(
+                index_k_cache=pool.get_index_k_buffer(layer_id),
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=writes.req,
+                n_from_tail=writes.n_from_tail,
+                chunk_src_start=writes.chunk_src,
+                tail_logical_base=writes.tail_logical_base,
+                ape=self.index_kpool_compress_ape,
+                loc=writes.write_loc,
+            )
+        if not tails.is_empty:
+            scatter_kpool_tail_updates(
+                pool=pool,
+                chunk_k=key,
+                chunk_score=gate_score,
+                tail_k=tail_k_buf,
+                tail_score=tail_score_buf,
+                req_pool_idx=tails.req,
+                dst_logical_start=tails.dst_logical_start,
+                chunk_src_start=tails.chunk_src,
+                n_write=tails.n_write,
+            )

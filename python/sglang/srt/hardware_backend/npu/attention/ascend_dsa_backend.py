@@ -11,12 +11,14 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
 )
-from sglang.srt.hardware_backend.npu.attention.ascend_kpool_plan import (
-    AscendKpoolWritePlan,
-    init_kpool_write_plan,
+from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
+from sglang.srt.layers.attention.dsa.kpool_plan import (
+    KPoolExtendPlan,
+    KPoolWritePlan,
+    init_kpool_extend_metadata,
+    init_kpool_write_plan_capture,
     update_kpool_write_plan,
 )
-from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
 if TYPE_CHECKING:
@@ -25,24 +27,22 @@ if TYPE_CHECKING:
 
 @dataclass
 class AscendDSAForwardMetadata(ForwardMetadata):
-    """Attention/indexer inputs and the bucket-owned KeyPool write plan.
-
-    The backend normalizes lengths; kpool owns write mappings and layer scratch.
-    """
+    """Attention/read inputs and shared extend or speculative write plans."""
 
     # ── Core attention ──
     page_size: int = 0
-    cache_seqlens_int32: Optional[torch.Tensor] = None
+    cache_lens_int32: Optional[torch.Tensor] = None
     real_page_table: Optional[torch.Tensor] = None
 
-    # Inputs for pooled key indexer (batch-level)
+    # Inputs for pooled_key_indexer (batch-level)
     pool_query_ends: Optional[torch.Tensor] = None
     pool_key_lens: Optional[torch.Tensor] = None
     pool_tail_lens: Optional[torch.Tensor] = None
     pool_page_table: Optional[torch.Tensor] = None
 
-    # Inputs for key pool
-    kpool: Optional[AscendKpoolWritePlan] = None
+    # Inputs for compress_write_npu
+    kpool_extend_plan: Optional[KPoolExtendPlan] = None
+    kpool_write_plan: Optional[KPoolWritePlan] = None
 
 
 @dataclass(frozen=True)
@@ -52,8 +52,8 @@ class AscendDSAIndexerMetadata(BaseIndexerMetadata):
     attn_metadata: AscendDSAForwardMetadata
 
     def get_seqlens_int32(self) -> torch.Tensor:
-        assert self.attn_metadata.cache_seqlens_int32 is not None
-        return self.attn_metadata.cache_seqlens_int32
+        assert self.attn_metadata.cache_lens_int32 is not None
+        return self.attn_metadata.cache_lens_int32
 
     def get_page_table_64(self) -> torch.Tensor:
         assert self.attn_metadata.real_page_table is not None
@@ -114,65 +114,74 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         metadata.seq_lens = seq_lens.clone()
         return metadata
 
-    def _resolve_sequence_layout(
-        self, forward_batch: ForwardBatch
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
-        """Normalize computed query, read length and committed write length once."""
+    def _query_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        """Return per-request query lengths without a device-host round trip."""
         mode = forward_batch.forward_mode
-        batch = forward_batch.batch_size
-        device = forward_batch.seq_lens.device
+        # Target verify and draft extend v2 both use a fixed batch_size * N query layout.
         if mode.is_target_verify() or mode.is_draft_extend_v2():
-            query_lens = torch.full(
-                (batch,),
+            return torch.full(
+                (forward_batch.batch_size,),
                 self.speculative_num_draft_tokens,
                 dtype=torch.int32,
-                device=device,
+                device=forward_batch.seq_lens.device,
             )
-        elif mode.is_extend():
-            query_lens = forward_batch.extend_seq_lens
-            if query_lens is None or query_lens.shape[0] < batch:
-                raise ValueError("DSA requires one query length per request")
-            query_lens = query_lens[:batch].to(torch.int32)
-        else:
-            query_lens = torch.ones((batch,), dtype=torch.int32, device=device)
+        if mode.is_extend():
+            return forward_batch.extend_seq_lens[: forward_batch.batch_size].to(
+                torch.int32
+            )
+        return torch.ones(
+            (forward_batch.batch_size,),
+            dtype=torch.int32,
+            device=forward_batch.seq_lens.device,
+        )
 
-        # Share the same adjustment between device lengths and the existing
-        # CPU maximum used to size page-table work. No device-to-host reads.
-        offset = 0
-        if mode.is_target_verify():
-            offset = self.speculative_num_draft_tokens
-        elif mode.is_decode_or_idle() and forward_batch.spec_info is not None:
-            offset = self.speculative_step_id + 1
-        cache_lens = forward_batch.seq_lens[:batch].to(torch.int32) + offset
-        assert forward_batch.seq_lens_cpu is not None
-        host_lens = forward_batch.seq_lens_cpu[:batch]
-        max_kv_len = (int(host_lens.max().item()) if host_lens.numel() else 0) + offset
+    def _cache_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
+        cache_seqlens = forward_batch.seq_lens[: forward_batch.batch_size].to(
+            torch.int32
+        )
+        if forward_batch.forward_mode.is_target_verify():
+            return cache_seqlens + self.speculative_num_draft_tokens
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        ):
+            return cache_seqlens + self.speculative_step_id + 1
+        return cache_seqlens
 
-        commit_lens = query_lens
-        if mode.is_draft_extend_v2():
-            commit_lens = torch.zeros_like(query_lens)
-            accepted = getattr(forward_batch.spec_info, "num_accept_tokens", None)
-            if accepted is not None:
-                count = min(batch, accepted.numel())
-                commit_lens[:count] = accepted[:count].to(torch.int32).clamp_min(0)
-            commit_lens = torch.minimum(commit_lens, query_lens)
-        return cache_lens, query_lens, commit_lens, max_kv_len
+    def _max_kv_len(self, forward_batch: ForwardBatch) -> int:
+        """Return the effective maximum KV length from the existing CPU mirror."""
+        max_seq_len = int(
+            forward_batch.seq_lens_cpu[: forward_batch.batch_size].max().item()
+        )
+        if forward_batch.forward_mode.is_target_verify():
+            return max_seq_len + self.speculative_num_draft_tokens
+        if (
+            forward_batch.forward_mode.is_decode_or_idle()
+            and forward_batch.spec_info is not None
+        ):
+            return max_seq_len + self.speculative_step_id + 1
+        return max_seq_len
 
     def _initialize_dsa_metadata(self, forward_batch: ForwardBatch, *, capture=False):
         """Construct complete metadata for eager execution or graph capture."""
         metadata = self.forward_metadata
         assert isinstance(metadata, AscendDSAForwardMetadata)
-        cache_lens, query_lens, commit_lens, max_kv_len = self._resolve_sequence_layout(
-            forward_batch
-        )
+        cache_lens = self._cache_lens_device(forward_batch)  #
+        query_lens = self._query_lens_device(forward_batch)
+        max_kv_len = self._max_kv_len(forward_batch)
         batch = forward_batch.batch_size
         device = cache_lens.device
-        req_slots = forward_batch.req_pool_indices[:batch]
-        token_table = self.req_to_token_pool.req_to_token[req_slots, :max_kv_len]
+
+        # prepare page table
+        token_table = self.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices[:batch], :max_kv_len
+        ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32
         )
-        metadata.cache_seqlens_int32 = cache_lens
+
+        # --- prepare real_page_table metadata ---
+        metadata.cache_lens_int32 = cache_lens
         if capture:
             max_num_pages = max(
                 page_table.shape[1],
@@ -184,99 +193,111 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
         else:
             metadata.real_page_table = page_table
+
+        # --- prepare kpool metadata ---
         if self.dsa_index_kpool > 1:
             ratio = self.dsa_index_kpool
+
+            # --- prepare pooled_key_indexer metadata ---
             metadata.pool_query_ends = query_lens.cumsum(0, dtype=torch.int64)
             metadata.pool_key_lens = (cache_lens // ratio).to(torch.int64)
             metadata.pool_tail_lens = (cache_lens % ratio).to(torch.int64)
             metadata.pool_page_table = metadata.real_page_table[:, ::ratio] // ratio
-            pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
+
+            # --- prepare compress_write_npu metadata ---
             mode = forward_batch.forward_mode
-            if mode.is_target_verify() or mode.is_draft_extend_v2():
-                write_mode = "mtp"
-                max_query_len = self.speculative_num_draft_tokens
-            else:
-                write_mode = "normal"
-                max_query_len = (
-                    1
-                    if mode.is_decode_or_idle()
-                    else forward_batch.out_cache_loc.numel()
+            if mode.is_extend_without_speculative():  # extend
+                plan = init_kpool_extend_metadata(
+                    metadata,
+                    forward_batch,
+                    kpool=ratio,
+                    physical_page_size=self.page_size,
+                    index_page_size=self.token_to_kv_pool.index_page_size,
+                    topk_transform_method=None,
+                    full_real_page_table=metadata.real_page_table,
+                    build_ragged_metadata=False,
                 )
-            metadata.kpool = init_kpool_write_plan(
-                batch_size=batch,
-                num_tokens=forward_batch.out_cache_loc.numel(),
-                cmp_ratio=self.dsa_index_kpool,
-                indexer_head_dim=pool.index_head_dim,
-                index_page_size=pool.index_page_size,
-                tail_capacity=self.dsa_index_kpool + pool.tail_extra_slots,
-                mode=write_mode,
-                max_query_len=max_query_len,
-                device=device,
-            )
-            self._update_kpool_metadata(
-                forward_batch, cache_lens, query_lens, commit_lens
-            )
+                metadata.kpool_extend_plan = plan.kpool_extend_plan
+            elif (
+                mode.is_target_verify() or mode.is_draft_extend_v2()
+            ):  # target_verify, draft_extend_v2
+                plan = init_kpool_write_plan_capture(
+                    metadata,
+                    max_bs=batch,
+                    kpool=ratio,
+                    physical_page_size=self.page_size,
+                    num_draft_tokens=self.speculative_num_draft_tokens,
+                    device=device,
+                    is_verify=False,
+                    index_page_size=self.token_to_kv_pool.index_page_size,
+                    is_v2=mode.is_draft_extend_v2(),
+                    build_schedule_metadata=False,
+                )
+                metadata.kpool_write_plan = plan.kpool_write_plan
+                self._mtp_update_metadata(forward_batch)
 
     def _replay_dsa_metadata(self, forward_batch: ForwardBatch):
         """Refresh captured metadata in place without replacing its buffers."""
         metadata = self.forward_metadata
-        assert isinstance(metadata, AscendDSAForwardMetadata)
-        cache_lens, query_lens, commit_lens, max_kv_len = self._resolve_sequence_layout(
-            forward_batch
-        )
+        cache_lens = self._cache_lens_device(forward_batch)
+        query_lens = self._query_lens_device(forward_batch)
+        max_kv_len = self._max_kv_len(forward_batch)
         batch = forward_batch.batch_size
-        if metadata.cache_seqlens_int32.shape != cache_lens.shape:
-            raise RuntimeError("DSA length shape differs from allocated metadata")
-        req_slots = forward_batch.req_pool_indices[:batch]
-        token_table = self.req_to_token_pool.req_to_token[req_slots, :max_kv_len]
+
+        # prepare page table
+        token_table = self.req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices[:batch], :max_kv_len
+        ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32
         )
-        if (
-            metadata.real_page_table.shape[0] != batch
-            or metadata.real_page_table.shape[1] < page_table.shape[1]
-        ):
-            raise RuntimeError("DSA page table exceeds allocated metadata")
-        metadata.cache_seqlens_int32.copy_(cache_lens)
-        metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
-        if self.dsa_index_kpool <= 1:
-            return
-        # Read-side lengths describe all computed tokens, independently of acceptance.
-        ratio = self.dsa_index_kpool
-        metadata.pool_query_ends.copy_(query_lens.cumsum(0, dtype=torch.int64))
-        metadata.pool_key_lens.copy_(cache_lens // ratio)
-        metadata.pool_tail_lens.copy_(cache_lens % ratio)
-        metadata.pool_page_table.copy_(metadata.real_page_table[:, ::ratio] // ratio)
-        self._update_kpool_metadata(forward_batch, cache_lens, query_lens, commit_lens)
 
-    def _update_kpool_metadata(
-        self, forward_batch: ForwardBatch, cache_lens, query_lens, commit_lens
-    ):
-        """Fill KeyPool request inputs and write mappings for init or replay."""
-        metadata = self.forward_metadata
-        write_plan = metadata.kpool
-        assert write_plan is not None
+        # --- update real_page_table metadata ---
+        metadata.cache_lens_int32.copy_(cache_lens)
+        metadata.real_page_table[:, : page_table.shape[1]].copy_(page_table)
+
+        # --- update kpool metadata ---
+        if self.dsa_index_kpool > 1:
+            ratio = self.dsa_index_kpool
+
+            # --- update pooled_key_indexer metadata ---
+            metadata.pool_query_ends.copy_(query_lens.cumsum(0, dtype=torch.int64))
+            metadata.pool_key_lens.copy_(cache_lens // ratio)
+            metadata.pool_tail_lens.copy_(cache_lens % ratio)
+            metadata.pool_page_table.copy_(
+                metadata.real_page_table[:, ::ratio] // ratio
+            )
+
+            # --- update compress_write_npu metadata ---
+            mode = forward_batch.forward_mode
+            if mode.is_target_verify() or mode.is_draft_extend_v2():
+                self._mtp_update_metadata(forward_batch)
+
+    def _mtp_update_metadata(self, forward_batch: ForwardBatch):
+        """Refresh the shared MTP plan."""
         batch = forward_batch.batch_size
-        # Replay keeps real requests before the bucket's padded suffix. Use that
-        # boundary directly; out_cache_loc may contain only the unpadded tokens.
-        num_padding = getattr(forward_batch, "num_padding", 0)
-        if not 0 <= num_padding <= batch:
-            raise ValueError("Invalid DSA request padding")
-        actual_mode = getattr(
-            forward_batch, "actual_forward_mode", forward_batch.forward_mode
-        )
-        num_real_requests = 0 if actual_mode.is_idle() else batch - num_padding
-        valid = query_lens > 0
-        valid[num_real_requests:] = False
-        start_pos = torch.where(valid, (cache_lens - query_lens).clamp_min(0), 0)
+        mode = forward_batch.forward_mode
+        num_draft_tokens = self.speculative_num_draft_tokens
+
+        write_start = forward_batch.seq_lens[:batch].to(torch.int32)
+        if mode.is_draft_extend_v2():  # seq_len already includes draft_len
+            write_start = write_start - num_draft_tokens
+        effective_n = None  # commit length
+        if mode.is_draft_extend_v2():
+            effective_n = forward_batch.spec_info.num_accept_tokens
+
+        # --- update compress_write_npu metadata ---
         update_kpool_write_plan(
-            write_plan,
-            start_pos=start_pos,
-            query_lens=query_lens,
-            commit_lens=torch.where(valid, commit_lens, 0),
-            req_pool_indices=forward_batch.req_pool_indices[:batch],
-            valid_requests=valid,
-            index_page_table=metadata.pool_page_table,
+            self.forward_metadata,
+            write_start=write_start,
+            req_pool_indices=forward_batch.req_pool_indices,
+            real_page_table=self.forward_metadata.real_page_table,
+            kpool=self.dsa_index_kpool,
+            physical_page_size=self.page_size,
+            num_draft_tokens=num_draft_tokens,
+            forward_mode=mode,
+            index_page_size=self.token_to_kv_pool.index_page_size,
+            effective_n_per_batch=effective_n,
         )
 
     def init_forward_metadata(self, forward_batch: ForwardBatch) -> None:
