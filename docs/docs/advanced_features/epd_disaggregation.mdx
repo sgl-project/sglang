@@ -98,12 +98,16 @@ item, so a repeated image or video is reused even when:
 - the same item appears alone in one request and with other items in another.
 
 The cache stores one entry per item; an all-item hit skips the vision forward and
-concatenates the cached rows. A partial hit re-encodes the whole batch and
-refreshes the missing item entries. Entries whose token count no longer matches
-the current preprocessing config are evicted before reuse.
+concatenates the cached rows. A partial hit encodes only the missing items and
+reuses the cached rows. Entries whose token count no longer matches the current
+preprocessing config are evicted before reuse.
 
 ```bash Command
-python -m sglang.launch_server   --model-path Qwen/Qwen3-VL-8B-Instruct   --encoder-only   --enable-prefix-mm-cache   --port 30000
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-VL-8B-Instruct \
+  --encoder-only \
+  --enable-prefix-mm-cache \
+  --port 30000
 ```
 
 The host cache size is controlled by `SGLANG_VLM_CACHE_SIZE_MB` (default
