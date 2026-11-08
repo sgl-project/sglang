@@ -70,6 +70,10 @@ from .custom_all_reduce_utils import (
 
 logger = logging.getLogger(__name__)
 
+# FABRIC workspaces whose collective release timed out; unmapping them while a
+# peer may still be draining would fault it, so they live until process exit.
+_unreleased_buffers: list = []
+
 _is_hip = is_hip()
 
 MB = 1024 * 1024
@@ -90,13 +94,13 @@ def _ceil_align(nbytes: int, align: int) -> int:
 
 
 def _allocate_symmetric_memory(
-    nbytes: int, device: torch.device, group: ProcessGroup
+    nbytes: int, device: torch.device, group: ProcessGroup, multinode: bool = False
 ) -> Tuple[object, List[torch.Tensor], int]:
     """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
     if _is_hip:
         from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
 
-        buffer = HipSymmetricBuffer(nbytes, device, group)
+        buffer = HipSymmetricBuffer(nbytes, device, group, require_fabric=multinode)
         return buffer, buffer.buffers, 0
 
     from torch._C._distributed_c10d import _SymmetricMemory
@@ -223,6 +227,7 @@ class CustomAllReduceV2:
         # buffers, which XGMI does not keep coherent; stage through the
         # uncached workspace inside graphs instead.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
+        self._is_multinode = is_multinode
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         self._is_graph_mode_supported = (
             not tms_cudagraph and not is_multinode and not _is_hip
@@ -306,7 +311,10 @@ class CustomAllReduceV2:
         sem_offset = push_bytes + pull_bytes
 
         self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
-            total_bytes, device=self.device, group=self.group
+            total_bytes,
+            device=self.device,
+            group=self.group,
+            multinode=self._is_multinode,
         )
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
@@ -588,8 +596,24 @@ class CustomAllReduceV2:
         if not self.disabled and hasattr(self, "obj"):
             if self._ipc_manager is not None:
                 self._ipc_manager.destroy()
-            dist.barrier(group=self.group)
+            fabric = _is_hip and self._is_multinode
+            if fabric:
+                from sglang.srt.utils.hip_vmm_utils import teardown_barrier
+
+                # Free the FABRIC workspace only after every rank's kernels have
+                # drained; a peer that never arrives leaves it to process exit.
+                peers_alive = teardown_barrier(self.group)
+                if peers_alive:
+                    torch.cuda.synchronize(self.device)
+                    peers_alive = teardown_barrier(self.group)
+            else:
+                dist.barrier(group=self.group)
             del self.obj  # drop the pointer holder before the workspace tensors
+            if fabric:
+                if peers_alive:
+                    self._symm_owner.close(group=self.group)
+                else:
+                    _unreleased_buffers.append(self._symm_owner)
         if hasattr(self, "_vmm_graph_input_manager"):
             self._vmm_graph_input_manager.close()
 
@@ -620,6 +644,12 @@ def can_use_custom_all_reduce_v2(
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
+        if _is_hip:
+            from .gfx1250_fabric import probe_fabric_clique
+
+            # NVML cliques do not exist on ROCm; only a gfx1250 UALink fabric
+            # clique can host a multi-node workspace
+            return probe_fabric_clique(group, device)
         return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
