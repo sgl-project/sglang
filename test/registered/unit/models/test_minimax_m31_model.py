@@ -296,6 +296,17 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 _minimax_m3_overrides(rocm_server_args(**quark), MXFP8)
             _minimax_m3_overrides(rocm_server_args(attn_dp_size=2, **quark), MXFP8)
 
+    def test_gfx950_keeps_custom_all_reduce_only_for_the_m31_quark_export(self):
+        """Custom all-reduce serves the M3.1 Quark export 11% faster at 8 requests; the
+        M3 export, whose linears are bf16, stays on NCCL."""
+        with gfx950():
+            m31 = _minimax_m3_overrides(
+                rocm_server_args(quantization="quark"), QUARK_M31
+            )
+            m3 = _minimax_m3_overrides(rocm_server_args(quantization="quark"), QUARK_M3)
+        self.assertNotIn("disable_custom_all_reduce", m31)
+        self.assertTrue(m3["disable_custom_all_reduce"])
+
     def test_gfx950_quick_all_reduce_takes_int4_only_where_unset(self):
         """M3.1 gets INT4 when no level is set; a level already set stays, INT8 included,
         since the ROCm images' INT8 cannot be told from one the user chose."""
