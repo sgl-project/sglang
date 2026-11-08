@@ -1479,7 +1479,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             self._window_index_cache = (forward_batch, layer.layer_id, *cache[2:])
             return cache[2], cache[3]
         parallel = get_parallel()
-        ring = self._draft_runner.draft_kv_ring if self._draft_runner else None
         positions, window_left = self._window_key_positions(layer, forward_batch)
         indices, counts = mla_window_sparse_indices(
             req_to_token=self.req_to_token,
@@ -1489,9 +1488,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             dcp_size=parallel.dcp_size if parallel.dcp_enabled else 1,
             dcp_rank=parallel.dcp_rank if parallel.dcp_enabled else 0,
             page_size=self.page_size,
-            v2p=None if ring else self.runner_ids.full_v2p_table,
-            ring_rows_per_req=ring.rows_per_req if ring else 0,
-            min_pos=ring.min_pos if ring else None,
+            v2p=self.runner_ids.full_v2p_table,
         )
         self._window_index_cache = (forward_batch, layer.layer_id, indices, counts)
         return indices, counts
