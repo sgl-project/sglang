@@ -271,8 +271,6 @@ def per_token_group_quant(
     use v2. FP16 stays on v2 because the trait kernel's FP16 quantization
     multiplier can overflow. Automatic allocation with ``scale_ue8m0=True``
     continues to produce packed scales.
-    The FP32 power-of-two flavor retains v2's NaN-to-negative-saturation
-    behavior; the packed BF16 path continues to preserve NaNs.
 
     With ``fuse_silu_and_mul=True``, ``silu_and_mul_mode="dense"`` matches the
     dense CUDA activation: FP32 SiLU and multiply, then one source-dtype round
