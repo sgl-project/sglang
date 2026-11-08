@@ -69,7 +69,9 @@ class TestMlaDecodeGfx115(CustomTestCase):
                         for k in [pool[kv_indptr[b] : kv_indptr[b + 1], 0].float()]
                     ]
                 )
-                # The bad partials varied run to run, so one clean run proves little.
+                # The bad partials varied run to run, so one clean run proves little, and
+                # identical inputs must give bitwise identical outputs on every run.
+                first = None
                 for _ in range(RUNS):
                     o = torch.zeros(
                         batch, HEADS, LV, dtype=torch.bfloat16, device="cuda"
@@ -106,6 +108,10 @@ class TestMlaDecodeGfx115(CustomTestCase):
                     torch.cuda.synchronize()
                     self.assertFalse(torch.isnan(o).any())
                     torch.testing.assert_close(o.float(), ref, rtol=0, atol=ATOL)
+                    if first is None:
+                        first = o.clone()
+                    else:
+                        self.assertTrue(torch.equal(o, first), "run-to-run mismatch")
 
 
 if __name__ == "__main__":
