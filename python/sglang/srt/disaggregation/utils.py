@@ -180,10 +180,7 @@ def disagg_transfers_in_flight(scheduler):
         if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             decode_offload_manager = scheduler.decode_offload_manager
             return bool(
-                any(
-                    not decode_req.host_staged
-                    for decode_req in scheduler.disagg_decode_transfer_queue.queue.items()
-                )
+                scheduler.disagg_decode_prealloc_queue.has_device_destinations
                 or scheduler.disagg_decode_prealloc_queue.has_published_destinations
                 or (
                     decode_offload_manager is not None
@@ -1553,6 +1550,15 @@ def _wire_state_type(state_type) -> Enum:
     return state_type if isinstance(state_type, Enum) else StateType(state_type)
 
 
+def wire_sub_pool(storage, state_type) -> str:
+    """The sub-pool a storage transfers as ``state_type``."""
+    return next(
+        entry.sub_pool
+        for entry in storage.wire_entries()
+        if _wire_state_type(entry.state_type) == state_type
+    )
+
+
 def setup_state_kv_args(
     kv_args: KVArgs,
     storage: KVStorage | StaticKVStorage,
@@ -1638,6 +1644,23 @@ def get_dsv41_spec_layout(kv_args: KVArgs) -> Optional[dict]:
         "kv_item_lens": list(kv_args.kv_item_lens),
         "state_types": [state_type.value for state_type in kv_args.state_types],
         "state_item_lens": [list(items) for items in kv_args.state_item_lens],
+    }
+
+
+def get_spec_kv_layout(kv_args: KVArgs) -> Optional[dict]:
+    """{} without injected draft KV; None when this rank has no draft KV entries."""
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+    spec = get_spec()
+    algorithm = SpeculativeAlgorithm.from_string(spec.speculative_algorithm)
+    if not algorithm.is_dflash_family():
+        return {}
+    if not kv_args.num_draft_entries:
+        return None
+    # No block size: prefill writes draft KV per token, unlike DSV4.1's SWA ring.
+    return {
+        "algorithm": algorithm.name,
+        "num_draft_entries": kv_args.num_draft_entries,
     }
 
 
