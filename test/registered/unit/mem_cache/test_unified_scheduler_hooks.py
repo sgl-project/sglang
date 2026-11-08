@@ -216,7 +216,7 @@ class TestOpportunisticCompactionErrors(CustomTestCase):
         scheduler.gracefully_exit = False
         scheduler.increment_scheduler_iterations = mock.Mock()
         scheduler.ingest_requests = mock.Mock()
-        scheduler._engine_paused = False
+        scheduler.init_pause_state()
         scheduler.last_batch = None
         scheduler.running_batch = None
         scheduler.process_batch_result = mock.Mock()
