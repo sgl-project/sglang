@@ -5,7 +5,7 @@ from typing import List, Optional, Sequence
 import torch
 
 from sglang.kernels.ops.memory.adler32 import adler32_strided_checksum
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MiniMaxSparseKVPool
@@ -24,8 +24,7 @@ def _flatten_ints(values: NestedInts) -> list[int]:
 
 
 def is_health_check_req(req: Req) -> bool:
-    rid = req.rid
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
+    return is_health_check_request(req.rid)
 
 
 def _to_page_indices_gpu(idx: torch.Tensor, page_size: int) -> torch.Tensor:

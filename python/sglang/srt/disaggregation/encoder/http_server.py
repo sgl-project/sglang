@@ -80,10 +80,6 @@ local_runtime: Optional[EncoderRuntime] = None
 dp_dispatcher: Optional["DPDispatcher"] = None
 
 
-def is_health_check_request(rid: Optional[str]) -> bool:
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
-
-
 @contextlib.asynccontextmanager
 async def _lifespan(app: FastAPI):
     if dp_dispatcher is not None:
