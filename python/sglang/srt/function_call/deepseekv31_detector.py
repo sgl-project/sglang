@@ -94,48 +94,59 @@ class DeepSeekV31Detector(BaseFormatDetector):
         Streaming incremental parsing tool calls for DeepSeekV3 format.
         """
         self._buffer += new_text
-        current_text = self._buffer
-
-        # Check if we have a tool call (either the start token or individual tool call)
-        has_tool_call = (
-            self.bot_token in current_text or "<｜tool▁call▁begin｜>" in current_text
-        )
-
-        if not has_tool_call:
-            self._buffer = ""
-            for e_token in [self.eot_token, "<｜tool▁call▁end｜>"]:
-                if e_token in new_text:
-                    new_text = new_text.replace(e_token, "")
-            return StreamingParseResult(normal_text=new_text)
 
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        CB = "<｜tool▁call▁begin｜>"
+        CE = "<｜tool▁call▁end｜>"
+        SEP = "<｜tool▁sep｜>"
+
         calls: list[ToolCallItem] = []
+        normal_text = ""
+
         try:
-            partial_match = re.search(
-                pattern=r"<｜tool▁call▁begin｜>(.*)<｜tool▁sep｜>(.*?)(<｜tool▁call▁end｜>|$)",
-                string=current_text,
-                flags=re.DOTALL,
-            )
-            if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
-                is_tool_end = partial_match.group(3)
-
-                # Initialize state if this is the first tool call
-                if self.current_tool_id == -1:
-                    self.current_tool_id = 0
-                    self.prev_tool_call_arr = []
-                    self.streamed_args_for_tool = [""]
-
-                # Ensure we have enough entries in our tracking arrays
-                while len(self.prev_tool_call_arr) <= self.current_tool_id:
-                    self.prev_tool_call_arr.append({})
-                while len(self.streamed_args_for_tool) <= self.current_tool_id:
-                    self.streamed_args_for_tool.append("")
-
+            # Process as many complete/partial tool calls as possible.
+            while True:
                 if not self.current_tool_name_sent:
+                    first_marker = self._buffer.find(CB)
+                    if first_marker == -1:
+                        # No tool call marker yet. If a bot token is present,
+                        # keep buffering; otherwise flush as normal text.
+                        if self.bot_token not in self._buffer and CB not in self._buffer:
+                            text = self._buffer
+                            self._buffer = ""
+                            for e_token in [self.eot_token, CE]:
+                                text = text.replace(e_token, "")
+                            if text or calls or normal_text:
+                                if text:
+                                    normal_text += text
+                                break
+                        return StreamingParseResult(
+                            normal_text=normal_text, calls=calls
+                        ) if (calls or normal_text) else StreamingParseResult(
+                            normal_text="", calls=[]
+                        )
+
+                    if first_marker > 0:
+                        normal_text += self._buffer[:first_marker]
+                        self._buffer = self._buffer[first_marker:]
+
+                    m = re.search(CB + r"(.*?)" + SEP, self._buffer, flags=re.DOTALL)
+                    if not m:
+                        break
+                    func_name = m.group(1).strip()
+
+                    if self.current_tool_id == -1:
+                        self.current_tool_id = 0
+                        self.prev_tool_call_arr = []
+                        self.streamed_args_for_tool = [""]
+
+                    while len(self.prev_tool_call_arr) <= self.current_tool_id:
+                        self.prev_tool_call_arr.append({})
+                    while len(self.streamed_args_for_tool) <= self.current_tool_id:
+                        self.streamed_args_for_tool.append("")
+
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -144,59 +155,71 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         )
                     )
                     self.current_tool_name_sent = True
-                    # Store the tool call info for serving layer completions endpoint
                     self.prev_tool_call_arr[self.current_tool_id] = {
                         "name": func_name,
                         "arguments": {},
                     }
-                else:
-                    argument_diff = (
-                        func_args_raw[len(self._last_arguments) :]
-                        if func_args_raw.startswith(self._last_arguments)
-                        else func_args_raw
-                    )
+                    self._last_arguments = ""
+                    self._buffer = self._buffer[m.end():]
+                    continue
 
-                    if argument_diff:
-                        calls.append(
-                            ToolCallItem(
-                                tool_index=self.current_tool_id,
-                                name=None,
-                                parameters=argument_diff,
-                            )
+                # Current tool call already named: stream its arguments.
+                ce_idx = self._buffer.find(CE)
+                if ce_idx >= 0:
+                    args_raw = self._buffer[:ce_idx].strip()
+                else:
+                    # Avoid consuming a following tool call's marker as args.
+                    next_cb = self._buffer.find(CB)
+                    if next_cb >= 0:
+                        args_raw = self._buffer[:next_cb].strip()
+                    else:
+                        args_raw = self._buffer.strip()
+
+                argument_diff = (
+                    args_raw[len(self._last_arguments):]
+                    if args_raw.startswith(self._last_arguments)
+                    else args_raw
+                )
+
+                if argument_diff:
+                    calls.append(
+                        ToolCallItem(
+                            tool_index=self.current_tool_id,
+                            name=None,
+                            parameters=argument_diff,
                         )
-                        self._last_arguments += argument_diff
+                    )
+                    self._last_arguments += argument_diff
+                    if self.current_tool_id < len(self.streamed_args_for_tool):
                         self.streamed_args_for_tool[self.current_tool_id] += (
                             argument_diff
                         )
 
-                    if _is_complete_json(func_args_raw):
-                        # Update the stored arguments
-                        try:
-                            parsed_args = json.loads(func_args_raw)
-                            self.prev_tool_call_arr[self.current_tool_id][
-                                "arguments"
-                            ] = parsed_args
-                        except json.JSONDecodeError:
-                            pass
+                if ce_idx >= 0:
+                    try:
+                        parsed_args = json.loads(args_raw)
+                        self.prev_tool_call_arr[self.current_tool_id][
+                            "arguments"
+                        ] = parsed_args
+                    except json.JSONDecodeError:
+                        pass
 
-                        # Find the end of the current tool call and remove only that part from buffer
-                        if is_tool_end:
-                            # Remove the completed tool call from buffer, keep any remaining content
-                            self._buffer = current_text[partial_match.end(3) :]
-                        else:
-                            self._buffer = ""
+                    self._buffer = self._buffer[ce_idx + len(CE):]
+                    self.current_tool_id += 1
+                    self.current_tool_name_sent = False
+                    self._last_arguments = ""
+                    continue
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
-                        self.current_tool_id += 1
-                        self._last_arguments = ""
-                        self.current_tool_name_sent = False
-                        return result
+                # No end marker yet: keep the buffer for future deltas.
+                break
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            if calls or normal_text:
+                return StreamingParseResult(normal_text=normal_text, calls=calls)
+            return StreamingParseResult(normal_text="", calls=[])
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            return StreamingParseResult(normal_text=self._buffer)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
