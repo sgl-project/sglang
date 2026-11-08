@@ -258,6 +258,19 @@ _CASES = [
             "meta_info": {"id": "rid-3", "output_token_logprobs": [[-0.5, 1, None]]},
         },
     },
+    {
+        # Levels 0/1 hide the prompt-derived entries nested in the media
+        # configs (the dotted skip names); the rest of each config still logs.
+        "name": "nested_skip_fields",
+        "body": {
+            "rid": "rid-7",
+            "text": "t",
+            "video_config": {"_question": "What is in the video?", "fps": 2.0},
+            "images_config": {"prefix": "The picture shows", "image_mode": "multi"},
+        },
+        "headers": {},
+        "out": {"text": "", "output_ids": [1], "meta_info": {"id": "rid-7"}},
+    },
 ]
 
 # OpenAI requests, logged as received from level 2: each the request model,

@@ -286,6 +286,70 @@ fn incremental_stream_logs_last_delta() {
     );
 }
 
+/// A dotted skip name hides only the field it names: a bare entry never
+/// matches below the top level, a list's items are never skipped, and the
+/// field's siblings still log.
+#[test]
+fn dotted_skip_names_match_only_their_level() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let skips = || vec!["text".to_owned(), "video_config._question".to_owned()];
+    let body = serde_json::json!({
+        "rid": "r-nested",
+        "text": "top-level prompt",
+        "video_config": {
+            "_question": "the question",
+            "fps": 2.0,
+            "nested": {"text": "deeper: no bare match below the top"},
+            "items": [{"text": "in a list: never skipped"}],
+        },
+    });
+
+    let log = RequestLog::for_test(
+        Some(RequestLogConfig {
+            skip_names: skips(),
+            ..level1(&fixture)
+        }),
+        false,
+    );
+    let mut records = receive_body(&log, &body, &http::HeaderMap::new());
+    let receive = log.logged_lines().remove(0);
+    assert!(!receive.contains("top-level prompt"), "{receive}");
+    assert!(!receive.contains("the question"), "{receive}");
+    assert!(
+        receive.contains(
+            "video_config={'fps': 2.0, 'nested': {'text': 'deeper: no bare match below the top'}, \
+             'items': [{'text': 'in a list: never skipped'}]}"
+        ),
+        "{receive}"
+    );
+    let rid = Rid::from_client("r-nested");
+    records[0].observe(&ResponseItem::Done(chunk(&rid, "z", &[1], None)));
+    let finish = log.logged_lines().remove(0);
+    assert!(!finish.contains("the question"), "{finish}");
+    assert!(
+        finish.contains("'nested': {'text': 'deeper: no bare match below the top'}"),
+        "{finish}"
+    );
+
+    let log = RequestLog::for_test(
+        Some(RequestLogConfig {
+            skip_names: skips(),
+            ..config_in(&fixture, "json", "1")
+        }),
+        false,
+    );
+    let _records = receive_body(&log, &body, &http::HeaderMap::new());
+    let receive = at_fixture_time(&log.logged_lines().remove(0), &fixture);
+    assert!(!receive.contains("top-level prompt"), "{receive}");
+    assert!(!receive.contains("the question"), "{receive}");
+    assert!(
+        receive.contains(
+            r#""video_config": {"fps": 2.0, "nested": {"text": "deeper: no bare match below the top"}, "items": [{"text": "in a list: never skipped"}]}"#
+        ),
+        "{receive}"
+    );
+}
+
 /// `SGLANG_LOG_REQUEST_EXCEEDED_MS` logs only the slow finishes.
 #[test]
 fn exceeded_ms_skips_fast_finishes() {

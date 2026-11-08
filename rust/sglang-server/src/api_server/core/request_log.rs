@@ -878,11 +878,11 @@ impl RequestLogger {
         let obj = self.openai_dump(request, body);
         let max_length = self.config.max_length;
         let line = if self.config.json {
-            let obj = JsonObject::transformed(obj.iter(), max_length);
+            let obj = JsonObject::transformed(obj.iter(), max_length, &*NO_SKIP);
             JsonLine::new("request.received.openai", obj, headers).render()
         } else {
             let mut line = String::from("Receive OpenAI: obj=");
-            write_dict(&mut line, obj.iter(), max_length, false);
+            write_dict(&mut line, obj.iter(), max_length, false, &*NO_SKIP, "");
             write_headers(&mut line, headers);
             line
         };
@@ -942,21 +942,20 @@ impl RequestLogger {
             .fields
             .iter()
             .zip(&self.json_defaults)
-            .filter(|((name, _), _)| !self.skip_names.contains(name))
             .map(|((name, _), default)| match obj.get(name) {
                 Some(value) => (name.as_str(), value, false),
                 None => (name.as_str(), default, true),
             })
             .collect();
-        let obj_fields = JsonObject { fields, max_length };
+        let obj_fields = JsonObject {
+            fields,
+            max_length,
+            skip: &self.skip_names,
+            path: String::new(),
+        };
         let mut line = JsonLine::new(event, obj_fields, headers);
         line.rid = Some(obj.get("rid").unwrap_or(&Value::Null));
-        line.out = out.map(|out| {
-            let kept = out
-                .iter()
-                .filter(|(name, _)| !self.out_skip_names.contains(name.as_str()));
-            JsonObject::transformed(kept, max_length)
-        });
+        line.out = out.map(|out| JsonObject::transformed(out.iter(), max_length, &self.out_skip_names));
         line.render()
     }
 
@@ -981,10 +980,11 @@ impl RequestLogger {
         line.push_str(", out=");
         write_dict(
             &mut line,
-            out.iter()
-                .filter(|(name, _)| !self.out_skip_names.contains(name.as_str())),
+            out.iter(),
             self.config.max_length,
             false,
+            &self.out_skip_names,
+            "",
         );
         line
     }
@@ -1006,7 +1006,18 @@ impl RequestLogger {
             line.push_str(name);
             line.push('=');
             match obj.get(name) {
-                Some(value) => write_field(line, name, value, self.config.max_length, false),
+                Some(value) => {
+                    let path = child_path(&self.skip_names, "", name);
+                    write_field(
+                        line,
+                        name,
+                        value,
+                        self.config.max_length,
+                        false,
+                        &self.skip_names,
+                        &path,
+                    )
+                }
                 None => line.push_str(default),
             }
         }
@@ -1313,18 +1324,63 @@ fn is_watermark_secret(name: &str, in_watermark: bool) -> bool {
     WATERMARK_SECRET_FIELDS.contains(&name) || (in_watermark && matches!(name, "key" | "key_b"))
 }
 
+/// Python `_child_skip_names`'s scope as a dotted prefix: `skip`'s entries
+/// that reach `name`'s subtree match at the next level as
+/// `path + name + "." + entry`; empty when nothing is skipped.
+fn child_path(skip: &HashSet<String>, path: &str, name: &str) -> String {
+    if skip.is_empty() {
+        String::new()
+    } else {
+        format!("{path}{name}.")
+    }
+}
+
+/// Python `name in skip_names` at the level `path` names.
+fn is_skipped(skip: &HashSet<String>, path: &str, name: &str) -> bool {
+    if path.is_empty() {
+        skip.contains(name)
+    } else {
+        skip.contains(&(path.to_string() + name))
+    }
+}
+
+/// Python's list branches transform their items without a skip scope.
+static NO_SKIP: std::sync::LazyLock<HashSet<String>> = std::sync::LazyLock::new(HashSet::new);
+
 /// One field or dict entry: the value, or `'<redacted>'` for a watermark
 /// secret.
-fn write_field(out: &mut String, name: &str, value: &Value, max_length: usize, in_watermark: bool) {
+fn write_field(
+    out: &mut String,
+    name: &str,
+    value: &Value,
+    max_length: usize,
+    in_watermark: bool,
+    skip: &HashSet<String>,
+    path: &str,
+) {
     if is_watermark_secret(name, in_watermark) {
         out.push_str("'<redacted>'");
     } else {
-        write_truncated(out, value, max_length, in_watermark || name == "watermark");
+        write_truncated(
+            out,
+            value,
+            max_length,
+            in_watermark || name == "watermark",
+            skip,
+            path,
+        );
     }
 }
 
 /// One value as `_dataclass_to_string_truncated(value, max_length)` prints it.
-fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_watermark: bool) {
+fn write_truncated(
+    out: &mut String,
+    value: &Value,
+    max_length: usize,
+    in_watermark: bool,
+    skip: &HashSet<String>,
+    path: &str,
+) {
     match value {
         Value::String(s) => {
             let len = s.chars().count();
@@ -1343,7 +1399,7 @@ fn write_truncated(out: &mut String, value: &Value, max_length: usize, in_waterm
             out.push_str(" ... ");
             write_list(out, &items[tail..], in_watermark);
         }
-        Value::Object(map) => write_dict(out, map.iter(), max_length, in_watermark),
+        Value::Object(map) => write_dict(out, map.iter(), max_length, in_watermark, skip, path),
         _ => write_repr(out, value, in_watermark),
     }
 }
@@ -1356,22 +1412,31 @@ fn halves(len: usize, max_length: usize) -> (usize, usize) {
 }
 
 /// A dict level of `_dataclass_to_string_truncated`: keys quoted as they are,
-/// values truncated in turn.
+/// values truncated in turn, the `skip` names (a dotted entry at a nested
+/// level) left out.
 fn write_dict<'a>(
     out: &mut String,
     entries: impl Iterator<Item = (&'a String, &'a Value)>,
     max_length: usize,
     in_watermark: bool,
+    skip: &HashSet<String>,
+    path: &str,
 ) {
     out.push('{');
-    for (i, (name, value)) in entries.enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for (name, value) in entries {
+        if is_skipped(skip, path, name) {
+            continue;
+        }
+        if !first {
             out.push_str(", ");
         }
+        first = false;
         out.push('\'');
         out.push_str(name);
         out.push_str("': ");
-        write_field(out, name, value, max_length, in_watermark);
+        let child = child_path(skip, path, name);
+        write_field(out, name, value, max_length, in_watermark, skip, &child);
     }
     out.push('}');
 }
@@ -1516,6 +1581,8 @@ struct TransformedField<'a> {
     value: &'a Value,
     max_length: usize,
     in_watermark: bool,
+    skip: &'a HashSet<String>,
+    path: String,
 }
 
 impl serde::Serialize for TransformedField<'_> {
@@ -1524,25 +1591,43 @@ impl serde::Serialize for TransformedField<'_> {
             return serializer.serialize_str("<redacted>");
         }
         let in_watermark = self.in_watermark || self.name == "watermark";
-        Transformed::new(self.value, self.max_length, in_watermark).serialize(serializer)
+        Transformed::new(
+            self.value,
+            self.max_length,
+            in_watermark,
+            self.skip,
+            self.path.clone(),
+        )
+        .serialize(serializer)
     }
 }
 
 /// A value as `_transform_data_for_logging` returns it, serialized without
 /// building it: a string or list longer than `max_length` keeps its two
-/// halves around `"..."`, at every depth.
+/// halves around `"..."`, at every depth; a `skip` name (a dotted entry at a
+/// nested level) is left out of an object.
 struct Transformed<'a> {
     value: &'a Value,
     max_length: usize,
     in_watermark: bool,
+    skip: &'a HashSet<String>,
+    path: String,
 }
 
 impl<'a> Transformed<'a> {
-    fn new(value: &'a Value, max_length: usize, in_watermark: bool) -> Self {
+    fn new(
+        value: &'a Value,
+        max_length: usize,
+        in_watermark: bool,
+        skip: &'a HashSet<String>,
+        path: String,
+    ) -> Self {
         Self {
             value,
             max_length,
             in_watermark,
+            skip,
+            path,
         }
     }
 }
@@ -1563,7 +1648,9 @@ impl serde::Serialize for Transformed<'_> {
                 serializer.serialize_str(&cut)
             }
             Value::Array(items) => {
-                let item = |item| Transformed::new(item, max_length, self.in_watermark);
+                let item = |item| {
+                    Transformed::new(item, max_length, self.in_watermark, &*NO_SKIP, String::new())
+                };
                 let mut seq = serializer.serialize_seq(None)?;
                 if items.len() > max_length {
                     let (head, tail) = halves(items.len(), max_length);
@@ -1584,6 +1671,10 @@ impl serde::Serialize for Transformed<'_> {
             Value::Object(map) => {
                 let mut entries = serializer.serialize_map(Some(map.len()))?;
                 for (name, value) in map {
+                    if is_skipped(self.skip, &self.path, name) {
+                        continue;
+                    }
+                    let child = child_path(self.skip, &self.path, name);
                     entries.serialize_entry(
                         name,
                         &TransformedField {
@@ -1591,6 +1682,8 @@ impl serde::Serialize for Transformed<'_> {
                             value,
                             max_length,
                             in_watermark: self.in_watermark,
+                            skip: self.skip,
+                            path: child,
                         },
                     )?;
                 }
@@ -1647,22 +1740,28 @@ impl serde::Serialize for JsonHeaders<'_> {
 }
 
 /// A dict or dataclass as `_transform_data_for_logging` returns it: each
-/// field's value transformed, or (`verbatim`) already Python's.
+/// field's value transformed, or (`verbatim`) already Python's; a `skip` name
+/// (a dotted entry at a nested level) left out.
 struct JsonObject<'a> {
     fields: Vec<(&'a str, &'a Value, bool)>,
     max_length: usize,
+    skip: &'a HashSet<String>,
+    path: String,
 }
 
 impl<'a> JsonObject<'a> {
     fn transformed(
         entries: impl Iterator<Item = (&'a String, &'a Value)>,
         max_length: usize,
+        skip: &'a HashSet<String>,
     ) -> Self {
         Self {
             fields: entries
                 .map(|(name, value)| (name.as_str(), value, false))
                 .collect(),
             max_length,
+            skip,
+            path: String::new(),
         }
     }
 }
@@ -1671,14 +1770,20 @@ impl serde::Serialize for JsonObject<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.fields.len()))?;
         for &(name, value, verbatim) in &self.fields {
+            if is_skipped(self.skip, &self.path, name) {
+                continue;
+            }
             if verbatim {
                 map.serialize_entry(name, value)?;
             } else {
+                let child = child_path(self.skip, &self.path, name);
                 let field = TransformedField {
                     name,
                     value,
                     max_length: self.max_length,
                     in_watermark: false,
+                    skip: self.skip,
+                    path: child,
                 };
                 map.serialize_entry(name, &field)?;
             }
