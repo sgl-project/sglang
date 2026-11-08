@@ -140,5 +140,39 @@ class TestGenerateRouteGate(CustomTestCase):
             http_server._global_state = prior_state
 
 
+class TestGenerateReqInputWithEmptyInputIds(CustomTestCase):
+    def _post(self, body):
+        class NormalizingTokenizerManager:
+            async def generate_request(self, obj, request):
+                obj.normalize_batch_and_arguments()  # raises ValueError like the real one
+                yield {"text": "ok"}
+
+        app = FastAPI()
+        app.add_api_route("/generate", http_server.generate_request, methods=["POST"])
+        prior = http_server.get_global_state()
+        http_server.set_global_state(
+            SimpleNamespace(tokenizer_manager=NormalizingTokenizerManager())
+        )
+        try:
+            return TestClient(app).post("/generate", json=body)
+        finally:
+            http_server._global_state = prior
+
+    def test_generate_req_input_when_passing_empty_input_ids_list(self):
+        response = self._post({"input_ids": [], "sampling_params": {}})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"], "input_ids cannot be empty."
+        )
+
+    def test_generate_req_input_when_passing_empty_element_in_input_ids_list(self):
+        response = self._post({"input_ids": [[1, 2, 3], []], "sampling_params": {}})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(
+            response.json()["error"]["message"],
+            "input_ids cannot be empty for any prompt in the batch.",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
