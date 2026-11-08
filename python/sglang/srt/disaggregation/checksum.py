@@ -65,10 +65,7 @@ def state_indices_for_request(
         )
         # uncompressed hybrid DSA registers index-K pages as a second state
         # component, indexed by page rather than by Mamba slot
-        if (
-            getattr(pool, "use_dsa", False)
-            and not pool.full_kv_pool.kpool_use_compress
-        ):
+        if getattr(pool, "use_dsa", False) and not pool.full_kv_pool.kpool_use_compress:
             kv_indices = scheduler.req_to_token_pool.req_to_token[
                 req.kv.req_pool_idx, start_idx:seq_len
             ]
