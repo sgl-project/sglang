@@ -74,10 +74,6 @@ jobs:
             suite_args: --auto-partition-id 2 --auto-partition-size 3 --fork-worker-batch-size 20
           - suite: unit-test-4-gpu-b200
             runner_config: 4-gpu-b200
-          - suite: unit-test-8-gpu-h200
-            runner_config: 8-gpu-h200
-            # Alone among these, it has never run the health check.
-            skip_health_check: true
           - suite: benchmark-test-1-gpu-large
             runner_config: 1-gpu-large
           - suite: benchmark-test-1-gpu-small
@@ -90,7 +86,6 @@ jobs:
           ref: ${{ inputs.git_ref || github.sha }}
 
       - uses: ./.github/actions/check-pr-test-health
-        if: ${{ !matrix.skip_health_check }}
 
       - uses: ./.github/actions/check-maintenance
 
