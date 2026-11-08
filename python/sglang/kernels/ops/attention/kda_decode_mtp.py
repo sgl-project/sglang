@@ -111,36 +111,21 @@ def _state_tile_v(*, block_threads: int, num_spec: int) -> int:
     return max(min_rows, HEAD_DIM // NUM_STATE_STAGES)
 
 
-def _preload_p1_tokens(
-    x, r_xc, r_xa, r_xi, bos, n_tok, p1_par, i_hv, lane, T_LOOP, J, window
-):
-    """Load every phase-1 input this warp reads, ahead of its first store."""
-    for s in range((T_LOOP + J - 1) // J):
-        i_t = p1_par + s * J
-        tok = bos + cutlass.min(i_t, n_tok - 1)
-        for i in range(VEC_SIZE):
-            r_xc[s * VEC_SIZE + i] = cutlass.Float32(x[0, tok, i_hv, i * 32 + lane])
-        if window:
-            for a in range(J - 1):
-                nx = bos + cutlass.min(i_t + 1 + a, T_LOOP - 1)
-                for i in range(VEC_SIZE):
-                    r_xa[(s * (J - 1) + a) * VEC_SIZE + i] = cutlass.Float32(
-                        x[0, nx, i_hv, i * 32 + lane]
-                    )
-    if window:
-        for pi in range(J - 1):
-            tok = bos + cutlass.min(pi, n_tok - 1)
-            for i in range(VEC_SIZE):
-                r_xi[pi * VEC_SIZE + i] = cutlass.Float32(
-                    x[0, tok, i_hv, i * 32 + lane]
-                )
-
-
-def _p1_x(preload, r_pre, row, i, x, tok, i_hv, lane):
-    """Phase-1 input: the preloaded register, or a load at the point of use."""
-    if preload:
-        return r_pre[row * VEC_SIZE + i]
-    return cutlass.Float32(x[0, tok, i_hv, i * 32 + lane])
+def _ld_p1(invariant, x, coord):
+    """Load one phase-1 input element, optionally as ld.global.nc."""
+    if not invariant:
+        return cutlass.Float32(x[coord])
+    atom = cute.make_copy_atom(
+        cute.nvgpu.CopyG2ROp(),
+        x.element_type,
+        num_bits_per_copy=x.element_type.width,
+        invariant=True,
+    )
+    row = x[coord[:-1] + (None,)]
+    src = cute.make_tensor(row.iterator + coord[-1], cute.make_layout((1,)))
+    dst = cute.make_rmem_tensor(cute.make_layout((1,)), x.element_type)
+    cute.copy(atom, src, dst)
+    return cutlass.Float32(dst[0])
 
 
 def _issue_state_tile(
@@ -239,6 +224,9 @@ def kda_decode_mtp_kernel(
     # block width signals -- see _block_threads).
     STREAM_STATE = _stream_state(block_threads=BLOCK_THREADS, num_spec=NUM_SPEC)
     TILES_PER_PASS = 1 if STREAM_STATE else NUM_V_TILES
+    # Read-only phase-1 inputs may then be scheduled ahead of the scratch/ring
+    # stores. Narrow block only: on the wide block the early loads lose.
+    P1_NC = BLOCK_THREADS == BLOCK_THREADS_NARROW
     smem = cutlass.utils.SmemAllocator()
     sQ = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
     sK = smem.allocate_tensor(cutlass.Float32, smem_qk_layout, 16)
@@ -289,28 +277,6 @@ def kda_decode_mtp_kernel(
     r_w4 = cute.make_rmem_tensor(
         cute.make_layout((KERNEL_WIDTH,), stride=(1,)), cutlass.Float32
     )
-    # Preload phase-1 inputs ahead of the scratch/ring stores (narrow block only).
-    P1_PRELOAD = BLOCK_THREADS == BLOCK_THREADS_NARROW
-    P1_STEPS = (T_LOOP + P1_JOB_WARPS - 1) // P1_JOB_WARPS
-    if cutlass.const_expr(P1_PRELOAD):
-        r_xc = cute.make_rmem_tensor(
-            cute.make_layout((P1_STEPS * VEC_SIZE,), stride=(1,)), cutlass.Float32
-        )
-        r_xa = cute.make_rmem_tensor(
-            cute.make_layout(
-                (max(1, P1_STEPS * (P1_JOB_WARPS - 1)) * VEC_SIZE,), stride=(1,)
-            ),
-            cutlass.Float32,
-        )
-        r_xi = cute.make_rmem_tensor(
-            cute.make_layout((max(1, P1_JOB_WARPS - 1) * VEC_SIZE,), stride=(1,)),
-            cutlass.Float32,
-        )
-        r_b = cute.make_rmem_tensor(
-            cute.make_layout((P1_STEPS,), stride=(1,)), cutlass.Float32
-        )
-    else:
-        r_xc = r_xa = r_xi = r_b = None
     if cutlass.const_expr(STREAM_STATE):
         r_v4q = cute.make_rmem_tensor(
             cute.make_layout((4,), stride=(1,)), cutlass.Float32
@@ -390,19 +356,6 @@ def kda_decode_mtp_kernel(
     scratch_row = intermediate_state_indices[i_n]
     r_exp_A = cutlass.Float32(0.0)
 
-    if cutlass.const_expr(P1_PRELOAD):
-        if warp_idx < P1_QKG_WARPS:
-            pre = (r_xc, r_xa, r_xi, bos, n_tok, p1_par, i_hv, in_warp_tid)
-            if p1_job == 0:
-                _preload_p1_tokens(x_q, *pre, T_LOOP, P1_JOB_WARPS, True)
-            elif p1_job == 1:
-                _preload_p1_tokens(x_k, *pre, T_LOOP, P1_JOB_WARPS, True)
-                for _s in cutlass.range_constexpr(P1_STEPS):
-                    _tok = cutlass.min(p1_par + _s * P1_JOB_WARPS, n_tok - 1)
-                    r_b[_s] = cutlass.Float32(beta[0, bos + _tok, i_hv])
-            else:
-                _preload_p1_tokens(g, *pre, T_LOOP, P1_JOB_WARPS, False)
-
     # Private weights remove the initial cross-warp dependency.
 
     if warp_idx < P1_QKG_WARPS:
@@ -420,8 +373,8 @@ def kda_decode_mtp_kernel(
             for _pi in cutlass.range_constexpr(P1_JOB_WARPS - 1):
                 if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
-                        _xn = _p1_x(
-                            P1_PRELOAD, r_xi, _pi, i, x_q, bos + _pi, i_hv, in_warp_tid
+                        _xn = _ld_p1(
+                            P1_NC, x_q, (0, bos + _pi, i_hv, i * 32 + in_warp_tid)
                         )
                         r_state[0 * VEC_SIZE + i] = r_state[1 * VEC_SIZE + i]
                         r_state[1 * VEC_SIZE + i] = r_state[2 * VEC_SIZE + i]
@@ -430,8 +383,8 @@ def kda_decode_mtp_kernel(
             for _pi in cutlass.range_constexpr(P1_JOB_WARPS - 1):
                 if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
-                        _xn = _p1_x(
-                            P1_PRELOAD, r_xi, _pi, i, x_k, bos + _pi, i_hv, in_warp_tid
+                        _xn = _ld_p1(
+                            P1_NC, x_k, (0, bos + _pi, i_hv, i * 32 + in_warp_tid)
                         )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = (
                             r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i]
@@ -443,7 +396,9 @@ def kda_decode_mtp_kernel(
         # One straight-line block per job, so the warp's token chains interleave.
         for _job in cutlass.range_constexpr(P1_NUM_JOBS):
             if p1_job == _job:
-                for producer_step in cutlass.range_constexpr(P1_STEPS):
+                for producer_step in cutlass.range_constexpr(
+                    (T_LOOP + P1_JOB_WARPS - 1) // P1_JOB_WARPS
+                ):
                     i_t = p1_par + producer_step * P1_JOB_WARPS
                     if cutlass.const_expr(T_LOOP % P1_JOB_WARPS == 0) or i_t < T_LOOP:
                         token = bos + cutlass.min(i_t, n_tok - 1)
@@ -464,26 +419,8 @@ def kda_decode_mtp_kernel(
                                         r_state[w * VEC_SIZE + i1]
                                         * r_wq[w * VEC_SIZE + i1]
                                     )
-                                r_xq_0 = _p1_x(
-                                    P1_PRELOAD,
-                                    r_xc,
-                                    producer_step,
-                                    i0,
-                                    x_q,
-                                    token,
-                                    i_hv,
-                                    in_warp_tid,
-                                )
-                                r_xq_1 = _p1_x(
-                                    P1_PRELOAD,
-                                    r_xc,
-                                    producer_step,
-                                    i1,
-                                    x_q,
-                                    token,
-                                    i_hv,
-                                    in_warp_tid,
-                                )
+                                r_xq_0 = _ld_p1(P1_NC, x_q, (0, token, i_hv, k_idx0))
+                                r_xq_1 = _ld_p1(P1_NC, x_q, (0, token, i_hv, k_idx1))
                                 _cwq_last_0 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i0]
                                 _cwq_last_1 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i1]
                                 r_conv_0 += r_xq_0 * _cwq_last_0
@@ -523,12 +460,9 @@ def kda_decode_mtp_kernel(
                                     qk_j % 4,
                                 ] = r_q[i]
                         elif cutlass.const_expr(_job == 1):
-                            if cutlass.const_expr(P1_PRELOAD):
-                                r_b_raw = r_b[producer_step]
-                            else:
-                                r_b_raw = cutlass.Float32(0.0)
-                                if in_warp_tid == 0:
-                                    r_b_raw = cutlass.Float32(beta[0, token, i_hv])
+                            r_b_raw = cutlass.Float32(0.0)
+                            if in_warp_tid == 0:
+                                r_b_raw = _ld_p1(P1_NC, beta, (0, token, i_hv))
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
                                 r_conv = (
@@ -549,16 +483,7 @@ def kda_decode_mtp_kernel(
                                     ]
                                     * r_wq[2 * VEC_SIZE + i]
                                 )
-                                r_xk = _p1_x(
-                                    P1_PRELOAD,
-                                    r_xc,
-                                    producer_step,
-                                    i,
-                                    x_k,
-                                    token,
-                                    i_hv,
-                                    in_warp_tid,
-                                )
+                                r_xk = _ld_p1(P1_NC, x_k, (0, token, i_hv, k_idx))
                                 r_conv += r_xk * r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i]
                                 r_conv = r_conv * cute.arch.rcp_approx(
                                     cutlass.Float32(1.0)
@@ -615,15 +540,8 @@ def kda_decode_mtp_kernel(
                         else:
                             # Gate warps do not otherwise use r_q in this phase.
                             for i in range(VEC_SIZE):
-                                r_q[i] = _p1_x(
-                                    P1_PRELOAD,
-                                    r_xc,
-                                    producer_step,
-                                    i,
-                                    g,
-                                    token,
-                                    i_hv,
-                                    in_warp_tid,
+                                r_q[i] = _ld_p1(
+                                    P1_NC, g, (0, token, i_hv, i * 32 + in_warp_tid)
                                 )
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
@@ -671,15 +589,10 @@ def kda_decode_mtp_kernel(
                             for _a in range(P1_JOB_WARPS - 1):
                                 _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
                                 for i in range(VEC_SIZE):
-                                    _xn = _p1_x(
-                                        P1_PRELOAD,
-                                        r_xa,
-                                        producer_step * (P1_JOB_WARPS - 1) + _a,
-                                        i,
+                                    _xn = _ld_p1(
+                                        P1_NC,
                                         x_q,
-                                        _nx,
-                                        i_hv,
-                                        in_warp_tid,
+                                        (0, _nx, i_hv, i * 32 + in_warp_tid),
                                     )
                                     r_state[0 * VEC_SIZE + i] = r_state[
                                         1 * VEC_SIZE + i
@@ -692,15 +605,10 @@ def kda_decode_mtp_kernel(
                             for _a in range(P1_JOB_WARPS - 1):
                                 _nx = bos + cutlass.min(i_t + 1 + _a, T_LOOP - 1)
                                 for i in range(VEC_SIZE):
-                                    _xn = _p1_x(
-                                        P1_PRELOAD,
-                                        r_xa,
-                                        producer_step * (P1_JOB_WARPS - 1) + _a,
-                                        i,
+                                    _xn = _ld_p1(
+                                        P1_NC,
                                         x_k,
-                                        _nx,
-                                        i_hv,
-                                        in_warp_tid,
+                                        (0, _nx, i_hv, i * 32 + in_warp_tid),
                                     )
                                     r_state[
                                         (KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i
@@ -735,13 +643,6 @@ def kda_decode_mtp_kernel(
                         x_v[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
                     )
                 )
-            if cutlass.const_expr(APPLY_ONORM and P1_PRELOAD):
-                _gates = [
-                    cutlass.Float32(
-                        onorm_g[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
-                    )
-                    for _t in range(T_LOOP)
-                ]
             for _t in cutlass.range_constexpr(T_LOOP):
                 _vconv = _win[_t] * _wv[0]
                 for _w in cutlass.range_constexpr(1, KERNEL_WIDTH):
@@ -751,12 +652,11 @@ def kda_decode_mtp_kernel(
                 )
                 sVall[_t * HEAD_DIM + _v_idx] = _vconv
                 if cutlass.const_expr(APPLY_ONORM):
-                    if cutlass.const_expr(P1_PRELOAD):
-                        gate_raw = _gates[_t]
-                    else:
-                        gate_raw = cutlass.Float32(
-                            onorm_g[0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx]
-                        )
+                    gate_raw = _ld_p1(
+                        P1_NC,
+                        onorm_g,
+                        (0, bos + cutlass.min(_t, n_tok - 1), i_hv, _v_idx),
+                    )
                     sOnormGate[_t * HEAD_DIM + _v_idx] = cute.arch.rcp_approx(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
