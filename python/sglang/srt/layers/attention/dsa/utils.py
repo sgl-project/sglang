@@ -515,9 +515,6 @@ def resolve_fp8_mqa_logits_fn():
 
 
 def _fp8_mqa_logits_scheduled(q, kv, weights, ks, ke, clean_logits=False):
-    """DeepGEMM's legacy MQA logits with its row schedule: the kernel balances
-    rows of different key ranges across SMs (same values as the unscheduled
-    call, which splits rows evenly)."""
     import deep_gemm
 
     kv_rows = kv[0].shape[0] if isinstance(kv, (tuple, list)) else kv.shape[0]
@@ -534,8 +531,6 @@ def use_bf16_indexer_logits() -> bool:
 
 
 def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
-    """MQA logits in bf16 from the FP8 query and keys, absolute columns like
-    fp8_mqa_logits. bf16 logits need bf16 weights."""
     import deep_gemm
 
     schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(

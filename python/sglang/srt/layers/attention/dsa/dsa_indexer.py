@@ -1810,7 +1810,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
-            # bf16 logits take half the bytes of the fp32 matrix the budget is sized for.
             get_budget_bytes=lambda: (
                 self._get_mqa_logits_budget_bytes(device_index)
                 * (2 if bf16_logits else 1)

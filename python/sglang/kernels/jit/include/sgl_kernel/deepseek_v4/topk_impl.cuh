@@ -82,8 +82,6 @@ inline constexpr bool kDeterministic = kExactness == Exactness::DETERMINISTIC;
 /// Mode 2's cluster tie keys order equal values by a 20-bit row index; longer rows are rejected.
 inline constexpr uint32_t kDeterministicIdxBits = 20;
 
-/// Score element type. A module built with -DSGL_TOPK_SCORE_BF16 reads bf16 scores and widens
-/// them to fp32 at load, so the selection itself is unchanged.
 #ifdef SGL_TOPK_SCORE_BF16
 using score_t = bf16_t;
 #else
@@ -612,8 +610,6 @@ struct TopKRadixBase : TopKConfig {
   static constexpr uint32_t kHistSize = 1 << kHistBits;
   using vec_t = AlignedVector<float, kVecSize>;
 
-  /// Scores [vi * kVecSize, vi * kVecSize + kVecSize) as fp32: one 16-byte load for fp32
-  /// scores, one 8-byte load widened in registers for bf16.
   SGL_DEVICE static void load_scores(vec_t& v, const score_t* in, int64_t vi) {
     if constexpr (std::is_same_v<score_t, float>) {
       v.load(in, vi);
