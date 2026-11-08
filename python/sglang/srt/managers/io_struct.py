@@ -550,6 +550,11 @@ class GenerateReqInput:
                     )
 
         self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
+        # n is the number of returned sequences. A non-positive n expands to
+        # zero sub-requests, which cannot answer the request: it used to reach
+        # `obj[i]` with the expanded inputs already empty and raise IndexError.
+        if self.parallel_sample_num < 1:
+            raise ValueError(f"n must be at least 1, got {self.parallel_sample_num}.")
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:

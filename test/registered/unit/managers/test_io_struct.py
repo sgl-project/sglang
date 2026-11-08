@@ -486,6 +486,16 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 self.assertEqual(req[1].sampling_params["max_new_tokens"], 20)
                 self.assertEqual(params, {"max_new_tokens": 20, "n": 2})
 
+    def test_parallel_sample_count_must_be_positive(self):
+        """n is the number of returned sequences; n < 1 expands to an empty batch."""
+        for n in (0, -1):
+            with self.subTest(n=n):
+                req = GenerateReqInput(
+                    text=["Hello", "World"], sampling_params={"n": n}
+                )
+                with self.assertRaisesRegex(ValueError, "n must be at least 1"):
+                    req.normalize_batch_and_arguments()
+
     def test_renormalization_refreshes_cached_sampling_params(self):
         """A cached subrequest must use the batch's current token budget after normalization."""
         req = GenerateReqInput(
