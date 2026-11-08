@@ -6,7 +6,7 @@ import os
 import statistics
 import unittest
 from pathlib import Path
-from typing import ClassVar, List, Optional
+from typing import ClassVar, Optional
 
 from sglang.benchmark.one_batch_server import (
     BenchArgs,
@@ -33,8 +33,6 @@ _PROFILE_NO_GRAPH_OUTPUT_LEN = 3
 # start_profile blocks until num_steps server steps complete, so it must be <= actual decode steps.
 _PROFILE_NO_GRAPH_STEPS = 3
 
-# Measured runs per server; the overhead compares their medians. Each server
-# first runs the measured case once more as warmup and drops it.
 _NUM_MEASURED_RUNS = 3
 
 
@@ -46,7 +44,6 @@ def _make_server_args(
         "--model-path",
         _QWEN3_MODEL,
         "--cuda-graph-backend-prefill=disabled",
-        # Log GC pauses long enough to show up as a stall in the samples.
         "--gc-warning-threshold-secs",
         "0.5",
     ]
@@ -95,7 +92,7 @@ def _run_one_canary_setting(
     profile_steps: int = _PROFILE_STEPS,
     num_runs: int = 1,
     skip_warmup: bool = False,
-) -> List[BenchOneCaseResult]:
+) -> list[BenchOneCaseResult]:
     server_args = _make_server_args(
         canary_on=canary_on, disable_cuda_graph=disable_cuda_graph
     )
@@ -141,14 +138,6 @@ def _make_scenario_key(*, batch_size: int, input_len: int, output_len: int) -> s
         f"{_QWEN3_SCENARIO_MODEL}/{workload}_bs{batch_size}"
         f"_isl{input_len}_osl{output_len}"
     )
-
-
-def _cost_secs(result: BenchOneCaseResult, *, output_len: int) -> float:
-    # A prefill-only case is all TTFT. A decode case leaves TTFT out: a one-off
-    # stall before the first prefill would otherwise swamp the decode cost.
-    if output_len == 1:
-        return result.latency
-    return result.latency - result.last_ttft
 
 
 def _resolve_profile_root() -> Optional[Path]:
@@ -229,7 +218,8 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
             return
 
         cost_name = "e2e" if output_len == 1 else "decode"
-        samples = {}
+        lines = [f"[canary self-bench] {scenario_key}, median {cost_name} time:"]
+        medians = {}
         for canary_on in (False, True):
             # The first run warms up the server with the measured shape.
             runs = _run_one_canary_setting(
@@ -240,22 +230,18 @@ class TestCanarySelfBenchSpeed(unittest.TestCase):
                 num_runs=1 + _NUM_MEASURED_RUNS,
                 skip_warmup=True,
             )[1:]
-            samples[canary_on] = runs
-
-        lines = [f"[canary self-bench] {scenario_key}:"]
-        medians = {}
-        for canary_on, runs in samples.items():
-            costs = [_cost_secs(r, output_len=output_len) for r in runs]
+            # Decode time excludes TTFT, which absorbs one-off stalls before the first prefill.
+            costs = [
+                r.latency if output_len == 1 else r.latency - r.last_ttft for r in runs
+            ]
             medians[canary_on] = statistics.median(costs)
-            spread_pct = (max(costs) - min(costs)) / medians[canary_on] * 100.0
             lines.append(
-                f"  {'on ' if canary_on else 'off'}: median {cost_name}="
-                f"{medians[canary_on]:.4f}s spread={spread_pct:.2f}% "
-                f"{cost_name}=[{', '.join(f'{c:.4f}' for c in costs)}]s "
-                f"ttft=[{', '.join(f'{r.last_ttft:.4f}' for r in runs)}]s"
+                f"  {'on ' if canary_on else 'off'}: {medians[canary_on]:.4f}s "
+                f"of [{', '.join(f'{c:.4f}' for c in costs)}]s, "
+                f"ttft [{', '.join(f'{r.last_ttft:.4f}' for r in runs)}]s"
             )
         overhead_pct = (medians[True] - medians[False]) / medians[False] * 100.0
-        lines.append(f"  overhead={overhead_pct:.2f}% (median {cost_name} time)")
+        lines.append(f"  overhead={overhead_pct:.2f}%")
         summary = "\n".join(lines)
         print(summary, flush=True)
         self.assertLess(
