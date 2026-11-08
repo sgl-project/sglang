@@ -11,20 +11,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""RDNA3.5 (gfx115x) launch config for the grouped decode-attention stage 1.
+"""RDNA (gfx110x, gfx115x, gfx120x) launch config for the grouped decode-attention stage 1.
 
 Dropping the CDNA hints is a 1.4-2.7x win only where the kernel is memory-bound with
 enough work in flight; on MLA, fp8 KV and tiny grids the hints win and must stay, and at
 head_dim 256 dropping them is neutral.
 
-    python -m pytest test/registered/unit/layers/attention/test_gfx115_decode_launch.py -v
+    python -m pytest test/registered/unit/layers/attention/test_rdna_decode_launch.py -v
 """
 
 import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.decode_attention import _gfx115_grouped_num_warps
+from sglang.kernels.ops.attention.decode_attention import _rdna_grouped_num_warps
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,7 +38,7 @@ def _warps(
     batch=16,
     head_tiles=8,
 ):
-    return _gfx115_grouped_num_warps(
+    return _rdna_grouped_num_warps(
         block_dmodel=block_dmodel,
         block_dpe=block_dpe,
         kv_dtype=kv_dtype,
@@ -47,7 +47,7 @@ def _warps(
     )
 
 
-class TestGfx115GroupedDecodeLaunch(CustomTestCase):
+class TestRdnaGroupedDecodeLaunch(CustomTestCase):
     def test_gqa_16bit_kv_drops_hints(self):
         for dtype in (torch.bfloat16, torch.float16):
             with self.subTest(dtype=dtype):
