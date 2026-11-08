@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+
 from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
