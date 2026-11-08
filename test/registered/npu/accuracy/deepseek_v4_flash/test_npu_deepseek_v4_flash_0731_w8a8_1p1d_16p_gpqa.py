@@ -18,23 +18,9 @@ register_npu_ci(
     nightly=True,
 )
 
-# npu_memcache MetaService must be started before the model server so the L3
-# cache backend can connect to it. Its ports follow the same per-pod offset
-# convention as SERVICE_PORT (first visible NPU id) so that concurrent test
-# pods sharing a host (hostNetwork) do not collide.
-def _get_first_visible_device():
-    devices = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or os.environ.get(
-        "ASCEND_VISIBLE_DEVICES"
-    )
-    if not devices:
-        return 0
-    return int(devices.strip().split(",")[0])
-
-
-DEVICE_OFFSET = _get_first_visible_device()
-META_SERVICE_PORT = 5007 + DEVICE_OFFSET
-CONFIG_STORE_PORT = 6007 + DEVICE_OFFSET
-META_METRICS_PORT = 8007 + DEVICE_OFFSET
+META_SERVICE_PORT = 5007
+CONFIG_STORE_PORT = 6007
+META_METRICS_PORT = 8007
 
 METASERVICE_CONFIG = {
     "meta_service_url": f"tcp://127.0.0.1:{META_SERVICE_PORT}",
