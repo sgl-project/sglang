@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import logging
 import mmap
 import os
 import pickle
@@ -14,6 +15,7 @@ from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 from torch import nn
@@ -51,7 +53,8 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -1652,6 +1655,36 @@ def discard_shm_features(obj) -> None:
         # leaks a multi-megabyte /dev/shm allocation.
         for _key, value in _model_specific_shm_values(item):
             value.close_and_unlink()
+
+
+def strip_mm_features_for_pp_relay(reqs: List) -> List:
+    """Copy requests for the next PP stage without raw multimodal features.
+
+    Only the first PP rank embeds multimodal inputs; later ranks need just the pad
+    values, which come from the item hash, so hashed items drop their feature tensor.
+    """
+    return [_strip_mm_features(req) for req in reqs]
+
+
+def _strip_mm_features(req):
+    if isinstance(req, BaseBatchReq):
+        return msgspec.structs.replace(
+            req, batch=[_strip_mm_features(sub_req) for sub_req in req.batch]
+        )
+    if not isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+        return req
+    if not isinstance(req.mm_inputs, MultimodalProcessorOutput):
+        return req
+    items = req.mm_inputs.mm_items
+    if not any(item.hash is not None and item.feature is not None for item in items):
+        return req
+    # An unhashed item keeps its feature: the next stage hashes it to derive the pad value.
+    stripped_items = [
+        msgspec.structs.replace(item, feature=None) if item.hash is not None else item
+        for item in items
+    ]
+    stripped_mm_inputs = msgspec.structs.replace(req.mm_inputs, mm_items=stripped_items)
+    return msgspec.structs.replace(req, mm_inputs=stripped_mm_inputs)
 
 
 def _unwrap_tensor_or_list(value):

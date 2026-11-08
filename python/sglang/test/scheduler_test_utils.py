@@ -27,12 +27,20 @@ class FakeReq(SimpleNamespace):
     __eq__ = object.__eq__
     __hash__ = object.__hash__
 
+    # Req's exit_ledger fields.
+    exit_via = None
+    send_via = None
 
-def release_only_retirer(tree_cache=None, hisparse_coordinator=None) -> RequestRetirer:
-    """A `RequestRetirer` for a test that only releases finished requests."""
+
+def release_only_retirer(
+    tree_cache=None, hisparse_coordinator=None, beam_coordinator=None
+) -> RequestRetirer:
+    """A `RequestRetirer` for a test that only releases requests, never aborts
+    a queued one."""
     return RequestRetirer(
         tree_cache=tree_cache,
-        beam_coordinator=None,
+        beam_coordinator=beam_coordinator
+        or SimpleNamespace(retire_group=lambda req: None),
         hisparse_coordinator=hisparse_coordinator,
         uocr_runtime=None,
         send_abort_output=None,

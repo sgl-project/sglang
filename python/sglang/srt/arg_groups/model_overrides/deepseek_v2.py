@@ -49,6 +49,7 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     "LongcatFlashForCausalLM",
     "LongcatFlashForCausalLMNextN",
     "Dots3NoteForCausalLM",
+    "Xing4_0ForCausalLM",
     "KimiK31ForConditionalGeneration",
 )
 def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
@@ -57,6 +58,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
     from sglang.srt.configs.model_config import (
         get_dsa_index_kpool,
         is_deepseek_dsa,
+        is_kimi_k31,
         unwrap_modelopt_quantization_config,
     )
 
@@ -100,7 +102,8 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     )
 
     if is_deepseek_dsa(hf_config):  # DeepSeek 3.2/GLM 5
-        overrides.update(_dsa_dcp_overrides(cfg))
+        if not is_kimi_k31(hf_config):
+            overrides.update(_dsa_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"
