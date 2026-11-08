@@ -2651,7 +2651,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
+            retire_unadmitted_request=self.retire_unadmitted_request,
             get_last_batch=lambda: self.last_batch,
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
@@ -3304,7 +3304,7 @@ class Scheduler(
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    self.retire_unadmitted_request(req)
                     return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -3318,12 +3318,8 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    if not envs.SGLANG_RUST_SERVER.get():
-                        recv_req.time_stats.trace_ctx.abort(
-                            abort_info={"reason": error_msg}
-                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    self.retire_unadmitted_request(req)
                     return
 
         elif (
@@ -3391,17 +3387,17 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = make_abort_req(
+            finished_reason = {
+                "type": "abort",
+                "status_code": HTTPStatus.BAD_REQUEST,
+                "message": error_msg,
+            }
+            req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+            self.request_retirer.abort(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.BAD_REQUEST,
-                    "message": error_msg,
-                },
+                reason=FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST),
+                finished_reason=finished_reason,
             )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self._release_rejected_session(req)
-            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3746,7 +3742,8 @@ class Scheduler(
         return True
 
     def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request the disaggregation queues rejected at their door."""
+        """Finish a request rejected before it was queued: at intake, or at a
+        disaggregation queue's door."""
         # `update_finish_state` returns early once `finished()`, so an already
         # set `finished_reason` is what the client receives; report the same.
         reason = req.finished_reason or req.to_finish
@@ -3801,16 +3798,8 @@ class Scheduler(
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self._release_rejected_session(req)
-        self.output_streamer.stream_output([req], req.return_logprob)
-
-    def _release_rejected_session(self, req: Req) -> None:
-        """`create_req` marked the streaming session in flight; release it for a
-        request rejected before it was queued."""
-        if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+        self.retire_unadmitted_request(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
