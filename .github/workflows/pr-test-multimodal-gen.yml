@@ -47,10 +47,6 @@ jobs:
     if: inputs.multimodal_gen == 'true'
     runs-on: ubuntu-latest
     outputs:
-      matrix-1gpu: ${{ steps.compute.outputs.matrix-1gpu }}
-      matrix-2gpu: ${{ steps.compute.outputs.matrix-2gpu }}
-      partition-count-1gpu: ${{ steps.compute.outputs['partition-count-1gpu'] }}
-      partition-count-2gpu: ${{ steps.compute.outputs['partition-count-2gpu'] }}
       plan-1gpu: ${{ steps.compute.outputs.plan-1gpu }}
       plan-2gpu: ${{ steps.compute.outputs.plan-2gpu }}
     steps:
@@ -74,22 +70,15 @@ jobs:
     if: |
       always() &&
       needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
+      fromJson(needs.compute-diffusion-partitions.outputs.plan-1gpu).partition_count > 0 &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-h100
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 240
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 240
       run_timeout_minutes: 240
-      timeout_per_file: 14400
-      partition_matrix: ${{ needs.compute-diffusion-partitions.outputs.matrix-1gpu }}
-      partition_count: ${{ needs.compute-diffusion-partitions.outputs['partition-count-1gpu'] }}
       partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
     secrets: inherit
 
@@ -100,14 +89,9 @@ jobs:
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-5090
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 180
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 180
       run_timeout_minutes: 120
-      timeout_per_file: 7200
       pre_test_timeout_minutes: 10
       pre_test_command: |
         # SM120-only diffusion unit tests
@@ -123,14 +107,9 @@ jobs:
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-bcg-1-gpu-h100
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 90
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 90
       run_timeout_minutes: 60
-      timeout_per_file: 3600
     secrets: inherit
 
   multimodal-gen-test-2-gpu:
@@ -138,24 +117,17 @@ jobs:
     if: |
       always() &&
       needs.compute-diffusion-partitions.result == 'success' &&
-      needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
+      fromJson(needs.compute-diffusion-partitions.outputs.plan-2gpu).partition_count > 0 &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-2-gpu-h100
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 55
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 55
       run_timeout_minutes: 55
-      timeout_per_file: 14400
-      partition_matrix: ${{ needs.compute-diffusion-partitions.outputs.matrix-2gpu }}
-      partition_count: ${{ needs.compute-diffusion-partitions.outputs['partition-count-2gpu'] }}
-      partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
       retry_deadline_seconds: 3000
+      partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
     secrets: inherit
 
   multimodal-gen-component-accuracy:
@@ -165,14 +137,9 @@ jobs:
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-component-2-gpu-h100
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 240
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 240
       run_timeout_minutes: 240
-      timeout_per_file: 14400
     secrets: inherit
 
   multimodal-gen-test-4-gpu-b200:
@@ -182,15 +149,9 @@ jobs:
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-b200
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 240
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 240
       run_timeout_minutes: 240
-      timeout_per_file: 14400
-      early_ld_library_path: true
       pre_test_timeout_minutes: 55
       pre_test_command: |
         # VAE parallel-group regression
@@ -226,14 +187,9 @@ jobs:
     uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-unit-1-gpu-h100
-      runs_on_map: ${{ inputs.runs_on_map }}
-      sgl_kernel: ${{ inputs.sgl_kernel }}
-      continue_on_error: ${{ inputs.continue_on_error }}
-      git_ref: ${{ inputs.git_ref }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check }}
-      job_timeout_minutes: 120
+      caller_inputs: ${{ toJson(inputs) }}
+      timeout_minutes: 120
       run_timeout_minutes: 60
-      timeout_per_file: 3600
       pre_test_timeout_minutes: 10
       pre_test_command: |
         # quant-videogen pins an incompatible torch, so install it without deps

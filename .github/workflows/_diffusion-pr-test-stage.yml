@@ -11,44 +11,20 @@ on:
         description: 'Key in scripts/ci/runner_configs.yml; the suite run is base-b-test-<runner_config>. Also names the lane in artifact names.'
         required: true
         type: string
-      runs_on_map:
+      caller_inputs:
+        description: 'toJson(inputs) from pr-test-multimodal-gen.yml. Read via fromJson(...).runs_on_map / sgl_kernel / continue_on_error / git_ref / skip_pr_test_health_check.'
         required: true
         type: string
-      sgl_kernel:
-        required: true
-        type: string
-      continue_on_error:
-        required: false
-        type: string
-        default: 'false'
-      git_ref:
-        required: false
-        type: string
-        default: ''
-      skip_pr_test_health_check:
-        required: false
-        type: string
-        default: 'false'
-      job_timeout_minutes:
+      timeout_minutes:
+        description: 'Job timeout.'
         required: true
         type: number
       run_timeout_minutes:
+        description: 'Timeout of the suite step, also the per-file timeout.'
         required: true
         type: number
-      timeout_per_file:
-        required: true
-        type: number
-      partition_matrix:
-        description: 'Matrix JSON with a `part` field; a single part 0 by default.'
-        required: false
-        type: string
-        default: '{"include":[{"part":0}]}'
-      partition_count:
-        description: 'Total partitions, set together with partition_plan; empty for an unpartitioned lane.'
-        required: false
-        type: string
-        default: ''
       partition_plan:
+        description: 'Plan JSON from compute_diffusion_partitions.py; one job per partitions[].part. Empty runs one unpartitioned job.'
         required: false
         type: string
         default: ''
@@ -60,17 +36,12 @@ on:
       pre_test_timeout_minutes:
         required: false
         type: number
-        default: 30
+        default: 10
       retry_deadline_seconds:
         description: 'Seconds from job start after which diffusion case retries stop; 0 for none.'
         required: false
         type: number
         default: 0
-      early_ld_library_path:
-        description: 'Set SGLANG_CI_EARLY_LD_LIBRARY_PATH=1 for the install.'
-        required: false
-        type: boolean
-        default: false
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 env:
@@ -78,16 +49,17 @@ env:
   NCCL_NVLS_ENABLE: "0"
   SGLANG_CUDA_COREDUMP: "1"
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == 'true' }}
+  SKIP_PR_TEST_HEALTH_CHECK: ${{ fromJson(inputs.caller_inputs).skip_pr_test_health_check == 'true' }}
 
 jobs:
   run:
     name: ${{ inputs.runner_config }} (${{ matrix.part }})
-    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
-    timeout-minutes: ${{ inputs.job_timeout_minutes }}
+    runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
     strategy:
       fail-fast: false
-      matrix: ${{ fromJson(inputs.partition_matrix) }}
+      matrix:
+        part: ${{ fromJson(inputs.partition_plan || '{"partitions":[{"part":0}]}').partitions.*.part }}
     steps:
       - name: Record retry deadline
         if: inputs.retry_deadline_seconds > 0
@@ -96,7 +68,7 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.git_ref || github.sha }}
+          ref: ${{ fromJson(inputs.caller_inputs).git_ref || github.sha }}
 
       - name: Resolve runner_config
         id: rc
@@ -107,7 +79,7 @@ jobs:
       - uses: ./.github/actions/check-maintenance
 
       - name: Download artifacts (v4)
-        if: inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4'
+        if: fromJson(inputs.caller_inputs).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v4'
         uses: actions/download-artifact@v4
         with:
           path: python/sglang/kernels/aot/dist/
@@ -115,7 +87,7 @@ jobs:
           pattern: wheel-python3.11-cuda*
 
       - name: Download artifacts (v6)
-        if: inputs.sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6'
+        if: fromJson(inputs.caller_inputs).sgl_kernel == 'true' && steps.rc.outputs.artifact_version == 'v6'
         uses: actions/download-artifact@v6
         with:
           path: python/sglang/kernels/aot/dist/
@@ -124,10 +96,8 @@ jobs:
 
       - name: Install dependencies
         timeout-minutes: ${{ fromJson(steps.rc.outputs.install_timeout) }}
-        env:
-          SGLANG_CI_EARLY_LD_LIBRARY_PATH: ${{ inputs.early_ld_library_path && '1' || '' }}
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{ inputs.sgl_kernel }} bash ${{ steps.rc.outputs.install }}
+          CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.caller_inputs).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
       - name: Run pre-test commands
         if: inputs.pre_test_command != ''
@@ -140,18 +110,18 @@ jobs:
           HF_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
-          DIFFUSION_CONTINUE_ON_ERROR: ${{ inputs.continue_on_error }}
+          DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
           # An unpartitioned lane passes empty values, which the suite bridge
-          # skips. format() keeps part 0 from reading as false.
-          DIFFUSION_PARTITION_ID: ${{ inputs.partition_count != '' && format('{0}', matrix.part) || '' }}
-          DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_count }}
+          # skips. format() keeps part 0 and the count from reading as false.
+          DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
+          DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_plan != '' && format('{0}', fromJson(inputs.partition_plan).partition_count) || '' }}
           DIFFUSION_PARTITION_PLAN_JSON: ${{ inputs.partition_plan }}
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
         run: |
           python3 test/run_suite.py \
             --hw cuda \
             --suite base-b-test-${{ inputs.runner_config }} \
-            --timeout-per-file ${{ inputs.timeout_per_file }}
+            --timeout-per-file $(( ${{ inputs.run_timeout_minutes }} * 60 ))
 
       - name: Upload execution report
         if: always()
