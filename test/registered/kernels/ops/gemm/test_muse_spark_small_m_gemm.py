@@ -106,6 +106,22 @@ def test_splitk_partials_sum(m):
     _close(p.sum(0), x.float() @ w.float().T, rtol=1e-4, atol=1e-3)
 
 
+@pytest.mark.parametrize("n", [2304, 4608])
+@pytest.mark.parametrize("m", [17, 24, 32])
+def test_splitk_partials_block_m_32_is_bitwise(n, m):
+    from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
+
+    torch.manual_seed(n + m)
+    w = (torch.randn(n, 8192, device="cuda") * 0.02).to(torch.bfloat16)
+    x = torch.randn(m, 8192, device="cuda").to(torch.bfloat16)
+    p16, p32 = (
+        torch.empty((8, m, n), device="cuda", dtype=torch.float32) for _ in range(2)
+    )
+    bf16_splitk_gemm_partials(x, w, p16, block_n=32, block_k=128, split_k=8)
+    bf16_splitk_gemm_partials(x, w, p32, block_n=32, block_k=128, split_k=8, block_m=32)
+    assert torch.equal(p16, p32)
+
+
 @pytest.mark.parametrize("m", [1, 8, 64, 80, 128, 384])
 def test_router_gemm_fp32(m):
     from sglang.kernels.ops.gemm.router_gemm_fp32 import (

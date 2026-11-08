@@ -261,8 +261,17 @@ def qkv_proj_qk_norm_rope_cache(
     assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
     assert cache_k.is_contiguous() and cache_v.is_contiguous()
     # Split-K 8 / block_n 32 were tuned at N 2304 (TP8); not re-tuned for N 4608.
+    # Above 16 rows one 32-row tile streams the weight once instead of twice.
     partials = torch.empty((8, m, n), device=x.device, dtype=torch.float32)
-    bf16_splitk_gemm_partials(x, weight, partials, block_n=32, block_k=128, split_k=8)
+    bf16_splitk_gemm_partials(
+        x,
+        weight,
+        partials,
+        block_n=32,
+        block_k=128,
+        split_k=8,
+        block_m=16 if m <= 16 else 32,
+    )
     qo = torch.empty((m, hq * d), device=x.device, dtype=torch.bfloat16)
     ko = torch.empty((m, hk * d), device=x.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)

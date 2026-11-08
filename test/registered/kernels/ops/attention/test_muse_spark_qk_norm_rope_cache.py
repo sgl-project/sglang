@@ -18,7 +18,7 @@ F8 = torch.float8_e4m3fn
 
 
 @pytest.mark.parametrize("heads", [(16, 2), (32, 4)])
-@pytest.mark.parametrize("m", [1, 8, 32])
+@pytest.mark.parametrize("m", [1, 8, 24, 32])
 def test_fused_projection_matches_unfused(heads, m):
     from sglang.kernels.ops.attention.qk_norm_rope_cache import (
         qk_norm_rope_cache,

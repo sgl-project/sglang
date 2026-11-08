@@ -49,6 +49,7 @@ def bf16_splitk_gemm_partials(
     block_n: int,
     block_k: int,
     split_k: int,
+    block_m: int = 16,
     cache: str = ".cg",
     num_warps: int = 4,
     num_stages: int = 2,
@@ -56,14 +57,14 @@ def bf16_splitk_gemm_partials(
     """Write ``partials[s] = x @ weight[:, s * K / split_k : (s + 1) * K / split_k].T`` (FP32, [split_k, M, N])."""
     m, k = x.shape
     n = weight.shape[0]
-    _dense_partial[(n // block_n, triton.cdiv(m, 16), split_k)](
+    _dense_partial[(n // block_n, triton.cdiv(m, block_m), split_k)](
         x,
         weight,
         partials,
         m,
         n,
         k,
-        16,
+        block_m,
         block_n,
         block_k,
         split_k,
