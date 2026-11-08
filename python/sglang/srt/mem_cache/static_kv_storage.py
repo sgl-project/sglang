@@ -753,6 +753,8 @@ def _static_state_entries(
     entries: List[Tuple[Any, Region, Any]] = []
     types: List[Any] = []
     owner_view = token_to_kv_pool
+    npu_dsv4 = is_npu() and _is_dsv4_npu(token_to_kv_pool)
+    npu_ratios = token_to_kv_pool.compression_ratios if npu_dsv4 else ()
 
     def add(
         state_type,
@@ -873,7 +875,9 @@ def _static_state_entries(
                 c128_ptrs, c128_lens, c128_item_lens = (
                     token_to_kv_pool.get_request_state_buf_infos()
                 )
-                if c128_ptrs:
+                if c128_ptrs or 128 in npu_ratios:
+                    # Components pair by wire position. A PP stage without
+                    # C128 must keep its slot before the NPU C4 component.
                     add(
                         StateType.DSV4_REQUEST_STATE,
                         c128_ptrs,
@@ -1008,11 +1012,11 @@ def _static_state_entries(
                 if tail_ptrs:
                     add(StateType.DSA_TAIL, tail_ptrs, tail_lens, tail_item_lens)
 
-    if is_npu() and _is_dsv4_npu(token_to_kv_pool):
+    if npu_dsv4:
         from sglang.srt.disaggregation.ascend.conn import AscendStateType
 
         c128_ptrs, c128_lens, c128_item_lens = token_to_kv_pool.get_c128_kv_buf_infos()
-        if c128_ptrs:
+        if c128_ptrs or 128 in npu_ratios:
             add(
                 AscendStateType.DSV4_C128,
                 c128_ptrs,
@@ -1027,7 +1031,7 @@ def _static_state_entries(
 
         if is_npu_arch35():
             c4_ptrs, c4_lens, c4_item_lens = token_to_kv_pool.get_c4_state_buf_infos()
-            if c4_ptrs:
+            if c4_ptrs or 4 in npu_ratios:
                 add(
                     AscendStateType.DSV4_C4_STATE,
                     c4_ptrs,

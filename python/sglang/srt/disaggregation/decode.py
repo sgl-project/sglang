@@ -2022,7 +2022,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             )
         state_indices: Optional[List] = [
-            payloads[st]() if st in payloads else None for st in state_types
+            payloads[st]()
+            if st in payloads and self.kv_manager.kv_args.state_data_ptrs[i]
+            else None
+            for i, st in enumerate(state_types)
         ]
 
         device_page_indices = None
