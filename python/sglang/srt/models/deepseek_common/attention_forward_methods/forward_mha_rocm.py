@@ -32,6 +32,8 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha imp
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_block_scale_fp8,
+    _is_gfx1250_supported,
+    _use_aiter,
     _use_aiter_bpreshuffle_gfx95,
     _use_aiter_gfx95,
 )
@@ -44,6 +46,8 @@ if TYPE_CHECKING:
 _use_fp8_prefill_attn = (
     get_bool_env_var("SGLANG_AITER_FP8_PREFILL_ATTN", "True") and _use_aiter_gfx95
 )
+# Same as gfx950: write/read MLA KV rows via store_mla/read_mla, not index_put.
+_use_mla_kv_rows = _use_aiter_gfx95 or (_use_aiter and _is_gfx1250_supported)
 
 if _use_aiter_gfx95:
     from aiter.ops.triton.fused_fp8_quant import fused_rms_fp8_group_quant
@@ -328,7 +332,7 @@ class DeepseekMHARocmForwardMixin:
         k_pe: torch.Tensor,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_mla_kv_rows:
             get_kv_layers().layer(self.attn_mha.layer_id).store_mla(
                 self.attn_mha,
                 KVWriteLoc.for_batch(forward_batch),
@@ -348,7 +352,7 @@ class DeepseekMHARocmForwardMixin:
         dst_dtype: torch.dtype,
         forward_batch: ForwardBatch,
     ):
-        if _use_aiter_gfx95:
+        if _use_mla_kv_rows:
             kv_a, k_pe = (
                 get_kv_layers()
                 .read(self.attn_mha.layer_id)

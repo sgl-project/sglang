@@ -40,7 +40,6 @@ from sglang.srt.utils import (
     is_cpu,
     is_cuda,
     is_flashinfer_available,
-    is_gfx1250_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -115,17 +114,8 @@ _has_rocm_triton_gemma_rms_norm = False
 if _use_aiter:
     import aiter as _aiter
     from aiter import layernorm2d_fwd as layer_norm
-
-    if is_gfx1250_supported():
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rms_norm,
-        )
-        from aiter.ops.triton.normalization.rmsnorm import (
-            rmsnorm2d_fwd_with_add as fused_add_rms_norm,
-        )
-    else:
-        from aiter import rmsnorm2d_fwd as rms_norm
-        from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
+    from aiter import rmsnorm2d_fwd as rms_norm
+    from aiter import rmsnorm2d_fwd_with_add as fused_add_rms_norm
 
     _has_aiter_layer_norm = True  # aiter provides the layer_norm functions
     _has_vllm_rms_norm = True  # aiter provides the rms_norm functions
