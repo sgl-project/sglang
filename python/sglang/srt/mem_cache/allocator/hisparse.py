@@ -422,6 +422,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
 
+    def window_pool_names(self):
+        return self.logical_attn_allocator.window_pool_names()
+
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
     ) -> str | None:

@@ -23,8 +23,8 @@ from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     PoolStats,
     SchedulerPoolStatsObserver,
-    kv_private_swa_tokens,
     kv_private_tokens,
+    kv_private_window_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_components.state_check import (
@@ -36,7 +36,7 @@ from sglang.srt.managers.scheduler_components.state_check import (
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.allocator.swa import is_swa_req_ring
-from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
+from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache, window_sub_pool_of
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.observability.scheduler_stage_metrics import (
     SCHEDULER_STAGE_SANITY_CHECK_CACHE,
@@ -249,6 +249,7 @@ class SchedulerInvariantChecker:
 
     def _check_swa_pool(self, ps: PoolStats, uncached: int = 0) -> Tuple[bool, str]:
         allocator = self.token_to_kv_pool_allocator
+        window = window_sub_pool_of(allocator)
         if is_swa_req_ring(allocator):
             # Per-request SWA ring: there is no token pool to conserve; ring-slot
             # leaks are caught by the req_to_token check instead.
@@ -262,8 +263,8 @@ class SchedulerInvariantChecker:
             "swa",
             ps.swa_available_size,
             ps.swa_evictable_size,
-            self.tree_cache.swa_protected_size(),
-            self.pool_stats_observer.session_held_swa_tokens(),
+            self.tree_cache.window_protected_size(window),
+            self.pool_stats_observer.session_held_window_tokens(window),
             ps.swa_capacity,
             uncached,
         )
@@ -363,7 +364,8 @@ class SchedulerInvariantChecker:
     def _get_total_uncached_sizes(self, has_window: bool) -> Tuple[int, int]:
         """(full, swa) footprint of the KV rows requests own; 0 swa without a window."""
         full_uncached = 0
-        swa_uncached = self.tree_cache.swa_transient_size()
+        swa_uncached = 0
+        window = window_sub_pool_of(self.token_to_kv_pool_allocator)
         for req in self._requests_owning_rows():
             if req.kv.cache_protected_len % self.page_size != 0:
                 self.reporter.report(
@@ -374,7 +376,7 @@ class SchedulerInvariantChecker:
                 )
             full_uncached += kv_private_tokens(req.kv, self.page_size)
             if has_window:
-                swa_uncached += kv_private_swa_tokens(req.kv, self.page_size)
+                swa_uncached += kv_private_window_tokens(req.kv, self.page_size, window)
 
             if req.beam_group is not None:
                 full_uncached += req.beam_group.extra_uncached_tokens()
@@ -563,6 +565,18 @@ class SchedulerInvariantChecker:
             messages.append(mamba_msg)
 
         return has_leak, messages
+
+    def check_admitted(self, reqs: Iterable[Req]) -> None:
+        """At admission from the waiting queue: no older step still carries the
+        request. A request never re-enters the batch while one does, which is what
+        lets `Scheduler.still_in_batch` look at the batch lists alone. Gated like
+        the request-list check."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        self._raise_if_any(
+            {req for req in reqs if req.inflight_steps != 0},
+            "Requests admitted while an older step still carries them",
+        )
 
     def _check_request_lists(self, batch: ScheduleBatch) -> None:
         """At the launch of `batch`: each live request is in exactly one list,
