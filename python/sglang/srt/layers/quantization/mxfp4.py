@@ -160,8 +160,12 @@ def _situ_gate_mode_kwargs(layer) -> Optional[dict]:
 
     The preshuffled A8W4 / A16W4 w13 is GU-interleaved; AITER's mxmoe stage1
     kernels read it by ``gate_mode`` (the older "gui" kernels ignore it).
+    gfx95 only: on other archs (gfx1250) INTERLEAVE selects AITER kernels that
+    read a different interleaved layout, so the runner keeps its default there.
     """
     if not getattr(layer, "situ_gate_up_interleaved", False):
+        return None
+    if not is_gfx95_supported():
         return None
     from aiter.ops.flydsl.moe_common import GateMode
 
