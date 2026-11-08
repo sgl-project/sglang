@@ -2358,6 +2358,11 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable data-parallel attention metrics.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DP_ROUND_TRACE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Log each prefill queue scan (visited, admitted, skip and stop reasons) and scheduler forward. Join DP_ADMISSION and DP_ROUND by scan ID within one scheduler process. Scans without a forward are logged separately. Enable SGLANG_ENABLE_METRICS_DP_ATTENTION for the existing token imbalance and synchronization wait samples.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
