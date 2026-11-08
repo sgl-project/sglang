@@ -1,6 +1,7 @@
 # Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
+# .dockerignore links here; Docker needs explicit recursive patterns.
+**/__pycache__/
+**/*.py[cod]
 *$py.class
 
 # C extensions
