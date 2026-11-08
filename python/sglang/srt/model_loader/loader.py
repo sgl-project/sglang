@@ -901,11 +901,6 @@ class DefaultModelLoader(BaseModelLoader):
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
                     continue
-                if (
-                    hasattr(module, "is_weights_quantized")
-                    and module.is_weights_quantized()
-                ):
-                    continue
                 quant_method.process_weights_after_loading(module)
         return model.eval()
 
@@ -1550,12 +1545,6 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
                     quant_method.process_weights_after_loading(module)
 
         return model.eval()
@@ -4234,23 +4223,6 @@ def get_model_loader(
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
-
-    # Use ModelOptModelLoader for unified quantization flags
-    if (
-        model_optloader_allowed
-        and hasattr(model_config, "quantization")
-        and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
-    ):
-        if model_config._is_already_quantized():
-            logger.info(
-                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
-            )
-        else:
-            logger.info(
-                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
-            )
         return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:
