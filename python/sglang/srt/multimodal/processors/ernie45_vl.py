@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
-from sglang.srt.utils import is_npu, logger
+from sglang.srt.utils import is_cpu, is_npu, logger
 
 _is_npu = is_npu()
 
@@ -176,12 +176,11 @@ async def preprocess_video(
     image_factor: int = IMAGE_FACTOR,
 ) -> torch.Tensor:
 
-    total_frames, video_fps = len(vr), vr.get_avg_fps()
+    total_frames, video_fps = len(vr), vr.avg_fps
     nframes = smart_nframes({}, total_frames=total_frames, video_fps=video_fps)
     idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
     idx = np.unique(idx)
-    video_np = vr.get_batch(idx).asnumpy()
-    video = torch.from_numpy(video_np).pin_memory()
+    video = vr.get_frames_as_tensor(idx.tolist())
     video = video.permute(0, 3, 1, 2)  # Convert to TCHW format
     nframes, _, height, width = video.shape
     min_pixels = VIDEO_MIN_PIXELS
@@ -205,7 +204,8 @@ async def preprocess_video(
     )
 
     video = video.permute(0, 2, 3, 1)
-    video = video.pin_memory()
+    if not is_cpu() and video.device.type == "cpu":
+        video = video.pin_memory()
     video_metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
