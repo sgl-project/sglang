@@ -335,6 +335,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None

@@ -29,6 +29,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -39,7 +40,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_spec,
 )
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_hip, is_npu
+from sglang.srt.utils import get_bool_env_var, is_hip, is_npu
 
 logger = logging.getLogger(__name__)
 

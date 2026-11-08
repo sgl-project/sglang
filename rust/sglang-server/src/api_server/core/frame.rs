@@ -33,6 +33,8 @@ pub(crate) struct CoreOutput {
     /// The launch weight version, which frames report until a terminal one's
     /// spans name the last; stamped by the core call.
     pub(crate) weight_version: Option<Arc<str>>,
+    /// This listener's data-parallel rank; stamped by the core call.
+    pub(crate) dp_rank: Option<u32>,
     pub(crate) text: String,
     pub(crate) completion_tokens: u64,
     pub(crate) stop_token_trimmed: bool,
@@ -60,6 +62,7 @@ impl From<ChunkEvent> for CoreOutput {
             cached_tokens,
             reasoning_tokens,
             weight_version: None,
+            dp_rank: None,
             text,
             completion_tokens,
             stop_token_trimmed,
@@ -91,6 +94,7 @@ impl CoreOutput {
         self.prompt_tokens = delta.prompt_tokens;
         self.cached_tokens = delta.cached_tokens;
         self.reasoning_tokens = delta.reasoning_tokens;
+        self.dp_rank = delta.dp_rank;
         if delta.finish_reason.is_some() {
             self.finish_reason = delta.finish_reason.clone();
             self.stop_token_trimmed = delta.stop_token_trimmed;
@@ -306,6 +310,7 @@ impl CoreOutput {
                 .and_then(|extras| extras.cached_tokens_details.clone())
                 .or_else(|| CachedTokensDetails::on_device(self.cached_tokens))
                 .map(cached_tokens_details),
+            dp_rank: self.dp_rank,
             ..Default::default()
         };
         let Some(extras) = self.extras.as_deref() else {
