@@ -25,11 +25,10 @@ if TYPE_CHECKING:
 
 
 class RequestRetirer:
-    """Ends requests and releases what they hold.
-
-    abort ends a request no launched step reports, tells the tokenizer once,
-    and releases it; release gives back what a request its caller ended holds,
-    detaching it first when aborted; the caller streams it."""
+    """Ends requests and releases what they hold: `abort` for one no launched
+    step reports (sends the abort output), `retire_unadmitted` for one rejected
+    before it was queued (streams its output), `release` for one its caller
+    ended and sends."""
 
     def __init__(
         self,
@@ -69,13 +68,10 @@ class RequestRetirer:
         self.release(req, checkpoint=checkpoint)
 
     def retire_unadmitted(self, req: Req) -> None:
-        """Finish a request rejected before it was queued: at intake, or at a
-        disaggregation queue's door. It holds no device KV, but the release still
-        matters: `create_req` marked its streaming session in flight, PREFILL's
-        `_prefetch_kvcache` armed the cache's paced retry for its handle, and a
-        retracted request keeps its host KV backup."""
-        # `update_finish_state` returns early once `finished()`, so an already
-        # set `finished_reason` is what the client receives; report the same.
+        """Finish a request rejected before it was queued. It holds no device KV,
+        but the release still frees its streaming session, its cache prefetch
+        retry and a retracted request's host KV backup."""
+        # An already set `finished_reason` is what the client receives.
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()

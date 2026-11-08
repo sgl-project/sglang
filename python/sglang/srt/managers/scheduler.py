@@ -112,6 +112,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    decode_offloads_kvcache,
     disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
@@ -689,7 +690,7 @@ class Scheduler(
         self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream = (
             self.enable_hierarchical_cache
             and self.tree_cache.cache_controller is not None
-            and not self._decode_offloads_kvcache()
+            and not decode_offloads_kvcache()
         )
 
         # Init running status
@@ -2891,17 +2892,9 @@ class Scheduler(
             stream_output=self.output_streamer.stream_output,
         )
 
-    @staticmethod
-    def _decode_offloads_kvcache() -> bool:
-        """Whether this PD decode server offloads a finished request's KV to host."""
-        return (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        )
-
     def maybe_init_decode_offload_manager(self) -> None:
         self.decode_offload_manager = None
-        if self._decode_offloads_kvcache():
+        if decode_offloads_kvcache():
             self.decode_offload_manager = DecodeKVCacheOffloadManager(
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,

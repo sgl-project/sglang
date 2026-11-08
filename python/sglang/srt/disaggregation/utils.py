@@ -220,6 +220,14 @@ def _poll_with_failure_injection_pp(pollers) -> List[int]:
     return [int(poller.poll_pp_consensus()) for poller in pollers]
 
 
+def decode_offloads_kvcache() -> bool:
+    """Whether this PD decode server offloads a finished request's KV to host."""
+    return (
+        get_disagg().disaggregation_mode == "decode"
+        and get_disagg().disaggregation_decode_enable_offload_kvcache
+    )
+
+
 def _is_fake_transfer(req: Req) -> bool:
     return req.bootstrap_host == FAKE_BOOTSTRAP_HOST or (
         req.bootstrap_host is None

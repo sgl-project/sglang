@@ -340,9 +340,8 @@ class DecodeKVCacheOffloadManager:
         if req.kv.req_pool_idx is None or req.kv.req_pool_idx == -1:
             return
 
-        # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. No checkpoint: the offloaded
-        # copy, not the device tree, keeps this request's KV.
+        # Only at finish: a mid-decode free races with admission over live slots.
+        # No checkpoint: the offloaded host copy keeps this KV, not the tree.
         self.request_retirer.release(req, checkpoint=False)
         self.offloaded_state.pop(req, None)
 
