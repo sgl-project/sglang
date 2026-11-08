@@ -33,8 +33,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,

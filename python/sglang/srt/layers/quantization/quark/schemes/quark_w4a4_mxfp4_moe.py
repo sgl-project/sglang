@@ -1013,6 +1013,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             and _aiter_situ_uses_gu_interleaved_weights()
         ):
             self._shuffle_gu_interleaved(layer)
+            layer.situ_gate_up_interleaved = True
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
                     build_dispatcher_quant_config(
@@ -1149,8 +1150,15 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             from aiter.ops.flydsl.moe_common import GateMode
 
             # Quark checkpoints store gate and up projections as separate
-            # contiguous row ranges. Keep that ordering for correctness.
-            _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
+            # contiguous row ranges. Keep that ordering for correctness, unless
+            # _shuffle_gu_interleaved rewrote w13 for SiTU A8W4 / A16W4.
+            _fused_moe_kwargs = {
+                "gate_mode": (
+                    GateMode.INTERLEAVE.value
+                    if getattr(layer, "situ_gate_up_interleaved", False)
+                    else GateMode.SEPARATED.value
+                )
+            }
         else:
             _fused_moe_kwargs = None
 
