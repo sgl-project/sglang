@@ -235,31 +235,6 @@ class ImagePatcher:
             return img.crop((j, i, j + tw, i + th))
         return img[:, i : i + th, j : j + tw].contiguous()
 
-    def get_num_patches(self, img_width: int, img_height: int) -> tuple[int, int]:
-        img_width, img_height = self.get_image_size_for_padding(img_width, img_height)
-        img_width, img_height = self.get_image_size_for_preprocess(
-            img_width, img_height
-        )
-        window_size = self.determine_window_size(
-            max(img_height, img_width), min(img_height, img_width)
-        )
-        if window_size == 0:
-            return 0, 0
-        else:
-            img_width, img_height = self.get_image_size_for_crop(
-                img_width, img_height, window_size
-            )
-            center_list, (x_num, y_num) = self.slide_window(
-                img_width,
-                img_height,
-                [(window_size, window_size)],
-                [(window_size, window_size)],
-            )
-            full_rows = (len(center_list) - 1) // x_num + 1
-            if len(center_list) > 0 and len(center_list) % x_num == 0:
-                full_rows -= 1
-            return len(center_list), full_rows
-
     def __call__(
         self, img: Step3Image
     ) -> tuple[Step3Image, list[Step3Image], list[bool] | None]:
@@ -348,16 +323,6 @@ class Step3VLProcessor:
     @property
     def image_token_id(self) -> int:
         return self.tokenizer.get_vocab()[self.image_token]
-
-    def get_num_image_tokens(self, img_width: int, img_height: int) -> int:
-        num_patches, num_newlines = self.patcher.get_num_patches(img_width, img_height)
-
-        return (
-            num_patches * (self.num_patch_feature_size + 2)
-            + self.num_image_feature_size
-            + 2
-            + num_newlines
-        )
 
     def _split_images(self, images: list[Image.Image]) -> list[ImageWithPatches]:
         result = []
@@ -537,15 +502,6 @@ class Step3VLImageProcessor(SGLangBaseProcessor):
             image_token_id=self.IM_TOKEN_ID,
             image_token_regex=re.compile(r"(?:<im_patch>)"),
         ).build(_processor)
-
-        mean = [0.48145466, 0.4578275, 0.40821073]
-        std = [0.26862954, 0.26130258, 0.27577711]
-
-    def preprocess(self, image):
-        return {"pixel_values": self.transform(image).unsqueeze(0)}
-
-    def __call__(self, image):
-        return self.preprocess(image)
 
     async def process_mm_data_async(
         self,

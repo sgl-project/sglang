@@ -880,11 +880,6 @@ class MiMoProcessor:
     def _process_video_content(self, content_idx, video_results, verbose):
         visual_patches, thw_grid, timestamps, video_meta = video_results[content_idx]
         grid_t, grid_h, grid_w = thw_grid
-        num_media_tokens = (
-            (grid_t * grid_h * grid_w)
-            // (self.merge_size**2)
-            // self.temporal_compression_ratio
-        )
 
         assert len(timestamps) == grid_t * self.temporal_patch_size, (
             f"Expected {grid_t} * {self.temporal_patch_size} = {grid_t * self.temporal_patch_size} timestamps, but got {len(timestamps)}"

@@ -1,5 +1,4 @@
 from transformers import AutoProcessor, PretrainedConfig
-from transformers.processing_utils import ProcessingKwargs
 
 try:
     from transformers import Qwen2_5_VLProcessor
@@ -66,14 +65,6 @@ class DotsVLMConfig(PretrainedConfig):
         self.vision_config = DotsVisionConfig(**vision_config)
         self.language_config = DeepseekV2Config(**kwargs)
         self.architectures = ["DotsVLMForCausalLM"]
-
-
-class DotsVLMProcessorKwargs(ProcessingKwargs, total=False):
-    _defaults = {
-        "text_kwargs": {
-            "padding": False,
-        },
-    }
 
 
 class DotsVLMProcessor(Qwen2_5_VLProcessor):

@@ -106,15 +106,6 @@ def resize_image(
     return image
 
 
-async def resize_image_async(
-    image,
-    min_pixels: int = MIN_PIXELS,
-    max_pixels: int = MAX_PIXELS,
-    size_factor: int = IMAGE_FACTOR,
-):
-    return resize_image(image, min_pixels, max_pixels, size_factor)
-
-
 def smart_nframes(
     ele: dict,
     total_frames: int,

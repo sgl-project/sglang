@@ -16,43 +16,14 @@ from transformers import (
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
-from sglang.srt.sampling.custom_logit_processor import (
-    DeepseekOCRNoRepeatNGramLogitProcessor,
-)
 
 DeepseekOCRImage = Union[Image.Image, torch.Tensor]
 
 BASE_SIZE = 1024
 IMAGE_SIZE = 640  # DeepSeek-OCR local crop; OCR-2 uses OCR2_IMAGE_SIZE
 OCR2_IMAGE_SIZE = 768
-CROP_MODE = True
 MIN_CROPS = 2
 MAX_CROPS = 6  # max:9; If your GPU memory is small, it is recommended to set it to 6.
-MAX_CONCURRENCY = 100  # If you have limited GPU memory, lower the concurrency count.
-NUM_WORKERS = 64  # image pre-process (resize/padding) workers
-PRINT_NUM_VIS_TOKENS = False
-SKIP_REPEAT = True
-MODEL_PATH = "deepseek-ai/DeepSeek-OCR"  # change to your model path
-
-NGRAM_NO_REPEAT_SIZE = 30
-NGRAM_NO_REPEAT_WINDOW = 90
-# Whitelist `<td>` and `</td>` token ids to allow table structures.
-NGRAM_NO_REPEAT_WHITELIST = (128821, 128822)
-
-DEFAULT_CUSTOM_LOGIT_PROCESSOR = DeepseekOCRNoRepeatNGramLogitProcessor.to_str()
-
-
-def get_default_ngram_custom_params() -> Dict[str, Any]:
-    """Return default custom params for the DeepSeek-OCR n-gram no repeat processor."""
-
-    return {
-        "ngram_size": NGRAM_NO_REPEAT_SIZE,
-        "window_size": NGRAM_NO_REPEAT_WINDOW,
-        "whitelist_token_ids": list(NGRAM_NO_REPEAT_WHITELIST),
-    }
-
-
-PROMPT = "<image>\n<|grounding|>Convert the document to markdown."
 
 
 def get_image_size(img: DeepseekOCRImage) -> Tuple[int, int]:
@@ -368,7 +339,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
 
     def format_messages_v2(self, messages: str, pil_images, max_req_input_len=-1):
         """play the role of format_messages_v2 and get_images_info in the last version"""
-        tokenized_data = []
         masked_tokenized_data = []  # labels
         images_list = []
         images_seq_mask = []
@@ -532,13 +502,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
         )
 
         return prepare
-
-    def find_all_indices(self, messages, target_value):
-        indices = []
-        for index, item in enumerate(messages):
-            if item == target_value:
-                indices.append(index)
-        return indices
 
     def tokenize_with_images(
         self,
