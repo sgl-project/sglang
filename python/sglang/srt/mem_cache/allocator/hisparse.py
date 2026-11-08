@@ -12,8 +12,8 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     HiSparseC4DevicePool,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
-from sglang.srt.utils.common import get_num_new_pages
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
@@ -300,6 +300,11 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
 
 class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
+    @property
+    def has_window_pool(self) -> bool:
+        # Wraps an SWA allocator and exposes its full interface.
+        return True
+
     def __init__(
         self,
         logical_attn_allocator: BaseTokenToKVPoolAllocator,
@@ -416,6 +421,9 @@ class DeepSeekV4HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
     def swa_available_size(self):
         return self.logical_attn_allocator.swa_available_size()
+
+    def window_pool_names(self):
+        return self.logical_attn_allocator.window_pool_names()
 
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int

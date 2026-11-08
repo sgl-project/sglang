@@ -11,7 +11,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Routing tests for the composite write paths (`UnifiedSWAKVPool`,
+"""Routing tests for the composite write paths (`RoutedKVCache`,
 `HybridLinearKVPool`).
 
 All write-location info travels in the attention metadata (`KVWriteLoc`); the
@@ -28,7 +28,7 @@ import torch
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
@@ -39,6 +39,9 @@ def _loc_info(virtual_loc, swa_phys=None, full_phys=None, physical=False):
 
 class _RecordingPool:
     """Stub sub-pool that records the `loc` and kwargs passed to `set_kv_buffer`."""
+
+    dtype = torch.bfloat16
+    store_dtype = torch.bfloat16
 
     def __init__(self):
         self.calls = []
@@ -56,20 +59,28 @@ class _RecordingPool:
 
 
 class TestUnifiedSWARouting(unittest.TestCase):
-    """`UnifiedSWAKVPool.set_kv_buffer` routing: full layers write `full_loc`
-    when present (triton's capture-stable buffer), else the rebound generic
-    `loc` -- the same id space; SWA layers write the swa-physical `swa_loc`,
-    which has no fallback (a different id space)."""
+    """`RoutedKVCache.set_kv_buffer` routing over an owner and a window: owner
+    layers write `full_loc` when present (triton's capture-stable buffer), else
+    the rebound generic `loc` -- the same id space; window layers write the
+    swa-physical `swa_loc`, which has no fallback (a different id space)."""
 
     def _make_bare_pool(self):
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+        from sglang.srt.mem_cache.kv.routed_cache import RoutedKVCache
 
-        # Bypass the heavy __init__; set only the attributes set_kv_buffer reads.
-        pool = object.__new__(UnifiedSWAKVPool)
-        pool.full_kv_pool = _RecordingPool()
-        pool.swa_kv_pool = _RecordingPool()
-        # layer 0 -> full attention; layer 1 -> SWA. (pool_layer_id, is_swa)
-        pool.layers_mapping = {0: (0, False), 1: (0, True)}
+        full, swa = _RecordingPool(), _RecordingPool()
+        # layer 0 -> full attention; layer 1 -> SWA, each index 0 in its view.
+        pool = RoutedKVCache(
+            arena=types.SimpleNamespace(device="cpu"),
+            owner="full",
+            layer_maps=[("full", full, {0: 0}), ("swa", swa, {1: 0})],
+            page_size=1,
+            start_layer=0,
+            end_layer=None,
+            size=0,
+            head_num=4,
+            head_dim=8,
+        )
+        pool.full_kv_pool, pool.swa_kv_pool = full, swa
         return pool
 
     def test_full_layer_writes_full_loc(self):
@@ -153,37 +164,37 @@ class TestUnifiedSWARouting(unittest.TestCase):
 
 
 class TestUnifiedSWATombstoneClamp(unittest.TestCase):
-    """`UnifiedSWAKVPool.translate_loc_from_full_to_swa` must clamp tombstoned
-    ids to the reserved padding sink (0).
+    """A window band's translation (its id space's write) must clamp
+    tombstoned ids to the reserved padding sink (0).
 
     A token whose swa page was freed carries -1 in `virtual_to_physical`, and a
     negative id makes a captured graph store at a negative offset from the
     buffer base.
     """
 
-    def _make_bare_pool(self, page_size, v2p):
-        from sglang.srt.mem_cache.allocator.unified_sub_pool import MultiEndedAllocator
-        from sglang.srt.mem_cache.unified_memory_pool import UnifiedSWAKVPool
+    def _make_bare_band(self, page_size, v2p):
+        from sglang.srt.mem_cache.kv.alloc.id_space import UnitIds
 
-        # A real sub-allocator (not a stand-in): the translation reads its v2p
-        # table, and the pool reaches it through the allocator's own method.
-        swa_allocator = object.__new__(MultiEndedAllocator)
-        # `page_size` is the WIDENED (DCP) surface, `pool_page_size` the physical
-        # rows per page; equal at dcp_size == 1, which is what this fixture is.
-        swa_allocator.page_size = page_size
-        swa_allocator.pool_page_size = page_size
-        swa_allocator.virtual_to_physical = v2p
-        pool = object.__new__(UnifiedSWAKVPool)
-        pool._swa_allocator = swa_allocator
-        return pool
+        # A real unit record (not a stand-in): the translation reads its v2p
+        # table. `unit_tokens` is the physical rows per page, the widened page
+        # at dcp_size == 1, which is what this fixture is.
+        ids = UnitIds(
+            num_virtual_ids=int(v2p.numel()) - 1,
+            num_physical_units=int(v2p.numel()) - 1,
+            unit_tokens=page_size,
+            shards_under_dcp=False,
+            device="cpu",
+        )
+        ids.virtual_to_physical = v2p
+        return types.SimpleNamespace(ids=ids)
 
     def test_tombstoned_id_lands_on_sink(self):
         for ps in (1, 4):
             v2p = torch.tensor([0, -1, 2], dtype=torch.int64)
-            pool = self._make_bare_pool(ps, v2p)
+            band = self._make_bare_band(ps, v2p)
             # Virtual ids covering the tombstoned page (index 1) and a live one.
             kv_indices = torch.tensor([0, ps, 2 * ps], dtype=torch.int64)
-            out = pool.translate_loc_from_full_to_swa(kv_indices)
+            out = band.ids.translate(kv_indices)
             self.assertEqual(out.dtype, torch.int64)
             self.assertTrue(
                 bool((out >= 0).all().item()),
@@ -262,7 +273,9 @@ class _RecordingMLAPool(_RecordingPool):
         super().__init__()
         self.mla_set_calls = []
 
-    def set_mla_kv_buffer(self, layer, loc, cache_k_nope, cache_k_rope):
+    def set_mla_kv_buffer(
+        self, layer, loc, cache_k_nope, cache_k_rope, layer_id_override=None
+    ):
         self.mla_set_calls.append(loc)
 
 
@@ -282,7 +295,7 @@ class TestHybridLinearMLARouting(CustomTestCase):
 
     def test_set_mla_kv_buffer_door_never_translates(self):
         """The translate happens exactly once, in the iteration's plan
-        (`KVLocPlan`); a door that translated again would double-translate
+        (`IterationIds`); a door that translated again would double-translate
         every unified MLA write."""
         pool = self._make_bare_pool()
         loc = torch.tensor([107, 108, 109], dtype=torch.int64)
@@ -302,8 +315,8 @@ class TestHybridLinearMLARouting(CustomTestCase):
             wait_until=lambda layer_id: calls.append(("wait", layer_id))
         )
 
-        def read(layer, loc, dst_dtype=None):
-            calls.append(("read", layer.layer_id))
+        def read(layer, loc, dst_dtype=None, layer_id_override=None):
+            calls.append(("read", layer_id_override))
 
         pool.full_kv_pool.get_mla_kv_buffer = read
         layer = types.SimpleNamespace(layer_id=6)

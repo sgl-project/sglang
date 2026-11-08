@@ -14,7 +14,7 @@ Run with:
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 import os
 import shutil
@@ -845,7 +845,9 @@ class TestDcpStorage(unittest.TestCase):
             cc = HiCacheController.__new__(HiCacheController)
             cc.enable_storage = False
             cc.host_memory_mode = "cache"
-            cc.storage_host_pool = object() if case == "non_mla" else host
+            cc.storage_host_pool = (
+                SimpleNamespace(layout=host.layout) if case == "non_mla" else host
+            )
             entries = [SimpleNamespace(name=PoolName.KV, host_pool=host)]
             if case in ("extra_pool", "wrong_pool", "file_kda", "mooncake_kda"):
                 entries.append(
@@ -863,6 +865,12 @@ class TestDcpStorage(unittest.TestCase):
             )
             with (
                 self.subTest(case=case),
+                mock.patch(
+                    "sglang.srt.managers.cache_controller.get_memory",
+                    return_value=SimpleNamespace(
+                        hicache_storage_key_scheme="rank-suffix"
+                    ),
+                ),
                 mock.patch(
                     "sglang.srt.managers.cache_controller.get_parallel",
                     return_value=SimpleNamespace(attn_dcp_size=2),

@@ -99,6 +99,8 @@ class TestHummingFp8Dispatch(CustomTestCase):
                 "w13": SimpleNamespace(
                     a_dtype=humming_runner.dtypes.float8e4m3,
                     input_scale_group_size=128,
+                    input_quant_mode=humming_runner.InputQuantizationMode.DynamicGroup,
+                    as_dtype=humming_runner.dtypes.float32,
                 )
             },
         )
@@ -169,6 +171,8 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         "w2": SimpleNamespace(
                             a_dtype=humming_runner.dtypes.float8e4m3,
                             input_scale_group_size=128,
+                            input_quant_mode=humming_runner.InputQuantizationMode.DynamicGroup,
+                            as_dtype=humming_runner.dtypes.float32,
                         )
                     }
                 )
@@ -199,10 +203,13 @@ class TestHummingFp8Dispatch(CustomTestCase):
                         side_effect=run_poisoned_kernel,
                     ) as fused_silu,
                 ):
-                    down_input, down_scale = runner._grouped_masked_act_quant(
-                        gate_up, expert_num_tokens, buffers
+                    down_input, down_scale, down_scale_2 = (
+                        runner._grouped_masked_act_quant(
+                            gate_up, expert_num_tokens, buffers
+                        )
                     )
 
+                self.assertIsNone(down_scale_2)
                 fused_silu.assert_called_once()
                 fallback_activation.assert_not_called()
                 call = fused_silu.call_args

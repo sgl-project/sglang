@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 """Boundary-KV fix kernels (SGLANG_ENABLE_MTP_BOUNDARY_KV_FIX) vs a pure-torch reference.
 
@@ -25,6 +25,7 @@ import torch
 from sglang.srt.speculative.multi_layer_eagle_utils import (
     compute_widened_draft_extend_locs_positions,
     fill_widened_draft_extend_inputs_triton,
+    rotate_input_ids,
     stash_append_boundary_state_triton,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -223,6 +224,55 @@ class TestBoundaryKvFixKernels(CustomTestCase):
         self.assertTrue(torch.equal(stash_t, ref_t), "seed stash tokens mismatch")
         self.assertTrue(torch.equal(stash_h, ref_h), "seed stash hiddens mismatch")
         self.assertTrue(torch.equal(valid_t, ref_v), "seed stash valid_len mismatch")
+
+
+# Lengths around the kernel's 4096-id block, plus an empty and a 1-id request.
+ROTATE_LENS = [0, 1, 2, 4095, 4096, 4097, 8197]
+ROTATE_GAP = 3
+SENTINEL = -1
+
+
+def _ref_rotate(ids, starts, lens, new_tokens, select_index):
+    out = ids.clone()
+    for i, (s, n) in enumerate(zip(starts, lens)):
+        if n == 0:
+            continue
+        out[s : s + n - 1] = ids[s + 1 : s + n]
+        last = s + n - 1 if select_index is None else int(select_index[i])
+        out[last] = new_tokens[i, 0]
+    return out
+
+
+class TestRotateInputIds(CustomTestCase):
+    def test_in_place_shift_across_blocks(self):
+        """A shift spanning several blocks must read only ids no earlier block
+        overwrote, and must not write outside its own request's window."""
+        torch.manual_seed(0)
+        starts, pos = [], ROTATE_GAP
+        for n in ROTATE_LENS:
+            starts.append(pos)
+            pos += n + ROTATE_GAP
+        ids = torch.full((pos,), SENTINEL, dtype=torch.int64, device=DEV)
+        for s, n in zip(starts, ROTATE_LENS):
+            ids[s : s + n] = torch.randint(5, 150000, (n,), device=DEV)
+        bs = len(ROTATE_LENS)
+        start_loc = torch.tensor(starts, dtype=torch.int32, device=DEV)
+        seq_lens = torch.tensor(ROTATE_LENS, dtype=torch.int32, device=DEV)
+        new_tokens = torch.arange(200000, 200000 + bs, device=DEV).view(bs, 1)
+        picked = torch.tensor(
+            [
+                s + (int(torch.randint(0, n, ())) if n else 0)
+                for s, n in zip(starts, ROTATE_LENS)
+            ],
+            dtype=torch.int64,
+            device=DEV,
+        )
+        for select_index in (None, picked):
+            with self.subTest(select_index=select_index is not None):
+                out = ids.clone()
+                rotate_input_ids(out, start_loc, seq_lens, new_tokens, select_index)
+                ref = _ref_rotate(ids, starts, ROTATE_LENS, new_tokens, select_index)
+                self.assertTrue(torch.equal(out, ref), "rotated input_ids mismatch")
 
 
 if __name__ == "__main__":

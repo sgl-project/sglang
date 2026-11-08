@@ -43,6 +43,11 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`ernie55`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>ERNIE-5.5-Flash (`baidu/ERNIE-5.5-Flash`, coming soon)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted as `<ernie:tool_call><invoke name="..."><parameter name="...">...</parameter></invoke></ernie:tool_call>`.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`glm`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>GLM series (e.g. `zai-org/GLM-4.6`)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
@@ -91,6 +96,11 @@ This guide demonstrates how to use SGLang’s [Function calling](https://platfor
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`step3`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Step-3</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}></td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`xing4_0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Xing4_0</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Tool calls are emitted inside blocks as either JSON (`{"name": ..., "arguments": {...}}`) or a tag-based form (`<param_key>...</param_key><param_value>...</param_value>`).</td>
     </tr>
   </tbody>
 </table>
