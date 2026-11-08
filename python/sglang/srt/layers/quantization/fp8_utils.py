@@ -115,8 +115,7 @@ class _MXFP4QuantizedData(MXFP4QuantizeUtil):
 
 # Force CK bpreshuffle (not Triton) for the dense w8a8-block GEMMs (MLA q/kv/o
 # projections), to match ATOM (CK preshuffle; Triton FP8 blockscale is slower).
-# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True). The env var
-# SGLANG_FORCE_CK_W8A8=1 still works as an override.
+# Default OFF; DeepseekV4 enables it via set_force_ck_w8a8(True).
 _FORCE_CK_W8A8: bool = False
 
 

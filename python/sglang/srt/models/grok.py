@@ -44,11 +44,10 @@ from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 from sglang.srt.layers.moe.topk import TopK
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.layers.rotary_embedding import (
-    RotaryEmbedding,
-    _yarn_find_correction_range,
-    _yarn_get_mscale,
-    get_rope,
+from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
+from sglang.srt.layers.rotary_embedding.yarn import (
+    yarn_find_correction_range,
+    yarn_get_mscale_simple,
 )
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -257,7 +256,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         if _is_npu:
             dtype = torch.float32
         # Get n-d magnitude scaling corrected for interpolation
-        self.mscale = float(_yarn_get_mscale(self.scaling_factor) * attn_factor)
+        self.mscale = float(yarn_get_mscale_simple(self.scaling_factor) * attn_factor)
         super().__init__(
             head_size, rotary_dim, max_position_embeddings, base, is_neox_style, dtype
         )
@@ -269,7 +268,7 @@ class ScalingRotaryEmbedding(RotaryEmbedding):
         inv_freq_extrapolation = 1.0 / pos_freqs
         inv_freq_interpolation = 1.0 / (scaling_factor * pos_freqs)
 
-        low, high = _yarn_find_correction_range(
+        low, high = yarn_find_correction_range(
             self.beta_fast,
             self.beta_slow,
             self.rotary_dim,

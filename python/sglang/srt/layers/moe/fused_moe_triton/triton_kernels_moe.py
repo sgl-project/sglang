@@ -203,63 +203,6 @@ def triton_kernel_fused_experts(
     return intermediate_cache3
 
 
-def triton_kernel_moe_with_bias_forward(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w1_pcg,
-    b1: torch.Tensor,
-    w2: torch.Tensor,
-    w2_pcg,
-    b2: torch.Tensor,
-    topk_output: TopKOutput,
-    moe_runner_config: MoeRunnerConfig,
-    apply_router_weight_on_input: bool = False,
-    use_fp8_w8a8: bool = False,
-    per_channel_quant: bool = False,
-    global_num_experts: int = -1,
-    expert_map: Optional[torch.Tensor] = None,
-    w1_scale: Optional[torch.Tensor] = None,
-    w2_scale: Optional[torch.Tensor] = None,
-    a1_scale: Optional[torch.Tensor] = None,
-    a2_scale: Optional[torch.Tensor] = None,
-    block_shape: Optional[list[int]] = None,
-) -> torch.Tensor:
-    from sglang.srt.layers.moe.topk import TopKOutputChecker
-
-    assert TopKOutputChecker.format_is_triton_kernels(topk_output)
-
-    a_ragged_metadata, gather_idx, scatter_idx, gate_scal, n_expts_act = topk_output
-
-    return triton_kernel_fused_experts_with_bias(
-        hidden_states,
-        w1=w1,
-        w1_pcg=w1_pcg,
-        b1=b1,
-        w2=w2,
-        w2_pcg=w2_pcg,
-        b2=b2,
-        a_ragged_metadata=a_ragged_metadata,
-        gather_indx=gather_idx,
-        scatter_indx=scatter_idx,
-        gate_scal=gate_scal,
-        n_expts_act=n_expts_act,
-        inplace=False,  # triton kernel doesn't support inplace
-        activation=moe_runner_config.activation,
-        apply_router_weight_on_input=apply_router_weight_on_input,
-        use_fp8_w8a8=use_fp8_w8a8,
-        per_channel_quant=per_channel_quant,
-        global_num_experts=global_num_experts,
-        expert_map=expert_map,
-        w1_scale=w1_scale,
-        w2_scale=w2_scale,
-        a1_scale=a1_scale,
-        a2_scale=a2_scale,
-        block_shape=block_shape,
-        gemm1_alpha=moe_runner_config.gemm1_alpha,
-        gemm1_clamp_limit=moe_runner_config.gemm1_clamp_limit,
-    )
-
-
 def triton_kernel_fused_experts_with_bias(
     hidden_states: torch.Tensor,
     w1: torch.Tensor,

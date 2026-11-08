@@ -102,10 +102,6 @@ from sglang.srt.layers.utils.common import add_prefix
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-ROTARY_EMBED_CLASSES = {
-    "normal": apply_rotary_pos_emb,
-}
-
 # === Vision Encoder === #
 FLASHINFER_WORKSPACE_SIZE_BYTES = 128 * 1024 * 1024
 
