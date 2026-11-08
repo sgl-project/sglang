@@ -191,6 +191,7 @@ For long-context agent workloads with prefix reuse, tune the prefill interval to
 | --- | --- | --- |
 | `--prefill-decode-interval` | `0` | `1` |
 | `--chunked-prefill-size` | `16384` | `16384` |
+| `--cuda-graph-max-bs-prefill` | `8192` | `8192` |
 | `--mamba-max-states-per-path` | `-1` (unlimited) | `2` |
 | `--mamba-full-memory-ratio` | `0.9` | `0.5` |
 
@@ -224,6 +225,7 @@ python -m sglang.launch_server \
   --max-running-requests 32 \
   --cuda-graph-max-bs-decode 32 \
   --cuda-graph-backend-prefill breakable \
+  --cuda-graph-max-bs-prefill 8192 \
   --mem-fraction-static 0.9 \
   --prefill-decode-interval 1 \
   --chunked-prefill-size 16384 \
@@ -237,7 +239,7 @@ python -m sglang.launch_server \
   --host 127.0.0.1 --port 30000
 ```
 
-For the baseline, change the interval to `0`, the path-state cap to `-1`, and the memory ratio to `0.9`. Both configurations use 16,384-token prefill chunks and an 8,192-token prefill graph budget.
+For the baseline, change the interval to `0`, the path-state cap to `-1`, and the memory ratio to `0.9`. Both configurations use 16,384-token prefill chunks and explicitly pin the prefill graph capacity to 8,192 tokens to match the measured configuration rather than rely on version-dependent defaults.
 
 </Accordion>
 
