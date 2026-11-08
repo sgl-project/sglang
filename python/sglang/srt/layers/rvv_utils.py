@@ -3,7 +3,7 @@ import logging
 import torch
 
 from sglang.srt.utils import cpu_has_rvv_support, is_host_cpu_riscv
-from sglang.srt.utils.common import use_riscv_rvv_backend
+from sglang.srt.utils.device import use_riscv_rvv_backend
 
 logger = logging.getLogger(__name__)
 

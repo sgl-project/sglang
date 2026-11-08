@@ -10,6 +10,16 @@ from sglang.srt.utils import is_host_cpu_riscv
 class _RVVBackendTestMixin:
     """Shared builders for backend tests."""
 
+    def setUp(self):
+        from unittest.mock import patch
+
+        self._parallel_patch = patch(
+            "sglang.srt.layers.attention.rvv_backend.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        )
+        self._parallel_patch.start()
+        self.addCleanup(self._parallel_patch.stop)
+
     def _make_backend_with_rvv_kernels(self):
         """Build an RVVAttnBackend and force RVV mode on for integration tests."""
         from unittest.mock import MagicMock, patch
@@ -49,6 +59,7 @@ class _RVVBackendTestMixin:
         batch.seq_lens = torch.tensor([4, 4], dtype=torch.int64)
         batch.extend_seq_lens = torch.tensor([2, 2], dtype=torch.int64)
         batch.extend_start_loc = torch.tensor([0, 2], dtype=torch.int64)
+        batch.out_cache_loc_is_physical = False
         batch.out_cache_loc = torch.tensor([3, 7], dtype=torch.int64)
         batch.encoder_out_cache_loc = torch.tensor([5, 9], dtype=torch.int64)
         return batch
@@ -67,7 +78,7 @@ class _RVVBackendTestMixin:
         return layer
 
 
-class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin):
+class TestRVVBackendInitAndRegistration(_RVVBackendTestMixin, unittest.TestCase):
     """Init and registry tests."""
 
     def test_registry_structure(self):
@@ -82,7 +93,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
         import torch
 
         from sglang.srt.layers.attention.rvv_backend import RVVAttnBackend
-        from sglang.srt.utils.common import cpu_has_rvv_support
+        from sglang.srt.utils.device import cpu_has_rvv_support
 
         mock_runner = Mock()
         mock_runner.device = "cpu"
@@ -111,7 +122,7 @@ class TestRVVBackendInitAndRegistration(unittest.TestCase, _RVVBackendTestMixin)
             self.assertIsNotNone(backend.fallback_backend)
 
 
-class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
+class TestRVVForwardMetadataGuards(_RVVBackendTestMixin, unittest.TestCase):
     """Forward-metadata guard behavior."""
 
     def test_metadata_rejects_oversized_batch(self):
@@ -149,7 +160,7 @@ class TestRVVForwardMetadataGuards(unittest.TestCase, _RVVBackendTestMixin):
         self.assertEqual(max_extend_len, 7)
 
 
-class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
+class TestRVVBackendFallbackSemantics(_RVVBackendTestMixin, unittest.TestCase):
     """Fallback behavior and non-regression semantics."""
 
     def test_decode_no_save_uses_fallback(self):
@@ -203,7 +214,7 @@ class TestRVVBackendFallbackSemantics(unittest.TestCase, _RVVBackendTestMixin):
         self.assertIs(result, sentinel)
 
 
-class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
+class TestRVVBackendCacheWiring(_RVVBackendTestMixin, unittest.TestCase):
     """Cache location and metadata wiring tests."""
 
     def test_decode_cross_attn_uses_encoder_loc(self):
@@ -266,7 +277,12 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
 
         out = backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
 
-        backend.token_to_kv_pool.set_kv_buffer.assert_not_called()
+        backend.token_to_kv_pool.layer_router.layer.return_value.store.assert_not_called()
+        write_loc = backend.token_to_kv_pool.layer_router.layer.return_value.store.call_args.args[
+            1
+        ]
+        self.assertTrue(torch.equal(write_loc.loc, batch.out_cache_loc))
+        self.assertFalse(write_loc.physical)
         backend.extend_fwd_impl.assert_called_once()
         self.assertEqual(tuple(out.shape), (4, 8 * 64))
 
@@ -288,9 +304,14 @@ class TestRVVBackendCacheWiring(unittest.TestCase, _RVVBackendTestMixin):
 
         backend.forward_extend(q, k, v, layer, batch, save_kv_cache=True)
 
-        backend.token_to_kv_pool.set_kv_buffer.assert_called_once_with(
-            layer, batch.out_cache_loc, k, v
+        backend.token_to_kv_pool.layer_router.layer.return_value.store.assert_called_once_with(
+            layer, unittest.mock.ANY, k, v
         )
+        write_loc = backend.token_to_kv_pool.layer_router.layer.return_value.store.call_args.args[
+            1
+        ]
+        self.assertTrue(torch.equal(write_loc.loc, batch.out_cache_loc))
+        self.assertFalse(write_loc.physical)
         backend.extend_fwd_impl.assert_called_once()
 
 

@@ -6,8 +6,10 @@ from typing import TYPE_CHECKING
 import torch
 
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.utils.common import cpu_has_rvv_support
+from sglang.srt.runtime_context import get_parallel
+from sglang.srt.utils.device import cpu_has_rvv_support
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -56,7 +58,7 @@ class RVVAttnBackend(AttentionBackend):
             layer_id = 0
 
             self.num_head = (
-                model_runner.model_config.num_attention_heads // model_runner.ps.tp_size
+                model_runner.model_config.num_attention_heads // get_parallel().tp_size
             )
             self.v_head_dim = pool.get_value_buffer(layer_id).shape[-1]
 
@@ -238,7 +240,9 @@ class RVVAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
 
             if save_kv_cache:
-                pool.set_kv_buffer(layer, forward_batch.out_cache_loc, k, v)
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer, KVWriteLoc.for_layer(forward_batch, layer), k, v
+                )
 
             current_bs = q.shape[0]
             q_view = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
