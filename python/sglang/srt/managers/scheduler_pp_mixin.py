@@ -1335,6 +1335,7 @@ class SchedulerPPMixin:
         from sglang.srt.speculative.spec_utils import (
             commit_mamba_states_after_verify,
             move_accept_tokens_to_target_kvcache,
+            relayed_commit_state_slots,
         )
 
         # Preserve the forward batch's row order after live-batch recomposition.
@@ -1366,6 +1367,7 @@ class SchedulerPPMixin:
                 accept_lens,
                 accept_index,
                 get_spec().speculative_num_draft_tokens,
+                state_slots=relayed_commit_state_slots(self.tp_worker, fwd_batch),
             )
 
         if verify_out_cache_loc is None:
