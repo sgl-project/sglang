@@ -1172,11 +1172,32 @@ impl ServerArgs {
         4.max(self.tokenizer_worker_num)
             .max(self.detokenizer_worker_num)
     }
+
+    /// Pinned tokenizer threads. Python's `--tokenizer-worker-num` defaults to
+    /// 1, which there still parallelizes encoding over a thread pool; here it
+    /// would leave one thread to render and encode every request, and long
+    /// prompts saturate it (~40 ms CPU per 16k-token prompt). Floored at 4.
+    pub fn tokenizer_thread_num(&self) -> usize {
+        4.max(self.tokenizer_worker_num)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tokenizer_threads_floor_at_four_and_honor_larger_counts() {
+        let threads = |n| {
+            ServerArgs {
+                tokenizer_worker_num: n,
+                ..Default::default()
+            }
+            .tokenizer_thread_num()
+        };
+        assert_eq!(threads(1), 4);
+        assert_eq!(threads(8), 8);
+    }
 
     #[test]
     fn bind_brackets_bare_ipv6() {

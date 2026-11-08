@@ -446,7 +446,7 @@ pub fn start(cfg: RuntimeConfig, http_layer: Option<HttpLayer>) -> Result<Runtim
         spawn_pool(
             "tokenizer",
             cpus,
-            cfg.server_args.tokenizer_worker_num,
+            cfg.server_args.tokenizer_thread_num(),
             &mut threads,
             |_i| {
                 tokenizer::TokenizerWorker::new(
