@@ -40,3 +40,4 @@ runner_configs:
   diffusion-bcg-1-gpu-h100:       { install: *diffusion, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-h100 }
   diffusion-component-2-gpu-h100: { install: *diffusion, artifact_version: v4, install_timeout: "20", runs_on: 2-gpu-h100 }
   diffusion-unit-1-gpu-h100:      { install: *diffusion, artifact_version: v4, install_timeout: "20", runs_on: 1-gpu-h100 }
+  diffusion-unit-1-gpu-b300:      { install: *diffusion, artifact_version: v6, install_timeout: "20", runs_on: 8-gpu-b300 }

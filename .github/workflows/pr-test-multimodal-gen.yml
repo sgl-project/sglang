@@ -187,6 +187,18 @@ jobs:
         uv pip install --no-deps comfy-kitchen==0.2.36
     secrets: inherit
 
+  multimodal-gen-unit-test-b300:
+    if: |
+      ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
+      inputs.multimodal_gen == 'true'
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
+    with:
+      runner_config: diffusion-unit-1-gpu-b300
+      caller_inputs: ${{ toJson(inputs) }}
+      job_timeout_minutes: 120
+      run_timeout_minutes: 60
+    secrets: inherit
+
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
     if: |
