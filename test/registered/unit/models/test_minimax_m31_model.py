@@ -297,8 +297,8 @@ class TestMiniMaxM31Rocm(CustomTestCase):
             _minimax_m3_overrides(rocm_server_args(attn_dp_size=2, **quark), MXFP8)
 
     def test_gfx950_keeps_custom_all_reduce_only_for_the_m31_quark_export(self):
-        """Custom all-reduce serves the M3.1 Quark export 11% faster at 8 requests; the
-        M3 export, whose linears are bf16, stays on NCCL."""
+        """Custom all-reduce is measured faster for the M3.1 Quark export; the M3 export,
+        whose linears are bf16, stays on NCCL."""
         with gfx950():
             m31 = _minimax_m3_overrides(
                 rocm_server_args(quantization="quark"), QUARK_M31

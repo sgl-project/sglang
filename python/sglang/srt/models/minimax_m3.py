@@ -2185,7 +2185,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: Set[str] = set()
-        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice.
+        # The Quark remap and scale alias below are ROCm-only, like Quark's MXFP8 loading.
         remap_llm_compressor_experts = (
             _is_hip
             and self.quant_config is not None

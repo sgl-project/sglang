@@ -432,7 +432,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         ):
             return
 
-        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
+        # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice.
+        # The Quark remap and scale alias are ROCm-only, like Quark's MXFP8 loading.
         if (
             _is_hip
             and self.quant_config is not None

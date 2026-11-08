@@ -1487,7 +1487,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 out_quant=out_quant,
             )
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        # the ROCm fused QK-norm/RoPE store already wrote K/V when it passes save_kv_cache=False
+        # ROCm: save_kv_cache=False means the fused QK-norm/RoPE store already wrote K/V
         kv_cached_by_fusion = (
             self.is_hip and not save_kv_cache
         ) or self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id)

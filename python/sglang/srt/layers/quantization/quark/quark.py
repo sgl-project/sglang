@@ -456,7 +456,8 @@ class QuarkConfig(QuantizationConfig):
         ):
             return None
 
-        # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as MXFP8
+        # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as
+        # MXFP8; ROCm only, so CUDA keeps its earlier handling of these checkpoints
         use_mxfp8 = (
             _is_hip
             and block_size == [1, 32]
@@ -593,6 +594,7 @@ class QuarkConfig(QuantizationConfig):
 
             from sglang.srt.layers.quantization.quark import mxfp8_base
 
+            # ROCm only: CUDA keeps raising for this source below
             if _is_hip and mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
                 return mxfp8_base.QuarkMxfp8BaseConfig.from_source(config, hf_config)
 
