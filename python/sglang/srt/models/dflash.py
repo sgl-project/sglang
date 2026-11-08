@@ -459,8 +459,8 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
         # Under DCP the draft pool keeps DCP owner rows like the target's
-        # (KVCacheConfigurator.draft_mla_rows_are_physical), so the layer runs
-        # the target's DCP decode path: gathered q, rank-local KV, LSE merge.
+        # (draft_loc_space_scale is 1), so the layer runs the target's DCP
+        # decode path: gathered q, rank-local KV, LSE merge.
         sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
