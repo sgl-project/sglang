@@ -1076,8 +1076,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     f"_get_k_bf16 received a {len(x)}-tuple; expected a plain tensor "
                     "or a 3-tuple (fp8, scale, bf16) from fused_rms_fp8_group_quant."
                 )
-        # Non-fusion path only; self.wk does not exist when fusion is on.
-        key, _ = self.wk(x)
+        if self.use_dsa_indexer_fusion:
+            key, _ = self._fused_k_weights(x)
+        else:
+            key, _ = self.wk(x)
         key = self.k_norm(key)
         if not self.skip_rope:
             k_rope, _ = torch.split(
@@ -1954,7 +1956,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 act_quant=act_quant,
                 out_cache_loc=out_cache_loc,
             )
-        elif self.use_dsa_indexer_fusion:
+        elif self.use_dsa_indexer_fusion and not is_cp_active(forward_batch):
             key_raw, _ = self._fused_k_weights(x)
             if num_tokens is not None:
                 assert num_tokens <= key_raw.shape[0]
@@ -1969,7 +1971,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 out_cache_loc=out_cache_loc,
             )
         else:
-            key = self._get_k_bf16(x, positions)
+            # Match the full Q/K path: restore global K before the cache write.
+            if is_cp_active(forward_batch):
+                key = self._get_k_bf16(x, positions, rotate=False)
+                key = self._maybe_rotate(key)
+                key = get_cp_strategy().materialize_full_indexer_k_cache(
+                    key, forward_batch
+                )
+            else:
+                key = self._get_k_bf16(x, positions)
             if num_tokens is not None:
                 assert num_tokens <= key.shape[0]
                 key = key[:num_tokens]
@@ -2199,7 +2209,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
 
         # Optimization: fast path when skipping topk computation
-        if skip_logits_computation and (not self.dsa_enable_prefill_cp):
+        if skip_logits_computation:
             topk_result = self._forward_cuda_k_only(
                 x,
                 positions,
