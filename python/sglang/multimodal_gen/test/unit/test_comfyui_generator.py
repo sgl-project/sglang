@@ -83,7 +83,7 @@ def test_rebuilt_worker_gets_this_runs_loras_not_the_previous_prompts() -> None:
             begin_sampler_run=lambda: None,
         )
         ex.set_lora = lambda **kw: (sent.append(kw), setattr(ex, "_lora_input", kw))
-        runtime.load_model = lambda **kwargs: setattr(runtime, "generator", object())
+        runtime.load_model = lambda **kwargs: _rebuild(runtime)
         runtime.ensure_executor(ex, lora_input=lora_input)
         return ex
 
@@ -99,9 +99,101 @@ def test_rebuilt_worker_gets_this_runs_loras_not_the_previous_prompts() -> None:
         begin_sampler_run=lambda: None,
     )
     ex.set_lora = lambda **kw: sent.append(kw)
-    runtime.load_model = lambda **kwargs: setattr(runtime, "generator", object())
+    runtime.load_model = lambda **kwargs: _rebuild(runtime)
     runtime.ensure_executor(ex)
     assert sent == [previous]
+
+
+def _rebuild(runtime):
+    """What load_model leaves behind when it starts a new worker."""
+    runtime.generator = SimpleNamespace(unmerge_lora_weights=Mock())
+    runtime.executor = SimpleNamespace(_lora_input=None, generator=runtime.generator)
+    runtime._worker_owner = runtime.executor
+
+
+def _cached_executor(lora_input, generator=None):
+    ex = SimpleNamespace(
+        generator=generator,
+        _sgld_reload={"model_path": "z.safetensors"},
+        _lora_input=lora_input,
+        begin_sampler_run=lambda: None,
+    )
+    ex.set_lora = Mock(side_effect=lambda **kw: setattr(ex, "_lora_input", kw))
+    return ex
+
+
+def test_executor_adopting_a_reused_worker_unmerges_its_owners_loras() -> None:
+    """load_model hands a stale executor the live worker of the same config; the
+    LoRA its owner applied is still on it and a no-LoRA run must remove it."""
+    runtime = SGLDiffusionGenerator()
+    gen = SimpleNamespace(unmerge_lora_weights=Mock())
+    owner_lora = {"lora_nickname": ["a"], "lora_path": ["a"]}
+    owner = _cached_executor(owner_lora, generator=gen)
+    runtime.generator, runtime._worker_owner = gen, owner
+    runtime.executor = owner  # behind the patcher load_model hands out
+    runtime.load_model = lambda **kwargs: None  # reuse: worker and owner unchanged
+    stale = _cached_executor(None, generator=object())
+
+    runtime.ensure_executor(stale, lora_input=None)
+
+    gen.unmerge_lora_weights.assert_called_once_with()
+    stale.set_lora.assert_not_called()
+    assert stale.generator is gen and stale._lora_input is None
+    # One owner per worker: the previous one rebinds before its next request.
+    assert runtime._worker_owner is stale and owner.generator is None
+    # The patcher load_model reuses still belongs to the owner's model.
+    assert runtime.executor is owner
+
+
+def test_executor_adopting_a_reused_worker_keeps_matching_loras() -> None:
+    runtime = SGLDiffusionGenerator()
+    gen = SimpleNamespace(unmerge_lora_weights=Mock())
+    lora = {"lora_nickname": ["a"], "lora_path": ["a"]}
+    runtime.generator, runtime._worker_owner = (
+        gen,
+        _cached_executor(lora, generator=gen),
+    )
+    runtime.load_model = lambda **kwargs: None
+    stale = _cached_executor(None, generator=object())
+
+    runtime.ensure_executor(stale, lora_input=dict(lora))
+
+    gen.unmerge_lora_weights.assert_not_called()
+    stale.set_lora.assert_not_called()
+    assert stale._lora_input == lora
+
+
+def test_executors_sharing_a_config_hand_the_worker_back_and_forth() -> None:
+    runtime = SGLDiffusionGenerator()
+    gen = SimpleNamespace(unmerge_lora_weights=Mock())
+    with_lora = {"lora_nickname": ["a"], "lora_path": ["a"]}
+    first = _cached_executor(None, generator=gen)
+    runtime.generator, runtime._worker_owner = gen, first
+    runtime._is_live = lambda: True
+    runtime.load_model = lambda **kwargs: None
+    first.set_lora(**with_lora)  # first's run applied a LoRA
+    second = _cached_executor(None, generator=object())
+
+    runtime.ensure_executor(second, lora_input=None)  # removes first's LoRA
+    runtime.ensure_executor(first, lora_input=with_lora)  # first takes it back
+    runtime.ensure_executor(second, lora_input=None)  # and it is removed again
+
+    assert gen.unmerge_lora_weights.call_count == 2
+    assert first.generator is None and second.generator is gen
+    assert second._lora_input is None
+
+
+def test_rebuilt_worker_unmerges_nothing() -> None:
+    runtime = SGLDiffusionGenerator()
+    lora = {"lora_nickname": ["c"], "lora_path": ["c"]}
+    runtime.load_model = lambda **kwargs: _rebuild(runtime)
+    stale = _cached_executor({"lora_nickname": ["a"], "lora_path": ["a"]}, object())
+
+    runtime.ensure_executor(stale, lora_input=lora)
+
+    runtime.generator.unmerge_lora_weights.assert_not_called()
+    stale.set_lora.assert_called_once_with(**lora)
+    assert runtime._worker_owner is stale
 
 
 def test_ensure_is_noop_when_executor_still_owns_live_worker() -> None:

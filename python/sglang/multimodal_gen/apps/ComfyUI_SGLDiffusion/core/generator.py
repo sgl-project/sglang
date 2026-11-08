@@ -107,6 +107,12 @@ def _looks_like_gguf(path: str) -> bool:
 # ensure_executor default: resend the adapters the executor last set.
 _LAST_LORA = object()
 
+
+def _applied(lora):
+    """The LoRA input as the worker sees it: None when it names no adapter."""
+    return lora if lora and lora.get("lora_nickname") else None
+
+
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
 NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
@@ -305,6 +311,9 @@ class SGLDiffusionGenerator:
         # Executor that sent the last request; differs from self.executor
         # after a cached executor rebuilt the worker.
         self._active_executor = None
+        # Executor whose adapter state the worker has; self.executor stays the
+        # one behind the patcher load_model hands out.
+        self._worker_owner = None
         self.model_type = None
         self.last_options = None
         self._patcher = None
@@ -507,8 +516,11 @@ class SGLDiffusionGenerator:
     def ensure_executor(self, executor, lora_input=_LAST_LORA) -> None:
         """Rebuild the worker if this cached executor no longer owns it.
 
-        The new worker gets ``lora_input``; by default (mid-run) the adapters
-        the executor last set.
+        The worker ends up with ``lora_input``; by default (mid-run) the
+        adapters the executor last set. ``load_model`` may hand back a live
+        worker built for the same config instead of a new one; that worker
+        still has the adapters its owner set, so they are taken over and
+        reconciled rather than assumed empty. One executor owns a worker.
         """
         self._active_executor = executor
         if self._owns_live(executor):
@@ -519,16 +531,29 @@ class SGLDiffusionGenerator:
                 "SGLD worker is down and this executor has no reload spec"
             )
         logger.info(
-            "Rebuilding SGLD worker for %s (previous worker was replaced or died)",
+            "Rebinding SGLD worker for %s (previous worker was replaced or died)",
             reload.get("model_path"),
         )
         self.load_model(**reload)
-        executor.generator = self.generator
         lora = executor._lora_input if lora_input is _LAST_LORA else lora_input
-        # The new worker has no adapters loaded.
-        executor._lora_input = None
-        if lora and lora.get("lora_nickname"):
-            executor.set_lora(**lora)
+        # After load_model the worker's owner is a fresh executor (no adapters)
+        # when it rebuilt, or the previous owner when it reused a live worker
+        # with the same config, whose adapters are still applied.
+        owner = self._worker_owner
+        on_worker = None
+        if owner is not None and owner is not executor:
+            on_worker = owner._lora_input
+            # It goes through ensure_executor again before its next request.
+            owner.generator = None
+        self._worker_owner = executor
+        executor.generator = self.generator
+        executor._lora_input = _applied(on_worker)
+        if _applied(lora) != _applied(on_worker):
+            if _applied(on_worker) is not None:
+                self.generator.unmerge_lora_weights()
+                executor._lora_input = None
+            if _applied(lora) is not None:
+                executor.set_lora(**lora)
         # The new worker's session cache starts empty, so conditioning the
         # old worker already had cannot be restored; resend it.
         executor.begin_sampler_run()
@@ -565,6 +590,7 @@ class SGLDiffusionGenerator:
         self.generator = None
         self.executor = None
         self._active_executor = None
+        self._worker_owner = None
         self.model_type = None
         self._patcher = None
 
@@ -754,6 +780,7 @@ class SGLDiffusionGenerator:
         _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
+        self._worker_owner = self.executor
         comfyui_model.diffusion_model = self.executor
 
         from comfy import model_management
