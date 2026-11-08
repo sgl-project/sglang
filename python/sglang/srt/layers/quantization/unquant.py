@@ -12,6 +12,12 @@ import torch.nn.functional as F
 from torch.nn.parameter import Parameter
 
 from sglang.kernels.fused_op import BaseFusedOp
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    maybe_skinny_gemm as _maybe_skinny_gemm,
+)
+from sglang.kernels.ops.gemm.sm121_skinny_gemm import (
+    sm121_skinny_enabled as _sm121_skinny_enabled,
+)
 from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.environ import envs
 from sglang.srt.layers.amx_utils import (
@@ -365,13 +371,42 @@ def _bf16_low_m_autotune(
     return None
 
 
+def _bf16_low_m_sm121(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """sm_121 (GB10): M <= 16 through the skinny GEMM when (N, K, M) has a plan.
+
+    cuBLAS serves these shapes with SM80 WMMA kernels on sm_121, and the
+    FlashInfer low-M autotune path above is SM100/SM103 only. None if not taken.
+    """
+    if bias is not None or not x.is_cuda or not _sm121_skinny_enabled():
+        return None
+    return _maybe_skinny_gemm(x, weight, out=out)
+
+
+def _bf16_low_m(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Low-M BF16 GEMM routes, by architecture; None if none of them takes it."""
+    output = _bf16_low_m_autotune(x, weight, bias, out=out)
+    if output is None:
+        output = _bf16_low_m_sm121(x, weight, bias, out=out)
+    return output
+
+
 def _bf16_gemm_dispatch_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    output = _bf16_low_m_autotune(x, weight, bias)
+    output = _bf16_low_m(x, weight, bias)
     if output is not None:
         return output if addend is None else output.add_(addend)
     m = x.numel() // x.shape[-1]
@@ -668,6 +703,9 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        output = _bf16_low_m_sm121(x, layer.weight, bias)
+        if output is not None:
+            return output
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
@@ -702,7 +740,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and output.dtype == torch.bfloat16
             and output.is_contiguous()
             and output.shape == (x.shape[0], layer.weight.shape[0])
-            and _bf16_low_m_autotune(x, layer.weight, bias, out=output) is not None
+            and _bf16_low_m(x, layer.weight, bias, out=output) is not None
         ):
             return output
         if (
