@@ -656,7 +656,6 @@ class DeepseekSparseAttnBackend(
             model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         )
         self.num_q_heads = self.local_num_q_heads * sharded_dcp_size
-        # sizes the trtllm multi-CTA counters, so it covers the padded heads
         self.num_dcp_q_heads = _trtllm_padded_heads(
             self.local_num_q_heads * self.attn_dcp_size
         )
@@ -4169,19 +4168,14 @@ class DeepseekSparseAttnBackend(
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
-        # Kimi-K3.1 sharded DCP: decode / target verify attend over this rank's
-        # KV and return a partial for the merge; prefill attends over the
-        # gathered KV.
+        # Sharded DCP: decode and verify return a partial; prefill reads gathered KV.
         sharded_dcp = self.dsa_shards_index_k
         dcp_partial = sharded_dcp and (
             not is_prefill or forward_batch.forward_mode.is_target_verify()
         )
         replicated_dcp = self.attn_dcp_size > 1 and not sharded_dcp
         if (dcp_partial or replicated_dcp) and get_in_autotune_dummy_run():
-            # Like dense MLA, skip attention only when this warmup discards its
-            # output. FlashInfer's nested tuning expands synthetic batches past
-            # our workspace-bounded chunks, overflowing the full-head DCP slab.
-            # Real requests, graph capture, and gathered-KV prefill still attend.
+            # Discarded warmup: nested FlashInfer tuning overflows the DCP slab.
             return (
                 torch.zeros(
                     (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
@@ -4341,8 +4335,6 @@ class DeepseekSparseAttnBackend(
                 page_size=1,
             )
         if dcp_partial:
-            # Global top-k slots -> this rank's rows at the front, -1 after;
-            # trtllm-gen reads seq_lens entries, so pass the owned count.
             page_table_1, seq_lens = dcp_localize_compact(page_table_1)
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
