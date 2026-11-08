@@ -3326,10 +3326,6 @@ class KVCacheConfigurator:
                 ),
                 frozen=frozen,
             )
-        # PP stages select batches independently, so the synchronized share is
-        # also a live admission cap, even on the stage already at the minimum.
-        full_cap = full if get_parallel().pp_size > 1 else None
-        sized = msgspec.structs.replace(sized, full_cap_tokens=full_cap)
         self._unified_sized = sized
         return MemoryPoolConfig(
             max_total_num_tokens=sized.full_tokens,
