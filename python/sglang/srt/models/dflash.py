@@ -72,6 +72,10 @@ if _is_gfx95:
         rowmajor_gemm_applies,
         rowmajor_gemm_partials,
     )
+    from sglang.kernels.ops.gemm.muse_spark_width_gemm import (
+        width_gemm,
+        width_gemm_applies,
+    )
     from sglang.kernels.ops.speculative.dflash_candidates import (
         MAX_PACKED_ID,
         merge_candidates,
@@ -138,7 +142,10 @@ def _project_candidate_logits(
             and weight.dtype == torch.bfloat16
         ):
             return bf16_gemm_dispatch(hidden, weight[:num_org], None)
-        return torch.matmul(hidden, weight[:num_org].T)
+        head = weight[:num_org]
+        if _is_gfx95 and width_gemm_applies(hidden, head):
+            return width_gemm(hidden, head)
+        return torch.matmul(hidden, head.T)
     # A packed weight can't be row-sliced to the org vocab like the dense path,
     # and flashinfer's radix top-k rejects the crop view (non-contiguous), so
     # mask the padded tail out of the top-k instead.

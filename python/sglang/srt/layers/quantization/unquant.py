@@ -93,6 +93,10 @@ if _is_gfx95:
     from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
         quantize_weight as quantize_fp8w_weight,
     )
+    from sglang.kernels.ops.gemm.muse_spark_width_gemm import (
+        width_gemm,
+        width_gemm_applies,
+    )
 
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
@@ -892,6 +896,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
         ):
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
+            if _is_gfx95 and bias is None and width_gemm_applies(x, layer.weight):
+                return width_gemm(x, layer.weight)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (

@@ -2285,6 +2285,9 @@ class Envs:
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
     SGLANG_MUSE_DENSE_TUNED = EnvBool(True)
+    # Exact-width hipBLASLt picks (kernels/ops/gemm/muse_spark_width_gemm.py) for the BF16 GEMMs the decode / verify
+    # graphs otherwise run on aiter tgemm, F.linear or torch.mm (TP8 target and DFlash draft linears, lm heads).
+    SGLANG_MUSE_WIDTH_GEMM = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(

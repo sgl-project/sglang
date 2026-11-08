@@ -1,0 +1,519 @@
+{
+ "_meta": {
+  "rocm": "7.2.26015-fc0010cf6a",
+  "note": "Exact-width hipBLASLt solution picks for the Muse Spark TP8 BF16 GEMMs that the decode / verify graphs run on the default library path. Solutions from cold-weight sweeps of every hipBLASLt solution; each row kept only if it is at least 3% faster than the path the branch takes at that width (cold weights, graph replay, MI355X), with the mean error vs an fp64 reference no larger. Solution indices are only valid for this ROCm build."
+ },
+ "1280,8192,bf16": {
+  "96": [
+   "hipblaslt",
+   438761,
+   ""
+  ],
+  "112": [
+   "hipblaslt",
+   438761,
+   ""
+  ],
+  "128": [
+   "hipblaslt",
+   438761,
+   ""
+  ],
+  "144": [
+   "hipblaslt",
+   438757,
+   ""
+  ],
+  "160": [
+   "hipblaslt",
+   438757,
+   ""
+  ],
+  "208": [
+   "hipblaslt",
+   438829,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   438559,
+   ""
+  ],
+  "256": [
+   "hipblaslt",
+   438954,
+   ""
+  ],
+  "320": [
+   "hipblaslt",
+   439453,
+   ""
+  ],
+  "352": [
+   "hipblaslt",
+   438765,
+   ""
+  ],
+  "384": [
+   "hipblaslt",
+   438628,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   439119,
+   ""
+  ],
+  "448": [
+   "hipblaslt",
+   439119,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   439119,
+   ""
+  ],
+  "512": [
+   "hipblaslt",
+   439453,
+   ""
+  ]
+ },
+ "2048,8192,bf16": {
+  "144": [
+   "hipblaslt",
+   438829,
+   ""
+  ],
+  "160": [
+   "hipblaslt",
+   438499,
+   ""
+  ],
+  "176": [
+   "hipblaslt",
+   438829,
+   ""
+  ],
+  "192": [
+   "hipblaslt",
+   439390,
+   ""
+  ],
+  "208": [
+   "hipblaslt",
+   438500,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   439116,
+   ""
+  ],
+  "240": [
+   "hipblaslt",
+   438904,
+   ""
+  ],
+  "256": [
+   "hipblaslt",
+   439116,
+   ""
+  ],
+  "320": [
+   "hipblaslt",
+   439178,
+   ""
+  ],
+  "352": [
+   "hipblaslt",
+   438896,
+   ""
+  ],
+  "384": [
+   "hipblaslt",
+   438627,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   439179,
+   ""
+  ],
+  "448": [
+   "hipblaslt",
+   439455,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   439455,
+   ""
+  ],
+  "512": [
+   "hipblaslt",
+   439107,
+   ""
+  ]
+ },
+ "2304,8192,bf16": {
+  "96": [
+   "hipblaslt",
+   440156,
+   ""
+  ],
+  "112": [
+   "hipblaslt",
+   439648,
+   ""
+  ],
+  "128": [
+   "hipblaslt",
+   438954,
+   ""
+  ],
+  "144": [
+   "hipblaslt",
+   438171,
+   ""
+  ],
+  "192": [
+   "hipblaslt",
+   438171,
+   ""
+  ],
+  "240": [
+   "hipblaslt",
+   438628,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   439119,
+   ""
+  ],
+  "448": [
+   "hipblaslt",
+   439119,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   439119,
+   ""
+  ]
+ },
+ "7168,8192,bf16": {
+  "80": [
+   "hipblaslt",
+   438420,
+   ""
+  ],
+  "96": [
+   "torch",
+   0,
+   ""
+  ],
+  "112": [
+   "hipblaslt",
+   438700,
+   ""
+  ],
+  "128": [
+   "hipblaslt",
+   438974,
+   ""
+  ],
+  "144": [
+   "hipblaslt",
+   439124,
+   ""
+  ],
+  "160": [
+   "hipblaslt",
+   439571,
+   ""
+  ],
+  "176": [
+   "hipblaslt",
+   438828,
+   ""
+  ],
+  "192": [
+   "hipblaslt",
+   439562,
+   ""
+  ],
+  "208": [
+   "hipblaslt",
+   440083,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   440083,
+   ""
+  ],
+  "240": [
+   "hipblaslt",
+   439457,
+   ""
+  ],
+  "256": [
+   "hipblaslt",
+   439457,
+   ""
+  ],
+  "320": [
+   "hipblaslt",
+   439180,
+   ""
+  ],
+  "352": [
+   "hipblaslt",
+   439183,
+   ""
+  ],
+  "384": [
+   "hipblaslt",
+   440092,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   440091,
+   ""
+  ],
+  "448": [
+   "hipblaslt",
+   440091,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   440077,
+   ""
+  ],
+  "512": [
+   "hipblaslt",
+   440090,
+   ""
+  ]
+ },
+ "8192,1024,bf16": {
+  "448": [
+   "hipblaslt",
+   438986,
+   ""
+  ]
+ },
+ "8192,3584,bf16": {
+  "80": [
+   "hipblaslt",
+   439014,
+   ""
+  ],
+  "144": [
+   "hipblaslt",
+   440222,
+   ""
+  ],
+  "160": [
+   "hipblaslt",
+   440222,
+   ""
+  ],
+  "176": [
+   "hipblaslt",
+   438828,
+   ""
+  ],
+  "192": [
+   "hipblaslt",
+   438828,
+   ""
+  ],
+  "208": [
+   "hipblaslt",
+   438831,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   438700,
+   ""
+  ],
+  "240": [
+   "hipblaslt",
+   439118,
+   ""
+  ],
+  "320": [
+   "hipblaslt",
+   438833,
+   ""
+  ],
+  "352": [
+   "hipblaslt",
+   438278,
+   ""
+  ],
+  "384": [
+   "hipblaslt",
+   438500,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   439118,
+   ""
+  ],
+  "448": [
+   "hipblaslt",
+   438638,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   439118,
+   ""
+  ],
+  "512": [
+   "hipblaslt",
+   439118,
+   ""
+  ]
+ },
+ "8192,4096,bf16": {
+  "448": [
+   "hipblaslt",
+   438700,
+   ""
+  ],
+  "480": [
+   "hipblaslt",
+   439118,
+   ""
+  ],
+  "512": [
+   "hipblaslt",
+   439118,
+   ""
+  ]
+ },
+ "25256,8192,bf16": {
+  "7": [
+   "hipblaslt",
+   439083,
+   ""
+  ],
+  "21": [
+   "hipblaslt",
+   439668,
+   ""
+  ],
+  "28": [
+   "hipblaslt",
+   438689,
+   ""
+  ],
+  "49": [
+   "hipblaslt",
+   438692,
+   ""
+  ],
+  "56": [
+   "hipblaslt",
+   438692,
+   ""
+  ],
+  "70": [
+   "hipblaslt",
+   439293,
+   ""
+  ],
+  "84": [
+   "hipblaslt",
+   439293,
+   ""
+  ],
+  "98": [
+   "hipblaslt",
+   438974,
+   ""
+  ],
+  "112": [
+   "hipblaslt",
+   438974,
+   ""
+  ],
+  "126": [
+   "hipblaslt",
+   438974,
+   ""
+  ],
+  "182": [
+   "hipblaslt",
+   438846,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   439553,
+   ""
+  ],
+  "280": [
+   "hipblaslt",
+   439555,
+   ""
+  ],
+  "336": [
+   "hipblaslt",
+   440068,
+   ""
+  ]
+ },
+ "25256,8192,f32": {
+  "8": [
+   "hipblaslt",
+   442262,
+   ""
+  ],
+  "16": [
+   "hipblaslt",
+   442259,
+   ""
+  ],
+  "24": [
+   "hipblaslt",
+   442247,
+   ""
+  ],
+  "32": [
+   "hipblaslt",
+   442247,
+   ""
+  ],
+  "192": [
+   "hipblaslt",
+   442133,
+   ""
+  ],
+  "224": [
+   "hipblaslt",
+   442132,
+   ""
+  ],
+  "256": [
+   "hipblaslt",
+   442131,
+   ""
+  ],
+  "416": [
+   "hipblaslt",
+   442132,
+   ""
+  ]
+ }
+}

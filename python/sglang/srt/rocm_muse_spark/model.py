@@ -47,6 +47,11 @@ from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
 from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
     quantize_weight as quantize_fp8w_weight,
 )
+from sglang.kernels.ops.gemm.muse_spark_width_gemm import (
+    enable_width_gemm,
+    width_gemm,
+    width_gemm_applies,
+)
 from sglang.kernels.ops.gemm.router_gemm_fp32 import (
     router_gemm_tuned,
     router_gemv_fp32,
@@ -133,11 +138,11 @@ class MuseSpark1xLogitsProcessor(OSSLogitsProcessor):
                 hidden_states, lm_head, embedding_bias, out=out
             )
         output_dtype = torch.float32 if self.use_fp32_output else lm_head.weight.dtype
-        logits = torch.mm(
-            hidden_states.to(lm_head.weight.dtype),
-            lm_head.weight.T,
-            out_dtype=output_dtype,
-        )
+        hidden_states = hidden_states.to(lm_head.weight.dtype)
+        if width_gemm_applies(hidden_states, lm_head.weight, output_dtype):
+            logits = width_gemm(hidden_states, lm_head.weight, output_dtype)
+        else:
+            logits = torch.mm(hidden_states, lm_head.weight.T, out_dtype=output_dtype)
         if embedding_bias is not None:
             logits = logits + embedding_bias
         return logits
@@ -478,6 +483,8 @@ def _dense_linear(
         and _get_tgemm()
     ):
         return _tgemm.mm(x, linear.weight, None, otype=torch.bfloat16)
+    if linear.bias is None and width_gemm_applies(x, linear.weight):
+        return width_gemm(x, linear.weight)
     return linear(x)
 
 
@@ -1826,6 +1833,8 @@ class MuseSparkTextForCausalLM(nn.Module):
             fp8_weights=fp8_shapes if _DENSE_FP8 else (),
             triton_a16w16=_DRAFT_TRITON_A16W16_GEMMS,
         )
+        if envs.SGLANG_MUSE_WIDTH_GEMM.get():
+            enable_width_gemm()
         if getattr(config, "inference_moe_w13_interleaved", False):
             raise ValueError("Interleaved expert checkpoints are not supported")
         quant_name = _quantization_name(quant_config)
