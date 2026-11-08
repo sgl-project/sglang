@@ -3,8 +3,8 @@
 This first implementation gathers the existing post-RoPE index queries rather
 than changing checkpoint loading or fused projections. The query gather goes through
 SGLang's communicator so AITER registration and graph capture remain owned by
-the runtime; the candidates return through an IPC exchange by default, or a second
-gather. Communication cost must be included in performance comparisons.
+the runtime; the candidates return through a second gather, or on the NVFP4 index cache
+through an IPC exchange. Communication cost must be included in performance comparisons.
 """
 
 import logging
@@ -13,11 +13,9 @@ import torch
 
 logger = logging.getLogger(__name__)
 
-# Verify batches below this many requests keep the native indexer: there the per-layer
-# exchange costs more than the index-K reads CP saves (TP4, under graph replay). The
-# IPC candidate exchange plus a Q gather breaks even far earlier than two gathers.
-CP_MIN_VERIFY_REQS = 48
-CP_MIN_VERIFY_REQS_IPC = 12
+# NVFP4 verify batches below this many requests keep the native indexer: there the Q
+# gather and candidate exchange cost more than the index-K reads CP saves (TP4, graphs)
+CP_MIN_VERIFY_REQS = 12
 
 
 def unsupported_reason(
@@ -130,7 +128,7 @@ def make_indexer_cp(backend, runner, sparse_cfg):
         return None
     cp = MiniMaxIndexerCP(parallel.attn_tp_group)
     # only the NVFP4 index cache reads the exchange; it is a collective on every rank
-    if backend.kv_is_nvfp4 and envs.SGLANG_MINIMAX_M3_INDEXER_CP_IPC.get():
+    if backend.kv_is_nvfp4:
         from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
             CpExchange,
         )
@@ -189,18 +187,15 @@ class MiniMaxIndexerCP:
                 can_fuse_verify_topk,
             )
 
-            min_reqs = (
-                CP_MIN_VERIFY_REQS if self.exchange is None else CP_MIN_VERIFY_REQS_IPC
-            )
             return (
                 common
                 and packed_queries > 1
                 and q.shape[0] % packed_queries == 0
-                and q.shape[0] // packed_queries >= min_reqs
+                and q.shape[0] // packed_queries >= CP_MIN_VERIFY_REQS
                 # the fused verify indexer scores all four heads' rows in one 32-row tile
                 and packed_queries * 4 <= 32
                 # the exchange's receive buffers hold CP_MAX_ROWS rows per head
-                and (self.exchange is None or q.shape[0] <= CP_MAX_ROWS)
+                and q.shape[0] <= CP_MAX_ROWS
                 and can_fuse_verify_topk(
                     q, k_cache, packed_queries, 16, local_blocks, k_cache.page_size, 128
                 )
@@ -240,8 +235,6 @@ class MiniMaxIndexerCP:
         )
         from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
             cp_verify_exchange,
-            cp_verify_local_keys,
-            cp_verify_merge,
         )
 
         batch = q.shape[0]
@@ -253,28 +246,10 @@ class MiniMaxIndexerCP:
         self.group.all_gather_into_tensor(gathered_q, local_q)
         q_heads = gathered_q.view(world, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
-        nvfp4 = isinstance(k_cache, Nvfp4Cache)
-        if nvfp4:
-            # verify_topk_idx's NVFP4 scale folding, so scores match it exactly
-            nvfp4_sm_scale = sm_scale * unit_scale(q_scale) * unit_scale(k_scale)
-            if self.exchange is not None:
-                # candidates delivered straight to each head's owner; no collective
-                return cp_verify_exchange(
-                    q_heads=q_heads,
-                    k_cache=k_cache,
-                    req_to_token=req_to_token,
-                    seq_lens=seq_lens,
-                    max_seqlen=max_seqlen,
-                    slot_ids=slot_ids,
-                    num_draft=packed_queries,
-                    block_size=128,
-                    topk=16,
-                    init_blocks=init_blocks,
-                    local_blocks=local_blocks,
-                    sm_scale=nvfp4_sm_scale,
-                    exchange=self.exchange,
-                )
-            keys = cp_verify_local_keys(
+        if isinstance(k_cache, Nvfp4Cache):
+            # candidates go straight to each head's owner; verify_topk_idx's NVFP4 scale
+            # folding, so scores match it exactly
+            return cp_verify_exchange(
                 q_heads=q_heads,
                 k_cache=k_cache,
                 req_to_token=req_to_token,
@@ -283,29 +258,28 @@ class MiniMaxIndexerCP:
                 slot_ids=slot_ids,
                 num_draft=packed_queries,
                 block_size=128,
+                topk=16,
                 init_blocks=init_blocks,
                 local_blocks=local_blocks,
-                sm_scale=nvfp4_sm_scale,
-                world=world,
-                rank=self.rank,
+                sm_scale=sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
+                exchange=self.exchange,
             )
-        else:
-            sm_scale *= 1.0 if q_scale is None else q_scale
-            scores = score_local_blocks(
-                q_heads,
-                k_cache,
-                req_to_token,
-                slot_ids,
-                seq_lens,
-                max_seqlen,
-                self.rank,
-                init_blocks,
-                local_blocks,
-                sm_scale,
-                1.0 if k_scale is None else k_scale,
-                packed_queries=packed_queries,
-            )
-            keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
+        sm_scale *= 1.0 if q_scale is None else q_scale
+        scores = score_local_blocks(
+            q_heads,
+            k_cache,
+            req_to_token,
+            slot_ids,
+            seq_lens,
+            max_seqlen,
+            self.rank,
+            init_blocks,
+            local_blocks,
+            sm_scale,
+            1.0 if k_scale is None else k_scale,
+            packed_queries=packed_queries,
+        )
+        keys = select_local_candidates(scores, seq_lens, self.rank, max_seqlen)
         received = torch.empty(
             (world, world, batch, 16), dtype=torch.int64, device=q.device
         )
@@ -315,16 +289,4 @@ class MiniMaxIndexerCP:
             received.view(torch.float32).view(world * world * batch, 32),
             keys.view(torch.float32).view(world * batch, 32),
         )
-        if nvfp4:
-            return cp_verify_merge(
-                gathered_keys=received,
-                head=self.rank,
-                seq_lens=seq_lens,
-                max_seqlen=max_seqlen,
-                req_to_token=req_to_token,
-                block_size=128,
-                topk=16,
-                init_blocks=init_blocks,
-                local_blocks=local_blocks,
-            )
         return merge_candidates(received, self.rank)

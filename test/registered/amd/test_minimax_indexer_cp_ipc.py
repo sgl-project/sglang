@@ -1,6 +1,6 @@
 """The IPC candidate exchange must deliver each head's native NVFP4 verify selection
-on four ranks, across call counters and their wrap, row-count changes and
-CUDA-graph replay."""
+on four ranks, for DSpark's 8-row and EAGLE's 4-row chains, tied scores and rows shorter
+than top-k, across call counters and their wrap, row-count changes and graph replay."""
 
 import multiprocessing
 import types
@@ -18,13 +18,59 @@ from sglang.test.test_utils import CustomTestCase
 register_amd_ci(est_time=60, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 WORLD = 4
-NUM_DRAFT, SM_SCALE, K_SCALE = 8, 0.07, 0.5
+BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
+SM_SCALE, K_SCALE = 0.07, 0.5
 CALLS = 5
+# (requests, draft rows, tied pages, init blocks, local blocks): init != local so a
+# swapped argument shows; the second case also has rows shorter than top-k
+CASES = ((64, 8, False, 2, 1), (17, 4, True, 0, 1))
+
+
+def _nvfp4_verify_inputs(prefixes, num_draft, seed, tied_pages=False):
+    """DSpark verify rows over a shuffled NVFP4 index-K pool of whole 128-token pages.
+
+    With ``tied_pages`` most pages copy page 1, so most blocks tie.
+    """
+    from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
+    from sglang.test.quant_ref_utils import nvfp4_kv_quantize
+
+    device = torch.device("cuda")
+    gen = torch.Generator(device=device).manual_seed(seed)
+    max_len = max(prefixes) + num_draft
+    pages_per_req = -(-max_len // BLOCK)
+    num_pages = len(prefixes) * pages_per_req
+    pages = torch.randperm(num_pages, device=device, generator=gen) + 1
+    offs = torch.arange(BLOCK, device=device)
+    table = (
+        (pages.view(len(prefixes), pages_per_req, 1) * BLOCK + offs)
+        .view(len(prefixes), -1)[:, :max_len]
+        .to(torch.int32)
+    )
+    k = torch.randn((num_pages + 1) * BLOCK, DIM, device=device, generator=gen)
+    if tied_pages:
+        k_pages = k.view(num_pages + 1, BLOCK * DIM)
+        rare = torch.arange(num_pages + 1, device=device) % 13 == 0
+        k_pages.copy_(k_pages[1 + rare.long()])
+    payload, scales = nvfp4_kv_quantize(
+        k.to(torch.bfloat16), torch.ones(1, device=device)
+    )
+    cache = Nvfp4Cache(
+        payload=payload.view(num_pages + 1, BLOCK, DIM // 2),
+        scales=scales.view(num_pages + 1, BLOCK, DIM // 16),
+    )
+    rows = len(prefixes) * num_draft
+    q = torch.randn(rows, HEADS, DIM, device=device, generator=gen).to(torch.bfloat16)
+    lengths = torch.tensor(
+        [p + j + 1 for p in prefixes for j in range(num_draft)],
+        dtype=torch.int64,
+        device=device,
+    )
+    slots = torch.arange(len(prefixes), device=device).repeat_interleave(num_draft)
+    # graph capture sizes the score columns past the real lengths
+    return q, cache, table, slots, lengths, max_len + 4 * BLOCK
 
 
 def _run_exchange(rank: int, port: int) -> None:
-    from test_minimax_indexer_cp import BLOCK, TOPK, _nvfp4_verify_inputs
-
     from sglang.kernels.ops.attention.minimax_sparse.decode import verify_topk_idx
     from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
         CpExchange,
@@ -45,10 +91,12 @@ def _run_exchange(rank: int, port: int) -> None:
         )
         exchange = CpExchange(group, device)
         # every rank builds the same pool; a call's row count changes between cases
-        for seed, num_reqs in enumerate((64, 17)):
+        for seed, (num_reqs, num_draft, tied, init, local) in enumerate(CASES):
             prefixes = [20000 - 97 * r - 1000 * seed for r in range(num_reqs)]
+            if num_reqs > 5:
+                prefixes[3], prefixes[5] = 3 * BLOCK - 2, 777  # <= top-k blocks
             q, cache, table, slots, lengths, _ = _nvfp4_verify_inputs(
-                prefixes, NUM_DRAFT, seed=seed
+                prefixes, num_draft, seed=seed, tied_pages=tied
             )
             max_len = table.shape[1]
             # distinct queries per call, so a word left from an earlier call never
@@ -66,11 +114,11 @@ def _run_exchange(rank: int, port: int) -> None:
                     seq_lens=lengths,
                     max_seqlen=max_len,
                     slot_ids=slots,
-                    num_draft=NUM_DRAFT,
+                    num_draft=num_draft,
                     block_size=BLOCK,
                     topk=TOPK,
-                    init_blocks=0,
-                    local_blocks=1,
+                    init_blocks=init,
+                    local_blocks=local,
                     sm_scale=SM_SCALE,
                     q_scale=None,
                     k_scale=K_SCALE,
@@ -82,8 +130,8 @@ def _run_exchange(rank: int, port: int) -> None:
 
             def exchange_call():
                 return cp_verify_exchange(
-                    q_heads, cache, table, lengths, max_len, slots, NUM_DRAFT,
-                    BLOCK, TOPK, 0, 1, SM_SCALE * K_SCALE, exchange,
+                    q_heads, cache, table, lengths, max_len, slots, num_draft,
+                    BLOCK, TOPK, init, local, SM_SCALE * K_SCALE, exchange,
                 )  # fmt: skip
 
             # seed 1 starts two calls short of the counters' wrap at 510

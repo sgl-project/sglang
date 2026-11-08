@@ -7,7 +7,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
@@ -101,50 +101,6 @@ def _cp_topk(q, cache, table, slots, lengths, max_len, k_scale, packed_queries=1
     return [merge_candidates(gathered_keys, head) for head in range(HEADS)]
 
 
-def _nvfp4_verify_inputs(prefixes, num_draft, seed, tied_pages=False):
-    """DSpark verify rows over a shuffled NVFP4 index-K pool of whole 128-token pages.
-
-    With ``tied_pages`` most pages copy page 1, so most blocks tie.
-    """
-    from sglang.kernels.ops.attention.minimax_sparse.common.nvfp4 import Nvfp4Cache
-    from sglang.test.quant_ref_utils import nvfp4_kv_quantize
-
-    device = torch.device("cuda")
-    gen = torch.Generator(device=device).manual_seed(seed)
-    max_len = max(prefixes) + num_draft
-    pages_per_req = -(-max_len // BLOCK)
-    num_pages = len(prefixes) * pages_per_req
-    pages = torch.randperm(num_pages, device=device, generator=gen) + 1
-    offs = torch.arange(BLOCK, device=device)
-    table = (
-        (pages.view(len(prefixes), pages_per_req, 1) * BLOCK + offs)
-        .view(len(prefixes), -1)[:, :max_len]
-        .to(torch.int32)
-    )
-    k = torch.randn((num_pages + 1) * BLOCK, DIM, device=device, generator=gen)
-    if tied_pages:
-        k_pages = k.view(num_pages + 1, BLOCK * DIM)
-        rare = torch.arange(num_pages + 1, device=device) % 13 == 0
-        k_pages.copy_(k_pages[1 + rare.long()])
-    payload, scales = nvfp4_kv_quantize(
-        k.to(torch.bfloat16), torch.ones(1, device=device)
-    )
-    cache = Nvfp4Cache(
-        payload=payload.view(num_pages + 1, BLOCK, DIM // 2),
-        scales=scales.view(num_pages + 1, BLOCK, DIM // 16),
-    )
-    rows = len(prefixes) * num_draft
-    q = torch.randn(rows, HEADS, DIM, device=device, generator=gen).to(torch.bfloat16)
-    lengths = torch.tensor(
-        [p + j + 1 for p in prefixes for j in range(num_draft)],
-        dtype=torch.int64,
-        device=device,
-    )
-    slots = torch.arange(len(prefixes), device=device).repeat_interleave(num_draft)
-    # graph capture sizes the score columns past the real lengths
-    return q, cache, table, slots, lengths, max_len + 4 * BLOCK
-
-
 @unittest.skipUnless(
     is_hip() and is_gfx95_supported(), "MiniMax indexer CP is gfx950-only"
 )
@@ -208,85 +164,6 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
                     self.assertTrue(
                         torch.equal(packed[head], native),
                         f"head {head}: {(packed[head] != native).sum()} IDs differ",
-                    )
-
-    def test_nvfp4_dspark_verify_rows_match_the_native_selector(self):
-        """On M3.1's NVFP4 index-K pool, sharded verify scoring must select exactly what
-        the native fused verify does, for DSpark's 8-row and EAGLE's 4-row chains."""
-        from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
-            unit_scale,
-        )
-        from sglang.kernels.ops.attention.minimax_sparse.decode import (
-            verify_topk_idx as verify_module,
-        )
-        from sglang.kernels.ops.attention.minimax_sparse.decode.verify_topk_gfx950 import (
-            cp_verify_local_keys,
-            cp_verify_merge,
-        )
-
-        sm_scale, k_scale = 0.07, 0.5
-        # tied scores and rows shorter than top-k; init != local so a swap shows
-        init_blocks, local_blocks, num_reqs = 2, 1, 17
-        for num_draft in (8, 4):
-            prefixes = [BLOCK * (60 + 37 * (r % 8)) - r for r in range(num_reqs)]
-            prefixes[3], prefixes[5] = 3 * BLOCK - 2, 777  # <= top-k blocks
-            q, cache, table, slots, lengths, max_len = _nvfp4_verify_inputs(
-                prefixes, num_draft, seed=num_reqs, tied_pages=True
-            )
-            q_scale = None
-            gathered_q = q.permute(1, 0, 2).contiguous()
-            keys = [
-                cp_verify_local_keys(
-                    gathered_q,
-                    cache,
-                    table,
-                    lengths,
-                    max_len,
-                    slots,
-                    num_draft,
-                    BLOCK,
-                    init_blocks,
-                    local_blocks,
-                    sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
-                    HEADS,
-                    rank,
-                )
-                for rank in range(HEADS)
-            ]
-            gathered_keys = torch.stack(keys, dim=0)
-            for head in range(HEADS):
-                with self.subTest(num_draft=num_draft, head=head):
-                    native = verify_module.verify_topk_idx(
-                        q=q[:, head : head + 1].contiguous(),
-                        k_cache=cache,
-                        req_to_token=table,
-                        seq_lens=lengths,
-                        max_seqlen=max_len,
-                        slot_ids=slots,
-                        num_draft=num_draft,
-                        block_size=BLOCK,
-                        topk=TOPK,
-                        init_blocks=init_blocks,
-                        local_blocks=local_blocks,
-                        sm_scale=sm_scale,
-                        q_scale=q_scale,
-                        k_scale=k_scale,
-                        page_size=BLOCK,
-                    )
-                    cp = cp_verify_merge(
-                        gathered_keys,
-                        head,
-                        lengths,
-                        max_len,
-                        table,
-                        BLOCK,
-                        TOPK,
-                        init_blocks,
-                        local_blocks,
-                    )
-                    self.assertTrue(
-                        torch.equal(cp, native),
-                        f"{(cp != native).sum()} IDs differ",
                     )
 
 

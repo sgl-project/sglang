@@ -760,74 +760,6 @@ def fused_verify_topk_idx(
     return out
 
 
-@triton.jit
-def _cp_local_keys_kernel(
-    part_k_ptr,  # [num_heads * rows, NC] int64 keys of a request's splits
-    part_n_ptr,  # [num_reqs] splits of each request
-    keys_ptr,  # [num_heads * rows, KP] int64: the best KP, best first, _NO_KEY empty
-    rows,
-    stride_p,
-    NUM_DRAFT: tl.constexpr,
-    KP: tl.constexpr,
-    NC: tl.constexpr,
-):
-    """One rank's split lists reduced to its best KP candidates, forced blocks excluded.
-
-    These are what the native merge would pick from were they all the blocks.
-    """
-    r = tl.program_id(0)
-    req = (r % rows) // NUM_DRAFT
-    c = tl.arange(0, NC)
-    NO_KEY: tl.constexpr = -9223372036854775808
-    key = tl.load(
-        part_k_ptr + r.to(tl.int64) * stride_p + c,
-        mask=c < tl.load(part_n_ptr + req) * KP,
-        other=NO_KEY,
-    )
-    # Empty entries have negative ids.
-    key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
-    tl.store(keys_ptr + r.to(tl.int64) * KP + tl.arange(0, KP), tl.topk(key, KP))
-
-
-@triton.jit
-def _cp_merge_kernel(
-    keys_ptr,  # [WORLD sources, num_heads, rows, KP] int64, gathered from every rank
-    topk_ptr,  # [rows, topk] int32
-    seq_lens_ptr,
-    rows,
-    max_blocks,
-    topk,
-    init_blocks,
-    local_blocks,
-    HEAD: tl.constexpr,
-    NUM_HEADS: tl.constexpr,
-    WORLD: tl.constexpr,
-    KP: tl.constexpr,
-    BLOCK_N: tl.constexpr,
-    KT: tl.constexpr,
-):
-    """_verify_index_topk_merge_kernel over every rank's best KP of head HEAD.
-
-    Rank r scored blocks r, r + WORLD, ..., so together they hold the whole row's best.
-    """
-    r = tl.program_id(0)
-    n_blocks = tl.minimum(
-        (tl.load(seq_lens_ptr + r).to(tl.int32) + BLOCK_N - 1) // BLOCK_N, max_blocks
-    )
-    c = tl.arange(0, WORLD * KP)
-    src, j = c // KP, c % KP
-    key = tl.load(
-        keys_ptr + ((src * NUM_HEADS + HEAD) * rows + r).to(tl.int64) * KP + j
-    )
-    NO_KEY: tl.constexpr = -9223372036854775808
-    # A key with a negative block id is empty. That includes the zeros the runtime's
-    # custom all-gather writes instead of gathering during CUDA-graph warmup.
-    key = tl.where((~key).to(tl.int32) >= 0, key, NO_KEY)
-    ids = _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT)
-    t = tl.arange(0, KT)
-    tl.store(topk_ptr + r.to(tl.int64) * topk + t, ids, mask=t < topk)
-
-
 def _cp_split_config(num_reqs: int) -> tuple[int, int, int, bool]:
     """``_split_config`` for a rank's quarter of the blocks, every head's rows in one tile.
 
@@ -909,96 +841,6 @@ def _cp_partial(
     return part_k, part_n, nc
 
 
-def cp_verify_local_keys(
-    q_heads: torch.Tensor,  # [heads, rows, 128]: every rank's index heads, gathered
-    k_cache: Nvfp4Cache,
-    req_to_token: torch.Tensor,
-    seq_lens: torch.Tensor,  # [rows]
-    max_seqlen: int,
-    slot_ids: torch.Tensor,  # [rows]
-    num_draft: int,
-    block_size: int,
-    init_blocks: int,
-    local_blocks: int,
-    sm_scale: float,  # q and k scales folded in, as verify_topk_idx does for NVFP4
-    world: int,
-    rank: int,
-) -> torch.Tensor:
-    """Indexer CP on an NVFP4 index-K pool: this rank's best _KP keys per (head, row).
-
-    The int64 keys [heads, rows, _KP] cover blocks rank, rank + world, ...; the partial
-    kernel is the fused verify indexer's, every head's rows in one tile, so each K block
-    is read once per request and scores match the unsharded ones.
-    """
-    heads, rows, _ = q_heads.shape
-    part_k, part_n, nc = _cp_partial(
-        q_heads,
-        k_cache,
-        req_to_token,
-        seq_lens,
-        max_seqlen,
-        slot_ids,
-        num_draft,
-        block_size,
-        init_blocks,
-        local_blocks,
-        sm_scale,
-        world,
-        rank,
-    )
-    keys = torch.empty((heads, rows, _KP), dtype=torch.int64, device=q_heads.device)
-    _cp_local_keys_kernel[(heads * rows,)](
-        part_k,
-        part_n,
-        keys,
-        rows,
-        part_k.stride(1),
-        NUM_DRAFT=num_draft,
-        KP=_KP,
-        NC=nc,
-        num_warps=1,
-    )
-    return keys
-
-
-def cp_verify_merge(
-    gathered_keys: torch.Tensor,  # [world, heads, rows, _KP] int64
-    head: int,
-    seq_lens: torch.Tensor,
-    max_seqlen: int,
-    req_to_token: torch.Tensor,
-    block_size: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
-) -> torch.Tensor:
-    """Head ``head``'s top-k ids [1, rows, topk] from every rank's candidates.
-
-    Laid out as fused_verify_topk_idx writes them.
-    """
-    world, heads, rows, kp = gathered_keys.shape
-    out = torch.empty((1, rows, topk), dtype=torch.int32, device=gathered_keys.device)
-    if rows:
-        _cp_merge_kernel[(rows,)](
-            gathered_keys,
-            out,
-            seq_lens,
-            rows,
-            triton.cdiv(min(max_seqlen, req_to_token.shape[1]), block_size),
-            topk,
-            init_blocks,
-            local_blocks,
-            HEAD=head,
-            NUM_HEADS=heads,
-            WORLD=world,
-            KP=kp,
-            BLOCK_N=block_size,
-            KT=triton.next_power_of_2(topk),
-            num_warps=1,
-        )
-    return out
-
-
 # ---- Indexer CP candidate exchange over IPC (no collective) ----
 # A rank writes its best KP candidates of head h straight into rank h's receive
 # buffer, [CP_PARITIES, world, CP_MAX_ROWS, KP] int64 there, and rank h's merge
@@ -1050,9 +892,10 @@ def _cp_local_keys_ipc_kernel(
     NC: tl.constexpr,
     MAX_ROWS: tl.constexpr,
 ):
-    """_cp_local_keys_kernel, delivering the keys over IPC instead of writing them out.
+    """One rank's split lists reduced to its best KP candidates, forced blocks excluded,
+    delivered into the receive buffer of the rank that owns ``head``.
 
-    The best KP of (head, row) go into the receive buffer of the rank that owns ``head``.
+    These are what the native merge would pick from were they all the blocks.
     """
     pid = tl.program_id(0)
     head, r = pid // rows, pid % rows
@@ -1092,7 +935,8 @@ def _cp_merge_ipc_kernel(
     MAX_ROWS: tl.constexpr,
     MAX_SPINS: tl.constexpr,
 ):
-    """_cp_merge_kernel over the words every rank delivered for this row.
+    """_verify_index_topk_merge_kernel over the best KP every rank delivered for this
+    row: rank r scored blocks r, r + WORLD, ..., so together they hold the row's best.
 
     Waits until all WORLD * KP carry this call's tag, then selects exactly as the
     native merge. A wait past MAX_SPINS polls traps the kernel.
@@ -1257,7 +1101,7 @@ def cp_verify_exchange(
     """Indexer CP with the candidate exchange done in place over IPC.
 
     Scores this rank's blocks, delivers each head's best _KP to its owner and merges what
-    the peers delivered for this rank's head: [1, rows, topk] int32, as cp_verify_merge.
+    the peers delivered for this rank's head: [1, rows, topk] int32, as verify_topk_idx.
     """
     heads, rows, head_dim = q_heads.shape
     assert rows <= CP_MAX_ROWS and heads == exchange.world
