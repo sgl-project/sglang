@@ -304,9 +304,9 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            # Kept for the PD decode queue paths, which stream requests that are
+            # not in any step's batch yet.
             if req.finished() and req.finished_output:
-                # With the overlap schedule, a request will try to output twice and hit this line twice
-                # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
             acc.accept(req=req)

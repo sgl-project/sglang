@@ -68,8 +68,6 @@ def _make_processor() -> SchedulerBatchResultProcessor:
     return SchedulerBatchResultProcessor(
         is_generation=True,
         disaggregation_mode=None,
-        enable_overlap=True,
-        enable_overlap_mlx=False,
         model_config=SimpleNamespace(
             think_end_ids=None, self_opened_think_start_ids=None
         ),
@@ -90,6 +88,7 @@ def _make_processor() -> SchedulerBatchResultProcessor:
         logprob_result_processor=None,
         output_streamer=MagicMock(),
         abort_request=lambda *args, **kwargs: None,
+        still_in_batch=lambda req: True,
     )
 
 

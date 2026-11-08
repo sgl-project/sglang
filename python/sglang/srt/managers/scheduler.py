@@ -2914,8 +2914,6 @@ class Scheduler(
         self.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=self.is_generation,
             disaggregation_mode=self.disaggregation_mode,
-            enable_overlap=self.enable_overlap,
-            enable_overlap_mlx=self.enable_overlap_mlx,
             model_config=self.model_config,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
@@ -2936,6 +2934,7 @@ class Scheduler(
             abort_request=self.abort_request,
             uocr_runtime=self.uocr_runtime,
             leave_prefill_launched=self.prefill_launched_reqs.leave,
+            still_in_batch=self.still_in_batch,
         )
 
     def init_internal_state(self) -> None:
@@ -4092,8 +4091,9 @@ class Scheduler(
         the result lands a step later; its batch still names the request as its
         ``chunked_req``, so the batch-result processors skip the aborted chunk:
         ``process_batch_result_disagg_prefill`` via its ``is_aborted`` drop, and
-        ``process_batch_result_prefill`` via its chunked branch (the finished req
-        is excluded from streaming and its logprob offset is still accounted).
+        ``process_batch_result_prefill`` as a row no longer in the batch (the
+        aborted req left the chunked slot, so it commits and streams nothing, and
+        its logprob offset is still accounted).
         Mirrors ``handle_bootstrap_failure``.
         """
         req = self._pending_chunked_abort_req
@@ -4657,6 +4657,9 @@ class Scheduler(
         if self.enable_hicache_storage and retries is not None:
             for req in can_run_list:
                 retries.cancel(req.rid)
+        self.invariant_checker.check_admitted(
+            req for req in can_run_list if req in self.waiting_queue
+        )
         self.waiting_queue.leave(can_run_set)
         if adder.preempt_list:
             for req in adder.preempt_list:
@@ -4833,6 +4836,17 @@ class Scheduler(
                 for r in batch.reqs
                 if r is not batch.chunked_req and r not in self.running_reqs
             )
+
+    def still_in_batch(self, req: Req) -> bool:
+        """Whether `req` is still in the batch: in running, prefill_launched or
+        chunked. A step's result commits only on the rows still in the batch; a
+        request that left (finished, retracted, aborted) since the step launched is
+        skipped."""
+        return (
+            req in self.running_reqs
+            or req in self.prefill_launched_reqs
+            or req in self.chunked_reqs
+        )
 
     def _on_step_launch(self, batch: ScheduleBatch) -> None:
         """The bookkeeping of every step launch, before its forward is issued."""
