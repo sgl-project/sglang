@@ -225,6 +225,21 @@ _MUSE_EXTEND_FP8_MIN_Q = 256
 # Muse Spark long-prefill 2D tile config (BLOCK_M, num_warps, num_stages, TILE_SIZE,
 # waves_per_eu) for 256+ query tokens: 90K cached + 5K new 5.57 -> 4.08 ms.
 _MUSE_PREFILL_2D_CONFIG = (128, 4, 2, 128, 2)
+# unified_attention loads a whole KV tile's block-table entries without a row mask,
+# up to TILE_SIZE / page_size - 1 past a row's end. The extra values are masked out,
+# but past the last row the load leaves the tensor; a zeroed storage tail as wide as
+# the widest tile (128 tokens) keeps it in bounds for any page size.
+_UA_BLOCK_TABLE_TAIL = 128
+
+
+def _ua_block_table(rows: int, cols: int, device) -> torch.Tensor:
+    """A zeroed int32 [rows, cols] block table followed by a zeroed storage tail."""
+    storage = torch.zeros(
+        rows * cols + _UA_BLOCK_TABLE_TAIL, dtype=torch.int32, device=device
+    )
+    return storage[: rows * cols].view(rows, cols)
+
+
 # Muse Spark 8-token verify on the unified 3D kernel: one 64-row tile per
 # (request, KV head) and 256 split-KV segments (C1-tuned).
 _MUSE_VERIFY_BLOCK_M = 64
@@ -1506,9 +1521,7 @@ class AiterAttnBackend(AttentionBackend):
             # are stale but unified_attention only walks rows [0, bs).
             page_table = dest_buf
         else:
-            page_table = torch.zeros(
-                bs, max_blocks, dtype=torch.int32, device=self.device
-            )
+            page_table = _ua_block_table(bs, max_blocks, self.device)
 
         if self.use_sliding_window_kv_pool:
             swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
@@ -1516,9 +1529,7 @@ class AiterAttnBackend(AttentionBackend):
             if swa_dest_buf is not None:
                 swa_page_table = swa_dest_buf
             else:
-                swa_page_table = torch.zeros(
-                    bs, max_blocks, dtype=torch.int32, device=self.device
-                )
+                swa_page_table = _ua_block_table(bs, max_blocks, self.device)
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
@@ -1586,7 +1597,7 @@ class AiterAttnBackend(AttentionBackend):
         if page_table_dest is not None:
             page_table = page_table_dest
         else:
-            page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+            page_table = _ua_block_table(bs, max_blocks, device)
 
         if self.use_sliding_window_kv_pool:
             swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
@@ -1594,9 +1605,7 @@ class AiterAttnBackend(AttentionBackend):
             if swa_page_table_dest is not None:
                 swa_page_table = swa_page_table_dest
             else:
-                swa_page_table = torch.zeros(
-                    bs, max_blocks, dtype=torch.int32, device=device
-                )
+                swa_page_table = _ua_block_table(bs, max_blocks, device)
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max(max_blocks, 1), BLOCK_SIZE))
@@ -1632,15 +1641,13 @@ class AiterAttnBackend(AttentionBackend):
         page_size = self.page_size
         max_blocks = max((max_kv_len + page_size - 1) // page_size, 1)
 
-        page_table = torch.zeros(bs, max_blocks, dtype=torch.int32, device=device)
+        page_table = _ua_block_table(bs, max_blocks, device)
 
         swa_slot_mapping = None
         swa_page_table = None
         if self.use_sliding_window_kv_pool:
             swa_slot_mapping = self.swa_kv_pool.full_to_swa_index_mapping.long()
-            swa_page_table = torch.zeros(
-                bs, max_blocks, dtype=torch.int32, device=device
-            )
+            swa_page_table = _ua_block_table(bs, max_blocks, device)
 
         BLOCK_SIZE = 1024
         grid = (bs, triton.cdiv(max_blocks, BLOCK_SIZE))
@@ -3471,10 +3478,8 @@ class AiterAttnBackend(AttentionBackend):
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
-            self.cuda_graph_page_table = torch.zeros(
-                (max_bs, max_num_blocks_per_seq),
-                dtype=torch.int32,
-                device=self.device,
+            self.cuda_graph_page_table = _ua_block_table(
+                max_bs, max_num_blocks_per_seq, self.device
             )
 
         if not self.skip_prefill:
@@ -3553,10 +3558,8 @@ class AiterAttnBackend(AttentionBackend):
             max_num_blocks_per_seq = (
                 self.max_context_len + self.page_size - 1
             ) // self.page_size
-            self.cuda_graph_swa_page_table = torch.zeros(
-                (max_bs, max_num_blocks_per_seq),
-                dtype=torch.int32,
-                device=self.device,
+            self.cuda_graph_swa_page_table = _ua_block_table(
+                max_bs, max_num_blocks_per_seq, self.device
             )
             # SWA write-target buffer; refilled and bound onto forward_metadata
             # in init_forward_metadata_out_graph before each replay.
