@@ -535,6 +535,11 @@ impl Cli {
                         && self.cache.cache_switch_margin_tokens.is_none(),
                 "reorg uses --affinity-mode and --affinity-load-* instead of pressure guards and cache queue gates"
             );
+            ensure!(
+                !self.affinity.route_by_uncached_tokens,
+                "reorg buckets match the input length; --route-by-uncached-tokens applies to \
+                 legacy routing only"
+            );
             if matches!(
                 self.routing.policy,
                 PolicyKind::SessionAware | PolicyKind::CacheAware
@@ -1347,6 +1352,26 @@ mod tests {
         ] {
             assert!(parse(&args).is_err(), "accepted {args:?}");
         }
+    }
+
+    /// Reorg resolves buckets on the input length (`chat/reorg.rs`), so the
+    /// legacy uncached-token bucket match is refused rather than stored and
+    /// ignored.
+    #[test]
+    fn reorg_refuses_route_by_uncached_tokens() {
+        let err = cfg_of("--chat-routing reorg --policy cache_aware --route-by-uncached-tokens")
+            .expect_err("reorg buckets never match on uncached tokens")
+            .to_string();
+        assert!(err.contains("--route-by-uncached-tokens"), "got: {err}");
+        assert!(
+            cfg_of("--policy cache_aware --route-by-uncached-tokens")
+                .unwrap()
+                .model
+                .affinity
+                .expect("cache_aware builds an affinity config")
+                .route_by_uncached_tokens,
+            "legacy routing keeps the flag"
+        );
     }
 
     #[test]
