@@ -4333,12 +4333,10 @@ class DeepseekSparseAttnBackend(
                 topk_indices=topk_indices,
                 page_size=1,
             )
-        if dcp_partial:
-            page_table_1, seq_lens = dcp_localize_compact(page_table_1)
         page_table_1, sparse_mla_top_k = self._pad_trtllm_sparse_page_table(
             page_table_1
         )
-        if self.attn_dcp_size > 1 and not self.dsa_shards_index_k:
+        if self.attn_dcp_size > 1 and (not self.dsa_shards_index_k or dcp_partial):
             page_table_1, seq_lens = localize_dcp_page_table(
                 self._dcp_page_table_cache,
                 metadata=metadata,

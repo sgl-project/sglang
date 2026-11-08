@@ -11,7 +11,6 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_trtllm_sparse_attention,
     trtllm_rows_per_call,
 )
-from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import _localize_compact_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -30,25 +29,6 @@ def _reference_page_table(page_table, dcp_size, rank):
         rows.append(owned + [-1] * (len(row) - len(owned)))
         counts.append(len(owned))
     return torch.tensor(rows, dtype=page_table.dtype), torch.tensor(counts)
-
-
-def _localize_compact(page_table, dcp_size, rank):
-    out = torch.empty_like(page_table)
-    counts = torch.empty(page_table.shape[0], dtype=torch.int32, device="cuda")
-    _localize_compact_kernel[(page_table.shape[0],)](
-        page_table,
-        page_table.stride(0),
-        out,
-        out.stride(0),
-        counts,
-        dcp_size,
-        rank,
-        TOPK=page_table.shape[1],
-    )
-    return out, counts
-
-
-_LOCALIZERS = (transform_index_page_table_dcp, _localize_compact)
 
 
 def _sparse_attention(query, kv, page_table, seq_lens, workspace_bytes=512 << 20):
@@ -78,26 +58,19 @@ class TestDsaDcpAttention(CustomTestCase):
             page_table = page_table.flip(1)
             page_table[0, ::3] = -1
             page_table[1] = -1
-            # The sharded localizer takes a power-of-two top-k width.
-            for localize in _LOCALIZERS if width == TOPK else _LOCALIZERS[:1]:
-                for dcp_size in (2, 4):
-                    for rank in range(dcp_size):
-                        with self.subTest(
-                            localize=localize.__name__,
-                            width=width,
-                            dcp=dcp_size,
-                            rank=rank,
-                        ):
-                            expected, expected_counts = _reference_page_table(
-                                page_table, dcp_size, rank
-                            )
-                            actual, counts = localize(
-                                page_table.cuda().contiguous(), dcp_size, rank
-                            )
-                            self.assertEqual(actual.cpu().tolist(), expected.tolist())
-                            self.assertEqual(
-                                counts.cpu().tolist(), expected_counts.tolist()
-                            )
+            for dcp_size in (2, 4):
+                for rank in range(dcp_size):
+                    with self.subTest(width=width, dcp=dcp_size, rank=rank):
+                        expected, expected_counts = _reference_page_table(
+                            page_table, dcp_size, rank
+                        )
+                        actual, counts = transform_index_page_table_dcp(
+                            page_table.cuda(), dcp_size, rank
+                        )
+                        self.assertEqual(actual.cpu().tolist(), expected.tolist())
+                        self.assertEqual(
+                            counts.cpu().tolist(), expected_counts.tolist()
+                        )
 
     def test_merged_shards_match_unsharded_attention(self):
         generator = torch.Generator().manual_seed(0)
