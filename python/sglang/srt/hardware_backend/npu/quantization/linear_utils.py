@@ -1,6 +1,6 @@
 """Shared weight preparation and bias handling for NPU linear methods."""
 
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch.nn import Module
@@ -102,30 +102,31 @@ def process_npu_arch35_mxfp8_linear_weights(
         _layout_npu_arch35_e4m3_weights(layer, weight_block_size)
 
 
-def _layout_npu_arch35_e4m3_weights(
-    layer: Module, weight_block_size: List[int]
-) -> None:
-    """Requantize an e4m3 block-FP8 weight (fp32 block scales) to MXFP8 layout.
+def requant_block_fp8_to_mxfp8(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    weight_block_size: List[int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Requantize an e4m3 block-FP8 weight (fp32 block scales) to MXFP8.
 
     Dequantizes the fp8 payload with the expanded block scales to BF16, then
     requantizes to MXFP8 (fp8 payload + 1x32 UE8M0 scale via
-    npu_dynamic_mx_quant) so the native Ascend 950 quantized GEMM
-    (``npu_w8a8_mxfp8_linear``) can run the layer. Chunked over rows to cap
-    peak memory; runs once at load time.
+    npu_dynamic_mx_quant) so the native A5 quantized GEMM can run it. Chunked
+    over rows to cap peak memory; runs once at load time. Returns the e4m3
+    payload ``[N, K]`` and its e8m0 block scale ``[N, K // 64, 2]``.
     """
     block_n, block_k = weight_block_size
     group_size = _NPU_ARCH35_MXFP8_BLOCK_SIZE
-    weight = layer.weight.data
     n_dim, k_dim = weight.shape
     if k_dim % (2 * group_size) != 0:
         raise ValueError(
-            "NPU Ascend 950 MXFP8 linear requires K to be divisible by "
+            "NPU arch35 MXFP8 requires K to be divisible by "
             f"{2 * group_size}, got {k_dim}."
         )
     device = f"npu:{torch.npu.current_device()}"
     if not weight.is_npu:
         weight = weight.to(device)
-    scale = layer.weight_scale_inv.data.to(device)
+    scale = weight_scale_inv.to(device)
 
     # Chunked over rows to cap peak memory: the BF16 intermediate is
     # chunk-sized, and only the new fp8 payload (the final weight itself) is
@@ -155,13 +156,35 @@ def _layout_npu_arch35_e4m3_weights(
         # Older torch_npu builds return [out, in//32]; reshape to 3D.
         w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
 
+    # A fully zero e4m3 block comes back with an e8m0 scale of 0, i.e. 2^-127
+    # in fp32, and the A5 grouped matmul reads that as a dead block rather than
+    # a zero one. Pruned checkpoints hit this constantly (Drama 3 zeroes 55% of
+    # the w13 blocks), so pin those blocks to a plain 1.0 scale and zero the
+    # payload: the product stays exactly zero, without a denormal scale.
+    scale_u8 = w_scale.reshape(n_dim, -1)
+    zero_block = scale_u8 == 0
+    if bool(zero_block.any()):
+        scale_u8[zero_block] = 127
+        qw.view(torch.uint8).reshape(n_dim, -1, group_size)[zero_block] = 0
+    return qw, w_scale
+
+
+def _layout_npu_arch35_e4m3_weights(
+    layer: Module, weight_block_size: List[int]
+) -> None:
+    """Requantize an e4m3 block-FP8 weight (fp32 block scales) to MXFP8 layout.
+
+    Delegates the requantization to ``requant_block_fp8_to_mxfp8`` (shared with
+    the MoE expert path) and stores the result on the layer.
+    """
+    qw, w_scale = requant_block_fp8_to_mxfp8(
+        layer.weight.data, layer.weight_scale_inv.data, weight_block_size
+    )
+
     # Layout mirrors _layout_npu_arch35_ue8m0_weights: weight [in, out] and
     # scale [in//64, out, 2] as strided transpose views — DO NOT call
-    # .contiguous() (the Ascend 950 kernel scans the row-major source K-major).
+    # .contiguous() (the A5 kernel scans the row-major source K-major).
     layer.weight.data = qw.transpose(0, 1)
-    if w_scale.dim() == 2:
-        # Older torch_npu builds return [out, in//32]; reshape to 3D.
-        w_scale = w_scale.reshape(w_scale.shape[0], w_scale.shape[1] // 2, 2)
     layer.weight_scale_inv.data = w_scale.transpose(0, 1)
 
 

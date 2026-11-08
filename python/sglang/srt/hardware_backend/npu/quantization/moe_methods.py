@@ -1191,3 +1191,82 @@ class NPUMXFP8MoEMethod(_NPUMoEMethodBase):
             transposed=True,
             **scale_args,
         )
+
+
+def process_npu_arch35_block_fp8_moe_weights(
+    layer: torch.nn.Module, weight_block_size: Tuple[int, int]
+) -> None:
+    """Requantize serialized block-FP8 experts into the A5 MXFP8 MoE layout.
+
+    A ``[128, 128]`` fp32 block scale cannot be expressed as the 1x32 UE8M0
+    scale the A5 grouped matmul needs, so every expert's payload is dequantized
+    and requantized — the same trade the dense path makes in
+    ``linear_utils.requant_block_fp8_to_mxfp8``. The result is stored in the shapes
+    an offline ModelSlim checkpoint would carry (e4m3 ``[E, N, K]`` payload plus
+    a flat e8m0 ``[E, N, K // 32]`` block scale) and then handed to
+    ``NPUMXFP8MoEMethod.process_weights_after_loading``, so the offline export
+    and this path agree on layout and dispatcher dtype by construction. Runs
+    once at load time, one expert at a time to cap peak memory.
+    """
+    from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
+        requant_block_fp8_to_mxfp8,
+    )
+
+    for weight_prefix in ("w13", "w2"):
+        weight = getattr(layer, f"{weight_prefix}_weight").data
+        if weight.dtype != torch.float8_e4m3fn:
+            raise ValueError(
+                "block-FP8 MXFP8 requantization expects float8_e4m3fn expert "
+                f"weights, got {weight.dtype} for {weight_prefix}."
+            )
+        scale_inv = getattr(layer, f"{weight_prefix}_weight_scale_inv").data
+
+        # requant_block_fp8_to_mxfp8 moves its inputs to the current device;
+        # the outputs are allocated next to it.
+        device = (
+            weight.device
+            if weight.is_npu
+            else torch.device(f"npu:{torch.npu.current_device()}")
+        )
+
+        num_experts, n_dim, k_dim = weight.shape
+        payload = torch.empty(
+            num_experts, n_dim, k_dim, dtype=torch.float8_e4m3fn, device=device
+        )
+        block_scale = None
+        for expert in range(num_experts):
+            payload_e, scale_e = requant_block_fp8_to_mxfp8(
+                weight[expert], scale_inv[expert], weight_block_size
+            )
+            payload[expert] = payload_e
+            if block_scale is None:
+                # Flat [E, N, K // 32] e8m0, i.e. exactly what an offline
+                # ModelSlim MXFP8 checkpoint would have carried.
+                block_scale = torch.empty(
+                    num_experts,
+                    n_dim,
+                    scale_e.numel() // n_dim,
+                    dtype=scale_e.dtype,
+                    device=device,
+                )
+            block_scale[expert] = scale_e.reshape(n_dim, -1)
+
+        setattr(
+            layer, f"{weight_prefix}_weight", Parameter(payload, requires_grad=False)
+        )
+        setattr(
+            layer,
+            f"{weight_prefix}_weight_scale",
+            Parameter(block_scale, requires_grad=False),
+        )
+        # The fp32 block scales are consumed here; dropping the parameter keeps
+        # the freed memory available to the KV pool.
+        setattr(layer, f"{weight_prefix}_weight_scale_inv", None)
+
+        # Hand the result to the MXFP8 kernel for the final relayout, so this
+        # path and the offline ModelSlim one are treated identically: [E, K, N]
+        # payload, [E, K // 64, N, 2] e8m0 scales, and the dispatcher dtype the
+        # kernel asks for.
+        NPUMXFP8MoEMethod(weight_prefix).process_weights_after_loading(
+            layer, weight_prefix
+        )

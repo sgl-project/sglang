@@ -2785,6 +2785,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             self.process_weights_hip_int4(layer)
 
         elif self.block_quant:
+            if (
+                _is_npu
+                and is_npu_arch35()
+                and not self.use_mxfp8
+                and not self.is_fp4_expert
+            ):
+                from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                    process_npu_arch35_block_fp8_moe_weights,
+                )
+
+                # The A5 grouped matmul needs 1x32 UE8M0 scales, but the
+                # checkpoint carries [128, 128] fp32 block scales, so requantize
+                # the experts once here and let NPUMXFP8MoEMethod run them.
+                process_npu_arch35_block_fp8_moe_weights(layer, self.weight_block_size)
+                return
             # Block quant doesn't need to process weights after loading
             self.process_weights_after_loading_block_quant(layer)
 
@@ -3130,6 +3145,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
 
+        # Serialized block-FP8 experts are requantized to MXFP8 at load time
+        # (process_weights_after_loading). They then run on the same grouped
+        # matmul as the MXFP8 MoE path, so attach those kernels and use the
+        # ASCEND runner instead of the triton one, which has no A5 path.
+        if (
+            _is_npu
+            and self.block_quant
+            and is_npu_arch35()
+            and not self.use_mxfp8
+            and not self.is_fp4_expert
+        ):
+            from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+                NPUMXFP8MoEMethod,
+            )
+            from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
+                create_ascend_moe_runner,
+            )
+
+            moe_runner_backend = get_moe_runner_backend()
+            if not (moe_runner_backend.is_auto() or moe_runner_backend.is_ascend()):
+                raise ValueError(
+                    "Block-FP8 MXFP8 MoE on Ascend requires --moe-runner-backend "
+                    f"'auto' or 'ascend', got {moe_runner_backend.value!r}."
+                )
+            self.runner = create_ascend_moe_runner(
+                layer,
+                moe_runner_config,
+                w13_kernel=NPUMXFP8MoEMethod("w13"),
+                w2_kernel=NPUMXFP8MoEMethod("w2"),
+            )
+            return
+
         # MXFP4 experts on NPU run through the ASCEND runner, which
         # quantizes activations internally.
         if _is_npu and self.is_fp4_expert:
@@ -3388,6 +3435,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
+            )
+        elif self.runner.runner_backend.is_ascend():
+            # Serialized block-FP8 experts were requantized to MXFP8 at load
+            # time, so the A5 grouped matmul needs the 1x32 e8m0 weight scales
+            # alongside the payload.
+            from sglang.srt.layers.moe.moe_runner.ascend import AscendQuantInfo
+
+            quant_info = AscendQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                w13_weight_scale=getattr(layer, "w13_weight_scale", None),
+                w2_weight_scale=getattr(layer, "w2_weight_scale", None),
             )
         elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight
