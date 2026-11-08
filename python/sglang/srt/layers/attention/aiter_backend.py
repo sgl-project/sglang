@@ -115,12 +115,14 @@ from sglang.kernels.ops.attention.dcp_kernels import (
     compact_dcp_verify_token_table_to_ragged,
     create_mla_kv_page_table_for_dcp,
 )
+from sglang.kernels.ops.attention.fp8_q_quant import fp8_q_quant, fp8_q_quant_supported
 from sglang.kernels.ops.attention.gqa_verify_splitkv import gqa_verify_splitkv
 from sglang.kernels.ops.attention.gqa_verify_splitkv_2kv import (
     gqa_verify_splitkv_2kv,
     pick_splits_v2,
 )
 from sglang.kernels.ops.attention.merge_state import merge_state_triton
+from sglang.kernels.ops.attention.muse_extend_short_3d import muse_extend_short_3d
 from sglang.kernels.ops.attention.swa_verify_splitkv import swa_verify_splitkv
 from sglang.kernels.ops.attention.verify_reduce_norm_gate import (
     DEFERRAL as _VERIFY_REDUCE_DEFERRAL,
@@ -975,6 +977,10 @@ class AiterAttnBackend(AttentionBackend):
             and muse_extend_attention_fly is not None
             and envs.SGLANG_MUSE_EXTEND_FLYDSL.get()
         )
+        self.muse_extend_short_3d = (
+            self.use_muse_attention_paths and envs.SGLANG_MUSE_EXTEND_SHORT_3D.get()
+        )
+        self._muse_extend_short_3d_logged = False
         self.muse_verify_kernels = frozenset(
             name
             for name, env in (
@@ -1748,8 +1754,11 @@ class AiterAttnBackend(AttentionBackend):
             # Muse Spark A8 extend: FP8 Q with a per-tensor scale computed on the
             # device (no host sync) against the FP8 KV cache, as B200's trtllm_mha
             # runs it when the KV cache is FP8.
-            q_descale = (q_u.abs().amax().float() / 448.0).clamp_min(1e-12).view(1)
-            q_u = (q_u.float() / q_descale).to(fp8_dtype)
+            if fp8_dtype == torch.float8_e4m3fn and fp8_q_quant_supported(q_u):
+                q_u, q_descale = fp8_q_quant(q_u)
+            else:
+                q_descale = (q_u.abs().amax().float() / 448.0).clamp_min(1e-12).view(1)
+                q_u = (q_u.float() / q_descale).to(fp8_dtype)
             if not self._muse_extend_fp8_logged:
                 self._muse_extend_fp8_logged = True
                 logger.info(
@@ -1788,6 +1797,36 @@ class AiterAttnBackend(AttentionBackend):
                 layer.scaling,
                 window=uni_window[0] + 1 if swa_gluon else 0,
             )
+            return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
+        if (
+            self.muse_extend_short_3d
+            and uni_window == (-1, -1)
+            and sinks is None
+            and layer.logit_cap == 0.0
+            and not layer.is_cross_attention
+            and muse_extend_short_3d(
+                q_u,
+                k_paged,
+                v_paged,
+                o,
+                cu_seqlens_q,
+                forward_batch.seq_lens,
+                pt,
+                self.forward_metadata.max_q_len,
+                pt.shape[1] * self.page_size,
+                layer.scaling,
+                q_descale,
+                k_descale,
+                v_descale,
+            )
+        ):
+            if not self._muse_extend_short_3d_logged:
+                self._muse_extend_short_3d_logged = True
+                logger.info(
+                    "Muse short extend on aiter's 3D kernel with 32-row q-blocks, q=%d max_q=%d",
+                    q_u.shape[0],
+                    self.forward_metadata.max_q_len,
+                )
             return o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         unified_attention(
             q=q_u,

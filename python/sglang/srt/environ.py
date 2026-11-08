@@ -2208,6 +2208,9 @@ class Envs:
     SGLANG_MUSE_EXTEND_SWA_GLUON = EnvBool(True)
     # Full-layer FP8 extend on the FlyDSL kernel; =0 keeps the Gluon kernel there.
     SGLANG_MUSE_EXTEND_FLYDSL = EnvBool(True)
+    # Full-layer extends that aiter's unified_attention runs on its split-KV 3D kernel (short extend, long context):
+    # the same kernel with 32-row q-blocks instead of 16 (bit-identical output).
+    SGLANG_MUSE_EXTEND_SHORT_3D = EnvBool(True)
     # Spec-v2 decode without the per-step seq_lens_cpu D2H (the aiter Muse verify path reads GPU lengths only).
     SGLANG_MUSE_SYNC_FREE_VERIFY = EnvBool(True)
     # Target verify: merge the split-KV attention partials inside the output norm-gate kernel (one launch for both).
@@ -2268,6 +2271,9 @@ class Envs:
     SGLANG_MUSE_QK_ROPE_CACHE = EnvBool(True)
     # Row cap of the fused QK norm / RoPE / cache-write kernel (one program per row and Q head, no limit of its own).
     SGLANG_MUSE_QK_ROPE_CACHE_MAX_ROWS = EnvInt(512)
+    # Extend (not target verify) on the one-program-per-token form of that kernel, any row count; it is
+    # fused_qk_norm's norm verbatim, so Q / K match the unfused extend bit for bit.
+    SGLANG_MUSE_QK_ROPE_CACHE_EXTEND = EnvBool(True)
     # Row cap of the joint router + pooler GEMM; above 64 rows only the joint form (BM 128 row-major tile) serves.
     SGLANG_MUSE_JOINT_ROUTER_MAX_ROWS = EnvInt(128)
     SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY = EnvBool(True)

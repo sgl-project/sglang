@@ -5,6 +5,9 @@
   (optionally through the full -> SWA slot mapping).
 * ``qkv_proj_qk_norm_rope_cache``: the same epilogue fed straight from the BF16 split-K partials of the fused
   QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate.
+* ``qk_norm_rope_cache_extend``: extend, one program per token over all its heads; the norm is
+  ``fused_qk_norm``'s body verbatim (same [heads, D] tile, reduction and warps), so it lowers to the same
+  reduction and matches the unfused extend (``fused_qk_norm``, RoPE, cache write) bit for bit.
 
 The BF16 round trips of the unfused sequence (norm output, query scaling, RoPE products, projection store)
 are explicit, so the results match the separate norm / RoPE / cache-write kernels.
@@ -106,6 +109,86 @@ def _muse_qk_rope_cache(
                 offset = slot * HK * D + kh * D + d
                 tl.store(KC + offset, k_value)
                 tl.store(VC + offset, v_value)
+
+
+@triton.jit
+def _muse_qk_norm_rope_cache_tok(
+    Q,
+    K,
+    V,
+    POS,
+    COS,
+    LOC,
+    MAP,
+    KC,
+    VC,
+    QO,
+    KO,
+    KS,
+    VS,
+    q_stride,
+    k_stride,
+    v_stride,
+    eps,
+    q_scale,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    D: tl.constexpr,
+    ROPE: tl.constexpr,
+    HAS_MAP: tl.constexpr,
+    HAS_SCALE: tl.constexpr,
+    COS_STRIDE: tl.constexpr,
+):
+    t = tl.program_id(0)
+    offs_q = tl.arange(0, HQ * D)
+    q = tl.load(Q + t * q_stride + offs_q).to(tl.float32)
+    q2 = tl.reshape(q, (HQ, D))
+    rstd_q = tl.rsqrt(tl.sum(q2 * q2, axis=1) / D + eps)
+    qn = (q2 * rstd_q[:, None]).to(tl.bfloat16).to(tl.float32) * q_scale
+    qn = qn.to(tl.bfloat16).to(tl.float32)
+    offs_k = tl.arange(0, HK * D)
+    k = tl.load(K + t * k_stride + offs_k).to(tl.float32)
+    k2 = tl.reshape(k, (HK, D))
+    rstd_k = tl.rsqrt(tl.sum(k2 * k2, axis=1) / D + eps)
+    kn = (k2 * rstd_k[:, None]).to(tl.bfloat16).to(tl.float32)
+    if ROPE:
+        d = tl.arange(0, D)
+        pos = tl.load(POS + t)
+        cosine = tl.load(COS + pos * COS_STRIDE + d // 2).to(tl.bfloat16).to(tl.float32)
+        sine = (
+            tl.load(COS + pos * COS_STRIDE + D // 2 + d // 2)
+            .to(tl.bfloat16)
+            .to(tl.float32)
+        )
+        even = (d % 2 == 0)[None, :]
+        oq = tl.reshape(tl.flip(tl.reshape(qn, (HQ, D // 2, 2)), 2), (HQ, D))
+        rq = tl.where(even, -oq, oq)
+        qn = (qn * cosine[None, :]).to(tl.bfloat16).to(tl.float32) + (
+            rq * sine[None, :]
+        ).to(tl.bfloat16).to(tl.float32)
+        ok = tl.reshape(tl.flip(tl.reshape(kn, (HK, D // 2, 2)), 2), (HK, D))
+        rk = tl.where(even, -ok, ok)
+        kn = (kn * cosine[None, :]).to(tl.bfloat16).to(tl.float32) + (
+            rk * sine[None, :]
+        ).to(tl.bfloat16).to(tl.float32)
+    qb = tl.reshape(qn, (HQ * D,)).to(tl.bfloat16)
+    kb = tl.reshape(kn, (HK * D,)).to(tl.bfloat16)
+    tl.store(QO + t * (HQ * D) + offs_q, qb)
+    tl.store(KO + t * (HK * D) + offs_k, kb)
+    slot = tl.load(LOC + t).to(tl.int64)
+    if slot >= 0:
+        if HAS_MAP:
+            slot = tl.load(MAP + slot).to(tl.int64)
+        if slot >= 0:
+            v = tl.load(V + t * v_stride + offs_k)
+            if HAS_SCALE:
+                k_value = kb.to(tl.float32) / tl.load(KS)
+                v_value = v.to(tl.float32) / tl.load(VS)
+            else:
+                k_value = kb.to(tl.float32)
+                v_value = v.to(tl.float32)
+            tl.store(KC + slot * (HK * D) + offs_k, k_value)
+            tl.store(VC + slot * (HK * D) + offs_k, v_value)
 
 
 @triton.jit
@@ -226,6 +309,66 @@ def qk_norm_rope_cache(
             cos_sin.stride(0) if cos_sin is not None else d,
             num_warps=warps,
             enable_fp_fusion=fp_fusion,
+        )
+    return qo, ko
+
+
+def qk_norm_rope_cache_extend(
+    q,
+    k,
+    v,
+    positions,
+    cos_sin,
+    cache_k,
+    cache_v,
+    locations,
+    swa_mapping,
+    eps,
+    q_scale,
+    k_scale,
+    v_scale,
+):
+    """Extend form of ``qk_norm_rope_cache`` (one program per token, any row count): the same outputs and cache
+    store, with Q / K bit-identical to ``fused_qk_norm`` followed by RoPE."""
+    m = q.shape[0]
+    d = 64
+    hq = q.shape[1] // d
+    hk = k.shape[1] // d
+    assert q.dtype == k.dtype == v.dtype == torch.bfloat16
+    assert cache_k.dtype == cache_v.dtype == torch.float8_e4m3fn
+    assert cache_k.is_contiguous() and cache_v.is_contiguous()
+    assert q.shape == (m, hq * d) and k.shape == v.shape == (m, hk * d)
+    assert q.stride(1) == k.stride(1) == v.stride(1) == 1
+    qo = torch.empty((m, hq * d), device=q.device, dtype=torch.bfloat16)
+    ko = torch.empty((m, hk * d), device=q.device, dtype=torch.bfloat16)
+    if m:
+        _muse_qk_norm_rope_cache_tok[(m,)](
+            q,
+            k,
+            v,
+            positions,
+            cos_sin,
+            locations,
+            swa_mapping,
+            cache_k,
+            cache_v,
+            qo,
+            ko,
+            k_scale,
+            v_scale,
+            q.stride(0),
+            k.stride(0),
+            v.stride(0),
+            float(eps),
+            float(q_scale),
+            hq,
+            hk,
+            d,
+            cos_sin is not None,
+            swa_mapping is not None,
+            k_scale is not None,
+            cos_sin.stride(0) if cos_sin is not None else d,
+            num_warps=4,
         )
     return qo, ko
 

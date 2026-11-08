@@ -1,4 +1,4 @@
-"""Fused QK norm / RoPE / FP8 KV-cache write for Muse Spark attention on ROCm (decode and target verify).
+"""Fused QK norm / RoPE / FP8 KV-cache write for Muse Spark attention on ROCm (decode, target verify, extend).
 
 ``MuseSpark1xAttention`` hands K/V to the cache itself when one of these kernels applies and then calls the
 attention layer with ``save_kv_cache=False``, the usual SGLang pattern for producers that fuse the cache store
@@ -6,7 +6,9 @@ attention layer with ``save_kv_cache=False``, the usual SGLang pattern for produ
 
 * ``qkv_proj_norm_rope_kv_write`` (``SGLANG_MUSE_FUSED_QKV_CACHE``): up to 32 rows, the QKV + output-gate
   projection's split-K partials feed the QK-norm / RoPE / cache-store epilogue directly.
-* ``qk_norm_rope_kv_write`` (``SGLANG_MUSE_QK_ROPE_CACHE``): up to 64 rows, from the projected Q/K/V.
+* ``qk_norm_rope_kv_write`` (``SGLANG_MUSE_QK_ROPE_CACHE``): decode / verify up to
+  ``SGLANG_MUSE_QK_ROPE_CACHE_MAX_ROWS`` rows, extend of any length (``SGLANG_MUSE_QK_ROPE_CACHE_EXTEND``),
+  from the projected Q/K/V.
 
 Both write exactly where and what the backend's own store would (FP8 with the layer's per-tensor scales, through
 the full -> SWA slot mapping on sliding layers), so they only engage when the backend reads K/V from the
@@ -22,6 +24,7 @@ import torch
 
 from sglang.kernels.ops.attention.qk_norm_rope_cache import (
     qk_norm_rope_cache,
+    qk_norm_rope_cache_extend,
     qkv_proj_qk_norm_rope_cache,
 )
 from sglang.srt.environ import envs
@@ -34,6 +37,7 @@ logger = logging.getLogger(__name__)
 QK_ROPE_CACHE = envs.SGLANG_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_MUSE_FUSED_QKV_CACHE.get()
 QK_ROPE_CACHE_MAX_ROWS = envs.SGLANG_MUSE_QK_ROPE_CACHE_MAX_ROWS.get()
+QK_ROPE_CACHE_EXTEND = envs.SGLANG_MUSE_QK_ROPE_CACHE_EXTEND.get()
 _logged: set = set()
 
 
@@ -47,7 +51,14 @@ class _KVWriteTarget(NamedTuple):
     cos_sin: torch.Tensor | None
 
 
-def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
+def _is_extend(forward_batch: ForwardBatch) -> bool:
+    mode = forward_batch.forward_mode
+    return mode.is_extend() and not mode.is_target_verify()
+
+
+def _attention_shape_ok(
+    attention, forward_batch: ForwardBatch, extend: bool = False
+) -> bool:
     return (
         attention.head_dim == 64
         and attention.num_kv_heads in (2, 4)
@@ -57,6 +68,7 @@ def _attention_shape_ok(attention, forward_batch: ForwardBatch) -> bool:
         and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
+            or (extend and _is_extend(forward_batch))
         )
         and not forward_batch.attn_attend_prefix_cache
         and forward_batch.dcp_kv_mask is None
@@ -176,18 +188,24 @@ def qk_norm_rope_kv_write(
     forward_batch: ForwardBatch,
 ):
     """(q, k) normalized and rotated with K/V already in the cache, or None when the kernel does not apply."""
+    extend = QK_ROPE_CACHE_EXTEND and _is_extend(forward_batch)
     if not (
-        0 < q.shape[0] <= QK_ROPE_CACHE_MAX_ROWS
+        q.shape[0] > 0
+        and (extend or q.shape[0] <= QK_ROPE_CACHE_MAX_ROWS)
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and q.stride(1) == k.stride(1) == v.stride(1) == 1
-        and _attention_shape_ok(attention, forward_batch)
+        and _attention_shape_ok(attention, forward_batch, extend)
     ):
         return None
     target = _kv_write_target(attention, forward_batch)
     if target is None:
         return None
-    _note("QK norm/RoPE/FP8 cache", q.shape[0])
-    return qk_norm_rope_cache(
+    _note(
+        "extend QK norm/RoPE/FP8 cache" if extend else "QK norm/RoPE/FP8 cache",
+        q.shape[0],
+    )
+    write = qk_norm_rope_cache_extend if extend else qk_norm_rope_cache
+    return write(
         q,
         k,
         v,

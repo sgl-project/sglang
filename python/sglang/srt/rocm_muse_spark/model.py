@@ -663,8 +663,8 @@ class MuseSpark1xAttention(nn.Module):
         if hidden_states.shape[0] == 0:
             return hidden_states
         prefill_fp8 = _prefill_fp8_rows(forward_batch, hidden_states.shape[0])
-        # Decode / verify: the fused QK-norm / RoPE kernels also store K/V into
-        # the FP8 cache, so the attention layer must not store them again.
+        # Decode / verify / extend: the fused QK-norm / RoPE kernels also store
+        # K/V into the FP8 cache, so the attention layer must not store them again.
         projected = (
             qkv_proj_norm_rope_kv_write(self, positions, hidden_states, forward_batch)
             if FUSED_QKV_CACHE and QK_ROPE_CACHE and _USE_FUSED_QK_NORM
