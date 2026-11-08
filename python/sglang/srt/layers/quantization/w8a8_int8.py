@@ -23,9 +23,8 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import should_ignore_layer
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.rvv_utils import _rvv_process_weight_after_loading
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     cpu_has_amx_support,
     cpu_has_rvv_support,

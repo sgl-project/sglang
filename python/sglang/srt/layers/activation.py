@@ -37,8 +37,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.runtime_context import get_exec, get_parallel, publish_role
 from sglang.srt.utils import (
     cpu_has_amx_support,
-    get_bool_env_var,
     cpu_has_rvv_support,
+    get_bool_env_var,
     is_cpu,
     is_cuda,
     is_hip,
