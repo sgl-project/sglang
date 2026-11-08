@@ -396,11 +396,12 @@ if HAS_TILELANG:
         min_scored_len: int = 0,
         threads: int = 128,
         dtype: str = "bfloat16",
+        groups_per_cta: int = 0,
     ):
         GROUP = 64
         group_rows = 4
         score_heads = 4
-        assert heads == 8
+        assert heads >= score_heads and heads % 8 == 0
         assert GROUP % page_size == 0
         sub_pages = GROUP // page_size
         batch = T.dynamic("batch")
@@ -417,9 +418,18 @@ if HAS_TILELANG:
             Logits: T.Tensor([batch, max_model_len], T.float32),
             Scale: T.float32,
         ):
-            with T.Kernel(
-                T.ceildiv(batch, group_rows), ctas_per_row, threads=threads
-            ) as (request, cta):
+            # With groups_per_cta > 0 (ROCm) each CTA scores that many consecutive
+            # groups and the grid spans the page table; CTAs past a request's
+            # context exit at once.
+            grid_y = (
+                T.ceildiv(T.ceildiv(max_pages, sub_pages), groups_per_cta)
+                if groups_per_cta > 0
+                else ctas_per_row
+            )
+            with T.Kernel(T.ceildiv(batch, group_rows), grid_y, threads=threads) as (
+                request,
+                cta,
+            ):
                 row_base = request * group_rows
                 q_shared = T.alloc_shared([group_rows, score_heads, head_dim], dtype)
                 q_gemm = T.reshape(q_shared, (group_rows * score_heads, head_dim))
@@ -433,7 +443,11 @@ if HAS_TILELANG:
                 table_row = T.min(row_base + group_rows - 1, batch - 1)
                 context_len = ContextLens[table_row]
                 num_groups = T.ceildiv(context_len, GROUP)
-                if context_len > min_scored_len and cta < num_groups:
+                if context_len > min_scored_len and (
+                    cta * groups_per_cta < num_groups
+                    if groups_per_cta > 0
+                    else cta < num_groups
+                ):
                     T.copy(
                         Q[
                             row_base : row_base + group_rows,
@@ -443,8 +457,16 @@ if HAS_TILELANG:
                         ],
                         q_shared,
                     )
-                    for step in T.serial(T.ceildiv(num_groups - cta, ctas_per_row)):
-                        group = step * ctas_per_row + cta
+                    for step in T.serial(
+                        groups_per_cta
+                        if groups_per_cta > 0
+                        else T.ceildiv(num_groups - cta, ctas_per_row)
+                    ):
+                        group = (
+                            cta * groups_per_cta + step
+                            if groups_per_cta > 0
+                            else step * ctas_per_row + cta
+                        )
                         for sp in range(sub_pages):
                             if (group * sub_pages + sp) * page_size < context_len:
                                 T.copy(
@@ -641,6 +663,10 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
+# ROCm grouped verify: four wavefronts and one group per CTA over a page-table-wide
+# grid beats 128 threads with a fixed CTA count per request on MI355X (bit-exact).
+_GROUPED_DECODE_THREADS = 256 if is_hip() else 128
+_GROUPED_DECODE_GROUPS_PER_CTA = 1 if is_hip() else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -703,7 +729,7 @@ def tilelang_qsa_mqa_decode(
         and q.shape[0] <= 380
         and q.shape[0] % 4 == 0
         and (query_heads if num_query_heads is None else num_query_heads) == 4
-        and query_heads <= 8
+        and query_heads <= 16
         and head_dim == 128
         and page_size == 16
         and q.is_cuda
@@ -734,23 +760,27 @@ def tilelang_qsa_mqa_decode(
             ],
             dim=1,
         )
-    kernel = (
-        _tilelang_qsa_mqa_decode_grouped_kernel
-        if use_grouped
-        else _tilelang_qsa_mqa_decode_kernel
-    )
-    if not use_grouped:
-        ctas = _decode_ctas_per_row(q.shape[0], q.device)
+    if use_grouped:
+        kernel = _tilelang_qsa_mqa_decode_grouped_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            ctas_per_row=1 if _GROUPED_DECODE_GROUPS_PER_CTA else 32,
+            min_scored_len=min_scored_len,
+            threads=_GROUPED_DECODE_THREADS,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+            groups_per_cta=_GROUPED_DECODE_GROUPS_PER_CTA,
+        )
     else:
-        ctas = 256 if is_hip() else 32
+        kernel = _tilelang_qsa_mqa_decode_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            ctas_per_row=_decode_ctas_per_row(q.shape[0], q.device),
+            min_scored_len=min_scored_len,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
     kernel(
-        heads=kernel_heads,
-        head_dim=head_dim,
-        page_size=page_size,
-        ctas_per_row=ctas,
-        min_scored_len=min_scored_len,
-        dtype=_TILELANG_DTYPES[scoring_dtype],
-    )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
         page_table.to(device=q.device, dtype=torch.int32).contiguous(),

@@ -124,7 +124,10 @@ def test_qsa_hip_aiter_varlen_matches_torch_reference():
 
 @pytest.mark.parametrize("requests", [1, 7, 16, 32])
 @pytest.mark.parametrize("min_scored_len", [0, 512])
-def test_qsa_gfx950_grouped_verify_scoring_is_bitwise(requests, min_scored_len):
+@pytest.mark.parametrize("padded_heads", [8, 16])
+def test_qsa_gfx950_grouped_verify_scoring_is_bitwise(
+    requests, min_scored_len, padded_heads
+):
     """The indexer scores the four verify rows of a request from one key load on
     gfx950; every written logit must equal the per-row kernel's bit for bit."""
     from sglang.srt.layers.attention.qsa.mqa import (
@@ -145,8 +148,8 @@ def test_qsa_gfx950_grouped_verify_scoring_is_bitwise(requests, min_scored_len):
     page_table = torch.randint(0, 1024, (requests, max_pages), dtype=torch.int32)
     page_table = page_table.repeat_interleave(4, dim=0).to(device)
     cache = torch.randn(1024, page_size, 1, 128, device=device).to(torch.bfloat16)
-    # The indexer projects 4 heads padded to 8.
-    q = torch.zeros(rows, 8, 128, device=device, dtype=torch.bfloat16)
+    # The indexer projects 4 heads, zero-padded to the kernel's head alignment.
+    q = torch.zeros(rows, padded_heads, 128, device=device, dtype=torch.bfloat16)
     q[:, :4] = torch.randn(rows, 4, 128, device=device).to(torch.bfloat16)
 
     args = (q, cache, page_table, lens, max_model_len)
