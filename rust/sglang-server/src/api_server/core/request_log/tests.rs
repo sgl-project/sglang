@@ -162,6 +162,38 @@ fn lines_match_python_request_logger() {
     assert!(checked >= 8, "the fixture lost OpenAI cases: {checked}");
 }
 
+/// A chat request's media content parts give its `Receive OpenAI` line
+/// Python's `multimodal` summary, in both formats.
+#[test]
+fn openai_multimodal_summary_matches_python() {
+    let fixture: Value = serde_json::from_str(FIXTURE).unwrap();
+    let cases = fixture["openai_multimodal_cases"].as_array().unwrap();
+    assert!(cases.len() >= 2, "the fixture lost OpenAI media cases");
+    for case in cases {
+        let name = case["name"].as_str().unwrap();
+        let body = serde_json::to_vec(&case["body"]).unwrap();
+        for (format, expected) in case["expected"].as_object().unwrap() {
+            let log = RequestLog::for_test(Some(config_in(&fixture, format, "2")), false);
+            log.openai_received(
+                OpenAiRequest::ChatCompletion,
+                &body,
+                &http::HeaderMap::new(),
+            );
+            let lines = log.logged_lines();
+            if format == "json" {
+                let line: Value = serde_json::from_str(&lines[0]).unwrap();
+                let summary = line.get("multimodal").cloned().unwrap_or(Value::Null);
+                assert_eq!(summary, *expected, "{name} at json");
+            } else {
+                let segment = lines[0]
+                    .find(", multimodal=")
+                    .map_or("", |start| &lines[0][start..]);
+                assert_eq!(segment, expected.as_str().unwrap(), "{name} at text");
+            }
+        }
+    }
+}
+
 fn core_output(output: &Value) -> CoreOutput {
     CoreOutput {
         text: output["text"].as_str().unwrap().into(),

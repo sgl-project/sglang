@@ -195,6 +195,20 @@ _CASES = [
         "out": {"text": "", "output_ids": [1], "meta_info": {"id": "s1"}},
     },
     {
+        # Media is summarized per modality at every level; the items
+        # themselves show from level 2.
+        "name": "single_media",
+        "body": {
+            "rid": "rid-7",
+            "text": "What is this?",
+            "image_data": "data:image/png;base64,iVBORw0KGgo=",
+            "video_data": {"url": "file:///tmp/clip.mp4", "fps": 2},
+            "audio_data": ["a.wav", "é中🙂.wav"],
+        },
+        "headers": {},
+        "out": {"text": "", "output_ids": [1], "meta_info": {"id": "rid-7"}},
+    },
+    {
         # Watermark keys are redacted, nested ones included.
         "name": "watermark_keys",
         "body": {
@@ -309,6 +323,60 @@ _OPENAI_CASES = [
     },
 ]
 
+# Chat requests with media content parts. Their lines print nested objects as
+# Python's model filled them in, which the Rust server does not, so only
+# their `multimodal` summary is compared.
+_OPENAI_MULTIMODAL_CASES = [
+    {
+        "name": "chat_media_parts",
+        "body": {
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be brief"},
+                {
+                    "role": "user",
+                    "content": [
+                        # Inline audio first: the summary lists it first.
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "UklGRg==", "format": "wav"},
+                        },
+                        {"type": "text", "text": "what is this?"},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": "data:image/png;base64,iVBORw0KGgo=",
+                                "detail": "high",
+                            },
+                        },
+                        {"type": "video_url", "video_url": {"url": "file:///é.mp4"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image_url", "image_url": {"url": "a.png"}},
+                        {"type": "audio_url", "audio_url": {"url": "b.mp3"}},
+                        {
+                            "type": "input_audio",
+                            "input_audio": {"data": "SUQz", "format": "mp3"},
+                        },
+                    ],
+                },
+            ],
+        },
+    },
+    {
+        "name": "chat_text_parts_only",
+        "body": {
+            "model": "m",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "hi"}]},
+            ],
+        },
+    },
+]
+
 # What `datetime.now()` reads while the fixture is built, for the JSON lines'
 # `timestamp`.
 _NOW = datetime.datetime(2026, 11, 4, 1, 2, 3, 456789)
@@ -378,6 +446,7 @@ def _build_rust_request_log_fixture() -> dict:
         "timestamp": _NOW.isoformat(),
         "cases": [],
         "openai_cases": [],
+        "openai_multimodal_cases": [],
     }
     # The OpenAI models' fields, once rather than in every level's settings.
     fixture["openai_fields"] = {
@@ -422,6 +491,22 @@ def _build_rust_request_log_fixture() -> dict:
                 )
                 (expected[fmt][str(level)],) = lines
         fixture["openai_cases"].append({**case, "expected": expected})
+    for case in _OPENAI_MULTIMODAL_CASES:
+        expected = {}
+        for fmt in _FORMATS:
+            lines = []
+            request = ChatCompletionRequest(**json.loads(json.dumps(case["body"])))
+            _logger(2, fmt, lines).log_openai_received_request(
+                request, request=_Request({})
+            )
+            (line,) = lines
+            if fmt == "json":
+                expected[fmt] = json.loads(line).get("multimodal")
+            else:
+                # The summary ends a line without headers.
+                start = line.find(", multimodal=")
+                expected[fmt] = line[start:] if start >= 0 else ""
+        fixture["openai_multimodal_cases"].append({**case, "expected": expected})
     return fixture
 
 
