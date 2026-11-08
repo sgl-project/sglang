@@ -62,6 +62,7 @@ from sglang.srt.utils import (
     is_hip,
     is_xpu,
     next_power_of_2,
+    use_gfx115_kernels,
 )
 
 _is_cuda = is_cuda()
@@ -71,6 +72,8 @@ _is_xpu = is_xpu()
 
 if _is_cuda:
     from sgl_kernel.utils import is_arch_support_pdl
+if _is_hip:
+    from sglang.srt.layers.attention import triton_backend_hip as _hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -217,6 +220,9 @@ class TritonAttnBackend(AttentionBackend):
         self.skip_prefill = skip_prefill
         max_bs = model_runner.req_to_token_pool.size
         self.sliding_window_size = model_runner.sliding_window_size
+        self.is_gfx950_m31_draft = self.verify_reads_window_kv_only = False
+        if _is_hip:
+            _hip.init_m31_draft(self, model_runner.model_config.hf_config)
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
@@ -240,11 +246,7 @@ class TritonAttnBackend(AttentionBackend):
         self.topk = get_spec().speculative_eagle_topk or 0
         # Split-KV verify is bit-equivalent only for a pure-causal chain (topk==1)
         # and is gfx95-only; else fall back to extend_attention_fwd.
-        self.use_verify_splitkv = (
-            is_gfx95_supported()
-            and envs.SGLANG_ENABLE_SPLITKV_VERIFY.get()
-            and self.topk == 1
-        )
+        self.use_verify_splitkv = is_gfx95_supported() and self.topk == 1
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # The grouped-head verify kernel is tuned for Kimi-K3 MLA and Qwen3.5
         # GQA with exactly one TP-local KV head.
@@ -260,6 +262,12 @@ class TritonAttnBackend(AttentionBackend):
             _is_hip
             and model_runner.is_draft_worker
             and model_runner.spec_algorithm.is_dflash()
+        )
+        # gfx1151 verify attention reads full-space slot ids straight from req_to_token
+        self.use_verify_gfx115 = (
+            use_gfx115_kernels()
+            and self.page_size == 1
+            and not self.runner_ids.is_translating
         )
         self.dcp_size = attention_dcp_size(
             backend="triton",
@@ -278,10 +286,13 @@ class TritonAttnBackend(AttentionBackend):
             get_parallel().attn_tp_size, get_parallel().attn_dcp_size
         )
         mla_config = model_runner.model_config
+        # MLA prefill with a cached prefix runs one dense (non-absorbed) FP8 MHA:
+        # the prefix is up-projected out of the latent KV cache instead of running
+        # the absorbed 576/512 prefill. It materializes K/V for the whole batch, so
+        # it only engages when the batch fits the chunk budget.
         self.use_dense_fp8_chunked_prefill = (
             self.use_mla
             and is_gfx95_supported()
-            and envs.SGLANG_TRITON_DENSE_PREFILL_ATTN.get()
             and envs.SGLANG_TRITON_FP8_PREFILL_ATTN.get()
             and model_runner.kv_cache_dtype == torch.float8_e4m3fn
             and self.num_head == 12
@@ -526,12 +537,14 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
-        kv_indices: torch.Tensor,
+        kv_indices: Optional[torch.Tensor],
         kv_indptr: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if kv_indptr is None:
             kv_indptr = self.kv_indptr[: bs + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        if kv_indices is None:
+            return kv_indptr
         self.runner_ids.pack_read_stream(
             plan,
             req_pool_indices=req_pool_indices,
@@ -614,6 +627,7 @@ class TritonAttnBackend(AttentionBackend):
         window_kv_offsets = self.cuda_graph_window_kv_offsets if swa else None
         if (
             self._use_dflash_draft_verify
+            and not self.verify_reads_window_kv_only
             and (spec_info is None or spec_info.custom_mask is None)
             and not self.kv_index_translator.reads_are_translated
             and not isinstance(self.token_to_kv_pool, BaseSWAKVPool)
@@ -656,7 +670,13 @@ class TritonAttnBackend(AttentionBackend):
                 device=self.device,
             )
             kv_indptr = self._fill_kv_indptr_and_indices(
-                plan, bs, seq_lens, req_pool_indices, self.cuda_graph_kv_indices
+                plan,
+                bs,
+                seq_lens,
+                req_pool_indices,
+                None
+                if self.verify_reads_window_kv_only
+                else self.cuda_graph_kv_indices,
             )
             if swa:
                 window_kv_indptr, window_kv_indices, _, window_kv_offsets[:bs] = (
@@ -1057,8 +1077,10 @@ class TritonAttnBackend(AttentionBackend):
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
                 seq_lens_sum = bs * self.max_context_len
-            kv_indices = torch.empty(
-                seq_lens_sum, dtype=torch.int64, device=self.device
+            kv_indices = (
+                None
+                if self.verify_reads_window_kv_only
+                else torch.empty(seq_lens_sum, dtype=torch.int64, device=self.device)
             )
             kv_indptr = self._fill_kv_indptr_and_indices(
                 forward_batch.iteration_ids,
@@ -1705,6 +1727,48 @@ class TritonAttnBackend(AttentionBackend):
                 layer, loc, k, v, k_scale, v_scale, **kwargs
             )
 
+    def _gfx115_verify_attention(self, q, o, layer, forward_batch) -> bool:
+        """Target-verify attention on gfx115x that reads the cached prefix once for the
+        whole draft block (the block's K/V are already in the cache). Returns whether it
+        ran."""
+        from sglang.kernels.ops.attention import verify_attention_gfx1151 as va
+
+        # the token count qo_indptr is built from
+        num_tokens_per_req = self._target_verify_num_tokens_per_req(
+            forward_batch.spec_info
+        )
+        k_buffer, v_buffer = self.kv_layers.read(layer.layer_id).kv()
+        qv = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        ov = o.view(-1, layer.tp_q_head_num, layer.v_head_dim)
+        if not (
+            num_tokens_per_req > 0
+            and qv.shape[0] % num_tokens_per_req == 0
+            and layer.qk_head_dim == layer.v_head_dim
+            and va.covered(
+                qv,
+                ov,
+                k_buffer,
+                v_buffer,
+                num_tokens_per_req,
+                layer.tp_q_head_num,
+                layer.tp_k_head_num,
+                layer.qk_head_dim,
+            )
+        ):
+            return False
+        va.verify_attention_gfx1151(
+            qv,
+            ov,
+            k_buffer,
+            v_buffer,
+            self.req_to_token,
+            forward_batch.req_pool_indices,
+            forward_batch.seq_lens,
+            num_tokens_per_req,
+            layer.scaling,
+        )
+        return True
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1738,10 +1802,8 @@ class TritonAttnBackend(AttentionBackend):
 
         if k is None and v is None:
             cache_loc = forward_batch.out_cache_loc
-            if (
-                self.use_sliding_window_kv_pool
-                and self.kv_layers.route(layer.layer_id).sub_pool
-                == IdSpaceKind.SLIDING_WINDOW
+            if self.use_sliding_window_kv_pool and self.kv_layers.plays(
+                layer.layer_id, IdSpaceKind.SLIDING_WINDOW
             ):
                 assert self.forward_metadata.swa_out_cache_loc is not None, (
                     "window-layer read-back before the metadata carried a "
@@ -1778,12 +1840,14 @@ class TritonAttnBackend(AttentionBackend):
                         v,
                     )
                 else:
+                    keep = self.is_gfx950_m31_draft and _hip.stores_kv_as_given(self, k)
                     self._set_kv_buffer(
                         forward_batch,
                         layer,
                         loc_info,
-                        k.clone(),  # cloned to protect k,v from in-place mutation in set_kv_buffer
-                        v.clone(),
+                        # cloned to protect k,v from in-place mutation in set_kv_buffer
+                        k if keep else k.clone(),
+                        v if keep else v.clone(),
                         layer.k_scale,
                         layer.v_scale,
                     )
@@ -1936,6 +2000,29 @@ class TritonAttnBackend(AttentionBackend):
                 )
                 return o
 
+        if (
+            self.use_verify_gfx115
+            and forward_batch.forward_mode.is_target_verify()
+            and save_kv_cache
+            and k is not None
+            and causal
+            and score_mod is None
+            and sinks is None
+            and sliding_window_size == -1
+            # bf16 KV checkpoints may still load unit k/v scales
+            and k_descale == 1.0
+            and v_descale == 1.0
+            and not logits_soft_cap
+            and self.forward_metadata.custom_mask is None
+            and not (
+                self.use_sliding_window_kv_pool
+                and self.kv_layers.route(layer.layer_id).sub_pool
+                == IdSpaceKind.SLIDING_WINDOW
+            )
+            and self._gfx115_verify_attention(q, o, layer, forward_batch)
+        ):
+            return o
+
         # Split-KV EAGLE-verify fast path (ROCm/Triton). On target-verify
         # (topk=1 causal chain), run the bandwidth-efficient split-KV kernel
         # instead of the serial-prefix extend kernel. verify_splitkv_fwd()
@@ -1957,8 +2044,9 @@ class TritonAttnBackend(AttentionBackend):
             and forward_batch.forward_mode.is_target_verify()
             and verify_fwd(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
-                k.contiguous(),
-                v.contiguous(),
+                # the grouped-head kernel reads the draft rows through their strides
+                k if self.use_verify_shared_kv else k.contiguous(),
+                v if self.use_verify_shared_kv else v.contiguous(),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),
                 self.kv_layers.read(layer.layer_id).key(),
                 self.kv_layers.read(layer.layer_id).value(),
@@ -2297,8 +2385,7 @@ class TritonAttnBackend(AttentionBackend):
             layer.sliding_window_size is not None
             and layer.sliding_window_size > -1
             and self.use_sliding_window_kv_pool
-            and self.kv_layers.route(layer.layer_id).sub_pool
-            == IdSpaceKind.SLIDING_WINDOW
+            and self.kv_layers.plays(layer.layer_id, IdSpaceKind.SLIDING_WINDOW)
         ):
             extend_kv_indices = self.forward_metadata.swa_out_cache_loc
             assert extend_kv_indices is not None, (
