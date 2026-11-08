@@ -157,7 +157,6 @@ if TYPE_CHECKING:
     from sglang.srt.dllm.config import DllmConfig
     from sglang.srt.layers.engram_staging import StagedRows
     from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
-    from sglang.srt.managers.scheduler_components.exit_ledger import UnsentOutputs
     from sglang.srt.managers.scheduler_components.metrics_reporter import PrefillStats
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
@@ -590,7 +589,6 @@ class Req(ReqDllmMixin):
         # Set by exit_ledger (CI only).
         self.exit_via: Optional[str] = None
         self.send_via: Optional[str] = None
-        self.taken_by: Optional[UnsentOutputs] = None
         # Owned by Scheduler.defer_response until its completion is retired.
         self.defer_output = False
         # If we want to abort the request in the middle of the event loop,

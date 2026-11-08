@@ -30,7 +30,6 @@ class FakeReq(SimpleNamespace):
     # Req's exit_ledger fields.
     exit_via = None
     send_via = None
-    taken_by = None
 
 
 def release_only_retirer(
