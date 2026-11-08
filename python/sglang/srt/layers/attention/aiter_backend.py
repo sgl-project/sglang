@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 
 """
 end to end attention solution with aiter kernels
@@ -26,6 +26,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     spec_kv_index_token_blocks,
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
+from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     resolve_window_id_space,
@@ -35,14 +36,14 @@ from sglang.srt.layers.attention.graph_variants import SeqLenBucketGraphVariants
 from sglang.srt.layers.dcp import update_local_kv_lens_for_dcp
 from sglang.srt.layers.dcp.planner import plan_dcp_decode_metadata
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
-    generate_draft_decode_kv_indices,
 )
 from sglang.srt.utils import is_gfx95_supported
 
@@ -386,6 +387,24 @@ def _asm_context_prefill_gather_indices(
     return tok_idx, cu_k
 
 
+def _unified_extend_q(q: torch.Tensor, num_heads: int, head_dim: int) -> torch.Tensor:
+    """q as unified_attention's (tokens, heads, head_dim) input, without a copy when possible.
+
+    unified_attention reads q through its token stride (query_stride_0) and needs the heads x
+    head_dim of a token dense (unit dim stride, head stride = head_dim). A q that is a column
+    slice of the fused QKV output (RoPE writes it in place) is such a view and is returned as
+    is; q.contiguous() copied the whole q of every prefill/extend batch. Any other layout,
+    or one view() rejects, is made contiguous as before.
+    """
+    try:
+        q_v = q.view(-1, num_heads, head_dim)
+        if q_v.stride(2) == 1 and q_v.stride(1) == head_dim:
+            return q_v
+    except RuntimeError:
+        pass
+    return q.contiguous().view(-1, num_heads, head_dim)
+
+
 class AiterAttnBackend(AttentionBackend):
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
@@ -393,6 +412,10 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+
+    # Set in __init__; declared here for tests that build the backend without it
+    # (test_aiter_fp8_kv_scales_paths.py).
+    deterministic_prefill_max_q: Optional[int] = None
 
     def __init__(
         self,
@@ -575,6 +598,31 @@ class AiterAttnBackend(AttentionBackend):
         else:
             self.use_triton_unified_attention = get_bool_env_var(
                 "SGLANG_USE_AITER_UNIFIED_ATTN"
+            )
+        # Deterministic mode allows aiter decode only for the paged_attention_ragged
+        # path and aiter prefill only for the batch prefill path; the unified-attention
+        # and 5D-pool kernels are not verified batch-invariant.
+        if get_exec().deterministic.enable_deterministic_inference and (
+            self.use_triton_unified_attention or self.kv_cache_is_vectorized_5d
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter attention only with the "
+                "default paged KV cache: not with sliding-window models, "
+                "SGLANG_USE_AITER_UNIFIED_ATTN or a vectorized 5D KV cache layout."
+            )
+
+        # Deterministic mode: AITER batch prefill's output depends on max_seqlen_q (it
+        # sizes the launch, and 1 selects a non-causal mask), so every call gets the
+        # same value, one that covers any extend: at most one chunk.
+        self.deterministic_prefill_max_q = None
+        if get_exec().deterministic.enable_deterministic_inference:
+            self._reject_deterministic_fp8_kv_prefill(
+                getattr(model_runner, "prefill_attention_backend_str", None),
+                self.kv_cache_dtype,
+            )
+            chunk = get_schedule().chunked_prefill_size
+            self.deterministic_prefill_max_q = (
+                chunk if chunk is not None and chunk > 0 else self.max_context_len
             )
 
         # Decode metadata format. unified_attention and pa_decode_gluon (the
@@ -1281,7 +1329,7 @@ class AiterAttnBackend(AttentionBackend):
                 pt = swa_page_table
 
         k_cache, v_cache = self.kv_layers.read(layer.layer_id).kv()
-        q_u = q.contiguous().view(-1, layer.tp_q_head_num, layer.qk_head_dim)
+        q_u = _unified_extend_q(q, layer.tp_q_head_num, layer.qk_head_dim)
         o = q_u.new_empty(
             (q_u.shape[0], layer.tp_q_head_num, layer.v_head_dim),
             dtype=self.input_dtype,
@@ -3158,7 +3206,7 @@ class AiterAttnBackend(AttentionBackend):
                             kv_indices[:new_rows, :new_cols].copy_(page_indices)
                             swa_page_table = self.cuda_graph_swa_page_table
                             swa_page_table[:new_rows, :new_cols].copy_(swa_page_indices)
-                        elif self.page_size > 1:
+                        else:
                             page_indices = self._transform_table_1_to_real(page_indices)
                             new_rows = page_indices.shape[0]
                             new_cols = page_indices.shape[1]
@@ -3740,6 +3788,28 @@ class AiterAttnBackend(AttentionBackend):
         # the merge_state_triton needs lse layout [tokens, heads].
         # See https://github.com/sgl-project/sglang/blob/98fce73d5bd0a25afe7d68443d314190b1c47e64/python/sglang/kernels/ops/attention/merge_state.py#L13-L15
         return output, lse.transpose(0, 1).contiguous()
+
+    @staticmethod
+    def _reject_deterministic_fp8_kv_prefill(prefill_backend, kv_cache_dtype):
+        """Reject aiter prefill on an fp8 KV cache in deterministic mode.
+
+        The argument check accepts aiter prefill with ``--kv-cache-dtype auto``,
+        but ``auto`` becomes an fp8 KV cache at load time when the checkpoint
+        quantizes its KV cache to FP8, and the fp8 KV prefill kernel is not
+        batch-invariant. Check the resolved dtype here.
+        """
+        if prefill_backend == "aiter" and kv_cache_dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
+            torch.float8_e5m2,
+        ):
+            raise ValueError(
+                "Deterministic inference supports aiter prefill attention only with "
+                f"a bf16 KV cache, but the KV cache is {kv_cache_dtype} (with "
+                "--kv-cache-dtype auto, the checkpoint's FP8 KV cache quantization "
+                "selects fp8). Use --kv-cache-dtype bfloat16 or another "
+                "--prefill-attention-backend."
+            )
 
     @staticmethod
     def _reject_target_verify_cross_layer_kv(k, v):
@@ -4587,16 +4657,12 @@ class AiterAttnBackend(AttentionBackend):
                         .view(v_cache.dtype)
                         .view(-1, layer.tp_v_head_num, layer.v_head_dim)
                     )
-                    fp8_q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
+                    q_fp8, q_scale = self._quantize_q_fp8(q)
                     o = flash_attn_varlen_fp8_pertensor_func(
-                        q.contiguous()
-                        .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                        .to(fp8_dtype),
+                        q_fp8.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         k_gather,
                         v_gather,
-                        fp8_q_descale.reshape(1),
+                        q_scale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
                         self.forward_metadata.qo_indptr[:bs0],
@@ -4723,6 +4789,9 @@ class AiterAttnBackend(AttentionBackend):
                 v_cache = v_cache.view(-1, self.page_size, *v_cache.shape[-2:])
                 extra_kwargs["kv_last_page_lens"] = last_page_len[: bs0 - 1]
 
+            max_q_len = self.forward_metadata.max_q_len
+            if self.deterministic_prefill_max_q is not None:
+                max_q_len = max(max_q_len, self.deterministic_prefill_max_q)
             o = mha_batch_prefill_func(
                 q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim),
                 k_cache,
@@ -4730,7 +4799,7 @@ class AiterAttnBackend(AttentionBackend):
                 self.forward_metadata.qo_indptr[:bs0],
                 kv_indptr_arg,
                 page_table,
-                self.forward_metadata.max_q_len,
+                max_q_len,
                 self.forward_metadata.max_kv_len,
                 softmax_scale=layer.scaling,
                 causal=True,

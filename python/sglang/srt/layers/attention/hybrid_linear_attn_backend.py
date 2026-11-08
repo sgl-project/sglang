@@ -34,7 +34,8 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -42,7 +43,8 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_exec, get_memory, get_spec
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
@@ -50,6 +52,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -127,6 +130,15 @@ class MambaAttnBackendBase(AttentionBackend):
         # Constant (== 1) for mamba-like backends; hoisted so the replay path
         # skips the per-cycle method dispatch.
         self._graph_seq_len_fill_value = self.get_cuda_graph_seq_len_fill_value()
+
+    @property
+    def state_tracking_indices(self) -> Optional[torch.Tensor]:
+        """Physical checkpoint destinations from the current execution metadata."""
+        return (
+            None
+            if self.forward_metadata is None
+            else self.forward_metadata.mamba_track_indices
+        )
 
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
@@ -754,6 +766,11 @@ class MambaAttnBackendBase(AttentionBackend):
         forward_mode: ForwardMode,
         spec_info: Optional[Union[EagleDraftInput, EagleVerifyInput]],
     ):
+        track_buf = (
+            None
+            if self.mamba_track_indices_buf is None
+            else self.mamba_track_indices_buf[:bs]
+        )
         if forward_mode.is_decode_or_idle():
             self.query_start_loc_list[bs - 1].copy_(
                 self.cached_cuda_graph_decode_query_start_loc[: bs + 1]
@@ -789,6 +806,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 retrieve_next_token=self.retrieve_next_token_list[bs - 1],
                 retrieve_next_sibling=self.retrieve_next_sibling_list[bs - 1],
                 retrieve_parent_token=self.retrieve_parent_token_list[bs - 1],
@@ -800,6 +818,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return ForwardMetadata(
                 query_start_loc=self.query_start_loc_list[bs - 1],
                 mamba_cache_indices=self.state_indices_list[bs - 1],
+                mamba_track_indices=track_buf,
                 replayssm_write_pos=replayssm_write_pos,
                 replayssm_force_flush=replayssm_force_flush,
                 replayssm_ring_indices=replayssm_ring_indices,
@@ -1335,6 +1354,14 @@ class HybridLinearAttnBackend(AttentionBackend):
             b.shared_read_ends(fm) for b in self.attn_backend_list
         )
 
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Linear layers capture identically under every label.
+        return self.full_attn_backend.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
+        )
+
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
         for attn_backend in self.attn_backend_list:
             attn_backend.init_forward_metadata_in_graph(forward_batch)
@@ -1586,6 +1613,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        # FIXME: on the PP stable-rows path this reads the request rows and
+        # translates state indices after the forward's declared shared-read
+        # end. A row or state slot reused on the schedule stream meanwhile is
+        # read with its new owner's values. Declare a later read end, or gather
+        # the indices during metadata preparation.
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:

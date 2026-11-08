@@ -1,3 +1,4 @@
+import contextlib
 import unittest
 from concurrent.futures import Future
 from types import SimpleNamespace
@@ -6,21 +7,30 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.disaggregation.base import KVPoll
+from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.common.conn import KVTransferError
 from sglang.srt.disaggregation.decode import (
     DecodePreallocQueue,
     DecodeRequest,
     DecodeTransferQueue,
-    HiCacheRestoreResult,
     SchedulerDisaggregationDecodeMixin,
     _PendingPublish,
 )
-from sglang.srt.disaggregation.decode_hicache_mixin import HiCacheRestoreGatedKVReceiver
+from sglang.srt.disaggregation.decode_hicache_mixin import (
+    HiCacheRestoreGatedKVReceiver,
+    HiCacheRestoreResult,
+)
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
+from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -124,11 +134,12 @@ class TestHeldDestinationPublication(CustomTestCase):
         )
         event = SimpleNamespace(query=MagicMock(return_value=True))
         entry = SimpleNamespace(
+            req=FakeReq(),
             kv_receiver=receiver,
             pending_metadata=(event, ("pages", 3, None), {}),
             is_rebootstrap=False,
         )
-        queue.queue = [entry]
+        queue.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
         return queue, entry, event, receiver
 
     def test_waits_for_every_rank_and_sends_once(self):
@@ -176,7 +187,7 @@ class TestHeldDestinationPublication(CustomTestCase):
             enable_decode_hicache=False,
             disagg_decode_prealloc_queue=prealloc,
             disagg_decode_transfer_queue=queue,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
         )
         SchedulerDisaggregationDecodeMixin.process_decode_queue(scheduler)
         receiver.send_metadata.assert_called_once_with("pages", 3, None)
@@ -201,7 +212,7 @@ class _GateReceiver:
 
 def _gated_decode_req(poll, restore_status):
     return SimpleNamespace(
-        req=SimpleNamespace(rid="r", bootstrap_room=7, return_logprob=False),
+        req=FakeReq(rid="r", bootstrap_room=7, return_logprob=False),
         kv_receiver=_GateReceiver(poll),
         metadata_buffer_index=3,
         hicache_restore_status=restore_status,
@@ -232,14 +243,11 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
                 gated = HiCacheRestoreGatedKVReceiver(_gated_decode_req(poll, status))
                 self.assertEqual(gated.poll(), expected)
 
-    @patch("sglang.srt.disaggregation.decode.release_kv_cache")
     @patch("sglang.srt.disaggregation.decode.prepare_abort")
-    def test_pop_transferred_branches_on_reduced_poll_only(
-        self, mock_prepare_abort, mock_release_kv_cache
-    ):
+    def test_pop_transferred_branches_on_reduced_poll_only(self, mock_prepare_abort):
         def make_queue(decode_req, peer_poll):
             queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
-            queue.queue = [decode_req]
+            queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
             queue.enable_staging = False
             queue.enable_host_receive = False
             queue.enable_deferred_kv_release = False
@@ -276,7 +284,7 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         decode_req = _gated_decode_req(KVPoll.Success, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Failed)
         self.assertEqual(queue.pop_transferred(), [])
-        self.assertEqual(queue.queue, [])
+        self.assertEqual(list(queue.queue.items()), [])
         queue._commit_transfer_to_req.assert_not_called()
         queue._record_transfer_failure.assert_called_once_with("HiCache restore failed")
         mock_prepare_abort.assert_called_once()
@@ -292,13 +300,12 @@ class TestDecodeHiCacheRestoreGate(CustomTestCase):
         mock_prepare_abort.assert_called_once()
 
         mock_prepare_abort.reset_mock()
-        mock_release_kv_cache.reset_mock()
         decode_req = _gated_decode_req(KVPoll.Transferring, HiCacheRestoreResult.FAILED)
         queue = make_queue(decode_req, peer_poll=KVPoll.Success)
         self.assertEqual(queue.pop_transferred(), [])
-        self.assertEqual(queue.queue, [decode_req])
+        self.assertEqual(list(queue.queue.items()), [decode_req])
         mock_prepare_abort.assert_not_called()
-        mock_release_kv_cache.assert_not_called()
+        queue.scheduler.request_retirer.release.assert_not_called()
 
 
 class _PollingReceiver:
@@ -336,7 +343,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.gloo_group = object()
-        queue.queue = list(decode_reqs)
+        queue.queue = decode_queue(ListKind.PD_PREALLOC, decode_reqs)
         queue.pending_reqs = []
         queue.retracted_queue = []
         queue.num_reserved_decode_tokens = 0
@@ -367,7 +374,9 @@ class TestDeferredDestinationPublish(CustomTestCase):
             translate_kv_indices_for_transfer=lambda indices: indices,
         )
         queue.kv_manager = SimpleNamespace(kv_args=SimpleNamespace(state_types=[]))
-        queue.transfer_queue = SimpleNamespace(queue=[], enable_staging=False)
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING), enable_staging=False
+        )
         queue.tree_cache = MagicMock()
         queue.scheduler = MagicMock(
             enable_priority_scheduling=False,
@@ -380,7 +389,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
 
     @staticmethod
     def _decode_req(receiver):
-        req = SimpleNamespace(
+        req = FakeReq(
             rid="deferred",
             origin_input_ids=[1] * 5,
             output_ids=[],
@@ -470,6 +479,89 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertEqual(decode_req.metadata_buffer_index, 0)
         self.assertTrue(queue.has_published_destinations)
 
+    def test_staging_readback_preserves_payload_and_waits_for_both_events(self):
+        payloads = []
+        original_empty, original_copy = torch.empty, torch.Tensor.copy_
+        for master, staging in ((False, True), (True, False), (True, True)):
+            receiver = _PollingReceiver()
+            receiver.require_staging = True
+            entry = self._decode_req(receiver)
+            entry.req.bootstrap_room, entry.req.bootstrap_host = 17, "127.0.0.1"
+            queue = self._deferring_queue([entry])
+            queue._defer_publish = False
+            queue.scheduler.enable_overlap = True
+            forward_done, readback_done = MagicMock(), MagicMock()
+            forward_done.query.return_value = readback_done.query.return_value = False
+            queue.scheduler.device_module = SimpleNamespace(Event=lambda: forward_done)
+            queue.scheduler.forward_stream = object()
+            queue.transfer_queue.enable_staging = staging
+            queue.transfer_queue.staging_handler = MagicMock()
+            queue.token_to_kv_pool_allocator.page_size = 2
+            queue.token_to_kv_pool_allocator.state_ids = lambda _: SimpleNamespace(
+                ids=lambda x: x + 100
+            )
+            queue.req_to_token_pool.req_index_to_mamba_index_mapping = torch.arange(
+                4
+            ).reshape(4, 1)
+            queue.kv_manager.kv_args.state_types = [StateType.MAMBA]
+
+            def pinned_empty(shape, *, dtype, pin_memory):
+                return original_empty(shape, dtype=dtype)
+
+            def copy(host, device, *, non_blocking):
+                self.assertTrue(non_blocking)
+                return original_copy(host, device)
+
+            with (
+                envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.cuda.is_available",
+                    return_value=True,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.cuda.Event",
+                    return_value=readback_done,
+                ),
+                patch(
+                    "sglang.srt.disaggregation.decode.torch.empty",
+                    side_effect=pinned_empty,
+                ),
+                patch.object(torch.Tensor, "copy_", copy),
+            ):
+                queue.pop_preallocated()
+            transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+            transfer.queue = decode_queue(ListKind.PD_RECEIVING, [entry])
+            transfer.gloo_group = object()
+            with patch(
+                "sglang.srt.disaggregation.decode.all_reduce_flags",
+                side_effect=_local_reduce,
+            ):
+                transfer.publish_pending_metadata()
+                receiver.send_metadata.assert_not_called()
+                forward_done.query.return_value = True
+                transfer.publish_pending_metadata()
+                self.assertEqual(
+                    receiver.send_metadata.call_count, int(not (master and staging))
+                )
+                readback_done.query.return_value = True
+                transfer.publish_pending_metadata()
+            receiver.send_metadata.assert_called_once()
+            pages, slot, states = receiver.send_metadata.call_args.args
+            payloads.append(
+                (
+                    pages.tolist(),
+                    slot,
+                    [[x.tolist() for x in part] for part in states],
+                    receiver.send_metadata.call_args.kwargs,
+                )
+            )
+            self.assertIsNone(entry.pending_metadata)
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(payloads[1], payloads[2])
+        self.assertEqual(
+            payloads[1], ([4, 5, 6], 0, [[[101]]], {"decode_prefix_len": 0})
+        )
+
     def test_recompute_waits_for_held_metadata_to_be_sent(self):
         receiver = _PollingReceiver()
         decode_req = self._decode_req(receiver)
@@ -488,7 +580,7 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue.pop_preallocated()
         queue._submit_prefill_recompute.assert_not_called()
         transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
-        transfer.queue = [decode_req]
+        transfer.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         transfer.gloo_group = object()
         transfer.scheduler = queue.scheduler
         with patch(
@@ -535,6 +627,95 @@ class TestDeferredDestinationPublish(CustomTestCase):
         self.assertIs(queue._publish_destination.call_args.kwargs["decode_req"], live)
         self.assertTrue(released.awaiting_publish)
         self.assertFalse(live.awaiting_publish)
+
+
+def _admit_req(**overrides):
+    fields = dict(
+        grammar=None,
+        output_dsa_topk_indices=None,
+        kv=SimpleNamespace(retraction_backup=None),
+        hidden_states_tensor=object(),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+class TestAdmissionOverlap(CustomTestCase):
+    def test_scope_uses_admitted_requests_and_keeps_host_read_paths_stock(self):
+        scheduler = SimpleNamespace(
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_eagle=lambda: True),
+            enable_hisparse=False,
+        )
+        disagg = SimpleNamespace(
+            disaggregation_decode_host_receive_threshold=1,
+            disaggregation_decode_enable_radix_cache=False,
+        )
+        with patch("sglang.srt.disaggregation.decode.get_disagg", return_value=disagg):
+            for enabled in (False, True):
+                with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(enabled):
+                    scope = (
+                        SchedulerDisaggregationDecodeMixin._nonblocking_admit_in_scope
+                    )
+                    self.assertEqual(
+                        scope(scheduler, SimpleNamespace(reqs=[_admit_req()])), enabled
+                    )
+                    self.assertFalse(
+                        scope(
+                            scheduler,
+                            SimpleNamespace(reqs=[_admit_req(grammar=object())]),
+                        )
+                    )
+
+    def test_seed_is_ordered_on_forward_stream_without_schedule_wait(self):
+        for nonblocking in (False, True):
+            batch = MagicMock()
+            batch.is_empty.return_value = False
+            calls = []
+
+            @contextlib.contextmanager
+            def forward_context():
+                calls.append("enter_forward")
+                yield
+                calls.append("leave_forward")
+
+            scheduler = SimpleNamespace(
+                _get_new_prebuilt_batch=lambda _: batch,
+                _nonblocking_admit_in_scope=lambda _: nonblocking,
+                _verify_kv_checksums=lambda _: calls.append("verify"),
+                ngram_embedding_manager=MagicMock(),
+                chunked_req=None,
+                future_map=object(),
+                enable_overlap=True,
+                schedule_stream=MagicMock(),
+                forward_stream=MagicMock(),
+                forward_stream_ctx=forward_context(),
+            )
+            batch.process_prebuilt.side_effect = lambda _: calls.append("seed")
+            result = SchedulerDisaggregationDecodeMixin.get_new_prebuilt_batch(
+                scheduler, object()
+            )
+            self.assertIs(result, batch)
+            if nonblocking:
+                self.assertEqual(
+                    calls, ["verify", "enter_forward", "seed", "leave_forward"]
+                )
+                scheduler.schedule_stream.wait_stream.assert_not_called()
+                scheduler.forward_stream.wait_stream.assert_called_once_with(
+                    scheduler.schedule_stream
+                )
+                batch.req_pool_indices.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                batch.seq_lens.record_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+            else:
+                self.assertEqual(calls, ["verify", "seed"])
+                scheduler.schedule_stream.wait_stream.assert_called_once_with(
+                    scheduler.forward_stream
+                )
+                scheduler.forward_stream.wait_stream.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -22,7 +22,7 @@ from sglang.srt.beam_search.output import (
     beam_completion_tokens,
     pack_beam_search_output,
 )
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.managers.incremental_detokenize import build_detokenize_header
 from sglang.srt.managers.io_struct import (
@@ -33,10 +33,9 @@ from sglang.srt.managers.io_struct import (
     RequestOutputStats,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import (
-    BaseFinishReason,
-    Req,
-)
+from sglang.srt.managers.req_types import BaseFinishReason
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,
@@ -306,9 +305,9 @@ class SchedulerOutputStreamer:
         for req in reqs:
             if req is skip_req:
                 continue
+            # Kept for the PD decode queue paths, which stream requests that are
+            # not in any step's batch yet.
             if req.finished() and req.finished_output:
-                # With the overlap schedule, a request will try to output twice and hit this line twice
-                # because of the one additional delayed token. This "continue" prevented the dummy output.
                 continue
 
             acc.accept(req=req)
@@ -579,6 +578,7 @@ class _GenerationStreamAccumulator:
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
+            record_send(req, "stream")
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
             should_output = True

@@ -30,6 +30,10 @@ from sglang.srt.layers.attention.linear.kda_prefill_graph import (
     build_track_rows,
 )
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import (
+    stage_pool_states,
+    unstage_pool_states,
+)
 from sglang.srt.layers.attention.linear.utils import (
     LinearAttnBackends,
     LinearAttnKernelBackend,
@@ -37,10 +41,12 @@ from sglang.srt.layers.attention.linear.utils import (
     pp_spec_stable_rows_enabled,
     select_verify_intermediate_state_indices,
 )
+from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardMetadata
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -49,7 +55,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
 )
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
-from sglang.srt.utils.common import is_pin_memory_available, rank0_log
+from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 
@@ -679,7 +686,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             extend_prefix_lens=forward_batch.extend_prefix_lens,
             track_rows=track_rows,
         )
+        if track_rows is None and forward_batch.mamba_track_indices is not None:
+            meta.track_dst[: forward_batch.batch_size].copy_(
+                forward_batch.mamba_track_indices
+            )
         self.prefill_graph_metadata = meta
+        self.forward_metadata = ForwardMetadata(
+            query_start_loc=meta.cu_seqlens,
+            mamba_cache_indices=meta.cache_indices,
+            mamba_track_indices=None
+            if forward_batch.mamba_track_indices is None
+            else meta.track_dst[: forward_batch.batch_size],
+        )
 
     def _prefill_graph_track_rows(
         self, forward_batch: ForwardBatch
@@ -1262,8 +1280,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         # Page-major envelope: the prefill kernels (CUDA causal_conv1d_fwd,
         # chunk_gated_delta_rule) write state back in place assuming a contiguous
         # slot layout, so they silently drop the write to the strided envelope
-        # pool. Run them on contiguous per-sequence copies (identity-indexed) and
-        # scatter the result back. No-op for the default contiguous pool.
+        # pool. Run them on contiguous per-sequence copies and scatter the result
+        # back. No-op for the default contiguous pool.
         # CPU kernels (causal_conv1d_fwd_cpu, chunk_gated_delta_rule_cpu) use
         # proper indexed writes and handle non-contiguous pools directly via
         # cache_indices, so the gather/scatter round-trip is unnecessary on CPU.
@@ -1277,13 +1295,13 @@ class GDNAttnBackend(MambaAttnBackendBase):
             and (not conv_states.is_contiguous() or not ssm_states.is_contiguous())
         )
         if needs_state_gather:
-            conv_states_contig = conv_states[cache_indices].contiguous()
-            ssm_states_contig = ssm_states[cache_indices].contiguous()
-            state_cache_indices = torch.arange(
-                cache_indices.shape[0],
-                device=cache_indices.device,
-                dtype=cache_indices.dtype,
-            )
+            # Row 0 of the copies is the padding sink, as in the pool: the
+            # prefill kernels treat state index 0 as padding.
+            (
+                (conv_states_contig, ssm_states_contig),
+                state_cache_indices,
+                staged_pool_rows,
+            ) = stage_pool_states((conv_states, ssm_states), cache_indices)
         else:
             conv_states_contig = conv_states
             ssm_states_contig = ssm_states
@@ -1464,8 +1482,11 @@ class GDNAttnBackend(MambaAttnBackendBase):
             if needs_state_gather:
                 # Scatter the in-place-updated contiguous copies back to the
                 # strided envelope pool (advanced indexing handles the strides).
-                conv_states[cache_indices] = conv_states_contig
-                ssm_states[cache_indices] = ssm_states_contig
+                unstage_pool_states(
+                    (conv_states, ssm_states),
+                    (conv_states_contig, ssm_states_contig),
+                    staged_pool_rows,
+                )
 
             if forward_metadata.has_mamba_track_mask:
                 self._track_mamba_state_extend(

@@ -20,11 +20,13 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import MetadataBuffers, kv_layout_signature
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def _ref_strided_adler32(tensors, indices, strides) -> int:
@@ -249,12 +251,15 @@ def _plain_kv_pool():
 class _FakeScheduler(SchedulerDisaggregationDecodeMixin):
     def __init__(self, computer, req_to_token):
         self.kv_checksum_computer = computer
+        self.enable_overlap = False
         self.waiting_queue = []
         self.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1, get_kvcache=_plain_kv_pool
         )
         self.req_to_token_pool = SimpleNamespace(req_to_token=req_to_token)
         self.tree_cache = None
+        self.request_retirer = Mock()
+        self.enable_hisparse = False
         self.output_streamer = SimpleNamespace(stream_output=self.stream_output)
         self.metrics_reporter = SimpleNamespace(enable_metrics=True)
         self.metrics_collector = Mock()
@@ -290,7 +295,7 @@ def _make_req(
     bootstrap_host="127.0.0.1",
     start_idx=0,
 ):
-    return SimpleNamespace(
+    return FakeReq(
         rid=rid,
         bootstrap_host=bootstrap_host,
         bootstrap_port=8998,
@@ -445,7 +450,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
         ):
             batch = self._run_once(sched)
             self.assertIsNone(self._run_once(sched))
@@ -454,7 +458,7 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         self.assertEqual(sched.waiting_queue, [])
         self.assertEqual(sched.streamed_aborts, [req])
         mock_abort.assert_called_once()
-        mock_release.assert_called_once()
+        sched.request_retirer.release.assert_called_once_with(req, checkpoint=False)
         sched.metrics_collector.increment_transfer_failed_reqs.assert_called_once_with()
 
     def test_mismatch_raises_in_ci(self):
@@ -473,15 +477,12 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         sched = self._make_sched(_SENTINEL)
         req = _make_req(0xDEADBEEF, self.num_pages, rid="HEALTH_CHECK_1")
         sched.waiting_queue = [req]
-        with (
-            patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache") as mock_release,
-        ):
+        with patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort:
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [req])
         self.assertEqual(sched.streamed_aborts, [])
         mock_abort.assert_not_called()
-        mock_release.assert_not_called()
+        sched.request_retirer.release.assert_not_called()
 
     def test_injected_mismatch_aborts_without_raising_in_ci(self):
         """The injector must not trip the in-CI raise it exists to exercise."""
@@ -492,7 +493,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
             envs.SGLANG_IS_IN_CI.override(True),
             envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.override(1.0),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             self.assertIsNone(self._run_once(sched))
         self.assertEqual(sched.streamed_aborts, [req])
@@ -506,7 +506,6 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort"),
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(
                 sched, reduce=lambda flags, group, op: [1] * len(flags)
@@ -571,12 +570,44 @@ class TestGetNewPrebuiltBatchChecksum(unittest.TestCase):
         with (
             envs.SGLANG_IS_IN_CI.override(False),
             patch("sglang.srt.disaggregation.decode.prepare_abort") as mock_abort,
-            patch("sglang.srt.disaggregation.decode.release_kv_cache"),
         ):
             batch = self._run_once(sched)
         self.assertEqual(batch.reqs, [skipped])
         self.assertEqual(sched.streamed_aborts, [aborted])
         mock_abort.assert_called_once()
+
+
+class TestKvChecksumMismatchHiSparse(unittest.TestCase):
+    def test_mismatch_releases_hisparse_before_kv(self):
+        # Transfer already admitted the request into HiSparse; the abort must
+        # free its host pages before the KV itself.
+        sched = _FakeScheduler(None, None)
+        calls = []
+        hisparse_coordinator = Mock()
+        hisparse_coordinator.request_finished.side_effect = lambda req: calls.append(
+            ("hisparse", req)
+        )
+        sched.request_retirer = release_only_retirer(Mock(), hisparse_coordinator)
+        req = _make_req(0xDEADBEEF, 4)
+        req.kv = SimpleNamespace(
+            holds_kv=True, holds_mamba=False, retraction_backup=None
+        )
+        # What the patched `prepare_abort` would set.
+        req.finished_reason = FINISH_ABORT("KV checksum mismatch")
+        req.cache_request_handle = None
+        req.session = None
+        req.get_mm_token_counts = Mock()
+        req.release_mm_inputs_on_abort = Mock()
+        with (
+            envs.SGLANG_IS_IN_CI.override(False),
+            patch("sglang.srt.disaggregation.decode.prepare_abort"),
+            patch(
+                "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+                side_effect=lambda req, *a, **kw: calls.append(("kv", req)),
+            ),
+        ):
+            sched._handle_kv_checksum_mismatch(req, "KV checksum mismatch")
+        self.assertEqual(calls, [("hisparse", req), ("kv", req)])
 
 
 _SENTINEL = object()

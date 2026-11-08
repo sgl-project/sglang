@@ -5,10 +5,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 import torch
 from torch import nn
 
+from sglang.kernels.ops.attention.qk_norm_rope import qk_norm_rope
 from sglang.kernels.ops.attention.table_qk_norm_rope import table_qk_norm_rope_
 from sglang.srt.environ import envs
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.layer_boundary import (
+    NORM_QUANT_READOUT,
     append_stages,
     declare_attn,
     declare_ffn,
@@ -19,10 +21,16 @@ from sglang.srt.layers.linear import QKVParallelLinear, RowParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.fp8_activation import (
+    aiter_prefers_bf16_input,
+    aiter_takes_fp8_group_input,
+    fp8_group_quant_fusion_allowed,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
 from sglang.srt.layers.rotary_embedding.mrope import MRotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -31,6 +39,7 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_kv_layers
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -38,10 +47,25 @@ from sglang.srt.model_loader.weight_utils import (
 )
 from sglang.srt.models.qwen2 import Qwen2MLP as Qwen3MLP
 from sglang.srt.models.qwen2 import Qwen2Model
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    maybe_enable_silu_fp4_quant_fusion,
+)
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_bool_env_var, is_cuda, is_hip, is_npu
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_exec,
+    get_parallel,
+    get_spec,
+    get_stream,
+)
+from sglang.srt.utils import (
+    get_bool_env_var,
+    is_cuda,
+    is_gfx95_supported,
+    is_hip,
+    is_npu,
+)
 
 Qwen3Config = None
 
@@ -49,6 +73,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_gfx95 = is_gfx95_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 _has_fused_qk_norm_mrope = False
@@ -179,6 +204,7 @@ class Qwen3Attention(nn.Module):
         attention_bias: bool = False,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
+        enable_prefill_qk_norm_rope: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -262,8 +288,36 @@ class Qwen3Attention(nn.Module):
             and not envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.get()
             and get_exec().deterministic.rl_on_policy_target is None
             and get_exec().graph.cuda_graph_config.prefill.tc_compiler != "inductor"
-            and type(self.rotary_emb) is RotaryEmbedding
+            and (
+                type(self.rotary_emb) is RotaryEmbedding
+                or (
+                    # At head_dim 256, triton_mrope_fused's BF16 rounding differs.
+                    type(self.rotary_emb) is MRotaryEmbedding
+                    and self.rotary_emb.mrope_section is not None
+                    and self.head_dim in (64, 128)
+                )
+            )
             and self.head_dim in (64, 128, 256)
+        )
+        self.table_rope_positions_ndim = (
+            2 if type(self.rotary_emb) is MRotaryEmbedding else 1
+        )
+
+        # Only the ordinary dense-Qwen3 caller opts in; inherited callers stay native.
+        self.use_prefill_qk_norm_rope = (
+            enable_prefill_qk_norm_rope
+            and self.use_table_qk_norm_rope
+            and type(self) is Qwen3Attention
+            and type(self.rotary_emb) is RotaryEmbedding
+            and quant_config is None
+            and attn_tp_size == 1
+            and self.head_dim == 128
+            and torch.cuda.get_device_capability()[0] == 9
+            and attention_backends()[0] in ("fa3", "flashinfer")
+            and get_spec().speculative_algorithm is None
+            and self.rotary_emb.is_neox_style
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
 
         self.use_fused_qk_norm_mrope = (
@@ -309,7 +363,12 @@ class Qwen3Attention(nn.Module):
             and qkv.dtype == torch.bfloat16
             and self.q_norm.weight.dtype == torch.bfloat16
             and self.k_norm.weight.dtype == torch.bfloat16
+            and positions.ndim == self.table_rope_positions_ndim
         ):
+            axis_map = None
+            if positions.ndim == 2:
+                axis_map = self.rotary_emb.axis_map
+                self.rotary_emb._match_cos_sin_cache_dtype(qkv)
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -321,6 +380,30 @@ class Qwen3Attention(nn.Module):
                 self.head_dim,
                 self.q_norm.variance_epsilon,
                 match_cuda=True,
+                axis_map=axis_map,
+            )
+        elif (
+            self.use_prefill_qk_norm_rope
+            and forward_batch.forward_mode == ForwardMode.EXTEND
+            and not torch.compiler.is_compiling()
+            and qkv.is_cuda
+            and qkv.is_contiguous()
+            and qkv.dtype in (torch.bfloat16, torch.float16)
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+            and positions.is_contiguous()
+            and positions.dtype in (torch.int32, torch.int64)
+        ):
+            q = qk_norm_rope(
+                q=q,
+                k=k,
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                head_dim=self.head_dim,
+                eps=self.q_norm.variance_epsilon,
             )
         else:
             q, k = apply_qk_norm(
@@ -395,9 +478,15 @@ class Qwen3Attention(nn.Module):
         if can_try_aiter_fused:
             k_cache, v_cache = get_kv_layers().read(self.attn.layer_id).kv()
             # The fused write targets the NHD layout, in the activation dtype or
-            # the one fp8 dtype the kernel quantizes to.
+            # the one fp8 dtype the kernel quantizes to. A fused-norm (fp8,
+            # scale) input still yields a bf16 qkv.
+            act_dtype = (
+                torch.bfloat16
+                if isinstance(hidden_states, tuple)
+                else hidden_states.dtype
+            )
             use_aiter_fused = k_cache.dim() == 3 and (
-                k_cache.dtype in (hidden_states.dtype, aiter_dtypes.fp8)
+                k_cache.dtype in (act_dtype, aiter_dtypes.fp8)
             )
 
         if use_aiter_fused:
@@ -467,6 +556,9 @@ class Qwen3DecoderLayer(nn.Module):
             attention_bias=config.attention_bias,
             prefix=add_prefix("self_attn", prefix),
             alt_stream=alt_stream,
+            enable_prefill_qk_norm_rope=(
+                type(self) is Qwen3DecoderLayer and config.model_type == "qwen3"
+            ),
         )
         self.mlp = Qwen3MLP(
             hidden_size=self.hidden_size,
@@ -476,6 +568,7 @@ class Qwen3DecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             reduce_results=False,
         )
+        maybe_enable_silu_fp4_quant_fusion(self.mlp)
 
         norm_kwargs = (
             dict(
@@ -499,6 +592,8 @@ class Qwen3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+        # Resolved on the first decode: the bpreshuffle happens at weight load.
+        self._decode_quant_formats = None
 
     @staticmethod
     def stage_facts(config: Qwen3Config, layer_id: int):
@@ -507,7 +602,47 @@ class Qwen3DecoderLayer(nn.Module):
         too (see make_layers)."""
         return (
             declare_attn(),
-            declare_ffn(sparse=False, next_layer_sparse=False),
+            declare_ffn(sparse=False, next_layer_sparse=False, read=NORM_QUANT_READOUT),
+        )
+
+    def _quant_formats(self, forward_batch: ForwardBatch, positions: torch.Tensor):
+        """quant_format for the attention and FFN input norms: "fp8" fuses the
+        1x128 fp8 quant of qkv_proj / gate_up_proj into the norm (decode only,
+        unless the linear runs this batch's rows faster on a bf16 input)."""
+        if not forward_batch.forward_mode.is_decode():
+            return "", ""
+        linears = (self.self_attn.qkv_proj, self.mlp.gate_up_proj)
+        if self._decode_quant_formats is None:
+            self._decode_quant_formats = tuple(
+                "fp8"
+                if _use_aiter
+                and _is_gfx95
+                and aiter_takes_fp8_group_input(linear)
+                # The GEMM returns bf16 for a pre-quantized input.
+                and linear.params_dtype == torch.bfloat16
+                else ""
+                for linear in linears
+            )
+        if not any(self._decode_quant_formats) or not fp8_group_quant_fusion_allowed():
+            return "", ""
+        # The layer input may be an opaque OwedOutput; positions has one entry
+        # per token (in its last dim under M-RoPE).
+        num_tokens = positions.shape[-1]
+        # A read that the input moves after (attention DP, scattered rows)
+        # cannot hand on the quantized input.
+        return tuple(
+            (
+                quant
+                if quant
+                and boundary.reads_quantized(forward_batch)
+                and not aiter_prefers_bf16_input(linear, num_tokens)
+                else ""
+            )
+            for quant, boundary, linear in zip(
+                self._decode_quant_formats,
+                (self.attn_boundary, self.ffn_boundary),
+                linears,
+            )
         )
 
     def forward(
@@ -518,14 +653,24 @@ class Qwen3DecoderLayer(nn.Module):
         post_residual_addition: Optional[torch.Tensor] = None,
         capture_output=None,
     ) -> torch.Tensor:
+        attn_quant, ffn_quant = self._quant_formats(forward_batch, positions)
+        if post_residual_addition is not None:
+            # The fused fp8 norm does not apply the addition.
+            attn_quant = ""
         # Self Attention
+        # quant_format goes only to a read that quantizes; other paths are called
+        # as for an unquantized model.
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
             post_residual_addition=post_residual_addition,
             capture=capture_output,
+            **({"quant_format": attn_quant} if attn_quant else {}),
         )
-        if hidden_states.shape[0] != 0:
+        num_tokens = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        ).shape[0]
+        if num_tokens != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -537,6 +682,7 @@ class Qwen3DecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(
             hidden_states,
             forward_batch,
+            **({"quant_format": ffn_quant} if ffn_quant else {}),
             cache=(
                 [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
                 if _is_npu

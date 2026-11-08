@@ -9,8 +9,8 @@ import torch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
-from sglang.srt.utils.common import is_npu
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -60,7 +60,11 @@ def resolve_window_id_space(
         return None
     allocator = model_runner.token_to_kv_pool_allocator
     if allocator.hands_out_virtual_ids and window_pool.requires_physical_write_loc:
-        return allocator.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
+        # The runner's ids resolve the sliding-window role to the storage its
+        # window layers live in: the target's window for the target, and for
+        # a fused draft its host, which is a band of its own when the draft's
+        # window differs from every target window.
+        return model_runner.runner_ids.space(IdSpaceKind.SLIDING_WINDOW)
     return window_pool.id_spaces().get(IdSpaceKind.SLIDING_WINDOW)
 
 
@@ -157,6 +161,11 @@ class AttentionBackend(ABC):
         """
         self.init_forward_metadata_out_graph(forward_batch)
         self.init_forward_metadata_in_graph(forward_batch)
+
+    @property
+    def requires_eager_metadata(self) -> bool:
+        """Whether metadata preparation has host work required on every replay."""
+        return False
 
     def glue_target_verify_metadata(self) -> str:
         """Empty if the target verify prep may be captured into the metadata glue graph
@@ -268,7 +277,6 @@ class AttentionBackend(ABC):
         self,
         forward_batch: ForwardBatch,
         *,
-        num_qo_tokens: int,
         build_snapshot: bool = True,
     ) -> SharedReadEnds:
         """Return this batch's prefill read end, building a snapshot when asked.
@@ -283,13 +291,11 @@ class AttentionBackend(ABC):
         if forward_batch.forward_mode != ForwardMode.EXTEND:
             return SharedReadEnds.UNKNOWN
         if build_snapshot:
-            return self._snapshot_prefill_shared_reads(
-                forward_batch, num_qo_tokens=num_qo_tokens
-            )
+            return self._snapshot_prefill_shared_reads(forward_batch)
         return self.shared_read_ends(forward_batch.forward_mode)
 
     def _snapshot_prefill_shared_reads(
-        self, forward_batch: ForwardBatch, *, num_qo_tokens: int
+        self, forward_batch: ForwardBatch
     ) -> SharedReadEnds:
         """Snapshot late shared reads; return PRE_REPLAY only if none remain.
 

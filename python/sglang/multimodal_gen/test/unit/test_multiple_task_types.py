@@ -62,10 +62,8 @@ def make_args(config, output=None):
 
 
 def test_legacy_enums_and_capabilities():
-    from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
-    from sglang.multimodal_gen.configs.sample.sampling_params import (
-        DataType as OldDataType,
-    )
+    from sglang.multimodal_gen.configs.task_type import DataType as OldDataType
+    from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
     assert ModelTaskType is Task
     assert OldDataType is DataType
@@ -222,7 +220,7 @@ def http_client(monkeypatch, tmp_path, request):
         return complete_dispatch()
 
     monkeypatch.setattr(image_api, "process_generation_batch", generate)
-    monkeypatch.setattr(image_api, "_upload_and_cleanup_images", upload)
+    monkeypatch.setattr(image_api.cloud_storage, "upload_all_and_cleanup", upload)
     monkeypatch.setattr(video_api, "_dispatch_job_async", dispatch)
     app = FastAPI()
     app.include_router(image_api.router)

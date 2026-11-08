@@ -15,13 +15,13 @@ from transformers.cache_utils import DynamicCache
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_model_info,

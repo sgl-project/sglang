@@ -74,7 +74,7 @@ class TestPrefillAdder(CustomTestCase):
     ) -> MagicMock:
         tree_cache = MagicMock()
         tree_cache.full_evictable_size.return_value = full_evictable_size
-        tree_cache.swa_evictable_size.return_value = swa_evictable_size
+        tree_cache.window_evictable_size.return_value = swa_evictable_size
         tree_cache.evictable_size.return_value = evictable_size
         tree_cache.disable = False
         tree_cache.inc_lock_ref.return_value = IncLockRefResult()
@@ -144,8 +144,7 @@ class TestPrefillAdder(CustomTestCase):
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
         req.retracted_stain = False
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
-        req.auxiliary_swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
@@ -207,7 +206,7 @@ class TestPrefillAdder(CustomTestCase):
     def create_shared_req(self, rid, max_new_tokens=4):
         req = self.create_mock_req(rid, priority=0, max_new_tokens=max_new_tokens)
         req.sampling_params.ignore_eos = False
-        req.swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.last_node = MagicMock()
         req.full_untruncated_fill_ids = list(range(12))
         return req
@@ -439,11 +438,11 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_shared_adder()
         self.assertIsNotNone(adder.token_to_kv_pool_allocator.alloc(24))
         self.mock_tree_cache.full_evictable_size.return_value = 24
-        self.mock_tree_cache.swa_evictable_size.return_value = 24
+        self.mock_tree_cache.window_evictable_size.return_value = 24
 
         def lock_prefix(_):
             self.mock_tree_cache.full_evictable_size.return_value = 0
-            self.mock_tree_cache.swa_evictable_size.return_value = 0
+            self.mock_tree_cache.window_evictable_size.return_value = 0
             return IncLockRefResult()
 
         self.mock_tree_cache.inc_lock_ref.side_effect = lock_prefix
@@ -1321,7 +1320,7 @@ class TestPrefillAdder(CustomTestCase):
         req.prefix_len = PREFIX
         req.full_untruncated_fill_ids = list(range(PREFIX + EXTEND))
         req.host_hit_length = 0
-        req.swa_host_hit_length = 0
+        req.window_host_hit_lengths = {}
         req.last_node = MagicMock()
         req.sampling_params = SimpleNamespace(max_new_tokens=40, ignore_eos=False)
 
@@ -1366,7 +1365,7 @@ class TestPrefillAdder(CustomTestCase):
             req.prefix_len = 0
             req.full_untruncated_fill_ids = list(range(SPAN))
             req.host_hit_length = HOST_HIT
-            req.swa_host_hit_length = WINDOW
+            req.window_host_hit_lengths = {"swa": WINDOW}
             req.needs_host_load_back.return_value = True
             req.last_node = MagicMock()
             req.best_match_node = MagicMock()
@@ -1443,7 +1442,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         req = self._create_host_hit_req(host_hit=6144, tail=2048)
         req.sampling_params.max_new_tokens = 1024
-        req.swa_host_hit_length = 1024
+        req.window_host_hit_lengths = {"swa": 1024}
         req.best_match_node = MagicMock()
         req.needs_host_load_back.return_value = True
 
@@ -1472,7 +1471,7 @@ class TestPrefillAdder(CustomTestCase):
                     first = self._create_delayer_req(
                         512, rid="first", max_new_tokens=16
                     )
-                    first.swa_host_hit_length = 0
+                    first.window_host_hit_lengths = {}
                     adder.add_one_req(
                         first, has_chunked_req=False, truncation_align_size=None
                     )
@@ -1610,6 +1609,11 @@ class TestPrefillAdder(CustomTestCase):
         self.mock_tree_cache.mock_add_spec(schedule_policy.UnifiedRadixCache)
         self.mock_tree_cache.buffer_pipeline = MagicMock()
         allocator = self.mock_token_allocator
+        allocator.prefill_state_fits.side_effect = (
+            lambda full, window, state, **kwargs: (
+                full + state * 64 <= allocator.available_size()
+            )
+        )
         allocator.create_prefill_budget.side_effect = lambda tree_cache, **kwargs: (
             ChainPrefillBudget(
                 allocator,
@@ -1619,12 +1623,22 @@ class TestPrefillAdder(CustomTestCase):
             )
         )
         adder = self.create_adder(self.create_running_batch())
-        adder.memory_budget.rem_state_slots = available_slots
+        allocator.mamba_allocator.schedulable_available_size.return_value = (
+            available_slots
+        )
+        self.mock_tree_cache.supports_mamba.return_value = True
+        self.mock_tree_cache.mamba_evictable_size.return_value = 0
         req = self._create_host_hit_req(host_hit=32, tail=8)
         req.mamba_host_hit_length = 1
         req.kv.mamba_pool_idx = torch.tensor([0]) if holds_state else None
+        allocator.storage.pending_state_slots.side_effect = lambda req: int(
+            not req.kv.holds_mamba
+        )
 
         def load_back(params):
+            allocator.mamba_allocator.schedulable_available_size.return_value -= (
+                int(not req.kv.holds_mamba) + req.mamba_host_hit_length
+            )
             req.kv.mamba_pool_idx = torch.tensor([0])
             return req.host_hit_length, req.last_node
 
@@ -1651,9 +1665,7 @@ class TestPrefillAdder(CustomTestCase):
                 )
                 if admitted:
                     self.mock_tree_cache.init_load_back.assert_called_once()
-                    self.assertEqual(
-                        adder.memory_budget.total_offset, 8 + 8 + 1 + slots * 64
-                    )
+                    self.assertEqual(adder.memory_budget.total_offset, 8 + 8 + 1)
                 else:
                     self.assertIs(result, AddReqResult.NO_TOKEN)
                     self.mock_tree_cache.init_load_back.assert_not_called()
@@ -1662,6 +1674,29 @@ class TestPrefillAdder(CustomTestCase):
                         self.mock_tree_cache.buffer_pipeline.defer_staged_admission.assert_called_once_with(
                             req, "mamba"
                         )
+
+    def test_idle_budget_failure_defers_staged_prefix_unless_kv_awaits_transfer(self):
+        for kv_awaiting_transfer in (False, True):
+            with self.subTest(kv_awaiting_transfer=kv_awaiting_transfer):
+                self.mock_token_allocator = self.create_token_allocator(
+                    available_size=100
+                )
+                self.mock_tree_cache = self.create_tree_cache()
+                self.mock_tree_cache.buffer_pipeline = MagicMock()
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    kv_awaiting_transfer=kv_awaiting_transfer,
+                )
+                req = self._create_delayer_req(1000)
+
+                result = adder.add_one_req(req, False, None)
+
+                self.assertIs(result, AddReqResult.NO_TOKEN)
+                defer = self.mock_tree_cache.buffer_pipeline.defer_staged_admission
+                if kv_awaiting_transfer:
+                    defer.assert_not_called()
+                else:
+                    defer.assert_called_once_with(req, "prefill_budget")
 
     def test_mamba_chunk_continuation_does_not_charge_restored_state_again(self):
         adder, req = self._build_mamba_restore_admission(
@@ -1674,7 +1709,7 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        next_adder.memory_budget.rem_state_slots = 0
+        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = 0
         self.assertIsNone(next_adder.add_chunked_req(req))
         self.assertEqual(next_adder.memory_budget.rem_state_slots, 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
@@ -1736,7 +1771,7 @@ class TestPrefillAdder(CustomTestCase):
                     req.host_hit_length -= 4
                 old_node, restored_node = req.last_node, object()
                 if name == "aux_only":
-                    req.swa_host_hit_length = 8
+                    req.window_host_hit_lengths = {"swa": 8}
 
                 def load_back(params):
                     self.assertIs(params.req, req)
@@ -2034,14 +2069,20 @@ class TestPrefillAdder(CustomTestCase):
         adder = self.create_swa_adder(size_swa=1024, sliding_window=128)
         self.assertTrue(
             adder.memory_budget.swa_never_fits(
-                extend_input_len=256, max_new_tokens=64, swa_host_hit_length=4096
+                extend_input_len=256,
+                max_new_tokens=64,
+                window_host_hit_lengths={"swa": 4096},
             )
         )
 
     def test_swa_never_fits_is_gated_by_pool_capacity(self):
         # Same request; only the pool size changes. Proves the check compares
         # the budget against size_swa (guards against a wrong-accessor bug).
-        req = dict(extend_input_len=256, max_new_tokens=64, swa_host_hit_length=600)
+        req = dict(
+            extend_input_len=256,
+            max_new_tokens=64,
+            window_host_hit_lengths={"swa": 600},
+        )
         self.assertTrue(
             self.create_swa_adder(
                 size_swa=512, sliding_window=128
