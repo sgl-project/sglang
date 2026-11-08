@@ -1,21 +1,13 @@
-"""Kimi-K3.1 trtllm DSA under sharded DCP: fused q concat-cast into a head-padded
-fp8 buffer, and per-rank trtllm-gen partials (owned top-k rows compacted, seq_lens =
-owned count, base-2 LSE) merging to the single-rank result. The prims_ts backend
-reads the same raw FP8 rows and owned-row tables; its partials carry a natural-log
-LSE."""
+"""Per-rank trtllm-gen DSA partials under sharded DCP merge to the single-rank result."""
 
 from __future__ import annotations
 
 import unittest
-from types import SimpleNamespace
-from unittest import mock
 
 import torch
 
-from sglang.kernels.ops.attention.mla_qk_prep import concat_and_cast_q_fp8_heads
 from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import _localize_compact_kernel
-from sglang.srt.models.deepseek_common.attention_forward_methods import forward_mla
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -29,7 +21,6 @@ SM_SCALE = (QK_NOPE + ROPE) ** -0.5
 
 def _sm100() -> bool:
     return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
-
 
 
 def _localize(slots: torch.Tensor, dcp: int, rank: int):
@@ -75,10 +66,9 @@ class TestShardedDcpPartials(CustomTestCase):
             torch.bfloat16
         )
         q8 = torch.zeros(rows, padded, DIM, dtype=FP8, device="cuda")
-        concat_and_cast_q_fp8_heads(q8, q[..., :KV_LORA], q[..., KV_LORA:])
+        q8[:, :heads] = q.to(FP8)
 
-        # global top-k slots, valid first then -1; row 0 has keys on rank 0
-        # only, so the other ranks see an empty row
+        # Row 0 has keys on rank 0 only, so the other ranks see an empty row.
         slots = torch.full((rows, TOPK), -1, dtype=torch.int32, device="cuda")
         counts = torch.randint(1, TOPK + 1, (rows,), generator=gen, device="cuda")
         counts[1] = TOPK
@@ -109,8 +99,7 @@ class TestShardedDcpPartials(CustomTestCase):
         merged = (w.unsqueeze(-1) * torch.stack(outs)).sum(0) / w.sum(0).unsqueeze(-1)
         merged_lse = torch.log2(w.sum(0)) + lse.max(0).values
 
-        # fp32 attention over the same fp8 q / KV: trtllm-gen's own error
-        # (fp8 P) is ~2%, so compare both paths against it, not each other.
+        # trtllm-gen's own fp8 error is ~2%, so compare both paths to fp32.
         qf, kvf = q8[:, :heads].float(), kv.float()
         ref = torch.empty_like(full)
         for r in range(rows):
@@ -126,7 +115,6 @@ class TestShardedDcpPartials(CustomTestCase):
         torch.testing.assert_close(
             merged_lse, full_lse[:, :heads], atol=1e-3, rtol=1e-3
         )
-
 
 
 if __name__ == "__main__":
