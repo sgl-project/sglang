@@ -6,15 +6,14 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
-    resolution_result,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend
@@ -522,6 +521,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
+    # The pool's ends compact lazily, behind the forwards and transfers that
+    # may still touch the pages they move; there is no eager compaction.
+    assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+        "--enable-unified-memory requires lazy compaction; unset "
+        "SGLANG_DISABLE_LAZY_COMPACTION."
+    )
     if cfg.disaggregation_mode != "null":
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
@@ -542,10 +547,6 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         ), (
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
-        )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with PD disaggregation requires lazy "
-            "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
         )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "

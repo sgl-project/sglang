@@ -36,6 +36,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+
 logger = logging.getLogger(__name__)
 
 # Swept on the hardware named; anything else gets _UNTUNED_DEFAULT and a warning.
@@ -290,7 +292,7 @@ def _union_path(*, q, kv, indices, sm_scale, d_v, out, G, union_config):
     U_STRIDE = G * K
     if union_config is not None:
         bn, warps, stages = union_config
-    elif torch.cuda.get_device_capability(q.device)[0] >= 12:
+    elif current_arch().is_sm_at_least(12):
         # SM120 sweeps on real indices: (64,4,3) at G=2. At G=4 the 32-row Q
         # tile makes BN=64 exceed the 100 KB budget; (32,4,2) beats every neighbour.
         bn, warps, stages = (64, 4, 3) if G == 2 else (32, 4, 2)
@@ -345,8 +347,9 @@ def _topk_length(indices, topk):
 
 
 # Per-arch tuned (BLOCK_N, num_warps, num_stages); see _PINNED.
-def _config(device):
-    cap = torch.cuda.get_device_capability(device)
+def _config():
+    cuda = current_arch().cuda
+    cap = cuda.capability
     if cap in _PINNED:
         return _PINNED[cap]
     if cap not in _UNTUNED_ARCH_WARNED:
@@ -470,7 +473,7 @@ def sparse_mla_prefill(
     if topk_length is None:
         topk_length = _topk_length(indices, topk)
 
-    bn, warps, stages = config or _config(q.device)
+    bn, warps, stages = config or _config()
     # int32 gather addressing keeps the gather loop on IMAD; int64 only when the
     # pool could overflow int32 element offsets (row*d_qk + d_qk-1), i.e. above
     # ~3.7M rows at d_qk=576. No test can allocate that pool, so the mode is

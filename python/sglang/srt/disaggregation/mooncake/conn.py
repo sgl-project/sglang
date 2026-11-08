@@ -46,12 +46,12 @@ from sglang.srt.disaggregation.common.utils import (
     run_on_device,
     unpack_int_lists,
 )
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.utils import (
     _validate_efa_allocator_compatibility,
     check_mooncake_custom_mem_pool_enabled,
 )
 from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
     build_dsa_tail_transfer_blocks,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
@@ -251,7 +251,9 @@ def _uses_flat_entry_layout(
     even on an MHA backend.
     """
     is_single_region_swa = (
-        state_type == StateType.SWA and num_src_entries == 1 and num_dst_entries == 1
+        state_type in (StateType.SWA, StateType.AUXILIARY_SWA)
+        and num_src_entries == 1
+        and num_dst_entries == 1
     )
     return mla_backend or force_flat or has_layer_ids or is_single_region_swa
 
@@ -669,7 +671,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
         return (ret, False)
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return
 
@@ -696,6 +698,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             self._staging_ctx.prefetch_requested,
             self._staging_ctx.prefetch_sockets,
             requester_pp_rank=self.pp_rank,
+            upto_tokens=upto_tokens,
         )
 
     def send_kvcache_staged(
@@ -854,6 +857,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         so mapped entries must agree on the stride or the write lands in the
         wrong slot.
         """
+        label = "KV" if state_type is None else state_type
         has_layer_ids = bool(src_layer_ids or dst_layer_ids)
         if not _uses_flat_entry_layout(
             mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
@@ -876,7 +880,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             for i, j in pairs:
                 if j >= len(dst_item_lens):
                     return (
-                        f"{state_type} decode published {len(dst_item_lens)} item "
+                        f"{label} decode published {len(dst_item_lens)} item "
                         f"lengths but paired entry dst[{j}] needs one"
                     )
                 if is_elided_entry(
@@ -890,7 +894,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     continue
                 if item_lens[i] != dst_item_lens[j]:
                     return (
-                        f"{state_type} item length mismatch for paired "
+                        f"{label} item length mismatch for paired "
                         f"entries src[{i}]={item_lens[i]} "
                         f"dst[{j}]={dst_item_lens[j]}"
                     )
@@ -905,7 +909,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         )
         if len(mapped_dst_lens) < layers_current_pp_stage:
             return (
-                f"{state_type} decode published {len(mapped_dst_lens)} item "
+                f"{label} decode published {len(mapped_dst_lens)} item "
                 f"lengths for this stage's {layers_current_pp_stage} entries"
             )
         for layer_id in range(layers_current_pp_stage):
@@ -918,7 +922,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 continue  # Elided by one peer; see the paired loop above.
             if item_lens[layer_id] != mapped_dst_lens[layer_id]:
                 return (
-                    f"{state_type} item length mismatch for positional "
+                    f"{label} item length mismatch for positional "
                     f"entry {layer_id}: prefill={item_lens[layer_id]} "
                     f"decode={mapped_dst_lens[layer_id]}"
                 )
@@ -933,7 +937,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         previous registration's verdict still stands. Returns the rejection
         reason, if any.
         """
-        fully_checked, mismatch = self._validate_peer_state_layout(decode_kv_args)
+        kv_layout_mismatch = self._kv_layout_mismatch(decode_kv_args)
+        fully_checked, state_mismatch = self._validate_peer_state_layout(decode_kv_args)
+        mismatch = kv_layout_mismatch or state_mismatch
         self.check_peer_aux_buffer_count(
             mooncake_session_id, len(decode_kv_args.dst_aux_ptrs)
         )
@@ -947,6 +953,99 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 self.state_strides_validated.add(mooncake_session_id)
             self.decode_kv_args_table[mooncake_session_id] = decode_kv_args
         return mismatch
+
+    def _kv_layout_mismatch(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        """Reject a decode peer whose KV page stride differs from ours.
+
+        ``send_kvcache`` addresses the decode pool as ``dst_ptr + page *
+        item_len`` with OUR ``item_len``. If the roles allocated different KV
+        layouts (e.g. a DSA model whose prefill and decode pick different
+        attention backends, or a different ``--kv-cache-dtype``), every page
+        lands at the wrong offset and the last pages run past the peer's buffer.
+
+        Checked for MLA pools, pools that publish KV layer ids, and plain MHA
+        pools at the same attn TP size; not for TP-sliced MHA.
+        """
+        if (
+            not self.kv_args.kv_item_lens
+            or not info.dst_kv_item_lens
+            or info.requires_dcp_relayout
+            # `_validate_envelope_kv_layout` checks the unified-memory envelope.
+            or get_memory().enable_unified_memory
+            # TP-sliced MHA (`send_kvcache_slice`) has a different stride by design.
+            or not (
+                self.is_mla_backend
+                or self.is_hybrid_mla_backend
+                or self.attn_tp_size == info.dst_attn_tp_size
+            )
+        ):
+            return None
+        try:
+            if _uses_flat_entry_layout(
+                mla_backend=self.is_mla_backend or self.is_hybrid_mla_backend,
+                force_flat=False,
+                has_layer_ids=bool(self.kv_args.kv_layer_ids or info.dst_kv_layer_ids),
+                state_type=None,
+                num_src_entries=len(self.kv_args.kv_data_ptrs),
+                num_dst_entries=len(info.dst_kv_ptrs),
+            ):
+                mismatch = self._state_stride_mismatch(
+                    src_data_ptrs=self.kv_args.kv_data_ptrs,
+                    dst_data_ptrs=info.dst_kv_ptrs,
+                    item_lens=self.kv_args.kv_item_lens,
+                    dst_item_lens=info.dst_kv_item_lens,
+                    src_layer_ids=self.kv_args.kv_layer_ids,
+                    dst_layer_ids=info.dst_kv_layer_ids,
+                )
+            else:
+                mismatch = self._mha_kv_stride_mismatch(info)
+        except Exception as e:
+            # Same policy as the state check: never kill the bootstrap thread.
+            logger.warning(
+                "Could not pre-check the KV layout for session %s: %s",
+                info.mooncake_session_id,
+                e,
+            )
+            return None
+        if mismatch is None:
+            return None
+        return (
+            f"PD KV layout mismatch ({mismatch}, page_size="
+            f"{self.kv_args.page_size}). Prefill and decode allocated different "
+            "KV cache layouts, e.g. different DSA attention backends "
+            "(--dsa-prefill-backend / --dsa-decode-backend) or --kv-cache-dtype; "
+            "use the same settings on both roles."
+        )
+
+    def _mha_kv_stride_mismatch(self, info: KVArgsRegisterInfo) -> Optional[str]:
+        """Plain MHA K/V entries, paired as ``_send_kvcache_generic`` pairs them.
+
+        Item lengths are parallel to pointers, so slicing them with
+        ``get_mha_kv_ptrs_with_pp`` gives each sent entry's decode stride.
+        """
+        src_lens, dst_lens = self.kv_args.kv_item_lens, info.dst_kv_item_lens
+        if len(src_lens) != len(self.kv_args.kv_data_ptrs) or len(dst_lens) != len(
+            info.dst_kv_ptrs
+        ):
+            return None  # Lengths not parallel to the pointers: cannot pair them.
+        if self.pp_size == 1 and len(src_lens) != len(dst_lens):
+            # E.g. a decode-only draft KV: Ascend's PP1 sender pairs entries
+            # positionally here, unlike the generic K/V split. Leave it unchecked.
+            return None
+        src_k, src_v, dst_k, dst_v, num_layers = self.get_mha_kv_ptrs_with_pp(
+            src_lens, dst_lens
+        )
+        if num_layers > min(len(dst_k), len(dst_v)):
+            return None  # The transfer rejects this layer count itself.
+        start_layer = self.kv_args.prefill_start_layer
+        for kind, src, dst in (("K", src_k, dst_k), ("V", src_v, dst_v)):
+            for i in range(num_layers):
+                if src[i] != dst[i]:
+                    return (
+                        f"KV {kind} item length mismatch for layer "
+                        f"{start_layer + i}: prefill={src[i]} decode={dst[i]}"
+                    )
+        return None
 
     def _validate_peer_state_layout(
         self, registration_info: KVArgsRegisterInfo
@@ -967,11 +1066,36 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
-            return False, (
-                "CP/TP-sharing DFLASH PD requires the same physical TP size: "
-                f"prefill={self.state_tp_size}, "
-                f"decode={registration_info.dst_attn_tp_size}"
+            # MLA drafts instead register one complete KV row per layer. Allow
+            # those only when both peers publish the same single-entry layout
+            # and token widths; equal widths alone can also occur for MHA.
+            num_draft = self.kv_args.num_draft_entries
+            draft_ids = self.kv_args.kv_layer_ids[-num_draft:]
+            src_lens = self.kv_args.kv_item_lens[-num_draft:]
+            dst_ids = registration_info.dst_kv_layer_ids
+            dst_lens = registration_info.dst_kv_item_lens[-num_draft:]
+            dst_page_scale = (
+                registration_info.dst_dcp_size
+                if registration_info.requires_dcp_relayout
+                else 1
             )
+            replicated_draft = (
+                num_draft > 0
+                and len(draft_ids) == len(set(draft_ids)) == num_draft
+                and dst_ids[-num_draft:] == draft_ids
+                and not set(draft_ids).intersection(dst_ids[:-num_draft])
+                and len(src_lens) == len(dst_lens) == num_draft
+                and all(
+                    src > 0 and dst == src * dst_page_scale
+                    for src, dst in zip(src_lens, dst_lens)
+                )
+            )
+            if not replicated_draft:
+                return False, (
+                    "CP/TP-sharing DFLASH PD requires the same physical TP size: "
+                    f"prefill={self.state_tp_size}, "
+                    f"decode={registration_info.dst_attn_tp_size}"
+                )
         state_types = getattr(self.kv_args, "state_types", [])
         fully_checked = True
         for i, st in enumerate(state_types):
@@ -1921,6 +2045,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         (not the mamba-state path); subclasses extend for hardware components."""
         return st in (
             StateType.SWA,
+            StateType.AUXILIARY_SWA,
             StateType.DSA,
             StateType.QSA_PENDING,
             StateType.QSA_COMPRESSED,
@@ -2102,7 +2227,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     and not self.is_hybrid_mla_backend
                     and not is_qwen4_qsa_state
                 )
-                if slice_kv_heads and st != StateType.SWA:
+                if slice_kv_heads and st not in (
+                    StateType.SWA,
+                    StateType.AUXILIARY_SWA,
+                ):
                     raise RuntimeError(
                         f"PD Disaggregation does NOT support PD different TP sizes for non-MLA {st.upper()} hybrid models yet."
                     )
@@ -3029,7 +3157,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     if layout_mismatch is not None:
                         logger.error(
-                            "Rejecting state transfers to decode session %s: %s",
+                            "Rejecting transfers to decode session %s: %s",
                             mooncake_session_id,
                             layout_mismatch,
                         )
