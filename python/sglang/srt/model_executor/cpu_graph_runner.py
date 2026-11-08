@@ -31,6 +31,12 @@ import tqdm
 
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.environ import envs
+from sglang.srt.layers.dp_attention import (
+    require_attn_tp_gather,
+    require_gathered_buffer,
+    require_mlp_sync,
+    require_mlp_tp_gather,
+)
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.mem_cache.kv.router import STATE_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -58,15 +64,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
 )
-from sglang.srt.utils import (
-    empty_context,
-    get_free_cpu_memory,
-    log_info_on_rank0,
-    require_attn_tp_gather,
-    require_gathered_buffer,
-    require_mlp_sync,
-    require_mlp_tp_gather,
-)
+from sglang.srt.utils import empty_context, get_free_cpu_memory, log_info_on_rank0
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
 logger = logging.getLogger(__name__)
