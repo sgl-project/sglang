@@ -144,10 +144,8 @@ jobs:
       run_timeout_minutes: 240
       pre_suite_timeout_minutes: 55
       pre_suite_commands: |
-        # VAE parallel-group regression
         python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
 
-        # ComfyUI Kitchen
         uv pip install --no-deps comfy-kitchen==0.2.36
 
         # Blackwell-only diffusion unit tests

@@ -113,7 +113,8 @@ jobs:
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
-          # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags; format() keeps part 0 from reading as false.
+          # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags;
+          # format() keeps part 0 from reading as false.
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
           DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_plan != '' && format('{0}', fromJson(inputs.partition_plan).partition_count) || '' }}
           DIFFUSION_PARTITION_PLAN_JSON: ${{ inputs.partition_plan }}
