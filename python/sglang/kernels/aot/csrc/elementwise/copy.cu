@@ -51,6 +51,7 @@ void copy_to_gpu_no_ce_impl(const at::Tensor& input, at::Tensor& output) {
   // may use multi thread blocks if performance bottleneck
   dim3 grid(1);
   dim3 block(static_cast<int>(input.numel()));
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   copy_to_gpu_no_ce_kernel<<<grid, block, 0, stream>>>(input_array, output.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -67,6 +68,7 @@ void copy_to_gpu_no_ce_fallback_impl(const at::Tensor& input, at::Tensor& output
   constexpr int kThreads = 256;
   dim3 grid((n + kThreads - 1) / kThreads);
   dim3 block(kThreads);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
   cudaStream_t stream = at::cuda::getCurrentCUDAStream();
   copy_to_gpu_no_ce_fallback_kernel<<<grid, block, 0, stream>>>(input_array, n, output.data_ptr<int>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -74,6 +76,7 @@ void copy_to_gpu_no_ce_fallback_impl(const at::Tensor& input, at::Tensor& output
 
 void copy_to_gpu_no_ce(const at::Tensor& input, at::Tensor& output) {
   check_copy_to_gpu_no_ce_inputs(input, output);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(output));
 
   const int64_t numel = input.numel();
   TORCH_CHECK(numel > 0, "copy_to_gpu_no_ce does not support empty tensors");
