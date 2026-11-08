@@ -2892,6 +2892,7 @@ class Scheduler(
 
     @staticmethod
     def _decode_offloads_kvcache() -> bool:
+        """Whether this PD decode server offloads a finished request's KV to host."""
         return (
             get_disagg().disaggregation_mode == "decode"
             and get_disagg().disaggregation_decode_enable_offload_kvcache
