@@ -71,6 +71,9 @@ class BackupKV(msgspec.Struct, frozen=True):
     actions carry a single eviction victim."""
 
     node_ids: list[NodeId]
+    # None preserves unfiltered/manual backups; [] omits Mamba; a request-end
+    # action names its endpoint explicitly, excluding every ancestor.
+    mamba_node_ids: list[NodeId] | None = None
 
 
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):

@@ -109,6 +109,7 @@ class _UnifiedBackupIntent(msgspec.Struct):
     snapshot: BufferBackupSnapshot
     pool: PoolName
     keys: list[str]
+    preserve_mamba_endpoint: bool = False
 
 
 class _UnifiedBufferBackupEntry(msgspec.Struct):
@@ -691,7 +692,12 @@ class BufferModePipeline:
         self._walk_admitted = None
 
     def enqueue_backup_intent(
-        self, node_id: NodeId, *, recheck: bool = False, backup_mamba: bool = True
+        self,
+        node_id: NodeId,
+        *,
+        recheck: bool = False,
+        backup_mamba: bool = True,
+        preserve_mamba_endpoint: bool = False,
     ) -> None:
         """Queue one intent per pool with something to write; rejected intents
         are counted and the node re-triggers on a later hit."""
@@ -753,7 +759,12 @@ class BufferModePipeline:
             if not parent_covered or self._backup_oversize(*self._sizing(pool, keys)):
                 self._log_backup_dropped(intent_tokens)
                 continue
-            intent = _UnifiedBackupIntent(snapshot=snapshot, pool=pool, keys=list(keys))
+            intent = _UnifiedBackupIntent(
+                snapshot=snapshot,
+                pool=pool,
+                keys=list(keys),
+                preserve_mamba_endpoint=preserve_mamba_endpoint,
+            )
             self.pending_write_queue.append(intent)
             self.inflight_backup_pools.setdefault(node_id, set()).add(pool)
             self._retain_queued_span(intent)
@@ -878,15 +889,15 @@ class BufferModePipeline:
                 keys = dict(self._write_intents(piece)).get(intent.pool)
                 if not keys:
                     continue  # covered since admission
-                if (
-                    intent.pool == PoolName.MAMBA
-                    and self._cache._mamba_request_end_only
-                ):
+                if intent.pool == PoolName.MAMBA and intent.preserve_mamba_endpoint:
                     # Keep only the original endpoint's state after a split.
                     if any(key not in intent.keys for key in keys):
                         continue
                 repaired = _UnifiedBackupIntent(
-                    snapshot=piece, pool=intent.pool, keys=list(keys)
+                    snapshot=piece,
+                    pool=intent.pool,
+                    keys=list(keys),
+                    preserve_mamba_endpoint=intent.preserve_mamba_endpoint,
                 )
                 survivors[key] = repaired
                 states[piece.node_id] = BufferBackupState(

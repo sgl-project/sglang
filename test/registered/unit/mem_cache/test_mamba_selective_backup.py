@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 
 import torch
 
+from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
     InsertResult,
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.cache_action import BackupKV
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
@@ -99,8 +101,10 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
         cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
         cache.tree_core = core
         cache.buffer_pipeline = None
+        cache.linker = None
         cache._mamba_request_end_only = selective
         cache.enable_storage = storage
+        cache.enable_storage_metrics = False
         cache.hicache_storage_pass_prefix_keys = False
         cache.cache_controller = MagicMock()
         cache.ongoing_write_through = {}
@@ -187,21 +191,19 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
 
     def test_buffer_mode_uses_the_same_tree_endpoint_and_retry_policy(self):
         cache, nodes, p = self.make_buffer_cache()
-        cache._insert_params = InsertParams(
-            key=RadixKey(array("q", range(4))), is_request_end=False
-        )
+        params = InsertParams(key=RadixKey(array("q", range(4))), is_request_end=False)
         p.begin_insert_walk()
-        cache._execute_and_commit_kv_backup(
-            cache.tree_core.build_backup_kv_action(nodes[-1])
+        cache._apply_insert_cache_actions(
+            [cache.tree_core.build_backup_kv_action(nodes[-1])], params
         )
         p.end_insert_walk()
         self.assertEqual([i.pool for i in p.pending_write_queue], [PoolName.KV] * 2)
 
-        cache._insert_params.is_request_end = True
+        params.is_request_end = True
         for _ in range(2):
             p.begin_insert_walk()
             cache._retry_request_end_mamba_backup(
-                InsertResult(prefix_len=4, last_device_node=nodes[-1])
+                InsertResult(prefix_len=4, last_device_node=nodes[-1]), params
             )
             p.end_insert_walk()
         states = [i for i in p.pending_write_queue if i.pool == PoolName.MAMBA]
@@ -289,11 +291,11 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
         for storage in (False, True):
             with self.subTest(storage=storage):
                 cache, nodes = self.make_cache(storage=storage)
-                cache._insert_params = InsertParams(
+                params = InsertParams(
                     key=RadixKey(array("q", range(4))), is_request_end=False
                 )
-                cache._execute_and_commit_kv_backup(
-                    cache.tree_core.build_backup_kv_action(nodes[-1])
+                cache._apply_insert_cache_actions(
+                    [cache.tree_core.build_backup_kv_action(nodes[-1])], params
                 )
                 for node in nodes:
                     spec = cache.tree_core.build_storage_backup_spec(node, False)
@@ -301,9 +303,9 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
                     self.assertNotIn(ComponentType.MAMBA, spec.comp_xfers)
                 self.assertEqual(sum(w[1] for w in cache.writes), 4)
 
-                cache._insert_params.is_request_end = True
+                params.is_request_end = True
                 cache._retry_request_end_mamba_backup(
-                    InsertResult(prefix_len=4, last_device_node=nodes[-1])
+                    InsertResult(prefix_len=4, last_device_node=nodes[-1]), params
                 )
                 self.assertEqual(
                     cache.writes[-1], (nodes[-1], 0, {ComponentType.MAMBA})
@@ -316,11 +318,103 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
                 )
                 before = len(cache.writes)
                 cache._retry_request_end_mamba_backup(
-                    InsertResult(prefix_len=4, last_device_node=nodes[-1])
+                    InsertResult(prefix_len=4, last_device_node=nodes[-1]), params
                 )
                 self.assertEqual(len(cache.writes), before)
                 ancestor = cache.tree_core.build_storage_backup_spec(nodes[0], False)
                 self.assertNotIn(ComponentType.MAMBA, ancestor.comp_xfers)
+
+    def test_pending_kv_ack_releases_old_locks_before_mamba_backup(self):
+        """A second pool transfer must not overwrite a node's unconsumed receipt."""
+        for selective in (False, True):
+            with self.subTest(selective=selective):
+                cache, nodes = self.make_cache(selective=selective, storage=False)
+                cache.disable = False
+                cache.metrics_collector = None
+                # Exercise real cache/tree locks and the production ack consumer;
+                # only DMA submission and device events are simulated on CPU.
+                del cache.inc_lock_ref, cache.dec_lock_ref, cache.writing_check
+                submitted = []
+                queued = []
+                copy_to_host = cache._execute_kv_backup
+                initial_sizes = (
+                    cache.tree_core.full_evictable_size(),
+                    cache.tree_core.mamba_evictable_size(),
+                )
+
+                class FinishEvent:
+                    finished = False
+
+                    def synchronize(self):
+                        self.finished = True
+
+                def copy_with_ack(node_id, device, transfers, sidecars):
+                    if ComponentType.MAMBA in transfers:
+                        self.assertFalse(cache.ongoing_write_through)
+                        self.assertTrue(all(e.finished for e in submitted))
+                        self.assertEqual(
+                            cache.tree_core.full_evictable_size(), initial_sizes[0]
+                        )
+                    host = copy_to_host(node_id, device, transfers, sidecars)
+                    event = FinishEvent()
+                    submitted.append(event)
+                    queued.append(HiCacheAck(None, event, [node_id]))
+                    return host
+
+                def submit():
+                    cache.cache_controller.ack_write_queue.extend(queued)
+                    queued.clear()
+
+                cache.cache_controller = SimpleNamespace(
+                    ack_write_queue=[], start_writing=submit
+                )
+                cache._execute_kv_backup = copy_with_ack
+                action = cache.tree_core.build_backup_kv_action(nodes[-1])
+                cache._execute_and_commit_kv_backup(
+                    BackupKV(action.node_ids, mamba_node_ids=[])
+                )
+                old_receipt = cache.ongoing_write_through[nodes[-1]].lock_params
+                self.assertFalse(any(e.finished for e in submitted))
+                self.assertEqual(cache.tree_core.full_evictable_size(), 0)
+
+                # Also cover manual/default-off sources: lock ownership is not
+                # conditional on the selective-backup feature or an insert.
+                cache._execute_and_commit_kv_backup(BackupKV([nodes[-1]]))
+                self.assertEqual(set(cache.ongoing_write_through), {nodes[-1]})
+                self.assertIsNot(
+                    cache.ongoing_write_through[nodes[-1]].lock_params, old_receipt
+                )
+                self.assertFalse(submitted[-1].finished)
+                self.assertEqual(cache.tree_core.full_evictable_size(), 0)
+                cache.writing_check(write_back=True)
+                self.assertTrue(all(e.finished for e in submitted))
+                self.assertFalse(cache.ongoing_write_through)
+                self.assertFalse(cache.cache_controller.ack_write_queue)
+                self.assertEqual(
+                    (
+                        cache.tree_core.full_evictable_size(),
+                        cache.tree_core.mamba_evictable_size(),
+                    ),
+                    initial_sizes,
+                )
+
+    def test_buffer_intent_keeps_endpoint_policy_after_split(self):
+        """A queued endpoint must not acquire an ancestor's state after a split."""
+        cache, nodes, pipeline = self.make_buffer_cache()
+        cache._backup_request_end_mamba(nodes[-1])
+        endpoint_keys = [
+            i.keys for i in pipeline.pending_write_queue if i.pool == PoolName.MAMBA
+        ]
+        self.assertEqual(len(endpoint_keys), 1)
+        # Admission is over: the delayed intent owns the decision even if the
+        # cache's policy changes before the queue is repaired.
+        cache._mamba_request_end_only = False
+        pump_insert(cache.tree_core, RadixKey(array("q", range(3))), mamba_slot=3)
+        pipeline._refresh_pending_backup_intents()
+        self.assertEqual(
+            [i.keys for i in pipeline.pending_write_queue if i.pool == PoolName.MAMBA],
+            endpoint_keys,
+        )
 
     def test_endpoint_retry_obeys_threshold_write_back_and_declined_tail(self):
         for write_back, threshold, declined in (
@@ -334,7 +428,7 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
                 cache, nodes = self.make_cache()
                 cache.is_write_back = write_back
                 cache.write_through_threshold = threshold
-                cache._insert_params = InsertParams(
+                params = InsertParams(
                     key=RadixKey(array("q", range(4))), is_request_end=True
                 )
                 cache._retry_request_end_mamba_backup(
@@ -342,7 +436,8 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
                         prefix_len=4,
                         last_device_node=nodes[-1],
                         rotation_tail_declined=declined,
-                    )
+                    ),
+                    params,
                 )
                 self.assertEqual(cache.writes, [])
                 self.assertEqual(cache.ongoing_write_through, {})
@@ -356,11 +451,11 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
         ):
             with self.subTest(selective=selective, source=source):
                 cache, nodes = self.make_cache(selective=selective)
-                cache._insert_params = InsertParams(
+                params = InsertParams(
                     key=RadixKey(array("q", range(4))), is_request_end=source
                 )
-                cache._execute_and_commit_kv_backup(
-                    cache.tree_core.build_backup_kv_action(nodes[-1])
+                cache._apply_insert_cache_actions(
+                    [cache.tree_core.build_backup_kv_action(nodes[-1])], params
                 )
                 cache.writing_check()
                 self.assertEqual(
