@@ -766,9 +766,8 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # SGLANG_AITER_MLA_DECODE_BACKEND=triton (the gfx1250 default) runs
-            # aiter.ops.triton.attention.mla.mla_decode_fwd; its batches do not
-            # read SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
+            # Batches on SGLANG_AITER_MLA_DECODE_BACKEND=triton do not read
+            # SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
             if is_gfx1250_supported():
                 self.use_aiter_triton_mla_decode = self.mla_decode_backend == "triton"
                 logger.info(
@@ -777,8 +776,9 @@ class AiterAttnBackend(AttentionBackend):
                         f"enabled (page size {self.page_size}, kernel block "
                         f"size {triton_mla_block_size(self.page_size)})"
                         if self.use_aiter_triton_mla_decode
-                        else "disabled (needs bf16 activations, no DCP, "
-                        "qk_rope_head_dim > 0)"
+                        else "disabled (SGLANG_AITER_MLA_DECODE_BACKEND resolved "
+                        f"to {self.mla_decode_backend!r}; auto picks triton "
+                        "with bf16 activations, no DCP, qk_rope_head_dim > 0)"
                     ),
                 )
             # aiter's mla_gluon asserts gfx950, so the gfx950 PS switch and

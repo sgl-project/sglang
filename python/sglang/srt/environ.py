@@ -1156,11 +1156,11 @@ class Envs:
     # zero-pad mla_decode_fwd fallback (benchmarking / emergency disable).
     SGLANG_AITER_MLA_GLUON = EnvBool(True)
     # Select the AITER MLA kernel for decode: "asm" (aiter.mla.mla_decode_fwd),
-    # "gluon" (gfx950 mla_gluon) or "triton" (gfx1250 only:
-    # aiter.ops.triton.attention.mla.mla_decode_fwd, which runs Gluon kernels on
-    # gfx1250; not sglang's --decode-attention-backend triton). "auto" is
-    # "triton" on gfx1250 with bf16 activations and no DCP, else "asm". On that
-    # gfx1250 path "asm" and "gluon" are ignored and give "triton".
+    # "gluon" (aiter mla_gluon where prefer_mla_gluon_decode holds, else ASM) or
+    # "triton" (aiter.ops.triton.attention.mla.mla_decode_fwd, not sglang's
+    # --decode-attention-backend triton; gfx1250 with bf16 activations, no DCP
+    # and qk_rope_head_dim > 0, else startup raises). "auto" is "triton" there,
+    # else "asm". Explicit values are honored as-is.
     SGLANG_AITER_MLA_DECODE_BACKEND = EnvStrWithAlias(
         "auto", deprecated_name="SGLANG_AITER_MLA_DCP_DECODE_BACKEND"
     )

@@ -1,16 +1,18 @@
 """gfx1250 MLA decode through aiter's Triton ``mla_decode_fwd``.
 
-``aiter.ops.triton.attention.mla.mla_decode_fwd`` reads the MLA KV pool through
-block tables with a bf16 query; aiter picks the kernel behind it, Gluon kernels
-on gfx1250. It is ``SGLANG_AITER_MLA_DECODE_BACKEND=triton``, the default
-(``auto``) on gfx1250 with bf16 activations and no DCP, where ``asm`` and
-``gluon`` are ignored. That value is not
-sglang's ``--decode-attention-backend triton``, which leaves aiter for sglang's
-own Triton decode kernel. aiter without ROCm/aiter#5935 computes wrong outputs
-for batches it runs with one KV segment per sequence. aiter's ASM
-``mla_decode_fwd`` also has a bf16-query FlyDSL kernel on gfx1250, but only in
-persistent mode at page size 1 with ``AITER_MLA_DECODE_PS1_FLYDSL`` set; this
-path does not read that switch.
+The wrapper calls ``aiter.ops.triton.attention.mla.mla_decode_fwd`` with a bf16
+query and reads the MLA KV pool through block tables; aiter picks the kernel
+behind that entry (its Gluon MLA decode kernels on gfx1250). It runs for
+``SGLANG_AITER_MLA_DECODE_BACKEND=triton``, which ``auto`` picks on gfx1250 for
+MLA with bf16 activations, no DCP and ``qk_rope_head_dim > 0``. That value is
+not sglang's ``--decode-attention-backend triton``, which leaves aiter for
+sglang's own Triton decode kernel. Explicit values are honored as-is on every
+arch: ``asm`` uses aiter's ASM ``mla_decode_fwd``, and ``mla_gluon`` only where
+``prefer_mla_gluon_decode`` holds and the ASM persistent kernel cannot run the
+batch; ``gluon`` uses aiter's ``mla_gluon`` for DCP decode and where
+``prefer_mla_gluon_decode`` holds, and the ASM decode otherwise. aiter without
+ROCm/aiter#5935 computes wrong outputs for batches it runs with one KV segment
+per sequence. This path does not read ``AITER_MLA_DECODE_PS1_FLYDSL``.
 """
 
 from __future__ import annotations
@@ -19,7 +21,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils import is_gfx1250_supported, print_info_once
+from sglang.srt.utils import is_gfx1250_supported
 
 
 def supports_aiter_triton_mla_decode(
@@ -48,11 +50,12 @@ def resolve_aiter_mla_decode_backend(
 ) -> str:
     """``SGLANG_AITER_MLA_DECODE_BACKEND`` as "asm", "gluon" or "triton".
 
-    "auto" is "triton" where ``supports_aiter_triton_mla_decode`` holds, else
-    "asm". There, "asm" and "gluon" are ignored and give "triton": neither
-    kernel takes a bf16 query in this backend's KV layout on gfx1250. A value
-    no kernel can serve raises here rather than at the first decode or CUDA
-    graph capture.
+    "auto" is "triton" for MLA where ``supports_aiter_triton_mla_decode``
+    holds, else "asm". Explicit values are honored as-is: "asm" and "gluon"
+    are returned unchanged on every arch. Unknown values raise, and so does
+    "triton" where this backend does not call aiter's Triton
+    ``mla_decode_fwd``: off gfx1250, and on gfx1250 without bf16 activations,
+    with DCP or with ``qk_rope_head_dim`` 0.
     """
     backend = value.lower()
     if backend not in ("auto", "asm", "gluon", "triton"):
@@ -60,6 +63,8 @@ def resolve_aiter_mla_decode_backend(
             "SGLANG_AITER_MLA_DECODE_BACKEND must be 'auto', 'asm', 'gluon' or "
             f"'triton', got {value!r}"
         )
+    if backend in ("asm", "gluon"):
+        return backend
     gfx1250 = is_gfx1250_supported()
     if backend == "triton" and not gfx1250:
         raise ValueError(
@@ -73,37 +78,23 @@ def resolve_aiter_mla_decode_backend(
         dcp_world_size=dcp_world_size,
         qk_rope_head_dim=qk_rope_head_dim,
     )
-    if triton:
-        if backend in ("asm", "gluon"):
-            print_info_once(
-                f"aiter gfx1250: SGLANG_AITER_MLA_DECODE_BACKEND={backend} is "
-                "ignored for MLA decode with bf16 activations and no DCP; it "
-                "runs aiter's Triton mla_decode_fwd"
-            )
-        return "triton"
     if backend == "auto":
-        return "asm"
-    if backend == "triton":
+        return "triton" if triton else "asm"
+    if not triton:
         raise ValueError(
             "SGLANG_AITER_MLA_DECODE_BACKEND=triton needs bf16 activations, no "
             f"DCP and qk_rope_head_dim > 0; got {input_dtype}, DCP size "
             f"{dcp_world_size}, qk_rope_head_dim {qk_rope_head_dim}"
         )
-    if backend == "gluon":
-        raise ValueError(
-            "SGLANG_AITER_MLA_DECODE_BACKEND=gluon selects aiter's mla_gluon, "
-            "which asserts gfx950; use 'auto' or 'asm' on gfx1250"
-        )
     return backend
 
 
 def triton_mla_block_size(page_size: int) -> int:
-    """KV tokens per block the kernel reads; each page holds page_size // block.
+    """KV tokens per kernel block: the largest power of 2 dividing page_size, capped at 128.
 
-    aiter's gfx1250 decode kernel, Gluon at the pinned aiter, needs a power-of-2
-    block size (its shared layouts assert one), and 256 overflows the 320 KB LDS
-    at 128 heads with bf16 KV.
-    Block sizes 1-128 are verified at 8, 16 and 128 heads with bf16 and fp8 KV.
+    aiter's Triton ``mla_decode_fwd`` on gfx1250 takes a power-of-2 block size,
+    and 256 overflows the 320 KB LDS at 128 heads with bf16 KV. Block sizes
+    1-128 are verified at 8, 16 and 128 heads with bf16 and fp8 KV.
     """
     return min(page_size & -page_size, 128)
 

@@ -198,40 +198,19 @@ class TestResolveAiterMlaDecodeBackend(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "=triton"):
                     self._resolve("triton", **kwargs)
 
-    def test_asm_and_gluon_are_ignored_on_gfx1250_bf16(self):
-        """aiter's gfx1250 ASM decode takes only an fp8 query and its own
-        64-token page layout, and mla_gluon asserts gfx950, so these values keep
-        the Triton decode and log that they are ignored."""
-        for value in ("asm", "gluon", "ASM"):
-            with self.subTest(value=value):
-                with mock.patch.object(atm, "print_info_once") as log:
-                    self.assertEqual(self._resolve(value), "triton")
-                log.assert_called_once()
-                self.assertIn("ignored", log.call_args.args[0])
-
-    def test_auto_and_triton_do_not_log_ignored(self):
-        for value in ("auto", "triton"):
-            with self.subTest(value=value):
-                with mock.patch.object(atm, "print_info_once") as log:
-                    self.assertEqual(self._resolve(value), "triton")
-                log.assert_not_called()
-
-    def test_asm_keeps_the_existing_dispatch_where_triton_cannot_serve(self):
-        """Including the DCP ASM PS decode on gfx1250."""
-        for kwargs in (
-            dict(dcp_world_size=2),
-            dict(input_dtype=torch.float16),
-            dict(qk_rope_head_dim=0),
-        ):
-            with self.subTest(**kwargs):
-                self.assertEqual(self._resolve("asm", **kwargs), "asm")
-
-    def test_gluon_raises_on_gfx1250_where_triton_cannot_serve(self):
-        """aiter's mla_gluon asserts gfx950."""
-        for kwargs in (dict(dcp_world_size=2), dict(input_dtype=torch.float16)):
-            with self.subTest(**kwargs):
-                with self.assertRaisesRegex(ValueError, "=gluon"):
-                    self._resolve("gluon", **kwargs)
+    def test_explicit_asm_and_gluon_are_honored_on_gfx1250(self):
+        """Explicit values are not second-guessed, including where auto would
+        pick triton and the DCP ASM decode."""
+        for value in ("asm", "gluon", "ASM", "Gluon"):
+            for kwargs in (
+                dict(),
+                dict(dcp_world_size=2),
+                dict(input_dtype=torch.float16),
+                dict(qk_rope_head_dim=0),
+                dict(use_mla=False),
+            ):
+                with self.subTest(value=value, **kwargs):
+                    self.assertEqual(self._resolve(value, **kwargs), value.lower())
 
     def test_other_archs_keep_asm_and_gluon(self):
         for value in ("asm", "gluon", "ASM", "Gluon"):
@@ -543,12 +522,39 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
 
     def test_triton_metadata_returns_the_kernel_output(self):
         backend = _backend(bs=2)
-        o = self._decode(backend, _layer(), 2)
+        layer = _layer()
+        layer.scaling = 0.125
+        o = self._decode(backend, layer, 2)
 
         self.assertEqual(tuple(o.shape), (2, _HEADS, _KV_LORA_RANK))
         self.assertEqual(o.dtype, torch.bfloat16)
         self.assertTrue(torch.all(o == _KERNEL_OUT))
         (call,) = self.kernel.calls
+        self.assertEqual(
+            set(call),
+            {
+                "q",
+                "kv_buffer",
+                "out",
+                "cu_seqlens_q",
+                "seqused_k",
+                "max_seqlen_kv",
+                "block_tables",
+                "softmax_scale",
+                "kv_lora_rank",
+                "qk_rope_head_dim",
+                "causal",
+                "q_descale",
+                "kv_descale",
+            },
+        )
+        self.assertEqual(tuple(call["q"].shape), (2, _HEADS, _KV_LORA_RANK + _ROPE_DIM))
+        self.assertIs(call["out"], o)
+        self.assertEqual(call["softmax_scale"], 0.125)
+        self.assertEqual(call["max_seqlen_kv"], 0)
+        self.assertIs(call["causal"], True)
+        self.assertIsNone(call["q_descale"])
+        self.assertIsNone(call["kv_descale"])
         fm = backend.forward_metadata
         self.assertIs(call["block_tables"], fm.triton_mla_block_tables)
         self.assertIs(call["seqused_k"], fm.triton_mla_seqused_k)
@@ -634,6 +640,40 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
                 backend = _backend()
                 backend.mla_decode_backend = value
                 self.assertIs(self._decode(backend, layer, 1), expected)
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_explicit_asm_and_gluon_on_gfx1250_bf16_take_their_kernels(self):
+        """Where auto picks triton, an explicit asm or gluon leaves the Triton
+        decode off and reaches the ASM decode or mla_gluon as on other archs."""
+        gluon_out = torch.full((1, _HEADS, _KV_LORA_RANK), 5.0)
+        for value, expected in (("asm", self.asm_out), ("gluon", gluon_out)):
+            with (
+                self.subTest(value),
+                mock.patch.object(atm, "is_gfx1250_supported", return_value=True),
+                mock.patch.multiple(
+                    aiter_backend,
+                    prefer_mla_gluon_decode=lambda **_: True,
+                    mla_gluon_decode=lambda **_: gluon_out,
+                    _use_mla_ps_kernel=True,
+                ),
+                mock.patch.multiple(
+                    aiter_backend.AiterAttnBackend,
+                    _asm_ps_supports_qlen=lambda self, q_len: True,
+                    _resolve_mla_gluon_min_kv_seq_len=lambda self, fb: 1,
+                ),
+            ):
+                resolved = atm.resolve_aiter_mla_decode_backend(
+                    value,
+                    use_mla=True,
+                    input_dtype=torch.bfloat16,
+                    dcp_world_size=1,
+                    qk_rope_head_dim=_ROPE_DIM,
+                )
+                self.assertEqual(resolved, value)
+                backend = _backend(triton=False)
+                backend.mla_decode_backend = resolved
+                self.assertFalse(backend.use_aiter_triton_mla_decode)
+                self.assertIs(self._decode(backend, _layer(), 1), expected)
         self.assertEqual(self.kernel.calls, [])
 
     def test_kv_descale_matches_the_asm_decode(self):
