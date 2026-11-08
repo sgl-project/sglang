@@ -338,41 +338,81 @@ def fp4_ragged_mqa_logits(
     """Prefill logits [rows, num_keys] of each row over keys [ks, ke), as fp8_mqa_logits
     lays them out; AITER writes only each row's window. weights: bf16 [rows, H], scaled
     by weight_scale in the kernel."""
+    rows = query.shape[0]
+    logits = torch.empty(
+        (rows, keys.num_keys), dtype=torch.float32, device=keys.payload.device
+    )
+    if rows == 0:
+        return logits
+    # AITER plans a row over keys [0, ke) of its table, so a request whose window starts
+    # deep in the batch's gathered keys pays for every key before it (and the attn-TP
+    # rank holding the batch's last requests stalls the others). Score each request
+    # (a run of rows with one ks) on a table starting at its first page.
+    ks_cpu = ks.cpu()
+    cuts = (torch.nonzero(ks_cpu[1:] != ks_cpu[:-1]).flatten() + 1).tolist()
+    for r0, r1 in zip([0, *cuts], [*cuts, rows]):
+        base = int(ks_cpu[r0]) // PAGE_KEYS * PAGE_KEYS
+        _fp4_ragged_mqa_logits_from(
+            query[r0:r1],
+            weights[r0:r1],
+            weight_scale,
+            keys,
+            ks[r0:r1] - base,
+            ke[r0:r1] - base,
+            base // PAGE_KEYS,
+            logits[r0:r1, base:],
+        )
+    return logits
+
+
+def _fp4_ragged_mqa_logits_from(
+    query: Fp4IndexQuery,
+    weights: torch.Tensor,
+    weight_scale: float,
+    keys: Fp4IndexKeys,
+    ks: torch.Tensor,
+    ke: torch.Tensor,
+    first_page: int,
+    out: torch.Tensor,
+) -> None:
+    """Logits of rows over keys [ks, ke) counted from page first_page, into out (a
+    column-offset view of the caller's logits)."""
     from aiter.ops.flydsl.kernels.mqa_logits.pa_mqa_logits_fp4_prefill import (
         compute_prefill_schedule,
         flydsl_pa_mqa_logits_fp4_prefill,
     )
 
     rows = query.shape[0]
-    pages = keys.payload.shape[0]
+    total_pages = keys.payload.shape[0]
+    pages = total_pages - first_page
     device = keys.payload.device
     # AITER compiles the scorer per table width and its schedule per search depth and
-    # bound alignment: a power-of-two table (one sequence over every staged page, plus
+    # bound alignment: a power-of-two table (one sequence over the staged pages, plus
     # the block the scorer prefetches past the last) and fresh bounds keep it to one
     # variant per doubling of the context
     width = max(1024, 1 << (pages + 4 - 1).bit_length())
     table = torch.zeros((1, width), dtype=torch.int32, device=device)
-    table[0, :pages] = torch.arange(pages, dtype=torch.int32, device=device)
-    ks, ke = ks.clone(), ke.clone()
+    table[0, :pages] = torch.arange(
+        first_page, total_pages, dtype=torch.int32, device=device
+    )
     row_to_batch = torch.zeros(rows, dtype=torch.int32, device=device)
     # a precomputed schedule spares the kernel its -inf fill of every column
     _, cta_info, n_ctas = compute_prefill_schedule(
         row_to_batch, ks, ke, 256, max(4096, rows), width * PAGE_KEYS
     )
-    logits = torch.empty((rows, keys.num_keys), dtype=torch.float32, device=device)
-    return flydsl_pa_mqa_logits_fp4_prefill(
+    flydsl_pa_mqa_logits_fp4_prefill(
         query.payload,
         query.scale,
-        keys.payload.view(pages, 1, 4, PAGE_KEYS, 16),
-        keys.scale.view(pages, 1, 4, PAGE_KEYS),
+        keys.payload.view(total_pages, 1, 4, PAGE_KEYS, 16),
+        keys.scale.view(total_pages, 1, 4, PAGE_KEYS),
         table,
         weights,
         row_to_batch,
         ks,
         ke,
-        keys.num_keys,
+        out.shape[1],
         weight_scale=weight_scale,
         cta_info=cta_info,
         n_ctas=n_ctas,
-        out=logits,
+        out=out,
     )
