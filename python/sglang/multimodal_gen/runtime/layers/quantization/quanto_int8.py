@@ -119,6 +119,21 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         if self.group_size is None:
             weight = layer.weight.to(dtype=x.dtype)
             weight.mul_(layer.weight_scale.to(dtype=x.dtype))
+        elif (
+            self.group_size == 128
+            and x.is_cuda
+            and torch.version.hip is None
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.int8
+            and layer.weight_scale.dtype == torch.float32
+            and layer.weight.is_contiguous()
+            and layer.weight_scale.is_contiguous()
+        ):
+            from sglang.kernels.ops.quantization.groupwise_int8_dequant import (
+                groupwise_int8_dequant,
+            )
+
+            weight = groupwise_int8_dequant(layer.weight, layer.weight_scale)
         else:
             out, width = layer.weight.shape
             if width % self.group_size == 0:

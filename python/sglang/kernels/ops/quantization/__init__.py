@@ -18,6 +18,16 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="quantization.groupwise_int8_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
