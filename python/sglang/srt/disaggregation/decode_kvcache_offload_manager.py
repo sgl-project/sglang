@@ -4,7 +4,7 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 from weakref import WeakKeyDictionary as WeakKeyDict
 
 import torch
@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.memory_pool import (
     MLATokenToKVPool,
     ReqToTokenPool,
 )
-from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.utils import storage_namespace_seed
 from sglang.srt.runtime_context import (
     get_memory,
@@ -53,12 +52,15 @@ class DecodeKVCacheOffloadManager:
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         tp_group: torch.distributed.ProcessGroup,
         tree_cache: BasePrefixCache,
+        release_request: Callable[..., None],
     ) -> None:
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
         self.page_size = get_schedule().page_size
         self.request_counter = 0
         self.tree_cache = tree_cache
+        # `RequestRetirer.release`: gives back what a finished request holds.
+        self.release_request = release_request
         env_stride = envs.SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE.get()
         if env_stride is None or env_stride <= 0:
             self.offload_stride = self.page_size
@@ -337,19 +339,9 @@ class DecodeKVCacheOffloadManager:
             return
 
         # Released only at request finish; a mid-decode free races with
-        # concurrent admission over live slots. The prefix the prealloc match
-        # took from the tree stays with the tree: not freed, only unlocked.
-        self.tree_cache.free_kv_row(
-            req.kv, [(req.kv.cache_protected_len, req.kv.kv_allocated_len)]
-        )
-        self.tree_cache.unlock(req.lock)
-        req.lock = None
-        kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
-        ).release_row(req)
-        req.kv.mark_kv_released()
+        # concurrent admission over live slots. No checkpoint: the offloaded
+        # copy, not the device tree, keeps this request's KV.
+        self.release_request(req, checkpoint=False)
         self.offloaded_state.pop(req, None)
 
     def _check_backup_progress(self, finish_count):

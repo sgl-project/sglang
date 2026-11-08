@@ -692,6 +692,8 @@ class Scheduler(
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tp_group=self.dp_tp_cpu_group,
                 tree_cache=self.tree_cache,
+                # Bound late: `init_request_retirer` runs after this.
+                release_request=lambda *a, **kw: self.request_retirer.release(*a, **kw),
             )
         else:
             self.decode_offload_manager = None
@@ -3743,9 +3745,10 @@ class Scheduler(
         reason = req.finished_reason or req.to_finish
         req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
         req.update_finish_state()
-        # Holds no memory, but the detach still matters: `create_req` marked its
-        # streaming session in flight, and PREFILL's `_prefetch_kvcache` armed
-        # the cache's paced retry for its handle; nothing else clears either.
+        # Holds no device KV, but the release still matters: `create_req` marked
+        # its streaming session in flight, PREFILL's `_prefetch_kvcache` armed the
+        # cache's paced retry for its handle, and a retracted request keeps its
+        # host KV backup; nothing else clears them.
         self.request_retirer.release(req, checkpoint=False)
         # Like `find_active_slot`, the detached request also leaves its session.
         if req.session is not None and req.session.streaming:

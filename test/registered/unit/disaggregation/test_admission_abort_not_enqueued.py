@@ -25,6 +25,8 @@ from http import HTTPStatus
 from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import torch
+
 from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import PrefillBootstrapQueue
@@ -37,6 +39,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
 )
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
@@ -229,6 +232,31 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                             q._create_receiver_and_enqueue.return_value.kv_receiver
                         )
                         receiver.init.assert_called_once_with(0)
+
+    def test_capacity_reject_retires_a_retracted_request(self):
+        """A retracted request the decode door turns away for KV capacity must be
+        retired once, or its host KV backup is never freed."""
+        req = _make_req(prompt_len=16)
+        backup = RetractionBackup(host_indices=torch.arange(4), pool_transfers=[])
+        req.kv.retraction_backup = backup
+        sched = _make_scheduler()
+        q = _decode_queue(sched)
+        q.token_to_kv_pool_allocator.prealloc_ceiling_fits.return_value = False
+        q._prealloc_required_tokens = MagicMock(return_value=(1 << 30, 1 << 30))
+        q._uses_swa_tail_prealloc = MagicMock(return_value=False)
+        q._check_if_req_exceed_kv_capacity = MethodType(
+            DecodePreallocQueue._check_if_req_exceed_kv_capacity, q
+        )
+
+        _admit_decode(q, req, is_retracted=True)
+
+        self.assertEqual(list(q.retracted_queue), [])
+        sched.retire_unadmitted_request.assert_called_once_with(req)
+        tree_cache = sched.request_retirer.tree_cache
+        tree_cache.discard_kv_cache_backup.assert_called_once_with(backup)
+        self.assertIsNone(req.kv.retraction_backup)
+        self.assertEqual(req.finished_reason.status_code, HTTPStatus.BAD_REQUEST)
+        sched.output_streamer.stream_output.assert_called_once()
 
     def test_preempted_reentry_is_not_retired(self):
         """Preemption requeues through a bare `_add_request_to_queue`.
