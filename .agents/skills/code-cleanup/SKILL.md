@@ -150,9 +150,8 @@ failures it finds, not its size.
   or a test means the file is alive, restore it; a mechanical sync keeps it deleted.
 - `from sgl_kernel import X` under an XPU branch resolves to `sgl-kernel-xpu`; it is not a
   reader of the CUDA AOT op.
-- `DeprecationWarning` raised from library code is hidden by default, and the env
-  `*WithAlias` fallback emits exactly that; a deprecation users must see needs
-  `logger.warning`, `UserWarning` or `FutureWarning`.
+- `DeprecationWarning` raised from library code is hidden by default; a deprecation users
+  must see needs `logger.warning`, `UserWarning` or `FutureWarning`.
 - argparse prefix matching: a deleted flag that prefixes one live flag silently binds to it.
   Check removals against the real parser, not grep.
 - Tests that fake `server_args` with `MagicMock` never notice a read of a deleted field;

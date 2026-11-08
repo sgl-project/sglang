@@ -328,9 +328,8 @@ reverted by #14533). #25821's NSA aliases went in three batches (#38375, #40795,
 Spot: `*WithAlias(`, `deprecated_name=`, `_DEPRECATED_ENVS`, `Deprecated*Action`,
 `FutureWarning` shims, dated `TODO: remove ... after <date>`. The warning must be visible
 (`logger.warning`, `UserWarning`, `FutureWarning`): `DeprecationWarning` from library code is
-filtered by default, and the `*WithAlias` fallback emits exactly that. An env var replaced
-by a flag keeps a `_DEPRECATED_ENVS` note naming the flag (#35060); #34492 left none, so the
-old var is ignored silently.
+filtered by default. An env var replaced by a flag keeps a `_DEPRECATED_ENVS` note naming
+the flag (#35060).
 Not this pattern: internal names need no alias; #25821's internal re-export shims only
 became cleanup work for #40795 and #47990. A path a pinned out-of-tree plugin imports is
 user-facing (#46625). External protocol surfaces are a separate decision. The repo has no
