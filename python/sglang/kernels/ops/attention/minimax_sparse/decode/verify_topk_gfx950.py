@@ -1,15 +1,15 @@
 """Fused target-verify indexer for gfx950: per-block max index score with a streaming top-k.
 
-A request's draft rows (num_draft x index heads, at most 16) form one MFMA tile. Each
-warp of a program streams its own index-K blocks of one context split and keeps every
-row's best ``KP`` blocks in registers; the program reduces its warps' lists to the
-split's best ``KP``, and a merge kernel reduces the splits' lists, adds the forced
-init/local blocks and writes ascending ids. The scores are the 16x16x32 MFMA products
-and scaling of ``_verify_score_kernel`` (bf16), or for an NVFP4 cache of
+A request's draft rows (num_draft x index heads, at most 16; 32 under indexer CP) form
+one MFMA tile. Each warp of a program streams its own index-K blocks of one context
+split and keeps every row's best ``KP`` blocks in registers; the program reduces its
+warps' lists to the split's best ``KP``, and a merge kernel reduces the splits' lists,
+adds the forced init/local blocks and writes ascending ids. The scores are the 16x16x32
+MFMA products and scaling of ``_verify_score_kernel`` (bf16), or for an NVFP4 cache of
 ``_verify_score_nvfp4_kernel`` (fp16, even dims then odd dims). Blocks rank by score,
-then lower block id, in the radix top-k's order; every list keeps its blocks' top
-``KP`` in that order, so the ids equal the score + top-k path's whatever the split of
-the blocks.
+then lower block id, in the radix top-k's order; every list keeps its blocks' top ``KP``
+in that order, so the ids equal the score + top-k path's whatever the split of the
+blocks.
 """
 
 import torch
@@ -219,8 +219,7 @@ def _score_round(
 ):
     """Score round ``it`` (local block b0 + it * W + w for warp w) into each row's list.
 
-    Local block l is physical block l * WORLD + RANK. Without ``K_FP4``, ``q_even`` is the
-    whole Q operand and ``q_odd`` is unused.
+    Without ``K_FP4``, ``q_even`` is the whole Q operand and ``q_odd`` is unused.
     """
     W: gl.constexpr = warp.shape[0]
     s = gl.zeros([W, M, BLOCK_N], gl.float32, mfma_layout)
@@ -525,10 +524,8 @@ def _verify_index_topk_partial_kernel(
 
 @triton.jit
 def _select_block_ids(key, n_blocks, topk, init_blocks, local_blocks, KT: tl.constexpr):
-    """A row's topk block ids from its candidate keys (NO_KEY when empty): the forced init
-    [0, init_blocks) and local [n_blocks - local_blocks, n_blocks) blocks, then the highest
-    scores, lower block id on ties; ascending, with the -1 tail the sparse decode kernels
-    expect."""
+    """A row's topk block ids: the forced init and local blocks, then the best candidate
+    keys (NO_KEY = empty); ascending, with the -1 tail the sparse decode kernels expect."""
     NO_KEY: tl.constexpr = -9223372036854775808
     BIG: tl.constexpr = 0x7FFFFFFF
     n_init = tl.minimum(init_blocks, n_blocks)
@@ -761,11 +758,8 @@ def fused_verify_topk_idx(
 
 
 def _cp_split_config(num_reqs: int) -> tuple[int, int, int, bool]:
-    """``_split_config`` for a rank's quarter of the blocks, every head's rows in one tile.
-
-    One wave of short splits up to 96 requests, then two waves of longer splits, which
-    leave fewer CUs idle (measured on MI350X).
-    """
+    """``_split_config`` for a rank's quarter of the blocks, every head's rows in one tile:
+    one wave of short splits up to 96 requests, then two waves of longer splits."""
     if num_reqs <= 96:
         return 256, 16, 4, num_reqs <= 64
     return max(512, 2 * num_reqs), 8, 16, False
@@ -786,10 +780,8 @@ def _cp_partial(
     world: int,
     rank: int,
 ):
-    """The fused verify partial pass over this rank's blocks, all heads in one tile.
-
-    The result is (split lists [heads, rows, nc], splits per request, nc).
-    """
+    """The fused verify partial pass over this rank's blocks, all heads in one tile:
+    (split lists [heads, rows, nc], splits per request, nc)."""
     heads, rows, head_dim = q_heads.shape
     num_reqs = rows // num_draft
     max_blocks = triton.cdiv(min(max_seqlen, req_to_token.shape[1]), block_size)
@@ -842,17 +834,12 @@ def _cp_partial(
 
 
 # ---- Indexer CP candidate exchange over IPC (no collective) ----
-# A rank writes its best KP candidates of head h straight into rank h's receive
-# buffer, [CP_PARITIES, world, CP_MAX_ROWS, KP] int64 there, and rank h's merge
-# reads them where they land. Each word carries the writing call's tag, so it is
-# its own arrival flag; the tag of a row's n-th call is n % 255 + 1 (0 is never
-# written, so the zeroed buffer reads as "not arrived"), counted per row by the
-# kernels themselves so graph replay keeps every rank's count in step. The count
-# wraps at 510, where tag and parity both repeat, so the int32 never overflows
-# into a negative parity on a long-running server. Slots
-# alternate by call parity: a rank's writes for call n + 2 can only start after
-# its own merge of call n + 1, which needed every peer's call n + 1 writes, so
-# no peer can still be reading call n's slots.
+# A rank writes its best KP candidates of head h into rank h's receive buffer
+# [CP_PARITIES, world, CP_MAX_ROWS, KP] int64. Each word carries its call's tag, its own
+# arrival flag: n % 255 + 1 for a row's n-th call, so a zeroed word reads "not arrived".
+# The kernels count calls per row, so graph replay keeps ranks in step; counts wrap at 510,
+# where tag and parity both repeat. Two parity slots suffice: a rank writes call n + 2 only
+# after merging call n + 1, which needed every peer's call n + 1 writes.
 CP_PARITIES = 2
 CP_MAX_ROWS = 4096
 # ~2.5 min of polls, under the scheduler watchdog's 300 s: a dead peer traps, not hangs
@@ -892,11 +879,8 @@ def _cp_local_keys_ipc_kernel(
     NC: tl.constexpr,
     MAX_ROWS: tl.constexpr,
 ):
-    """One rank's split lists reduced to its best KP candidates, forced blocks excluded,
-    delivered into the receive buffer of the rank that owns ``head``.
-
-    These are what the native merge would pick from were they all the blocks.
-    """
+    """This rank's best KP candidates of (head, row), forced blocks excluded, written into
+    the head owner's receive buffer: what the native merge would pick from these blocks."""
     pid = tl.program_id(0)
     head, r = pid // rows, pid % rows
     req = r // NUM_DRAFT
@@ -935,12 +919,9 @@ def _cp_merge_ipc_kernel(
     MAX_ROWS: tl.constexpr,
     MAX_SPINS: tl.constexpr,
 ):
-    """_verify_index_topk_merge_kernel over the best KP every rank delivered for this
-    row: rank r scored blocks r, r + WORLD, ..., so together they hold the row's best.
-
-    Waits until all WORLD * KP carry this call's tag, then selects exactly as the
-    native merge. A wait past MAX_SPINS polls traps the kernel.
-    """
+    """Waits for every rank's KP words of this row to carry this call's tag (trapping
+    after MAX_SPINS polls), then selects as _verify_index_topk_merge_kernel: rank r scored
+    blocks r, r + WORLD, ..., so together they hold the row's best."""
     r = tl.program_id(0)
     n = tl.load(counters_ptr + r)
     tl.store(counters_ptr + r, (n + 1) % 510)
@@ -1000,7 +981,6 @@ class CpExchange:
             (self.world, CP_MAX_ROWS), dtype=torch.int32, device=device
         )
         self.merge_calls = torch.zeros(CP_MAX_ROWS, dtype=torch.int32, device=device)
-        self.max_spins = CP_MAX_SPINS
         torch.cuda.synchronize(device)
         dist.barrier(group=group.cpu_group)
 
@@ -1098,11 +1078,8 @@ def cp_verify_exchange(
     sm_scale,
     exchange: CpExchange,
 ):
-    """Indexer CP with the candidate exchange done in place over IPC.
-
-    Scores this rank's blocks, delivers each head's best _KP to its owner and merges what
-    the peers delivered for this rank's head: [1, rows, topk] int32, as verify_topk_idx.
-    """
+    """Indexer CP: score this rank's blocks, send each head's best _KP to its owner over
+    IPC and merge this rank's head: [1, rows, topk] int32, as verify_topk_idx."""
     heads, rows, head_dim = q_heads.shape
     assert rows <= CP_MAX_ROWS and heads == exchange.world
     num_reqs = rows // num_draft
@@ -1152,7 +1129,7 @@ def cp_verify_exchange(
         BLOCK_N=block_size,
         KT=triton.next_power_of_2(topk),
         MAX_ROWS=CP_MAX_ROWS,
-        MAX_SPINS=exchange.max_spins,
+        MAX_SPINS=CP_MAX_SPINS,
         num_warps=1,
     )
     return out
