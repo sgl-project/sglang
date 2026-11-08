@@ -178,6 +178,15 @@ def select_comparable_weight(quant_method) -> Optional[type]:
         and quant_method.block_quant
         and not quant_method.use_mxfp8
     ):
+        # Fp8BlockComparable assumes the checkpoint's square blocks.
+        if (
+            isinstance(quant_method, Fp8MoEMethod)
+            and quant_method.w2_weight_block_size is not None
+        ):
+            raise NotImplementedError(
+                "weight checker has no ComparableWeight for block-FP8 MoE "
+                "scales refined for a TP shard"
+            )
         return Fp8BlockComparable
     if isinstance(quant_method, ModelOptNvFp4FusedMoEMethod):
         if getattr(quant_method, "enable_flashinfer_trtllm_moe", False):

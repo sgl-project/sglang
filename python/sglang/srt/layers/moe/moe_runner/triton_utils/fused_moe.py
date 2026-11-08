@@ -949,19 +949,20 @@ def _fused_moe_kernel_sequence(
         out_slice = out_hidden_states
         out_slice.zero_()
 
+    down_block_shape = w2_block_shape or block_shape
     if (
         _is_cuda
         and down_moe_use_tma
         and use_fp8_w8a8
-        and block_shape is not None
+        and down_block_shape is not None
         and a2_scale is None
-        and intermediate_cache2.shape[-1] != block_shape[1]
+        and intermediate_cache2.shape[-1] != down_block_shape[1]
     ):
         # Same quant the down call would run, restricted to the rows the down
         # GEMM reads; a single whole-row group keeps that call's per-token kernel.
         intermediate_cache2, a2_scale = per_token_group_quant(
             intermediate_cache2,
-            group_size=block_shape[1],
+            group_size=down_block_shape[1],
             sorted_token_ids=sorted_token_ids,
             num_tokens_post_padded=num_tokens_post_padded,
             num_valid_tokens=topk_ids.numel(),
@@ -998,7 +999,7 @@ def _fused_moe_kernel_sequence(
         use_int8_w8a16=use_int8_w8a16,
         use_int4_w4a16=use_int4_w4a16,
         per_channel_quant=per_channel_quant,
-        block_shape=w2_block_shape or block_shape,
+        block_shape=down_block_shape,
         a_use_tma=down_moe_use_tma,
         b_use_tma=down_moe_use_tma,
         filter_expert=filter_expert,

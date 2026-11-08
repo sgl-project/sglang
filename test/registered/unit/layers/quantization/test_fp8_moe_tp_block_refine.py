@@ -11,10 +11,20 @@ from unittest.mock import patch
 
 import torch
 
+import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fused_moe_module
 from sglang.srt import runtime_context
 from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
+    try_get_optimal_moe_config,
+)
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8 import (
+    Fp8Config,
+    _tp_refined_moe_block_sizes,
+)
+from sglang.srt.model_executor.weight_checker_comparator import (
+    select_comparable_weight,
+)
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -164,14 +174,36 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
         # weights or scales would be off by about the size of the output.
         tp1_err, tp2_err = _relative_error(tp1, ref), _relative_error(summed, ref)
         self.assertLess(tp2_err, 1.02 * tp1_err)
+        return method
 
     def test_triton(self):
         # TP splits w13 along N and w2 along K; only those are refined.
-        self._assert_ranks_match_tp1(
+        method = self._assert_ranks_match_tp1(
             MoeRunnerBackend.TRITON,
             blocks=([64, BLOCK], [BLOCK, 64]),
             num_tokens=33,
         )
+        # The weight checker reads square checkpoint blocks; refined layers
+        # must be refused, not dequantized with misplaced scales.
+        with self.assertRaises(NotImplementedError):
+            select_comparable_weight(method)
+
+    def test_triton_down_tma(self):
+        # A tuned down config with USE_TMA pre-quantizes the down activation;
+        # its groups must follow w2's refined K block.
+        def with_down_tma(*args, **kwargs):
+            config, (down_config, extra) = try_get_optimal_moe_config(*args, **kwargs)
+            return config, ({**(down_config or config), "USE_TMA": True}, extra)
+
+        with (
+            patch.object(fused_moe_module, "_moe_support_tma", return_value=True),
+            patch.object(fused_moe_module, "try_get_optimal_moe_config", with_down_tma),
+        ):
+            self._assert_ranks_match_tp1(
+                MoeRunnerBackend.TRITON,
+                blocks=([64, BLOCK], [BLOCK, 64]),
+                num_tokens=33,
+            )
 
     @unittest.skipUnless(
         deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0, "needs DeepGEMM with UE8M0 scales"
@@ -179,6 +211,17 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
     def test_deep_gemm(self):
         # Below and above the token count where SM120 switches to its own
         # contiguous layout.
+        # The fused SiTU quant kernels take 128-wide groups only.
+        self.assertIsNone(
+            _tp_refined_moe_block_sizes(
+                weight_block_size=[BLOCK, BLOCK],
+                intermediate_size_per_partition=I // TP,
+                moe_tp_size=TP,
+                hidden_size=H,
+                runner_backend=MoeRunnerBackend.DEEP_GEMM,
+                activation="situ",
+            )
+        )
         for num_tokens in (33, 1100):
             with self.subTest(num_tokens=num_tokens):
                 self._assert_ranks_match_tp1(
