@@ -25,6 +25,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -280,7 +281,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
-        s._engine_paused = False
+        s.pause_state = PauseState()
         s.increment_scheduler_iterations = Mock()
         s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
         s.is_generation = True

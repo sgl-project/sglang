@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -1167,7 +1168,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         scheduler.ingest_requests = lambda: []
         scheduler.increment_scheduler_iterations = lambda: None
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
