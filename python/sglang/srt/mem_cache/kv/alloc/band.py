@@ -1042,7 +1042,7 @@ class Band:
 
     def available_size(self) -> int:
         """Tokens this band alone can take in place now, nothing in the chain moved
-        (the chain-wide read is `units_available`); memoized on the chain epoch."""
+        (the chain-wide question is `units_fit`); memoized on the chain epoch."""
         epoch = self._chain_capacity_epoch()
         if self._avail_memo_epoch != epoch:
             self._avail_memo_tokens = self._available_tokens()

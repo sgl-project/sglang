@@ -114,6 +114,10 @@ class MlxAuxiliaryStatePool:
     def schedulable_available_size(self) -> int:
         return self.available_size()
 
+    def slots_fit(self, count: int) -> bool:
+        """Whether ``count`` slots can be taken now."""
+        return self.schedulable_available_size() >= count
+
     def alloc_group_begin(self, num_reqs: int) -> None:
         self._alloc_iter = None
         if num_reqs > 0:

@@ -41,6 +41,7 @@ from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.tree_slots import window_evictable
 from sglang.test.unified_allocator_fixtures import (
     hold_band,
+    largest_take,
     release_band,
     setup_allocator_context,
 )
@@ -1746,7 +1747,7 @@ class TestDeclaredParts(CustomTestCase):
             ),
         )
         allocator = storage.allocator
-        available = allocator.available_size()
+        available = largest_take(allocator)
         ids = allocator.alloc(available)
         self.assertIsNotNone(ids)
         self.assertIsNone(allocator.alloc(4))
@@ -1758,7 +1759,7 @@ class TestDeclaredParts(CustomTestCase):
         allocator.load_cpu_copy(saved, ids)
         self.assertTrue(torch.all(view.k_buffer[0][physical] == 7))
         allocator.free(ids)
-        self.assertEqual(allocator.available_size(), available)
+        self.assertEqual(largest_take(allocator), available)
         self.assertEqual(allocator.verify_byte_accounting(), [])
         self.assertEqual(
             storage.plan.tree_slots()[0].component,
@@ -2063,14 +2064,16 @@ class TestDeclaredParts(CustomTestCase):
         )
         self.assertTrue(a.admits(KVDemand(400, demand_windows(a, 400, 16))))
         self.assertFalse(a.admits(KVDemand(400, demand_windows(a, 400, 400))))
-        full_budget = a.full_available_size()
+        full_budget = largest_take(a, a.full_attn_allocator.sub_pool_name)
         swa_budget = a.conserve_swa_available_size()
+        # Over a shared memory the budgets count from zero: holding nothing
+        # back, the request fits.
         self.assertTrue(
             a.prealloc_fits(
                 token_demand(a, 400, 16),
                 evictable=evictable_by_sub_pool(cache, a),
-                full_budget_tokens=full_budget,
-                window_budget_tokens={a.target_window_pool(): swa_budget},
+                full_budget_tokens=0,
+                window_budget_tokens={a.target_window_pool(): 0},
             )
         )
         # Pending requests and decode headroom are deducted from these budgets.
@@ -2090,10 +2093,8 @@ class TestDeclaredParts(CustomTestCase):
                     a.prealloc_fits(
                         token_demand(a, 400, 16),
                         evictable=evictable_by_sub_pool(cache, a),
-                        full_budget_tokens=full_budget - full_reserved,
-                        window_budget_tokens={
-                            a.target_window_pool(): swa_budget - swa_reserved
-                        },
+                        full_budget_tokens=-full_reserved,
+                        window_budget_tokens={a.target_window_pool(): -swa_reserved},
                     ),
                     fits,
                 )
@@ -2623,10 +2624,13 @@ class TestDeclaredParts(CustomTestCase):
         queue = object.__new__(DecodePreallocQueue)
         queue.tree_cache = cache
         queue.token_to_kv_pool_allocator = a
-        full_budget = a.full_available_size() + cache.full_evictable_size()
-        swa_budget = a.swa_available_size() + cache.window_evictable_size(
-            a.swa_attn_allocator.sub_pool_name
+        full_budget = (
+            largest_take(a, a.full_attn_allocator.sub_pool_name)
+            + cache.full_evictable_size()
         )
+        swa_budget = largest_take(
+            a, a.swa_attn_allocator.sub_pool_name
+        ) + cache.window_evictable_size(a.swa_attn_allocator.sub_pool_name)
         from sglang.srt.mem_cache.base_prefix_cache import evictable_by_sub_pool
 
         evictable = evictable_by_sub_pool(cache, a)
@@ -2637,11 +2641,11 @@ class TestDeclaredParts(CustomTestCase):
             # requests: charged beside this one in one admission question,
             # where reclaimed bytes of either side may serve it.
             held_full = (
-                a.full_available_size()
+                largest_take(a, a.full_attn_allocator.sub_pool_name)
                 + evictable[a.full_attn_allocator.sub_pool_name]
                 - full
             )
-            held_swa = a.window_available_size(target) + evictable[target] - swa
+            held_swa = largest_take(a, target) + evictable[target] - swa
             demand = token_demand(a, need, need)
             return a.admits(
                 KVDemand(
@@ -2663,8 +2667,9 @@ class TestDeclaredParts(CustomTestCase):
             self.assertEqual(
                 queue._prealloc_reservation_fits(
                     token_demand(a, need, need),
-                    full_allocatable_tokens=full,
-                    window_allocatable_tokens={target: swa},
+                    # Counted from zero: what each budget holds back.
+                    full_allocatable_tokens=full - full_budget,
+                    window_allocatable_tokens={target: swa - swa_budget},
                 ),
                 jointly(full, swa),
             )
@@ -3572,11 +3577,10 @@ class TestDeclaredParts(CustomTestCase):
                             a.conserve_swa_available_size(),
                             (window_capacity - 32) * factor,
                         )
-                        self.assertGreater(a.swa_available_size(), 0)
-                        full, window = a.swa_capacity_and_available(
-                            full_capacity=sized.full_tokens,
-                            swa_capacity=sized.window_tokens,
+                        self.assertGreater(
+                            largest_take(a, a.swa_attn_allocator.sub_pool_name), 0
                         )
+                        window = a.usage()[a.swa_attn_allocator.sub_pool_name]
                         self.assertEqual(window[0] - window[1], 32 * factor)
                         a.free(ids)
                         self.assertEqual(

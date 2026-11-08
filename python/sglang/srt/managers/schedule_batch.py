@@ -123,6 +123,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     TreeLock,
 )
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     evict_from_tree_cache,
@@ -2922,6 +2923,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             total += ceil_align(nxt, page_size) - ceil_align(cur, page_size)
         return total
 
+    @capacity_decision
     def check_decode_mem(self, selected_indices: Optional[List[int]] = None):
         """Whether the next decode step fits in the KV pool. The ALLOCATOR owns
         the capacity gate (eviction + any per-step reservations of its own) —
@@ -2944,6 +2946,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             spec_algorithm=self.spec_algorithm,
         )
 
+    @capacity_decision
     def retract_decode(
         self, request_retirer: RequestRetirer
     ) -> Tuple[List[Req], float, List[Req]]:

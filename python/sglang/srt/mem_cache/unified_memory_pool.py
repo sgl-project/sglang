@@ -39,13 +39,15 @@ class UnifiedMambaSlotAllocator:
         device: str,
         *,
         take: Callable[[int], Optional[torch.Tensor]],
-        capacity: Callable[[], int],
+        fits: Callable[[int], bool],
+        estimate: Callable[[], int],
     ):
         self._multi_ended_allocator = mea
         # Slots are taken and priced through the chain allocator owning the
         # band: the band's own reads cannot see room a relayout would make.
         self._take = take
-        self._capacity = capacity
+        self._fits = fits
+        self._estimate = estimate
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
 
@@ -67,13 +69,17 @@ class UnifiedMambaSlotAllocator:
 
     def available_size(self) -> int:
         # Slot-conservation count (max - allocated): the leak-check view, not
-        # what a take can serve (`schedulable_available_size`).
+        # what a take can serve (`slots_fit`).
         return self.size - self._multi_ended_allocator.allocated_count()
 
+    def slots_fit(self, count: int) -> bool:
+        # Whether ``count`` slots can be taken now: the chain's layout search.
+        return self._fits(count)
+
     def schedulable_available_size(self) -> int:
-        # The slots a take can have now (>= N => alloc(N) succeeds): the chain's
-        # layout search.
-        return self._capacity()
+        # The chain's estimate of the slots a take could have: observers
+        # only; a decision asks `slots_fit`.
+        return self._estimate()
 
     @property
     def free_slots(self) -> torch.Tensor:
@@ -137,7 +143,8 @@ def _wire_mamba_slot_allocator(
     take: Callable[[int], Optional[torch.Tensor]],
     state: StateStorage,
     device,
-    capacity: Callable[[], int],
+    fits: Callable[[int], bool],
+    estimate: Callable[[], int],
 ) -> UnifiedMambaSlotAllocator:
     """Install Mamba slot allocation and host capacities."""
     state_pool = state.pool
@@ -145,7 +152,8 @@ def _wire_mamba_slot_allocator(
         mamba_end,
         device=device,
         take=take,
-        capacity=capacity,
+        fits=fits,
+        estimate=estimate,
     )
     state.slots = slot_allocator
     state_pool.host_capacity_tokens = state_pool.size

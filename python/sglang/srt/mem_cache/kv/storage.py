@@ -504,10 +504,15 @@ class KVStorage:
             return self._allocator.full_attn_allocator
         return self._allocator
 
-    def available_units(self, sub_pool: str) -> int:
-        """Units ``take_units`` can hand out without eviction: the planner's
-        answer, which counts the room a relayout makes, as a take does."""
-        return self._allocator.units_available(sub_pool)
+    def units_fit(self, sub_pool: str, count: int) -> bool:
+        """Whether ``take_units`` can hand out ``count`` units (tokens, slots for
+        state) now, counting the room a relayout makes, as a take does."""
+        if count <= 0:
+            return True
+        allocator = self._allocator
+        if sub_pool != allocator.sub_pool_roles()[2]:
+            count = -(-count // allocator.page_size)
+        return allocator.units_fit({sub_pool: count})
 
     def take_units(self, sub_pool: str, count: int) -> Optional[torch.Tensor]:
         """``count`` rows of ``sub_pool`` alone (a load the tree stages); None
@@ -555,6 +560,22 @@ class KVStorage:
         self._allocator.free_full_segments(
             [(row[start:end], start) for start, end in ranges]
         )
+
+    def window_rows_freed_by_release(self, req: Req) -> Dict[str, int]:
+        """Window rows, by sub-pool, that releasing ``req``'s row now frees in whole
+        pages: ``[cache_protected_len, owned_kv_len)`` less rows retired before."""
+        kv = req.kv
+        if kv.req_pool_idx is None:
+            return {}
+        page_size = self._allocator.page_size
+        start, end = kv.cache_protected_len, req.owned_kv_len()
+        dead_lo = kv.window_dead_lo(page_size)
+        freed = {}
+        for name in self._allocator.window_allocators:
+            dead_hi = max(dead_lo, kv.get_evicted_seqlen(name))
+            retired = max(0, min(dead_hi, end) - max(dead_lo, start))
+            freed[name] = max(0, end - start - retired) // page_size * page_size
+        return freed
 
     def window_ids(self, sub_pool: str, owner_ids: torch.Tensor) -> torch.Tensor:
         """The window's row ids of these owner token ids, as transfers and the

@@ -88,7 +88,7 @@ def _staged_fixture(full_match=2):
     cache.supports_swa = lambda: True
     cache.evict_for_alloc = Mock()
     cache.token_to_kv_pool_allocator = SimpleNamespace(
-        full_available_size=Mock(return_value=100)
+        full_available_size=Mock(return_value=100), pools_share_memory=False
     )
     cc = HybridCacheController.__new__(HybridCacheController)
     cc.pp_prefetch_command_group = None
