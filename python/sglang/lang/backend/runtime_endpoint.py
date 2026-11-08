@@ -462,7 +462,7 @@ class Runtime:
 
     def get_tokenizer(self):
         from sglang.srt.arg_groups.model_override_base import resolving_view
-        from sglang.srt.utils.hf_transformers import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         cfg = resolving_view(self.server_args)
         return get_tokenizer(

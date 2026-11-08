@@ -19,6 +19,7 @@ import torch
 
 from sglang.srt.disaggregation.decode import SchedulerDisaggregationDecodeMixin
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.io_struct import PauseGenerationReqInput
 from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
@@ -29,6 +30,7 @@ from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
     _CacheHitRateWindow,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata, SchedulerPPMixin
 from sglang.srt.managers.utils import GenerationBatchResult
@@ -302,8 +304,6 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
-                        is_retracted=length == 200,
-                        finished=lambda length=length: length == 300,
                         grammar=None,
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
@@ -335,7 +335,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
+                    processor, result, batch, [True, False, False]
                 )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
@@ -1068,7 +1068,7 @@ class TestForwardPassMetrics(unittest.TestCase):
 
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler._sched_idled = False
         scheduler.forward_ct = 0
         scheduler.is_generation = True
@@ -1262,6 +1262,69 @@ class TestForwardPassMetrics(unittest.TestCase):
             with self.subTest(name), patch("time.monotonic", return_value=42.0):
                 self.assertEqual(select().batch_to_run.fpm_start_time, 42.0)
 
+    def test_pp_prefill_selection_preserves_pause_and_timing(self):
+        # Drive the actual PP prefill loop through selection, then stop before
+        # device/transport work. A held pause must block selection just like an
+        # applied pause; a resumed or DP-sync batch must retain its start stamp.
+        for state in ("paused", "held", "resumed", "empty", "dp_sync"):
+            with self.subTest(state=state):
+                batch = self._make_batch(fpm_start_time=None)
+                running = SimpleNamespace()
+                scheduler = Scheduler.__new__(Scheduler)
+                scheduler.pause_state = PauseState()
+                if state == "paused":
+                    scheduler.pause_state.pause()
+                elif state == "held":
+                    scheduler.pause_state.take_inputs(
+                        [PauseGenerationReqInput(mode="in_place")], stop_at_pause=True
+                    )
+                elif state == "resumed":
+                    scheduler.pause_state.pause()
+                    scheduler.pause_state.resume()
+                scheduler.init_pp_loop_state = Mock()
+                scheduler.pp_loop_size = 1
+                scheduler.running_mbs = [running]
+                scheduler.last_mbs = [None]
+                scheduler.mbs = [None]
+                scheduler.pp_group = SimpleNamespace(is_last_rank=True)
+                scheduler.increment_scheduler_iterations = Mock()
+                scheduler._pp_ingest_requests = Mock(return_value=[])
+                scheduler.process_bootstrapped_queue = Mock()
+                scheduler._pp_pd_get_prefill_transferred_ids = Mock(return_value={})
+                scheduler._pp_commit_comm_work = Mock()
+                scheduler.process_prefill_chunk = Mock()
+                scheduler._process_hicache_events = Mock()
+                scheduler.get_new_batch_prefill = Mock(
+                    return_value=SimpleNamespace(
+                        batch_to_run=None if state in ("empty", "dp_sync") else batch,
+                        running_batch=running,
+                    )
+                )
+                scheduler.dp_attn_adapter = SimpleNamespace(
+                    maybe_prepare_mlp_sync_batch=Mock(
+                        return_value=None if state == "empty" else batch
+                    )
+                )
+                scheduler._pp_recv_proxy_tensors = Mock()
+                scheduler._pp_commit_proxy_send_work = Mock(side_effect=StopIteration)
+                with (
+                    get_parallel().override(pp_size=1, pp_async_batch_depth=0),
+                    patch(
+                        "sglang.srt.managers.scheduler_pp_mixin.time.monotonic",
+                        return_value=42.0,
+                    ),
+                    self.assertRaises(StopIteration),
+                ):
+                    SchedulerPPMixin.event_loop_pp_disagg_prefill(scheduler)
+                if state in ("paused", "held"):
+                    scheduler.get_new_batch_prefill.assert_not_called()
+                    scheduler.dp_attn_adapter.maybe_prepare_mlp_sync_batch.assert_not_called()
+                else:
+                    scheduler.get_new_batch_prefill.assert_called_once_with(running)
+                selected = state in ("resumed", "dp_sync")
+                self.assertIs(scheduler.mbs[0], batch if selected else None)
+                self.assertEqual(batch.fpm_start_time, 42.0 if selected else None)
+
     def test_disagg_prefill_queued_metrics_include_compute_waiting_queue(self):
         self.scheduler.disaggregation_mode = DisaggregationMode.PREFILL
         self.scheduler.disagg_prefill_bootstrap_queue = types.SimpleNamespace(
@@ -1410,6 +1473,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 self.scheduler._fpm_publisher.metrics.clear()
                 timer, interval = DeviceTimer(), FakeInterval(9)
                 receiver = SchedulerPPMixin()
+                # No unified pool: nothing keeps freed pages on the forward.
+                receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
