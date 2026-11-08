@@ -23,6 +23,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    DecodeCudaGraphRunner,
+)
 from sglang.srt.models.fast_dvlm import _flatten_weight_name
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -467,6 +470,14 @@ class TestHierarchyBlockResultProcessing(unittest.TestCase):
         )
 
         self.assertIsNone(req.dllm_algo_state)
+
+    def test_graph_runner_refuses_forwards_marked_eager(self):
+        """A causal forward replayed from a graph captured bidirectionally
+        would write the wrong KV without any error."""
+        forward_batch = SimpleNamespace(replace_embeds=None, dllm_eager=True)
+        self.assertFalse(
+            DecodeCudaGraphRunner.can_run_graph(SimpleNamespace(), forward_batch)
+        )
 
     def test_worker_passes_carried_state_into_sync_runs(self):
         def worker(carries):
