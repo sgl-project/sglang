@@ -276,7 +276,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 128
+    eval_batch_size = 64
     # percent: each tier's baseline is set independently so L2 and L3 can be
     # tuned separately; both are enforced by assert_metrics via this dict.
     min_hit_rate_pcts = {

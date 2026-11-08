@@ -201,7 +201,7 @@ class TestNPUDeepSeekV4ProW4A8PDSEPGPQAHigh(TestNpuAccuracyMultiNodePdSepTestCas
     accuracy = 0.85
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_PRO_W4A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 64
+    eval_batch_size = 32
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     def test_npu_deepseek_v4_pro_w4a8_pd_sep_gpqa_high(self):
