@@ -467,6 +467,25 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
+        if sliding_window_size > -1:
+            from sglang.srt.speculative.draft_worker_common import (
+                DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+                resolve_draft_worker_attention_backend,
+            )
+
+            # The other MLA backends ignore a layer's sliding window.
+            draft_attention_backend = resolve_draft_worker_attention_backend(
+                algo_label="DFLASH"
+            )
+            if draft_attention_backend not in (
+                "triton",
+                *DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+            ):
+                raise ValueError(
+                    "DFLASH mla sliding_attention layers require "
+                    "--speculative-draft-attention-backend triton, trtllm_mla or "
+                    f"cutedsl_mla, got {draft_attention_backend!r}."
+                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
