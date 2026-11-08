@@ -138,6 +138,40 @@ class TestBatchStagingReservations(CustomTestCase):
         run(scheduler, batch)
 
 
+class TestRequestWindowRetention(CustomTestCase):
+    """DeepSeek-V4.1 encoder replay keeps SWA in per-request window rows over a
+    plain paged allocator, which keeps no window pool: the window entry's kept
+    tail still comes from the pool's window."""
+
+    def test_request_window_over_a_paged_allocator_keeps_the_window(self):
+        page_size, window = 4, 8
+        calls = []
+
+        class _Rows:
+            def page_indices(self, slot, start, end):
+                calls.append((slot, start, end))
+                return list(range(start // page_size, -(-end // page_size)))
+
+        pool = object.__new__(DeepSeekV4TokenToKVPool)
+        pool.request_window = _Rows()
+        pool.sliding_window = window
+        pool.page_size = page_size
+        allocator = SimpleNamespace(
+            storage=None,
+            state=None,
+            page_size=page_size,
+            get_kvcache=lambda: pool,
+            window_pool_names=lambda: (),
+        )
+        storage = StaticKVStorage(None, allocator)
+        self.assertEqual(storage.retained_window_lengths(), {"swa": window})
+        req = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=3))
+        units = storage.resume_units("swa", req, token_start=0, token_boundary=21)
+        self.assertEqual(calls, [(3, 12, 21)])
+        self.assertEqual(units.token_start, 12)
+        self.assertEqual(units.unit_ids.tolist(), [3, 4, 5])
+
+
 class TestMixedSWAKVBlockScales(CustomTestCase):
     def test_swa_block_scales_follow_each_subpools_dtype(self):
         from sglang.srt.mem_cache.memory_pool import (
@@ -429,6 +463,7 @@ class TestDisaggregationWire(unittest.TestCase):
             state_item_lens=[[32]],
             state_layer_ids=[[]],
             aux_data_ptrs=[],
+            kv_item_lens=[],
         )
         manager.is_mla_backend = True
         manager.is_hybrid_mla_backend = False
@@ -472,6 +507,143 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertFalse(manager.state_strides_validated)
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
+
+    def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
+        """A decode KV pool with another page stride is rejected at registration.
+
+        The sender writes decode pages at ``page * prefill_item_len``, so a
+        different layout (e.g. DSA FP8 KV: 656 B/token with flashmla_*, 576 with
+        trtllm) silently corrupts the decode KV. A PP stage judges only its layers.
+        """
+        flashmla, trtllm = 656 * 64, 576 * 64
+        cases = [
+            # (prefill lens, start layer, decode lens, mla, prefill/decode TP,
+            #  KV layer ids, rejected)
+            ([flashmla] * 4, 0, [trtllm] * 4, True, (1, 1), [], True),
+            ([trtllm] * 2, 2, [flashmla] * 2 + [trtllm] * 2, True, (1, 1), [], False),
+            ([trtllm] * 2, 2, [trtllm] * 2 + [flashmla] * 2, True, (1, 1), [], True),
+            # TP-sliced MHA reslices heads, so its item length differs by design.
+            # Pools that publish KV layer ids (K then V) would otherwise be
+            # compared entry by entry, so only the TP guard keeps this peer.
+            ([4096] * 4, 0, [2048] * 4, False, (2, 4), [0, 1, 0, 1], False),
+        ]
+        for src_lens, start, dst_lens, mla, tp, layer_ids, rejected in cases:
+            src_tp, dst_tp = tp
+            with self.subTest(src_lens=src_lens, start=start, dst_lens=dst_lens):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=[0x1000 + i for i in range(len(src_lens))],
+                    kv_item_lens=src_lens,
+                    kv_layer_ids=layer_ids,
+                    page_size=64,
+                    num_draft_entries=0,
+                    prefill_start_layer=start,
+                    state_types=[],
+                    aux_data_ptrs=[],
+                )
+                manager.is_mla_backend = mla
+                manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = src_tp
+                manager.pp_size = 2 if start else 1
+                manager.session_lock = threading.Lock()
+                manager.failed_sessions = set()
+                manager.session_failures = defaultdict(int)
+                manager.failed_session_probes = {}
+                manager.state_layout_rejections = {}
+                manager.state_strides_validated = set()
+                manager.decode_kv_args_table = {}
+                info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_kv_ptrs=[0x2000 + i for i in range(len(dst_lens))],
+                    dst_kv_item_lens=dst_lens,
+                    dst_kv_layer_ids=layer_ids,
+                    dst_attn_tp_size=dst_tp,
+                    requires_dcp_relayout=False,
+                    dst_aux_ptrs=[],
+                )
+                with get_context().override_server_args(enable_unified_memory=False):
+                    mismatch = manager._publish_peer_registration("decode", info)
+                if not rejected:
+                    self.assertIsNone(mismatch)
+                    continue
+                self.assertIn("PD KV layout mismatch", mismatch)
+                self.assertIn(f"prefill={src_lens[0]} decode={dst_lens[-1]}", mismatch)
+                self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
+
+    def test_mooncake_rejects_a_plain_mha_kv_page_stride_at_registration(self):
+        """A plain MHA pool (no KV layer ids) at the same attn TP is checked too.
+
+        Its entries are K for every layer then V for every layer, paired as
+        ``_send_kvcache_generic`` pairs them, so a PP stage judges only its own
+        layers and K and V are compared separately. TP-sliced MHA is not checked.
+        """
+        k_lens, v_lens = [4096] * 4, [2048] * 4
+        cases = [
+            # (prefill lens, start layer, decode lens, prefill/decode TP, rejected)
+            # FP8 prefill (--kv-cache-dtype fp8_e4m3), BF16 decode, both TP1.
+            ([4096] * 4, 0, [8192] * 4, (1, 1), "prefill=4096 decode=8192"),
+            ([4096] * 4, 0, [4096] * 4, (1, 1), None),
+            # The second of two prefill PP stages against a PP1 decode.
+            (k_lens[2:] + v_lens[2:], 2, k_lens + v_lens, (1, 1), None),
+            (
+                k_lens[2:] + v_lens[2:],
+                2,
+                k_lens + v_lens[:2] + [1024] * 2,
+                (1, 1),
+                "prefill=2048 decode=1024",
+            ),
+            # The first stage does not judge the other stage's layers.
+            (
+                k_lens[:2] + v_lens[:2],
+                0,
+                k_lens + v_lens[:2] + [1024] * 2,
+                (1, 1),
+                None,
+            ),
+            # TP-sliced MHA reslices heads, so its item length differs by design.
+            ([4096] * 4, 0, [2048] * 4, (2, 4), None),
+        ]
+        for src_lens, start, dst_lens, (src_tp, dst_tp), rejected in cases:
+            with self.subTest(src_lens=src_lens, start=start, dst_lens=dst_lens):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    kv_data_ptrs=[0x1000 + i for i in range(len(src_lens))],
+                    kv_item_lens=src_lens,
+                    kv_layer_ids=[],
+                    page_size=64,
+                    num_draft_entries=0,
+                    prefill_start_layer=start,
+                    state_types=[],
+                    aux_data_ptrs=[],
+                )
+                manager.is_mla_backend = False
+                manager.is_hybrid_mla_backend = False
+                manager.attn_tp_size = src_tp
+                manager.pp_size = 2 if len(src_lens) != len(dst_lens) else 1
+                manager.session_lock = threading.Lock()
+                manager.failed_sessions = set()
+                manager.session_failures = defaultdict(int)
+                manager.failed_session_probes = {}
+                manager.state_layout_rejections = {}
+                manager.state_strides_validated = set()
+                manager.decode_kv_args_table = {}
+                info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_kv_ptrs=[0x2000 + i for i in range(len(dst_lens))],
+                    dst_kv_item_lens=dst_lens,
+                    dst_kv_layer_ids=[],
+                    dst_attn_tp_size=dst_tp,
+                    requires_dcp_relayout=False,
+                    dst_aux_ptrs=[],
+                )
+                with get_context().override_server_args(enable_unified_memory=False):
+                    mismatch = manager._publish_peer_registration("decode", info)
+                if rejected is None:
+                    self.assertIsNone(mismatch)
+                    continue
+                self.assertIn("PD KV layout mismatch", mismatch)
+                self.assertIn(rejected, mismatch)
+                self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
 
     def test_mooncake_unpublished_state_metadata_keeps_the_transfer_check(self):
         """An unpublished component cannot be judged; keep the transfer check."""

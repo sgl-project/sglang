@@ -87,14 +87,27 @@ impl Replies {
     /// or returned an undecodable payload fails the whole operation; the
     /// error names each such rank. `what` names the operation in that error.
     pub(crate) fn decode<T: DeserializeOwned>(self, what: &str) -> Result<Vec<T>, CoreError> {
+        self.decode_with(what, Ok::<T, String>)
+    }
+
+    /// [`Replies::decode`], then `convert` each rank's value: a value
+    /// `convert` rejects fails its rank as an undecodable payload does.
+    pub(crate) fn decode_with<T: DeserializeOwned, U>(
+        self,
+        what: &str,
+        convert: impl Fn(T) -> Result<U, String>,
+    ) -> Result<Vec<U>, CoreError> {
         let total = self.replies.len();
         let mut values = Vec::with_capacity(total);
         let mut failures = Vec::new();
         for RankReply { rank, outcome } in self.replies {
             let decoded = outcome.and_then(|bytes| {
-                rmp_serde::from_slice::<T>(&bytes).map_err(|error| {
-                    CoreError::InvalidResponse(format!("invalid {what} response: {error}"))
-                })
+                rmp_serde::from_slice::<T>(&bytes)
+                    .map_err(|error| error.to_string())
+                    .and_then(&convert)
+                    .map_err(|error| {
+                        CoreError::InvalidResponse(format!("invalid {what} response: {error}"))
+                    })
             });
             match decoded {
                 Ok(value) => values.push(value),

@@ -4,8 +4,8 @@ from typing import Optional
 
 import torch
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.utils import LazyImport
 
 # Resolved on first call: CUDA builds without FlashInfer must still import
 # this module.
