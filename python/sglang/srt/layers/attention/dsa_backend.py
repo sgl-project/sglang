@@ -73,8 +73,8 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 )
 from sglang.srt.layers.attention.dsa.dsa_dcp_sharded import (
     dcp_gather_request_rows,
-    dcp_localize_compact,
     init_dcp_candidate_all_gather,
+    init_dcp_fused_topk,
     init_dcp_topk_merge,
 )
 from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import DSAIndexerMetadata
@@ -376,6 +376,9 @@ class DSAMetadata:
     topk_indices_offset: Optional[torch.Tensor] = None
     # DCP prefill: this rank's KV rows of page_table_1_flattened, in order
     dcp_local_kv_rows: Optional[torch.Tensor] = None
+    # DCP decode: [rows] valid local KV slots of each top-k row, written in
+    # place by the indexer; layers that reuse the top-k reuse it too
+    dcp_topk_length: Optional[torch.Tensor] = None
 
     # k_start and k_end in kv cache for each token.
     indexer_k_start_end: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
@@ -787,12 +790,17 @@ class DeepseekSparseAttnBackend(
             max_rows = max(model_runner.max_running_requests, 1) * (
                 self.speculative_num_draft_tokens or 1
             )
-            # The fused merge returns only this rank's slots; top-k capture needs all.
-            if (
-                get_exec().features.enable_return_indexer_topk
-                or not init_dcp_topk_merge(max_rows, self.dsa_index_topk)
-            ):
+            # the indexer returns only this rank's local KV slots, which top-k capture can't use
+            assert not get_exec().features.enable_return_indexer_topk
+            if not init_dcp_topk_merge(max_rows, self.dsa_index_topk):
                 init_dcp_candidate_all_gather(max_rows, self.dsa_index_topk)
+            if envs.SGLANG_ENABLE_DSA_DCP_FUSED_TOPK.get():
+                init_dcp_fused_topk(
+                    max_rows,
+                    self.dsa_index_topk,
+                    self.physical_page_size,
+                    self.max_context_len,
+                )
 
         if _is_xpu:
             self.device_capability = (0, 0)
@@ -1110,6 +1118,17 @@ class DeepseekSparseAttnBackend(
             object.__setattr__(metadata, "paged_mqa_schedule_metadata", new_schedule)
         else:
             metadata.paged_mqa_schedule_metadata.copy_(new_schedule)
+
+    def _dcp_topk_length_buffer(
+        self, forward_mode: ForwardMode, seqlens_expanded: torch.Tensor
+    ) -> Optional[torch.Tensor]:
+        # the sharded indexer writes each query row's local top-k count here
+        if not (
+            self.dsa_shards_index_k
+            and (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
+        ):
+            return None
+        return seqlens_expanded.new_empty(seqlens_expanded.shape[0])
 
     def _build_topk_v2_plan(
         self, seqlens_expanded: torch.Tensor
@@ -1600,6 +1619,9 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            dcp_topk_length=self._dcp_topk_length_buffer(
+                forward_batch.forward_mode, seqlens_expanded
+            ),
         )
         metadata = self._init_kpool_metadata(
             metadata,
@@ -1974,6 +1996,9 @@ class DeepseekSparseAttnBackend(
             real_page_table=real_page_table,
             dsa_extend_seq_lens_list=dsa_extend_seq_lens_list,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
+            dcp_topk_length=self._dcp_topk_length_buffer(
+                forward_mode, seqlens_expanded
+            ),
         )
         metadata = self._init_kpool_metadata_capture(metadata, bs, forward_mode)
         self.decode_cuda_graph_metadata[bs] = metadata
@@ -3583,7 +3608,11 @@ class DeepseekSparseAttnBackend(
         tile_scheduler_metadata = metadata.flashmla_metadata.flashmla_metadata
         num_splits = metadata.flashmla_metadata.num_splits
         if dcp_partial:
-            page_table_1, topk_length = dcp_localize_compact(page_table_1)
+            # the indexer's local slots and their counts
+            topk_length = metadata.dcp_topk_length
+            pad = page_table_1.shape[0] - topk_length.shape[0]
+            if pad > 0:  # padded rows (DP / attention-TP padding) select nothing
+                topk_length = torch.nn.functional.pad(topk_length, (0, pad))
             if get_platform().is_sm90:
                 # SM90 needs static top-k; -1 padding masks nonlocal keys.
                 topk_length = None
