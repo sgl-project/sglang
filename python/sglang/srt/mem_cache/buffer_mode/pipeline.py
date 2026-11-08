@@ -690,14 +690,14 @@ class BufferModePipeline:
     def end_insert_walk(self) -> None:
         self._walk_admitted = None
 
-    def enqueue_backup_intent(self, node_id: NodeId) -> None:
+    def enqueue_backup_intent(self, node_id: NodeId, *, recheck: bool = False) -> None:
         """Queue one intent per pool with something to write; rejected intents
         are counted and the node re-triggers on a later hit."""
         if not self._cache.enable_storage:
             return
         admitted = self._walk_admitted
         if admitted is not None:
-            if node_id in admitted:
+            if node_id in admitted and not recheck:
                 return
             admitted.add(node_id)
         snapshot = self._cache.tree_core.snapshot_buffer_backup(

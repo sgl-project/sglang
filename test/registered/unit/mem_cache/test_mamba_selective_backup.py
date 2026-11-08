@@ -134,7 +134,7 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
         cache.writing_check = drain
         return cache, nodes
 
-    def test_buffer_mode_uses_the_same_tree_endpoint_and_retry_policy(self):
+    def make_buffer_cache(self):
         cache, nodes = self.make_cache()
         cache.components = {ComponentType.MAMBA: MagicMock()}
         cache.sidecar_pool_specs = []
@@ -149,6 +149,41 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
         p = BufferModePipeline(cache, swa_component=None, write_backlog_cap=128)
         cache.buffer_pipeline = p
         p._backup_oversize = lambda *args: False
+        return cache, nodes, p
+
+    def test_buffer_mode_rechecks_split_endpoint_after_commit(self):
+        cache, _, p = self.make_buffer_cache()
+        cache.disable = False
+        cache.linker = None
+        cache.kv_storage = MagicMock()
+        cache.tree_core.set_hicache_enabled()
+        cache.tree_core.set_host_memory_buffer_only()
+        cache.tree_core.write_through_threshold = 1
+        params = InsertParams(
+            key=RadixKey(array("q", range(3))),
+            value=torch.arange(3, dtype=torch.int64),
+            mamba_value=torch.tensor([3], dtype=torch.int64),
+            is_request_end=True,
+        )
+        result = cache.insert(params)
+        states = [i for i in p.pending_write_queue if i.pool == PoolName.MAMBA]
+        self.assertEqual(
+            [i.snapshot.node_id for i in states], [result.last_device_node]
+        )
+        self.assertEqual(
+            states[0].keys,
+            cache.tree_core.get_hash_values(result.last_device_node)[-1:],
+        )
+        queued = [(i.snapshot.node_id, i.pool, i.keys) for i in p.pending_write_queue]
+        self.assertEqual(sum(i.pool == PoolName.KV for i in p.pending_write_queue), 2)
+        cache.insert(params)
+        self.assertEqual(
+            [(i.snapshot.node_id, i.pool, i.keys) for i in p.pending_write_queue],
+            queued,
+        )
+
+    def test_buffer_mode_uses_the_same_tree_endpoint_and_retry_policy(self):
+        cache, nodes, p = self.make_buffer_cache()
         cache._insert_params = InsertParams(
             key=RadixKey(array("q", range(4))), is_request_end=False
         )

@@ -2092,6 +2092,8 @@ class UnifiedRadixCache(BasePrefixCache):
         self._execute_and_commit_kv_backup(
             self.tree_core.build_backup_kv_action(node_id)
         )
+        if self.buffer_pipeline is not None:
+            self.buffer_pipeline.enqueue_backup_intent(node_id, recheck=True)
 
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
