@@ -142,6 +142,7 @@ from sglang.srt.lora.lora_overlap_loader import LoRAOverlapLoader
 from sglang.srt.managers.deferred_output import ResponseCompletion
 from sglang.srt.managers.disagg_service import maybe_create_ascend_config_store
 from sglang.srt.managers.hisparse_coordinator import HiSparseCoordinator
+from sglang.srt.managers.inflight_prompt_cache import InflightPromptCache
 from sglang.srt.managers.io_struct import (
     AbortReq,
     ActiveRanksOutput,
@@ -1394,6 +1395,7 @@ class Scheduler(
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
+        self.inflight_prompt_cache = InflightPromptCache()
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
         # Requests merged into a running batch, until they finish or a retract,
@@ -4404,6 +4406,10 @@ class Scheduler(
         ) and self.chunked_req is None:
             return None, running_batch
 
+        inflight_prompt_cache = getattr(self, "inflight_prompt_cache", None)
+        if inflight_prompt_cache is not None:
+            inflight_prompt_cache.prune()
+
         running_bs = len(running_batch.reqs)
         # Skipped during a chunked prefill: that pass must proceed regardless.
         if (
@@ -4598,6 +4604,16 @@ class Scheduler(
                     req.host_hit_is_storage = False
 
             req.init_next_round_input(self.tree_cache)
+            if (
+                inflight_prompt_cache is not None
+                and self.tree_cache.supports_prefix_sharing()
+                and not self.tree_cache.supports_mamba()
+                and self.dllm_config is None
+                and inflight_prompt_cache.should_wait(req)
+            ):
+                # The matching leader's KV is not in the radix tree yet. Keep
+                # this request queued until the leader checkpoints it.
+                continue
             if adder.should_defer(req):
                 break
             if self.enable_hicache_storage and (
@@ -4614,6 +4630,18 @@ class Scheduler(
                 has_chunked_req=(self.chunked_req is not None),
                 truncation_align_size=self.truncation_align_size,
             )
+
+            if (
+                inflight_prompt_cache is not None
+                and self.tree_cache.supports_prefix_sharing()
+                and not self.tree_cache.supports_mamba()
+                and self.dllm_config is None
+                and adder.can_run_list
+                and req is adder.can_run_list[-1]
+            ):
+                inflight_prompt_cache.admit(
+                    req, is_chunked=req is adder.new_chunked_req
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
