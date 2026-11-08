@@ -6,6 +6,7 @@ This does not load a model or qualify image/GPU/EPD transport behavior.
 """
 
 import asyncio
+import hashlib
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
@@ -47,7 +48,9 @@ def _ctx(features, feature_fn, *, itemwise=False, items_per_req=None):
                     {
                         "modality": Modality.IMAGE,
                         "feature": feature,
-                        "image_grid_thw": grid[index : index + 1],
+                        "model_specific_data": {
+                            "image_grid_thw": grid[index : index + 1],
+                        },
                     }
                 )
                 for index, feature in enumerate(features)
@@ -75,7 +78,9 @@ def _ctx(features, feature_fn, *, itemwise=False, items_per_req=None):
 def _encoder(*, capacity=1 << 20):
     encoder = MMEncoder.__new__(MMEncoder)
     encoder.model_type = "qwen2_5_vl"
-    encoder.cache_namespace = "encoder-prefix-cache-cpu"
+    encoder.cache_namespace = (
+        "sha256:" + hashlib.sha256(b"encoder-prefix-cache-cpu").hexdigest()
+    )
     encoder.preprocessor = SimpleNamespace(
         get_num_patches=lambda grid, modality: int(grid.prod().item())
     )
