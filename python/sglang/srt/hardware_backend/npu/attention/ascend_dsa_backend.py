@@ -11,7 +11,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
 )
-from sglang.srt.hardware_backend.npu.attention.ascend_kpool import AscendKPoolWorkspace
+from sglang.srt.hardware_backend.npu.attention.ascend_kpool_plan import (
+    AscendKpoolWritePlan,
+    init_kpool_write_plan,
+    update_kpool_write_plan,
+)
 from sglang.srt.layers.attention.dsa.dsa_indexer import BaseIndexerMetadata
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 
@@ -21,7 +25,7 @@ if TYPE_CHECKING:
 
 @dataclass
 class AscendDSAForwardMetadata(ForwardMetadata):
-    """Attention/indexer inputs and the bucket-owned KeyPool write workspace.
+    """Attention/indexer inputs and the bucket-owned KeyPool write plan.
 
     The backend normalizes lengths; kpool owns write mappings and layer scratch.
     """
@@ -31,14 +35,14 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     cache_seqlens_int32: Optional[torch.Tensor] = None
     real_page_table: Optional[torch.Tensor] = None
 
-    # Request-level inputs for the A3/A5 pooled-key indexer.
+    # Inputs for pooled key indexer (batch-level)
     pool_query_ends: Optional[torch.Tensor] = None
     pool_key_lens: Optional[torch.Tensor] = None
     pool_tail_lens: Optional[torch.Tensor] = None
     pool_page_table: Optional[torch.Tensor] = None
 
-    # Write-side inputs and scratch owned by this forward/capture bucket.
-    kpool: Optional[AscendKPoolWorkspace] = None
+    # Inputs for key pool
+    kpool: Optional[AscendKpoolWritePlan] = None
 
 
 @dataclass(frozen=True)
@@ -196,11 +200,11 @@ class AscendDSAAttnBackend(AscendAttnBackend):
             )
             pool = getattr(self.token_to_kv_pool, "full_kv_pool", self.token_to_kv_pool)
             mode, max_query_len = self._kpool_layout(forward_batch)
-            metadata.kpool = AscendKPoolWorkspace.allocate(
+            metadata.kpool = init_kpool_write_plan(
                 batch_size=batch,
                 num_tokens=forward_batch.out_cache_loc.numel(),
                 cmp_ratio=self.dsa_index_kpool,
-                head_dim=pool.index_head_dim,
+                indexer_head_dim=pool.index_head_dim,
                 index_page_size=pool.index_page_size,
                 tail_capacity=self.dsa_index_kpool + pool.tail_extra_slots,
                 mode=mode,
@@ -212,7 +216,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
     def _update_dsa_metadata(
         self, forward_batch: ForwardBatch, *, sequence_layout=None
     ):
-        """Refresh attention/read inputs and the owned write workspace in place."""
+        """Refresh attention/read inputs and the owned write plan in place."""
         metadata = self.forward_metadata
         assert isinstance(metadata, AscendDSAForwardMetadata)
         cache_lens, query_lens, commit_lens, max_kv_len = (
@@ -241,10 +245,10 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         if self.dsa_index_kpool <= 1:
             return
         self._update_indexer_inputs(metadata, cache_lens, query_lens)
-        workspace = metadata.kpool
-        assert workspace is not None
+        write_plan = metadata.kpool
+        assert write_plan is not None
         write_mode, max_query_len = self._kpool_layout(forward_batch)
-        if workspace.mode != write_mode or workspace.max_query_len != max_query_len:
+        if write_plan.mode != write_mode or write_plan.max_query_len != max_query_len:
             raise RuntimeError(
                 "KeyPool replay mode/query capacity differs from capture"
             )
@@ -258,7 +262,8 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         valid = query_lens > 0
         valid[num_real_requests:] = False
         start_pos = torch.where(valid, (cache_lens - query_lens).clamp_min(0), 0)
-        workspace.update_inputs(
+        update_kpool_write_plan(
+            write_plan,
             start_pos=start_pos,
             query_lens=query_lens,
             commit_lens=torch.where(valid, commit_lens, 0),

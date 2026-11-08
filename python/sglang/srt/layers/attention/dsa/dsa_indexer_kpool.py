@@ -9,7 +9,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
-from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
     BaseIndexerMetadata,
@@ -40,7 +39,7 @@ if is_cuda():
     except ImportError as e:
         deep_gemm = e
 
-if is_npu() and not is_npu_arch35():
+if is_npu():
     try:
         import custom_ops  # noqa: F401
     except ImportError:
@@ -132,53 +131,6 @@ def _mqa_logits_row_chunks(
         slice(start, min(start + rows_per_chunk, num_rows))
         for start in range(0, num_rows, rows_per_chunk)
     )
-
-
-def _prepare_nonempty_pool_key_indexer_inputs(
-    query, weights, query_ends, pool_lens, tail_lens, page_table
-):
-    """Keep CANN's zero-pool and fully padded TND paths supplied with work.
-
-    The trailing request owns graph-padding queries and a sentinel query.
-    Empty real histories read a safe candidate which output packing discards.
-    Allocations belong to this invocation/capture, never a global workspace.
-    """
-    if page_table.shape[1] == 0:
-        page_table = F.pad(page_table, (0, 1))
-    return (
-        torch.cat((query, query.new_zeros((1, *query.shape[1:])))),
-        torch.cat((weights, weights.new_zeros((1, weights.shape[1])))),
-        torch.cat((query_ends, query_ends.new_full((1,), query.shape[0] + 1))),
-        torch.cat((pool_lens.clamp_min(1), pool_lens.new_ones((1,)))),
-        torch.cat((tail_lens, tail_lens.new_zeros((1,)))),
-        torch.cat((page_table, page_table.new_zeros((1, page_table.shape[1])))),
-    )
-
-
-def _pack_pool_key_indexer_indices(
-    indices, positions, query_ends, topk, pool_size, valid_mask=None
-):
-    """Restore real causal tails and remove dummy candidates and padding rows."""
-    rows = indices.shape[0]
-    positions = positions.reshape(-1)[:rows]
-    position_rows = positions.shape[0]
-    positions = F.pad(positions.to(torch.int64), (0, rows - position_rows))
-    row_ids = torch.arange(rows, device=indices.device)
-    valid_rows = row_ids < (query_ends[-1] if query_ends.numel() else 0)
-    valid_rows = valid_rows & (row_ids < position_rows) & (positions >= 0)
-    if valid_mask is not None:
-        valid_mask = valid_mask.reshape(-1)[:rows]
-        valid_rows = valid_rows & F.pad(valid_mask, (0, rows - valid_mask.shape[0]))
-    visible = (positions + 1).clamp_min(0).unsqueeze(1)
-    tail_start = torch.div(visible, pool_size, rounding_mode="floor") * pool_size
-    history = tail_start.clamp_max(topk)
-    cols = torch.arange(topk + pool_size - 1, device=indices.device).unsqueeze(0)
-    history_valid = (cols < history) & (indices >= 0) & (indices < tail_start)
-    result = torch.where(history_valid, indices, -1)
-    tail_col = cols - history
-    tail_valid = (tail_col >= 0) & (tail_col < visible - tail_start)
-    result = torch.where(tail_valid, (tail_start + tail_col).to(torch.int32), result)
-    return torch.where(valid_rows.unsqueeze(1), result, -1)
 
 
 class IndexerKPool(MultiPlatformOp):
@@ -1947,13 +1899,16 @@ class IndexerKPool(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         """BF16 compression and request-level pooled-key selection on A3/A5."""
 
+        if not return_indices:
+            return None
+
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         if metadata is None:
             return None
 
         assert forward_batch.seq_lens_cpu is not None
         mode = forward_batch.forward_mode
-        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0:
+        if mode.is_idle() or len(forward_batch.seq_lens_cpu) == 0 or x.shape[0] == 0:
             return torch.full(
                 (x.shape[0], self.index_topk + self.index_kpool - 1),
                 -1,
@@ -1961,30 +1916,22 @@ class IndexerKPool(MultiPlatformOp):
                 device=x.device,
             )
 
-        self._update_kpool_cache_npu(x, layer_id, metadata)
+        # --- Write Phase ---
+        self._compress_write_npu(x, layer_id, metadata)
 
-        if not return_indices:
-            # Layers that skip top-k only update the index cache and do not need
-            # to continue with read-side computation.
-            return None
-
-        query, _ = self.wq_b(q_lora)
-        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-        return self._get_topk_pool_key_npu(
+        # --- Read Phase ---
+        query, _ = self.wq_b(q_lora)  # [T,H*D]
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)  # [T,H,D]
+        return self._get_topk_npu(
             layer_id,
             query,
             x,
             positions,
             metadata,
             forward_batch.out_cache_loc != 0,
-        )
+        )  # [T, index_topk + index_kpool - 1]
 
-    def _get_pool_key_indexer_weights_npu(self, x):
-        weights, _ = self.weights_proj(x.float())
-        # PoolKeyIndexer already applies 1/sqrt(D) before ReLU.
-        return (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
-
-    def _get_topk_pool_key_npu(
+    def _get_topk_npu(
         self,
         layer_id,
         query,
@@ -1993,31 +1940,45 @@ class IndexerKPool(MultiPlatformOp):
         metadata: BaseIndexerMetadata,
         valid_mask,
     ):
-        from sgl_kernel_npu.operators.indexer import pool_key_indexer
+        from sgl_kernel_npu.operators.indexer import (
+            pack_pool_key_indexer_indices,
+            pool_key_indexer,
+        )
 
+        # 1. get model weights
+        weights, _ = self.weights_proj(x.float())  # [T,H]
+        # Here only apply 1/sqrt(H). PoolKeyIndexer will apply 1/sqrt(D)
+        weights = (weights * self.n_heads**-0.5).to(torch.bfloat16).contiguous()
+
+        # 2. get dsa metadata for pooled-key indexer (batch-level)
         metadata = metadata.attn_metadata
         if metadata.pool_query_ends is None:
             raise RuntimeError(
                 "NPU KPool requires request-level pooled-indexer metadata"
             )
-        weights = self._get_pool_key_indexer_weights_npu(x)
-        inputs = _prepare_nonempty_pool_key_indexer_inputs(
-            query.contiguous(),
-            weights,
-            metadata.pool_query_ends,
-            metadata.pool_key_lens,
-            metadata.pool_tail_lens,
-            metadata.pool_page_table,
+        query_ends = metadata.pool_query_ends
+        pool_lens = metadata.pool_key_lens
+        tail_lens = metadata.pool_tail_lens
+        page_table = metadata.pool_page_table
+        # Append a zero-pool request at the end
+        query_ends_padded = torch.cat(
+            (query_ends, query_ends.new_full((1,), query.shape[0]))
         )
-        query_safe, weights_safe, ends, lengths, tails, tables = inputs
+        pool_lens_padded = torch.cat((pool_lens, pool_lens.new_zeros((1,))))
+        tail_lens_padded = torch.cat((tail_lens, tail_lens.new_zeros((1,))))
+        page_table_padded = torch.cat(
+            (page_table, page_table.new_zeros((1, page_table.shape[1])))
+        )
+
+        query = query.contiguous()
         indices = pool_key_indexer(
-            query=query_safe,
+            query=query,
             pool_key=get_token_to_kv_pool().get_index_k_with_scale_buffer(layer_id),
-            weights=weights_safe,
-            pool_tail_k=tails,
-            actual_seq_q=ends,
-            actual_seq_k=lengths,
-            block_table=tables,
+            weights=weights,
+            pool_tail_k=tail_lens_padded,
+            actual_seq_q=query_ends_padded,
+            actual_seq_k=pool_lens_padded,
+            block_table=page_table_padded,
             layout_q="TND",
             layout_k="PA_BBND",
             topk=self.index_topk,
@@ -2025,85 +1986,65 @@ class IndexerKPool(MultiPlatformOp):
             mask_mode=3,
             quant_mode=-1,
             return_value=False,
+        )  # selected kv token [T, index_topk + index_kpool - 1]
+        return pack_pool_key_indexer_indices(
+            indices=indices,
+            positions=positions,
+            valid_mask=valid_mask,
+            topk=self.index_topk,
+            pool_size=self.index_kpool,
         )
-        return _pack_pool_key_indexer_indices(
-            indices[: query.shape[0]],
-            positions,
-            metadata.pool_query_ends,
-            self.index_topk,
-            self.index_kpool,
-            valid_mask,
-        )
 
-    def validate_key_pool_weights_npu(self):
-        """Reject unsupported fused-write inputs during GLM weight loading."""
-        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-
-        if not isinstance(self.wk.quant_method, UnquantizedLinearMethod):
-            raise ValueError("NPU key_pool requires an unquantized K projection")
-        if not self.skip_rope:
-            raise ValueError("NPU key_pool does not support indexer RoPE")
-        for name, weight in (
-            ("wk", self.wk.weight),
-            ("gate", self.index_kpool_compress_gate),
-        ):
-            if weight.dtype != torch.bfloat16 or weight.shape != (
-                self.head_dim,
-                self.hidden_size,
-            ):
-                raise ValueError(f"NPU key_pool requires BF16 {name} [D,H]")
-            if not weight.is_contiguous():
-                raise ValueError(f"NPU key_pool requires contiguous {name}")
-            if weight.device.type == "npu":
-                import torch_npu
-
-                if torch_npu.get_npu_format(weight) != 2:
-                    raise ValueError(f"NPU key_pool requires ND {name} storage")
-        self._key_pool_weights_validated = True
-
-    def _update_kpool_cache_npu(self, x, layer_id, metadata: BaseIndexerMetadata):
+    def _compress_write_npu(self, x, layer_id, metadata: BaseIndexerMetadata):
         from sgl_kernel_npu.operators.mem_cache import key_pool, key_pool_write_cache
 
-        if not getattr(self, "_key_pool_weights_validated", False):
-            self.validate_key_pool_weights_npu()
-        if x.dtype != torch.bfloat16:
-            raise ValueError("NPU key_pool requires BF16 hidden states")
+        from sglang.srt.hardware_backend.npu.attention.ascend_kpool_plan import (
+            pack_compressed_tail,
+        )
+
+        # 1. get model config / weights / hidden_states
+        # 2. get dsa metadata (write_plan)
+        write_plan = metadata.attn_metadata.kpool
+        assert write_plan is not None
+        # 3. get memory pool (compressed tail, index cache)
         pool = get_token_to_kv_pool()
         tail_k, tail_gate = pool.get_compress_tail_buffers(layer_id)
-        workspace = metadata.attn_metadata.kpool
-        assert workspace is not None
-        state = workspace.pack_history(tail_k, tail_gate)
-        pooled = key_pool(
-            x.contiguous(),
-            self.wk.weight,
-            self.index_kpool_compress_gate,
-            self.index_kpool_compress_ape,
-            state,
-            workspace.state_block_table,
-            workspace.state_start_pos,
+        state = pack_compressed_tail(
+            write_plan, tail_k, tail_gate
+        )  # batch-level tail buffer
+
+        pooled_key = key_pool(
+            hidden_states=x.contiguous(),
+            wk=self.wk.weight,
+            gate_weight=self.index_kpool_compress_gate,
+            ape=self.index_kpool_compress_ape,
+            state_cache=state,  # in/out
+            cache_block_table=write_plan.state_block_table,
+            start_pos=write_plan.state_start_pos,
             norm_weight=self.k_norm.weight,
             norm_bias=self.k_norm.bias,
-            cu_seqlens=workspace.query_start_loc,
+            cu_seqlens=write_plan.query_start_loc,
             cmp_ratio=self.index_kpool,
             norm_eps=self.k_norm.variance_epsilon,
-        )
-        is_mtp = workspace.mode == "mtp"
+        )  # compressed keys [T//r,D]
+
+        is_mtp = write_plan.mode == "mtp"
         key_pool_write_cache(
-            pooled,
-            state,
-            workspace.pooled_slot_mapping,
-            workspace.tail_write_indices,
-            workspace.tail_state_indices,
-            workspace.tail_token_indices,
-            pool.get_index_k_with_scale_buffer(layer_id),
-            tail_k,
-            tail_gate,
+            pooled_key=pooled_key,
+            state_cache=state,
+            pooled_slot_mapping=write_plan.pooled_slot_mapping,
+            tail_write_indices=write_plan.tail_write_indices,
+            tail_state_indices=write_plan.tail_state_indices,
+            tail_token_indices=write_plan.tail_token_indices,
+            index_cache=pool.get_index_k_with_scale_buffer(layer_id),
+            tail_k=tail_k,
+            tail_gate=tail_gate,
             hidden_states=x if is_mtp else None,
             wk=self.wk.weight if is_mtp else None,
             gate_weight=self.index_kpool_compress_gate if is_mtp else None,
             norm_weight=self.k_norm.weight if is_mtp else None,
             norm_bias=self.k_norm.bias if is_mtp else None,
-            mode=workspace.mode,
+            mode=write_plan.mode,
             cmp_ratio=self.index_kpool,
             norm_eps=self.k_norm.variance_epsilon,
         )
