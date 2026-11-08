@@ -329,7 +329,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.125), 1.0)
 
     def test_inplace_only_sets_flag(self):
-        """in_place pause should only set the paused flag and return."""
+        """An in-place pause sets the flag and starts the pause window; it leaves the
+        batches and the chunked request alone."""
         scheduler = self._new_scheduler()
         scheduler.last_batch = MagicMock()
         scheduler.cur_batch_for_debug = MagicMock()
@@ -714,7 +715,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.chunked_req, chunked_req)
 
     def test_retract_drains_overlap_queue(self):
-        """Single-result retract must preserve the existing chunk-preparation state."""
+        """A retract pause processes the one held result and leaves the PD prefill
+        chunk preparation (`prefill_chunk_processed`) to the loop."""
         for mode in (
             DisaggregationMode.NULL,
             DisaggregationMode.PREFILL,
