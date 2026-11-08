@@ -3,7 +3,7 @@ DeepGEMM on SM100+, torch elsewhere."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -16,12 +16,16 @@ from sglang.kernels.ops.attention.dsv4.index_logits import (
     deep_gemm_fp4_paged_mqa_logits,
 )
 from sglang.srt.layers.attention.dsv4.indexer import topk_transform_paged_from_metadata
+from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.utils import is_xpu
 
 from .scoring import (
+    _index_q_and_weights,
     decode_scores,
     dense_prefill_topk,
     get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_index_k_cache,
     prefill_requests,
     select_decode,
     sharded_dense_prefill_topk,
@@ -45,6 +49,9 @@ def _lite_topk_wins(num_rows: int, max_len: int) -> bool:
     return (num_rows >= 512 and num_rows * max_len >= 1 << 26) or max_len <= 6144
 
 
+_XPU_MQA_LOGITS_BUDGET_BYTES = 64 << 20
+
+
 class FullTopKIndexer:
     def __init__(
         self,
@@ -65,16 +72,164 @@ class FullTopKIndexer:
         )
 
     def topk_prefill(self, inputs: PrefillInputs) -> None:
-        if self.use_deep_gemm_prefill:
+        if is_xpu():
+            self._xpu_topk_prefill(inputs)
+        elif self.use_deep_gemm_prefill:
             self._deep_gemm_prefill(inputs)
         else:
             self._torch_prefill(inputs)
 
     def topk_decode(self, inputs: DecodeInputs) -> None:
-        if self.use_deep_gemm_decode:
+        if is_xpu():
+            self._xpu_topk_decode(inputs)
+        elif self.use_deep_gemm_decode:
             self._deep_gemm_decode(inputs)
         else:
             self._torch_decode(inputs)
+
+    def _xpu_logits_and_topk(
+        self,
+        q_fp4: torch.Tensor,
+        q_scales: torch.Tensor,
+        weights: torch.Tensor,
+        seq_lens: torch.Tensor,
+        k_cache: torch.Tensor,
+        page_tables: torch.Tensor,
+        max_seq_len: int,
+        page_size: int,
+        out_page_indices: Optional[torch.Tensor],
+        out_raw_indices: Optional[torch.Tensor],
+    ) -> None:
+        from sgl_kernel import fp4_paged_mqa_logits, topk_transform
+
+        rows_per_chunk = max(1, _XPU_MQA_LOGITS_BUDGET_BYTES // max(max_seq_len * 4, 1))
+        for start in range(0, q_fp4.shape[0], rows_per_chunk):
+            end = min(start + rows_per_chunk, q_fp4.shape[0])
+            seq_lens_chunk = seq_lens[start:end].to(torch.int32).contiguous()
+            page_tables_chunk = page_tables[start:end].to(torch.int32).contiguous()
+            logits = fp4_paged_mqa_logits(
+                (q_fp4[start:end], q_scales[start:end]),
+                k_cache,
+                weights[start:end].to(torch.float32),
+                seq_lens_chunk,
+                page_tables_chunk,
+                None,
+                max_seq_len,
+                clean_logits=False,
+            )
+            page_out = (
+                out_page_indices[start:end] if out_page_indices is not None else None
+            )
+            raw_out = (
+                out_raw_indices[start:end] if out_raw_indices is not None else None
+            )
+            if page_out is not None:
+                topk_transform(
+                    logits,
+                    seq_lens_chunk,
+                    page_tables_chunk,
+                    page_out,
+                    page_size,
+                    raw_out,
+                )
+            else:
+                from sgl_kernel import topk_transform_ragged
+
+                assert raw_out is not None
+                topk_transform_ragged(
+                    logits,
+                    seq_lens_chunk,
+                    raw_out,
+                    torch.zeros_like(seq_lens_chunk),
+                )
+
+    def _xpu_topk_prefill(self, inputs: PrefillInputs) -> None:
+        inputs.reset_outputs()
+        if not inputs.x.shape[0]:
+            return
+        assert inputs.seq_lens_cpu is not None
+        assert inputs.rows_per_request is not None
+        assert len(inputs.rows_per_request) == inputs.req_pool_indices.numel()
+
+        q_fp4, q_scales, weights = _index_q_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
+        seq_lens = ((inputs.positions + 1) // inputs.compress_ratio).to(torch.int32)
+        max_seq_len = max(
+            (length // inputs.compress_ratio for length in inputs.seq_lens_cpu),
+            default=0,
+        )
+        if max_seq_len == 0:
+            return
+
+        page_size = self.token_to_kv_pool.get_index_k_page_size(inputs.compress_ratio)
+        page_tables = expand_index_page_table(
+            inputs.kv_page_table,
+            full_page_size=self.token_to_kv_pool.page_size,
+            compress_ratio=inputs.compress_ratio,
+            index_page_size=page_size,
+        ).contiguous()
+        k_cache = get_index_k_cache(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=inputs.layer_id,
+            page_size=page_size,
+        )
+
+        row_start = 0
+        for request_idx, request_rows in enumerate(inputs.rows_per_request):
+            row_end = row_start + request_rows
+            if request_rows:
+                request_table = page_tables[request_idx : request_idx + 1]
+                self._xpu_logits_and_topk(
+                    q_fp4[row_start:row_end].unsqueeze(1),
+                    q_scales[row_start:row_end].unsqueeze(1),
+                    weights[row_start:row_end],
+                    seq_lens[row_start:row_end],
+                    k_cache,
+                    request_table.expand(request_rows, -1),
+                    max_seq_len,
+                    page_size,
+                    (
+                        inputs.out_page_indices[row_start:row_end]
+                        if inputs.out_page_indices is not None
+                        else None
+                    ),
+                    inputs.out_raw_indices[row_start:row_end],
+                )
+            row_start = row_end
+        assert row_start == inputs.x.shape[0]
+
+    def _xpu_topk_decode(self, inputs: DecodeInputs) -> None:
+        inputs.reset_outputs()
+        data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
+        metadata = inputs.paged_metadata
+        if metadata.max_compressed_seq_len == 0:
+            return
+        rows_per_request = metadata.rows_per_request
+        q_fp4 = data.q_fp4
+        q_scales = data.q_sf
+        seq_lens = metadata.compressed_seq_lens.reshape(-1).to(torch.int32).contiguous()
+        page_tables = (
+            metadata.page_table[::rows_per_request]
+            .repeat_interleave(rows_per_request, dim=0)
+            .contiguous()
+        )
+        self._xpu_logits_and_topk(
+            q_fp4,
+            q_scales,
+            data.weights,
+            seq_lens,
+            data.k_cache,
+            page_tables,
+            metadata.max_compressed_seq_len,
+            metadata.compressed_page_size,
+            inputs.out_page_indices,
+            None,
+        )
 
     def _deep_gemm_prefill(self, inputs: PrefillInputs) -> None:
         inputs.reset_outputs()
