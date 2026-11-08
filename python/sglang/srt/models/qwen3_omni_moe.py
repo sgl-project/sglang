@@ -255,11 +255,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
 
-    def _freeze_parameters(self):
-        for param in self.parameters():
-            param.requires_grad = False
-        self._requires_grad = False
-
     def get_input_embeddings(self) -> nn.Module:
         return self.conv1
 

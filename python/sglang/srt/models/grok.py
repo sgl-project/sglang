@@ -566,9 +566,6 @@ class Grok1DecoderLayer(nn.Module):
         deferred_norm: Optional[RMSNorm] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, RMSNorm]:
 
-        hidden_states_original = hidden_states
-        residual_original = residual
-
         # Self Attention
         if deferred_norm is not None:
             assert residual is not None
@@ -893,57 +890,6 @@ class Grok1ForCausalLM(nn.Module):
                 )
 
         return hit_names
-
-    def get_num_params_analytical(self):
-        cfg = self.config
-        moe_intermediate_size = getattr(
-            cfg,
-            "moe_intermediate_size",
-            getattr(cfg, "intermediate_size", None),
-        )
-        residual_moe = getattr(cfg, "residual_moe", False)
-        if cfg.num_local_experts > 0:
-            num_experts = cfg.num_local_experts + (1 if residual_moe else 0)
-        else:
-            num_experts = 1
-
-        wq = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        wkv = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_key_value_heads
-            * cfg.head_dim
-            * 2
-        )
-        out = (
-            cfg.num_hidden_layers
-            * cfg.hidden_size
-            * cfg.num_attention_heads
-            * cfg.head_dim
-        )
-        ffn1 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-            * 2
-        )
-        ffn2 = (
-            cfg.num_hidden_layers
-            * num_experts
-            * cfg.hidden_size
-            * moe_intermediate_size
-        )
-        embed = cfg.hidden_size * cfg.vocab_size * 2
-        return wq + wkv + out + ffn1 + ffn2 + embed
-
-    def get_num_params_torch(self):
-        return sum(p.numel() for p in self.parameters()) * get_parallel().tp_size
 
 
 old_prepare_weights = getattr(DefaultModelLoader, "_prepare_weights")

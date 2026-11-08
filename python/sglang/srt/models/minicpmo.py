@@ -20,7 +20,6 @@ from array import array
 from dataclasses import dataclass
 from typing import Any, Iterable, List, Literal, Optional, Tuple, Union
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.nn.utils.parametrize as P
@@ -723,66 +722,6 @@ class ConditionalChatTTS(PreTrainedModel):
         return past_key_values
 
     @torch.inference_mode()
-    def prefill_audio_ids(
-        self,
-        input_ids: torch.Tensor,
-        past_key_values: List[Tuple[torch.Tensor, torch.Tensor]],
-        streaming_tts_text_mask=None,
-        add_audio_bos: bool = True,
-    ):
-        """Prefill a chunk of audio ids to the model. Used in sliding-window long audio generation.
-        Specifically, prefill many audio ids (typically from last window) to the model in the new window.
-
-        Args:
-            input_ids (torch.Tensor): (1, seq_len, num_vq) Audio input token ids.
-            past_key_values (List[Tuple[torch.Tensor, torch.Tensor]]): Past key values for attention mechanism.
-        """
-        assert input_ids.shape[0] == 1
-        assert past_key_values is not None
-
-        code_emb = [self.emb_code[i](input_ids[:, :, i]) for i in range(self.num_vq)]
-        inputs_embeds = torch.stack(code_emb, 3).sum(3)  # [1,seq_len,768]
-        input_len = input_ids.shape[1]
-
-        if add_audio_bos:
-            narrowed_input_ids = torch.tensor(
-                [[self.audio_bos_token_id]], dtype=torch.long, device=self.device
-            )
-            bos_inputs_embeds = self.emb_text(narrowed_input_ids)
-            inputs_embeds = torch.cat([bos_inputs_embeds, inputs_embeds], dim=1)
-            input_len += 1
-
-        past_key_values_length = past_key_values[0][0].shape[2]
-        position_ids = torch.arange(
-            past_key_values_length,
-            past_key_values_length + input_len,
-            dtype=torch.long,
-            device=self.device,
-        ).unsqueeze(0)
-
-        cache_position = position_ids.clone()
-        causal_mask = make_streaming_chunk_mask_generation(
-            inputs_embeds=inputs_embeds,
-            past_seen_tokens=past_key_values[0][0].shape[2],
-            streaming_tts_text_mask=streaming_tts_text_mask,
-            streaming_reserved_length=self.streaming_text_reserved_len,
-            streaming_text_chunk_size=self.streaming_text_chunk_size,
-        )  # [1, 1, 1, past_key_values_length + input_len]
-
-        # Model forward
-        outputs: BaseModelOutputWithPast = self.model(
-            attention_mask=causal_mask,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=inputs_embeds,
-            use_cache=True,
-            output_attentions=False,
-            cache_position=cache_position,
-        )
-        past_key_values = outputs.past_key_values
-        return past_key_values
-
-    @torch.inference_mode()
     def generate(
         self,
         input_ids: torch.Tensor,
@@ -1049,43 +988,6 @@ class ConditionalChatTTS(PreTrainedModel):
             past_key_values=past_key_values,  # for update purpose
             finished=finish.all(),
         )
-
-    @torch.inference_mode()
-    def decode_to_mel_specs(
-        self,
-        result_list: List[torch.Tensor],
-    ):
-        """Decode discrete audio codes to mel spectrograms.
-
-        Borrowed from `https://github.com/2noise/ChatTTS/blob/main/ChatTTS/core.py`
-
-        Args:
-            result_list (List[torch.Tensor]): Audio codes output from `generate`.
-
-        Returns:
-            torch.Tensor: Mel spectrograms.
-        """
-
-        decoder = self.dvae
-        max_x_len = -1
-        if len(result_list) == 0:
-            return np.array([], dtype=np.float32)
-        for result in result_list:
-            if result.size(0) > max_x_len:
-                max_x_len = result.size(0)
-        batch_result = torch.zeros(
-            (len(result_list), result_list[0].size(1), max_x_len),
-            dtype=result_list[0].dtype,
-            device=result_list[0].device,
-        )
-        for i in range(len(result_list)):
-            src = result_list[i]
-            batch_result[i].narrow(1, 0, src.size(0)).copy_(src.permute(1, 0))
-            del src
-
-        mel_specs = decoder(batch_result)
-        del batch_result
-        return mel_specs
 
 
 # Copied from transformers.models.whisper.modeling_whisper.WhisperEncoderLayer and add use_cache for streaming inference

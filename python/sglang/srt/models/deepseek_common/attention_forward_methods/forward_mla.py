@@ -136,15 +136,6 @@ if _is_cuda:
     from sglang.kernels.ops.gemm import bmm_fp8
 
 
-def should_defer_dsa_cp_kv_gather(
-    *,
-    dsa_prefill_cp: bool,
-    fuse_rope_for_trtllm_mla: bool,
-) -> bool:
-    """Compatibility predicate imported by the unchanged ROCm MLA path."""
-    return dsa_prefill_cp and fuse_rope_for_trtllm_mla
-
-
 def _apply_attention_output_gate(module, attn_output, gate):
     apply_gate = getattr(module, "apply_attention_output_gate", None)
     if apply_gate is not None:
