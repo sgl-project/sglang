@@ -277,9 +277,33 @@ class BaseSpecWorker(ABC):
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()
+        if get_memory().hicache_draft_size > 0 and len(draft_runners) != 1:
+            raise ValueError("--hicache-draft-size requires exactly one draft model.")
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        if get_memory().hicache_draft_size > 0:
+            from sglang.srt.mem_cache.memory_pool import (
+                MHATokenToKVPool,
+                MLATokenToKVPool,
+            )
+
+            if get_memory().enable_unified_cache_external_linker:
+                raise ValueError(
+                    "--hicache-draft-size does not support the external linker."
+                )
+            if draft_runners[0].runner_ids.is_fused_draft:
+                raise ValueError("--hicache-draft-size requires a separate draft pool.")
+            if not isinstance(draft_pools[0], (MHATokenToKVPool, MLATokenToKVPool)):
+                raise ValueError(
+                    "--hicache-draft-size requires a full-attention MHA/MLA draft pool."
+                )
+            if draft_pools[0].layer_num == 0:
+                raise ValueError("--hicache-draft-size requires a draft KV cache.")
+            # A packed allocation cannot honor an independent draft byte budget.
+            return HiCacheDraftPlan(
+                mode=HiCacheDraftMode.SIDECAR, device_pools=draft_pools
+            )
         if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
                 validate_fused_hicache_draft,

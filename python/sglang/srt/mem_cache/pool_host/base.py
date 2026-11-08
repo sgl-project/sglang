@@ -152,7 +152,7 @@ def host_memory_budget_bytes(
     return free // ranks_per_host()
 
 
-def sync_fixed_hicache_size(size: int, host_size: int) -> int:
+def sync_fixed_hicache_size(size: int, host_size: float) -> int:
     """Sync fixed-size HiCache token capacity across PP ranks.
 
     A fixed --hicache-size is specified in GB, but each PP stage may have a
@@ -221,7 +221,7 @@ class HostKVCache(abc.ABC):
         start_layer: int,
         end_layer: int,
         host_to_device_ratio: float,
-        host_size: int,
+        host_size: float,
         page_size: int,
         layout: str,
         pin_memory: bool,
@@ -232,6 +232,7 @@ class HostKVCache(abc.ABC):
         pool_label: str = "kv",
         is_dummy: bool = False,
         host_token_capacity: int | None = None,
+        min_host_tokens: int = 0,
     ):
         """Allocate host pages from geometry prepared by the concrete host pool."""
         self.pool_label = pool_label
@@ -271,6 +272,12 @@ class HostKVCache(abc.ABC):
             # Reserve the padding page only when sizing an independent pool.
             self.page_num = self.size // self.page_size + 1
             self.size = self.page_num * self.page_size
+        if min_host_tokens > 0 and self.logical_size < min_host_tokens:
+            raise ValueError(
+                f"HiCache {self.pool_label} host pool has {self.logical_size} tokens, "
+                f"but must cover at least {min_host_tokens} target host tokens. "
+                "Increase --hicache-draft-size or reduce the target HiCache capacity."
+            )
         self.start_layer = start_layer
         self.end_layer = end_layer
         if not is_dummy:

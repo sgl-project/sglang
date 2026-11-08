@@ -1697,6 +1697,8 @@ def _build_mha_mla_host_pool(
     allocator_type: str,
     pool_label: str,
     host_token_capacity: int | None = None,
+    host_size: float = 0,
+    min_host_tokens: int = 0,
 ):
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
@@ -1707,12 +1709,13 @@ def _build_mha_mla_host_pool(
 
     kwargs = dict(
         host_to_device_ratio=host_to_device_ratio,
-        host_size=0,
+        host_size=host_size,
         page_size=page_size,
         layout=layout,
         allocator_type=allocator_type,
         pool_label=pool_label,
         host_token_capacity=host_token_capacity,
+        min_host_tokens=min_host_tokens,
     )
     if is_mha:
         host_cls, host_kwargs = _mha_host_inputs(pool, buffer_info)
@@ -1771,7 +1774,15 @@ def build_full_draft_pools(
         layout=get_memory().hicache_mem_layout,
         allocator_type=_get_allocator_type(),
         pool_label="draft",
-        host_token_capacity=host_pool_group.logical_size,
+        host_token_capacity=(
+            host_pool_group.logical_size
+            if get_memory().hicache_draft_size == 0
+            else None
+        ),
+        host_size=get_memory().hicache_draft_size,
+        min_host_tokens=(
+            host_pool_group.logical_size if get_memory().hicache_draft_size > 0 else 0
+        ),
     )
 
     specs = [

@@ -23,6 +23,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -816,13 +817,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             draft.model_config.num_nextn_predict_layers = nextn_layers
             with (
                 self.subTest(linker=linker_enabled, nextn=nextn_layers),
-                patch.object(
-                    spec,
-                    "get_memory",
-                    return_value=SimpleNamespace(
-                        enable_hierarchical_cache=not linker_enabled,
-                        enable_unified_cache_external_linker=linker_enabled,
-                    ),
+                get_context().override_server_args(
+                    enable_hierarchical_cache=not linker_enabled,
+                    enable_unified_cache_external_linker=linker_enabled,
                 ),
             ):
                 plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)

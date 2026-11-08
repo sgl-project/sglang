@@ -106,7 +106,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         self,
         buffer_info: MLABufferInfo | MLAHostAllocation,
         host_to_device_ratio: float,
-        host_size: int,
+        host_size: float,
         page_size: int,
         layout: str,
         pin_memory: bool = True,
@@ -126,6 +126,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         write_back_staging: torch.Tensor | None = None,
         page_unified_layout: PageUnifiedLayout | None = None,
         host_token_capacity: int | None = None,
+        min_host_tokens: int = 0,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
         self.override_kv_cache_dim = override_kv_cache_dim
@@ -243,6 +244,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             dcp_rank=dcp_rank,
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
+            min_host_tokens=min_host_tokens,
             is_dummy=self._is_dummy,
         )
         if self._is_dummy:
