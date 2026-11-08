@@ -286,8 +286,6 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
             revision=source.revision,
         )
     except (HfHubHTTPError, httpx.TransportError) as error:
-        # Only a rate limit, a server error, or a lost connection falls back; a
-        # missing repo, revision, or access right still fails here.
         if isinstance(error, HfHubHTTPError) and not (
             error.response.status_code == 429 or error.response.status_code >= 500
         ):
@@ -315,8 +313,7 @@ def _cached_hub_inventory(source: WeightSource) -> WeightInventory | None:
 
     Returns None when the revision is not cached. The listing holds only the
     files downloaded so far, so callers must use it only to find a file they
-    name exactly, never to choose among candidates, unless the Hub API cannot
-    be reached and the cached listing is the only one left.
+    name exactly, never to choose among candidates, unless the Hub API is unavailable.
     """
     assert source.repo_id is not None
     try:

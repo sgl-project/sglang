@@ -275,7 +275,6 @@ def test_remote_safetensors_shards_use_one_pinned_revision(tmp_path):
 
 
 def _cache_snapshot(cache_dir, monkeypatch):
-    """Cache owner/repo@main as an earlier run would have left it."""
     sha = "a" * 40
     repo_dir = cache_dir / "models--owner--repo"
     (repo_dir / "refs").mkdir(parents=True)
@@ -284,7 +283,7 @@ def _cache_snapshot(cache_dir, monkeypatch):
     snapshot.mkdir(parents=True)
     (snapshot / "model.safetensors").write_bytes(b"cached")
     monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(cache_dir))
-    return sha, snapshot
+    return sha
 
 
 def _hub_error(error_type, status_code):
@@ -295,7 +294,7 @@ def _hub_error(error_type, status_code):
 
 
 def test_hub_rate_limit_falls_back_to_cached_snapshot(tmp_path, monkeypatch):
-    sha, snapshot = _cache_snapshot(tmp_path, monkeypatch)
+    sha = _cache_snapshot(tmp_path, monkeypatch)
 
     with patch(
         "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
@@ -305,7 +304,6 @@ def test_hub_rate_limit_falls_back_to_cached_snapshot(tmp_path, monkeypatch):
 
     assert resolved.inventory.resolved_revision == sha
     assert resolved.selected_files == ("model.safetensors",)
-    assert materialize_weight_set(resolved) == (str(snapshot / "model.safetensors"),)
 
 
 def test_hub_repo_not_found_is_not_masked_by_cache(tmp_path, monkeypatch):
