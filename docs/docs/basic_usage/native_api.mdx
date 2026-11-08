@@ -131,10 +131,14 @@ Flush the radix cache. It will be automatically triggered when the model weights
 
 Parameters:
 - `timeout` (query, float, default `0`, unit: seconds): Wait time for idle state before flushing. `0` means fail fast if not idle. When HiCache async operations are in-flight, a non-zero timeout allows the server to wait until idle before flushing, avoiding unnecessary 400 errors.
+- `empty_cache` (query, bool, default `true`): Release unused device allocator memory after flushing. Set `false` to clear the KV cache while retaining allocator memory for reuse, for example when measuring prefill without including fresh device allocations.
 
 ```bash Command
 # With timeout (wait up to 30s for idle state)
 curl -s -X POST "http://127.0.0.1:30000/flush_cache?timeout=30"
+
+# Clear KV while retaining device allocator memory
+curl -s -X POST "http://127.0.0.1:30000/flush_cache?empty_cache=false"
 ```
 
 ```python Example

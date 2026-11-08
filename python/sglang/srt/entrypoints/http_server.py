@@ -1024,9 +1024,13 @@ def _refuse_decision_layout(obj: EmbeddingReqInput) -> None:
 
 @app.api_route("/flush_cache", methods=["GET", "POST"])
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
-async def flush_cache(timeout: float = Query(0.0, ge=0.0)):
-    """Flush the radix cache."""
-    ret = await _global_state.tokenizer_manager.flush_cache(timeout_s=timeout)
+async def flush_cache(
+    timeout: float = Query(0.0, ge=0.0), empty_cache: bool = Query(True)
+) -> Response:
+    """Flush the radix cache, optionally retaining unused device allocations."""
+    ret = await _global_state.tokenizer_manager.flush_cache(
+        timeout_s=timeout, empty_cache=empty_cache
+    )
     if ret.success:
         content = (
             "Cache flushed.\nPlease check backend logs for more details. "
