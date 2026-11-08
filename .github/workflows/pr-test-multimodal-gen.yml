@@ -9,9 +9,6 @@ on:
       sgl_kernel:
         required: true
         type: string
-      runner_config:
-        required: true
-        type: string
       runs_on_map:
         required: true
         type: string
@@ -80,7 +77,7 @@ jobs:
       needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-h100
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-1-gpu-h100'] }}
     timeout-minutes: 240
     strategy:
       fail-fast: false
@@ -106,7 +103,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
       - name: Run diffusion server tests
         timeout-minutes: 240
         env:
@@ -150,7 +147,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-5090
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-1-gpu-5090'] }}
     timeout-minutes: 180
     steps:
       - name: Checkout code
@@ -173,7 +170,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run SM120-only diffusion unit tests
         timeout-minutes: 10
@@ -223,7 +220,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-h100
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-bcg-1-gpu-h100'] }}
     timeout-minutes: 90
     steps:
       - name: Checkout code
@@ -246,7 +243,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run BCG diffusion tests
         timeout-minutes: 60
@@ -282,7 +279,7 @@ jobs:
       needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 2-gpu-h100
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-2-gpu-h100'] }}
     timeout-minutes: 55
     strategy:
       fail-fast: false
@@ -311,7 +308,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run diffusion server tests
         timeout-minutes: 55
@@ -358,7 +355,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 2-gpu-h100
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-component-2-gpu-h100'] }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -381,7 +378,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run diffusion component accuracy tests
         timeout-minutes: 240
@@ -403,7 +400,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-1-gpu-b200'] }}
     timeout-minutes: 240
     steps:
       - name: Checkout code
@@ -428,7 +425,7 @@ jobs:
         env:
           SGLANG_CI_EARLY_LD_LIBRARY_PATH: "1"
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run VAE parallel-group regression
         timeout-minutes: 10
@@ -503,7 +500,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    runs-on: 1-gpu-h100
+    runs-on: ${{ fromJson(inputs.runs_on_map)['diffusion-unit-1-gpu-h100'] }}
     timeout-minutes: 120
     steps:
       - name: Checkout code
@@ -526,7 +523,7 @@ jobs:
       - name: Install dependencies
         timeout-minutes: 20
         run: |
-          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+          CUSTOM_BUILD_SGL_KERNEL=${{inputs.sgl_kernel}} bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Install Quant-VideoGen
         timeout-minutes: 5

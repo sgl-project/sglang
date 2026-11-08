@@ -290,7 +290,7 @@ jobs:
 
       - name: Install dependencies (diffusion)
         timeout-minutes: 20
-        run: bash scripts/ci/cuda/ci_install_dependency.sh diffusion
+        run: bash scripts/ci/cuda/ci_install_dependency_diffusion.sh
 
       - name: Run test
         timeout-minutes: 60
