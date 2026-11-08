@@ -75,12 +75,15 @@ def draft_is_chain_layout(algorithm, eagle_topk):
     qualifies only under the static (verify-all) schedule, where every request
     verifies its whole draft block; ragged verify trims rows per request.
     """
-    from sglang.srt.environ import envs
+    from sglang.srt.speculative.ragged_verify import (
+        RaggedVerifyMode,
+        read_ragged_verify_mode,
+    )
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
     algo = SpeculativeAlgorithm.from_string(algorithm)
     if algo.is_dspark():
-        return envs.SGLANG_RAGGED_VERIFY_MODE.get() == "static"
+        return read_ragged_verify_mode() is RaggedVerifyMode.STATIC
     return algo.is_none() or (algo.is_eagle() and (eagle_topk or 1) == 1)
 
 
@@ -247,8 +250,7 @@ class MiniMaxIndexerCP:
         q_heads = gathered_q.view(world, batch, 128)
         sm_scale = 128**-0.5 if sm_scale is None else sm_scale
         if isinstance(k_cache, Nvfp4Cache):
-            # candidates go straight to each head's owner; verify_topk_idx's NVFP4 scale
-            # folding, so scores match it exactly
+            # sm_scale folds q and k scales as verify_topk_idx does, so the ids match it
             return cp_verify_exchange(
                 q_heads=q_heads,
                 k_cache=k_cache,

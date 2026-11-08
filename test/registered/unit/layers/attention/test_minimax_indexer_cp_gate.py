@@ -1,9 +1,11 @@
 import unittest
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.minimax_sparse_ops.indexer_cp import (
     draft_is_chain_layout,
     unsupported_reason,
 )
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -55,6 +57,14 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
                     }
                 )
                 self.assertEqual(reason is None, expected, reason)
+        # ragged verify trims rows per request, which CP would score as whole chains
+        for mode in RaggedVerifyMode:
+            with (
+                self.subTest(algorithm="DSPARK", mode=mode),
+                envs.SGLANG_RAGGED_VERIFY_MODE.override(mode.value),
+            ):
+                chain = draft_is_chain_layout("DSPARK", None)
+                self.assertEqual(chain, mode is RaggedVerifyMode.STATIC)
 
     def test_sm90_enables_only_validated_topologies(self):
         """Each rank must serve exactly one index head of the four; any other split,
