@@ -1879,8 +1879,6 @@ class KvBufferDesc:
 class KVCache(abc.ABC):
     layer_shard_enabled: bool = False
     post_capture_active: bool = False
-    # Under DCP, rows are owner rows (loc // dcp_size) rather than raw widened
-    # locs; PD transfer must then map a draft like the target.
     rows_are_dcp_collapsed: bool = False
 
     @property
@@ -4891,8 +4889,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
 
     @property
     def rows_are_dcp_collapsed(self) -> bool:
-        # Either the plan resolved the owner rule or the sharded kernel does;
-        # a replicated draft pool keeps raw widened rows.
         return get_parallel().dcp_enabled and not self.dcp_replicated
 
     @property

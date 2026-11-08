@@ -182,13 +182,6 @@ def build_dcp_token_transfer_plan(
     num_kv_tokens: Optional[int] = None,
     draft_rows_collapsed: bool = False,
 ) -> DCPTokenTransferPlan:
-    """Rows to copy for one decode DCP rank.
-
-    The target lands on owner rows (``loc // dcp_size``, physical page). The
-    draft lands on raw widened rows (virtual page) unless the decode's draft
-    pool is DCP-collapsed too (``draft_rows_collapsed``, an MLA draft), in
-    which case it takes the target mapping.
-    """
     src_pages = np.asarray(src_page_indices, dtype=np.int64)
     dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
     virtual_page_size = physical_page_size * dcp_size

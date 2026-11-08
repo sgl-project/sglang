@@ -630,7 +630,6 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
-    # NPU drafts index allocator-global slots (mla_attention_dcp_size), not owner rows.
     rows_are_dcp_collapsed = False
 
     def __init__(

@@ -373,7 +373,7 @@ class TestDcpDsaIndexKTransfer(unittest.TestCase):
 
         for dst_rank in range(dcp):
             with self.subTest(dst_rank=dst_rank):
-                layers = {500000: None, 600000: None}  # two index-K layers
+                layers = {500000: None, 600000: None}
                 src_buffers = {10000: np.zeros(1024 * 8, dtype=np.uint8)}
                 for base in layers:
                     src = np.zeros(16 * page_bytes, dtype=np.uint8)

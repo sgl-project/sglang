@@ -35,8 +35,6 @@ def _plan(*, src, dst, page_size, dcp_size, dcp_rank, **kwargs):
 
 class TestDcpCollapsedDraftPlan(CustomTestCase):
     def test_collapsed_draft_takes_the_target_rows(self):
-        # Same geometry as test_one_virtual_page_explicit_rows; rank 2 owns
-        # positions 2 and 6 -> src rows 4, 8 -> local rows 14, 15 on page 7.
         plan = _plan(
             src=[5, 2, 11, 4],
             dst=[7],

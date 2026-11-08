@@ -1065,8 +1065,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Use the manager's captured target layout, not scoped CP flags.
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
-            # A DCP-collapsed MLA draft (Kimi-K3.1) is replicated like the
-            # target and goes through the DCP send path.
             and not registration_info.dst_draft_rows_dcp_collapsed
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
@@ -1556,7 +1554,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
             )
         params = []
-        # A page holds its tokens' keys, then their scales, each addressed in its width.
+        # NOTE(kpham-sgl): a page holds its tokens' keys, then their scales;
+        # each part is addressed in units of its own width.
         for width, offset in ((value_bytes, 0), (scale_bytes, page_size * value_bytes)):
             units_per_page = page_bytes // width
             src_units = (
@@ -1609,7 +1608,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             registration_info.dst_state_item_lens[i],
             StateType.DSA,
         )
-        # Layers that reuse the previous top-k keep no index-K on either side.
         pairs = [
             (src, dst, src_len)
             for src, dst, src_len, dst_len in zip(
@@ -1737,7 +1735,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 plan.target_src_token_indices,
                 plan.target_dst_token_indices,
                 pack_buffer,
-                # after the target and draft KV rows packed for this transfer
                 pack_offset_bytes=(
                     plan.target_src_token_indices.size
                     * sum(dcp_token_item_lens[:num_target])
@@ -2226,7 +2223,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 and target_rank_registration_info is not None
                 and target_rank_registration_info.requires_dcp_relayout
             ):
-                # Moved row by row with the KV (send_kvcache_dcp).
                 continue
             src_data_ptrs = self.kv_args.state_data_ptrs[i]
             src_item_lens = self.kv_args.state_item_lens[i]

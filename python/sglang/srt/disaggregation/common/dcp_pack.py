@@ -135,7 +135,6 @@ def init_dcp_pack_buffers(
     size_bytes = dcp_pack_buffer_bytes(
         kv_item_lens, kv_args.page_size, max_tokens, dcp_size
     )
-    # DSA index-K moves with the target KV rows (see dsa_index_k_dcp_entries).
     index_k_token_bytes = sum(
         item_len // kv_args.page_size for item_len in dsa_index_k_item_lens(kv_args)
     )

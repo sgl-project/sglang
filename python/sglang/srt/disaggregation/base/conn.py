@@ -90,15 +90,12 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
-    # Per-token (key, scale) bytes of a token-shardable DSA index-K page, else None.
     dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
-    # Decode side: its draft pool stores DCP owner rows, so PD transfer maps
-    # the draft like the target instead of raw widened rows.
     draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
