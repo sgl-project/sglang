@@ -11,7 +11,6 @@ from sglang.srt.function_call.core_types import (
     ToolCallItem,
     _GetInfoFunc,
 )
-from sglang.srt.function_call.utils import _is_complete_json
 
 logger = logging.getLogger(__name__)
 
@@ -113,7 +112,10 @@ class DeepSeekV31Detector(BaseFormatDetector):
                     if first_marker == -1:
                         # No tool call marker yet. If a bot token is present,
                         # keep buffering; otherwise flush as normal text.
-                        if self.bot_token not in self._buffer and CB not in self._buffer:
+                        if (
+                            self.bot_token not in self._buffer
+                            and CB not in self._buffer
+                        ):
                             text = self._buffer
                             self._buffer = ""
                             for e_token in [self.eot_token, CE]:
@@ -122,10 +124,10 @@ class DeepSeekV31Detector(BaseFormatDetector):
                                 if text:
                                     normal_text += text
                                 break
-                        return StreamingParseResult(
-                            normal_text=normal_text, calls=calls
-                        ) if (calls or normal_text) else StreamingParseResult(
-                            normal_text="", calls=[]
+                        return (
+                            StreamingParseResult(normal_text=normal_text, calls=calls)
+                            if (calls or normal_text)
+                            else StreamingParseResult(normal_text="", calls=[])
                         )
 
                     if first_marker > 0:
@@ -160,7 +162,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         "arguments": {},
                     }
                     self._last_arguments = ""
-                    self._buffer = self._buffer[m.end():]
+                    self._buffer = self._buffer[m.end() :]
                     continue
 
                 # Current tool call already named: stream its arguments.
@@ -176,7 +178,7 @@ class DeepSeekV31Detector(BaseFormatDetector):
                         args_raw = self._buffer.strip()
 
                 argument_diff = (
-                    args_raw[len(self._last_arguments):]
+                    args_raw[len(self._last_arguments) :]
                     if args_raw.startswith(self._last_arguments)
                     else args_raw
                 )
@@ -198,13 +200,13 @@ class DeepSeekV31Detector(BaseFormatDetector):
                 if ce_idx >= 0:
                     try:
                         parsed_args = json.loads(args_raw)
-                        self.prev_tool_call_arr[self.current_tool_id][
-                            "arguments"
-                        ] = parsed_args
+                        self.prev_tool_call_arr[self.current_tool_id]["arguments"] = (
+                            parsed_args
+                        )
                     except json.JSONDecodeError:
                         pass
 
-                    self._buffer = self._buffer[ce_idx + len(CE):]
+                    self._buffer = self._buffer[ce_idx + len(CE) :]
                     self.current_tool_id += 1
                     self.current_tool_name_sent = False
                     self._last_arguments = ""
