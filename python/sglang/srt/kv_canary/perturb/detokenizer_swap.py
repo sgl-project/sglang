@@ -6,11 +6,11 @@ import re
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Final, Optional
 
+from sglang.srt.constants import is_health_check_request
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.canary_info.aux_output import CANARY_INFOS_KEY
 from sglang.srt.kv_canary.perturb.utils import (
     advance_delivered_counts,
-    is_health_check_rid,
 )
 from sglang.srt.managers.io_struct import unwrap_from_pickle, wrap_as_pickle
 
@@ -93,7 +93,7 @@ def _swap_due_pairs(*, recv_obj: BatchTokenIDOutput, swap_at_output: int) -> Non
     due = [
         index
         for index, rid in enumerate(recv_obj.rids)
-        if not is_health_check_rid(rid)
+        if not is_health_check_request(rid)
         and rid not in _swapped_rids
         and recv_obj.output_ids_offsets[index + 1] > recv_obj.output_ids_offsets[index]
         and _delivered_counts.get(rid, 0) >= swap_at_output
