@@ -591,10 +591,6 @@ class LongcatFlashModel(nn.Module):
         super().__init__()
         self.vocab_size = config.vocab_size
 
-        if _is_npu and not hasattr(config, "indexer_rope_interleave"):
-            # LongCat's indexer defaults to the main attention's RoPE layout.
-            config.indexer_rope_interleave = getattr(config, "rope_interleave", True)
-
         if config.use_ngram_embedding:
             self.use_ngram_embedding = True
             self.embed_tokens = NgramEmbedding(

@@ -668,6 +668,15 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        if (
+            get_platform().is_npu
+            and self.hf_config.model_type == "longcat_flash"
+            and not hasattr(self.hf_config, "indexer_rope_interleave")
+        ):
+            # Resolve LongCat's indexer layout after applying model overrides.
+            self.hf_config.indexer_rope_interleave = getattr(
+                self.hf_config, "rope_interleave", True
+            )
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:

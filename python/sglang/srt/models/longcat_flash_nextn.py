@@ -223,8 +223,6 @@ class LongcatFlashModelNextN(nn.Module):
                 "index_share_for_mtp_iteration",
                 getattr(config, "dsa_mtp_cli", False),
             )
-        if _is_npu and not hasattr(config, "indexer_rope_interleave"):
-            config.indexer_rope_interleave = getattr(config, "rope_interleave", True)
         self.alt_stream = (
             get_stream("alt")
             if not _is_npu or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
