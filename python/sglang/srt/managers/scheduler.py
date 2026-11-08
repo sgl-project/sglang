@@ -6237,9 +6237,6 @@ class Scheduler(
                 else:
                     req.request_finish(FINISH_ABORT())
 
-    def _pause_engine(self) -> Tuple[List[Req], int]:
-        raise NotImplementedError()
-
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
         self.pause_state.pause()

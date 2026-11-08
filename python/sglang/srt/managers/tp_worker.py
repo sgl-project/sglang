@@ -543,9 +543,6 @@ class TpModelWorker(BaseTpWorker):
         if self.hicache_layer_transfer_counter is not None:
             self.hicache_layer_transfer_counter.set_consumer(consumer_index)
 
-    def register_hisparse_coordinator(self, coordinator):
-        self.model_runner.hisparse_coordinator = coordinator
-
     def get_worker_info(self):
         # The runner already reports logical DCP capacity.
         kv_capacity = (
