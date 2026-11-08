@@ -565,7 +565,7 @@ class TestFusedMLAHost(unittest.TestCase):
             page_size=self.PS,
             need_sort=False,
             forward_stream=None,
-            lazy_compaction=False,
+            lazy_compaction=True,
         )
         dp = DraftMHAView(
             arena=pool,
