@@ -165,7 +165,7 @@ For a rename where the old key must keep working with a warning:
 SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
 ```
 
-Use `EnvBoolWithAlias` / `EnvIntWithAlias` / `EnvStrWithAlias`. The fallback emits a `DeprecationWarning` and copies the old value over. A legacy `SGL_FOO` needs no alias for `SGLANG_FOO`: the import-time prefix rewrite already covers it. An old name without either prefix (e.g. `FOO`) does need one.
+Use `EnvBoolWithAlias` / `EnvIntWithAlias` / `EnvStrWithAlias`. The fallback emits a `DeprecationWarning` and copies the old value over. Python hides a `DeprecationWarning` raised from library code by default, so users rarely see it; `_DeprecatedEnv(replacement=...)` in `_DEPRECATED_ENVS` also forwards the value and warns visibly. A legacy `SGL_FOO` needs no alias for `SGLANG_FOO`: the import-time prefix rewrite already covers it. An old name without either prefix (e.g. `FOO`) does need one.
 
 For a removal, or a var replaced by a CLI flag or another var, add an entry to `_DEPRECATED_ENVS` in `environ.py` and delete the descriptor:
 

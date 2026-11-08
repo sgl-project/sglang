@@ -33,7 +33,7 @@ it matches, the evidence, and the action. "This module could be simpler" is not 
 
 1. **Fix the base.** Work from the latest main and record the SHA every comparison uses.
    Merge main again before opening the PR and re-run the leftover greps; main may have
-   added a reader of something you deleted.
+   added a reader of something you deleted while the PR was open.
 2. **Inventory with scripts before reading files.**
    - Identifier frequency over the whole repo, strings included: top-level defs whose name
      occurs only at their definition. Then drop the dynamic ones (A1, "Not this pattern").
@@ -42,13 +42,15 @@ it matches, the evidence, and the action. "This module could be simpler" is not 
      different name than documented.
    - Architecture gates: `get_device_capability`, `is_sm_at_least`, `is_blackwell`, `major
      >=`, gfx substring tests, next to the kernels they guard.
+   - Dead locals: `ruff check --select F841` (the repo hook does not select it).
    - Baseline: import every module under the packages in scope and run `pytest
      --collect-only` on the test trees, on the base SHA.
 3. **Verify every candidate at every site.** Read the code, not the grep line. Check the
    other platforms (ROCm, NPU, XPU, MUSA, CPU), out-of-tree users (the `sgl-kernel` wheel
    API, plugin pins, `from sglang import ...`), open PRs that are about to use it (`gh pr
-   list --search <symbol>`), and its age: code merged in the last few weeks is usually
-   waiting to be wired, not dead.
+   list --state all --search <symbol>`), trackers closed by the inactivity bot (stalled, not
+   finished), and its age: code merged in the last few weeks is usually waiting to be
+   wired, not dead.
 4. **Decide per finding:** delete, dedupe, fix, keep, or report to the owner. Default to
    keep and report when the decision is a product call (removing a user-facing feature,
    a backend that is someone's only path), when an owner reserved the directory, or when
@@ -75,11 +77,16 @@ every branch-only failure serially on both trees before calling it a regression;
 runs produce port collisions (`EADDRINUSE`) that look like failures.
 
 - **Dead code deletion:** whole-repo grep including strings and configs; the import walk and
-  `--collect-only` show no new failures; the tests that cover the neighborhood pass.
+  `--collect-only` show no new failures; the tests that cover the neighborhood pass. A
+  deleted AOT op needs a clean rebuild of sgl-kernel.
+- **Refactor that claims no behavior change:** greedy tokens and logprobs compared bitwise,
+  base vs branch. A small accuracy eval cannot resolve it: identical code has moved GSM8K by
+  0.03 on 200 questions.
 - **Dedup of two implementations:** outputs bit-identical (`torch.equal`, or identical
   generated code) over the shapes and dtypes every caller uses, on each architecture
-  claimed, including edge inputs (zero tokens, fully masked rows, ties). If not bit-exact,
-  keep both and say why in one line.
+  claimed, including edge inputs (zero tokens, fully masked rows, ties, all-underflow). Force
+  the merged path when the default config skips it, and log or count that it ran. If not
+  bit-exact, keep both and say why in one line.
 - **Kernel rewrite or move between packages:** the above, plus CUDA graph / piecewise graph
   / `torch.compile` paths, the custom-op registration, and the nightly accuracy test of an
   affected model; JIT lands with a bitwise JIT-vs-AOT test before the AOT copy goes.
@@ -90,8 +97,12 @@ runs produce port collisions (`EADDRINUSE`) that look like failures.
   cookbook updated, the result checked against the real parser.
 - **Default change:** end-to-end accuracy with sgl-eval on the target hardware, a log line or
   trace proving the new default path ran, and perf where the path is a fast path.
-- **Architecture gate change:** a probe of the gate on each architecture it touches, and the
-  tests of the kernel on the hardware of the lane they are registered on.
+- **Architecture gate change:** the gate written as a pure function of the capability tuple
+  and unit-tested on CPU across families (or `current_arch` patched), a probe on each
+  architecture it touches, and the kernel's tests on the hardware of the lane they are
+  registered on.
+- **Diffusion fast path:** the tier it runs at, scored with
+  `multimodal_gen/test/quality_tier_admission.py`, and `torch.equal` at `exact`.
 
 ## PR structure
 
@@ -104,7 +115,8 @@ Title `[Refactor] <area>: <what>`. In the body, in this order:
 4. What was deleted or merged, grouped by pattern, with the proof for each group.
 5. **Kept on purpose**: things that look removable and are not, with the reason.
 6. **For the owners (not changed here)**: findings that need a product or owner decision.
-7. Validation per hardware, and **not validated**: platforms and paths you could not run.
+7. Validation per hardware with the base and head SHA each run used, and **not validated**:
+   platforms and paths you could not run.
 
 Do not add a line-count target or a deletion quota; the value of a cleanup is in the silent
 failures it finds, not its size.
@@ -120,6 +132,8 @@ failures it finds, not its size.
 - Were the hardware lanes the change touches actually run, including nightly-only tests of
   affected models?
 - Does it fight an in-flight migration from the list in patterns.md?
+- Is each problem found in review classified as introduced by the PR or pre-existing on the
+  base SHA, and does every result name the SHA it ran on?
 
 ## Traps
 
@@ -134,6 +148,17 @@ failures it finds, not its size.
   architecture.
 - If main changes a file you deleted while the PR is open: a change that extends a guard
   or a test means the file is alive, restore it; a mechanical sync keeps it deleted.
+- `from sgl_kernel import X` under an XPU branch resolves to `sgl-kernel-xpu`; it is not a
+  reader of the CUDA AOT op.
+- `DeprecationWarning` raised from library code is hidden by default, and the env
+  `*WithAlias` fallback emits exactly that; a deprecation users must see needs
+  `logger.warning`, `UserWarning` or `FutureWarning`.
+- argparse prefix matching: a deleted flag that prefixes one live flag silently binds to it.
+  Check removals against the real parser, not grep.
+- Tests that fake `server_args` with `MagicMock` never notice a read of a deleted field;
+  build one real `ServerArgs`.
+- `/rerun-test` on a unittest file takes `file.py::Class.method`; `Class::method` fails with
+  `AttributeError` before any test runs.
 - Subagents fanning out over files: give them a fixed brief, have them prove each verdict,
   and re-verify every proposed deletion yourself; "covered by X" claims from a quick pass
   are leads, not findings.
