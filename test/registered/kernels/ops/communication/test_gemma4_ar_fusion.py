@@ -156,20 +156,24 @@ def test_site(hidden: int, rows: int, round_a: bool):
     torch.cuda.synchronize()
     out, scales = out_buf.tensor[:rows].clone(), scales_buf.tensor[:rows].clone()
 
-    ref_res, ref_y = _reference(
-        _gather(partial), residual_all, w_a, w_b, scalar, round_a
-    )
-    # this rank's residual rows, then every rank's view of the quantized rows
+    # every collective runs before any assert: a rank that failed early would
+    # skip a gather its peers wait in, and the next case would deadlock
+    partials, outs, all_scales = _gather(partial), _gather(out), _gather(scales)
+    ref_res, ref_y = _reference(partials, residual_all, w_a, w_b, scalar, round_a)
+    # this rank's residual rows; atol covers a one-ulp flip of the bf16-rounded
+    # first norm (1/32 for |a| < 8, times the 0.75 scalar), which a residual
+    # add that cancels a leaves far above rtol
     torch.testing.assert_close(
-        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=2e-2
+        residual.float(), ref_res[row0 : row0 + mine].float(), rtol=2e-2, atol=3e-2
     )
+    # then every rank's view of the quantized rows
     deq = out.float() * scales.repeat_interleave(GROUP, dim=1)
     torch.testing.assert_close(
         deq, ref_y, rtol=7e-2, atol=4e-2
     )  # e4m3 has 3 mantissa bits
     assert torch.all(scales > 0)
-    for name, t in (("out", out), ("scales", scales)):
-        for i, other in enumerate(_gather(t)):
+    for name, t, gathered in (("out", out, outs), ("scales", scales, all_scales)):
+        for i, other in enumerate(gathered):
             assert torch.equal(other, t), f"{name} differs on rank {i}"
 
 
@@ -199,10 +203,11 @@ def test_final(hidden: int, rows: int):
     )
     torch.cuda.synchronize()
     out = staged.clone()
-    ref_res, _ = _reference(_gather(partial), residual_all, w_a, w_a, scalar, False)
+    partials, outs = _gather(partial), _gather(out)  # collectives before asserts
+    ref_res, _ = _reference(partials, residual_all, w_a, w_a, scalar, False)
     torch.testing.assert_close(out.float(), ref_res.float(), rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(residual, out[row0 : row0 + mine])
-    for i, other in enumerate(_gather(out)):
+    for i, other in enumerate(outs):
         assert torch.equal(other, out), f"out differs on rank {i}"
 
 
