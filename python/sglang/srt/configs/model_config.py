@@ -748,6 +748,10 @@ class ModelConfig:
             if self.decision_config is not None:
                 # A bare backbone whose readout the loader places in the LM head.
                 self.hf_config.architectures = ["Qwen3_5ForConditionalGeneration"]
+                # The readout replaces the LM head, so it must not share storage with
+                # the embedding: the zero-filled code matrix would erase every token
+                # row outside the code set.
+                self.hf_config.tie_word_embeddings = False
                 if (
                     self.decision_config.get("attention_mode")
                     == NONCAUSAL_FULL_ATTENTION
