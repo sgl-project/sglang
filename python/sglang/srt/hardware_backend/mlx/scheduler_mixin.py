@@ -210,7 +210,7 @@ class SchedulerMlxOverlapMixin:
             self.increment_scheduler_iterations()
 
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_gate.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 

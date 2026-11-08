@@ -12,6 +12,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
     DeferredResponses,
 )
+from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -46,7 +47,8 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
-        scheduler._engine_paused = True
+        scheduler.pause_gate = PauseGate()
+        scheduler.pause_gate.pause()
         scheduler.enable_overlap = False
         scheduler.last_batch = None
         scheduler.cur_batch = None
@@ -126,10 +128,10 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
 
     def test_flush_cache_does_not_ignore_waiting_reqs_while_unpaused(self):
-        """ignore_waiting is gated on _engine_paused inside flush_cache — a
+        """ignore_waiting is gated on pause_gate.paused inside flush_cache — a
         flush issued without pausing first must not be silently permissive."""
         scheduler = self._new_scheduler()
-        scheduler._engine_paused = False
+        scheduler.pause_gate = PauseGate()
         scheduler.waiting_queue = [_make_req(is_retracted=True)]
 
         self.assertFalse(scheduler.flush_cache())

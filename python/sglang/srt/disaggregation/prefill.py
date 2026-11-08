@@ -745,7 +745,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_gate.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.join(
@@ -884,7 +884,7 @@ class SchedulerDisaggregationPrefillMixin:
             received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
-            if self._engine_paused:
+            if self.pause_gate.paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
@@ -908,7 +908,7 @@ class SchedulerDisaggregationPrefillMixin:
                     not self.gracefully_exit
                     or self.dp_attn_adapter.shutdown_vote_pending()
                 )
-                and not self._deferred_input_requests
+                and self.pause_gate.may_launch()
                 and not skip_batch_creation
             ):
                 # Get the next batch to run

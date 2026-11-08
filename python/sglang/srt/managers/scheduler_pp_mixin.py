@@ -145,7 +145,7 @@ class SchedulerPPMixin:
                         self.send_req_work = self._pp_send_reqs_to_next_stage(recv_reqs)
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     batch = None
-                    if self._pp_may_launch():
+                    if self.pause_gate.may_launch():
                         plan = self.get_next_batch_to_run(
                             running_batch=self.running_batch,
                             last_batch=self.last_batch,
@@ -294,7 +294,7 @@ class SchedulerPPMixin:
                 )
                 self._process_hicache_events()
                 batch = None
-                if self._pp_may_launch():
+                if self.pause_gate.may_launch():
                     prefill_plan = self.get_new_batch_prefill(self.running_batch)
                     batch = prefill_plan.batch_to_run
                     self.running_batch = prefill_plan.running_batch
@@ -416,7 +416,7 @@ class SchedulerPPMixin:
                     self._pp_commit_comm_work(self.send_req_work)
 
                 # Paused: open no new queue consensus; every stage skips together.
-                may_launch = self._pp_may_launch()
+                may_launch = self.pause_gate.may_launch()
                 retract_rids = prealloc_rids = transferred_rids = None
                 if may_launch:
                     # reaching consensus through PP ranks
@@ -587,19 +587,13 @@ class SchedulerPPMixin:
         has_unprocessed_mb = any(mb is not None for mb in self.mbs)
         return self.ingest_requests(stop_at_pause=has_unprocessed_mb)
 
-    def _pp_may_launch(self: Scheduler) -> bool:
-        """No new micro-batch once a pause is held or applied."""
-        return not (self._engine_paused or self._deferred_input_requests)
-
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
-        running_batch = self.running_batch
         for mb_id in range(self.pp_loop_size):
-            self.running_batch = self.running_mbs[mb_id]
-            self.last_batch = self.last_mbs[mb_id]
-            self._retract_running_batch()
+            self._retract_batch(self.running_mbs[mb_id], self.last_mbs[mb_id])
             self.last_mbs[mb_id] = None
-        self.running_batch = running_batch
+        self.last_batch = None
+        self.cur_batch_for_debug = None
 
     def init_pp_loop_state(self: Scheduler):
         self.pp_loop_size: int = (
