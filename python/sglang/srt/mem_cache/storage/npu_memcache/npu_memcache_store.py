@@ -701,7 +701,6 @@ class NpuMemcacheStore(HiCacheStorage):
             page_keys, host_indices
         )
         exist_result = self._batch_exist(key_strs)
-        existing_keys = sum(1 for state in exist_result if state == 1)
 
         set_keys = []
         set_buffer_ptrs = []
@@ -838,7 +837,6 @@ class NpuMemcacheStore(HiCacheStorage):
             keys, target_locations, target_sizes
         )
         end_time = time.perf_counter()
-        hit_keys = sum(1 for r in get_result if r > 0)
 
         if self.is_mla_backend:
             key_multiplier = self._mla_key_multiplier()

@@ -1942,7 +1942,7 @@ class TestPagedBand(unittest.TestCase):
             need_sort=False,
             forward_stream=None,
         )
-        # The leak invariant reads `_conserve_*`; public `*_available_size()`
+        # The leak invariant reads `conserve_*`; public `*_available_size()`
         # is `min(conserve, schedulable)` and may be smaller.
         self.assertEqual(allocator.conserve_full_available_size(), full_max)
         self.assertEqual(allocator.conserve_swa_available_size(), swa_max)
