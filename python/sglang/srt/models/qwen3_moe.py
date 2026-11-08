@@ -71,6 +71,8 @@ from sglang.srt.models.utils import (
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
     is_non_idle_and_non_empty,
+    router_quant_config,
+    unquantize_router_if_stored_so,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
@@ -233,28 +235,6 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
-# Formats whose config says, per layer, whether the router is stored quantized.
-_ROUTER_QUANT_FORMATS = ("modelslim", "compressed_tensors")
-
-
-def _router_quant_config(
-    quant_config: Optional[QuantizationConfig],
-) -> Optional[QuantizationConfig]:
-    """The quantization config that the MoE router (``mlp.gate``) is built with.
-
-    ModelSlim carries a per-layer quant_model_description, and compressed-tensors
-    an ``ignore`` list, so for these formats the config decides: a router the
-    checkpoint stores quantized (for example as W4A16 ``weight_packed`` and
-    ``weight_scale``) is loaded and dequantized with its scales, and one the
-    config ignores stays BF16. Without the config, the stored names have no
-    parameter and the router keeps its initial weight. Other formats, such as
-    online FP8/MXFP8, keep the router in BF16.
-    """
-    if quant_config is not None and quant_config.get_name() in _ROUTER_QUANT_FORMATS:
-        return quant_config
-    return None
-
-
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -294,7 +274,7 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=_router_quant_config(quant_config),
+            quant_config=router_quant_config(quant_config),
             prefix=add_prefix("gate", prefix),
         )
         self.topk = self._make_topk(config, layer_id, norm_topk_prob)
@@ -1260,6 +1240,10 @@ class Qwen3MoeForCausalLM(nn.Module):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
+                    # A router the checkpoint stores unquantized although the config quantizes it
+                    unquantize_router_if_stored_so(
+                        self, name, loaded_weight, params_dict, (".mlp.gate",)
+                    )
                     # Skip loading extra bias for GPTQ models.
                     if name.endswith(".bias") and name not in params_dict:
                         continue

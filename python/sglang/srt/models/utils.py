@@ -931,3 +931,70 @@ def bind_or_assign(target, source):
         return target
     else:
         return source
+
+
+# Formats whose config says, per layer, whether a MoE router is stored quantized.
+ROUTER_QUANT_FORMATS = ("modelslim", "compressed_tensors", "fp8")
+
+
+def router_quant_config(quant_config):
+    """The quantization config a MoE router (``gate`` / ``router``) is built with.
+
+    For ModelSlim, compressed-tensors and fp8, the router is built as the config describes it, so a router the
+    checkpoint stores quantized (FP8 codes with a ``weight_scale``, or W4A16 ``weight_packed``) is loaded and
+    dequantized with its scales instead of being read as plain numbers or skipped. Other formats keep the router
+    unquantized. A checkpoint may still store the router unquantized although its config would quantize it, and
+    fp8 quantization of a 16-bit checkpoint at load keeps the router in 16 bits: ``load_weights`` handles both with
+    ``unquantize_router_if_stored_so``.
+    """
+    if quant_config is not None and quant_config.get_name() in ROUTER_QUANT_FORMATS:
+        return quant_config
+    return None
+
+
+def unquantize_router_if_stored_so(
+    model: torch.nn.Module,
+    name: str,
+    loaded_weight: torch.Tensor,
+    params_dict: dict,
+    router_suffixes: Tuple[str, ...],
+) -> None:
+    """Called by ``load_weights`` before it loads ``name``. If ``name`` is the ``weight`` of a router built
+    quantized and the checkpoint stores it as a 16- or 32-bit float tensor, rebuild the router unquantized, so
+    the weight is loaded as stored, and update ``params_dict``."""
+    if not name.endswith(".weight") or loaded_weight.dtype not in (
+        torch.float16,
+        torch.bfloat16,
+        torch.float32,
+    ):
+        return
+    prefix = name[: -len(".weight")]
+    if not prefix.endswith(router_suffixes):
+        return
+    from sglang.srt.layers.linear import ReplicatedLinear
+    from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+    try:
+        router = model.get_submodule(prefix)
+    except AttributeError:
+        return
+    if not isinstance(router, ReplicatedLinear) or isinstance(
+        router.quant_method, UnquantizedLinearMethod
+    ):
+        return
+    parent_name, _, child = prefix.rpartition(".")
+    with torch.device(next(router.parameters()).device):
+        unquantized = ReplicatedLinear(
+            router.input_size,
+            router.output_size,
+            bias=router.bias is not None,
+            params_dtype=router.params_dtype,
+            quant_config=None,
+            prefix=prefix,
+        )
+    setattr(model.get_submodule(parent_name), child, unquantized)
+    for key in [k for k in params_dict if k.startswith(prefix + ".")]:
+        del params_dict[key]
+    params_dict.update(
+        {f"{prefix}.{k}": v for k, v in unquantized.named_parameters(recurse=False)}
+    )
