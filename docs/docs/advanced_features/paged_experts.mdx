@@ -255,7 +255,7 @@ Ways to give the experts more memory:
 
 - a shorter `--context-length` or `--max-total-tokens`, if your requests are shorter than the
   model's context, or fewer `--max-running-requests`;
-- `--kv-cache-dtype fp8`, which halves the KV cache's cost per token;
+- `--kv-cache-dtype fp8_e4m3`, which halves the KV cache's cost per token;
 - a larger `--mem-fraction-static`, if the GPU has activation memory to spare.
 
 `auto` cannot be combined with `--enable-memory-saver`, `--enable-lora`,
