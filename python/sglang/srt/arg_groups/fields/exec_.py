@@ -48,6 +48,13 @@ def _paged_experts_num_resident(value: str) -> Optional[int]:
     )
 
 
+def _parse_attention_backend_arg(value: str) -> str:
+    """Reject the retired alias before argparse checks supported choices."""
+    if value == "compressed":
+        raise argparse.ArgumentTypeError("compressed was removed; use dsv4")
+    return value
+
+
 class ExecFeatures(msgspec.Struct):
     """Namespace ``exec.features``."""
 
@@ -223,6 +230,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for attention layers.",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -231,6 +239,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for decode attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None
@@ -251,6 +260,7 @@ class ExecKernel(msgspec.Struct):
         Arg(
             help="Choose the kernels for prefill attention layers (have priority over --attention-backend).",
             choices=ATTENTION_BACKEND_CHOICES,
+            type_parser=_parse_attention_backend_arg,
             resolvable=True,
         ),
     ] = None

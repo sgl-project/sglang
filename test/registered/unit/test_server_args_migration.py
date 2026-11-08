@@ -5,6 +5,8 @@ translates field annotations into argparse arguments.
 """
 
 import argparse
+import contextlib
+import io
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -191,6 +193,23 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     args = self.parser.parse_args(["--model", "dummy", flag])
                 self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
                 self.assertEqual(vars(args), baseline)
+
+    def test_retired_compressed_backend_names_its_replacement(self):
+        """The removed `compressed` alias stops the launch with a message naming
+        `dsv4`, not argparse's generic invalid-choice list."""
+        for flag in (
+            "--attention-backend",
+            "--decode-attention-backend",
+            "--prefill-attention-backend",
+        ):
+            with self.subTest(flag=flag):
+                stderr = io.StringIO()
+                with contextlib.redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit):
+                        self.parser.parse_args(["--model", "dummy", flag, "compressed"])
+                self.assertIn("compressed was removed; use dsv4", stderr.getvalue())
+                args = self.parser.parse_args(["--model", "dummy", flag, "dsv4"])
+                self.assertEqual(getattr(args, flag[2:].replace("-", "_")), "dsv4")
 
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
