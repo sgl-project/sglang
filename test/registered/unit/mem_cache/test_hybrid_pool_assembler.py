@@ -1546,10 +1546,14 @@ class TestFusedDraftHiCacheValidation(CustomTestCase):
         region = DenseDraftRegion(
             lane_num=1, head_num=2, head_dim=4, store_dtype=torch.float16
         )
-        for host in ("full", "swa"):
+        # The pool's window states no length: its sub-pool is "window", which
+        # hosts as a window.
+        for host in ("full", "window"):
             with self.subTest(host=host):
                 placement = FusedDraftPlacement.from_counts(
-                    counts={host: [1]}, regions={host: region}
+                    counts={host: [1]},
+                    regions={host: region},
+                    hosted={"window": "swa"} if host == "window" else None,
                 )
                 bundle = _build_unified_swa_pool(fused_draft=placement)
                 draft = DraftMHAView(
@@ -1981,6 +1985,34 @@ class TestMambaSwaStackMatchesOtherStacks(CustomTestCase):
                 ),
             ):
                 self.assertEqual(hybrid_pool_assembler._state_host_layout(), expected)
+
+
+class TestHostLoadEvictsTheTargetWindowOnly(CustomTestCase):
+    """A host load of the target window evicts only the target's shortfall,
+    from the target's entries: a fused draft's own window, which a target
+    load never writes, keeps its entries."""
+
+    def test_a_short_target_beside_a_draft_window(self):
+        evicted = []
+        allocator = SimpleNamespace(
+            storage=SimpleNamespace(
+                plan=SimpleNamespace(
+                    primary_window=lambda: SimpleNamespace(name="window_4096")
+                )
+            ),
+            swa_available_size=lambda: 10,
+            window_pool_names=lambda: ("window_4096", "window_128"),
+        )
+        cache = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            evict_for_alloc=lambda params: evicted.append(params),
+        )
+        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 16)
+        self.assertEqual(len(evicted), 1)
+        self.assertEqual(evicted[0].window_num_tokens, {"window_4096": 6})
+        evicted.clear()
+        hybrid_pool_assembler._evict_swa_for_device_alloc(cache, 10)
+        self.assertEqual(evicted, [])
 
 
 if __name__ == "__main__":
