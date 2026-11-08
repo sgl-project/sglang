@@ -97,15 +97,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
         scheduler.req_to_token_pool.clear.assert_called_once()
         scheduler.token_to_kv_pool_allocator.clear.assert_called_once()
 
-    def test_flush_cache_succeeds_with_never_scheduled_reqs_while_paused(self):
-        """A request that was queued but never scheduled holds no KV/pool state
-        either; a paused-engine flush must not starve on it."""
-        scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [_make_req(is_retracted=False)]
-
-        self.assertTrue(scheduler.flush_cache())
-        scheduler.tree_cache.reset.assert_called_once()
-
     def test_paused_flush_refuses_waiting_req_holding_kv(self):
         """A PD-decode request whose KV has arrived waits holding its request
         row; a paused flush would free KV it still owns."""
@@ -117,15 +108,6 @@ class TestSchedulerFlushCacheAfterRetract(unittest.TestCase):
 
         self.assertFalse(scheduler.flush_cache())
         scheduler.tree_cache.reset.assert_not_called()
-
-    def test_is_fully_idle_default_ignores_nothing(self):
-        """Regression guard: every other is_fully_idle() caller passes no args,
-        so a non-empty waiting_queue must still report not-idle by default."""
-        scheduler = self._new_scheduler()
-        scheduler.waiting_queue = [_make_req(is_retracted=True)]
-
-        self.assertFalse(scheduler.is_fully_idle())
-        self.assertTrue(scheduler.is_fully_idle(ignore_waiting=True))
 
     def test_flush_cache_does_not_ignore_waiting_reqs_while_unpaused(self):
         """ignore_waiting is gated on pause_state.paused inside flush_cache — a

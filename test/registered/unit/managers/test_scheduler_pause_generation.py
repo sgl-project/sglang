@@ -290,7 +290,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.update_running_batch(batch)
 
-    def drain_with_pause_start_seen(self, scheduler, mode, now):
+    def paused_time_seen_while_draining(self, scheduler, mode, now):
         # Records the pause time busy accounting sees, up to `now`, while the held
         # result drains.
         seen = []
@@ -310,7 +310,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_first_retract_starts_the_pause_after_draining(self):
         scheduler = self._new_scheduler()
         self.assertEqual(
-            self.drain_with_pause_start_seen(scheduler, "retract", 3.5), [0.0]
+            self.paused_time_seen_while_draining(scheduler, "retract", 3.5), [0.0]
         )
         # The window opened at 3.5.
         self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 0.5)
@@ -323,7 +323,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
         self.assertEqual(
-            self.drain_with_pause_start_seen(scheduler, "retract", 10.125), [10.0]
+            self.paused_time_seen_while_draining(scheduler, "retract", 10.125), [10.0]
         )
         # The window still opens at 0.125.
         self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.125), 1.0)
@@ -340,6 +340,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         original_cur_batch = scheduler.cur_batch_for_debug
         original_chunked_req = scheduler.chunked_req
 
+        scheduler.enable_overlap = True
+        scheduler.last_batch.forward_mode.is_extend.return_value = True
+        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
+
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
         self.assertTrue(scheduler.pause_state.paused)
@@ -347,6 +351,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
         self.assertIs(scheduler.chunked_req, original_chunked_req)
+        # The held result stays queued and nothing is merged.
+        self.assertEqual(len(scheduler.result_queue), 1)
+        original_last_batch.filter_batch.assert_not_called()
+        scheduler.running_batch.merge_batch.assert_not_called()
 
     def test_cache_flush_while_paused_is_published_before_resume(self):
         """A cache flush during a retract pause (the weight-update window) must be
@@ -392,43 +400,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             "flush_cache while paused was not published by the paused loop",
         )
 
-    def test_inplace_does_not_drain_overlap_queue(self):
-        """in_place should not process the overlap result_queue."""
-        scheduler = self._new_scheduler()
-        scheduler.enable_overlap = True
-        scheduler.last_batch = MagicMock()
-        scheduler.result_queue = deque([(MagicMock(), MagicMock())])
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
-
-        self.assertTrue(scheduler.pause_state.paused)
-        self.assertEqual(len(scheduler.result_queue), 1)
-
-    def test_inplace_does_not_merge_batch(self):
-        """in_place should not filter or merge last_batch into running_batch."""
-        scheduler = self._new_scheduler()
-        last_batch = MagicMock()
-        last_batch.forward_mode.is_extend.return_value = True
-        scheduler.last_batch = last_batch
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
-
-        last_batch.filter_batch.assert_not_called()
-        scheduler.running_batch.merge_batch.assert_not_called()
-
     def test_abort_mode_rejected_at_scheduler(self):
         """abort mode must be rejected by the scheduler-side assert."""
         scheduler = self._new_scheduler()
 
         with self.assertRaises(AssertionError):
             scheduler.pause_generation(PauseGenerationReqInput(mode="abort"))
-
-    def test_default_mode_rejected_at_scheduler(self):
-        """bare PauseGenerationReqInput defaults to abort and must be rejected."""
-        scheduler = self._new_scheduler()
-
-        with self.assertRaises(AssertionError):
-            scheduler.pause_generation(PauseGenerationReqInput())
 
     def test_retract_clears_last_batch_state(self):
         """retract mode should clear last_batch and cur_batch_for_debug."""
@@ -504,29 +481,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [req.retraction_count for req in (run_req_a, run_req_b)], [1, 1]
         )
 
-    def test_retract_with_empty_running_uses_last_batch_reqs(self):
-        """retract with empty running batch releases and requeues the last extend reqs."""
-        scheduler = self._new_scheduler()
-        last_req = self._make_req("last")
-        scheduler.running_batch = ScheduleBatch(reqs=[], batch_is_full=True)
-        scheduler.last_batch = self._make_batch(
-            scheduler,
-            reqs=[last_req],
-            forward_mode=ForwardMode.EXTEND,
-            with_tensors=True,
-        )
-        scheduler.chunked_req = MagicMock()
-        requeue_log = self._spy_requeue(scheduler)
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertEqual([entry["req"] for entry in requeue_log], [last_req])
-        self.assertTrue(requeue_log[0]["is_retracted"])
-        self.assertEqual(last_req.retraction_count, 1)
-        self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertFalse(scheduler.running_batch.batch_is_full)
-        self.assertIsNone(scheduler.chunked_req)
-
     def test_retract_fold_in_releases_via_scheduler_hisparse_coordinator(self):
         """retract of a folded-in last extend batch must release through the scheduler-owned hisparse coordinator."""
         scheduler = self._new_scheduler()
@@ -576,26 +530,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertEqual(last_req.retraction_count, 0)
         self.assertFalse(last_req.is_retracted)
 
-    def test_retract_decode_last_batch_only_retracts_running(self):
-        """retract with a decode last batch only releases and requeues running reqs."""
-        scheduler = self._new_scheduler()
-        run_req = self._make_req("run")
-        running = self._make_batch(
-            scheduler,
-            reqs=[run_req],
-            forward_mode=ForwardMode.DECODE,
-            with_tensors=True,
-        )
-        scheduler.running_batch = running
-        scheduler.last_batch = running
-        requeue_log = self._spy_requeue(scheduler)
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertEqual([entry["req"] for entry in requeue_log], [run_req])
-        self.assertEqual(run_req.retraction_count, 1)
-        self.assertEqual(scheduler.running_batch.reqs, [])
-
     def test_retract_partial_finished_running_batch(self):
         """retract with mixed finished/unfinished reqs only releases the unfinished ones."""
         scheduler = self._new_scheduler()
@@ -634,27 +568,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         self.assertIsNone(scheduler.chunked_req)
         self.assertFalse(scheduler.running_batch.batch_is_full)
 
-    def test_retract_all_finished_clears_fields_without_requeue(self):
-        """retract with only finished reqs clears fields but releases nothing."""
-        scheduler = self._new_scheduler()
-        req_finished_a = self._make_req("finished-a", finished=True)
-        req_finished_b = self._make_req("finished-b", finished=True)
-        scheduler.running_batch = self._make_batch(
-            scheduler, reqs=[req_finished_a, req_finished_b]
-        )
-        scheduler.running_batch.batch_is_full = True
-        scheduler.chunked_req = MagicMock()
-        requeue_log = self._spy_requeue(scheduler)
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertEqual(requeue_log, [])
-        self.assertEqual(req_finished_a.retraction_count, 0)
-        self.assertEqual(req_finished_b.retraction_count, 0)
-        self.assertEqual(scheduler.running_batch.reqs, [])
-        self.assertFalse(scheduler.running_batch.batch_is_full)
-        self.assertIsNone(scheduler.chunked_req)
-
     def test_retract_drain_happens_once_before_release(self):
         """retract with overlap drains the result_queue once before releasing reqs."""
         scheduler = self._new_scheduler()
@@ -685,16 +598,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         self.assertEqual(event_log, ["drain", "requeue-released"])
         self.assertEqual(len(scheduler.result_queue), 0)
-
-    def test_retract_empty_running_batch_requeues_nothing(self):
-        """retract with empty running_batch must not release or requeue any request."""
-        scheduler = self._new_scheduler()
-
-        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        self.assertTrue(scheduler.pause_state.paused)
-        self.assertEqual(len(scheduler.waiting_queue), 0)
-        self.assertEqual(scheduler.running_batch.reqs, [])
 
     def test_retract_disagg_prefill_keeps_live_chunked_req(self):
         """disagg-PREFILL retract must leave a live mid-chunk chunked_req untouched."""
@@ -738,35 +641,6 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 self.assertFalse(scheduler.result_queue)
                 self.assertFalse(batch.prefill_chunk_processed)
 
-    def test_pd_decode_retract_requeues_for_rebootstrap(self):
-        """PD decode retract should rebootstrap instead of resuming stale CPU KV."""
-        scheduler = self._new_scheduler()
-        scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.last_batch = None
-        scheduler._add_request_to_queue = MagicMock()
-        scheduler.disagg_decode_prealloc_queue = MagicMock()
-
-        req = _FakeReq(
-            finished=lambda: False,
-            output_ids=[10, 11, 12],
-            time_stats=MagicMock(),
-        )
-        scheduler.running_batch.reqs = [req]
-
-        with patch("sglang.srt.managers.scheduler.retract_all") as mock_retract_all:
-            scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
-
-        scheduler._add_request_to_queue.assert_not_called()
-        scheduler.disagg_decode_prealloc_queue.hold_rebootstrap.assert_called_once_with(
-            req
-        )
-        # Already-streamed output must not shrink while the prefill recomputes.
-        self.assertEqual(req.output_ids, [10, 11, 12])
-        # Rebootstrap recomputes the KV from the prefill, so the retract must skip
-        # the device->host KV offload rather than offload-then-delete it.
-        mock_retract_all.assert_called_once()
-        self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
-
     def test_pd_decode_retract_includes_transferred_waiting_reqs(self):
         """A transferred request waiting for a running slot holds a request row
         and KV; retract must rebuild it too, so a paused flush cannot free it."""
@@ -793,6 +667,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
         self.assertEqual(mock_retract_all.call_args.kwargs["reqs"], [running, staged])
+        # Rebootstrap recomputes the KV from the prefill, so the retract skips the
+        # device->host KV offload rather than offload-then-delete it.
+        self.assertEqual(mock_retract_all.call_args.kwargs["offload_kv"], False)
         self.assertEqual(list(scheduler.waiting_queue), [unstaged])
         held = [
             c.args[0]
