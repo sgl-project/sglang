@@ -72,6 +72,13 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     snapshot_chain,
 )
 from sglang.srt.mem_cache.kv.alloc.signals import NetworkWaiter
+from sglang.srt.mem_cache.kv.alloc.stage_capacity import (
+    StageCapacity,
+    StageGeometry,
+    check_stage_pools,
+    simulated_snapshot,
+    stage_geometry,
+)
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
@@ -86,6 +93,11 @@ _GROWTH_DECAY = 16
 _GROWTH_SCALE = 64
 
 logger = logging.getLogger(__name__)
+
+
+def _units_key(demands: Mapping[str, int]) -> Tuple[Tuple[str, int], ...]:
+    """A demand of units per band as a question pipeline stages compare."""
+    return tuple(sorted(demands.items()))
 
 
 def _one_operation(method):
@@ -116,6 +128,8 @@ class _ScopedPhysicalTakes:
         self.demands = {name: n for name, n in demands.items() if n > 0}
         # Make the rearrangement this reservation needs before any take is
         # issued, so the takes then fit in place, in whatever order they come.
+        # Under pipeline stages, which decide on snapshots that fix no page, none is
+        # fixed here: a host load's reservation ends inside the scope that took it.
         if not allocator.lay_out_for(self.demands):
             raise RuntimeError(
                 "physical reservation needs reclamation before its scope"
@@ -238,6 +252,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     plan = None
     request_memory = None
     retained_windows: Optional[Dict[str, int]] = None
+    # Under pipeline parallelism, every stage's geometry, which every capacity
+    # question is asked of (`install_stage_capacity`); None on a single stage.
+    stage_capacity: Optional[StageCapacity] = None
+    # Every stage's simulated snapshot, kept until the capacity epoch moves.
+    _stage_memo: Tuple[Optional[int], Tuple[ChainSnapshot, ...]] = (None, ())
 
     # Base init writes `self.size`; the chain computes its capacity.
     @property
@@ -523,46 +542,185 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _cap_full_available(self, tokens):
         return self.full_attn_allocator.cap_available(tokens)
 
+    # -- pipeline stages --
+    #
+    # Every stage holds the same units in its own arena and asks each capacity
+    # question of every stage's simulated snapshot, so every stage decides alike.
+
+    def stage_geometry(self) -> StageGeometry:
+        """This stage's arena bytes and bands, as every stage prices them."""
+        id_owners = tuple(
+            band.sub_pool_name
+            for band in (self.full_attn_allocator, self.mamba_allocator)
+            if band is not None
+        )
+        return stage_geometry(
+            self.pricing_snapshot(),
+            id_owners=id_owners,
+            window_tokens=self._size_swa,
+        )
+
+    def _stage_pools(self) -> Tuple[Tuple[str, ...], int]:
+        return tuple(sorted(band.sub_pool_name for band in self.bands)), self.page_size
+
+    def agree_on_stage_shares(self, group) -> None:
+        """Every stage in ``group`` joins, whatever its bands: all must plan the same
+        sub-pools, then with a window each keeps the smallest FULL and window shares,
+        so request limits and the HiCache host pools sized from them agree."""
+        every = [None] * torch.distributed.get_world_size(group)
+        torch.distributed.all_gather_object(
+            every,
+            (self._stage_pools(), self._size_full, self._size_swa),
+            group=group,
+        )
+        check_stage_pools([pools for pools, _, _ in every])
+        if self._windows:
+            self._size_full = min(full for _, full, _ in every)
+            self._size_swa = min(window for _, _, window in every)
+            self._size_window_host_pools()
+
+    def install_stage_capacity(
+        self,
+        stage: int,
+        geometries: Sequence[StageGeometry],
+        *,
+        checks: bool = False,
+    ) -> None:
+        """Answer capacity questions as stage ``stage`` of ``geometries`` (stage order),
+        asking every stage; each keeps the smallest nominal window share."""
+        if geometries[stage] != self.stage_geometry():
+            raise ValueError(f"stage {stage}'s geometry is not this chain's")
+        check_stage_pools([(g.sub_pools(), g.page_size) for g in geometries])
+        if self._windows:
+            self._size_swa = min(geometry.window_tokens for geometry in geometries)
+        self.stage_capacity = StageCapacity(stage, geometries, checks=checks)
+        self._stage_memo = (None, ())
+
+    def _logical_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """Live pages per band, and virtual pages in use per id owner: what
+        every stage holds alike."""
+        live = {
+            band.sub_pool_name: band.allocated_count() // band.page_size
+            for band in self.bands
+        }
+        used = {
+            band.sub_pool_name: band.ids.num_virtual_ids
+            - band.min_page_index
+            - len(band.free_virtual_ids)
+            for band in (self.full_attn_allocator, self.mamba_allocator)
+            if band is not None
+        }
+        return live, used
+
+    def _stage_snapshots(self) -> Tuple[ChainSnapshot, ...]:
+        """The snapshots each capacity question is asked of: the pricing snapshot on a
+        single stage, else every stage's simulated snapshot, in stage order."""
+        capacity = self.stage_capacity
+        if capacity is None:
+            return (self.pricing_snapshot(),)
+        key = self._snapshot_key_now()
+        if self._stage_memo[0] != key:
+            live, used = self._logical_counts()
+            self._stage_memo = (
+                key,
+                tuple(
+                    simulated_snapshot(geometry, live, used)
+                    for geometry in capacity.geometries
+                ),
+            )
+        return self._stage_memo[1]
+
+    def _ask(
+        self,
+        op: str,
+        key: Callable[[], Any],
+        on_stage: Callable[[ChainSnapshot], Any],
+        combine: Callable = all,
+    ):
+        """Question ``(op, key())`` answered by ``on_stage`` on the pricing snapshot,
+        or under pipeline stages ``combine`` of its answers on every stage's
+        snapshot; ``key`` is built only for the stages' digest."""
+        capacity = self.stage_capacity
+        if capacity is None:
+            return on_stage(self.pricing_snapshot())
+        answer = combine(on_stage(s) for s in self._stage_snapshots())
+        if capacity.checks:
+            capacity.note(op, key(), answer)
+        return answer
+
+    def _decided_take(self, demands: Dict[str, int]) -> Optional[bool]:
+        """Whether a take of ``demands`` (units per band) succeeds on every pipeline
+        stage; None on a single stage, where the take itself decides."""
+        if self.stage_capacity is None:
+            return None
+        demands = {n: d for n, d in demands.items() if d > 0}
+        return self._ask(
+            "take",
+            lambda: _units_key(demands),
+            lambda s: self._units_fit_on(s, demands),
+        )
+
+    def _refused_decided_take(self, decided: Optional[bool], demands) -> None:
+        # The only fixed pages under pipeline stages are a host load's reservation,
+        # held only inside its own scope, which laid out every take of that load.
+        if decided:
+            raise RuntimeError(
+                f"this pipeline stage cannot take {demands}, which every "
+                "stage decided it takes"
+            )
+
+    def stage_counts(self) -> Tuple[Dict[str, int], Dict[str, int]]:
+        """The units every stage holds alike (`_logical_counts`)."""
+        return self._logical_counts()
+
     # -- capacity questions --
     #
     # Sub-pools share bytes and demands mix per-token and per-request units, so
     # decisions ask the demand itself; the scalar reads below are observer estimates.
 
     def units_fit(self, demands: Dict[str, int]) -> bool:
-        """Whether a take of these units (pages of a token sub-pool, slots of
-        the state sub-pool) succeeds now, by the take's own checks."""
-        owner = self.full_attn_allocator
-        owner_pages = demands.get(owner.sub_pool_name, 0)
-        if owner_pages > len(owner.free_virtual_ids):
+        """Whether a take of these units (pages of a token sub-pool, slots of the
+        state sub-pool) succeeds now by the take's own checks, on every PP stage."""
+        return self._ask(
+            "units_fit",
+            lambda: _units_key(demands),
+            lambda snapshot: self._units_fit_on(snapshot, demands),
+        )
+
+    def _units_fit_on(self, snapshot: ChainSnapshot, demands: Dict[str, int]) -> bool:
+        owner = snapshot.band(self.full_attn_allocator.sub_pool_name)
+        owner_pages = demands.get(owner.name, 0)
+        if owner_pages > owner.free_virtual_pages:
             return False
         if self._full_cap_reclaim(owner_pages * self.page_size):
             return False
         # A window binds the owner's virtual pages: it can never hold more.
-        bound = owner.ids.num_virtual_ids - owner.min_page_index
+        bound = owner.num_virtual_pages - owner.min_page
         if any(demands.get(w.sub_pool_name, 0) > bound for w in self._windows):
             return False
         state = self.mamba_allocator
-        if state is not None and demands.get(state.sub_pool_name, 0) > len(
-            state.free_virtual_ids
+        if (
+            state is not None
+            and demands.get(state.sub_pool_name, 0)
+            > snapshot.band(state.sub_pool_name).free_virtual_pages
         ):
             return False
-        return feasible(
-            self.pricing_snapshot(), {n: d for n, d in demands.items() if d > 0}
-        )
-
-    def _id_bound(self, band: Band) -> int:
-        """Units a sub-pool's demand can never exceed: its id owner's room."""
-        if band is self.mamba_allocator:
-            return len(band.free_virtual_ids)
-        owner = self.full_attn_allocator
-        if band is owner:
-            return len(owner.free_virtual_ids)
-        return owner.ids.num_virtual_ids - owner.min_page_index
+        return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
 
     def _estimated_pages(self, names: Tuple[str, ...]) -> int:
         """Pages each of ``names`` could take together by free bytes, index space, id
         room and FULL cap; it ignores alignment, fixed and pending pages, so may err."""
-        snapshot = self.pricing_snapshot()
+        # The least over every stage's simulated snapshot, so every stage agrees.
+        return min(
+            self._estimated_pages_on(snapshot, names)
+            for snapshot in self._stage_snapshots()
+        )
+
+    def _estimated_pages_on(
+        self, snapshot: ChainSnapshot, names: Tuple[str, ...]
+    ) -> int:
+        owner_name = self.full_attn_allocator.sub_pool_name
+        owner_snap = snapshot.band(owner_name)
         # Every band's first page lies past the padding sink.
         sink = min(b.min_page * b.page_bytes for b in snapshot.bands)
         free_bytes = (
@@ -573,8 +731,13 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         named = [snapshot.bands[snapshot.index(name)] for name in names]
         pages = max(0, free_bytes) // sum(b.page_bytes for b in named)
         for b in named:
-            band = self.bands[self._band_positions[b.name]]
-            pages = min(pages, b.num_pages - b.min_page - b.live, self._id_bound(band))
+            # Its id owner's room: an owner's own free ids; a window binds
+            # the token owner's.
+            if b.name in self.window_pool_names():
+                id_room = owner_snap.num_virtual_pages - owner_snap.min_page
+            else:
+                id_room = b.free_virtual_pages
+            pages = min(pages, b.num_pages - b.min_page - b.live, id_room)
         owner = self.full_attn_allocator
         if owner.sub_pool_name in names and owner.max_live_tokens is not None:
             room = max(0, owner.max_live_tokens - owner.allocated_count())
@@ -670,13 +833,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def owner_tokens_only_owner_frees_serve(self, owner_pages: int) -> int:
         """Of a take of ``owner_pages`` owner pages, the tokens only freeing owner
-        tokens makes room for (past the FULL live-token cap or the owner's free
-        ids), so an eviction can count them before it walks."""
-        owner = self.full_attn_allocator
-        short_ids = max(0, owner_pages - len(owner.free_virtual_ids))
-        return max(
-            self._full_cap_reclaim(owner_pages * self.page_size),
-            short_ids * self.page_size,
+        tokens makes room for (past the FULL live-token cap or the owner's free ids,
+        the most over PP stages), so an eviction can count them before it walks."""
+        owner = self.full_attn_allocator.sub_pool_name
+
+        def on_stage(snapshot: ChainSnapshot) -> int:
+            short_ids = max(0, owner_pages - snapshot.band(owner).free_virtual_pages)
+            return max(
+                self._full_cap_reclaim(owner_pages * self.page_size),
+                short_ids * self.page_size,
+            )
+
+        return self._ask(
+            "owner_frees_serve", lambda: owner_pages, on_stage, combine=max
         )
 
     def window_pool_names(self) -> Tuple[str, ...]:
@@ -726,58 +895,95 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         sub-pool, slots for state) are evicted, or in an empty pool. Every
         admission question asks this, so an admitted demand is one the take
         serves. Token counts may be fractional expected values."""
-        full_tokens = demand.full_tokens
         window_tokens = dict(demand.window_tokens)
-        state_slots = demand.state_slots
         if set(window_tokens) != set(self.window_pool_names()):
             raise ValueError(
                 f"admission must name every window: got {sorted(window_tokens)}, "
                 f"the pool keeps {sorted(self.window_pool_names())}"
             )
-        if full_tokens < 0 or any(t < 0 for t in window_tokens.values()):
-            return False
         evictable = {} if empty_pool or evictable is None else evictable
-        owner = self.full_attn_allocator
+        units = self._admission_units(demand, evictable, empty_pool)
+
+        def key():
+            return (
+                demand.full_tokens,
+                tuple(sorted(window_tokens.items())),
+                demand.state_slots,
+                tuple(sorted(evictable.items())),
+                empty_pool,
+            )
+
+        if units is None:
+            return self._ask("admits", key, lambda snapshot: False)
+        demands, reclaim = units
+        return self._ask(
+            "admits",
+            key,
+            lambda snapshot: self._admits_on(
+                snapshot, demand.state_slots, demands, reclaim, empty_pool
+            ),
+        )
+
+    def _admission_units(
+        self, demand: KVDemand, evictable: Dict[str, int], empty_pool: bool
+    ) -> Optional[Tuple[Dict[str, int], Dict[str, int]]]:
+        """The units ``demand`` takes and those ``evictable`` frees, per band;
+        None when it fits no stage (negative counts, the FULL cap)."""
+        full_tokens = demand.full_tokens
+        if full_tokens < 0 or any(t < 0 for t in demand.window_tokens.values()):
+            return None
+        owner = self.full_attn_allocator.sub_pool_name
         # Expected decode lengths may be fractional; a page holds whole tokens.
         full_tokens = math.ceil(full_tokens)
         if self._full_cap_reclaim(full_tokens, empty_pool=True):
-            return False
+            return None
         if self._full_cap_reclaim(full_tokens, empty_pool=empty_pool) > evictable.get(
-            owner.sub_pool_name, 0
+            owner, 0
         ):
-            return False
+            return None
         page = self.page_size
-        demands = {owner.sub_pool_name: -(-full_tokens // page)}
-        reclaim = {owner.sub_pool_name: evictable.get(owner.sub_pool_name, 0) // page}
-        owner_pages = owner.ids.num_virtual_ids - owner.min_page_index
-        for window in self._windows:
-            name = window.sub_pool_name
-            demands[name] = -(-math.ceil(window_tokens[name]) // page)
-            # A window binds the owner's virtual pages: it can never hold more.
-            if demands[name] > owner_pages:
-                return False
+        demands = {owner: -(-full_tokens // page)}
+        reclaim = {owner: evictable.get(owner, 0) // page}
+        for name in self.window_pool_names():
+            demands[name] = -(-math.ceil(demand.window_tokens[name]) // page)
             reclaim[name] = evictable.get(name, 0) // page
+        state = self.mamba_allocator
+        if state is not None:
+            demands[state.sub_pool_name] = int(demand.state_slots)
+            reclaim[state.sub_pool_name] = int(evictable.get(state.sub_pool_name, 0))
+        return demands, reclaim
+
+    def _admits_on(
+        self,
+        snapshot: ChainSnapshot,
+        state_slots,
+        demands: Dict[str, int],
+        reclaim: Dict[str, int],
+        empty_pool: bool,
+    ) -> bool:
+        """`admits` on one stage's ``snapshot``: its ids, then its layout."""
+        owner = snapshot.band(self.full_attn_allocator.sub_pool_name)
+        owner_pages = owner.num_virtual_pages - owner.min_page
+        # A window binds the owner's virtual pages: it can never hold more.
+        if any(demands[name] > owner_pages for name in self.window_pool_names()):
+            return False
         free_ids = (
             owner_pages
             if empty_pool
-            else len(owner.free_virtual_ids) + reclaim[owner.sub_pool_name]
+            else owner.free_virtual_pages + reclaim[owner.name]
         )
-        if demands[owner.sub_pool_name] > free_ids:
+        if demands[owner.name] > free_ids:
             return False
-        state = self.mamba_allocator
-        if state is not None:
-            demands[state.sub_pool_name] = int(state_slots)
-            reclaim[state.sub_pool_name] = int(evictable.get(state.sub_pool_name, 0))
+        if self.mamba_allocator is not None:
+            state = snapshot.band(self.mamba_allocator.sub_pool_name)
             free_slots = (
-                state.ids.num_virtual_ids - state.min_page_index
+                state.num_virtual_pages - state.min_page
                 if empty_pool
-                else len(state.free_virtual_ids) + reclaim[state.sub_pool_name]
+                else state.free_virtual_pages + reclaim[state.name]
             )
             if state_slots > free_slots:
                 return False
-        snapshot = reclaimed_snapshot(
-            self.pricing_snapshot(), reclaim, empty_pool=empty_pool
-        )
+        snapshot = reclaimed_snapshot(snapshot, reclaim, empty_pool=empty_pool)
         return feasible(snapshot, {n: d for n, d in demands.items() if d > 0})
 
     def prealloc_ceiling_fits(self, demand: KVDemand) -> bool | None:
@@ -1302,10 +1508,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         no reachable layout serves the demand. With ``window_tail_pages`` (naming
         every window), each window binds only the last that many new pages."""
         owner = self.full_attn_allocator
-        if self._full_cap_reclaim(full_tokens) or num_owner_pages > len(
-            owner.free_virtual_ids
-        ):
-            return None
         demands = {owner.sub_pool_name: num_owner_pages}
         for window in self._windows:
             demands[window.sub_pool_name] = (
@@ -1313,10 +1515,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 if window_tail_pages is None
                 else window_tail_pages[window.sub_pool_name]
             )
+        decided = self._decided_take(demands)
+        if decided is False:
+            return None
+        if self._full_cap_reclaim(full_tokens) or num_owner_pages > len(
+            owner.free_virtual_ids
+        ):
+            self._refused_decided_take(decided, demands)
+            return None
         physical = self._plan_and_take(
             demands, bind_at_frontier=True, consumer=consumer
         )
         if physical is None:
+            self._refused_decided_take(decided, demands)
             return None
         # free_virtual_ids is rebound (slice/cat), never mutated in place, so
         # this prefix view still names the pages the owner is about to consume.
@@ -1767,14 +1978,18 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         state = self.mamba_allocator
         if need_size <= 0:
             return torch.empty(0, dtype=torch.int64, device=self.device)
+        demands = {state.sub_pool_name: need_size}
+        decided = self._decided_take(demands)
+        if decided is False:
+            return None
         if need_size > len(state.free_virtual_ids):
+            self._refused_decided_take(decided, demands)
             return None
         physical = self._plan_and_take(
-            {state.sub_pool_name: need_size},
-            bind_at_frontier=True,
-            consumer=Consumer.SCHEDULE_COPY,
+            demands, bind_at_frontier=True, consumer=Consumer.SCHEDULE_COPY
         )
         if physical is None:
+            self._refused_decided_take(decided, demands)
             return None
         slots = state.free_virtual_ids[:need_size]
         pages = physical[state.sub_pool_name]

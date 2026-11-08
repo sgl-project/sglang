@@ -484,7 +484,14 @@ class TestChainRealize(CustomTestCase):
             units = {}
             for band in allocator.bands:
                 name = band.sub_pool_name
-                bound = allocator._id_bound(band)
+                # Its id owner's room: an owner's own free ids; a window
+                # binds the token owner's.
+                owner = allocator.full_attn_allocator
+                bound = (
+                    len(band.free_virtual_ids)
+                    if band.is_id_owner
+                    else owner.ids.num_virtual_ids - owner.min_page_index
+                )
                 largest = max(
                     n
                     for n in range(bound + 2)
