@@ -63,7 +63,7 @@ def _layer():
     )
 
 
-def _backend(conv_pool, ssm_pool):
+def _backend(conv_pool, ssm_pool, *, fp32_snapshots=False):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
     backend.state_pool = None
@@ -87,6 +87,7 @@ def _backend(conv_pool, ssm_pool):
     backend._mamba_chunk_size = CHUNK
     backend.conv_states_shape = conv_pool.shape
     backend.accept_lens_pool = None
+    backend.enable_fp32_prefix_snapshots = fp32_snapshots
     backend.prefill_graph_metadata = None
     backend.kernel_dispatcher = GDNKernelDispatcher(
         LinearAttnKernelBackend.TRITON,
@@ -188,6 +189,7 @@ class TestGDNPrefillGraph(CustomTestCase):
             num_tokens=BUCKET,
             max_seqs_cap=MAX_SEQS,
             track=True,
+            fp32_snapshots=self.backend.enable_fp32_prefix_snapshots,
             cache_index_dtype=torch.int32,
             device=torch.device("cuda"),
         )
@@ -248,6 +250,64 @@ class TestGDNPrefillGraph(CustomTestCase):
         self.assertTrue(bool((out[:, total:] == 0).all()), "padded rows not zeroed")
         self.assertTrue(torch.equal(self.conv_pool, ref_conv), "conv pool differs")
         self.assertTrue(torch.equal(self.ssm_pool, ref_ssm), "ssm pool differs")
+
+    def test_fp32_boundary_snapshot(self) -> None:
+        for fp32_snapshots in (False, True):
+            with self.subTest(fp32_snapshots=fp32_snapshots):
+                self._setup(torch.float32)
+                self.backend.enable_fp32_prefix_snapshots = fp32_snapshots
+                torch.manual_seed(23)
+                self.conv_pool[1].zero_()
+                self.ssm_pool[1].zero_()
+                self.mixed.normal_()
+                self.a.normal_()
+                self.b.normal_()
+
+                reference_conv = self.conv_pool.clone()
+                reference_ssm = self.ssm_pool.clone()
+                reference_backend = _backend(reference_conv, reference_ssm)
+                reference_batch = _batch([CHUNK], [0])
+                reference_backend.init_forward_metadata(reference_batch)
+                reference_backend.forward_extend(
+                    self.layer,
+                    reference_batch,
+                    self.mixed[:CHUNK],
+                    self.a[:CHUNK],
+                    self.b[:CHUNK],
+                )
+                expected_snapshot = reference_ssm[1]
+                self.assertFalse(
+                    torch.equal(expected_snapshot, expected_snapshot.bfloat16().float())
+                )
+
+                if not fp32_snapshots:
+                    expected_snapshot = expected_snapshot.bfloat16().float()
+
+                tracked_batch = _batch([CHUNK + 1], [0], track={0: CHUNK + 1})
+                eager_conv = self.conv_pool.clone()
+                eager_ssm = self.ssm_pool.clone()
+                eager_backend = _backend(
+                    eager_conv, eager_ssm, fp32_snapshots=fp32_snapshots
+                )
+                eager_backend.init_forward_metadata(tracked_batch)
+                eager_backend.forward_extend(
+                    self.layer,
+                    tracked_batch,
+                    self.mixed[: CHUNK + 1],
+                    self.a[: CHUNK + 1],
+                    self.b[: CHUNK + 1],
+                )
+                torch.testing.assert_close(
+                    eager_ssm[NUM_SLOTS // 2], expected_snapshot, rtol=0, atol=0
+                )
+
+                metadata, graph, _ = self._capture()
+                self._fill(metadata, tracked_batch)
+                graph.replay()
+                torch.cuda.synchronize()
+                torch.testing.assert_close(
+                    self.ssm_pool[NUM_SLOTS // 2], expected_snapshot, rtol=0, atol=0
+                )
 
     def test_replays_match_eager(self):
         cases = [
