@@ -64,7 +64,7 @@ class TestDiffusionRustGate(unittest.TestCase):
         caller = jobs["call-multimodal-gen-tests"]
         self.assertNotIn("rust-ext-build", caller["needs"])
         self.assertNotIn("rust_ext_artifact", caller["with"])
-        for workflow in ("pr-test-multimodal-gen.yml", "_pr-test-stage-diffusion.yml"):
+        for workflow in ("pr-test-multimodal-gen.yml", "_diffusion-pr-test-stage.yml"):
             with self.subTest(workflow=workflow):
                 callee = (ROOT / ".github/workflows" / workflow).read_text()
                 self.assertNotIn("download-rust-ext", callee)

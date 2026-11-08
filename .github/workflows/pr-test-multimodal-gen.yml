@@ -77,7 +77,7 @@ jobs:
       needs.compute-diffusion-partitions.outputs.matrix-1gpu != '{"include":[]}' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-h100
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -97,7 +97,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-5090
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -120,7 +120,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-bcg-1-gpu-h100
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -141,7 +141,7 @@ jobs:
       needs.compute-diffusion-partitions.outputs.matrix-2gpu != '{"include":[]}' &&
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-2-gpu-h100
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -162,7 +162,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-component-2-gpu-h100
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -179,7 +179,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-1-gpu-b200
       runs_on_map: ${{ inputs.runs_on_map }}
@@ -223,7 +223,7 @@ jobs:
     if: |
       ((github.event_name == 'schedule' || inputs.test_parallel_dispatch == 'true') || (inputs.caller_needs_failure != 'true' && !cancelled())) &&
       inputs.multimodal_gen == 'true'
-    uses: ./.github/workflows/_pr-test-stage-diffusion.yml
+    uses: ./.github/workflows/_diffusion-pr-test-stage.yml
     with:
       runner_config: diffusion-unit-1-gpu-h100
       runs_on_map: ${{ inputs.runs_on_map }}
