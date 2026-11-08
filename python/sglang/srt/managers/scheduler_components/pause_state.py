@@ -10,11 +10,11 @@ from sglang.srt.managers.io_struct import PauseGenerationReqInput
 PAUSE_WINDOWS_MAX = 1024
 
 
-class PauseGate:
-    """The engine's pause: whether it is paused (`pause_generation` until
-    `continue_generation`), the inputs held behind a pause until the loop reaches a
-    point where it can apply it, and the pause windows that step timing leaves
-    out. The event loops ask it whether they may launch."""
+class PauseState:
+    """The state of the engine's pause: whether it is paused (`pause_generation`
+    until `continue_generation`), the inputs held behind a pause until the loop
+    reaches a point where it can apply it, and the pause windows that step timing
+    leaves out. The event loops ask it whether they may launch."""
 
     def __init__(self) -> None:
         self._paused = False

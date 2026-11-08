@@ -11,7 +11,7 @@ from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
@@ -325,7 +325,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(

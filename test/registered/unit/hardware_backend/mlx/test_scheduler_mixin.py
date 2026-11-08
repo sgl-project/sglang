@@ -17,7 +17,7 @@ import platform
 import unittest
 from unittest.mock import MagicMock, patch
 
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
@@ -127,7 +127,7 @@ class TestOverlapLoopStampsLaunchTs(unittest.TestCase):
         )
         _use_real_launch_hook(scheduler)
         scheduler.gracefully_exit = False
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         scheduler.ingest_requests.side_effect = recv_side_effect
@@ -278,7 +278,7 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         scheduler = MagicMock()
         scheduler.forward_ct = 0
         scheduler.gracefully_exit = False
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
         recv_requests = MagicMock(side_effect=recv_side_effect)
@@ -325,8 +325,8 @@ class TestOverlapLoopGracefulExit(unittest.TestCase):
         # event_loop_normal/event_loop_overlap, or shutdown during a pause
         # spins forever.
         scheduler = self._make_scheduler(recv_side_effect=[[MagicMock()], _StopLoop()])
-        scheduler.pause_gate = PauseGate()
-        scheduler.pause_gate.pause()
+        scheduler.pause_state = PauseState()
+        scheduler.pause_state.pause()
 
         with patch(
             "sglang.srt.hardware_backend.mlx.scheduler_mixin.mx.synchronize"
@@ -362,7 +362,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.forward_ct = 0
         scheduler._sched_idled = False
         scheduler.gracefully_exit = False
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler.enable_overlap = False
         scheduler.enable_overlap_mlx = True
         scheduler.disaggregation_mode = DisaggregationMode.NULL
@@ -465,7 +465,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
 
     @staticmethod
     def _resume(scheduler):
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
 
     def test_retract_pause_processes_inflight_job_before_retract(self):
         # Iteration 1 launches a decode job.  Iteration 2 pauses with retract

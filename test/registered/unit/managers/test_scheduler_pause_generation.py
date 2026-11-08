@@ -34,7 +34,7 @@ from sglang.srt.managers.scheduler_components.deferred_responses import (
 from sglang.srt.managers.scheduler_components.kv_events_publisher import (
     SchedulerKvEventsPublisher,
 )
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.pool_stats_observer import PoolStats
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -99,7 +99,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
     def _new_scheduler(self) -> Scheduler:
         scheduler = Scheduler.__new__(Scheduler)
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler.enable_overlap = False
         scheduler.enable_skip_finishing_decode = False
         scheduler.enable_overlap_mlx = False
@@ -298,10 +298,10 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.last_batch = MagicMock()
         scheduler.result_queue = deque([(MagicMock(), MagicMock())])
         scheduler.process_batch_result = lambda batch, result: seen.append(
-            scheduler.pause_gate.consume_paused_time(0.0, now)
+            scheduler.pause_state.consume_paused_time(0.0, now)
         )
         with patch(
-            "sglang.srt.managers.scheduler_components.pause_gate.time.monotonic",
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
             return_value=now,
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode=mode))
@@ -313,12 +313,12 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             self.drain_with_pause_start_seen(scheduler, "retract", 3.5), [0.0]
         )
         # The window opened at 3.5.
-        self.assertEqual(scheduler.pause_gate.consume_paused_time(0.0, 4.0), 0.5)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 0.5)
 
     def test_retract_after_in_place_keeps_the_first_pause_start(self):
         scheduler = self._new_scheduler()
         with patch(
-            "sglang.srt.managers.scheduler_components.pause_gate.time.monotonic",
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
             return_value=0.125,
         ):
             scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
@@ -326,7 +326,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             self.drain_with_pause_start_seen(scheduler, "retract", 10.125), [10.0]
         )
         # The window still opens at 0.125.
-        self.assertEqual(scheduler.pause_gate.consume_paused_time(0.0, 1.125), 1.0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.125), 1.0)
 
     def test_inplace_only_sets_flag(self):
         """in_place pause should only set the paused flag and return."""
@@ -341,7 +341,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        self.assertTrue(scheduler.pause_gate.paused)
+        self.assertTrue(scheduler.pause_state.paused)
         # All state must be preserved — no mutation
         self.assertIs(scheduler.last_batch, original_last_batch)
         self.assertIs(scheduler.cur_batch_for_debug, original_cur_batch)
@@ -400,7 +400,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="in_place"))
 
-        self.assertTrue(scheduler.pause_gate.paused)
+        self.assertTrue(scheduler.pause_state.paused)
         self.assertEqual(len(scheduler.result_queue), 1)
 
     def test_inplace_does_not_merge_batch(self):
@@ -438,7 +438,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        self.assertTrue(scheduler.pause_gate.paused)
+        self.assertTrue(scheduler.pause_state.paused)
         self.assertIsNone(scheduler.last_batch)
         self.assertIsNone(scheduler.cur_batch_for_debug)
 
@@ -691,7 +691,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
 
         scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
 
-        self.assertTrue(scheduler.pause_gate.paused)
+        self.assertTrue(scheduler.pause_state.paused)
         self.assertEqual(len(scheduler.waiting_queue), 0)
         self.assertEqual(scheduler.running_batch.reqs, [])
 
@@ -945,15 +945,15 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
         scheduler.disagg_decode_prealloc_queue = MagicMock()
-        scheduler.pause_gate = PauseGate()
-        scheduler.pause_gate.pause()
+        scheduler.pause_state = PauseState()
+        scheduler.pause_state.pause()
 
         scheduler.continue_generation(
             ContinueGenerationReqInput(torch_empty_cache=False)
         )
 
         scheduler.disagg_decode_prealloc_queue.enqueue_held_rebootstrap.assert_called_once_with()
-        self.assertFalse(scheduler.pause_gate.paused)
+        self.assertFalse(scheduler.pause_state.paused)
 
     def test_pd_decode_abort_finishes_a_held_rebootstrap(self):
         scheduler = self._new_scheduler()
@@ -978,8 +978,8 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.beam_coordinator = MagicMock()
         scheduler.init_request_retirer()
         scheduler.enable_continuous_input_polling = False
-        scheduler.pause_gate = PauseGate()
-        scheduler.pause_gate.pause()
+        scheduler.pause_state = PauseState()
+        scheduler.pause_state.pause()
         aborted, kept = self._make_req("aborted"), self._make_req("kept")
         prealloc_queue.hold_rebootstrap(aborted)
         prealloc_queue.hold_rebootstrap(kept)
@@ -1118,7 +1118,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             ],
         )
         scheduler.get_next_batch_to_run.assert_not_called()
-        self.assertTrue(scheduler.pause_gate.paused)
+        self.assertTrue(scheduler.pause_state.paused)
         self.assertEqual(scheduler.last_mbs, [None, None])
         self.assertEqual([mb.reqs for mb in scheduler.running_mbs], [[], []])
         self.assertEqual(len(scheduler.running_reqs), 0)

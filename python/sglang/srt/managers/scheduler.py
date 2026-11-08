@@ -304,7 +304,7 @@ from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -705,7 +705,7 @@ class Scheduler(
 
         # Init running status
         self.init_running_status()
-        self.init_pause_gate()
+        self.init_pause_state()
 
         # Init chunked prefill
         self.init_chunked_prefill()
@@ -928,7 +928,7 @@ class Scheduler(
                     self.ipc_channels.recv_from_tokenizer,
                     self.ipc_channels.recv_from_rpc,
                 ],
-                can_empty_cache=lambda: not self.pause_gate.paused,
+                can_empty_cache=lambda: not self.pause_state.paused,
             )
         else:
             self.idle_sleeper = None
@@ -1422,8 +1422,8 @@ class Scheduler(
         self.session_controller = SessionController(self.tree_cache)
         self.forward_sleep_time = None
 
-    def init_pause_gate(self):
-        self.pause_gate = PauseGate()
+    def init_pause_state(self):
+        self.pause_state = PauseState()
 
     def init_chunked_prefill(self):
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
@@ -2134,7 +2134,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            if self.pause_gate.paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2179,7 +2179,7 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            if self.pause_gate.paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
@@ -2282,7 +2282,7 @@ class Scheduler(
         local_reqs = []
         # Avoid re-enqueuing timeout aborts while dispatch is stopped at a pause.
         if (
-            not self.pause_gate.holds_inputs()
+            not self.pause_state.holds_inputs()
             and get_parallel().pp_rank == 0
             and get_parallel().attn_tp_rank == 0
             and get_parallel().attn_cp_rank == 0
@@ -2290,7 +2290,7 @@ class Scheduler(
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
         received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
-        recv_reqs = self.pause_gate.take_inputs(
+        recv_reqs = self.pause_state.take_inputs(
             received_reqs, stop_at_pause=stop_at_pause
         )
 
@@ -2567,7 +2567,7 @@ class Scheduler(
         # The idle loop parks in the server's wait_request, on the request ring
         # only with --sleep-on-idle (see RustServer.wait_request).
         self.idle_sleeper = RustServerIdleSleeper(
-            rust_server, can_empty_cache=lambda: not self.pause_gate.paused
+            rust_server, can_empty_cache=lambda: not self.pause_state.paused
         )
 
     def dump_requests_before_crash(self) -> None:
@@ -5581,7 +5581,7 @@ class Scheduler(
             if prev_end_ts is not None:
                 # A new burst or mode can still overlap an earlier prefill.
                 start_ts = prev_end_ts if contiguous else max(start_ts, prev_end_ts)
-            paused = self.pause_gate.consume_paused_time(start_ts, end_ts)
+            paused = self.pause_state.consume_paused_time(start_ts, end_ts)
             step_us = int((end_ts - start_ts - paused) * 1e6)
         else:
             # Decode regression uses launch cadence and skips boundaries.
@@ -5767,7 +5767,7 @@ class Scheduler(
         lists = self.request_lists()
         if for_health_check:
             busy_lists = {ListKind.CHUNKED, ListKind.WAITING}
-            if not self.pause_gate.paused:
+            if not self.pause_state.paused:
                 busy_lists.add(ListKind.PD_RETRACTED)
         else:
             busy_lists = lists.keys() - {
@@ -5937,7 +5937,7 @@ class Scheduler(
 
     def flush_cache(self, empty_cache: bool = True):
         """Flush memory pools (e.g., KV cache, Mamba cache) and optionally empty device allocator cache."""
-        if self.is_fully_idle(ignore_waiting=self.pause_gate.paused):
+        if self.is_fully_idle(ignore_waiting=self.pause_state.paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
             if self.uocr_runtime is not None:
@@ -6151,7 +6151,7 @@ class Scheduler(
 
     def pause_generation(self, recv_req: PauseGenerationReqInput):
         assert recv_req.mode in ("in_place", "retract")
-        self.pause_gate.pause()
+        self.pause_state.pause()
 
         if recv_req.mode == "in_place":
             # In-place pause: just set the flag and return immediately.
@@ -6161,12 +6161,12 @@ class Scheduler(
             # chunked_req cleanup, and overlap result processing through
             # the standard code paths. This avoids duplicating batch
             # manipulation logic and the accounting bugs that come with it.
-            self.pause_gate.start_window()
+            self.pause_state.start_window()
             return
 
         if get_parallel().pp_size > 1:
             # The PP loops hold this pause until no micro-batch is in flight.
-            self.pause_gate.start_window()
+            self.pause_state.start_window()
             self._pp_retract_microbatches()
             self._publish_paused_state()
             return
@@ -6183,7 +6183,7 @@ class Scheduler(
         elif self.enable_overlap_mlx:
             self._drain_mlx_pending_jobs()
         # The pause starts once the in-flight result has drained.
-        self.pause_gate.start_window()
+        self.pause_state.start_window()
         self._retract_batch(self.running_batch, self.last_batch)
         self.last_batch = None
         self.cur_batch_for_debug = None
@@ -6296,7 +6296,7 @@ class Scheduler(
             and self.disagg_decode_prealloc_queue is not None
         ):
             self.disagg_decode_prealloc_queue.enqueue_held_rebootstrap()
-        self.pause_gate.resume()
+        self.pause_state.resume()
 
     def handle_scale_elastic_ep(
         self, recv_req: ScaleElasticEPReqInput

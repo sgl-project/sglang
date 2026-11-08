@@ -14,7 +14,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.kv.advance import advance_tracking
 from sglang.srt.runtime_context import get_context
@@ -117,7 +117,7 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     side_effect=[[], [], StopIteration]
                 )
                 scheduler.process_input_requests = MagicMock()
-                scheduler.pause_gate = PauseGate()
+                scheduler.pause_state = PauseState()
                 scheduler.running_batch = batch
                 scheduler.should_process_last_batch_early = MagicMock(
                     return_value=False

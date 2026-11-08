@@ -20,7 +20,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.pause_gate import PauseGate
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
@@ -395,7 +395,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
         self.assertEqual(scheduler.total_prefill_busy_us, total_us([14.0 - 6.25]))
         # Every window ended before this step's end, so none is kept.
-        self.assertEqual(scheduler.pause_gate.consume_paused_time(0.0, 14.0), 0.0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 14.0), 0.0)
 
     def test_pause_inside_an_idle_gap_is_not_subtracted_from_the_next_prefill(self):
         scheduler = self.make_scheduler([])
@@ -416,12 +416,12 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
         self.pause(scheduler, 2.0)
         self.resume(scheduler, 3.0)
         # One window, [1.0, 3.0].
-        self.assertEqual(scheduler.pause_gate.consume_paused_time(0.0, 1.5), 0.5)
-        self.assertEqual(scheduler.pause_gate.consume_paused_time(0.0, 4.0), 2.0)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 1.5), 0.5)
+        self.assertEqual(scheduler.pause_state.consume_paused_time(0.0, 4.0), 2.0)
 
     def pause(self, scheduler, paused_at):
         with patch(
-            "sglang.srt.managers.scheduler_components.pause_gate.time.monotonic",
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
             return_value=paused_at,
         ):
             Scheduler.pause_generation(
@@ -430,7 +430,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
 
     def resume(self, scheduler, resumed_at):
         with patch(
-            "sglang.srt.managers.scheduler_components.pause_gate.time.monotonic",
+            "sglang.srt.managers.scheduler_components.pause_state.time.monotonic",
             return_value=resumed_at,
         ):
             Scheduler.continue_generation(
@@ -563,7 +563,7 @@ class TestSchedulerIdleStepCounters(CustomTestCase):
             else get_parallel().tp_size
         )
         scheduler.gracefully_exit = False
-        scheduler.pause_gate = PauseGate()
+        scheduler.pause_state = PauseState()
         scheduler._sched_idled = False
         scheduler._prev_step = None
         scheduler._prev_prefill_end_ts = None
