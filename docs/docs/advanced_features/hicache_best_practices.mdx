@@ -271,3 +271,41 @@ python3 -m sglang.launch_server \
 
 ***
 *This document will be continuously updated based on community feedback and new features. Contributions and suggestions are welcome!*
+
+## Attributing Cache Misses and HiCache Restores via KV Events
+
+When running multi-turn agents, `--enable-cache-report` returns `cached_tokens` per request, but that counter alone does not distinguish:
+1. Client-side prompt changes that alter the token prefix before RadixAttention or HiCache can match it.
+2. Confirmed RadixTree evictions when the working set exceeds both GPU memory and HiCache host memory.
+3. Hits served from GPU HBM versus hits restored from HiCache host memory after a GPU eviction.
+
+You can enable SGLang's ZMQ KV-event publisher (`--kv-events-config`, SGLang `>= 0.5.20`) and connect [Prefixwise](https://github.com/tejachavali/prefixwise) (MIT; stores block hashes and token counts, never prompt text) to attribute each turn:
+
+```bash
+pip install "prefixwise[engines]"
+
+# 1. Launch SGLang with HiCache, cache reporting, and ZMQ KV events
+python -m sglang.launch_server \
+  --model-path <model> \
+  --port 30000 \
+  --enable-hierarchical-cache \
+  --enable-cache-report \
+  --kv-events-config '{"publisher": "zmq", "endpoint": "tcp://*:5557"}'
+
+# 2. Start Prefixwise in front of SGLang (--kv-events auto subscribes across DP ranks)
+prefixwise serve \
+  --upstream http://127.0.0.1:30000 \
+  --engine sglang \
+  --kv-events auto \
+  --full-attention
+```
+
+Send requests to `http://127.0.0.1:8080/v1`, then run `prefixwise report --detail`:
+
+- **If GPU HBM served the prefix:** The verdict is `none`.
+- **If GPU HBM evicted the prefix and HiCache restored it:** The verdict is `none` with detail `host_restored`.
+- **If both GPU HBM and HiCache evicted the prefix:** The verdict is `evicted, confirmed`.
+- **If another DP rank holds the prefix:** The verdict is `routing_miss, confirmed`.
+- **If the client changed the prompt:** The verdict names the first changed block (`volatile_system`, `tool_reserialize`, `history_edit`, `tool_result_mutation`). Pass `--fix canonical_tools` to canonicalize tool order in flight.
+
+See the [Prefixwise SGLang guide](https://github.com/tejachavali/prefixwise/blob/main/docs/SGLANG.md) for benchmark results.
