@@ -204,7 +204,7 @@ class TestFlashMLAV41(CustomTestCase):
 
     def test_backend_precomputes_only_split_schedules(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _flashmla_splits_kv,
+            _flashmla_v41_splits_kv,
         )
 
         for n, topk, extra_topk in self.SHAPES:
@@ -214,7 +214,9 @@ class TestFlashMLAV41(CustomTestCase):
                 c.decode(meta)
                 self.assertEqual(
                     meta.tile_scheduler_metadata is not None,
-                    _flashmla_splits_kv(c.indices, c.extra_indices, SPLIT_KV_MIN_TOPK),
+                    _flashmla_v41_splits_kv(
+                        c.indices, c.extra_indices, SPLIT_KV_MIN_TOPK
+                    ),
                 )
 
     def test_schedule_is_shared_across_layers(self):
