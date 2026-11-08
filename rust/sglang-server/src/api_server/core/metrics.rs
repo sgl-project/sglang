@@ -342,6 +342,7 @@ struct RequestSeries {
     /// Cached tokens by [`CACHE_SOURCES`], each series registered at its
     /// source's first hit, as Python labels a source only once it counts one.
     cached_tokens: [OnceLock<Arc<Counter>>; 3],
+    cached_tokens_host_source: [OnceLock<Arc<Counter>>; 2],
     prompt_tokens_histogram: Arc<Histogram>,
     uncached_prompt_tokens_histogram: Arc<Histogram>,
     generation_tokens_histogram: Arc<Histogram>,
@@ -369,6 +370,7 @@ pub(crate) struct FrontendMetrics {
     num_so_requests: CounterFamily,
     num_aborted_requests: CounterFamily,
     cached_tokens: CounterFamily,
+    cached_tokens_host_source: CounterFamily,
     prompt_tokens_histogram: HistogramFamily,
     uncached_prompt_tokens_histogram: HistogramFamily,
     generation_tokens_histogram: HistogramFamily,
@@ -429,6 +431,10 @@ impl FrontendMetrics {
             cached_tokens: CounterFamily::new(
                 "sglang:cached_tokens_total",
                 "Number of cached prompt tokens by source (device/host/storage).",
+            ),
+            cached_tokens_host_source: CounterFamily::new(
+                "sglang:cached_tokens_host_source_total",
+                "Number of cached prompt tokens on host by write source (write_back/prefetch).",
             ),
             prompt_tokens_histogram: HistogramFamily::new(
                 "sglang:prompt_tokens_histogram",
@@ -548,6 +554,7 @@ impl FrontendMetrics {
             generation_tokens: self.generation_tokens.series(&stream_labels),
             num_so_requests: self.num_so_requests.series(&labels),
             cached_tokens: Default::default(),
+            cached_tokens_host_source: Default::default(),
             prompt_tokens_histogram: self.prompt_tokens_histogram.series(&labels),
             uncached_prompt_tokens_histogram: self.uncached_prompt_tokens_histogram.series(&labels),
             generation_tokens_histogram: self.generation_tokens_histogram.series(&labels),
@@ -566,7 +573,7 @@ impl FrontendMetrics {
             .clone()
     }
 
-    fn counters(&self) -> [&CounterFamily; 6] {
+    fn counters(&self) -> [&CounterFamily; 7] {
         [
             &self.num_requests,
             &self.prompt_tokens,
@@ -574,6 +581,7 @@ impl FrontendMetrics {
             &self.num_so_requests,
             &self.num_aborted_requests,
             &self.cached_tokens,
+            &self.cached_tokens_host_source,
         ]
     }
 
@@ -699,6 +707,8 @@ impl RequestMetrics {
                     device: details.device,
                     host: details.host,
                     storage: details.storage.unwrap_or(0),
+                    host_write_back: details.host_write_back,
+                    host_prefetch: details.host_prefetch,
                 },
             );
         let first_output_at = *self.first_output_at.get_or_insert(now);
@@ -767,6 +777,7 @@ impl RequestMetrics {
                 device,
                 host,
                 storage,
+                ..
             } = self.cached_tokens_split;
             for ((counter, source), count) in series
                 .cached_tokens
@@ -780,6 +791,24 @@ impl RequestMetrics {
                             let mut labels = series.labels.clone();
                             labels.push(("cache_source".into(), source.into()));
                             self.metrics.cached_tokens.series(&labels)
+                        })
+                        .inc(u64::from(count));
+                }
+            }
+        }
+        if let Some((write_back, prefetch)) = self.cached_tokens_split.host_source() {
+            for ((counter, source), count) in series
+                .cached_tokens_host_source
+                .iter()
+                .zip(["write_back", "prefetch"])
+                .zip([write_back, prefetch])
+            {
+                if count > 0 {
+                    counter
+                        .get_or_init(|| {
+                            let mut labels = series.labels.clone();
+                            labels.push(("host_source".into(), source.into()));
+                            self.metrics.cached_tokens_host_source.series(&labels)
                         })
                         .inc(u64::from(count));
                 }
@@ -901,6 +930,7 @@ mod tests {
                 | "sglang:request_time_per_output_token_seconds"
                 | "sglang:e2e_request_latency_seconds" => Some("is_streaming"),
                 "sglang:cached_tokens_total" => Some("cache_source"),
+                "sglang:cached_tokens_host_source_total" => Some("host_source"),
                 _ => None,
             };
             let mut names = base.clone();
@@ -1155,6 +1185,33 @@ mod tests {
             ),
             Some(2.0)
         );
+    }
+
+    #[test]
+    fn cached_tokens_host_origin_is_a_separate_counter() {
+        let cfg = config(&std::env::temp_dir(), BTreeMap::new());
+        let metrics = Arc::new(FrontendMetrics::new(&cfg, DisaggregationMode::Null).unwrap());
+        let mut observed = metrics.start_request(&request(false, None), Instant::now());
+        observed.cached_tokens = 10;
+        observed.cached_tokens_split = CachedTokensSplit {
+            device: 2,
+            host: 8,
+            storage: 0,
+            host_write_back: Some(3),
+            host_prefetch: Some(5),
+        };
+        observed.observe_finished(Some("length"), Instant::now(), Instant::now());
+        let total = |family: &CounterFamily| {
+            family
+                .series
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(_, counter)| counter.0.load(Ordering::Relaxed))
+                .sum::<u64>()
+        };
+        assert_eq!(total(&metrics.cached_tokens), 10);
+        assert_eq!(total(&metrics.cached_tokens_host_source), 8);
     }
 
     /// Each request of the fixture's cache-tier frames

@@ -136,7 +136,7 @@ def _commit_disagg_handoff(
     queue.metadata_buffers = SimpleNamespace(
         get_buf=lambda _: (
             torch.tensor([token_id], dtype=torch.long),
-            torch.zeros(7, dtype=torch.long),
+            torch.zeros(16, dtype=torch.long),
             torch.zeros(1),
             torch.zeros(1, dtype=torch.long),
             torch.zeros(1),

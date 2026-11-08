@@ -1747,6 +1747,8 @@ mod tests {
                 host: 2,
                 storage: None,
                 storage_backend: None,
+                host_write_back: None,
+                host_prefetch: None,
             };
             request
                 .sink

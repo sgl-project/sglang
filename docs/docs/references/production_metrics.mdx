@@ -287,3 +287,12 @@ Average estimated memory bandwidth in GB/s:
 - These metrics are estimates intended for observability and trend analysis.
 - Estimated memory bytes reflect modeled traffic and are not a direct hardware
   counter from GPU profilers.
+
+
+## L2 hit origins
+
+`sglang:cached_tokens_host_source_total{host_source="write_back"}` counts L2 hit
+tokens retained after device backup. The `host_source="prefetch"` series counts
+L2 hit tokens retained after an earlier L3 read. They are subcategories of the
+host series in `sglang:cached_tokens_total`. A request with unknown provenance
+contributes to the host tier total and omits the two origin counters.

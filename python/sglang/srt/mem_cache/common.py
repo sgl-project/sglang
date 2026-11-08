@@ -309,6 +309,9 @@ def match_kv_cache(
         match_result.swa_host_hit_length,
         match_result.mamba_host_hit_length,
     )
+    req.host_hit_write_back = match_result.host_hit_write_back
+    req.host_hit_prefetch = match_result.host_hit_prefetch
+    req.host_hit_source_ranges = match_result.host_hit_source_ranges
     req.matched_auxiliary_swa_host_hit_length = (
         match_result.auxiliary_swa_host_hit_length
     )

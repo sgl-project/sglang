@@ -211,6 +211,9 @@ class CachedTokensDetails(BaseModel):
     # L3 storage fields are only present when storage backend is enabled
     storage: Optional[int] = None  # Tokens from L3 storage backend
     storage_backend: Optional[str] = None  # Type of storage backend used
+    # Host source breakdown (only present when HiCache is enabled)
+    host_write_back: Optional[int] = None  # Host tokens backed up from device
+    host_prefetch: Optional[int] = None  # Host tokens prefetched from L3
 
     @model_serializer(mode="wrap")
     def _serialize(self, handler):
@@ -220,6 +223,10 @@ class CachedTokensDetails(BaseModel):
             data.pop("storage", None)
         if self.storage_backend is None:
             data.pop("storage_backend", None)
+        if self.host_write_back is None:
+            data.pop("host_write_back", None)
+        if self.host_prefetch is None:
+            data.pop("host_prefetch", None)
         return data
 
 

@@ -629,6 +629,11 @@ pub struct CachedTokensDetails {
     /// The attached storage tier's backend.
     #[prost(string, optional, tag = "4")]
     pub storage_backend: ::core::option::Option<::prost::alloc::string::String>,
+    /// L2 origin detail, present when the host-hit interval is fully attributed.
+    #[prost(uint32, optional, tag = "5")]
+    pub host_write_back: ::core::option::Option<u32>,
+    #[prost(uint32, optional, tag = "6")]
+    pub host_prefetch: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GenerateResponse {

@@ -570,6 +570,8 @@ mod tests {
                 host: 1,
                 storage: None,
                 storage_backend: None,
+                host_write_back: None,
+                host_prefetch: None,
             }),
             ..Default::default()
         }));
@@ -592,6 +594,8 @@ mod tests {
             host: 1,
             storage: None,
             storage_backend: None,
+            host_write_back: None,
+            host_prefetch: None,
         });
         assert_eq!(meta(&first).cached_tokens_details, split);
         assert_eq!(meta(&finished).cached_tokens_details, split);
