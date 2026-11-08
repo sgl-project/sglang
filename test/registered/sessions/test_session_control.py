@@ -99,7 +99,6 @@ class TestSessionControl(CustomTestCase):
                         "id": session_id,
                         "rid": rid,
                         "offset": -1,
-                        "replace": True,
                     },
                     "sampling_params": {
                         "temperature": 0,
@@ -133,7 +132,6 @@ class TestSessionControl(CustomTestCase):
                     "id": session_id,
                     "rid": rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -157,7 +155,6 @@ class TestSessionControl(CustomTestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -177,14 +174,35 @@ class TestSessionControl(CustomTestCase):
             ]
         )
 
-        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
+        # query with a non-existing rid, should see abort
         ret = requests.post(
             self.base_url + "/generate",
             json={
                 "input_ids": chunks_ids[-1],
                 "session_params": {
                     "id": session_id,
-                    "rid": rid,
+                    "rid": uuid.uuid4().hex,
+                    "offset": -1,
+                },
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": gen_len,
+                    "no_stop_trim": True,
+                    "skip_special_tokens": False,
+                },
+                "return_logprob": True,
+            },
+        )
+        self.assertNotEqual(ret.status_code, 200)
+
+        # query with replace, which is not supported, should see abort
+        ret = requests.post(
+            self.base_url + "/generate",
+            json={
+                "input_ids": chunks_ids[-1],
+                "session_params": {
+                    "id": session_id,
+                    "rid": first_rid,
                     "offset": -1,
                     "replace": True,
                 },
@@ -194,7 +212,6 @@ class TestSessionControl(CustomTestCase):
                     "no_stop_trim": True,
                     "skip_special_tokens": False,
                 },
-                "return_logprob": True,
             },
         )
         self.assertNotEqual(ret.status_code, 200)
@@ -214,7 +231,6 @@ class TestSessionControl(CustomTestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": -1,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -324,7 +340,7 @@ class TestSessionControl(CustomTestCase):
                         )
                         yield data["text"], data["meta_info"]["id"], finish_reason
 
-    async def run_session_control_backtrack_with_abort(self, replace):
+    async def run_session_control_backtrack_with_abort(self):
         chunks = [
             "Let me tell you something about France.",
             "The capital of France is",
@@ -349,7 +365,6 @@ class TestSessionControl(CustomTestCase):
                 "id": session_id,
                 "rid": rid,
                 "offset": -1,
-                "replace": True,
             },
             "sampling_params": {
                 "temperature": 0,
@@ -362,19 +377,19 @@ class TestSessionControl(CustomTestCase):
         }
         gen_so_far = ""
         finish_reason = ""
-        second_output = ""
+        first_rid = None
         async for chunk, rid, finish_reason_chunk in self.async_generate(payload):
             gen_so_far += chunk
             if finish_reason == "":
                 finish_reason = finish_reason_chunk
-            if len(gen_so_far) > 50 and second_output == "":
+            if len(gen_so_far) > 50 and first_rid is None:
+                first_rid = rid
                 payload2 = {
                     "input_ids": chunks_ids[1],
                     "session_params": {
                         "id": session_id,
-                        "rid": rid,
+                        "rid": first_rid,
                         "offset": 50,
-                        "replace": replace,
                     },
                     "sampling_params": {
                         "temperature": 0,
@@ -385,12 +400,15 @@ class TestSessionControl(CustomTestCase):
                     "stream": False,
                     "stream_output": True,
                 }
-                response = requests.post(
-                    url=self.base_url + "/generate", json=payload2
-                ).json()
-                second_output = response["text"]
-        if replace:
-            assert finish_reason == "abort"
+                # appending to a running request, should see abort
+                ret = requests.post(url=self.base_url + "/generate", json=payload2)
+                assert ret.status_code != 200
+                requests.post(self.base_url + "/abort_request", json={"rid": first_rid})
+        assert finish_reason == "abort"
+
+        # backtrack to the aborted request and regenerate
+        response = requests.post(url=self.base_url + "/generate", json=payload2).json()
+        second_output = response["text"]
         print("first request output:")
         print(gen_so_far)
         print("second request output:")
@@ -403,41 +421,35 @@ class TestSessionControl(CustomTestCase):
         )
         assert ret.status_code == 200
 
-        if not replace:
-            assert response["meta_info"]["finish_reason"]["type"] == "abort"
-        else:
-            # 2. not using session control
-            requests.post(self.base_url + "/flush_cache")
-            output_ids = tokenizer.encode(gen_so_far)
-            if output_ids[0] == tokenizer.bos_token_id:
-                output_ids = output_ids[1:]
-            input_ids = chunks_ids[0] + output_ids
-            input_ids = input_ids[:50] + chunks_ids[1]
-            payload = {
-                "input_ids": input_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 32,
-                    "no_stop_trim": True,
-                    "skip_special_tokens": False,
-                },
-                "stream": False,
-                "stream_output": True,
-            }
-            response = requests.post(
-                url=self.base_url + "/generate", json=payload
-            ).json()
-            output_no_session = response["text"]
-            print("second request output without session:")
-            print(output_no_session)
-            assert second_output == output_no_session, (
-                f"second_output: {second_output}, output_no_session: {output_no_session}"
-            )
+        # 2. not using session control
+        requests.post(self.base_url + "/flush_cache")
+        output_ids = tokenizer.encode(gen_so_far)
+        if output_ids[0] == tokenizer.bos_token_id:
+            output_ids = output_ids[1:]
+        input_ids = chunks_ids[0] + output_ids
+        input_ids = input_ids[:50] + chunks_ids[1]
+        payload = {
+            "input_ids": input_ids,
+            "sampling_params": {
+                "temperature": 0,
+                "max_new_tokens": 32,
+                "no_stop_trim": True,
+                "skip_special_tokens": False,
+            },
+            "stream": False,
+            "stream_output": True,
+        }
+        response = requests.post(url=self.base_url + "/generate", json=payload).json()
+        output_no_session = response["text"]
+        print("second request output without session:")
+        print(output_no_session)
+        assert second_output == output_no_session, (
+            f"second_output: {second_output}, output_no_session: {output_no_session}"
+        )
 
     @unittest.skip("broken")
     def test_session_control_backtrack_with_abort(self):
-        asyncio.run(self.run_session_control_backtrack_with_abort(replace=True))
-        asyncio.run(self.run_session_control_backtrack_with_abort(replace=False))
+        asyncio.run(self.run_session_control_backtrack_with_abort())
 
     def run_session_control_with_branching(
         self, root_prompt, chunks_per_step, gen_len=16
@@ -462,7 +474,6 @@ class TestSessionControl(CustomTestCase):
                     "id": session_id,
                     "rid": None,
                     "offset": 0,
-                    "replace": False,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -486,7 +497,6 @@ class TestSessionControl(CustomTestCase):
                             "id": session_id,
                             "rid": rid_per_branch[j],
                             "offset": 0,
-                            "replace": False,
                         },
                         "sampling_params": {
                             "temperature": 0,
@@ -649,7 +659,6 @@ class TestSessionControlVision(CustomTestCase):
                         "id": session_id,
                         "rid": rid,
                         "offset": 0,
-                        "replace": True,
                     },
                     "sampling_params": {
                         "temperature": 0,
@@ -676,7 +685,6 @@ class TestSessionControlVision(CustomTestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -688,16 +696,15 @@ class TestSessionControlVision(CustomTestCase):
         ).json()
         outputs_from_session.append(response["text"])
 
-        # query with a non-existing rid (the last one should be disappeared because of backtrack), should see abort
+        # query with a non-existing rid, should see abort
         ret = requests.post(
             self.base_url + "/generate",
             json={
                 "text": text_chunks[-1],
                 "session_params": {
                     "id": session_id,
-                    "rid": rid,
+                    "rid": uuid.uuid4().hex,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,
@@ -724,7 +731,6 @@ class TestSessionControlVision(CustomTestCase):
                     "id": session_id,
                     "rid": first_rid,
                     "offset": 0,
-                    "replace": True,
                 },
                 "sampling_params": {
                     "temperature": 0,

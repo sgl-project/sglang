@@ -148,17 +148,15 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     id: Optional[str] = None
     # A request identifier *within* the session. In non-streaming sessions the
     # session maintains a tree of request nodes keyed by rid; this field selects
-    # which node to continue from (append) or replace. When None the default
-    # branch point is used (latest node for streaming, all nodes cleared on
-    # replace).
+    # which node to continue from. When None the default branch point is used
+    # (latest node for streaming, a new root otherwise).
     rid: Optional[str] = None
     # Token-level insertion point. When set, the new request's tokens are
     # spliced into the accumulated context at this position instead of being
     # appended at the end (i.e. ``context[:offset] + new_tokens``).
     offset: Optional[int] = None
-    # When True, the request node identified by ``rid`` (or all nodes if
-    # ``rid`` is None) is aborted and its children are cleared before the new
-    # request is inserted. Not supported in streaming sessions.
+    # No longer supported: a request that sets it is rejected. Kept so the
+    # positional (array_like) wire layout of the fields after it is unchanged.
     replace: Optional[bool] = None
     # When True, the previous request's generated output tokens are excluded
     # from the accumulated context so the new turn sees only the original input.
