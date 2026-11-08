@@ -92,6 +92,21 @@ SGLANG_TRACE_ASYNC=1 python -m sglang.launch_server --enable-trace --otlp-traces
 | `SGLANG_TRACE_ASYNC` | Enable async tracing | `false` |
 | `SGLANG_TRACE_ASYNC_FLUSH_THRESHOLD` | Max buffered ops before auto-flush | `100` |
 
+## Request Span Attributes
+
+When a request finishes, its root span gets usage attributes named after the [OpenTelemetry GenAI semantic conventions](https://github.com/open-telemetry/semantic-conventions-genai):
+
+| Attribute | Value |
+| --- | --- |
+| `gen_ai.provider.name` | `sglang` |
+| `gen_ai.usage.input_tokens` | Prompt tokens |
+| `gen_ai.usage.output_tokens` | Generated tokens (not set for embedding requests) |
+| `gen_ai.usage.cache_read.input_tokens` | Prompt tokens served from the prefix cache |
+| `gen_ai.response.model` | Served model name |
+| `gen_ai.response.finish_reasons` | Why generation stopped |
+
+The deprecated names `gen_ai.usage.prompt_tokens`, `gen_ai.usage.completion_tokens` and `gen_ai.usage.cached_tokens` are still set with the same values, so existing dashboards keep working.
+
 ## How to add Tracing for slices you're interested in?(API introduction)
 We have already inserted instrumentation points in the tokenizer and scheduler main threads. If you wish to trace additional request execution segments or perform finer-grained tracing, please use the APIs from the tracing package as described below.
 

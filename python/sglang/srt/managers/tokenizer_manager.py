@@ -4100,13 +4100,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         if not self.enable_trace:
             return span_attrs
 
-        # Token usage attributes
+        span_attrs[SpanAttributes.GEN_AI_PROVIDER_NAME] = "sglang"
+
+        # Token usage attributes, under the current names and the deprecated ones
         if not isinstance(recv_obj, BatchEmbeddingOutput):
+            completion_tokens = recv_obj.completion_tokens[i]
+            span_attrs[SpanAttributes.GEN_AI_USAGE_OUTPUT_TOKENS] = completion_tokens
             span_attrs[SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS] = (
-                recv_obj.completion_tokens[i]
+                completion_tokens
             )
+        span_attrs[SpanAttributes.GEN_AI_USAGE_INPUT_TOKENS] = (
+            request_stats.prompt_tokens
+        )
         span_attrs[SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS] = (
             request_stats.prompt_tokens
+        )
+        span_attrs[SpanAttributes.GEN_AI_USAGE_CACHE_READ_INPUT_TOKENS] = (
+            request_stats.cached_tokens
         )
         span_attrs[SpanAttributes.GEN_AI_USAGE_CACHED_TOKENS] = (
             request_stats.cached_tokens
