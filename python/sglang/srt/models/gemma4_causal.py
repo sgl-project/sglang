@@ -67,6 +67,7 @@ from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import (
@@ -899,10 +900,10 @@ class Gemma4TextModel(PreTrainedModel):
         # non-first PP ranks (eager path produces correct output and
         # GSM8K ~0.92, cuda-graph path emits token soup).  Refuse the
         # combination until the runner becomes schema-aware; users can run
-        # PP + PLE eagerly with --disable-cuda-graph.
+        # PP + PLE eagerly with CUDA graphs disabled on both phases.
         if self.pp_group.world_size > 1 and self.hidden_size_per_layer_input > 0:
             sa = get_server_args()
-            if sa is not None and not get_exec().graph.disable_cuda_graph:
+            if sa is not None and not cuda_graph_fully_disabled():
                 raise ValueError(
                     "Pipeline parallelism is currently incompatible with "
                     "per-layer-input (PLE) embeddings under CUDA graph: "
@@ -910,8 +911,10 @@ class Gemma4TextModel(PreTrainedModel):
                     "{hidden_states, residual} and silently drops "
                     "per_layer_inputs, corrupting per-layer contributions on "
                     "non-first PP ranks. Workarounds: (a) pass "
-                    "--disable-cuda-graph to fall back to eager replay, or "
-                    "(b) use tensor parallelism (--tp-size) instead of PP."
+                    "--cuda-graph-backend-decode disabled "
+                    "--cuda-graph-backend-prefill disabled to fall back to "
+                    "eager execution, or (b) use tensor parallelism "
+                    "(--tp-size) instead of PP."
                 )
 
         if self.pp_group.is_first_rank:
