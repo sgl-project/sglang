@@ -1017,13 +1017,26 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     assert torch.equal(q_out, q_ref)
     assert torch.equal(k_out, k_ref)
     assert q_out.stride() == q_ref.stride()
+    assert k_out.stride() == k_ref.stride()
     sig = (tuple(q.shape), tuple(q.stride()), tuple(k.stride()), q.device.index)
     assert gate.is_verified(sig)
     assert not gate.disabled
-    # a different token count is a new signature and is verified on its own
-    assert not gate.is_verified(
-        (tuple(q.shape[:2]) + (tokens + 1, head_dim),) + sig[1:]
+    # a different token count is a new signature: unverified until it runs
+    freqs2 = rope((frames + 1, height, width), torch.device("cuda"))
+    tokens2 = (frames + 1) * height * width
+    x2 = torch.randn(
+        batch, tokens2, heads * head_dim, device="cuda", dtype=torch.bfloat16
     )
+    q2 = x2.reshape(batch, tokens2, heads, head_dim).transpose(1, 2)
+    sig2 = (tuple(q2.shape), tuple(q2.stride()), tuple(q2.stride()), q2.device.index)
+    assert not gate.is_verified(sig2)
+    with torch.no_grad():
+        q2_out, _ = sana_video2._apply_rope_pair(
+            q2, q2, (freqs2, *sana_video2._rope_tables(freqs2))
+        )
+    assert torch.equal(q2_out, sana_video2._apply_rope(q2, freqs2))
+    assert gate.is_verified(sig2)
+    assert not gate.disabled
 
 
 # -------------------------------------------------------------------------
