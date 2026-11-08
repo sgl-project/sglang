@@ -2,10 +2,11 @@
 
 Both PD queues install a network-transfer waiter on the pool's storage at
 construction, static pools included; and the decode queue's judgement of a
-failed receive, which the waiter MIN-reduces across ranks every round, stays
-done once its release timeout has passed. A receive preallocation takes its
-pages for the network receive that writes them first. Unified memory refuses
-staging buffers at startup.
+failed receive, which the waiter MIN-reduces across ranks every round, turns
+done only on its drain acknowledgements and stays done, however long its
+release timeout passed. A receive preallocation takes its pages for the
+network receive that writes them first. Unified memory refuses staging
+buffers, and a disabled deferred release, at startup.
 """
 
 import unittest
@@ -52,16 +53,17 @@ class TestStaticStorageNetworkWaiter(CustomTestCase):
 
 class _FailedReceiver:
     """A receive that failed once ``failed`` is set, with the prefill's drain
-    acknowledgements never arriving."""
+    acknowledgement in once ``drained`` is set."""
 
     def __init__(self):
         self.failed = False
+        self.drained = False
         self.require_staging = False
         self.abort_notified = True
         self.bootstrap_infos = [object()]
         self.kv_mgr = SimpleNamespace(
             enable_deferred_decode_kv_release=True,
-            is_abort_release_safe=lambda room, acks: False,
+            is_abort_release_safe=lambda room, acks: self.drained,
         )
 
     def poll(self):
@@ -82,15 +84,16 @@ class TestReceiveTimeoutStaysDone(CustomTestCase):
         queue._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
+        queue._undrained_receives = []
         receiver = _FailedReceiver()
         decode_req = DecodeRequest(
             req=FakeReq(rid="r", bootstrap_room=7), kv_receiver=receiver
         )
         return queue, receiver, decode_req
 
-    def test_staggered_failures_agree_once_timed_out(self):
-        """REGRESSION: a timed-out failed receive stays done, so ranks that saw
-        the failure at different times agree in the waiter's MIN reduction."""
+    def test_staggered_failures_agree_once_drained(self):
+        """Regression: a failed receive is done only once drained, never flipping
+        back, so ranks that saw the failure at different times agree in the MIN."""
         ranks = [self._rank(), self._rank()]
         now = [0.0]
         with patch(
@@ -103,13 +106,16 @@ class TestReceiveTimeoutStaysDone(CustomTestCase):
                 ranks[0][1].failed = True
                 # The second rank sees the failure one second later.
                 ranks[1][1].failed = now[0] >= 1.0
+                # The drain acknowledgements arrive long past the timeout.
+                for _, receiver, _ in ranks:
+                    receiver.drained = now[0] >= 30.0
                 flags = [queue._receive_done(req) for queue, _, req in ranks]
                 if all(flags) and agreed_at is None:
                     agreed_at = now[0]
                 if agreed_at is not None:
                     # Done stays done until the release.
                     self.assertEqual(flags, [True, True], now[0])
-        self.assertEqual(agreed_at, 11.0)
+        self.assertEqual(agreed_at, 30.0)
 
 
 class TestReceivePreallocationConsumer(CustomTestCase):
@@ -186,6 +192,24 @@ class TestUnifiedMemoryRefusesStagingBuffers(CustomTestCase):
         }.items():
             msgspec.structs.force_setattr(sa, name, value)
         handle_unified_memory_pool(sa)
+
+    def test_disabled_deferred_release_is_refused(self):
+        """A failed transfer's pages are reused only on the peers' drain
+        acknowledgements, which deferred release carries."""
+        from sglang.srt.environ import envs
+
+        for mode in ("prefill", "decode"):
+            with self.subTest(mode=mode):
+                with envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.override(
+                    False
+                ):
+                    with self.assertRaises(AssertionError) as ctx:
+                        self._check(mode)
+                self.assertIn(
+                    "SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE",
+                    str(ctx.exception),
+                )
+                self._check(mode)
 
     def test_staging_buffers_are_refused(self):
         from sglang.srt.environ import envs

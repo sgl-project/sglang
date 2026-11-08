@@ -825,6 +825,9 @@ class Envs:
     # (supports_deferred_decode_kv_release).
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE = EnvBool(True)
     SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT = EnvFloat(30.0)
+    # Seconds an orphaned unified-memory transfer's held pages stay unproven before
+    # they are logged and counted as quarantined (default: four release timeouts).
+    SGLANG_DISAGGREGATION_KV_QUARANTINE_TIMEOUT = EnvFloat(None)
     # Under overlap, publish decode KV destinations one iteration later instead of
     # reading them back inline; False restores the inline publish.
     SGLANG_ENABLE_DISAGG_DECODE_DEFERRED_PUBLISH = EnvBool(True)

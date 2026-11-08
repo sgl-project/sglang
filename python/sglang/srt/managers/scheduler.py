@@ -107,6 +107,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.prefill import (
     PrefillBootstrapQueue,
     SchedulerDisaggregationPrefillMixin,
+    make_transfer_reaper,
 )
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
@@ -1716,6 +1717,7 @@ class Scheduler(
                 scheduler_stage_metrics=self.scheduler_stage_metrics,
                 transfer_backend=self.transfer_backend,
             )
+            self.disagg_prefill_transfer_reaper = make_transfer_reaper(self)
             self.enable_staging = envs.SGLANG_DISAGG_STAGING_BUFFER.get()
 
         # Init mm receiver for EPD disaggregation mode
@@ -2744,17 +2746,34 @@ class Scheduler(
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
-            # Hisparse pool counters diverge during host backup (see the
-            # _get_swa_token_info clamp), and pending deferred KV releases hold
-            # pages out of the allocator by design.
+            # Hisparse counters diverge in host backup (_get_swa_token_info clamp);
+            # deferred KV releases and quarantined pages hold pages out by design.
             get_skip_idle_pool_checks=lambda: (
                 self.enable_hisparse
                 or (
                     self.disaggregation_mode == DisaggregationMode.DECODE
                     and self.disagg_decode_transfer_queue.has_pending_deferred_releases()
                 )
+                or self._holds_quarantined_kv()
             ),
             scheduler_stage_metrics=self.scheduler_stage_metrics,
+        )
+
+    def holds_unreleased_network_transfers(self) -> bool:
+        """Whether a network transfer may still touch the pool (a PD transfer
+        in flight, or one whose request is gone and whose end is unproven)."""
+        return kv_storage_of(
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
+        ).has_unreleased_network_transfers()
+
+    def _holds_quarantined_kv(self) -> bool:
+        """Whether pages are QUARANTINED for a network transfer that never
+        proved it stopped: out of capacity by design."""
+        return any(
+            usage.quarantined
+            for usage in kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).usage()
         )
 
     def init_rank_consensus_checker(self) -> None:
@@ -6067,6 +6086,8 @@ class Scheduler(
                 )
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
+            # Keeps out of reuse what an unreleased network transfer may still
+            # touch (`Band.clear`).
             self.token_to_kv_pool_allocator.clear()
             self.req_to_token_pool.reset_aux_cache_allocator()
             self.grammar_manager.clear()

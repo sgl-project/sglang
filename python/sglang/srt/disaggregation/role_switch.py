@@ -84,6 +84,14 @@ def handle_pd_role_switch(
             "before switching",
             safe_to_restore=True,
         )
+    # The PD queues proving a failed transfer's end go with the teardown, and
+    # its pages would then stay held for good.
+    if scheduler.holds_unreleased_network_transfers():
+        return _fail(
+            "a KV transfer that failed has not proven it stopped; retry once its "
+            "peers acknowledge, or restart the instance to switch its role",
+            safe_to_restore=True,
+        )
 
     required_graph_gb = recv_req.decode_cuda_graph_memory_gb
     # Same condition ensure_decode_cuda_graphs skips on, so the check cannot be

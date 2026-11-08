@@ -50,10 +50,12 @@ from sglang.srt.disaggregation.utils import (
     KVClassType,
     MetadataBuffers,
     NetworkTransferWaiter,
+    OrphanedTransferReaper,
     ReqToMetadataIdxAllocator,
     TransferBackend,
     build_kv_layer_ids,
     build_staging_slot_metadata,
+    end_network_transfer,
     get_dsa_tail_state_indices,
     get_kv_class,
     get_kv_transfer_buf_infos,
@@ -63,6 +65,7 @@ from sglang.srt.disaggregation.utils import (
     is_mla_backend,
     is_unadmitted_reject,
     kv_layout_signature,
+    kv_quarantine_timeout,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
@@ -232,28 +235,34 @@ def maybe_release_metadata_buffer(
 
 
 def _send_peer(sender):
-    """What a page move judges a send about to be queued by: its sender and
-    how many sends of its room were queued before it."""
+    """What a page move judges a send about to be queued by: its sender, the room's
+    send record it joins, and how many of that record's sends were queued before."""
     if not isinstance(sender.kv_mgr, CommonKVManager):
         return None  # an engine without a transfer worker touches nothing later
-    queued, _ = sender.kv_mgr.send_counts(sender.bootstrap_room)
-    return sender, queued
+    record = sender.kv_mgr.send_record(sender.bootstrap_room)
+    return sender, record, record.queued
 
 
 def _send_done(peer) -> bool:
-    """Whether this rank's transfer worker is done with a send: finished (in
-    queue order), never queued, or its room failed or was cleared."""
+    """Whether the transfer engine is done with a send: never queued, or finished
+    with nothing submitted still running; a failed or cleared room proves nothing."""
     if peer is None:
         return True
-    sender, queued_before = peer
-    manager, room = sender.kv_mgr, sender.bootstrap_room
-    if manager.request_status.get(room, KVPoll.Failed) == KVPoll.Failed:
-        # TODO(ch-wan): a failed or cleared room's send is released without
-        # quiescence, so a move or reuse can land under a send still reading;
-        # those bytes reach only the failed request's never-served destination.
-        return True
-    queued, finished = manager.send_counts(room)
-    return queued <= queued_before or finished > queued_before
+    _, record, queued_before = peer
+    return record.done(queued_before)
+
+
+def make_transfer_reaper(scheduler) -> OrphanedTransferReaper:
+    """The reaper releasing sends whose request is gone once reported done, and
+    quarantining their pages past the bound; the attention TP ranks decide together."""
+    return OrphanedTransferReaper(
+        kv_storage_of(
+            scheduler.req_to_token_pool, scheduler.token_to_kv_pool_allocator
+        ),
+        _send_done,
+        (scheduler.attn_tp_cpu_group,),
+        quarantine_after=kv_quarantine_timeout(),
+    )
 
 
 def _send_waiter(scheduler) -> NetworkTransferWaiter:
@@ -679,6 +688,10 @@ class SchedulerDisaggregationPrefillMixin:
     """
     Mixin for Scheduler to handle disaggregation prefill
     """
+
+    # Releases sends whose request is gone once proven done
+    # (`make_transfer_reaper`).
+    disagg_prefill_transfer_reaper: Optional[OrphanedTransferReaper] = None
 
     def maybe_prefetch_staging_for_batch(self: Scheduler, batch: ScheduleBatch) -> None:
         """Pre-send STAGING_REQ so decode allocates staging during GPU forward."""
@@ -1365,6 +1378,11 @@ class SchedulerDisaggregationPrefillMixin:
         Only these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own sender reports.
         """
+        # Release the sends of requests already gone that the workers proved
+        # done, and quarantine the pages of those unproven past the bound.
+        if self.disagg_prefill_transfer_reaper is not None:
+            self.disagg_prefill_transfer_reaper.resolve()
+
         if len(self.disagg_prefill_transfer_queue) == 0:
             return []
 
@@ -1447,6 +1465,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.batch_result_processor._maybe_collect_routed_experts(req)
                 if not isinstance(req.finished_reason, FINISH_ABORT):
                     req.finish_outside_step(FINISH_LENGTH(length=0))
+                # Every rank's sends finished: they read nothing more.
+                end_network_transfer(
+                    kv_storage_of(
+                        self.req_to_token_pool, self.token_to_kv_pool_allocator
+                    ),
+                    req,
+                )
                 self.request_retirer.release(req, checkpoint=True)
                 # FIXME: clean up req's data in transfer engine
                 req.disagg_kv_sender.clear()

@@ -541,6 +541,14 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
+        # A failed transfer's pages are reused only on every peer's drain ack, which
+        # also makes a failed send wait for its writes still running.
+        assert envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get(), (
+            "--enable-unified-memory with PD disaggregation requires "
+            "SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE: a failed "
+            "transfer's pages are reused only after the peers acknowledge "
+            "that its writes drained."
+        )
         assert not (
             cfg.disaggregation_transfer_backend == "mooncake"
             and cfg.speculative_algorithm is not None

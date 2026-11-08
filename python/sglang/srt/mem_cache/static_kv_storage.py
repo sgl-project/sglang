@@ -473,6 +473,21 @@ class StaticKVStorage:
     def set_network_waiter(self, waiter) -> None:
         """See `KVStorage.set_network_waiter`: nothing ever waits."""
 
+    def network_transfers(self, req: Req) -> list:
+        """See `KVStorage.network_transfers`: nothing was recorded."""
+        return []
+
+    def orphan_network_transfers(self, req: Req) -> None:
+        """See `KVStorage.orphan_network_transfers`: nothing was recorded."""
+
+    def orphaned_transfers(self) -> list:
+        """See `KVStorage.orphaned_transfers`: nothing was recorded."""
+        return []
+
+    def has_unreleased_network_transfers(self) -> bool:
+        """See `KVStorage.has_unreleased_network_transfers`."""
+        return False
+
     def end_network_transfer(self, req: Req) -> None:
         """Rows of a static pool are not ordered against network transfers."""
 

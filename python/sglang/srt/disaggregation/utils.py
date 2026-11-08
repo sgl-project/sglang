@@ -225,7 +225,9 @@ class NetworkTransferWaiter:
     and one in-deadline flag, MIN-reduced over ``groups``, so all ranks return
     or raise in the same round whatever order they list the transfers in.
     Between rounds it sleeps, releasing the GIL the engine's threads report
-    through. The default ``deadline`` lies past the protocol's own deadlines."""
+    through. The default ``deadline`` lies past the protocol's own deadlines.
+    ``done`` needs proof the engine stopped, never a timeout; a transfer whose
+    request is gone is not waited for (`OrphanedTransferReaper`)."""
 
     def __init__(
         self,
@@ -288,6 +290,76 @@ class NetworkTransferWaiter:
                 )
                 reported = now
             time.sleep(self._interval)
+
+
+def kv_quarantine_timeout() -> float:
+    """Seconds an orphaned transfer stays unproven before its pages are QUARANTINED;
+    by default four release timeouts, well past a live peer's acknowledgement."""
+    timeout = envs.SGLANG_DISAGGREGATION_KV_QUARANTINE_TIMEOUT.get()
+    if timeout is None:
+        timeout = (
+            4 * envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE_TIMEOUT.get()
+        )
+    return timeout
+
+
+class OrphanedTransferReaper:
+    """Releases orphaned network transfers once proven done, and QUARANTINES those
+    unproven past ``quarantine_after``: `resolve` MIN-reduces each rank's flags over
+    ``groups``, so every rank agrees, and returns the peers released."""
+
+    def __init__(
+        self,
+        storage,
+        done: Callable[[Any], bool],
+        groups: Sequence[Optional[dist.ProcessGroup]],
+        *,
+        quarantine_after: float,
+    ):
+        self._storage = storage
+        self._done = done
+        self._groups = [g for g in groups if g is not None]
+        self._quarantine_after = quarantine_after
+
+    def resolve(self) -> List[Any]:
+        orphans = self._storage.orphaned_transfers()
+        if not orphans:
+            return []
+        now = time.monotonic()
+        flags = [int(bool(self._done(o.transfer.peer))) for o in orphans]
+        flags += [
+            int(o.quarantined or now - o.since < self._quarantine_after)
+            for o in orphans
+        ]
+        for group in self._groups:
+            flags = all_reduce_flags(flags=flags, group=group, op=dist.ReduceOp.MIN)
+        done, in_time = flags[: len(orphans)], flags[len(orphans) :]
+        released = []
+        for orphan, is_done, is_in_time in zip(orphans, done, in_time):
+            if is_done:
+                if orphan.quarantined:
+                    logger.warning(
+                        "Quarantined KV pages of request %s (room %s) are "
+                        "released: its transfer ended after %.0f s.",
+                        orphan.rid,
+                        orphan.room,
+                        now - orphan.since,
+                    )
+                self._storage.settle_orphaned_transfer(orphan)
+                released.append(orphan.transfer.peer)
+            elif not is_in_time:
+                self._storage.quarantine_orphaned_transfer(orphan)
+                logger.error(
+                    "KV pages of request %s (room %s) are quarantined after %.0f s: "
+                    "a transfer of it failed and its engine never proved it "
+                    "stopped. Its %d pages stay out of capacity and in place until "
+                    "it does, or until restart.",
+                    orphan.rid,
+                    orphan.room,
+                    now - orphan.since,
+                    orphan.page_count,
+                )
+        return released
 
 
 #########################

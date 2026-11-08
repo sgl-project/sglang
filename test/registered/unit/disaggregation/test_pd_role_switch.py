@@ -48,6 +48,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.server_args = sa
         s.is_fully_idle = MagicMock(return_value=idle)
         s.request_lists = MagicMock(return_value={})
+        s.holds_unreleased_network_transfers = MagicMock(return_value=False)
         teardown_patcher = patch.object(role_switch, "teardown_disaggregation")
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
@@ -169,6 +170,18 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         )
         self.assertFalse(out.success)
         self.assertTrue(out.safe_to_restore)
+        s.teardown_disaggregation.assert_not_called()
+
+    def test_rejected_while_a_failed_transfer_is_unproven(self):
+        """The queues that prove a failed transfer's end go with the teardown;
+        its fenced pages would then stay fenced for good."""
+        s = self._scheduler(DisaggregationMode.PREFILL)
+        s.holds_unreleased_network_transfers.return_value = True
+        out = Scheduler.handle_pd_role_switch(
+            s, PdRoleSwitchReqInput(new_role="decode")
+        )
+        self.assertFalse(out.success)
+        self.assertIn("has not proven it stopped", out.message)
         s.teardown_disaggregation.assert_not_called()
 
     def test_rejected_when_decode_graph_headroom_is_missing(self):

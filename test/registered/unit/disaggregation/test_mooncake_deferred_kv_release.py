@@ -7,6 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -17,6 +18,7 @@ from test_deferred_decode_kv_release import (
     WorkerFailureAbortScenarios,
 )
 
+from sglang.srt.disaggregation import prefill
 from sglang.srt.disaggregation.base.conn import KVPoll
 from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
@@ -238,6 +240,72 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestMooncakeSendReports(CustomTestCase):
+    """The transfer worker reports every send to its counted record, with whether
+    the engine may still run what it submitted; moves and held releases wait on that."""
+
+    def _worker(self, status=KVPoll.WaitingForInput):
+        manager = _manager(status=status)
+        TestMooncakeAbortNotification._prepare_worker(self, manager)
+        return manager
+
+    def _queue_send(self, manager, chunk):
+        peer = prefill._send_peer(SimpleNamespace(kv_mgr=manager, bootstrap_room=ROOM))
+        chunk.send_record = manager.send_record(ROOM)
+        manager.note_send_enqueued(ROOM)
+        return chunk, peer
+
+    def _run(self, manager, chunk):
+        queue = MagicMock()
+        queue.get.side_effect = [chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+
+    def test_a_send_the_engine_finished_or_never_read_is_done(self):
+        for name, status in (
+            ("sent", KVPoll.WaitingForInput),
+            ("skipped", KVPoll.Failed),
+        ):
+            with self.subTest(name=name):
+                manager = self._worker(status)
+                chunk, peer = self._queue_send(manager, _chunk())
+                self.assertFalse(prefill._send_done(peer))
+                self._run(manager, chunk)
+                self.assertTrue(prefill._send_done(peer))
+                self.assertEqual(
+                    manager.send_kvcache.call_count, 1 if name == "sent" else 0
+                )
+
+    def test_a_send_whose_transfer_failed_is_never_done(self):
+        """REGRESSION: a send whose Mooncake batch timed out (it may still run) is
+        reported unsettled and never done, so its rows are not reused under it."""
+        manager = self._worker()
+        manager.send_kvcache.return_value = -1
+        chunk, peer = self._queue_send(manager, _chunk())
+        with self.assertLogs(
+            "sglang.srt.disaggregation.mooncake.conn", level="ERROR"
+        ) as logs:
+            self._run(manager, chunk)
+        self.assertTrue(any(f"room {ROOM}" in line for line in logs.output))
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        manager._forget_sends(ROOM)  # the sender's clear()
+        self.assertFalse(prefill._send_done(peer))
+
+    def test_a_worker_that_raised_mid_send_leaves_it_unsettled(self):
+        """A worker that raised before it handed the engine anything leaves
+        nothing running; once it may have, the send is never done."""
+        for name, raised_at in (("before", "check"), ("after", "send")):
+            with self.subTest(name=name):
+                manager = self._worker()
+                chunk, peer = self._queue_send(manager, _chunk())
+                if raised_at == "check":
+                    manager.check_status = MagicMock(side_effect=RuntimeError("x"))
+                else:
+                    manager.send_kvcache.side_effect = RuntimeError("x")
+                with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
+                    self._run(manager, chunk)
+                self.assertEqual(prefill._send_done(peer), raised_at == "check")
 
 
 if __name__ == "__main__":

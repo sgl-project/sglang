@@ -231,9 +231,9 @@ class TestResets(CustomTestCase):
         self.assertTrue(storage.others_hold_rows(None))
         self.assertFalse(storage.only_parked_rows_held())
 
-    def test_role_switch_reset_ends_transfers_and_receive_holds(self):
-        """The reset a role switch (as a flush) runs frees every row, so every
-        network transfer and receive hold keyed by a request ends with it."""
+    def test_role_switch_reset_ends_receive_holds_and_orphans_transfers(self):
+        """A role-switch reset frees every row: receive holds keyed by a request end,
+        and each unreleased network transfer is orphaned until proof of its end."""
         storage = _storage(pre_alloc_size=4)
         sent, received = _active(storage, "sent"), _active(storage, "received")
         transfer, hold = NetworkTransfer(), ReceiveHold()
@@ -249,13 +249,18 @@ class TestResets(CustomTestCase):
         )
         _release_prefix_cache_for_role_switch(scheduler)
         self.assertEqual(resets, ["tree"])
-        self.assertTrue(transfer.released)
+        self.assertFalse(transfer.released, "the reset proves nothing")
+        self.assertEqual([o.transfer for o in storage.orphaned_transfers()], [transfer])
+        self.assertTrue(storage.has_unreleased_network_transfers())
         self.assertTrue(hold.released)
         self.assertEqual(storage._network_transfers, {})
         self.assertEqual(storage._receive_holds, {})
         self.assertEqual(storage.requests.count(RowState.FREE), 8)
         self.assertFalse(storage.others_hold_rows(None))
         self.assertFalse(storage.only_parked_rows_held())
+        storage.settle_orphaned_transfer(storage.orphaned_transfers()[0])
+        self.assertTrue(transfer.released)
+        self.assertFalse(storage.has_unreleased_network_transfers())
 
     def test_closing_a_parked_session_frees_its_row(self):
         """A session slot is no request: releasing its parked row ends no

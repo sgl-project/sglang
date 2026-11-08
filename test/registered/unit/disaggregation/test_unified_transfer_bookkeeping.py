@@ -76,16 +76,44 @@ class TestSendCompletion(CustomTestCase):
         self.assertFalse(prefill._send_done(second))
         self.assertEqual(manager.request_status[7], KVPoll.Transferring)
 
-    def test_a_send_never_queued_or_of_a_failed_room_waits_for_nothing(self):
+    def test_a_send_never_queued_waits_for_nothing(self):
         manager = _Manager()
         manager.update_status(8, KVPoll.Bootstrapping)
         skipped = prefill._send_peer(SimpleNamespace(kv_mgr=manager, bootstrap_room=8))
         self.assertTrue(prefill._send_done(skipped), "no worker reads its rows")
-        queued = self._queued_send(manager, 8)
-        self.assertFalse(prefill._send_done(queued))
-        manager.update_status(8, KVPoll.Failed)
-        self.assertTrue(prefill._send_done(queued))
         self.assertTrue(prefill._send_done(None))
+
+    def test_a_failed_or_cleared_room_waits_for_the_workers_report(self):
+        """REGRESSION: a send of a failed or cleared room is not done at once; it waits
+        for the worker's report, which reaches its record after the room is gone."""
+        manager = _Manager()
+        manager.update_status(8, KVPoll.Bootstrapping)
+        manager.update_status(8, KVPoll.Transferring)
+        record = manager.send_record(8)
+        queued = self._queued_send(manager, 8)
+        manager.update_status(8, KVPoll.Failed)
+        self.assertFalse(prefill._send_done(queued), "a failed room proves nothing")
+        manager._forget_sends(8)  # the sender's clear()
+        manager.request_status.pop(8)
+        self.assertFalse(prefill._send_done(queued), "nor does a cleared one")
+        manager.note_send_finished(8, record)
+        self.assertTrue(prefill._send_done(queued))
+        self.assertFalse(manager._send_records, "the report recreates nothing")
+
+    def test_a_send_whose_submitted_transfer_failed_never_ends(self):
+        """A transfer that failed or timed out inside the engine may still run, so its
+        send is never done; the room's other sends end as the worker reports them."""
+        manager = _Manager()
+        manager.update_status(4, KVPoll.Bootstrapping)
+        record = manager.send_record(4)
+        first, second, third = (self._queued_send(manager, 4) for _ in range(3))
+        manager.note_send_finished(4, record)
+        manager.note_send_finished(4, record, settled=False)
+        manager.note_send_finished(4, record)
+        self.assertEqual(
+            [prefill._send_done(p) for p in (first, second, third)],
+            [True, False, True],
+        )
 
     def test_the_send_waiter_spans_the_attention_tp_ranks_only(self):
         """REGRESSION: the send waiter reduces over attention TP only; CP ranks
@@ -109,6 +137,7 @@ class TestSendCompletion(CustomTestCase):
         manager.note_send_finished(5, record)
         self.assertFalse(manager._send_records)
         self.assertEqual(manager.send_counts(5), (0, 0))
+        self.assertEqual((record.queued, record.finished), (1, 1))
 
     def test_a_late_report_does_not_finish_a_send_of_the_room_started_anew(self):
         """A send of the room's previous lifecycle that finishes late must not
@@ -241,7 +270,8 @@ class _Clock:
 
 class TestWaiterEndsWithTheProtocol(CustomTestCase):
     """REGRESSION: the wait's own deadline lies past the protocol's, feeds the
-    watchdog until then, and fails together on every rank once it passes."""
+    watchdog until then, and fails a transfer whose end is never proven together
+    on every rank."""
 
     def test_a_receive_finishing_after_180_s_within_a_300_s_timeout(self):
         clock = _Clock()
@@ -316,8 +346,8 @@ class TestWaiterEndsWithTheProtocol(CustomTestCase):
         self.assertEqual(reduced, [[0, 1]])
 
     def test_a_failed_transfer_worker_ends_the_wait(self):
-        """REGRESSION: a Mooncake transfer worker that raises fails its room,
-        so a page move waiting for its unfinished send returns."""
+        """REGRESSION: a Mooncake transfer worker that raises before handing the
+        engine anything fails its room and reports the send done; the wait returns."""
         from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 
         manager = _Manager()
@@ -339,6 +369,7 @@ class TestWaiterEndsWithTheProtocol(CustomTestCase):
             poison_deferred_ack_room=lambda room: None,
             record_failure=lambda room, reason: None,
             update_status=manager.update_status,
+            note_send_finished=manager.note_send_finished,
             bootstrap_port=0,
         )
         with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
@@ -477,8 +508,8 @@ class _Receiver(CommonKVReceiver):
 
 class TestReceiveCompletion(CustomTestCase):
     """What a page move waits for on a decode node: a receive, until it
-    succeeded, or failed and no prefill rank still writes it, by the rule
-    deferred release keeps (acknowledgements, or the release timeout)."""
+    succeeded, or failed and every prefill rank that could write it
+    acknowledged its drain. A timeout proves nothing."""
 
     ROOM = 3
 
@@ -492,6 +523,7 @@ class TestReceiveCompletion(CustomTestCase):
         queue._deferred_releases = IndexedReqList(
             ListKind.PD_RELEASING, req_of=lambda x: x[0].req
         )
+        queue._undrained_receives = []
         return queue
 
     def _decode_req(self, *, n_peers=2, deferred=True):
@@ -535,10 +567,9 @@ class TestReceiveCompletion(CustomTestCase):
         self.assertTrue(queue._receive_done(decode_req))
         self.assertEqual(len(receiver.sent), 2, "the abort is notified once")
 
-    def test_an_unacknowledged_failure_ends_at_one_deadline_the_hold_keeps(self):
-        """The release timeout runs from the first sight of the failure, a
-        page move's or the queue's, and a later hold keeps that deadline and
-        its own acknowledgement count."""
+    def test_an_unacknowledged_failure_never_ends_at_its_deadline(self):
+        """REGRESSION: past its release timeout (run from first sight, kept by a later
+        hold) a failed receive is not done; it still waits for every acknowledgement."""
         queue = self._queue(timeout=10.0)
         decode_req = self._decode_req(n_peers=2)
         decode_req.kv_receiver.status = KVPoll.Failed
@@ -549,9 +580,11 @@ class TestReceiveCompletion(CustomTestCase):
             queue._defer_release(decode_req)
             ((_, start, deadline, _, required_acks),) = queue._deferred_releases.items()
             self.assertEqual((start, deadline, required_acks), (100.0, 110.0, 2))
-            now[0] = 109.9
+            now[0] = 1e6
             self.assertFalse(queue._receive_done(decode_req))
-            now[0] = 110.0
+            self._ack(decode_req, 0)
+            self.assertFalse(queue._receive_done(decode_req))
+            self._ack(decode_req, 1)
             self.assertTrue(queue._receive_done(decode_req))
 
     def test_a_failure_never_published_is_done_at_once(self):
@@ -569,14 +602,15 @@ class TestReceiveCompletion(CustomTestCase):
                 self.assertTrue(queue._receive_done(decode_req))
                 self.assertEqual(decode_req.kv_receiver.sent, [])
 
-    def test_without_deferred_release_a_failure_is_done_at_once(self):
-        """The queue releases such a failure at once, as a static pool does."""
+    def test_without_deferred_release_a_published_failure_never_ends(self):
+        """REGRESSION: with deferred release off a failed receive is not done at once;
+        no peer acks then, so it never ends (unified memory refuses this setup)."""
         for queue_flag, manager_flag in ((False, True), (True, False)):
             with self.subTest(queue=queue_flag, manager=manager_flag):
                 queue = self._queue(deferred=queue_flag)
                 decode_req = self._decode_req(deferred=manager_flag)
                 decode_req.kv_receiver.status = KVPoll.Failed
-                self.assertTrue(queue._receive_done(decode_req))
+                self.assertFalse(queue._receive_done(decode_req))
 
 
 class TestTransferBookkeeping(CustomTestCase):
@@ -616,6 +650,353 @@ class TestTransferBookkeeping(CustomTestCase):
         )
         (use,) = allocator.mamba_allocator.usage.transfers()
         self.assertEqual(np.asarray(use.ids).tolist(), [3])
+
+
+def _tri_pool():
+    setup_allocator_context()
+    allocator = build_unified_bundle(
+        UnifiedGeometry(
+            chain="tri",
+            full_layer_ids=(0,),
+            swa_layer_ids=(1,),
+            state_layer_ids=(2,),
+            lazy=True,
+            device="cpu",
+        )
+    ).token_to_kv_pool_allocator
+    return allocator, allocator.storage
+
+
+def _physical_pages(band, ids) -> list:
+    pages = band.ids.virtual_to_physical[ids // band.page_size] * band.page_size
+    return (pages // band.pool_page_size).tolist()
+
+
+def _record(allocator, req, pages, *, writes, peer):
+    record_network_transfer(
+        allocator.storage,
+        req,
+        peer=peer,
+        writes=writes,
+        page_indices=np.array(pages, dtype=np.int32),
+        page_size=allocator.page_size,
+    )
+
+
+class _Blocked:
+    """Runs ``fn`` on a thread, so a test can see it wait and then end."""
+
+    def __init__(self, fn):
+        self.result = []
+        self.thread = threading.Thread(
+            target=lambda: self.result.append(fn()), daemon=True
+        )
+        self.thread.start()
+
+    def still_waiting(self, seconds=0.3) -> bool:
+        self.thread.join(seconds)
+        return self.thread.is_alive()
+
+    def finish(self):
+        self.thread.join(30)
+        assert not self.thread.is_alive(), "the wait never ended"
+        return self.result[0]
+
+
+class TestFailedTransferRowsWaitForTheirProof(CustomTestCase):
+    """A failed transfer's rows are reused or moved over only on proof the engine is
+    done with them: a failure or timeout aborts the request but proves nothing."""
+
+    ROOM = TestReceiveCompletion.ROOM
+
+    def test_a_failed_send_still_read_keeps_its_old_row_until_the_report(self):
+        """REGRESSION: a flush must not reuse a moved page's vacated row while a failed
+        room's timed-out transfer may still read it; it waits for the worker report."""
+        allocator, storage = _tri_pool()
+        storage.set_network_waiter(
+            NetworkTransferWaiter(prefill._send_done, (), interval=0.001)
+        )
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        ids = owner.alloc(8 * page)
+        # The page nearest the frontier is the first a compaction moves.
+        top = _physical_pages(owner, ids[:1])
+        manager = _Manager()
+        manager.update_status(1, KVPoll.Bootstrapping)
+        manager.update_status(1, KVPoll.Transferring)
+        record = manager.send_record(1)
+        peer = prefill._send_peer(SimpleNamespace(kv_mgr=manager, bootstrap_room=1))
+        manager.note_send_enqueued(1)
+        _record(allocator, SimpleNamespace(rid="r1"), top, writes=False, peer=peer)
+        # The engine's batch timed out and keeps reading; the room fails and
+        # its sender is cleared.
+        manager.update_status(1, KVPoll.Failed)
+        manager._forget_sends(1)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        self.assertGreater(owner.flush_opportunistic(), 0)
+        self.assertIn(top[0], owner.usage.pending_pages)
+        flush = _Blocked(owner.flush_for_allocation)
+        self.assertTrue(flush.still_waiting(), "it reused the row still read")
+        self.assertNotIn(top[0], owner._free_phys_pages.tolist())
+        manager.note_send_finished(1, record)  # the worker's late report
+        flush.finish()
+        self.assertNotIn(top[0], owner.usage.pending_pages)
+
+    def test_a_receive_written_past_its_timeout_keeps_its_row_until_drained(self):
+        """REGRESSION: a flush must not move a failed receive's row past its release
+        timeout while the prefill may still write it; it waits for every drain ack."""
+        allocator, storage = _tri_pool()
+        queue = TestReceiveCompletion._queue(self, timeout=10.0)
+        decode_req = TestReceiveCompletion._decode_req(self, n_peers=1)
+        storage.set_network_waiter(
+            NetworkTransferWaiter(queue._receive_done, (), interval=0.001)
+        )
+        owner = allocator.full_attn_allocator
+        page = allocator.page_size
+        ids = owner.alloc(8 * page)
+        top = _physical_pages(owner, ids[:1])
+        _record(allocator, decode_req.req, top, writes=True, peer=decode_req)
+        owner.free(ids[2 * page : 6 * page])  # interior holes
+        decode_req.kv_receiver.status = KVPoll.Failed
+        now = [100.0]
+        with mock.patch.object(decode_mod.time, "monotonic", lambda: now[0]):
+            self.assertFalse(queue._receive_done(decode_req))
+            queue._defer_release(decode_req)
+            now[0] = 1e6  # far past the release timeout
+            self.assertEqual(owner.flush_opportunistic(), 0)
+            flush = _Blocked(owner.flush_for_allocation)
+            self.assertTrue(flush.still_waiting(), "it moved the row still written")
+            self.assertEqual(_physical_pages(owner, ids[:1]), top)
+            TestReceiveCompletion._ack(self, decode_req, 0)
+            self.assertGreater(flush.finish(), 0)
+        self.assertNotEqual(_physical_pages(owner, ids[:1]), top)
+
+
+class _Orphan:
+    """A request with a row whose transfer of ``pages`` pages is recorded and
+    unproven; ``proof`` is what the engine reports."""
+
+    def __init__(self, allocator, *, pages=4, writes=True, rid="r", room=7):
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        self.allocator, self.storage = allocator, allocator.storage
+        self.owner = allocator.full_attn_allocator
+        self.proof = {"done": False}
+        self.req = SimpleNamespace(rid=rid, bootstrap_room=room, kv=ReqKvInfo())
+        assert self.storage.acquire([self.req]) is not None
+        self.ids = self.owner.alloc(pages * allocator.page_size)
+        self.pages = set(_physical_pages(self.owner, self.ids))
+        _record(allocator, self.req, sorted(self.pages), writes=writes, peer=self.proof)
+
+    def give_back(self):
+        """The transfer failed: the request is given back at once."""
+        self.owner.free(self.ids)
+        self.storage.release_row(self.req)
+
+
+def _reaper(storage, *, quarantine_after=120.0):
+    return utils_mod.OrphanedTransferReaper(
+        storage, lambda peer: peer["done"], (), quarantine_after=quarantine_after
+    )
+
+
+class TestTheLedgerHoldsAFailedTransfersPages(CustomTestCase):
+    """A failed transfer's request goes back at once; the page ledger alone keeps its
+    pages fixed, out of reuse and capacity until proven, QUARANTINED past a bound."""
+
+    def test_freed_pages_of_a_gone_receive_wait_for_the_drain(self):
+        """REGRESSION: a page freed while its receive was unreleased joined the free
+        list under a late write; it now stays put, out of capacity, until the drain."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        orphan = _Orphan(allocator)
+        orphan.give_back()
+        self.assertFalse(storage._network_transfers, "the request is gone")
+        held = len(orphan.pages) * allocator.page_size
+        available = owner.available_size()
+        self.assertTrue(owner.moves_blocked(), "fixed in place")
+        taken = owner.alloc(owner.available_size())
+        self.assertTrue(
+            orphan.pages.isdisjoint(_physical_pages(owner, taken)),
+            "a page a late write may reach was handed out",
+        )
+        owner.free(taken)
+        (record,) = storage.orphaned_transfers()
+        self.assertEqual(record.page_count, len(orphan.pages))
+        orphan.proof["done"] = True
+        self.assertEqual(_reaper(storage).resolve(), [orphan.proof])
+        self.assertFalse(owner.moves_blocked())
+        owner.flush_opportunistic()
+        self.assertEqual(owner.available_size(), available + held, "out of capacity")
+
+    def test_the_reaper_releases_on_proof_and_quarantines_past_the_bound(self):
+        """Unproven past the bound, the held pages are quarantined: counted in pool
+        stats and logged once with room and page count; a late proof gives them back."""
+        allocator, storage = _tri_pool()
+        owner = allocator.full_attn_allocator
+        orphan = _Orphan(allocator, room=9)
+        orphan.give_back()
+        available = owner.available_size()
+        reaper = _reaper(storage, quarantine_after=60.0)
+        clock = _Clock()
+        with mock.patch.object(utils_mod, "time", clock):
+            for o in storage._orphaned:
+                o.since = clock.now
+            clock.now += 59.0
+            self.assertEqual(reaper.resolve(), [])
+            self.assertFalse(storage.orphaned_transfers()[0].quarantined)
+            clock.now += 1.0
+            with self.assertLogs(utils_mod.logger, level="ERROR") as logs:
+                reaper.resolve()
+            reaper.resolve()
+        self.assertEqual(len(logs.output), 1)
+        self.assertIn("room 9", logs.output[0])
+        self.assertIn(f"{len(orphan.pages)} pages", logs.output[0])
+        quarantined = len(orphan.pages) * allocator.page_size
+        usage = {u.name: u for u in storage.usage()}
+        self.assertEqual(usage[allocator.roles.owner].quarantined, quarantined)
+        self.assertEqual(owner.available_size(), available)
+
+        orphan.proof["done"] = True
+        with self.assertLogs(utils_mod.logger, level="WARNING"):
+            self.assertEqual(reaper.resolve(), [orphan.proof])
+        self.assertEqual(storage.orphaned_transfers(), [])
+        owner.flush_opportunistic()
+        self.assertEqual(owner.available_size(), available + quarantined)
+        self.assertEqual(
+            {u.name: u for u in storage.usage()}[allocator.roles.owner].quarantined, 0
+        )
+
+    def test_ranks_quarantine_together(self):
+        """One rank past the bound quarantines on every rank, in the round
+        that reduces the proofs."""
+        allocator, storage = _tri_pool()
+        _Orphan(allocator).give_back()
+
+        def reduce(flags, group, op):
+            return [flags[0], 0]  # another rank is past the bound
+
+        reaper = utils_mod.OrphanedTransferReaper(
+            storage, lambda peer: False, ("tp",), quarantine_after=1e9
+        )
+        with (
+            mock.patch.object(utils_mod, "all_reduce_flags", reduce),
+            self.assertLogs(utils_mod.logger, level="ERROR"),
+        ):
+            reaper.resolve()
+        self.assertTrue(storage.orphaned_transfers()[0].quarantined)
+
+    def test_a_pool_clear_hands_out_no_held_page(self):
+        """A cache flush clears the pools while a dead peer's transfers are
+        unproven: every other page comes back, theirs do not."""
+        for quarantine in (False, True):
+            with self.subTest(quarantine=quarantine):
+                allocator, storage = _tri_pool()
+                total = allocator.available_size()
+                orphan = _Orphan(allocator)
+                owner = orphan.owner
+                # Pages the cache keeps, which the clear gives back.
+                owner.alloc(4 * allocator.page_size)
+                orphan.give_back()
+                if quarantine:
+                    with self.assertLogs(utils_mod.logger, level="ERROR"):
+                        _reaper(storage, quarantine_after=0.0).resolve()
+                storage.requests.clear()
+                allocator.clear()
+                taken = owner.alloc(owner.available_size())
+                self.assertTrue(orphan.pages.isdisjoint(_physical_pages(owner, taken)))
+                owner.free(taken)
+                orphan.proof["done"] = True
+                _reaper(storage).resolve()
+                owner.flush_opportunistic()
+                allocator.clear()
+                self.assertEqual(allocator.available_size(), total)
+
+    def test_a_pool_clear_without_transfers_resets(self):
+        allocator, storage = _tri_pool()
+        total = allocator.available_size()
+        allocator.full_attn_allocator.alloc(8 * allocator.page_size)
+        allocator.clear()
+        self.assertEqual(allocator.available_size(), total)
+
+
+class TestAFailedReceiveIsGivenBackAtOnce(CustomTestCase):
+    """On decode a failed receive's request goes back at once; its rows stay held, and
+    its receiver and metadata slot kept, until every peer acknowledges the drain."""
+
+    ROOM = TestReceiveCompletion.ROOM
+
+    def test_the_request_goes_and_its_rows_wait_for_the_acknowledgements(self):
+        allocator, storage = _tri_pool()
+        queue = TestReceiveCompletion._queue(self)
+        decode_req = TestReceiveCompletion._decode_req(self, n_peers=1)
+        decode_req.metadata_buffer_index = 5
+        decode_req.kv_receiver.status = KVPoll.Failed
+        queue.fences_failed_receives = True
+        queue.tree_cache = SimpleNamespace(
+            req_to_token_pool=storage.requests, token_to_kv_pool_allocator=allocator
+        )
+        queue.transfer_reaper = utils_mod.OrphanedTransferReaper(
+            storage, queue._receive_done, (), quarantine_after=120.0
+        )
+        owner = allocator.full_attn_allocator
+        req = decode_req.req
+        from sglang.srt.managers.schedule_batch import ReqKvInfo
+
+        req.kv = ReqKvInfo()
+        self.assertIsNotNone(storage.acquire([req]))
+        ids = owner.alloc(4 * allocator.page_size)
+        pages = set(_physical_pages(owner, ids))
+        _record(allocator, req, sorted(pages), writes=True, peer=decode_req)
+        released, finished = [], []
+
+        def release(r, *, checkpoint):
+            released.append(r)
+            owner.free(ids)
+            storage.release_row(r)
+
+        queue.scheduler = SimpleNamespace(
+            request_retirer=SimpleNamespace(release=release)
+        )
+        queue._finish_release = lambda d, idx: finished.append((d, idx))
+        self.assertFalse(queue._receive_done(decode_req))  # notifies the abort
+        queue._release_undrained(decode_req)
+        self.assertEqual(released, [req], "the request is gone at once")
+        self.assertEqual(len(storage.orphaned_transfers()), 1)
+        others = owner.alloc(owner.available_size())
+        self.assertTrue(pages.isdisjoint(_physical_pages(owner, others)))
+        queue._resolve_undrained_receives()
+        self.assertEqual(finished, [])
+        TestReceiveCompletion._ack(self, decode_req, 0)
+        queue._resolve_undrained_receives()
+        self.assertEqual(finished, [(decode_req, 5)])
+        self.assertEqual(storage.orphaned_transfers(), [])
+        self.assertEqual(queue._undrained_receives, [])
+
+
+class TestMemoryReleaseWaitsForUnprovenTransfers(CustomTestCase):
+    def test_memory_is_not_released_under_an_unproven_transfer(self):
+        """Released and resumed memory would be handed out under a remote
+        engine's late writes."""
+        from sglang.srt.managers.io_struct import ReleaseMemoryOccupationReqInput
+        from sglang.srt.managers.scheduler_components.weight_updater import (
+            SchedulerWeightUpdaterManager,
+        )
+
+        updater = SimpleNamespace(
+            scheduler=SimpleNamespace(
+                pause_state=SimpleNamespace(paused=False),
+                holds_unreleased_network_transfers=lambda: True,
+            ),
+            is_fully_idle=lambda **kw: True,
+            offload_tags=set(),
+        )
+        out = SchedulerWeightUpdaterManager.release_memory_occupation(
+            updater, ReleaseMemoryOccupationReqInput(tags=None)
+        )
+        self.assertFalse(out.success)
+        self.assertIn("has not proven", out.message)
+        self.assertEqual(updater.offload_tags, set())
 
 
 if __name__ == "__main__":

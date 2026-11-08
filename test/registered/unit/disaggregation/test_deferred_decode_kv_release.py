@@ -494,6 +494,7 @@ def _make_queue(timeout=30.0, enable_metrics=False):
     q._deferred_releases = IndexedReqList(
         ListKind.PD_RELEASING, req_of=lambda x: x[0].req
     )
+    q._undrained_receives = []
     q.queue = IndexedReqList(ListKind.PD_RECEIVING, req_of=lambda x: x.req)
     q.gloo_group = dist.group.WORLD
     q.tp_rank = 0

@@ -480,6 +480,20 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        if (
+            GPU_MEMORY_TYPE_KV_CACHE in tags
+            and scheduler is not None
+            and scheduler.holds_unreleased_network_transfers()
+        ):
+            # A remote engine may still write the pool: memory released now
+            # could be handed out after the resume under its late writes.
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="Memory was not released because a KV transfer that "
+                "failed has not proven it stopped touching the pool; retry once "
+                "its peers acknowledge, or restart the instance.",
+            )
+
         for tag in tags:
             self.offload_tags.add(tag)
 

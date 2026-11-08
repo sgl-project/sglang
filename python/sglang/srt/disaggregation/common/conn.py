@@ -298,14 +298,24 @@ class DeferredAbortAckState(msgspec.Struct):
 
 
 class SendRecord:
-    """A room's sends queued for the transfer worker and finished by it, so a
-    page move can tell when the engine is done with one send's rows."""
+    """A room lifecycle's sends queued and finished by the transfer worker; waiters hold
+    the record, which reports still reach after the room fails, clears or restarts."""
 
-    __slots__ = ("queued", "finished")
+    __slots__ = ("queued", "finished", "unsettled")
 
     def __init__(self) -> None:
         self.queued = 0
         self.finished = 0
+        # Queue positions of sends finished with a failed submitted transfer, which the
+        # engine may still run and nothing reports the end of.
+        self.unsettled: Set[int] = set()
+
+    def done(self, position: int) -> bool:
+        """Whether the engine is done with the send queued at ``position``: none was
+        queued, or the worker finished it (in queue order) with nothing left running."""
+        if self.queued <= position:
+            return True
+        return self.finished > position and position not in self.unsettled
 
 
 class CommonKVManager(BaseKVManager):
@@ -765,13 +775,23 @@ class CommonKVManager(BaseKVManager):
         self.send_record(bootstrap_room).queued += 1
 
     def note_send_finished(
-        self, bootstrap_room: int, record: Optional[SendRecord] = None
+        self,
+        bootstrap_room: int,
+        record: Optional[SendRecord] = None,
+        *,
+        settled: bool = True,
     ) -> None:
-        """The transfer worker is done with a queued send (worker thread); a
-        report whose ``record`` is no longer the room's is dropped."""
-        current = (self._send_records or {}).get(bootstrap_room)
-        if current is not None and (record is None or record is current):
-            current.finished += 1
+        """The transfer worker is done with a queued send (worker thread), reported to
+        its ``record`` even after a room reset; unsettled, it never counts as done."""
+        if record is None:
+            record = (self._send_records or {}).get(bootstrap_room)
+            if record is None:
+                return
+        if not settled:
+            # Before the count, so a reader never sees the send finished
+            # without seeing it unsettled.
+            record.unsettled.add(record.finished)
+        record.finished += 1
 
     def send_counts(self, bootstrap_room: int) -> Tuple[int, int]:
         """The room's sends queued and finished so far, in queue order."""
@@ -2611,8 +2631,8 @@ class CommonKVSender(BaseKVSender):
         )
 
     def _retire_sends(self) -> None:
-        """Drop the room's send record once it concluded or failed; a later
-        worker report finds no record and is dropped."""
+        """Drop the room's send record once it concluded or failed, so a room started
+        anew counts afresh; waiters hold the record, and later reports go to it."""
         self.kv_mgr._forget_sends(self.bootstrap_room)
 
     def abort(self):

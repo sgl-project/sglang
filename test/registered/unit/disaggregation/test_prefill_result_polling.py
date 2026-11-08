@@ -192,6 +192,9 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
         self.prefill_launched_reqs = KeyedReqList(ListKind.PREFILL_LAUNCHED)
         self.invariant_checker = Mock()
         self.uocr_runtime = None
+        # A static pool: a concluded send's transfers end with nothing to do.
+        self.req_to_token_pool = SimpleNamespace()
+        self.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
         self.waiting_queue = IndexedReqList(ListKind.WAITING)
         self.cur_batch_for_debug = None
         self.pause_state = PauseState()
