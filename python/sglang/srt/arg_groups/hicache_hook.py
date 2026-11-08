@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
@@ -108,10 +109,19 @@ def handle_hicache_ratio_default(server_args: Any):
     A decode server keeps the ratio unset here: kv_cache_builder resolves
     it against the retraction-backup backend (1.0 for host_pool, else 2.0).
 
-    An explicit --hicache-ratio or --hicache-size is honored as given, so it
+    An explicit ratio, target size or draft size is honored as given, so it
     resolves --hicache-host-memory-fraction to None (auto-sizing off).
     """
     cfg = resolving_view(server_args)
+    if not math.isfinite(cfg.hicache_draft_size) or cfg.hicache_draft_size < 0:
+        raise ValueError("--hicache-draft-size must be finite and nonnegative.")
+    if cfg.hicache_draft_size > 0:
+        if not cfg.enable_hierarchical_cache:
+            raise ValueError(
+                "--hicache-draft-size requires --enable-hierarchical-cache."
+            )
+        if cfg.speculative_algorithm in (None, "NGRAM"):
+            raise ValueError("--hicache-draft-size requires a speculative draft model.")
     fraction = cfg.hicache_host_memory_fraction
     if fraction is not None and not 0 < fraction <= 1:
         raise ValueError("--hicache-host-memory-fraction must be in (0, 1].")
@@ -120,7 +130,11 @@ def handle_hicache_ratio_default(server_args: Any):
         fields["hicache_ratio"] = (
             1.2 if cfg.hicache_host_memory_mode == "buffer_only" else 2.0
         )
-    if cfg.hicache_ratio is not None or cfg.hicache_size > 0:
+    if (
+        cfg.hicache_ratio is not None
+        or cfg.hicache_size > 0
+        or cfg.hicache_draft_size > 0
+    ):
         fields["hicache_host_memory_fraction"] = None
     if fields:
         declare_resolution(server_args, "_handle_hicache_ratio_default", **fields)

@@ -40,7 +40,7 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         self,
         buffer_info: MHABufferInfo,
         host_to_device_ratio: float,
-        host_size: int,
+        host_size: float,
         page_size: int,
         layout: str,
         pin_memory: bool = True,
@@ -54,6 +54,7 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
         write_back_staging: tuple[torch.Tensor, torch.Tensor] | None = None,
         pool_label: str = "kv",
         host_token_capacity: int | None = None,
+        min_host_tokens: int = 0,
     ):
         if layout != "page_first":
             raise NotImplementedError(
@@ -93,6 +94,7 @@ class MHATokenToKVPoolMXFP8Host(MHATokenToKVPoolHost):
             write_back_staging=write_back_staging,
             pool_label=pool_label,
             host_token_capacity=host_token_capacity,
+            min_host_tokens=min_host_tokens,
         )
         if self.page_size != buffer_info.page_size:
             raise ValueError(
