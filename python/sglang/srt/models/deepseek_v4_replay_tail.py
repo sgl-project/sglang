@@ -87,18 +87,21 @@ def _replay_tail_scope():
         _in_replay_tail = False
 
 
-def scattered_dp_counts(num_tokens: int, num_rows: int) -> Tuple[int, List[int]]:
-    """The largest step token count and every rank's tail rows, gathered on the
-    host; safe only when every rank runs the step eagerly."""
+def scattered_dp_counts(
+    num_tokens: int, num_rows: int, tail_graph_compatible: bool
+) -> Tuple[int, List[int], bool]:
+    """Gather sizes and replay eligibility when every rank runs the step eagerly."""
     group = get_parallel().tp_group.cpu_group
     counts = torch.empty(
-        2 * torch.distributed.get_world_size(group=group), dtype=torch.int64
+        3 * torch.distributed.get_world_size(group=group), dtype=torch.int64
     )
     all_gather_single(
-        counts, torch.tensor([num_tokens, num_rows], dtype=torch.int64), group=group
+        counts,
+        torch.tensor([num_tokens, num_rows, tail_graph_compatible], dtype=torch.int64),
+        group=group,
     )
-    tokens, rows = counts.view(-1, 2).T.tolist()
-    return max(tokens), rows
+    tokens, rows, tail_graph_votes = counts.view(-1, 3).T.tolist()
+    return max(tokens), rows, all(tail_graph_votes)
 
 
 def _tail_kv_store(attention, x, positions, qkv_a) -> None:
@@ -192,7 +195,6 @@ class DecoderReplayTail:
         forward_batch: ForwardBatch,
         num_tokens: int,
         tail_in_graph: bool,
-        late_dp_counts: Optional[List[int]],
     ) -> Tuple[bool, Optional[List[int]]]:
         """Whether this step uses a tail graph and, under DP attention, every rank's
         tail rows; also feeds the warm gate."""
@@ -232,10 +234,20 @@ class DecoderReplayTail:
                 and self.runner.bucket_rows(tail.positions.shape[0]) is not None,
                 None,
             )
-        dp_rows = scattered[1] if scattered is not None else None
-        if dp_rows is None:
-            dp_rows = self._gathered_dp_rows(late_dp_counts, forward_batch)
-        if dp_rows is None or self.runner.bucket_rows(max(dp_rows)) is None:
+        if scattered is not None:
+            _, dp_rows, can_replay = scattered
+        elif get_moe_a2a_backend().is_none() and forward_batch.is_extend_in_batch:
+            dp_rows = forward_batch.global_late_layer_num_tokens_cpu
+            can_replay = forward_batch.global_late_layer_tail_graph_compatible
+        else:
+            return False, None
+        # A live decode rank has no prefill tail. Fall back on every rank so
+        # that it keeps its rows and the tail collectives still agree.
+        if (
+            not can_replay
+            or dp_rows is None
+            or self.runner.bucket_rows(max(dp_rows)) is None
+        ):
             return False, None
         return True, dp_rows
 
@@ -246,7 +258,7 @@ class DecoderReplayTail:
         tail_in_graph: bool,
         forward_batch: ForwardBatch,
         num_tokens: int,
-    ) -> Optional[Tuple[int, List[int]]]:
+    ) -> Optional[Tuple[int, List[int], bool]]:
         """`scattered_dp_counts` for a MoE routing each rank's own rows. Such a MoE
         lets ranks pick prefill graph or eager independently, so it needs the
         prefill graph disabled."""
@@ -260,28 +272,10 @@ class DecoderReplayTail:
         ):
             return None
         return scattered_dp_counts(
-            num_tokens, 0 if tail is None else tail.positions.shape[0]
+            num_tokens,
+            0 if tail is None else tail.positions.shape[0],
+            tail is not None or forward_batch.forward_mode.is_idle(),
         )
-
-    @staticmethod
-    def _gathered_dp_rows(
-        late_dp_counts: Optional[List[int]], forward_batch: ForwardBatch
-    ) -> Optional[List[int]]:
-        """Every rank's tail rows for a TP MoE, or None without a uniform layout."""
-        if not get_moe_a2a_backend().is_none() or not forward_batch.is_extend_in_batch:
-            return None
-        # Exchanged before the forward (ForwardBatch.prepare_mlp_sync_batch).
-        if forward_batch.global_late_layer_num_tokens_cpu is not None:
-            return list(forward_batch.global_late_layer_num_tokens_cpu)
-        if late_dp_counts is not None:
-            return late_dp_counts
-        # No re-layout was needed: every rank's tail is its whole extend.
-        early = forward_batch.global_num_tokens_padded_cpu
-        if early is None:
-            early = forward_batch.global_num_tokens_cpu
-        if early is None or len(early) != get_parallel().attn_dp_size:
-            return None
-        return list(early)
 
     def breaks_out_of_prefill_graph(
         self, tail: LateLayerTail, *, num_tokens: int

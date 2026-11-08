@@ -4178,7 +4178,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 num_tokens=input_ids.shape[0],
                 tail_in_graph=tail_in_graph,
-                late_dp_counts=late_dp_counts,
             )
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
