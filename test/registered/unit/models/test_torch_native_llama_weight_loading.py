@@ -1,9 +1,11 @@
 """TorchNativeLlamaForCausalLM and TorchNativePhi3ForCausalLM load checkpoint
-tensors and FP8 KV-cache scales.
+tensors and FP8 KV-cache scales, and refuse quantized linear weights.
 
 `load_weights` used to collect only the root module's own parameters, so it
 loaded no checkpoint tensor, and the attention was built without the
-quantization config, so it had no k_scale/v_scale parameters.
+quantization config, so it had no k_scale/v_scale parameters. The linear layers
+are plain torch.nn.Linear, so a checkpoint that stores them quantized (FP8
+codes with a weight_scale, packed INT4) cannot be read and must not load.
 """
 
 import unittest
@@ -138,6 +140,29 @@ class TestTorchNativeLlamaWeightLoading(CustomTestCase):
                     (layer.input_layernorm.weight, norm),
                 ):
                     torch.testing.assert_close(param.cpu(), expected, rtol=0, atol=0)
+
+    def test_quantized_linear_weights_are_refused(self):
+        # As in RedHatAI/Meta-Llama-3.1-8B-Instruct-FP8: FP8 codes with a
+        # per-tensor weight_scale and input_scale; and a packed INT4 layer.
+        prefix = "model.layers.1.self_attn.q_proj"
+        checkpoints = {
+            "fp8 weight": [
+                (f"{prefix}.weight", torch.zeros(64, 64).to(torch.float8_e4m3fn))
+            ],
+            "weight_scale": [(f"{prefix}.weight_scale", torch.ones(1))],
+            "input_scale": [(f"{prefix}.input_scale", torch.ones(1))],
+            "weight_packed": [
+                (f"{prefix}.weight_packed", torch.zeros(64, 8, dtype=torch.int32))
+            ],
+        }
+        for cls in MODELS:
+            for kind, weights in checkpoints.items():
+                with self.subTest(model=cls.__name__, tensor=kind):
+                    model = self.build(cls)
+                    with self.assertRaisesRegex(
+                        ValueError, "cannot load the quantized"
+                    ):
+                        model.load_weights(weights)
 
 
 if __name__ == "__main__":

@@ -405,6 +405,28 @@ class LlamaModel(nn.Module):
         return hidden_states
 
 
+# Checkpoint tensors that only a quantized linear layer can hold. The TorchNative
+# classes build plain torch.nn.Linear layers (quantization goes through torchao
+# after loading), so a checkpoint that stores its linear layers quantized cannot
+# be read: its codes would load as numbers and its scales would be skipped.
+_LINEAR_QUANT_SUFFIXES = (
+    ".weight_scale",
+    ".weight_scale_inv",
+    ".weight_scale_2",
+    ".weight_global_scale",
+    ".weight_packed",
+    ".weight_shape",
+    ".weight_zero_point",
+    ".input_scale",
+    ".input_global_scale",
+    ".qweight",
+    ".qzeros",
+    ".scales",
+    ".g_idx",
+)
+_UNQUANTIZED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
+
+
 class TorchNativeLlamaForCausalLM(nn.Module):
     def __init__(
         self,
@@ -504,6 +526,16 @@ class TorchNativeLlamaForCausalLM(nn.Module):
                 name = maybe_remap_kv_scale_name(name, kv_scales)
                 if name is None:
                     continue
+            if name.endswith(_LINEAR_QUANT_SUFFIXES) or (
+                name.endswith(".weight")
+                and loaded_weight.dtype not in _UNQUANTIZED_DTYPES
+            ):
+                raise ValueError(
+                    f"{type(self).__name__} builds torch.nn.Linear layers and "
+                    f"cannot load the quantized checkpoint tensor {name} "
+                    f"({loaded_weight.dtype}); serve this checkpoint with the "
+                    "model's default class."
+                )
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
