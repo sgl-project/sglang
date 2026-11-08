@@ -72,9 +72,14 @@ class MambaComponent(TreeComponent):
             "MambaComponent requires a request table with state slots, got "
             f"{type(params.req_to_token_pool)}"
         )
+        self.state_from_prefill = params.mamba_state_from_prefill
         # Without the extra buffer only the sequence-end state exists, so a cached
         # state needs page 1; a disabled tree caches none.
-        if not params.enable_mamba_extra_buffer and not params.disable:
+        if (
+            not params.enable_mamba_extra_buffer
+            and not params.disable
+            and not self.state_from_prefill
+        ):
             assert params.page_size == 1, (
                 f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
             )
@@ -158,6 +163,8 @@ class MambaComponent(TreeComponent):
     def create_match_validator(
         self, match_device_only: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        if self.state_from_prefill:
+            return lambda node: True
         ct = self.component_type
         # Host-only checkpoints never occupy a GPU slot. Counting the host
         # value as a device-prefix match keeps Full KV indices reachable.
@@ -178,6 +185,8 @@ class MambaComponent(TreeComponent):
         value_chunks: list[torch.Tensor],
         best_value_len: int,
     ) -> MatchResult:
+        if self.state_from_prefill:
+            return result
         last_node = result.best_match_node
 
         mamba_boundary_len = result.device_prefix_len + result.host_hit_length
@@ -206,6 +215,8 @@ class MambaComponent(TreeComponent):
     def finalize_match_result_in_cache(
         self, params: MatchPrefixParams, result: MatchResult
     ) -> MatchResult:
+        if self.state_from_prefill:
+            return result
         # Copy-on-write the matched device mamba state into a per-request slot.
         if not params.cow_mamba:
             return result
@@ -367,6 +378,9 @@ class MambaComponent(TreeComponent):
         result: InsertResult,
         cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
+        if self.state_from_prefill:
+            assert params.mamba_value is None
+            return
         if params.mamba_host_value is not None:
             assert params.mamba_value is None
             self._commit_host_only_checkpoint(node, params, result, cache_actions)
@@ -774,6 +788,10 @@ class MambaComponent(TreeComponent):
         token_ids_len: int,
         is_finished: bool,
     ) -> Optional[int]:
+        if self.state_from_prefill:
+            # The received state is at the full prompt boundary, not necessarily
+            # the page-aligned KV boundary. Never donate it as a checkpoint.
+            return None
         if self.cache.enable_mamba_extra_buffer:
             cache_len = req.kv.mamba_last_track_seqlen
         else:
@@ -865,6 +883,11 @@ class MambaComponent(TreeComponent):
         insert_result: Optional[InsertResult] = None,
         insert_params: Optional[InsertParams] = None,
     ) -> None:
+        if self.state_from_prefill:
+            if is_finished:
+                storage, sub_pool = self._state()
+                storage.release_state(sub_pool, req)
+            return
         if self._mamba_host_only_checkpoint():
             self._release_unused_host_checkpoint(insert_result, insert_params)
         if is_finished:

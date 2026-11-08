@@ -494,7 +494,11 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._independent_windows = (
             sum(slot.family == TREE_WINDOW for slot in params.tree_slots) > 1
         )
-        self.is_eagle = params.is_eagle and TREE_STATE not in self._family_slot_ids
+        # KV-only PD trees also cache shifted draft KV, so their keys must
+        # retain the next token even though they contain a recurrent-state slot.
+        self.is_eagle = params.is_eagle and (
+            TREE_STATE not in self._family_slot_ids or params.mamba_state_from_prefill
+        )
         self.enable_hicache = False
         self.is_host_memory_buffer_only = False
         self.enable_storage = False
