@@ -13,6 +13,7 @@ import torch
 # accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_npu_ci(est_time=5, suite="base-a-test-npu")
 
@@ -38,6 +39,7 @@ from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     _reshape_kv_for_fia_nz,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_parallel
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -110,6 +112,146 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
         tensor = torch.arange(total, dtype=torch.float32)
         result = _reshape_kv_for_fia_nz(tensor, num_heads, head_dim, page_size)
         self.assertEqual(result.data_ptr(), tensor.data_ptr())
+
+
+class _HostLengthCopies:
+    """Count host uploads; return separate storage as a real H2D copy would."""
+
+    def __init__(self, tensor):
+        self.tensor = tensor
+        self.copies = 0
+
+    def to(self, *args, **kwargs):
+        self.copies += 1
+        return self.tensor.to(*args, **kwargs).clone()
+
+
+class TestSparseAttentionLengthLifetime(CustomTestCase):
+    """Eager layers must share one upload without reusing a previous batch's
+    lengths or replacing the CPU lengths adjusted for speculative decoding.
+    """
+
+    def _backend(self, *, packed=False):
+        backend = object.__new__(AscendAttnBackend)
+        backend.device = "cpu"
+        backend.dsa_dcp_target = False
+        backend.dense_mla_dcp_target = False
+        backend.page_size = 2
+        backend.speculative_step_id = 1
+        backend.speculative_num_draft_tokens = 3
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.use_mla = False
+        backend.use_int8_quant_indexer = False
+        backend.kv_cache_dtype = torch.float8_e4m3fn if packed else torch.bfloat16
+        backend.kv_capability = SimpleNamespace(
+            main_kv_packed=packed, kv_cache_dtype=torch.int8
+        )
+        backend.qk_rope_head_dim = 2
+        backend.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.arange(2 * 64).view(2, 64)
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_kv_buffer=lambda layer_id: (torch.zeros(1), torch.zeros(1))
+        )
+        return backend
+
+    def _batch(self, mode, *, draft=False):
+        return SimpleNamespace(
+            forward_mode=mode,
+            spec_info=SimpleNamespace(draft_token_num=3) if draft else None,
+            spec_algorithm=None,
+            # The CPU mirror may be ahead under overlap scheduling.
+            seq_lens=torch.tensor([6, 10]),
+            seq_lens_cpu=torch.tensor([7, 11]),
+            req_pool_indices=torch.arange(2),
+            extend_seq_lens=torch.tensor([2, 3]),
+            extend_seq_lens_cpu=[2, 3],
+            extend_prefix_lens_cpu=[0, 0],
+            out_cache_loc=None,
+        )
+
+    def _layer(self, backend, batch):
+        # The vendor boundary returns the lengths it consumes. The tests assert
+        # those values as well as uploads, so a stale/wrong-source cache fails.
+        def attention(**kwargs):
+            lengths = kwargs["actual_seq_lengths_kv"].clone()
+            return (
+                lengths
+                if backend.kv_capability.main_kv_packed
+                else (lengths, None, None)
+            )
+
+        with (
+            get_parallel().override(attn_cp_size=1),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "torch_npu.npu_sparse_flash_attention",
+                side_effect=attention,
+            ),
+            patch(
+                "sglang.srt.hardware_backend.npu.attention.ascend_backend."
+                "torch_npu.npu_kv_quant_sparse_flash_attention",
+                side_effect=attention,
+            ),
+        ):
+            return backend.forward_sparse(
+                torch.zeros(5, 1, 4, dtype=torch.bfloat16),
+                None,
+                None,
+                SimpleNamespace(layer_id=0, scaling=1.0),
+                batch,
+                save_kv_cache=False,
+                q_rope=torch.zeros(5, 1, 2, dtype=torch.bfloat16),
+                topk_indices=torch.zeros(5, 1, dtype=torch.int32),
+            )
+
+    def test_eager_layers_upload_offset_adjusted_lengths_once(self):
+        for packed in (False, True):
+            for mode, draft, expected in (
+                (ForwardMode.EXTEND, False, [7, 11]),
+                (ForwardMode.DECODE, False, [7, 11]),
+                (ForwardMode.TARGET_VERIFY, True, [10, 14]),
+                (ForwardMode.DECODE, True, [9, 13]),
+                (ForwardMode.DRAFT_EXTEND_V2, True, [7, 11]),
+            ):
+                with self.subTest(mode=mode, draft=draft, packed=packed):
+                    backend = self._backend(packed=packed)
+                    batch = self._batch(mode, draft=draft)
+                    backend.init_forward_metadata(batch)
+                    host = _HostLengthCopies(backend.forward_metadata.seq_lens_cpu_int)
+                    backend.forward_metadata.seq_lens_cpu_int = host
+                    for _ in range(4):
+                        self.assertEqual(self._layer(backend, batch).tolist(), expected)
+                    self.assertEqual(host.copies, 1)
+
+    def test_new_forward_refreshes_lengths(self):
+        backend = self._backend()
+        batch = self._batch(ForwardMode.DECODE)
+        backend.init_forward_metadata(batch)
+        self.assertEqual(self._layer(backend, batch).tolist(), [7, 11])
+        batch.seq_lens_cpu = torch.tensor([13, 17])
+        backend.init_forward_metadata(batch)
+        self.assertEqual(self._layer(backend, batch).tolist(), [13, 17])
+
+    def test_graph_lengths_stay_live_without_cpu_mirror(self):
+        backend = self._backend()
+        batch = self._batch(ForwardMode.DECODE)
+        backend.forward_metadata = ForwardMetadata(
+            seq_lens=torch.tensor([7, 11], dtype=torch.int64),
+            actual_seq_lengths_q=torch.tensor([1, 2], dtype=torch.int32),
+        )
+        self.assertEqual(self._layer(backend, batch).tolist(), [7, 11])
+        backend.forward_metadata.seq_lens.copy_(torch.tensor([13, 17]))
+        self.assertEqual(self._layer(backend, batch).tolist(), [13, 17])
+
+    def test_explicit_lengths_override_an_existing_cpu_upload(self):
+        backend = self._backend()
+        batch = self._batch(ForwardMode.DECODE)
+        backend.init_forward_metadata(batch)
+        self.assertEqual(self._layer(backend, batch).tolist(), [7, 11])
+        backend.forward_metadata.actual_seq_lengths_kv = torch.tensor([3, 5])
+        self.assertEqual(self._layer(backend, batch).tolist(), [3, 5])
 
 
 class TestGenerateMaskFlag(unittest.TestCase):

@@ -138,6 +138,10 @@ class ForwardMetadata:
     prefix_token_indices: Optional[torch.Tensor] = None
     flatten_prefix_block_tables: Optional[torch.Tensor] = None
 
+    # Eager sparse attention uploads the offset-adjusted CPU lengths once per
+    # forward. Graph metadata has no CPU tensor and keeps its live device input.
+    sparse_attn_kv_lens: Optional[torch.Tensor] = None
+
 
 class AscendAttnMaskBuilder:
     def __init__(self, model_runner: ModelRunner, device, use_fia, use_mla):
@@ -1616,6 +1620,18 @@ class AscendAttnBackend(AttentionBackend):
         )
         return attn_out.view(-1, layer.tp_q_head_num * layer.v_head_dim)
 
+    def _get_sparse_attn_kv_lens(self, seq_lens, device):
+        metadata = self.forward_metadata
+        if seq_lens is metadata.seq_lens_cpu_int and seq_lens is not None:
+            if metadata.sparse_attn_kv_lens is None:
+                metadata.sparse_attn_kv_lens = seq_lens.to(
+                    device=device, dtype=torch.int32
+                )
+            return metadata.sparse_attn_kv_lens
+        # CP/DCP may replace the lengths, and graph replay updates its device
+        # buffers. Preserve those paths' conversion and storage semantics.
+        return seq_lens.to(device=device, dtype=torch.int32)
+
     def forward_sparse(
         self,
         q: torch.Tensor,
@@ -1728,8 +1744,8 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_query=actual_seq_qlen.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_kv=self._get_sparse_attn_kv_lens(
+                        actual_seq_lengths_kv, q_nope.device
                     ),
                     block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
@@ -1753,8 +1769,8 @@ class AscendAttnBackend(AttentionBackend):
                     actual_seq_lengths_query=actual_seq_qlen.to(
                         device=q_nope.device, dtype=torch.int32
                     ),
-                    actual_seq_lengths_kv=actual_seq_lengths_kv.to(
-                        device=q_nope.device, dtype=torch.int32
+                    actual_seq_lengths_kv=self._get_sparse_attn_kv_lens(
+                        actual_seq_lengths_kv, q_nope.device
                     ),
                     block_table=self.forward_metadata.block_tables,
                     sparse_block_size=1,
