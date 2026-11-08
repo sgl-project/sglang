@@ -36,7 +36,7 @@ from sglang.srt.layers.quantization.unquant import (
     bf16_gemm_dispatch,
     get_bf16_gemm_backend,
 )
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -52,7 +52,7 @@ from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
     get_dflash_attention_sliding_window_size,
-    get_dflash_layer_types,
+    get_dflash_layer_attention_params,
     is_dense_head_weight,
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
@@ -171,43 +171,6 @@ def candidate_topk(
     return torch.gather(gathered_ids, -1, sel).long(), top_vals, lse
 
 
-def _get_dflash_attention_type(config, *, default: AttentionType) -> AttentionType:
-    """Honor explicit causality while preserving legacy layer defaults."""
-    text_config = config.get_text_config()
-    is_causal = getattr(text_config, "is_causal", None)
-    if is_causal is None:
-        return default
-    return AttentionType.DECODER if is_causal else AttentionType.ENCODER_ONLY
-
-
-def _get_dflash_layer_attention_params(
-    config, layer_id: int
-) -> Tuple[int, AttentionType]:
-    layer_types = get_dflash_layer_types(config)
-    if layer_types is None:
-        return -1, AttentionType.ENCODER_ONLY
-    if layer_id >= len(layer_types):
-        raise ValueError(
-            "DFLASH config.layer_types must contain one entry per draft layer. "
-            f"Got {len(layer_types)} entries, layer_id={layer_id}."
-        )
-
-    layer_type = layer_types[layer_id]
-    if layer_type == "full_attention":
-        return -1, _get_dflash_attention_type(
-            config, default=AttentionType.ENCODER_ONLY
-        )
-    if layer_type == "sliding_attention":
-        sliding_window_size = get_dflash_attention_sliding_window_size(config)
-        assert sliding_window_size is not None
-        return sliding_window_size, _get_dflash_attention_type(
-            config, default=AttentionType.DECODER
-        )
-    raise ValueError(
-        f"Unsupported DFLASH draft layer type. layer_types[{layer_id}]={layer_type!r}."
-    )
-
-
 _ROPE_DIM_SUPERSEDED_KEYS = frozenset(
     {"rope_dim", "partial_rotary_factor", "mrope_section", "mrope_interleaved"}
 )
@@ -304,7 +267,7 @@ class DFlashAttention(nn.Module):
             and getattr(rotary, "rotary_dim", None) == head_dim
             and getattr(rotary, "is_neox_style", False)
         )
-        self.sliding_window_size, self.attn_type = _get_dflash_layer_attention_params(
+        self.sliding_window_size, self.attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
         draft_cfg = parse_dflash_draft_config(draft_hf_config=config)
@@ -484,27 +447,23 @@ class DFlashAttention(nn.Module):
 
 
 class DFlashMLAAttention(DeepseekV2AttentionMLA):
+    """SpecForge MLA draft attention served by the target's absorbed MLA path.
+
+    SpecForge exports DeepSeek's MLA parameter names and RoPE conventions, so
+    only the DFlash layer causality, context-KV writes and loading differ.
+    """
+
     def __init__(
         self, config, layer_id: int, quant_config=None, prefix: str = ""
     ) -> None:
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
-        sliding_window_size, attn_type = _get_dflash_layer_attention_params(
+        # Under DCP the draft pool keeps DCP owner rows like the target's
+        # (KVCacheConfigurator.draft_mla_rows_are_physical), so the layer runs
+        # the target's DCP decode path: gathered q, rank-local KV, LSE merge.
+        sliding_window_size, attn_type = get_dflash_layer_attention_params(
             config, layer_id
         )
-        if sliding_window_size > -1:
-            from sglang.srt.speculative.draft_worker_common import (
-                resolve_draft_worker_attention_backend,
-            )
-
-            # The other MLA backends ignore a layer's sliding window.
-            draft_attention_backend = resolve_draft_worker_attention_backend()
-            if draft_attention_backend != "triton":
-                raise ValueError(
-                    "DFLASH mla sliding_attention layers require "
-                    "--speculative-draft-attention-backend triton, "
-                    f"got {draft_attention_backend!r}."
-                )
         rope_theta, rope_scaling = get_rope_config(config)
         if rope_scaling is not None and rope_scaling.get(
             "rope_type", rope_scaling.get("type")
