@@ -138,7 +138,7 @@ def build_draft(vocab=512, *, embedding_only=False):
 def source_weights(model):
     if isinstance(model, Gemma4ForConditionalGeneration):
         embed = model.language_model.embed_tokens.weight
-        return embed, embed
+        return embed, model.lm_head.weight
     source = getattr(model, "language_model", model)
     return source.model.embed_tokens.weight, source.lm_head.weight
 
@@ -277,8 +277,11 @@ class TestGemmaSharedVocabLayout(CustomTestCase):
                     with changed_scope(True), torch.device("cuda"):
                         draft = Gemma4AssistantForCausalLM(config)
                     actual_embed, actual_head = share(model, draft)
-                    self.assertIs(actual_embed, embed)
-                    self.assertIs(actual_head, head)
+                    for actual, weight in ((actual_embed, embed), (actual_head, head)):
+                        self.assertEqual(actual.data_ptr(), weight.data_ptr())
+                        torch.testing.assert_close(
+                            actual, weight[: text_config.vocab_size], rtol=0, atol=0
+                        )
                     draft.set_embed_and_head(actual_embed, actual_head)
                     ids = torch.tensor([0, 512], device="cuda")
                     torch.testing.assert_close(

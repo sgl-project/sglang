@@ -100,6 +100,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     ReqList,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     is_war_barrier_enabled,
@@ -139,6 +140,7 @@ from sglang.srt.mem_cache.memory_pool import (
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
     set_time_batch,
@@ -154,16 +156,10 @@ from sglang.srt.runtime_context import (
     get_memory,
     get_parallel,
 )
-from sglang.srt.utils import (
-    ceil_align,
-    get_num_new_pages,
-    is_npu,
-    rank_consensus_checker,
-)
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
 
@@ -438,6 +434,9 @@ class _PendingPublish(msgspec.Struct, frozen=True):
     prefix_len: int
     total_prefix_len: int
     fill_len: int
+    # The allocator's reuse fences after this allocation: prefill's RDMA into the
+    # destination follows no stream, so it is published only once they complete.
+    reuse_fences: Tuple[torch.cuda.Event, ...] = ()
 
 
 class DecodePreallocQueue(DecodeHiCachePreallocMixin):
@@ -1778,6 +1777,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                         prefix_len=prefix_len,
                         total_prefix_len=total_prefix_len,
                         fill_len=fill_len,
+                        reuse_fences=tuple(
+                            self.token_to_kv_pool_allocator.reuse_fences()
+                        ),
                     )
                 )
             else:
@@ -1833,6 +1835,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # Gate the readback on this allocation only, not on the forward the
             # schedule stream has been fenced behind since.
             self._publish_stream.wait_event(entry.allocated)
+            for fence in entry.reuse_fences:
+                self._publish_stream.wait_event(fence)
             with torch.cuda.stream(self._publish_stream):
                 self._publish_destination(
                     decode_req=entry.decode_req,
@@ -3650,11 +3654,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
@@ -3682,6 +3686,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -3703,11 +3708,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
@@ -3759,6 +3764,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _flush_staging_scatters(self: Scheduler) -> None:
         handler = self.disagg_decode_transfer_queue.staging_handler
@@ -3941,7 +3947,10 @@ class SchedulerDisaggregationDecodeMixin:
         # keeps going and drops just this request; CI fails instead, because a
         # single aborted request is easy to miss in a passing run -- unless the
         # mismatch was injected to exercise this very path.
-        if is_in_ci() and envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get() == 0:
+        if (
+            envs.SGLANG_IS_IN_CI.get()
+            and envs.SGLANG_TEST_DISAGG_KV_CHECKSUM_MISMATCH_PROB.get() == 0
+        ):
             raise RuntimeError(msg)
         prepare_abort(
             req,

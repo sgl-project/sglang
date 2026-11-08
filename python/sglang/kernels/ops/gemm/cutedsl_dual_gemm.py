@@ -44,7 +44,7 @@ from cutlass.utils import blackwell_helpers as sm100_utils
 from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_sm100_supported
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 _THREADS = 256
 _FP8_MAX = 448.0
