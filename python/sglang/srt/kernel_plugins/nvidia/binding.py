@@ -34,6 +34,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     BuiltMegakernel,
     Feature,
     MegakernelSpec,
+    PostVerifyStrategy,
+    SpeculativeRuntimeHooks,
     Step,
     find_spec,
     registered_architectures,
@@ -383,6 +385,10 @@ class MegakernelBinding:
             backend, self._seal_cache, hybrid=hybrid, legacy=not hybrid_family
         )
         return view
+
+    def prefill_view(self) -> ForwardView:
+        """The view for an eager prefill step, without graph-static decode metadata."""
+        return self.forward_view(forward_batch=None)
 
     def seal_capture_view(self, forward_batch: ForwardBatch, view: ForwardView) -> None:
         """Seal graph-static step tensors for this mode and batch-size bucket."""
@@ -1277,6 +1283,43 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         )
 
 
+def bind_speculative_runtime_hooks(
+    model: torch.nn.Module,
+    defaults: SpeculativeRuntimeHooks,
+) -> SpeculativeRuntimeHooks:
+    """Resolve target-side speculative strategies once at the binding boundary.
+
+    The caller's stock strategies are returned by identity when the runtime master
+    switch is off or the built provider has no factory. Provider presence must agree
+    across ranks before any rank can call it. The provider may change the local key
+    builder, but the runtime-owned verification runner cannot be replaced.
+    """
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return defaults
+
+    built = built_megakernel(model)
+    factory = None if built is None else built.speculative_runtime_hooks
+    megakernel_agree(
+        factory is not None,
+        what="speculative runtime hooks factory presence",
+    )
+    if factory is None:
+        return defaults
+
+    hooks = factory(defaults)
+    if not isinstance(hooks, SpeculativeRuntimeHooks):
+        raise TypeError(
+            "speculative runtime hooks factory must return SpeculativeRuntimeHooks"
+        )
+    if not isinstance(hooks.post_verify, PostVerifyStrategy):
+        raise TypeError("post_verify must be a PostVerifyStrategy")
+    if hooks.post_verify.run is not defaults.post_verify.run:
+        raise ValueError("a provider cannot replace the runtime post-verify runner")
+    if not callable(hooks.post_verify.local_keys):
+        raise TypeError("post_verify.local_keys must be callable")
+    return hooks
+
+
 def megakernel_agree(value: Any, *, what: str, group: Any = None) -> None:
     """Raise on every rank unless every rank of group (default: the TP group) holds
     the same value; ranks that differ would wait in different collectives."""
@@ -1472,11 +1515,18 @@ class _Dispatch:
                     input_ids, positions, forward_batch, *args, **kwargs
                 )
             if isinstance(self.binding, MegakernelBinding):
-                view = self.binding.forward_view(forward_batch)
-                if capturing:
-                    self.binding.seal_capture_view(forward_batch, view)
+                if step.mode == "prefill":
+                    view = self.binding.prefill_view()
+                else:
+                    view = self.binding.forward_view(forward_batch)
+                    if capturing:
+                        self.binding.seal_capture_view(forward_batch, view)
             else:
-                view = self.binding.forward_view()
+                view = (
+                    self.binding.prefill_view()
+                    if step.mode == "prefill"
+                    else self.binding.forward_view()
+                )
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,

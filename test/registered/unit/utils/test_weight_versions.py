@@ -1,7 +1,7 @@
 import random
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.scheduler import Scheduler
@@ -17,13 +17,13 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _ReqStub:
+class _ReqStub(FakeReq):
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
@@ -414,12 +414,19 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
-        sent = []
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
-            send_abort_output=lambda obj, req_arg: sent.append(obj),
+        req.finished_reason = None
+        req.finish_outside_step = lambda reason: None
+        req.kv = SimpleNamespace(
+            holds_kv=False, holds_mamba=False, retraction_backup=None
         )
+        sent = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_priority_scheduling = False
+        scheduler.abort_on_priority_when_disabled = True
+        scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
+        scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.hisparse_coordinator = None
+        scheduler.init_request_retirer()
 
         with patch(
             "sglang.srt.managers.utils.get_serving",

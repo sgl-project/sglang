@@ -265,17 +265,12 @@ if _is_cuda:
 
 if _is_cuda or _is_hip or _is_xpu:
     if _is_xpu:
-        # XPU has no tvm_ffi, so the CUDA JIT topk_sigmoid isn't reachable;
-        # use the AOT symbols from sgl_kernel directly. topk_sigmoid was aligned
-        # with the post-#28715 CUDA signature in sgl-kernel-xpu#285.
+        # XPU has no tvm_ffi; use the AOT symbols from sgl_kernel directly.
+        # topk_sigmoid was aligned with the post-#28715 CUDA signature in
+        # sgl-kernel-xpu#285.
         from sgl_kernel import topk_sigmoid, topk_softmax
     else:
         from sglang.kernels.ops.moe import topk_softmax
-
-        try:
-            from sglang.kernels.ops.moe.moe_topk_sigmoid import topk_sigmoid
-        except ImportError:
-            pass
 if _use_aiter:
     try:
         from aiter import biased_grouped_topk as aiter_biased_grouped_topk
@@ -1411,7 +1406,7 @@ def fused_topk(
                 topk_weights *= (
                     routed_scaling_factor if routed_scaling_factor is not None else 1.0
                 )
-        elif _is_cuda:
+        elif _is_cuda or _is_hip:
             # Unified Triton router (subsumes the AOT topk_sigmoid CUDA kernel).
             from sglang.kernels.ops.moe.moe_fused_gate import (
                 moe_fused_gate as _jit_moe_fused_gate,
@@ -1994,6 +1989,17 @@ def _fused_gate_emits_packed_ids(
     )
 
 
+def _padded_row_mask(
+    x: torch.Tensor, num_token_non_padded: torch.Tensor
+) -> torch.Tensor:
+    rows = torch.arange(
+        x.shape[0],
+        dtype=num_token_non_padded.dtype,
+        device=x.device,
+    )
+    return rows >= num_token_non_padded
+
+
 def _mask_topk_ids_padded_region(
     topk_ids: torch.Tensor,
     num_token_non_padded: Optional[torch.Tensor] = None,
@@ -2004,8 +2010,9 @@ def _mask_topk_ids_padded_region(
     if not topk_ids.is_cuda:
         if _is_npu:
             return
-        rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
-        topk_ids.masked_fill_((rows >= num_token_non_padded)[:, None], fill_value)
+        topk_ids.masked_fill_(
+            _padded_row_mask(topk_ids, num_token_non_padded)[:, None], fill_value
+        )
         return
     # TODO: let the kernel support other dtypes
     if _is_cuda and topk_ids.dtype == torch.int32 and fill_value == -1:
@@ -2015,8 +2022,7 @@ def _mask_topk_ids_padded_region(
     elif _can_fuse_padded_region(topk_ids):
         _fill_padded_rows(topk_ids, num_token_non_padded, fill_value)
     else:
-        indices = torch.arange(0, topk_ids.shape[0], device=topk_ids.device)
-        topk_ids[indices >= num_token_non_padded, :] = fill_value
+        topk_ids[_padded_row_mask(topk_ids, num_token_non_padded), :] = fill_value
 
 
 def _zero_topk_weights_padded_region(
@@ -2026,14 +2032,14 @@ def _zero_topk_weights_padded_region(
     if num_token_non_padded is None:
         return
     if not topk_weights.is_cuda:
-        rows = torch.arange(topk_weights.shape[0], device=topk_weights.device)
-        topk_weights.masked_fill_((rows >= num_token_non_padded)[:, None], 0.0)
+        topk_weights.masked_fill_(
+            _padded_row_mask(topk_weights, num_token_non_padded)[:, None], 0.0
+        )
         return
     if _can_fuse_padded_region(topk_weights):
         _fill_padded_rows(topk_weights, num_token_non_padded, 0.0)
         return
-    indices = torch.arange(0, topk_weights.shape[0], device=topk_weights.device)
-    topk_weights[indices >= num_token_non_padded, :] = 0.0
+    topk_weights[_padded_row_mask(topk_weights, num_token_non_padded), :] = 0.0
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend())
@@ -2116,7 +2122,6 @@ def biased_grouped_topk_gpu(
             num_fused_shared_experts,
             num_expert_group,
             topk_group,
-            gating_output.device.index,
         ) and moe_route_warp.bias_layout_ok(correction_bias):
             return moe_route_warp.moe_route_warp(
                 gating_output,
@@ -2908,9 +2913,8 @@ def _post_process_topk_ids(
     if _is_npu:
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         if recorder_topk_ids is not None and num_token_non_padded is not None:
-            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
             recorder_topk_ids = recorder_topk_ids.masked_fill(
-                (rows >= num_token_non_padded)[:, None], -1
+                _padded_row_mask(topk_ids, num_token_non_padded)[:, None], -1
             )
 
     if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
@@ -3054,6 +3058,16 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
+            from sglang.srt.layers.moe import route_quant_handoff
+
+            route_quant_handoff.bind_select_experts(
+                num_token_non_padded,
+                fused_routing_ok=(
+                    expert_location_dispatch_info is None
+                    and not routing_overridden
+                    and num_shared_topk_slots == 0
+                ),
+            )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -3066,6 +3080,7 @@ def select_experts(
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
             )
+            padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(
