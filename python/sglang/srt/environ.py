@@ -2251,6 +2251,8 @@ class Envs:
     # Split-K 17..128-row GEMMs (tiled copy or row-major) for the weight shapes the
     # ROCm Muse Spark model registers (O projection, MoE pooler / unpooler, DFlash draft MLP).
     SGLANG_MUSE_DENSE_TILED = EnvBool(True)
+    # aiter Triton a16w16 tiles for the TP8 DFlash draft gate/up / down at 8 / 16 rows and the O projection at 8.
+    SGLANG_MUSE_A16W16_TILES = EnvBool(True)
     # FP8-weight small-M GEMMs (activations quantized in-kernel per row and K group) for the attention QKV / O
     # projections and the MoE unpooler at decode / verify widths; =0 keeps BF16 weights.
     SGLANG_MUSE_DENSE_FP8 = EnvBool(True)

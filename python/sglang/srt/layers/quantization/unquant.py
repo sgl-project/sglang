@@ -80,6 +80,7 @@ _skip_aiter_unquant = False
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.ops.triton.gemm_a16w16 import gemm_a16w16 as _aiter_triton_a16w16
+    from aiter.ops.triton.utils.gemm_config_utils import compute_splitk_params
     from aiter.tuned_gemm import tgemm
 
 if _is_gfx95:
@@ -114,23 +115,38 @@ _A16W16_TRITON_NARROW_K_MAX_M = 512
 # * weight shapes (N, K) that also keep a per-channel FP8 copy for the FP8 small-M
 #   GEMM a model calls itself with pre-quantized activations (SGLANG_MUSE_DENSE_FP8);
 # * exact (M, N, K) GEMMs routed to the aiter Triton a16w16 kernel (wide K, where
-#   the tuned table's pick for the padded M is slower).
+#   the tuned table's pick for the padded M is slower), optionally with their own
+#   launch config.
 _gfx950_tiled_weight_shapes: set = set()
 _gfx950_rowmajor_weight_shapes: set = set()
 _gfx950_fp8w_weight_shapes: set = set()
 _gfx950_triton_a16w16_shapes: set = set()
+_gfx950_triton_a16w16_configs: dict = {}
 
 
 def register_gfx950_unquantized_gemm_shapes(
-    *, tiled_weights=(), rowmajor_weights=(), fp8_weights=(), triton_a16w16=()
+    *,
+    tiled_weights=(),
+    rowmajor_weights=(),
+    fp8_weights=(),
+    triton_a16w16=(),
+    triton_a16w16_configs=None,
 ) -> None:
     """Opt (N, K) weight shapes into the tiled or row-major small-M GEMM and exact
     (M, N, K) shapes into the aiter Triton a16w16 GEMM for every unquantized linear
-    layer loaded afterwards in this process. No effect off gfx950."""
+    layer loaded afterwards in this process; ``triton_a16w16_configs`` maps exact
+    (M, N, K) shapes to the aiter config they run with. No effect off gfx950."""
     _gfx950_tiled_weight_shapes.update(tuple(s) for s in tiled_weights)
     _gfx950_rowmajor_weight_shapes.update(tuple(s) for s in rowmajor_weights)
     _gfx950_fp8w_weight_shapes.update(tuple(s) for s in fp8_weights)
     _gfx950_triton_a16w16_shapes.update(tuple(s) for s in triton_a16w16)
+    if _use_aiter:
+        for shape, config in (triton_a16w16_configs or {}).items():
+            shape = tuple(shape)
+            _gfx950_triton_a16w16_shapes.add(shape)
+            _gfx950_triton_a16w16_configs[shape] = compute_splitk_params(
+                dict(config), shape[2]
+            )
 
 
 def _prefer_triton_a16w16(x: torch.Tensor, weight: torch.Tensor) -> bool:
@@ -895,7 +911,15 @@ class UnquantizedLinearMethod(LinearMethodBase):
             and type(layer.weight.data) is torch.Tensor
         ):
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
-                return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
+                return _aiter_triton_a16w16(
+                    x,
+                    layer.weight,
+                    bias,
+                    dtype=x.dtype,
+                    config=_gfx950_triton_a16w16_configs.get(
+                        (x.shape[0], *layer.weight.shape)
+                    ),
+                )
             if _is_gfx95 and bias is None and width_gemm_applies(x, layer.weight):
                 return width_gemm(x, layer.weight)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)

@@ -378,6 +378,40 @@ _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
 # The DFlash draft's gate/up and down GEMMs at the measured M = 24 (TP8) on the
 # aiter Triton a16w16 kernel instead of the tuned table's padded-M pick.
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
+
+
+def _a16w16_tile(block_m: int, block_n: int, waves_per_eu: int = 0) -> dict:
+    # BLOCK_SIZE_K 256, one K split and MFMA nonkdim 16 as in aiter's gfx950 default
+    # config at these widths: the same K order per output, so the bytes match it.
+    return {
+        "BLOCK_SIZE_M": block_m,
+        "BLOCK_SIZE_N": block_n,
+        "BLOCK_SIZE_K": 256,
+        "GROUP_SIZE_M": 1,
+        "num_warps": 4,
+        "num_stages": 3,
+        "waves_per_eu": waves_per_eu,
+        "matrix_instr_nonkdim": 16,
+        "cache_modifier": ".cg",
+        "NUM_KSPLIT": 1,
+    }
+
+
+# The DFlash draft's gate/up and down at 8 / 16 rows and the attention O projection
+# at 8 rows (TP8) on aiter Triton a16w16 tiles, in place of tgemm.mm (MLP) and the
+# default Triton config (O); MI355X, cold weights, us: gate/up 25.2 / 26.2 -> 22.4 /
+# 21.8, down 13.6 / 13.5 -> 11.7 / 11.5, O 6.1 -> 5.6 (at 16 rows O gains nothing).
+_TRITON_A16W16_TILES = (
+    {
+        (8, 7168, 8192): _a16w16_tile(16, 16, 8),
+        (16, 7168, 8192): _a16w16_tile(16, 32),
+        (8, 8192, 3584): _a16w16_tile(16, 16),
+        (16, 8192, 3584): _a16w16_tile(16, 32),
+        (8, 8192, 1024): _a16w16_tile(16, 16),
+    }
+    if envs.SGLANG_MUSE_A16W16_TILES.get()
+    else {}
+)
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_MUSE_FUSED_UNPOOL_BOUNDARY.get()
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
@@ -1846,6 +1880,7 @@ class MuseSparkTextForCausalLM(nn.Module):
             rowmajor_weights=_ROWMAJOR_LINEAR_SHAPES,
             fp8_weights=fp8_shapes if _DENSE_FP8 else (),
             triton_a16w16=_DRAFT_TRITON_A16W16_GEMMS,
+            triton_a16w16_configs=_TRITON_A16W16_TILES,
         )
         if envs.SGLANG_MUSE_WIDTH_GEMM.get():
             enable_width_gemm()
