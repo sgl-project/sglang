@@ -208,15 +208,17 @@ class IndexKeyCache:
     def _page_buffers(self) -> list[torch.Tensor]:
         return [*self.buffer, *self.scale_buffer]
 
-    def _item_len(self, layer_idx: int) -> int:
+    @staticmethod
+    def _page_item_len(buf: torch.Tensor) -> int:
         # 0-row layers (skip-topk, or non-owned under CP layer split) have no item.
-        buf = self.buffer[layer_idx]
         return 0 if buf.shape[0] == 0 else buf[0].nbytes
 
     def state_buf_infos(self):
-        assert not self.fp4, "PD transfer of FP4 index keys is not supported"
-        layer_num = self.pool.layer_num
-        data_ptrs = [self.buffer[i].data_ptr() for i in range(layer_num)]
-        data_lens = [self.buffer[i].nbytes for i in range(layer_num)]
-        item_lens = [self._item_len(i) for i in range(layer_num)]
+        # FP4 keys and their exponents are separate page buffers on the same page
+        # ids: every layer's key pages, then every layer's exponent pages. Both PD
+        # peers register the same order, so pages move with the generic page path.
+        buffers = self._page_buffers()
+        data_ptrs = [buf.data_ptr() for buf in buffers]
+        data_lens = [buf.nbytes for buf in buffers]
+        item_lens = [self._page_item_len(buf) for buf in buffers]
         return data_ptrs, data_lens, item_lens
