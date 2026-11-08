@@ -301,8 +301,6 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
-                        is_retracted=length == 200,
-                        finished=lambda length=length: length == 300,
                         grammar=None,
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,

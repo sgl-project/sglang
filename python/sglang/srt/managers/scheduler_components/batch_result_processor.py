@@ -442,6 +442,8 @@ class SchedulerBatchResultProcessor:
                     )
 
                 if not still_in_batch_rows[i]:
+                    # Commit nothing; only move the input logprob pointer past
+                    # this row.
                     if batch.return_logprob:
                         logprob_pt = self._apply_prefill_logprobs(
                             req=req,

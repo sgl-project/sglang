@@ -345,8 +345,8 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
 
 class TestDeadRows(CustomTestCase):
     def test_dead_row_commits_nothing_and_keeps_live_row_aligned(self):
-        """A request that left the live lists after launch gets no token, hidden
-        state, logprob or streamed row, yet the live row still reads its own slice
+        """A request that left the batch after launch gets no token, hidden state,
+        logprob or streamed row, yet the row still in the batch reads its own slice
         of the step's result."""
         self._check_dead_prefill_row()
         self._check_dead_decode_row()
