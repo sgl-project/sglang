@@ -941,6 +941,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False
+        if forward_batch.dllm_eager:
+            return False
 
         ragged_layout = (
             forward_batch.ragged_verify_layout if self.ragged_verify_mode else None

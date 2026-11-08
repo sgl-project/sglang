@@ -587,6 +587,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # dLLM committed positions are immutable, including literal mask-token IDs.
     # None when no request in the batch has a literal mask ID.
     dllm_prompt_mask: Optional[torch.Tensor] = None
+    # Set by a dLLM algorithm for a forward whose attention mask differs from
+    # the one its CUDA graphs were captured with; that forward runs eagerly.
+    dllm_eager: bool = False
 
     # For extend
     extend_num_tokens: Optional[int] = None

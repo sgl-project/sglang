@@ -53,12 +53,13 @@ def _batch(rows, prompt_mask=None):
         batch_size=input_ids.shape[0],
         input_ids=input_ids.view(-1).clone(),
         dllm_prompt_mask=prompt_mask,
+        dllm_eager=False,
     )
 
 
 class _Model:
     def __init__(self):
-        self.causal = True
+        self.causal = False
 
     def set_block_attention_causal(self, causal):
         self.causal = causal
@@ -81,12 +82,14 @@ class _OracleRunner:
         self.peaks = torch.as_tensor(peaks, dtype=torch.float32)
         self.model = _Model()
         self.forwards = []
+        self.eager = []
         self.fail_on_forward = fail_on_forward
 
     def forward(self, forward_batch, pp_proxy_tensors=None):
         if self.fail_on_forward == len(self.forwards):
             raise RuntimeError("forward failed")
         self.forwards.append((self.model.causal, forward_batch.input_ids.clone()))
+        self.eager.append(forward_batch.dllm_eager)
         targets = self.targets if self.model.causal else self.bidirectional_targets
         batch_size, width = targets.shape
         block_size = width - 1
@@ -112,11 +115,14 @@ class TestHierarchyBlockRun(unittest.TestCase):
 
         causal_flags = [causal for causal, _ in runner.forwards]
         self.assertEqual(causal_flags, [False, False, True])
+        # Only the causal forward skips CUDA graphs captured bidirectionally.
+        self.assertEqual(runner.eager, causal_flags)
         # Sub-block 1 stays masked until sub-block 0 is resolved.
         self.assertEqual(runner.forwards[1][1][4:].tolist(), [MASK] * 4)
         self.assertEqual(next_ids[0].tolist(), targets[0][:8])
         self.assertEqual(states, [18])
-        self.assertTrue(runner.model.causal)
+        self.assertFalse(runner.model.causal)
+        self.assertFalse(batch.dllm_eager)
 
     def test_low_confidence_still_unmasks_one_token_per_step(self):
         targets = [[10, 11, 12, 13, 14, 15, 16, 17, 18]]
@@ -218,11 +224,16 @@ class TestHierarchyBlockRun(unittest.TestCase):
         self.assertNotIn(MASK, next_ids[0].tolist())
         self.assertLessEqual(len(runner.forwards), 8)
 
-    def test_attention_is_causal_again_after_a_failed_denoise_forward(self):
-        runner = _OracleRunner([[10] * 9], HIGH, fail_on_forward=0)
+    def test_failed_causal_forward_restores_the_graph_state(self):
+        # Forwards 0 and 1 denoise; forward 2 is the causal KV write.
+        runner = _OracleRunner(
+            [[10, 11, 12, 13, 14, 15, 16, 17, 18]], HIGH, fail_on_forward=2
+        )
+        batch = _batch([[MASK] * 8])
         with self.assertRaises(RuntimeError):
-            _algorithm().run(runner, _batch([[MASK] * 8]), [10])
-        self.assertTrue(runner.model.causal)
+            _algorithm().run(runner, batch, [10])
+        self.assertFalse(runner.model.causal)
+        self.assertFalse(batch.dllm_eager)
 
     def test_sub_block_size_must_divide_block_size(self):
         with self.assertRaises(ValueError):
@@ -276,15 +287,15 @@ class TestHierarchyBlockLaunch(unittest.TestCase):
         args.update(overrides)
         return SimpleNamespace(**args)
 
-    def test_cuda_graphs_are_disabled_in_both_phases(self):
-        """Graphs bake the attention mask in at capture, but denoising and the
-        final KV write need different masks in the same block."""
+    def test_decode_graphs_stay_on_and_prefill_graphs_go_off(self):
+        """Denoise forwards replay decode-phase graphs; the eager causal forwards
+        are DLLM_EXTEND too and must not fall through to a prefill graph."""
         server_args = self._server_args()
 
         HierarchyBlock.configure_server_args(server_args)
 
         resolved = resolving_view(server_args).cuda_graph_config
-        self.assertEqual(resolved.decode.backend, Backend.DISABLED)
+        self.assertEqual(resolved.decode.backend, Backend.FULL)
         self.assertEqual(resolved.prefill.backend, Backend.DISABLED)
 
     def test_multimodal_is_off_unless_explicitly_requested(self):

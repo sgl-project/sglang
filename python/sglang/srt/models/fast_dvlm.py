@@ -36,10 +36,13 @@ class Fast_dVLMForConditionalGeneration(Qwen2_5_VLForConditionalGeneration):
                 if isinstance(module, RadixAttention)
             )
         )
+        # Bidirectional by default: denoising forwards replay CUDA graphs
+        # captured in this state, and HierarchyBlock runs causal ones eagerly.
+        self.set_block_attention_causal(False)
 
     def set_block_attention_causal(self, causal: bool) -> None:
-        # Backends read attn_type at forward time, so this only holds for
-        # eager forwards; HierarchyBlock disables CUDA graphs.
+        # Backends read attn_type when a forward runs or is captured, so a
+        # replayed graph keeps the type it was captured with.
         attn_type = AttentionType.DECODER if causal else AttentionType.ENCODER_ONLY
         for layer in self._block_attention_layers:
             layer.attn_type = attn_type

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
-from typing import TYPE_CHECKING, Iterator, List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -21,7 +20,8 @@ class HierarchyBlock(DllmAlgorithm):
     """Fast-dLLM v2 hierarchical block decoding.
 
     Sub-blocks are denoised left to right with bidirectional attention inside
-    the block. Every block then gets one causal forward, so the KV left in the
+    the block, which is the model's default and what its CUDA graphs capture.
+    Every block then gets one eager causal forward, so the KV left in the
     cache (and inserted into the radix tree) is what an autoregressive pass over
     the same tokens would write. The last position of that causal forward
     predicts the first token of the request's next block; that token is the
@@ -46,11 +46,12 @@ class HierarchyBlock(DllmAlgorithm):
         # dLLM path does not handle image inputs yet.
         if cfg.enable_multimodal:
             raise ValueError("HierarchyBlock does not support multimodal inputs yet")
-        # Denoise and the final KV write use different block masks; a graph
-        # captured with one mask cannot replay the other.
-        graph_config = cfg.cuda_graph_config
-        for phase in Phase.ALL:
-            graph_config = with_phase(graph_config, phase, backend=Backend.DISABLED)
+        # Decode-phase graphs are captured with the model's bidirectional block
+        # attention and replay the denoise forwards; the causal forwards run
+        # eagerly. Prefill-phase graphs would otherwise pick those up.
+        graph_config = with_phase(
+            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
+        )
         # FDFO is on by default, but each block here is decoded in one run.
         declare_resolution(
             server_args,
@@ -92,13 +93,9 @@ class HierarchyBlock(DllmAlgorithm):
         if algo_states is not None:
             self._seed_inherited_tokens(forward_batch, algo_states)
         self._seed_after_prompt_tail(model_runner, forward_batch, start_list)
+        self._denoise(model_runner, forward_batch)
 
-        model = model_runner.model
-        if self._denoise_mask(forward_batch).any():
-            with _bidirectional_block_attention(model):
-                self._denoise(model_runner, forward_batch)
-
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = _causal_forward(model_runner, forward_batch)
         full_logits = out.logits_output.full_logits
         vocab_size = full_logits.shape[-1]
         last_logits = full_logits.view(batch_size, self.block_size, vocab_size)[:, -1]
@@ -153,7 +150,7 @@ class HierarchyBlock(DllmAlgorithm):
         rows = [i for i, start in enumerate(start_list) if 0 < start < self.block_size]
         if not rows:
             return
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = _causal_forward(model_runner, forward_batch)
         full_logits = out.logits_output.full_logits
         logits = full_logits.view(forward_batch.batch_size, self.block_size, -1)
         row_ids = torch.tensor(rows, device=logits.device)
@@ -205,13 +202,17 @@ class HierarchyBlock(DllmAlgorithm):
         forward_batch.input_ids.copy_(new_input_ids.view(-1))
 
 
-@contextmanager
-def _bidirectional_block_attention(model: torch.nn.Module) -> Iterator[None]:
-    model.set_block_attention_causal(False)
+def _causal_forward(model_runner: ModelRunner, forward_batch: ForwardBatch):
+    # The model's default block attention is bidirectional, which is what its
+    # CUDA graphs capture, so a causal forward has to run eagerly.
+    model = model_runner.model
+    model.set_block_attention_causal(True)
+    forward_batch.dllm_eager = True
     try:
-        yield
+        return model_runner.forward(forward_batch, pp_proxy_tensors=None)
     finally:
-        model.set_block_attention_causal(True)
+        forward_batch.dllm_eager = False
+        model.set_block_attention_causal(False)
 
 
 Algorithm = HierarchyBlock
