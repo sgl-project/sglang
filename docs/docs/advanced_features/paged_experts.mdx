@@ -160,7 +160,14 @@ GPU, with no host synchronization, so the decode graph captures it:
   count) to GPU buffers;
 - a second kernel copies the planned experts of every paged tensor from the pinned host store
   into their slots, reading the host memory directly through its unified address and the count
-  on the device, so each graph replay moves exactly the experts it decided on.
+  on the device, so each graph replay moves exactly the experts it decided on;
+- pre-copy: after a layer's copy, a side stream applies the next MoE layer's router to this
+  layer's input and copies up to 3 of its predicted experts that are in none of its slots into
+  its least recently used slots (never one holding a predicted expert), with a narrow grid beside
+  this layer's compute; the next layer waits for it before it decides, so a right prediction takes
+  a copy off the critical path. On for layers that route by plain softmax top-k (e.g. Qwen3-Next,
+  Qwen3 MoE); others are skipped, logged at startup. It changes which experts are resident, not
+  what is computed.
 
 Decode capture batch sizes are capped at `K // top_k` (logged at startup); larger batches run
 without a graph. Prefill steps plan their waves on the host: under a breakable prefill graph the

@@ -27,6 +27,7 @@ def _jit_module() -> Module:
             ("paged_experts_rows_to_slots", "paged_experts_rows_to_slots"),
             ("paged_experts_tiered_plan", "paged_experts_tiered_plan"),
             ("paged_experts_await_rows", "paged_experts_await_rows"),
+            ("paged_experts_precopy_plan", "paged_experts_precopy_plan"),
             (
                 "paged_experts_host_device_pointer",
                 "paged_experts_host_device_pointer",
@@ -80,15 +81,65 @@ def paged_experts_gather(
     src: torch.Tensor,
     dst: torch.Tensor,
     count: torch.Tensor,
+    blocks: int = 256,
 ) -> None:
     """Copy experts ``src[i]`` into slots ``dst[i]`` for ``i < count[0]``, for every paged tensor.
 
     ``hosts``/``gpus``/``row_bytes`` are int64 GPU tensors with one entry per paged tensor: the UVA
     device pointer of its pinned host store (``paged_experts_host_device_pointer``), the address of
     its GPU table, and its size per expert in bytes, even. Rows are copied in 16-byte loads when
-    their size allows, else in 4- or 2-byte loads.
+    their size allows, else in 4- or 2-byte loads, by ``blocks`` blocks of 256 threads (fewer leave
+    the SMs to a kernel running beside the copy).
     """
-    _jit_module().paged_experts_gather(hosts, gpus, row_bytes, src, dst, count)
+    _jit_module().paged_experts_gather(
+        hosts, gpus, row_bytes, src, dst, count, int(blocks)
+    )
+
+
+def paged_experts_precopy_plan(
+    logits: torch.Tensor,
+    top_k: int,
+    margin: float,
+    max_copies: int,
+    step: torch.Tensor,
+    slot_expert: torch.Tensor,
+    expert_slot: torch.Tensor,
+    slot_lastuse: torch.Tensor,
+    src: torch.Tensor,
+    dst: torch.Tensor,
+    count: torch.Tensor,
+    last: torch.Tensor,
+    last_stamp: torch.Tensor,
+    counts: torch.Tensor,
+) -> None:
+    """Plan the pre-copy into a layer from its predicted routing (one block, ``E <= 1024``).
+
+    ``logits`` ``[E]`` bfloat16: the layer's softmax router on the previous layer's input. Its top
+    ``top_k + 1``, each one's margin in softmax probability over the ``(top_k + 1)``-th; best first, each predicted expert whose margin
+    beats ``margin`` and that is in none of the layer's slots, at most ``max_copies``, gets the least
+    recently used slot holding no predicted expert. The layer's residency (``step``, ``slot_expert``,
+    ``expert_slot``, ``slot_lastuse``, as ``paged_experts_decide``) moves in place, the slot stamped
+    with ``step`` as it is; the copy plan goes to ``src``/``dst`` ``[K]`` and ``count`` ``[1]`` for
+    ``paged_experts_gather``. ``last`` ``[K]`` / ``last_stamp`` ``[1]`` hold the previous plan, tallied
+    into ``counts`` ``[4]`` int32 (planned, used, wasted, below the margin or resident) before this
+    one.
+    """
+    _jit_module().paged_experts_precopy_plan(
+        logits,
+        int(top_k),
+        float(margin),
+        int(max_copies),
+        step,
+        slot_expert,
+        expert_slot,
+        slot_lastuse,
+        src,
+        dst,
+        count,
+        last,
+        last_stamp,
+        counts,
+    )
 
 
 def paged_experts_rows_to_slots(
