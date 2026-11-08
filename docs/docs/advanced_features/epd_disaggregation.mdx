@@ -87,6 +87,13 @@ python -m sglang.launch_server \
   --port 30002
 ```
 
+Notes:
+
+- This cache is for **multimodal encoder embeddings**, not the language model KV cache.
+- The feature currently uses Mooncake as the shared backing store.
+- It can be enabled regardless of which `--encoder-transfer-backend` you use.
+- It is most relevant for EPD or encoder-disaggregated VLM deployments where the same images are likely to appear across requests or instances.
+
 ### Per-item encoder prefix cache
 
 For a single encoder server (no Mooncake required), `--enable-prefix-mm-cache`
@@ -97,10 +104,13 @@ item, so a repeated image or video is reused even when:
 - several requests are fused into one encoder batch, or
 - the same item appears alone in one request and with other items in another.
 
-The cache stores one entry per item; an all-item hit skips the vision forward and
-concatenates the cached rows. A partial hit encodes only the missing items and
-reuses the cached rows. Entries whose token count no longer matches the current
-preprocessing config are evicted before reuse.
+Cache entries follow the preprocessing grid boundaries, including when a model
+combines several grids in one forward item. An all-item hit skips the vision
+forward and concatenates the cached rows in request order. A partial hit encodes
+only the missing grids and reuses the cached rows. Entries whose token count no
+longer matches the current preprocessing metadata are evicted before reuse.
+Cache-hit metrics count only entries found at lookup, excluding newly encoded
+rows and items that exceed the host cache capacity.
 
 ```bash Command
 python -m sglang.launch_server \
@@ -113,13 +123,6 @@ python -m sglang.launch_server \
 The host cache size is controlled by `SGLANG_VLM_CACHE_SIZE_MB` (default
 4096 MB). This local cache is independent of `--enable-mm-global-cache`; the
 global cache uses Mooncake and can be enabled together with it.
-
-Notes:
-
-- This cache is for **multimodal encoder embeddings**, not the language model KV cache.
-- The feature currently uses Mooncake as the shared backing store.
-- It can be enabled regardless of which `--encoder-transfer-backend` you use.
-- It is most relevant for EPD or encoder-disaggregated VLM deployments where the same images are likely to appear across requests or instances.
 
 #### Qwen VL
 
