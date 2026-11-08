@@ -44,7 +44,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
-    is_musa,
     is_npu,
     is_xpu,
     next_power_of_2,
@@ -57,7 +56,6 @@ from sglang.srt.utils.nvtx_utils import profile_range
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
@@ -293,9 +291,6 @@ def check_simulate_acc_token_mode() -> None:
 
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = (
-    _is_cuda or _is_musa
-)  # This kernel is only available for CUDA and MUSA now
 
 
 def draft_kv_indices_buffer_width(

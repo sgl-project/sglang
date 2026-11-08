@@ -411,7 +411,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         self._warned_sampling_fallback = False
         self._warned_lilicorr_eager = False
         self._draft_probs_buf = None
-        self._logged_first_verify = False
         self._full_embed_gpu: Optional[torch.Tensor] = None
         # Under dp attention, peer DP ranks run different (idle) paths, so
         # spec broadcasts must stay within the attn-TP group.
