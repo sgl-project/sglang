@@ -11,7 +11,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
-from sglang.srt.utils.common import ceil_align, is_npu
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -175,7 +176,7 @@ class StreamingSession:
         if not _is_streaming(req):
             return False
 
-        from sglang.srt.managers.schedule_batch import FINISH_ABORT
+        from sglang.srt.managers.req_types import FINISH_ABORT
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"

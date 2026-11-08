@@ -492,7 +492,7 @@ export const config = {
   // sweep is 8k-in / 1k-out random, num_prompts = 5 × concurrency, cache-cold.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -1349,8 +1349,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1381,8 +1379,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1413,8 +1409,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -1499,8 +1493,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2126,8 +2118,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2158,8 +2148,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",
@@ -2190,8 +2178,6 @@ export const config = {
         "NCCL_CUMEM_ENABLE=1",
         "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True",
         "SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0",
-        "SGLANG_K3_ATTN_RES_MODE=jit",
-        "SGLANG_MOE_FUSED_GATE_RADIX=1",
         "SGLANG_HOST_IP={{LOCAL_IP}}",
         "NCCL_SOCKET_IFNAME={{NETWORK_IFACE}}",
         "GLOO_SOCKET_IFNAME={{NETWORK_IFACE}}",

@@ -5,13 +5,13 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from sglang.srt.runtime_context import reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
     pin_every_band,
-    reset_context,
     setup_allocator_context,
 )
 

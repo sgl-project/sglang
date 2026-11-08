@@ -9,7 +9,9 @@ use std::sync::{
 
 use crate::message::detok::DetokMsg;
 use crate::message::ids::Rid;
+use crate::message::io_struct::ControlRequest;
 use crate::message::request::Request;
+use crate::utils::error::Error;
 
 /// Blocking receive that also wakes on shutdown: returns `None` when `rx` closes
 /// *or* the `shutdown` sender is dropped.
@@ -39,6 +41,13 @@ pub enum TmEvent {
     /// shm) set on it, or `Failed` (bad media URL, unsupported modality,
     /// preprocess error, ...).
     Encoded(Request),
+    /// A control message the scheduler does not answer: pushed to the
+    /// scheduler as is, with no response sink to register or release.
+    /// `queued` reports whether it reached the scheduler's queue.
+    OneWay {
+        control: ControlRequest,
+        queued: tokio::sync::oneshot::Sender<Result<(), Error>>,
+    },
 }
 
 const ADMISSION_PENDING: u8 = 0;

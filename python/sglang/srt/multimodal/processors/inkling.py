@@ -37,6 +37,10 @@ from sglang.srt.multimodal.inkling import (
     InklingImageProcessor,
     InklingProcessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    download_remote_media,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
@@ -49,7 +53,6 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
-from sglang.srt.utils.common import CLIENT_MEDIA_EXCEPTIONS, download_remote_media
 
 logger = logging.getLogger(__name__)
 

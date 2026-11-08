@@ -5,8 +5,8 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.configs.pipeline_configs.flux import _patchify_latents
-from sglang.multimodal_gen.configs.pipeline_configs.llada_image import (
+from sglang.multimodal_gen.configs.pipeline_configs.flux import (
+    _patchify_latents,
     flux2_vae_bn_stats,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
