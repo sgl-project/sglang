@@ -1558,6 +1558,24 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 f"capture mode ({self.capture_hidden_mode.name})."
             )
 
+    def compact_input_buffers(self, num_tokens: int):
+        """Views written on the same stream as the subsequent verify replay."""
+        if (
+            not self.ragged_verify_mode
+            or num_tokens not in self.capture_num_tokens
+            or self.require_mlp_tp_gather
+            or self.enable_two_batch_overlap
+        ):
+            return None
+        if not hasattr(self, "_compact_window_index"):
+            self._compact_window_index = torch.empty_like(self.buffers.input_ids)
+        return (
+            self.buffers.input_ids[:num_tokens],
+            self.buffers.positions[:num_tokens],
+            self.buffers.out_cache_loc[:num_tokens],
+            self._compact_window_index[:num_tokens],
+        )
+
     def load_batch(
         self,
         forward_batch: ForwardBatch,
@@ -1600,7 +1618,15 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     f"stale ragged raw_num_token {self.raw_num_token} != "
                     f"{ragged_layout.graph_num_tokens}"
                 )
-                self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+                staged = getattr(self, "_prepared_compact_layout", None)
+                if not (
+                    envs.SGLANG_DSPARK_COMPACT_DIRECT_INPUTS.get()
+                    and staged is not None
+                    and staged[0] is ragged_layout
+                    and staged[1] == graph_size_key
+                ):
+                    self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+                self._prepared_compact_layout = None
             self._set_dp_real_num_tokens(self.raw_num_token)
             self._copy_replay_inputs(forward_batch)
             if (
@@ -1663,6 +1689,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
             padded_num_tokens = graph_size_key
             self._stage_ragged_verify_layout(ragged_layout, graph_size_key)
+            self._prepared_compact_layout = (ragged_layout, graph_size_key)
         else:
             raw_num_token = raw_bs * self.captured_req_width
             if self.require_mlp_tp_gather:
@@ -1981,6 +2008,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         return early.take(key=key, forward_batch=forward_batch)
 
     def _copy_replay_inputs(self, forward_batch: ForwardBatch) -> None:
+        if envs.SGLANG_DSPARK_COMPACT_DIRECT_INPUTS.get() and self.ragged_verify_mode:
+            from sglang.srt.model_executor.cuda_graph_buffer_registry import (
+                same_tensor_view,
+            )
+
+            if all(
+                same_tensor_view(
+                    getattr(self.buffers, name)[: self.raw_num_token],
+                    getattr(forward_batch, name),
+                )
+                for name in ("input_ids", "positions")
+            ):
+                self._prefilled_inputs = None
+                return
         prefilled = self._prefilled_inputs
         self._prefilled_inputs = None
         staged = None

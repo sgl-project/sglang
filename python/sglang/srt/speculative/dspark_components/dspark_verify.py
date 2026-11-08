@@ -28,6 +28,12 @@ from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
     build_ring_commit_inject_layout,
     scatter_compact_to_strided_into,
 )
+from sglang.kernels.ops.speculative.dspark.native_compact import (
+    accept_ragged,
+    compact_commit_layout,
+    pack_verify_inputs,
+    ragged_candidates,
+)
 from sglang.kernels.ops.speculative.dspark.sharded_accept_hip import (
     accept_sampling_sharded,
 )
@@ -106,6 +112,7 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
 class TargetVerifyResult(msgspec.Struct, frozen=True):
     logits_output: object
     can_run_cuda_graph: bool
+    native_compact: bool = False
 
 
 def candidate_request_length_bound(
@@ -480,17 +487,45 @@ class TargetVerifyExecutor:
         sampling_info,
         verify_window: VerifyWindow,
         inject_gate: bool = False,
-    ) -> tuple[TargetVerifyResult, torch.Tensor]:
-        ragged_window = BuildRaggedVerifyWindow.execute(
-            batch=batch,
-            layout=layout,
-            draft_block_ids=draft_block_ids,
-            draft_tokens=draft_tokens,
-            bs=bs,
-            device=device,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
+    ) -> tuple[TargetVerifyResult, Optional[torch.Tensor]]:
+        runner = self.model_runner.decode_cuda_graph_runner
+        outputs = (
+            runner.compact_input_buffers(layout.graph_num_tokens)
+            if envs.SGLANG_DSPARK_COMPACT_DIRECT_INPUTS.get() and runner is not None
+            else None
         )
+        if outputs is None:
+            ragged_window = BuildRaggedVerifyWindow.execute(
+                batch=batch,
+                layout=layout,
+                draft_block_ids=draft_block_ids,
+                draft_tokens=draft_tokens,
+                bs=bs,
+                device=device,
+                verify_num_draft_tokens=self.verify_num_draft_tokens,
+                model_runner=self.model_runner,
+            )
+        else:
+            ids, positions, locations, window_index = outputs
+            pack_verify_inputs(
+                indptr=layout.qo_indptr_device,
+                reqs=batch.req_pool_indices,
+                prefixes=batch.seq_lens,
+                req_to_token=self.model_runner.req_to_token_pool.req_to_token,
+                anchors=draft_block_ids,
+                drafts=draft_tokens,
+                width=self.verify_num_draft_tokens,
+                ids=ids,
+                positions=positions,
+                locations=locations,
+                window_index=window_index,
+            )
+            ragged_window = RaggedVerifyWindow(
+                positions=positions,
+                verify_cache_loc=locations,
+                verify_ids=ids,
+                window_index=window_index,
+            )
         if self.verify_epilogue is not None:
             self.verify_epilogue.begin_step(layout.verify_lens, armed=inject_gate)
         target_verify = self._run_ragged(
@@ -502,8 +537,24 @@ class TargetVerifyExecutor:
         )
         logits_output = target_verify.logits_output
 
+        if (
+            inject_gate
+            and target_verify.can_run_cuda_graph
+            and self.verify_epilogue is not None
+            and self.verify_epilogue.native_compact
+        ):
+            return TargetVerifyResult(
+                logits_output=logits_output,
+                can_run_cuda_graph=True,
+                native_compact=True,
+            ), None
+
         stride = self.verify_num_draft_tokens
-        if self.verify_epilogue is not None and target_verify.can_run_cuda_graph:
+        if (
+            self.verify_epilogue is not None
+            and target_verify.can_run_cuda_graph
+            and not self.verify_epilogue.native_compact
+        ):
             strided_logits = self.verify_epilogue.strided_logits
             hidden_strided = self.verify_epilogue.strided_hidden
             assert strided_logits is not None and hidden_strided is not None, (
@@ -513,6 +564,12 @@ class TargetVerifyExecutor:
             strided_logits = strided_logits[: bs * stride]
             hidden_strided = hidden_strided[: bs * stride]
         else:
+            if self.verify_epilogue is not None and self.verify_epilogue.native_compact:
+                if not getattr(self, "_native_fallback_logged", False):
+                    self._native_fallback_logged = True
+                    logger.info(
+                        "DSpark native compact: strided fallback for unsupported request or graph"
+                    )
             compact_logits = logits_output.next_token_logits
             strided_logits = ScatterCompactToStrided.execute(
                 compact=compact_logits,
@@ -667,6 +724,20 @@ class DsparkVerifyEpilogue:
         self._static_step_state: Optional[tuple[int, bool]] = None
         # Set when a captured static epilogue recorded the engram history commit.
         self.folds_engram_commit = False
+        self.native_compact = (
+            envs.SGLANG_DSPARK_COMPACT_NATIVE_ACCEPT.get()
+            and torch.device(device).type == "cuda"
+            and torch.version.cuda is not None
+            and simulated_correct_len is None
+            and commit_ctx is not None
+        )
+        self.native_folds_engram = False
+        self.native_post_fold = (
+            self.native_compact and envs.SGLANG_DSPARK_COMPACT_POST_FOLD.get()
+        )
+        self._compact_candidates = torch.empty(
+            (self.max_bs, self.stride), dtype=torch.int64, device=device
+        )
         # Per captured static batch size; the sampling-accept region's replays read them.
         self.static_io: dict[int, StaticVerifyIO] = {}
 
@@ -685,6 +756,13 @@ class DsparkVerifyEpilogue:
         if not runner.ragged_verify_mode:
             self._static_epilogue(out, forward_batch)
             return
+        # The draft KV pool is created after this epilogue's constructor.
+        if self.native_compact and not self.folds_commit:
+            self.native_compact = False
+            self.native_post_fold = False
+        if self.native_compact:
+            self._native_epilogue(out, forward_batch)
+            return
         self(
             compact_logits=out.next_token_logits,
             compact_hidden=out.hidden_states,
@@ -693,6 +771,74 @@ class DsparkVerifyEpilogue:
             req_pool_indices=forward_batch.req_pool_indices,
             bs=forward_batch.batch_size,
         )
+
+    def _native_epilogue(self, out, forward_batch) -> None:
+        bs = forward_batch.batch_size
+        indptr = forward_batch.ragged_verify_layout.qo_indptr_device
+        lens = self.verify_lens_buf[:bs]
+        prediction = sampling_argmax(out.next_token_logits).reshape(-1)
+        accept_ragged(
+            ids=forward_batch.input_ids,
+            prediction=prediction,
+            indptr=indptr,
+            lens=lens,
+            width=self.stride,
+            correct=self.correct_len_buf[:bs],
+            bonus=self.bonus_buf[:bs],
+            trim=self.cap_trim_lens_buf[:bs],
+        )
+        accept = build_accept_outs(
+            correct_len=self.correct_len_buf[:bs],
+            bonus=self.bonus_buf[:bs],
+            cap_trim_lens=self.cap_trim_lens_buf[:bs],
+            prefix_lens=forward_batch.seq_lens[:bs],
+            draft_tokens=self.draft_tokens_buf[: bs * self.gamma].view(bs, self.gamma),
+            gamma=self.gamma,
+            verify_num_draft_tokens=self.stride,
+            tp_sync=self._tp_sync,
+            sync_site=SpecTpSyncSite.DSPARK_ACCEPT_GRAPH,
+            out=self.read_accept(bs),
+            block_accept_lens_out=self.read_block_accept_lens(bs),
+        )
+        ctx = self.commit_ctx
+        pool = ctx.resolve_pool()
+        n = out.hidden_states.shape[0]
+        positions = torch.empty(n, dtype=torch.int64, device=out.hidden_states.device)
+        locations = torch.empty(n, dtype=torch.int32, device=out.hidden_states.device)
+        compact_commit_layout(
+            indptr=indptr,
+            lens=lens,
+            reqs=forward_batch.req_pool_indices,
+            prefixes=forward_batch.seq_lens,
+            commits=accept.commit_lens,
+            gate=self.inject_gate_buf,
+            req_to_token=ctx.resolve_req_to_token(),
+            full_to_swa=pool.full_to_swa_index_mapping,
+            ring=pool.swa_req_ring_size,
+            positions=positions,
+            locations=locations,
+        )
+        ctx.draft_model.write_target_hidden_kv(
+            main_hidden=out.hidden_states,
+            swa_loc=locations,
+            positions=positions,
+            pool=pool,
+        )
+        if self.native_post_fold:
+            candidates = self._compact_candidates[:bs]
+            ragged_candidates(
+                ids=forward_batch.input_ids, indptr=indptr, lens=lens, out=candidates
+            )
+            committed = self._commit_engram_history(
+                candidates,
+                forward_batch.req_pool_indices,
+                accept.commit_lens,
+                lens,
+                self.inject_gate_buf,
+            )
+            if committed:
+                self.native_folds_engram = True
+            self._scatter_future_relay(forward_batch.req_pool_indices, bs)
 
     def begin_step(self, verify_lens, armed: bool) -> None:
         self._static_step_state = None

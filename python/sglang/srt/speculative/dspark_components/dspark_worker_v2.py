@@ -448,7 +448,14 @@ class DSparkWorkerV2(BaseSpecWorker):
                                 self.model_runner.ngram_embedding_manager.engram_hasher
                             )
                         )
-                        if envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                        if (
+                            envs.SGLANG_OPT_DSV41_POST_FORWARD_CUDA_GRAPH.get()
+                            or (
+                                self._verify_planner.mode_value == "compact"
+                                and envs.SGLANG_DSPARK_COMPACT_NATIVE_ACCEPT.get()
+                                and envs.SGLANG_DSPARK_COMPACT_POST_FOLD.get()
+                            )
+                        )
                         else None
                     ),
                 ),
@@ -1144,6 +1151,23 @@ class DSparkWorkerV2(BaseSpecWorker):
             )
             and not batch.has_grammar
         )
+        if (
+            run_compact
+            and self._verify_epilogue is not None
+            and self._verify_epilogue.native_compact
+        ):
+            # These consumers still require fixed-stride logits. Their graph
+            # accept/commit is disarmed and the existing eager path runs below.
+            fold_eligible = fold_eligible and not (
+                batch.return_logprob
+                or (
+                    sampling_info is not None and sampling_info.has_watermark_candidates
+                )
+                or envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
+                or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+                or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ESTIMATE_PATH.get()
+                or envs.SGLANG_DSPARK_BLOCK_ACCEPT_ONLINE_INTERVAL.get()
+            )
         if not self._sim_draw_ahead:
             self._verify_executor.begin_simulated_step()
             if fold_eligible and self._verify_executor.verify_epilogue.simulate_fold:
@@ -1258,9 +1282,16 @@ class DSparkWorkerV2(BaseSpecWorker):
                 accept_lens=accept.commit_lens,
             )
         engram_in_graph = (
-            folded_accept and not run_compact and epilogue.folds_engram_commit
-        ) or (
-            region_accept is not None and self._sampling_accept_graph.committed_engram
+            (folded_accept and not run_compact and epilogue.folds_engram_commit)
+            or (
+                folded_accept
+                and target_verify.native_compact
+                and epilogue.native_folds_engram
+            )
+            or (
+                region_accept is not None
+                and self._sampling_accept_graph.committed_engram
+            )
         )
         # The static verify graph committed the engram history when it folded the accept.
         if not engram_in_graph:
@@ -1331,7 +1362,11 @@ class DSparkWorkerV2(BaseSpecWorker):
             bs=bs,
             proposal_folded=proposal.folded,
             verify_ids_2d=verify_ids_2d,
-            target_logits=logits_output.next_token_logits,
+            target_logits=(
+                None
+                if target_verify.native_compact
+                else logits_output.next_token_logits
+            ),
             layout=layout,
             confidence=confidence,
             confidence_raw=proposal.confidence_raw,
@@ -1427,10 +1462,14 @@ class DSparkWorkerV2(BaseSpecWorker):
         )
 
     def _future_relay_in_graph(self, *, run_compact: bool, folded_accept: bool):
-        """The FutureMap relay this step's static graph already scattered into
-        (SGLANG_OPT_DSV41_DSPARK_POST_FOLD), or None for the host scatter."""
+        """The FutureMap relay already written by this step's verify graph,
+        or None when the host must publish its accept result."""
         epilogue = self._verify_executor.verify_epilogue
-        if epilogue is None or run_compact or not folded_accept:
+        if epilogue is None or not folded_accept:
+            return None
+        if run_compact and not epilogue.native_post_fold:
+            return None
+        if not run_compact and not epilogue._post_fold:
             return None
         relay = epilogue.future_relay
         if relay is None or not relay.adopted:
