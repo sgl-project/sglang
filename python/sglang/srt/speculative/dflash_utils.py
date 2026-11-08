@@ -532,29 +532,16 @@ def _parse_optional_int(
     return parsed
 
 
-def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
-    """One attention mode per draft layer.
-
-    SpecForge exports the scalar ``dflash_config.attention_mode``; per-layer
-    ``attention_modes`` lists come from forks that mix modes. Default is gqa.
-    """
-    dflash_cfg = _get_dflash_config(draft_hf_config)
-    num_hidden_layers = _parse_optional_int(
-        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
-        field_name="DFLASH draft num_hidden_layers",
-        min_value=1,
-    )
-    if num_hidden_layers is None:
-        raise ValueError("DFLASH attention modes require config.num_hidden_layers.")
+def _parse_dflash_is_mla(dflash_cfg: dict, num_hidden_layers: Optional[int]) -> bool:
+    # SpecForge exports attention_mode; forks that mix modes list attention_modes.
     if "attention_mode" in dflash_cfg and "attention_modes" in dflash_cfg:
         raise ValueError(
             "DFLASH dflash_config sets both attention_mode and attention_modes; "
             "set only one."
         )
-
     raw_modes = dflash_cfg.get("attention_modes")
     if raw_modes is None:
-        raw_modes = [dflash_cfg.get("attention_mode", "gqa")] * num_hidden_layers
+        raw_modes = [dflash_cfg.get("attention_mode", "gqa")]
     elif not isinstance(raw_modes, (list, tuple)) or len(raw_modes) != (
         num_hidden_layers
     ):
@@ -563,27 +550,31 @@ def get_dflash_attention_modes(draft_hf_config: Any) -> Tuple[str, ...]:
             f"layer (num_hidden_layers={num_hidden_layers}), got {raw_modes!r}."
         )
 
-    modes = tuple(str(mode).lower() for mode in raw_modes)
-    unsupported = set(modes) - _DFLASH_ATTENTION_MODES
+    modes = {str(mode).lower() for mode in raw_modes}
+    unsupported = modes - _DFLASH_ATTENTION_MODES
     if unsupported:
         raise ValueError(
             f"DFLASH draft attention mode(s) {sorted(unsupported)} are not "
             f"supported; expected one of {sorted(_DFLASH_ATTENTION_MODES)}."
         )
-    return modes
-
-
-def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
-    modes = get_dflash_attention_modes(draft_hf_config)
     if "mla" not in modes:
         return False
     # The draft KV pool has a single per-layer row layout.
-    if any(mode != "mla" for mode in modes):
+    if modes != {"mla"}:
         raise ValueError(
             "DFLASH drafts that mix mla with gqa/mha layers are not supported, "
-            f"got attention modes {list(modes)}."
+            f"got attention modes {list(raw_modes)}."
         )
     return True
+
+
+def is_dflash_mla_draft_config(draft_hf_config: Any) -> bool:
+    num_hidden_layers = _parse_optional_int(
+        _cfg_get(_get_text_config(draft_hf_config), "num_hidden_layers", None),
+        field_name="DFLASH draft num_hidden_layers",
+        min_value=1,
+    )
+    return _parse_dflash_is_mla(_get_dflash_config(draft_hf_config), num_hidden_layers)
 
 
 # The served MLA layer reinterprets any RoPE scaling as DeepSeek YaRN.
