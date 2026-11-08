@@ -52,6 +52,10 @@ from sglang.kernels.ops.gemm.muse_spark_width_gemm import (
     width_gemm,
     width_gemm_applies,
 )
+from sglang.kernels.ops.gemm.router_gemm_bf16x3 import (
+    router_gemm_bf16x3,
+    router_gemm_bf16x3_supported,
+)
 from sglang.kernels.ops.gemm.router_gemm_fp32 import (
     router_gemm_tuned,
     router_gemv_fp32,
@@ -365,6 +369,9 @@ _tgemm = None
 # tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
 # split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_MUSE_DENSE_TUNED.get()
+# The FP32 router at prefill widths the tuned table misses: three bf16 MFMA terms
+# (kernels/ops/gemm/router_gemm_bf16x3.py) instead of torch.mm.
+_ROUTER_BF16X3 = envs.SGLANG_MUSE_ROUTER_BF16X3.get()
 # Tiled 17..64-row GEMMs: the pooler here, unquantized linear layers through
 # register_gfx950_unquantized_gemm_shapes (the O projection, the DFlash draft MLP).
 _DENSE_TILED = envs.SGLANG_MUSE_DENSE_TILED.get()
@@ -1204,6 +1211,13 @@ class MuseSpark1xMoE(nn.Module):
                 router_logits = router_gemm_tuned(hidden_states, self.router.weight)
                 if router_logits is not None:
                     _log_dense_tuned("router", hidden_states.shape[0])
+            if (
+                router_logits is None
+                and _ROUTER_BF16X3
+                and self.router_in_fp32
+                and router_gemm_bf16x3_supported(hidden_states, self.router.weight)
+            ):
+                router_logits = router_gemm_bf16x3(hidden_states, self.router.weight)
             if router_logits is None:
                 router_input = (
                     hidden_states.float() if self.router_in_fp32 else hidden_states

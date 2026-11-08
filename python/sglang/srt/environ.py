@@ -2288,6 +2288,8 @@ class Envs:
     # Exact-width hipBLASLt picks (kernels/ops/gemm/muse_spark_width_gemm.py) for the BF16 GEMMs the decode / verify
     # graphs otherwise run on aiter tgemm, F.linear or torch.mm (TP8 target and DFlash draft linears, lm heads).
     SGLANG_MUSE_WIDTH_GEMM = EnvBool(True)
+    # The FP32 router from 257 rows (prefill) as three bf16 MFMA terms (kernels/ops/gemm/router_gemm_bf16x3.py).
+    SGLANG_MUSE_ROUTER_BF16X3 = EnvBool(True)
     SGLANG_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
     SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
