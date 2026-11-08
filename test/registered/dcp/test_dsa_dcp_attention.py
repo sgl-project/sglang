@@ -78,7 +78,8 @@ class TestDsaDcpAttention(CustomTestCase):
             page_table = page_table.flip(1)
             page_table[0, ::3] = -1
             page_table[1] = -1
-            for localize in _LOCALIZERS:
+            # The sharded localizer takes a power-of-two top-k width.
+            for localize in _LOCALIZERS if width == TOPK else _LOCALIZERS[:1]:
                 for dcp_size in (2, 4):
                     for rank in range(dcp_size):
                         with self.subTest(
