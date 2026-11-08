@@ -11,24 +11,39 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from sglang.kernels.ops.attention.dsv4.torch_quant import (
+from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
+from sglang.kernels.ops.gemm.router_gemv_hip import rocm_gemv_split_k_max_tokens
+from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
+from sglang.kernels.ops.quantization.fp4_fake_quant import (
     fake_quant_compressed_kv,
     fake_quant_fp4,
 )
-from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-from sglang.kernels.ops.layernorm.rmsnorm_fp32 import rmsnorm_fp32
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
+from sglang.srt.utils import is_gfx95_supported
 
 
-def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False):
-    if x.is_cuda and torch.version.cuda is not None and x.dtype == torch.bfloat16:
+def _fused_dsv41_kernels(x: torch.Tensor) -> bool:
+    # validated on CUDA and gfx950; other ROCm GPUs keep the torch forms
+    return x.is_cuda and (torch.version.cuda is not None or is_gfx95_supported())
+
+
+def _rope_fq4(x, freqs, rope_dim, *, compressed_kv=False, positions=None):
+    """RoPE plus fake FP4 quantization, fused for bf16 inputs on CUDA and ROCm. With
+    positions, freqs is the whole table and the fused kernel gathers freqs[positions]."""
+    if _fused_dsv41_kernels(x) and x.dtype == torch.bfloat16:
         from sglang.kernels.ops.attention.dsv4.fp4_rope_fake_quant import (
             rope_tail_fake_quant_fp4,
         )
 
-        return rope_tail_fake_quant_fp4(x, freqs, rope_dim, compressed_kv=compressed_kv)
+        return rope_tail_fake_quant_fp4(
+            x, freqs, rope_dim, compressed_kv=compressed_kv, positions=positions
+        )
+    if positions is not None:
+        freqs = freqs[positions]
     quant = fake_quant_compressed_kv if compressed_kv else fake_quant_fp4
     return quant(rope_tail(x, freqs, rope_dim))
 
@@ -42,9 +57,9 @@ class RMSNorm(nn.Module):
         self.weight = nn.Parameter(torch.ones(dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # the Triton kernel is bitwise this fallback for bf16 rows on CUDA and ROCm (gfx950)
         if (
-            x.is_cuda
-            and torch.version.cuda is not None
+            _fused_dsv41_kernels(x)
             and x.dtype in (torch.bfloat16, torch.float32)
             and self.weight.dtype in (torch.bfloat16, torch.float32)
             and x.shape[-1] in (128, 512)
@@ -63,6 +78,15 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        layout = forward_batch.ragged_verify_layout
+        if layout is not None:
+            # Tokens past qo_indptr[-1] take pool slot 0, like the padded rows of
+            # a dense verify graph.
+            rows = ragged_verify_token_rows(
+                layout,
+                forward_batch.positions.shape[0] if num_tokens is None else num_tokens,
+            )
+            return torch.cat([req, req.new_zeros(1)])[rows]
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
@@ -87,12 +111,14 @@ def rope_tail(
 
 
 def fused_low_ratio_compress_supported() -> bool:
-    """The fused c1 / c2 / index-K decode kernels pack fp4 with
-    `cvt.rn.satfinite.e2m1x2`, an sm100+ instruction; the answer also fixes the
-    ratio-2 weight layout (`wkv_gate`, or `wkv` plus `wgate`)."""
-    if not torch.cuda.is_available() or torch.version.hip is not None:
+    """The fused c1 / c2 / index-K decode kernels need sm90+ on CUDA or gfx950 on
+    ROCm; the answer also fixes the ratio-2 weight layout (`wkv_gate`, or `wkv`
+    plus `wgate`)."""
+    if not torch.cuda.is_available():
         return False
-    return torch.cuda.get_device_capability()[0] >= 10
+    if torch.version.hip is not None:
+        return is_gfx95_supported()
+    return torch.cuda.get_device_capability()[0] >= 9
 
 
 class DeepseekV41Compressor(nn.Module):
@@ -158,13 +184,21 @@ class DeepseekV41Compressor(nn.Module):
         return (kv2 * score2.softmax(dim=1)).sum(dim=1)
 
 
-def _small_weights_proj_max_m(n_heads: int, hidden_size: int) -> int:
-    # -1 means the device or checkpoint shape requires the linear fallback.
-    if not torch.cuda.is_available() or torch.version.hip is not None:
-        return -1
-    from sglang.kernels.ops.gemm.small_gemm_bf16 import MAX_M, can_use_n32k5120_gemm
+# Decode batches up to 32 rows take the tiny GEMM for the two shapes it was measured
+# on: weights_proj (32 heads x 5120) and wk (128 x 512).
+_TINY_GEMM_SHAPES = ((32, 5120), (128, 512))
 
-    return MAX_M if can_use_n32k5120_gemm(n_heads, hidden_size, 1) else -1
+
+def _tiny_gemm_max_m(n: int, k: int) -> int:
+    # -1 means the device or checkpoint shape requires the linear fallback.
+    if (
+        (n, k) not in _TINY_GEMM_SHAPES
+        or not torch.cuda.is_available()
+        or torch.version.hip is not None
+        or torch.cuda.get_device_capability()[0] < 9
+    ):
+        return -1
+    return 32
 
 
 class DeepseekV41Indexer(nn.Module):
@@ -208,8 +242,12 @@ class DeepseekV41Indexer(nn.Module):
             quant_config=None,
             prefix=add_prefix("weights_proj", prefix),
         )
+        # -1 off gfx950 or for shapes the split-K GEMV lacks
+        self.weights_proj_hip_max_tokens = rocm_gemv_split_k_max_tokens(
+            n=self.n_heads, k=config.hidden_size, weight_dtype=torch.bfloat16
+        )
         # The decode GEMM matches tiny_gemm's reduction order, not cuBLAS's.
-        self.weights_proj_small_max_m = _small_weights_proj_max_m(
+        self.weights_proj_small_max_m = _tiny_gemm_max_m(
             self.n_heads, config.hidden_size
         )
         if self.owns_k:
@@ -217,18 +255,11 @@ class DeepseekV41Indexer(nn.Module):
                 head_dim, self.index_head_dim, bias=False, dtype=torch.bfloat16
             )
             self.k_norm = RMSNorm(self.index_head_dim, config.rms_norm_eps)
+            self.wk_small_max_m = _tiny_gemm_max_m(self.index_head_dim, head_dim)
 
     def forward_wk(self, latent: torch.Tensor) -> torch.Tensor:
-        from sglang.kernels.ops.gemm.small_gemm_bf16 import (
-            can_use_n128k512_gemm,
-            n128k512_gemm_bf16,
-        )
-
-        # The JIT kernel raises rather than falling back on an unsupported shape.
-        if can_use_n128k512_gemm(
-            self.index_head_dim, latent.shape[-1], latent.shape[0]
-        ):
-            return n128k512_gemm_bf16(latent, self.wk.weight)
+        if 0 < latent.shape[0] <= self.wk_small_max_m:
+            return tiny_gemm_bf16(latent, self.wk.weight)
         return self.wk(latent)
 
     def index_keys(self, latent: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -236,17 +267,22 @@ class DeepseekV41Indexer(nn.Module):
         k = self.k_norm(self.forward_wk(latent))
         return _rope_fq4(k, freqs, self.rope_head_dim)
 
-    def queries(self, q_lora: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    def queries(
+        self,
+        q_lora: torch.Tensor,
+        freqs: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """freqs per token, or the whole table with positions (gathered inside the
+        fused RoPE launch)."""
         q, _ = self.wq_b(q_lora)
         q = q.view(q.shape[0], self.n_local_heads, self.index_head_dim)
-        return _rope_fq4(q, freqs, self.rope_head_dim)
+        return _rope_fq4(q, freqs, self.rope_head_dim, positions=positions)
 
     def head_weights_raw(self, x: torch.Tensor) -> torch.Tensor:
         """`weights_proj(x)` before the scale, [tokens, n_heads] bf16."""
         if 0 < x.shape[0] <= self.weights_proj_small_max_m and x.is_cuda:
-            from sglang.kernels.ops.gemm.small_gemm_bf16 import n32k5120_gemm_bf16
-
-            return n32k5120_gemm_bf16(x, self.weights_proj.weight)
+            return tiny_gemm_bf16(x, self.weights_proj.weight)
         w, _ = self.weights_proj(x)
         return w
 

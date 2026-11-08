@@ -17,7 +17,6 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
 from sglang.srt.hardware_backend.xpu.graph_runner.xpu_graph_runner import XPUGraphRunner
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -26,9 +25,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
     check_cuda_graph_backend,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
     merge_graph_memory_usage,
     merge_graph_time_usage,
@@ -43,6 +42,7 @@ from sglang.srt.model_executor.runner import (
 )
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
+from sglang.srt.platforms.interface import require_out_of_tree_impl
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -95,6 +95,25 @@ def has_standard_gqa_for_all_local_layers(
     return attention_layer_count >= end_layer - start_layer
 
 
+def has_hybrid_graph_handlers(
+    *,
+    attention_layers: list[Any],
+    moe_layers: list[Any],
+    start_layer: int,
+    end_layer: int,
+) -> bool:
+    """Accept pure MoE layers while rejecting gaps in the local decoder range."""
+    return (
+        0 <= start_layer < end_layer
+        and end_layer <= len(attention_layers)
+        and end_layer <= len(moe_layers)
+        and all(
+            attention_layers[i] is not None or moe_layers[i] is not None
+            for i in range(start_layer, end_layer)
+        )
+    )
+
+
 def index_attention_layers_by_global_id(
     attention_layers: list[Any],
     mha_companion_layers: list[Any],
@@ -117,8 +136,13 @@ def index_attention_layers_by_global_id(
             )
         return attention_layers, mha_companion_layers
     max_layer_id = max(int(layer.layer_id) for layer in populated)
-    indexed_attention = [None] * (max_layer_id + 1)
-    indexed_companions = [None] * (max_layer_id + 1)
+    # Keep trailing pure MoE layers represented as well. Their graph handler
+    # lives in moe_layers, and shrinking this list loses decoder alignment.
+    indexed_size = max(
+        max_layer_id + 1, len(layer_model.layers) if layer_model is not None else 0
+    )
+    indexed_attention = [None] * indexed_size
+    indexed_companions = [None] * indexed_size
     has_reused_layers = False
     for attention, companion in zip(attention_layers, mha_companion_layers):
         if attention is None:
@@ -408,12 +432,11 @@ def capture_cuda_graphs(
         capture_time=0,
     )
     if capture_decode_cuda_graph:
-        if model_runner.device in ("cuda", "musa", "cpu", "npu", "xpu"):
-            decode = capture_decode_graph(model_runner=model_runner)
-        elif (
-            current_platform.is_out_of_tree() and current_platform.support_cuda_graph()
-        ):
-            decode = capture_decode_graph(model_runner=model_runner)
+        model_runner.maybe_init_uocr_greedy_graph()
+        if current_platform.capabilities.graph_capture:
+            decode = capture_decode_graph(
+                model_runner=model_runner, prefill_runner=prefill.runner
+            )
     else:
         decode = GraphCapture(
             runner=eager_runner,
@@ -471,6 +494,28 @@ def capture_prefill_graph(
             capture_time=capture_time,
         )
 
+    # CPU prefill graph capture is owned by CPUGraphRunner; keep the shared
+    # setup path eager for unsupported CPU configurations.
+    if getattr(model_runner, "device", None) == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return result(None)
+        if model_runner.is_draft_worker and not force_for_draft_worker:
+            return result(None)
+        if (
+            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
+            or not model_runner._uses_cpu_graph_attention_backend()
+        ):
+            return result(None)
+        if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
+            return result(None)
+        prefill_backend = get_exec().graph.cuda_graph_config.prefill.backend
+        if prefill_backend is not None and prefill_backend != Backend.FULL:
+            raise ValueError(
+                f"Unsupported CPU prefill graph backend: {prefill_backend!r}; "
+                "only 'full' is supported on CPU."
+            )
+        return result(CPUGraphRunner(model_runner))
+
     if check_cuda_graph_backend(Phase.PREFILL, Backend.DISABLED):
         logger.info(
             "Disable prefill CUDA graph because cuda_graph_config "
@@ -489,6 +534,15 @@ def capture_prefill_graph(
     # init_lm_head so graphs capture the final embedding weights.
     if model_runner.is_draft_worker and not force_for_draft_worker:
         return result(None)
+
+    if model_runner.is_draft_worker and get_parallel().enable_prefill_cp:
+        from sglang.srt.layers.cp.base import is_interleave
+
+        if is_interleave():
+            # EagleWorkerV2 requests capture again with force_for_draft_worker=True
+            # after init_lm_head, bypassing the guard above. The interleave adapter
+            # supports only target prefill; draft CP must stay eager on that call too.
+            return result(None)
 
     # Skip prefill CG for EAGLE target on tc_piecewise when the fixed server
     # capture ceiling is below FULL. EAGLE target prefill requests FULL, so a
@@ -537,10 +591,13 @@ def capture_prefill_graph(
     prefill_config = get_exec().graph.cuda_graph_config.prefill
     prefill_backend = prefill_config.backend
     parallel = get_parallel()
+    from sglang.srt.layers.cp.bcg import supports_prefill_cp_bcg
+
     if (
         prefill_backend == Backend.BREAKABLE
         and parallel.enable_prefill_cp
         and parallel.pp_size > 1
+        and not supports_prefill_cp_bcg(model_runner.server_args)
     ):
         logger.warning(
             "Disable prefill CUDA graph because pipeline parallelism combined "
@@ -624,7 +681,17 @@ def capture_prefill_graph(
         layer_model,
     )
 
-    if not has_standard_gqa_for_all_local_layers(
+    supports_hybrid_graph = (
+        getattr(layer_model, "supports_hybrid_prefill_graph", False)
+        and prefill_backend == Backend.BREAKABLE
+        and has_hybrid_graph_handlers(
+            attention_layers=model_runner.attention_layers,
+            moe_layers=model_runner.moe_layers,
+            start_layer=model_runner.layer_info.start_layer,
+            end_layer=model_runner.layer_info.end_layer,
+        )
+    )
+    if not supports_hybrid_graph and not has_standard_gqa_for_all_local_layers(
         attention_layer_count=sum(
             layer is not None for layer in model_runner.attention_layers
         ),
@@ -660,7 +727,9 @@ def capture_prefill_graph(
     return result(prefill_runner, mem_usage, capture_time)
 
 
-def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
+def capture_decode_graph(
+    *, model_runner: ModelRunner, prefill_runner: Optional[BaseRunner] = None
+) -> GraphCapture:
     """Capture device graphs."""
     if model_runner.is_draft_worker:
         memory_phase = "draft_decode"
@@ -686,14 +755,37 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     if not model_runner.is_generation:
         # TODO: Currently, cuda graph only captures decode steps, which only exists for generation models
         return no_capture
+
     if get_model().model_impl.lower() == ModelImpl.MINDSPORE:
         return no_capture
-    if model_runner.device != "cpu" and check_cuda_graph_backend(
-        Phase.DECODE, Backend.DISABLED
-    ):
+    if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED):
         return no_capture
-    if model_runner.device == "cpu" and not get_flags().capture.enable_torch_compile:
-        return no_capture
+
+    if getattr(model_runner, "device", None) == "cpu":
+        if not get_flags().capture.enable_torch_compile:
+            return no_capture
+        if (
+            not hasattr(model_runner, "_uses_cpu_graph_attention_backend")
+            or not model_runner._uses_cpu_graph_attention_backend()
+        ):
+            return no_capture
+        decode_backend = get_exec().graph.cuda_graph_config.decode.backend
+        if decode_backend != Backend.FULL:
+            raise ValueError(
+                f"Unsupported CPU decode graph backend: {decode_backend!r}; "
+                "only 'full' is supported on CPU."
+            )
+        runner = (
+            prefill_runner
+            if isinstance(prefill_runner, CPUGraphRunner)
+            else CPUGraphRunner(model_runner)
+        )
+        return GraphCapture(
+            runner=runner,
+            memory_phase=memory_phase,
+            memory_usage_gb=0,
+            capture_time=0,
+        )
 
     tic = time.perf_counter()
     before_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
@@ -714,33 +806,38 @@ def capture_decode_graph(*, model_runner: ModelRunner) -> GraphCapture:
     else:
         capture_name = f"{role} decode"
         num_tokens_per_req = 1
-    capture_bs, _ = get_batch_sizes_to_capture(model_runner, num_tokens_per_req)
     decode_backend = get_exec().graph.cuda_graph_config.decode.backend
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} begin. "
         f"backend={decode_backend}, num_tokens_per_req={num_tokens_per_req}, "
-        f"bs={capture_bs}, avail mem={before_mem:.2f} GB"
+        f"avail mem={before_mem:.2f} GB"
     )
 
-    if current_platform.is_out_of_tree():
-        GraphRunnerCls = current_platform.get_graph_runner_cls()
-        runner = GraphRunnerCls(model_runner)
-    else:
+    GraphRunnerCls = current_platform.get_graph_runner_cls()
+    if GraphRunnerCls is None:
+        require_out_of_tree_impl(
+            current_platform,
+            hook="get_graph_runner_cls()",
+            subsystem="CUDA graph runner",
+        )
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
                 "cpu": CPUGraphRunner,
-                "npu": NPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )
-        runner = graph_runners[model_runner.device](model_runner)
+        GraphRunnerCls = graph_runners[model_runner.device]
+    runner = GraphRunnerCls(model_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     memory_usage_gb = before_mem - after_mem
     capture_time = time.perf_counter() - tic
+    # The runner owns the bucket list: a dp-local draft aligns by its local
+    # batch, which a global re-derivation here would reject as empty.
     logger.info(
         f"Capture {capture_name} {graph_backend[model_runner.device]} end. "
+        f"bs={runner.capture_bs}, "
         f"elapsed={capture_time:.2f} s, "
         f"mem usage={memory_usage_gb:.2f} GB, avail mem={after_mem:.2f} GB."
     )

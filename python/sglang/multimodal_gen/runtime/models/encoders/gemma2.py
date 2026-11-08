@@ -40,6 +40,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 )
 from sglang.multimodal_gen.runtime.models.encoders.base import (
     EncoderTensorParallelMixin,
+    get_attention_head_partition,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,14 +115,10 @@ class Gemma2Attention(nn.Module):
         self.hidden_size = hidden_size
         tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
-        assert self.total_num_heads % tp_size == 0
-        self.num_heads = self.total_num_heads // tp_size
         self.total_num_kv_heads = num_kv_heads
-        if self.total_num_kv_heads >= tp_size:
-            assert self.total_num_kv_heads % tp_size == 0
-        else:
-            assert tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // tp_size)
+        self.num_heads, self.num_kv_heads = get_attention_head_partition(
+            num_heads, num_kv_heads, tp_size
+        )
 
         arch = config.arch_config
         self.head_dim = arch.head_dim

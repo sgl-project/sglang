@@ -15,7 +15,7 @@ use tokio::{
     sync::{watch, Mutex},
     task::JoinHandle,
 };
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     core::{metrics_aggregator::MetricPack, ConnectionMode, Worker, WorkerRegistry, WorkerType},
@@ -164,35 +164,37 @@ impl WorkerManager {
         let workers = worker_registry.get_all();
         let total_workers = workers.len();
 
-        let futures: Vec<_> = workers
-            .iter()
-            .map(|worker| {
-                let url = worker.url().to_string();
-                let api_key = worker.api_key().clone();
-                let worker_type = match worker.worker_type() {
-                    WorkerType::Regular => None,
-                    WorkerType::Prefill { .. } => Some("prefill".to_string()),
-                    WorkerType::Decode => Some("decode".to_string()),
-                };
-                let is_http = matches!(worker.connection_mode(), ConnectionMode::Http);
-                let client = client.clone();
+        // DP-aware workers share one engine (url() is a virtual `base@rank`),
+        // so fetch /v1/loads once per engine and map each rank to its entry.
+        let mut engines: HashMap<&str, Vec<&Arc<dyn Worker>>> = HashMap::new();
+        let mut loads = Vec::new();
+        for worker in &workers {
+            if matches!(worker.connection_mode(), ConnectionMode::Http) {
+                engines.entry(worker.base_url()).or_default().push(worker);
+            } else {
+                loads.push(Self::load_info(worker, -1));
+            }
+        }
 
-                async move {
-                    let load = if is_http {
-                        Self::parse_load_response(&client, &url, api_key.as_deref()).await
-                    } else {
-                        -1
-                    };
-                    WorkerLoadInfo {
-                        worker: url,
-                        worker_type,
-                        load,
-                    }
-                }
+        let futures: Vec<_> = engines
+            .into_iter()
+            .map(|(base_url, workers)| async move {
+                let api_key = workers[0].api_key().as_deref();
+                let json = Self::fetch_loads(client, base_url, api_key).await;
+                workers
+                    .into_iter()
+                    .map(|worker| {
+                        let load = json
+                            .as_ref()
+                            .and_then(|json| Self::parse_load(json, worker.dp_rank()))
+                            .unwrap_or(-1);
+                        Self::load_info(worker, load)
+                    })
+                    .collect::<Vec<_>>()
             })
             .collect();
 
-        let loads = future::join_all(futures).await;
+        loads.extend(future::join_all(futures).await.into_iter().flatten());
         let successful = loads.iter().filter(|l| l.load >= 0).count();
         let failed = loads.iter().filter(|l| l.load < 0).count();
 
@@ -204,29 +206,51 @@ impl WorkerManager {
         }
     }
 
-    async fn parse_load_response(
+    fn load_info(worker: &Arc<dyn Worker>, load: isize) -> WorkerLoadInfo {
+        WorkerLoadInfo {
+            worker: worker.url().to_string(),
+            worker_type: match worker.worker_type() {
+                WorkerType::Regular => None,
+                WorkerType::Prefill { .. } => Some("prefill".to_string()),
+                WorkerType::Decode => Some("decode".to_string()),
+            },
+            load,
+        }
+    }
+
+    async fn fetch_loads(
         client: &reqwest::Client,
-        url: &str,
+        base_url: &str,
         api_key: Option<&str>,
-    ) -> isize {
-        let load_url = format!("{}/v1/loads?include=core", url);
+    ) -> Option<Value> {
+        let load_url = format!("{}/v1/loads?include=core", base_url.trim_end_matches('/'));
         let mut req = client.get(&load_url).timeout(REQUEST_TIMEOUT);
         if let Some(key) = api_key {
             req = req.bearer_auth(key);
         }
 
         match req.send().await {
-            Ok(r) if r.status().is_success() => match r.json::<Value>().await {
-                Ok(json) => json
-                    .get("aggregate")
-                    .and_then(|a| a.get("total_tokens"))
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as isize)
-                    .unwrap_or(-1),
-                _ => -1,
-            },
-            _ => -1,
+            Ok(r) if r.status().is_success() => r.json::<Value>().await.ok(),
+            _ => None,
         }
+    }
+
+    /// Token load from a `/v1/loads` response: the `loads[]` entry of `dp_rank`,
+    /// the sum over `loads[]` for a non-DP worker, or legacy `aggregate.total_tokens`.
+    fn parse_load(json: &Value, dp_rank: Option<usize>) -> Option<isize> {
+        let tokens = |entry: &Value| entry.get("num_total_tokens").and_then(Value::as_i64);
+        let load = match (json.get("loads").and_then(Value::as_array), dp_rank) {
+            (Some(entries), Some(rank)) => entries
+                .iter()
+                .find(|e| e.get("dp_rank").and_then(Value::as_u64) == Some(rank as u64))
+                .and_then(tokens),
+            (Some(entries), None) => entries.iter().map(tokens).sum(),
+            (None, _) => json
+                .get("aggregate")
+                .and_then(|a| a.get("total_tokens"))
+                .and_then(Value::as_i64),
+        };
+        load.filter(|n| *n >= 0).map(|n| n as isize)
     }
 
     pub async fn get_engine_metrics(
@@ -356,24 +380,24 @@ impl LoadMonitor {
 
             let result = WorkerManager::get_all_worker_loads(&worker_registry, &client).await;
 
-            let mut loads = HashMap::new();
-            for load_info in result.loads {
-                loads.insert(load_info.worker, load_info.load);
-            }
+            // Drop failed fetches (-1) so policies fall back to request counts
+            let loads: HashMap<String, isize> = result
+                .loads
+                .into_iter()
+                .filter(|l| l.load >= 0)
+                .map(|l| (l.worker, l.load))
+                .collect();
 
-            if !loads.is_empty() {
-                debug!(
-                    "Fetched loads from {} workers, updating {} PowerOfTwo policies",
-                    loads.len(),
-                    power_of_two_policies.len()
-                );
-                for policy in &power_of_two_policies {
-                    policy.update_loads(&loads);
-                }
-                let _ = tx.send(loads);
-            } else {
-                warn!("No loads fetched from workers");
+            debug!(
+                "Fetched loads from {} workers, updating {} PowerOfTwo policies",
+                loads.len(),
+                power_of_two_policies.len()
+            );
+            // Publish even when empty so stale loads are cleared
+            for policy in &power_of_two_policies {
+                policy.update_loads(&loads);
             }
+            let _ = tx.send(loads);
         }
     }
 
@@ -390,5 +414,26 @@ impl Drop for LoadMonitor {
                 handle.abort();
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn test_parse_load() {
+        let json = json!({"loads": [
+            {"dp_rank": 0, "num_total_tokens": 100},
+            {"dp_rank": 1, "num_total_tokens": 20}
+        ]});
+        assert_eq!(WorkerManager::parse_load(&json, Some(1)), Some(20));
+        assert_eq!(WorkerManager::parse_load(&json, Some(2)), None);
+        assert_eq!(WorkerManager::parse_load(&json, None), Some(120));
+
+        let legacy = json!({"aggregate": {"total_tokens": 7}});
+        assert_eq!(WorkerManager::parse_load(&legacy, None), Some(7));
     }
 }

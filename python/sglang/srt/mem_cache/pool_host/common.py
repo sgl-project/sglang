@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import ctypes
+import ctypes.util
 import json
 import logging
+import math
 import os
+import resource
+import time
+import weakref
 from collections import defaultdict
 from functools import lru_cache
 
@@ -18,6 +24,7 @@ logger = logging.getLogger(__name__)
 _is_hip = is_hip()
 
 _CUDA_HOST_REGISTERED_RANGES_ATTR = "_sglang_cuda_host_registered_ranges"
+_HOST_LOCKED_RANGE_ATTR = "_sglang_host_locked_range"
 
 
 class HostTensorAllocator:
@@ -194,6 +201,8 @@ def _cuda_host_register(
         if remaining_ranges:
             setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
         raise
+    if total > 0:
+        _mlock_host_buffer(buffer)
 
 
 def _cuda_host_unregister_ranges(
@@ -231,6 +240,195 @@ def _cuda_host_unregister(buffer: torch.Tensor) -> None:
         cudart, registered_ranges, operation="host-pool destroy"
     )
     setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, remaining_ranges)
+    if not remaining_ranges:
+        _munlock_host_buffer(buffer)
+
+
+@lru_cache(maxsize=1)
+def _libc() -> ctypes.CDLL:
+    lib = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6", use_errno=True)
+    lib.mlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.mlock.restype = ctypes.c_int
+    lib.munlock.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.munlock.restype = ctypes.c_int
+    return lib
+
+
+def _memlock_state() -> str:
+    """This process's memlock limits, CAP_IPC_LOCK and locked memory, for logs."""
+    status = {}
+    with open("/proc/self/status") as f:
+        for line in f:
+            key, _, value = line.partition(":")
+            status[key] = value.strip()
+    cap_eff = status.get("CapEff")
+    cap_ipc_lock = None if cap_eff is None else bool((int(cap_eff, 16) >> 14) & 1)
+    soft, hard = (
+        "unlimited" if limit == resource.RLIM_INFINITY else limit
+        for limit in resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    )
+    return (
+        f"RLIMIT_MEMLOCK soft={soft} hard={hard}, CAP_IPC_LOCK={cap_ipc_lock}, "
+        f"VmLck {status.get('VmLck')}"
+    )
+
+
+def _mlock_host_buffer(buffer: torch.Tensor) -> None:
+    """mlock a pinned host buffer so that page aging never scans its pages.
+
+    Pinning keeps the pages resident but leaves them on the evictable LRU, and
+    aging clears the accessed flag of every page it scans there. Where the GPU
+    reads host memory through the CPU page tables (ATS), its next access to such
+    a page takes a page fault, which slows copies out of the buffer. Locked pages
+    sit on the unevictable LRU and are not scanned.
+
+    The lock only keeps device reads fast; the buffer is pinned either way. So a
+    refused lock (a memlock limit below the buffer size without CAP_IPC_LOCK, as
+    in many containers) logs a warning with the limits instead of failing.
+    """
+    ptr = buffer.data_ptr()
+    size = buffer.numel() * buffer.element_size()
+    soft, hard = resource.getrlimit(resource.RLIMIT_MEMLOCK)
+    if soft != resource.RLIM_INFINITY and (
+        hard == resource.RLIM_INFINITY or soft < hard
+    ):
+        # Raising the soft limit up to the hard limit needs no privilege.
+        resource.setrlimit(resource.RLIMIT_MEMLOCK, (hard, hard))
+    start = time.perf_counter()
+    rc = _libc().mlock(ctypes.c_void_p(ptr), ctypes.c_size_t(size))
+    err = ctypes.get_errno()
+    elapsed = time.perf_counter() - start
+    if rc != 0:
+        logger.warning(
+            "mlock of a %.2f GiB pinned host buffer at %#x failed: errno %d (%s); "
+            "%s. The buffer stays pinned but unlocked, so where the GPU reads host "
+            "memory through the CPU page tables, page aging can make its reads of "
+            "the buffer fault. Raise the memlock limit or grant CAP_IPC_LOCK.",
+            size / 2**30,
+            ptr,
+            err,
+            os.strerror(err),
+            _memlock_state(),
+        )
+        return
+    setattr(buffer, _HOST_LOCKED_RANGE_ATTR, (ptr, size))
+    logger.info(
+        "Host buffer mlock: %.2f GiB at [%#x, %#x) locked in %.2f s; %s",
+        size / 2**30,
+        ptr,
+        ptr + size,
+        elapsed,
+        _memlock_state(),
+    )
+
+
+def _munlock_host_buffer(buffer: torch.Tensor) -> None:
+    locked_range = getattr(buffer, _HOST_LOCKED_RANGE_ATTR, None)
+    if locked_range is None:
+        return
+    ptr, size = locked_range
+    if _libc().munlock(ctypes.c_void_p(ptr), ctypes.c_size_t(size)) != 0:
+        err = ctypes.get_errno()
+        logger.warning(
+            "munlock failed during host-pool destroy (errno %d, %s) for ptr=%#x size=%d",
+            err,
+            os.strerror(err),
+            ptr,
+            size,
+        )
+        return
+    setattr(buffer, _HOST_LOCKED_RANGE_ATTR, None)
+
+
+@lru_cache(maxsize=1)
+def _hip_runtime() -> ctypes.CDLL:
+    from sglang.srt.distributed.device_communicators.cuda_wrapper import (
+        find_loaded_library,
+    )
+
+    # Bind the copy torch loaded; dlopen by soname could load a second HIP runtime.
+    path = find_loaded_library("libamdhip64")
+    if path is None:
+        raise RuntimeError("libamdhip64 is not loaded in this process")
+    lib = ctypes.CDLL(path)
+    lib.hipHostMalloc.argtypes = [
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.c_size_t,
+        ctypes.c_uint,
+    ]
+    lib.hipHostMalloc.restype = ctypes.c_int
+    lib.hipHostFree.argtypes = [ctypes.c_void_p]
+    lib.hipHostFree.restype = ctypes.c_int
+    lib.hipGetErrorString.argtypes = [ctypes.c_int]
+    lib.hipGetErrorString.restype = ctypes.c_char_p
+    return lib
+
+
+def _hip_host_malloc(nbytes: int) -> int:
+    lib = _hip_runtime()
+    ptr = ctypes.c_void_p()
+    # hipHostMallocDefault, the flags torch's pinned allocator uses.
+    rc = lib.hipHostMalloc(ctypes.byref(ptr), nbytes, 0)
+    if rc != 0:
+        raise RuntimeError(
+            f"hipHostMalloc of {nbytes / 1e9:.2f} GB for a HiCache host pool failed "
+            f"(rc={rc}, {lib.hipGetErrorString(rc).decode()}). With "
+            "HSA_USERPTR_FOR_PAGED_MEM=0 host pools are GTT memory, which all ranks "
+            "on a node share up to /sys/class/drm/card*/device/mem_info_gtt_total. "
+            "Reduce --hicache-size or unset HSA_USERPTR_FOR_PAGED_MEM."
+        )
+    return ptr.value
+
+
+def _hip_host_free(ptr: int) -> None:
+    rc = _hip_runtime().hipHostFree(ptr)
+    if rc != 0:
+        logger.warning("hipHostFree failed (rc=%d) for ptr=%#x", rc, ptr)
+
+
+@lru_cache(maxsize=1)
+def _log_hip_owned_host_pool() -> None:
+    logger.info(
+        "HSA_USERPTR_FOR_PAGED_MEM=0: allocating HiCache host pools with "
+        "hipHostMalloc (GTT) instead of hipHostRegister (USERPTR)."
+    )
+    if envs.SGLANG_HUGEPAGE_SIZE.get():
+        logger.warning(
+            "SGLANG_HUGEPAGE_SIZE is ignored for hipHostMalloc HiCache host pools."
+        )
+
+
+def _uses_hip_owned_host_memory(
+    pin_memory: bool, allocator: HostTensorAllocator
+) -> bool:
+    # hipHostRegister memory is USERPTR even with HSA_USERPTR_FOR_PAGED_MEM=0; any page
+    # migration in it stalls every GPU queue while KFD revalidates. GTT never migrates.
+    return (
+        _is_hip
+        and pin_memory
+        # Storage allocators own their backing (shm fds, registered transfer buffers).
+        and type(allocator) is HostTensorAllocator
+        and os.environ.get("HSA_USERPTR_FOR_PAGED_MEM") == "0"
+    )
+
+
+def _alloc_hip_host_tensor(dims: tuple, dtype: torch.dtype) -> torch.Tensor:
+    # Not torch pin_memory: its host allocator rounds each block up to a power of
+    # two, so a 180 GB pool would pin 256 GiB of GTT.
+    numel = math.prod(dims)
+    nbytes = numel * dtype.itemsize
+    ptr = _hip_host_malloc(nbytes)
+    try:
+        array = (ctypes.c_uint8 * nbytes).from_address(ptr)
+        buffer = torch.frombuffer(array, dtype=dtype, count=numel).reshape(dims)
+    except BaseException:
+        _hip_host_free(ptr)
+        raise
+    # Freed with the tensor's last view; at interpreter exit the driver reclaims it.
+    weakref.finalize(array, _hip_host_free, ptr).atexit = False
+    # Not host-registered, so HostKVCache.destroy() must not cudaHostUnregister it.
+    setattr(buffer, _CUDA_HOST_REGISTERED_RANGES_ATTR, [])
+    return buffer
 
 
 def alloc_with_host_register(
@@ -242,9 +440,14 @@ def alloc_with_host_register(
     registration_granularity_bytes: int | None = None,
 ) -> torch.Tensor:
     """
-    Allocate tensor and register host memory with cudaHostRegister.
-    CudaHostRegister only applies when pin_memory=True.
+    Allocate tensor and pin host memory: register it with cudaHostRegister, then
+    mlock it. Pinning only applies when pin_memory=True. On ROCm with
+    HSA_USERPTR_FOR_PAGED_MEM=0, default-allocator pools come from hipHostMalloc.
     """
+    if _uses_hip_owned_host_memory(pin_memory=pin_memory, allocator=allocator):
+        assert device == "cpu", f"HiCache host pools are CPU memory; got {device!r}"
+        _log_hip_owned_host_pool()
+        return _alloc_hip_host_tensor(dims=dims, dtype=dtype)
     buffer = allocator.allocate(dims, dtype=dtype, device=device)
     if pin_memory:
         _cuda_host_register(buffer, registration_granularity_bytes)
@@ -263,6 +466,35 @@ def alloc_with_pin_memory(
     Allocate tensor using PyTorch's built-in pin_memory flag.
     """
     buffer = torch.empty(dims, dtype=dtype, device=device, pin_memory=pin_memory)
+    return buffer
+
+
+def alloc_with_pin_memory_xpu(
+    dims: tuple,
+    dtype: torch.dtype,
+    device: str,
+    pin_memory: bool,
+    allocator: None,
+    registration_granularity_bytes: int | None = None,
+) -> torch.Tensor:
+    """`alloc_with_pin_memory`, failing on a null pinned buffer.
+
+    torch-xpu returns `data_ptr() == 0` from a failed pinned allocation instead of
+    raising; an empty tensor has a null pointer on every backend and is fine.
+    """
+    buffer = alloc_with_pin_memory(
+        dims=dims,
+        dtype=dtype,
+        device=device,
+        pin_memory=pin_memory,
+        allocator=allocator,
+    )
+    if pin_memory and buffer.numel() > 0 and buffer.data_ptr() == 0:
+        n_bytes = buffer.numel() * buffer.element_size()
+        raise RuntimeError(
+            f"Pinned host memory allocation of {n_bytes / (1024**3):.1f} GiB "
+            f"({n_bytes} bytes) returned a null pointer"
+        )
     return buffer
 
 
@@ -327,6 +559,6 @@ ALLOC_MEMORY_FUNCS = defaultdict(
     {
         "npu": alloc_with_pin_memory,
         "musa": alloc_with_pin_memory,
-        "xpu": alloc_with_pin_memory,
+        "xpu": alloc_with_pin_memory_xpu,
     },
 )

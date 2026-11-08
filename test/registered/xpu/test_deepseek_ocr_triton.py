@@ -8,7 +8,7 @@ from pathlib import Path
 
 from test_deepseek_ocr import TestDeepSeekOCR
 
-from sglang.srt.utils.hf_transformers import get_tokenizer
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -18,7 +18,12 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(
     est_time=360,
-    suite="nightly-xpu-1-gpu",
+    suite="nightly-xpu-kernel-main-1-gpu",
+    nightly=True,
+)
+register_xpu_ci(
+    est_time=360,
+    suite="nightly-xpu-kernel-wheel-1-gpu",
     nightly=True,
 )
 
