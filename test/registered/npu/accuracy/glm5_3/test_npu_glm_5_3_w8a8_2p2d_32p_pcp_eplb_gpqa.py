@@ -131,7 +131,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     "--ep-num-redundant-experts",
     16,
     "--eplb-rebalance-num-iterations",
-    50,
+    10000,
     "--expert-distribution-recorder-buffer-size",
     50,
 ]
