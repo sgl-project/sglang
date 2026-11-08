@@ -329,7 +329,7 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
         and pool.kv_buffer is not None
         and pool.dcp_size == anchor.dcp_size
     ):
-        return  # DFLASH MLA draft holds this rank's rows, like the target
+        return
     raise NotImplementedError(
         f"HiCache L3 with DCP does not support the {entry.name} host pool "
         f"({type(pool).__name__})."
