@@ -878,11 +878,11 @@ impl RequestLogger {
         let obj = self.openai_dump(request, body);
         let max_length = self.config.max_length;
         let line = if self.config.json {
-            let obj = JsonObject::transformed(obj.iter(), max_length, &*NO_SKIP);
+            let obj = JsonObject::transformed(obj.iter(), max_length, &NO_SKIP);
             JsonLine::new("request.received.openai", obj, headers).render()
         } else {
             let mut line = String::from("Receive OpenAI: obj=");
-            write_dict(&mut line, obj.iter(), max_length, false, &*NO_SKIP, "");
+            write_dict(&mut line, obj.iter(), max_length, false, &NO_SKIP, "");
             write_headers(&mut line, headers);
             line
         };
@@ -955,7 +955,8 @@ impl RequestLogger {
         };
         let mut line = JsonLine::new(event, obj_fields, headers);
         line.rid = Some(obj.get("rid").unwrap_or(&Value::Null));
-        line.out = out.map(|out| JsonObject::transformed(out.iter(), max_length, &self.out_skip_names));
+        line.out =
+            out.map(|out| JsonObject::transformed(out.iter(), max_length, &self.out_skip_names));
         line.render()
     }
 
@@ -1649,7 +1650,7 @@ impl serde::Serialize for Transformed<'_> {
             }
             Value::Array(items) => {
                 let item = |item| {
-                    Transformed::new(item, max_length, self.in_watermark, &*NO_SKIP, String::new())
+                    Transformed::new(item, max_length, self.in_watermark, &NO_SKIP, String::new())
                 };
                 let mut seq = serializer.serialize_seq(None)?;
                 if items.len() > max_length {
