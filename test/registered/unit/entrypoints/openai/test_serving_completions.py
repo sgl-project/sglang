@@ -18,6 +18,7 @@ from fastapi import Request
 
 from sglang.srt.entrypoints.openai.protocol import CompletionRequest
 from sglang.srt.entrypoints.openai.serving_completions import OpenAIServingCompletion
+from sglang.srt.managers.io_struct import SubagentKeepaliveReqInput
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -106,6 +107,23 @@ class ServingCompletionTestCase(unittest.TestCase):
         internal, _ = self.sc._convert_to_internal_request(req)
         self.assertEqual(internal.cache_salt, "tenant-a")
         self.assertEqual(internal.extra_key, "classification")
+
+    def test_parent_session_id_reaches_keepalive_dispatch(self):
+        """OpenAI completion metadata must reach the scheduler control path."""
+        request = CompletionRequest(
+            model="x",
+            prompt="child turn",
+            parent_session_id="parent-session",
+        )
+        internal, _ = self.sc._convert_to_internal_request(request)
+        manager = Mock(spec=TokenizerManager)
+
+        with get_context().override_server_args(allow_subagent_keepalive=True):
+            TokenizerManager._maybe_send_subagent_keepalive(manager, internal)
+
+        keepalive = manager._dispatch_to_scheduler.call_args.args[0]
+        self.assertIsInstance(keepalive, SubagentKeepaliveReqInput)
+        self.assertEqual(keepalive.session_id, "parent-session")
 
     def test_single_request_rejects_batched_cache_salt(self):
         req = CompletionRequest(
