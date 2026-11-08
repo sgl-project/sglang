@@ -71,6 +71,29 @@ class TestInflightPromptCache(CustomTestCase):
             )
         )
 
+    def test_rollout_groups_release_independently(self):
+        """Completing one prompt must not unblock another in-flight group."""
+        cache = InflightPromptCache()
+        leaders = []
+        followers = []
+        for group in range(8):
+            tokens = [group, *range(63)]
+            leader = make_req(tokens=tokens)
+            cache.admit(leader, is_chunked=False)
+            group_followers = [make_req(tokens=tokens) for _ in range(15)]
+            self.assertTrue(all(cache.should_wait(req) for req in group_followers))
+            leaders.append(leader)
+            followers.append(group_followers)
+
+        for leader in leaders[:4]:
+            leader.prefix_len = len(leader.origin_input_ids)
+        cache.prune()
+
+        for group, group_followers in enumerate(followers):
+            self.assertTrue(
+                all(cache.should_wait(req) == (group >= 4) for req in group_followers)
+            )
+
     def test_aborted_leader_does_not_strand_followers(self):
         """A leader released without checkpoint must let the follower recompute."""
         cache = InflightPromptCache()
@@ -86,6 +109,7 @@ class TestInflightPromptCache(CustomTestCase):
         """Uncacheable or partial KV must not suppress a follower's prefill."""
         for leader, is_chunked in (
             (make_req(return_logprob=True), False),
+            (make_req(skip_radix_cache_insert=True), False),
             (make_req(multimodal_inputs=object()), False),
             (make_req(positional_embed_overrides=object()), False),
             (make_req(), True),
