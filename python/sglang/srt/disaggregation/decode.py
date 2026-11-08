@@ -100,6 +100,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     ReqList,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     is_war_barrier_enabled,
@@ -1763,6 +1764,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # Counted as published until extend(): a later allocation in this
                 # loop must not compact (move) pages the publish will read back.
                 self._num_published_destinations += 1
+                # A take of pages a forward may still use (freed while it ran)
+                # queued its wait for that forward on this stream first, so this
+                # event, and the readback the publish gates on it, follow it.
                 allocated = torch.cuda.Event()
                 allocated.record()
                 self._pending_publish.append(
@@ -3464,6 +3468,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
                 self._defer_release(decode_req)
                 deferred_indices.add(i)
             else:
+                # FIXME: without deferred release, a failed receive's device
+                # destination is released at once, with no proof that the
+                # remote writer stopped; a late write can land in reused pages.
                 self.scheduler.request_retirer.release(decode_req.req, checkpoint=False)
                 receiver = decode_req.kv_receiver
                 receiver.clear()
@@ -3562,6 +3569,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
 
     def resolve_deferred_releases(self) -> None:
         """Release drained transfers; device destinations may also time out."""
+        # FIXME: a device destination released at its deadline has no proof
+        # that the remote writer stopped. Its pages can then be handed out
+        # again while a late write still lands in them.
         if not self._deferred_releases:
             return
         now = time.monotonic()
@@ -3645,11 +3655,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
@@ -3677,6 +3687,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -3698,11 +3709,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
@@ -3754,6 +3765,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _flush_staging_scatters(self: Scheduler) -> None:
         handler = self.disagg_decode_transfer_queue.staging_handler

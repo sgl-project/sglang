@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -50,6 +51,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # The steps a lazily compacting unified pool's freed pages wait for.
+    forward_steps: Optional[ForwardSteps] = None
 
     @property
     def state_slots(self):

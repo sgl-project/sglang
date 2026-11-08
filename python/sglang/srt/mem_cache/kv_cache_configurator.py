@@ -21,6 +21,7 @@ from sglang.srt.configs.hybrid_arch import (
     mambaish_config,
 )
 from sglang.srt.configs.model_config import (
+    AttentionArch,
     ModelConfig,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
@@ -119,6 +120,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
     cpu_has_amx_support,
     get_available_gpu_memory,
@@ -374,6 +376,15 @@ def host_only_mamba_checkpoint() -> bool:
     return True
 
 
+def draft_loc_space_scale(*, hf_config, use_mla_backend: bool, dcp_size: int) -> int:
+    execution_width = (
+        mla_attention_dcp_size(hf_config, dcp_size=dcp_size, is_nextn=True)
+        if use_mla_backend
+        else 1
+    )
+    return dcp_size // execution_width
+
+
 @dataclass(slots=True, kw_only=True)
 class KVCacheConfigurator:
     device: str
@@ -403,6 +414,7 @@ class KVCacheConfigurator:
     memory_pool_config: Optional[MemoryPoolConfig]
     draft_parallel_layout: DraftParallelLayout | None = None
     dflash_draft_cell_size_per_token: int | None = field(init=False, default=None)
+    dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
@@ -418,6 +430,14 @@ class KVCacheConfigurator:
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
+
+    @property
+    def use_combined_kv_buffer(self) -> bool:
+        return (
+            get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
+            and self.spec_algorithm.is_dspark()
+            and not self.is_draft_worker
+        )
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -437,6 +457,13 @@ class KVCacheConfigurator:
                 draft_model_config=aux.draft_model_config,
                 draft_num_layers=aux.dflash_draft_num_layers,
                 attn_tp_size=self.draft_attn_tp_size,
+            )
+            self.dflash_draft_loc_space_scale = draft_loc_space_scale(
+                hf_config=aux.draft_model_config.hf_config,
+                use_mla_backend=(
+                    aux.draft_model_config.attention_arch == AttentionArch.MLA
+                ),
+                dcp_size=get_parallel().attn_dcp_size,
             )
         self.mambaish_config = mambaish_config(self.model_config)
         self.hybrid_gdn_config = hybrid_gdn_config(self.model_config)
@@ -610,17 +637,13 @@ class KVCacheConfigurator:
     # 2. A pool must page as its allocator does, or its last page falls short.
     @property
     def loc_space_scale(self) -> int:
-        dcp_size = get_parallel().attn_dcp_size
         if not self.is_draft_worker:
             return 1
-        execution_width = (
-            mla_attention_dcp_size(
-                self.model_config.hf_config, dcp_size=dcp_size, is_nextn=True
-            )
-            if self.use_mla_backend
-            else 1
+        return draft_loc_space_scale(
+            hf_config=self.model_config.hf_config,
+            use_mla_backend=self.use_mla_backend,
+            dcp_size=get_parallel().attn_dcp_size,
         )
-        return dcp_size // execution_width
 
     @property
     def pool_page_size(self) -> int:
@@ -2017,6 +2040,11 @@ class KVCacheConfigurator:
         if not self.is_draft_worker:
             # Fresh rows include beam slots and PD preallocation. Reused rows
             # retain their current history; retraction has its own replay reset.
+            # FIXME: the ring and request-window rows are reset on the schedule
+            # stream when a row is reused, while the forward of the row's
+            # previous request may still read or write them (the write-after-read
+            # barrier orders only shared reads). Order the reset after that
+            # forward.
             def reset_request_rows(rows):
                 if token_to_kv_pool._unified_kv:
                     token_to_kv_pool.clear_c4_req_states(rows)
@@ -2173,6 +2201,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
@@ -2435,7 +2464,7 @@ class KVCacheConfigurator:
 
     def _build_minimax_sparse_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
         from sglang.srt.configs.model_config import (
-            uses_minimax_m3_nvfp4_native_stack,
+            uses_minimax_m3_packed_nvfp4_kv,
         )
         from sglang.srt.server_args import m3_fp8_attn_gemm_enabled
 
@@ -2454,7 +2483,10 @@ class KVCacheConfigurator:
                 parse_hisparse_config().host_to_device_ratio
             )
         pool_cls = MiniMaxSparseKVPool
-        if uses_minimax_m3_nvfp4_native_stack(self.model_config.quantization):
+        if uses_minimax_m3_packed_nvfp4_kv(
+            self.model_config.quantization,
+            speculative_algorithm=get_spec().speculative_algorithm,
+        ):
             from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
             pool_cls = MiniMaxM3Nvfp4KVPool
@@ -2535,6 +2567,8 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            if _is_npu:
+                extra_args["use_combined_kv_buffer"] = self.use_combined_kv_buffer
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(

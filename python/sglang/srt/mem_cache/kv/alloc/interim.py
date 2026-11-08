@@ -526,11 +526,12 @@ class _TokenEndsPolicy(_WindowPolicy):
         )
         if not realization.flush_ends:
             return realization.fits
-        c.full_attn_allocator.flush_for_allocation()
-        c.swa_attn_allocator.flush_for_allocation()
-        return ends_fit(
-            _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
-        )
+        with c.settle_pending_for_recovery():
+            c.full_attn_allocator.flush_for_allocation()
+            c.swa_attn_allocator.flush_for_allocation()
+            return ends_fit(
+                _snapshot(c), ends, num_full_pages, num_swa_pages, compacted=False
+            )
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(window="joint")
@@ -756,6 +757,14 @@ class _FloatChainPolicy(_WindowPolicy):
             return False
         if c.can_reserve(full_tokens, swa_tokens):
             return True
+        with c.settle_pending_for_recovery():
+            return self._recover_capacity(c, full_tokens, swa_tokens)
+
+    def _recover_capacity(
+        self, c: ChainAllocator, full_tokens: int, swa_tokens: int
+    ) -> bool:
+        if c.can_reserve(full_tokens, swa_tokens):
+            return True
         if full_tokens != swa_tokens:
             for allocator in c._flush_targets():
                 allocator.flush_for_allocation()
@@ -846,8 +855,9 @@ class _FloatChainPolicy(_WindowPolicy):
         c.flush_deferred_full_frees()
         if target_size <= c.mamba_allocator.available_size():
             return
-        c.full_attn_allocator.flush_for_allocation()
-        relieve_for_alloc(c.mamba_allocator, target_size)
+        with c.settle_pending_for_recovery():
+            c.full_attn_allocator.flush_for_allocation()
+            relieve_for_alloc(c.mamba_allocator, target_size)
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         # State competes for the shared gap too; keep the split token admission
@@ -1108,34 +1118,35 @@ class _MultiWindowPolicy(_WindowPolicy):
             state_slots=state_slots,
         ):
             return True
-        for band in self.flush_targets(c):
-            band.flush_for_allocation()
-        if self.can_reserve(
-            c,
-            full_tokens,
-            swa_tokens,
-            auxiliary_swa_tokens=auxiliary_swa_tokens,
-            state_slots=state_slots,
-        ):
-            return True
-        demand = {
-            next(b for b in c.bands if b.sub_pool_name == name): n
-            for name, n in self._demands(
-                c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
-            )
-        }
-        for band in c.bands:
-            if isinstance(band, FloatBand):
-                _float_open_short_side(band, demand)
-                if self.can_reserve(
-                    c,
-                    full_tokens,
-                    swa_tokens,
-                    auxiliary_swa_tokens=auxiliary_swa_tokens,
-                    state_slots=state_slots,
-                ):
-                    return True
-        return False
+        with c.settle_pending_for_recovery():
+            for band in self.flush_targets(c):
+                band.flush_for_allocation()
+            if self.can_reserve(
+                c,
+                full_tokens,
+                swa_tokens,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            ):
+                return True
+            demand = {
+                next(b for b in c.bands if b.sub_pool_name == name): n
+                for name, n in self._demands(
+                    c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+                )
+            }
+            for band in c.bands:
+                if isinstance(band, FloatBand):
+                    _float_open_short_side(band, demand)
+                    if self.can_reserve(
+                        c,
+                        full_tokens,
+                        swa_tokens,
+                        auxiliary_swa_tokens=auxiliary_swa_tokens,
+                        state_slots=state_slots,
+                    ):
+                        return True
+            return False
 
     def flush_targets(self, c):
         return tuple(sorted(c.bands, key=lambda b: b.grow_direction != "float"))

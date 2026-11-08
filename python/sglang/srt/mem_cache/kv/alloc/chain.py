@@ -42,7 +42,9 @@ from sglang.srt.mem_cache.kv.alloc.band import (
     flush_deferred_free_group,
     full_tokens_before_mamba_recheck,
     relieve_for_alloc,
+    settle_pending_for_recovery,
 )
+from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
@@ -57,7 +59,6 @@ from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.invariants import expect, resolve_level
-from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
 
@@ -274,6 +275,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 self.mamba_allocator,
             )
             if b is not None
+        )
+        # A lazy chain hands a freed page out again from the schedule stream
+        # (zeroing, compaction), so its freed pages wait for the steps in flight.
+        self.forward_steps: Optional[ForwardSteps] = (
+            ForwardSteps(self.members) if lazy_compaction else None
         )
         by_name = {band.sub_pool_name: band for band in self.members}
         self.bands = tuple(by_name[band.name] for band in arena.bands)
@@ -521,7 +527,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         ):
             raise RuntimeError("the arena must be backed before allocator.resize")
         for band in self.members:
-            if band.allocated_count() or band._pending_reuse:
+            if (
+                band.allocated_count()
+                or band._pending_reuse
+                or band._pending_until_retire
+            ):
                 raise RuntimeError(
                     f"cannot resize non-empty band {band.sub_pool_name!r}"
                 )
@@ -801,6 +811,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     None if member is self.mamba_allocator else out_cache_loc_virtual,
                 )
 
+    def settle_pending_for_recovery(self, bands=None):
+        """The entry of an urgent recovery over ``bands`` (every member by
+        default): one host read ahead, then every pending page of those bands
+        settles (`band.py::settle_pending_for_recovery`)."""
+        return settle_pending_for_recovery(self.members if bands is None else bands)
+
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
@@ -933,6 +949,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 "live_page_count",
                 "_free_phys_pages",
                 "_free_phys_sorted",
+                "_pending_until_retire",
             ]
             if isinstance(band, FloatBand):
                 fields += ["low_wm_page", "high_wm_page", "_next_hole_end"]
@@ -1021,7 +1038,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    next_power_of_2(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
@@ -1185,7 +1201,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        next_power_of_2(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices
