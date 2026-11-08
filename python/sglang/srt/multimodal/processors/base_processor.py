@@ -33,6 +33,7 @@ from sglang.srt.multimodal.cache import (
 )
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
+    GPUImageDecodeMode,
     configure_media_url_security,
     load_audio,
     load_image,
@@ -232,7 +233,9 @@ def _forget_parent_executor_wakeups():
 
 class BaseMultimodalProcessor(ABC):
     models = []
-    gpu_image_decode = True  # Enable GPU decoding by default
+    # JPEG decode mode: True (nvJPEG), False (PIL) or "nvjpeg_fancy". None, the
+    # default, decodes on the GPU unless the PIL image processor is selected.
+    gpu_image_decode: Optional[GPUImageDecodeMode] = None
     smart_rgb_conversion = False
     video_preprocessing_device = None
     # Redo preprocessing on CPU when the GPU runs out of memory (the tokenizer
@@ -289,6 +292,10 @@ class BaseMultimodalProcessor(ABC):
         if get_mm().disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
+        if self.gpu_image_decode is None:
+            # The PIL image processor needs host images: a GPU decode would be
+            # copied straight back and leave a CUDA context in this process.
+            self.gpu_image_decode = not self.disable_fast_image_processor
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config
@@ -1008,19 +1015,25 @@ class BaseMultimodalProcessor(ABC):
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        gpu_image_decode: Optional[GPUImageDecodeMode] = None,
     ):
         """
         Load a single multimodal data.
 
         If data is processor_output or precomputed embedding, return directly.
 
-        Class method that can be pickled for multiprocessing
+        Class method that can be pickled for multiprocessing, so callers pass
+        the instance's resolved ``gpu_image_decode``.
         """
         if cls._is_preprocessed_input(data):
             return data
         try:
             if modality == Modality.IMAGE:
-                img, _ = load_image(data, cls.gpu_image_decode)
+                if gpu_image_decode is None:
+                    gpu_image_decode = (
+                        True if cls.gpu_image_decode is None else cls.gpu_image_decode
+                    )
+                img, _ = load_image(data, gpu_image_decode)
                 if isinstance(img, torch.Tensor):
                     return img  # JPEG already decoded on GPU by nvJPEG
                 # PIL decodes lazily; do it here in the io worker so the decode
@@ -1127,6 +1140,7 @@ class BaseMultimodalProcessor(ABC):
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
+                gpu_image_decode=self.gpu_image_decode,
             )
             futures.append((modality, idx, future))
 
@@ -1187,6 +1201,7 @@ class BaseMultimodalProcessor(ABC):
                         frame_count_limit,
                         audio_sample_rate,
                         discard_alpha_channel,
+                        gpu_image_decode=self.gpu_image_decode,
                     )
                 )
                 task_info.append((modality, data, frame_count_limit))

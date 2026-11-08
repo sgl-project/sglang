@@ -23,7 +23,7 @@ import torch
 from transformers.video_utils import VideoMetadata
 
 from sglang.srt.models.embedding_gemma2 import EmbeddingGemma2Model
-from sglang.srt.multimodal.media_io import load_audio
+from sglang.srt.multimodal.media_io import GPUImageDecodeMode, load_audio
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
@@ -119,6 +119,7 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
         frame_count_limit: int | None = None,
         audio_sample_rate: int | None = None,
         discard_alpha_channel: bool = True,
+        gpu_image_decode: GPUImageDecodeMode | None = None,
     ) -> Any:
         if modality == Modality.AUDIO:
             return _load_audio_from_memory(data, sr=audio_sample_rate, mono=True)
@@ -128,6 +129,7 @@ class EmbeddingGemma2SGLangProcessor(Gemma4SGLangProcessor):
             frame_count_limit=frame_count_limit,
             audio_sample_rate=audio_sample_rate,
             discard_alpha_channel=discard_alpha_channel,
+            gpu_image_decode=gpu_image_decode,
         )
 
     async def load_mm_data(  # type: ignore[override]
