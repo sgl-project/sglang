@@ -9,6 +9,7 @@ Covers:
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import torch
@@ -24,6 +25,7 @@ from sglang.srt.managers.tokenizer_manager_score_mixin import (
     TokenizerManagerScoreMixin,
 )
 from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -93,6 +95,49 @@ class TestValidatePositionalEmbedOverrides(CustomTestCase):
             with self.subTest(bogus=bogus):
                 with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
                     self._validate(bogus)
+
+
+class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_generate_and_embedding_requests_reject_malformed_overrides(self):
+        manager = TokenizerManager.__new__(TokenizerManager)
+        manager.preferred_sampling_params = None
+        manager.sampling_params_class = SamplingParams
+        manager.tokenizer = None
+        manager.model_config = SimpleNamespace(
+            hidden_size=HIDDEN_DIM,
+            vocab_size=128,
+        )
+        manager.fake_bootstrap_room_counter = 0
+        manager.rid_to_state = {
+            "test-rid": SimpleNamespace(time_stats=MagicMock()),
+        }
+        malformed_overrides = {"embeds": [[1.0] * HIDDEN_DIM], "positions": [0]}
+        requests = (
+            GenerateReqInput(
+                input_ids=[1, 2],
+                rid="test-rid",
+                sampling_params={},
+                positional_embed_overrides=malformed_overrides,
+            ),
+            EmbeddingReqInput(
+                input_ids=[1, 2],
+                rid="test-rid",
+                sampling_params={},
+                positional_embed_overrides=malformed_overrides,
+            ),
+        )
+
+        for request in requests:
+            with self.subTest(request_type=type(request).__name__):
+                with self.assertRaisesRegex(
+                    ValueError, "must be a PositionalEmbeds"
+                ):
+                    manager._create_tokenized_object(request, "hello", [1, 2])
 
 
 class TestPositionalEmbedsRankAndEmptiness(CustomTestCase):
