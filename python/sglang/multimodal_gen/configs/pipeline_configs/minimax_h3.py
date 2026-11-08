@@ -39,6 +39,10 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
     # generic TI2V image resize would both duplicate that work and overwrite
     # the already-resolved target canvas.
     skip_input_image_preprocess: bool = True
+    # How fl2va keyframes reach the target canvas: "stretch" resizes the first
+    # keyframe directly (followers cover-crop); "source_crop" center-crops
+    # every keyframe to the canvas aspect at source resolution, then resizes.
+    keyframe_fit: str = "stretch"
     native_only_components: tuple[str, ...] = (
         "text_encoder",
         "transformer",
@@ -444,6 +448,9 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
 @dataclass
 class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
     """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    # Pika's reference pipeline center-crops keyframes before resizing.
+    keyframe_fit: str = "source_crop"
 
     def validate_server_args(self, server_args) -> None:
         # A BF16 merge rounds away about a third of the adapters' update (by

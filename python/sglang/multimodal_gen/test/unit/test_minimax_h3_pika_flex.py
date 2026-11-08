@@ -181,3 +181,28 @@ def test_release_adapter_defaults_to_dynamic_lora(monkeypatch) -> None:
     explicit = server_args(True, "merge")
     PikaH3FlexPipelineConfig().validate_server_args(explicit)
     assert explicit.lora_merge_mode == "merge"
+
+
+def test_keyframes_center_crop_before_resize() -> None:
+    from PIL import Image
+
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        MiniMaxH3PipelineConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.canvas import (
+        minimax_h3_center_crop_keyframe_canvas,
+    )
+
+    assert PikaH3FlexPipelineConfig().keyframe_fit == "source_crop"
+    assert MiniMaxH3PipelineConfig().keyframe_fit == "stretch"
+    # 4:3 source onto a 16:9 canvas: crop 400x225 from the middle, then resize.
+    source = Image.new("RGB", (400, 300), (255, 0, 0))
+    source.paste((0, 0, 255), (0, 37, 400, 263))
+    out = minimax_h3_center_crop_keyframe_canvas(
+        source, target_width=160, target_height=90
+    )
+    assert out.size == (160, 90)
+    expected = source.crop((0, 37, 400, 262)).resize(
+        (160, 90), Image.Resampling.LANCZOS
+    )
+    assert out.tobytes() == expected.tobytes()
