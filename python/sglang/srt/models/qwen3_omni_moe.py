@@ -39,6 +39,9 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.rotary_embedding.mrope_rope_index import (
+    _get_feat_extract_output_lengths,
+)
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.model_loader.weight_utils import default_weight_loader
@@ -183,19 +186,6 @@ class SinusoidsPositionEmbedding(nn.Module):
 
     def forward(self, seqlen: int):
         return self.positional_embedding[:seqlen, :]
-
-
-def _get_feat_extract_output_lengths(input_lengths):
-    """
-    Computes the output length of the convolutional layers and the output length of the audio encoder
-    """
-
-    input_lengths_leave = input_lengths % 100
-    feat_lengths = (input_lengths_leave - 1) // 2 + 1
-    output_lengths = (
-        ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
-    )
-    return output_lengths
 
 
 class Qwen3OmniMoeAudioEncoder(PreTrainedModel):

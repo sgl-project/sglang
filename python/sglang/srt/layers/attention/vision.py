@@ -3,7 +3,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import math
-import warnings
 from functools import lru_cache, partial
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -1178,13 +1177,6 @@ class VisionAttention(nn.Module):
         **kwargs,
     ):
         super().__init__()
-        if head_dim is None and "head_size" in kwargs:
-            head_dim = kwargs.pop("head_size")
-            warnings.warn(
-                "VisionAttention(head_size=...) is deprecated; use head_dim=...",
-                DeprecationWarning,
-                stacklevel=2,
-            )
         self.tp_size = 1 if use_data_parallel else get_parallel().attn_tp_size
         self.tp_rank = 0 if use_data_parallel else get_parallel().attn_tp_rank
         self.dropout = dropout
