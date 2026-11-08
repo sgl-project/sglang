@@ -1564,6 +1564,8 @@ def setup_state_kv_args(
     storage: KVStorage | StaticKVStorage,
     draft_token_to_kv_pool=None,
     total_kv_layers: Optional[int] = None,
+    *,
+    mamba_pool=None,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout."""
@@ -1571,6 +1573,8 @@ def setup_state_kv_args(
     from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 
+    kv_args.state_cp_size = mamba_pool.cp_size if mamba_pool is not None else 1
+    kv_args.state_cp_rank = getattr(mamba_pool, "cp_rank", 0)
     kv_args.state_types = []
     kv_args.state_data_ptrs = []
     kv_args.state_data_lens = []

@@ -8,6 +8,7 @@ register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -99,6 +100,52 @@ def _build_unified_chain(cap, length=3):
 
 
 class TestMambaPathStateCap(unittest.TestCase):
+    def test_optional_cp_snapshots_use_spare_slots_without_tree_internals(self):
+        for available, expected in ((2, []), (3, []), (4, [192]), (8, [64, 128, 192])):
+            with self.subTest(available=available):
+                allocator = mock.Mock()
+                allocator.available_size.return_value = available
+                allocator.alloc.side_effect = lambda count: torch.arange(1, count + 1)
+                component = object.__new__(MambaComponent)
+                component.cache = SimpleNamespace(
+                    disable=False,
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_allocator=allocator, mamba_ckpt_pool=None
+                    ),
+                )
+                storage = SimpleNamespace(
+                    quantizes_checkpoints=lambda _: False,
+                    available_units=lambda _: allocator.available_size(),
+                    take_state_slots=lambda _, count: allocator.alloc(count),
+                )
+                component._state = lambda: (storage, "state")
+                component.tree_core = object()
+                req = SimpleNamespace(
+                    kv=SimpleNamespace(mamba_pending_checkpoints=[]),
+                    skip_radix_cache_insert=False,
+                )
+                component.prepare_mamba_checkpoints(
+                    req, [64, 128, 192], reserve_slots=3
+                )
+                self.assertEqual(
+                    [position for position, _ in req.kv.mamba_pending_checkpoints],
+                    expected,
+                )
+                if expected:
+                    allocator.alloc.assert_called_once_with(len(expected))
+                else:
+                    allocator.alloc.assert_not_called()
+
+    def test_cp_snapshots_respect_request_cache_bypass(self):
+        component = object.__new__(MambaComponent)
+        component.cache = SimpleNamespace(disable=False)
+        req = SimpleNamespace(
+            kv=SimpleNamespace(mamba_pending_checkpoints=[]),
+            skip_radix_cache_insert=True,
+        )
+        component.prepare_mamba_checkpoints(req, [8192], reserve_slots=3)
+        self.assertEqual(req.kv.mamba_pending_checkpoints, [])
+
     def test_server_arg_rejects_zero_and_values_below_negative_one(self):
         for value in (0, -2):
             args = ServerArgs(model_path="dummy", mamba_max_states_per_path=value)

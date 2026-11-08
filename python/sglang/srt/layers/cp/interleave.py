@@ -221,8 +221,10 @@ class InterleaveCPStrategy(ContextParallelStrategy):
 
     def shard_position_ids(self, positions: Any, forward_batch) -> Any:
         metadata = forward_batch.attn_cp_metadata
-        local_positions = self._interleave_shard(positions[: metadata.total_seq_lens])
-        return pad_local_rows(local_positions, metadata, dim=0)
+        local_positions = positions[
+            ..., self.cp_rank : metadata.total_seq_lens : self.cp_size
+        ].contiguous()
+        return pad_local_rows(local_positions, metadata, dim=-1)
 
     def _interleave_shard(self, input_: Any) -> Any:
         cp_size = self.cp_size

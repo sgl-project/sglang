@@ -1,5 +1,5 @@
 """
-GPU Staging Buffer for heterogeneous TP KV cache transfer.
+GPU staging buffer for CP and heterogeneous TP KV cache transfer.
 
 When prefill attn_tp_size != decode attn_tp_size, the per-token RDMA approach
 generates O(tokens * layers) small RDMA requests. This module provides a staging
@@ -14,6 +14,9 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from functools import cache
+from itertools import accumulate
 from typing import List, Optional, Tuple
 
 import torch
@@ -22,6 +25,7 @@ import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import compute_kv_head_overlap
 from sglang.srt.utils import create_device_stream, device_stream_context
 
 logger = logging.getLogger(__name__)
@@ -733,8 +737,30 @@ def gather_all_layers_to_staging(
     Dispatches to Triton fused kernel when available, falls back to torch.gather.
     """
     _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer.device)
-    if _USE_TRITON_STAGING:
-        return _gather_all_layers_triton(
+    buffers = k_buffers + v_buffers
+    head_bytes = get_kv_bytes_per_head(buffers)
+    if (
+        page_size <= 0
+        or num_heads <= 0
+        or src_head_start < 0
+        or src_head_start + num_heads > buffers[0].shape[1]
+    ):
+        raise ValueError("Invalid staging gather geometry")
+    tokens = len(page_indices_np) * page_size
+    offsets = compute_staging_entry_byte_offsets(
+        [num_heads * b for b in head_bytes], tokens
+    )
+    if not staging_buffer.fits(offsets[-1]):
+        raise ValueError("Staging gather exceeds allocation")
+    if not tokens:
+        return 0
+    if len({(b.dtype, b.shape[1:]) for b in buffers}) == 1:
+        gather = (
+            _gather_all_layers_triton
+            if _USE_TRITON_STAGING
+            else _gather_all_layers_torch
+        )
+        return gather(
             k_buffers,
             v_buffers,
             page_indices_np,
@@ -743,15 +769,67 @@ def gather_all_layers_to_staging(
             num_heads,
             page_size,
         )
-    return _gather_all_layers_torch(
-        k_buffers,
-        v_buffers,
-        page_indices_np,
-        staging_buffer,
-        src_head_start,
-        num_heads,
-        page_size,
-    )
+    # CUDA's current device is thread-local. Transfer workers must bind the KV
+    # owner before StreamContext captures the stream it will restore on exit.
+    staging_buffer.device_module.set_device(buffers[0].device.index)
+    stream = staging_buffer.get_gather_stream()
+    # Source KV completion is owned by the transfer worker, not the scheduler.
+    stream.wait_stream(staging_buffer.producer_stream())
+    with device_stream_context(stream):
+        idx = torch.as_tensor(
+            page_indices_np, device=buffers[0].device, dtype=torch.int64
+        )
+        if _USE_TRITON_STAGING:
+            import triton
+
+            ptrs = torch.tensor(
+                [b.data_ptr() for b in buffers], device=idx.device, dtype=torch.int64
+            )
+            meta = torch.tensor(
+                [
+                    [
+                        offsets[i],
+                        num_heads * hb,
+                        buf.stride(0) * buf.element_size(),
+                        src_head_start * hb,
+                        1,
+                    ]
+                    for i, (buf, hb) in enumerate(zip(buffers, head_bytes))
+                ],
+                device=idx.device,
+                dtype=torch.int64,
+            )
+            _get_kv_rearrange_kernel()[
+                (len(buffers), triton.cdiv(tokens * num_heads * max(head_bytes), 1024))
+            ](
+                ptrs,
+                meta,
+                idx,
+                staging_buffer.buffer,
+                None,
+                len(buffers),
+                page_size,
+                1,
+                tokens,
+                False,
+                False,
+                1024,
+            )
+        else:
+            rows = (
+                idx[:, None] * page_size + torch.arange(page_size, device=idx.device)
+            ).flatten()
+            for i, buf in enumerate(buffers):
+                # View bytes before indexing: Torch lacks float8 index kernels.
+                value = buf.view(torch.uint8)[
+                    rows, src_head_start : src_head_start + num_heads, :
+                ]
+                staging_buffer.buffer[offsets[i] : offsets[i + 1]].copy_(
+                    value.reshape(-1)
+                )
+    # RDMA consumes the packed allocation on the host transfer worker.
+    stream.synchronize()
+    return offsets[-1]
 
 
 def _scatter_staging_to_kv_torch(
@@ -917,11 +995,31 @@ def scatter_staging_to_kv(
     decode_attn_tp_size: int,
     dst_tp_rank: int,
     total_kv_heads: int,
+    cp_size: int = 1,
+    writer_slot_mask: Optional[torch.Tensor] = None,
 ) -> None:
     """Scatter data from a contiguous staging region into KV cache buffers."""
     _check_kv_on_staging_device(k_buffers, v_buffers, staging_buffer_view.device)
-    if _USE_TRITON_STAGING:
-        return _scatter_staging_to_kv_triton(
+    buffers = k_buffers + v_buffers
+    head_bytes = get_kv_bytes_per_head(buffers)
+    if (
+        cp_size < 1
+        or page_size % cp_size
+        or (cp_size > 1 and prefill_attn_tp_size != 1)
+    ):
+        raise ValueError("Invalid CP staging scatter geometry")
+    if (
+        cp_size == 1
+        and writer_slot_mask is None
+        and prefill_attn_tp_size <= total_kv_heads
+        and len({(b.dtype, b.shape[1:]) for b in buffers}) == 1
+    ):
+        scatter = (
+            _scatter_staging_to_kv_triton
+            if _USE_TRITON_STAGING
+            else _scatter_staging_to_kv_torch
+        )
+        return scatter(
             staging_buffer_view,
             k_buffers,
             v_buffers,
@@ -932,53 +1030,105 @@ def scatter_staging_to_kv(
             dst_tp_rank,
             total_kv_heads,
         )
-    return _scatter_staging_to_kv_torch(
-        staging_buffer_view,
-        k_buffers,
-        v_buffers,
-        page_idx_tensor,
-        page_size,
-        prefill_attn_tp_size,
-        decode_attn_tp_size,
-        dst_tp_rank,
-        total_kv_heads,
+    local_page = page_size // cp_size
+    tokens = page_idx_tensor.numel() * local_page
+    writers = (
+        cp_size if cp_size > 1 else max(1, prefill_attn_tp_size // decode_attn_tp_size)
     )
+    if writer_slot_mask is not None and writer_slot_mask.shape != (
+        writers,
+        len(buffers),
+    ):
+        raise ValueError("Staging writer/slot completion mask has the wrong shape")
+    if not tokens:
+        return
+    meta, base, max_width = [], 0, 0
+    for writer in range(writers):
+        # Packed writer IDs are local to this receiver. Convert to the
+        # attention-TP rank before intersecting its global KV-head range.
+        src_rank = (
+            (dst_tp_rank % decode_attn_tp_size)
+            * (prefill_attn_tp_size // decode_attn_tp_size)
+            + writer
+            if prefill_attn_tp_size > decode_attn_tp_size
+            else (dst_tp_rank % decode_attn_tp_size)
+            // (decode_attn_tp_size // prefill_attn_tp_size)
+        )
+        _, heads, start = compute_kv_head_overlap(
+            prefill_attn_tp_size,
+            decode_attn_tp_size,
+            src_rank,
+            dst_tp_rank,
+            total_kv_heads,
+        )
+        if start + heads > buffers[0].shape[1]:
+            raise ValueError("Staging head slice exceeds destination")
+        offsets = compute_staging_entry_byte_offsets(
+            [heads * hb for hb in head_bytes], tokens
+        )
+        # Replicated source GQA heads have multiple completion senders, but
+        # only one may write a destination row (avoid GPU write/write races).
+        replicas = max(1, prefill_attn_tp_size // total_kv_heads)
+        enabled = cp_size > 1 or writer % replicas == 0
+        for i, (buf, hb) in enumerate(zip(buffers, head_bytes)):
+            meta.append(
+                [
+                    base + offsets[i],
+                    heads * hb,
+                    buf.stride(0) * buf.element_size(),
+                    start * hb,
+                    int(enabled),
+                ]
+            )
+            max_width = max(max_width, heads * hb)
+        base += offsets[-1]
+    if base > staging_buffer_view.numel():
+        raise ValueError("Staging scatter exceeds allocation")
+    if _USE_TRITON_STAGING:
+        import triton
 
-
-def compute_head_slice_params(
-    src_attn_tp_size: int,
-    dst_attn_tp_size: int,
-    src_tp_rank: int,
-    dst_tp_rank: int,
-    total_kv_heads: int,
-) -> Tuple[int, int, int, int]:
-    """Compute head slicing parameters for heterogeneous TP transfer.
-
-    Returns:
-        (src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send)
-    """
-    src_heads_per_rank = max(1, total_kv_heads // src_attn_tp_size)
-    dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
-
-    local_tp_rank = src_tp_rank % src_attn_tp_size
-    dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
-
-    if src_attn_tp_size > dst_attn_tp_size:
-        src_head_start = 0
-        num_heads_to_send = src_heads_per_rank
-        src_replication = max(1, src_attn_tp_size // total_kv_heads)
-        unique_head_idx = local_tp_rank // src_replication
-        dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
+        ptrs = torch.tensor(
+            [b.data_ptr() for b in buffers],
+            device=page_idx_tensor.device,
+            dtype=torch.int64,
+        )
+        metadata = torch.tensor(meta, device=page_idx_tensor.device, dtype=torch.int64)
+        _get_kv_rearrange_kernel()[(len(meta), triton.cdiv(tokens * max_width, 1024))](
+            ptrs,
+            metadata,
+            page_idx_tensor,
+            staging_buffer_view,
+            writer_slot_mask,
+            len(buffers),
+            local_page,
+            cp_size,
+            tokens,
+            True,
+            writer_slot_mask is not None,
+            1024,
+        )
     else:
-        # GQA replication: consecutive decode ranks share a KV head
-        # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
-        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
-        unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
-        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
-        num_heads_to_send = dst_heads_per_rank
-        dst_head_start = 0
-
-    return src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send
+        for task, (offset, width, stride, head, enabled) in enumerate(meta):
+            if not enabled:
+                continue
+            writer, slot = divmod(task, len(buffers))
+            rows = (
+                page_idx_tensor[:, None] * page_size
+                + torch.arange(local_page, device=page_idx_tensor.device) * cp_size
+                + (writer if cp_size > 1 else 0)
+            ).flatten()
+            dst = buffers[slot].view(torch.uint8).reshape(-1, stride)
+            value = staging_buffer_view[offset : offset + tokens * width].reshape(
+                tokens, width
+            )
+            # where keeps masked slots untouched without a device->host wait.
+            if writer_slot_mask is not None:
+                value = torch.where(
+                    writer_slot_mask[writer, slot],
+                    value,
+                    dst[rows, head : head + width],
+                )
+            dst[rows, head : head + width] = value
 
 
 def compute_staging_layout(
@@ -989,6 +1139,8 @@ def compute_staging_layout(
     num_tokens: int,
     bytes_per_head_token: int,
     num_layers: int,
+    cp_size: int = 1,
+    slot_head_bytes: Optional[List[int]] = None,
 ) -> Tuple[int, List[int], int]:
     """Compute per-writer byte layout for a staging region.
 
@@ -996,21 +1148,36 @@ def compute_staging_layout(
         (num_writers, writer_bytes_list, total_bytes)
         where writer_bytes_list[i] = bytes for writer i covering all layers (K+V).
     """
+    byte_sum = (
+        sum(slot_head_bytes)
+        if slot_head_bytes is not None
+        else bytes_per_head_token * num_layers * 2
+    )
+    if byte_sum <= 0 or (
+        slot_head_bytes is not None
+        and (
+            len(slot_head_bytes) != num_layers * 2
+            or any(n <= 0 for n in slot_head_bytes)
+        )
+    ):
+        raise ValueError("Invalid staging slot byte metadata")
+    if cp_size > 1:
+        if src_attn_tp_size != 1 or num_tokens % cp_size:
+            raise ValueError(
+                "CP staging requires aligned tokens and prefill attention TP1"
+            )
+        num_heads = max(1, total_kv_heads // dst_attn_tp_size)
+        per_writer = (num_tokens // cp_size) * num_heads * byte_sum
+        return cp_size, [per_writer] * cp_size, per_writer * cp_size
     if src_attn_tp_size > dst_attn_tp_size:
         num_writers = src_attn_tp_size // max(1, dst_attn_tp_size)
     else:
         num_writers = 1
 
-    writer_bytes = []
-    for wr in range(num_writers):
-        _, nh, _, _ = compute_head_slice_params(
-            src_attn_tp_size,
-            dst_attn_tp_size,
-            wr,
-            dst_tp_rank,
-            total_kv_heads,
-        )
-        writer_bytes.append(num_tokens * nh * bytes_per_head_token * num_layers * 2)
+    # Every connected writer contributes the smaller local head shard. Rank
+    # offsets affect placement, not the size of the packed staging allocation.
+    num_heads = max(1, total_kv_heads // max(src_attn_tp_size, dst_attn_tp_size))
+    writer_bytes = [num_tokens * num_heads * byte_sum] * num_writers
     return num_writers, writer_bytes, sum(writer_bytes)
 
 
@@ -1056,3 +1223,223 @@ def compute_grid_segments(
     if not segments:
         segments = [(start_idx, end_idx)]
     return segments
+
+
+def build_staging_kv_entry_ids(num_layers, num_target_layers, start_layer=0):
+    """Identify [all K, all V] buffer entries independently of pointer order.
+
+    Target indices use the full-attention layer ordering across PP stages.
+    Draft indices live in a separate namespace and never alias target layers.
+    """
+    if not 0 < num_target_layers <= num_layers or start_layer < 0:
+        raise ValueError("Invalid target/draft staging layer counts")
+    layers = [("target", start_layer + i) for i in range(num_target_layers)]
+    layers += [("draft", i) for i in range(num_layers - num_target_layers)]
+    return [(model, kind, layer) for kind in ("k", "v") for model, layer in layers]
+
+
+def validate_staging_kv_entries(entry_ids, entry_page_bytes=None):
+    """Validate a version-1 staging layout before using any remote offsets."""
+    if not entry_ids or len(entry_ids) % 2:
+        raise ValueError("Staging layout requires paired K/V slots")
+    ids = []
+    for entry in entry_ids:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 3
+            or entry[0] not in ("target", "draft")
+            or entry[1] not in ("k", "v")
+            or type(entry[2]) is not int
+            or entry[2] < 0
+        ):
+            raise ValueError("Invalid staging entry identity")
+        ids.append(tuple(entry))
+    half = len(ids) // 2
+    if (
+        len(set(ids)) != len(ids)
+        or any(kind != "k" for _, kind, _ in ids[:half])
+        or ids[half:] != [(model, "v", layer) for model, _, layer in ids[:half]]
+    ):
+        raise ValueError("Staging slots must be unique and ordered [all K, all V]")
+    if entry_page_bytes is not None and (
+        len(entry_page_bytes) != len(ids)
+        or any(type(n) is not int or n <= 0 for n in entry_page_bytes)
+    ):
+        raise ValueError("Invalid per-entry staging byte strides")
+    return ids
+
+
+def map_src_to_dst_kv_entries(source_ids, destination_ids):
+    """Return (src_entry_index, dst_entry_index) pairs by model, K/V and layer.
+
+    These are buffer entries, not token slots. Receiver-only NEXTN entries
+    remain untouched.
+    """
+    source_ids = validate_staging_kv_entries(source_ids)
+    destination_ids = validate_staging_kv_entries(destination_ids)
+    destination = {slot: i for i, slot in enumerate(destination_ids)}
+    missing = [slot for slot in source_ids if slot not in destination]
+    if missing:
+        raise ValueError(f"Decode staging layout is missing source slots: {missing}")
+    return [(i, destination[slot]) for i, slot in enumerate(source_ids)]
+
+
+def compute_staging_entry_byte_offsets(entry_token_bytes, num_tokens):
+    """Prefix byte offsets of packed K/V entries, including the final end offset."""
+    if num_tokens < 0 or any(n <= 0 for n in entry_token_bytes):
+        raise ValueError("Invalid KV slot byte geometry")
+    return list(accumulate((num_tokens * n for n in entry_token_bytes), initial=0))
+
+
+def get_kv_bytes_per_head(buffers):
+    """Return bytes per head for each [token, head, dim] KV buffer."""
+    if not buffers:
+        raise ValueError("Empty KV staging buffer list")
+    for buf in buffers:
+        if buf.ndim != 3 or not buf.is_contiguous():
+            raise ValueError("Staging requires contiguous [token, head, dim] buffers")
+    if len({buf.shape[1] for buf in buffers}) != 1:
+        raise ValueError("KV entries must share the attention head partition")
+    return [buf.shape[2] * buf.element_size() for buf in buffers]
+
+
+@cache
+def _get_kv_rearrange_kernel():
+    import triton
+    import triton.language as tl
+
+    @triton.jit(
+        do_not_specialize=["TOKENS"],
+        do_not_specialize_on_alignment=["pages"],
+    )
+    def _rearrange_kv_cache_kernel(
+        ptrs,
+        metadata,
+        pages,
+        packed,
+        writer_mask,
+        NUM_SLOTS: tl.constexpr,
+        PAGE: tl.constexpr,
+        CP: tl.constexpr,
+        TOKENS,
+        SCATTER: tl.constexpr,
+        HAS_MASK: tl.constexpr,
+        BLOCK: tl.constexpr,
+    ):
+        task = tl.program_id(0)
+        slot = task % NUM_SLOTS
+        writer = task // NUM_SLOTS
+        ptr = tl.load(ptrs + slot).to(tl.pointer_type(tl.uint8))
+        # packed offset, token_slot bytes, pool stride, head offset, writer enabled
+        base = tl.load(metadata + task * 5)
+        width = tl.load(metadata + task * 5 + 1)
+        stride = tl.load(metadata + task * 5 + 2)
+        head = tl.load(metadata + task * 5 + 3)
+        enabled = tl.load(metadata + task * 5 + 4) != 0
+        x = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+        mask = (x < TOKENS * width) & enabled
+        if HAS_MASK:
+            mask = mask & tl.load(writer_mask + task)
+        token, byte = x // width, x % width
+        page = tl.load(pages + token // PAGE, mask=mask, other=0).to(tl.int64)
+        token_slot = page * PAGE + token % PAGE
+        if SCATTER:
+            token_slot = page * PAGE * CP + (token % PAGE) * CP
+            if CP > 1:
+                token_slot += writer
+        address = token_slot * stride + head + byte
+        if SCATTER:
+            value = tl.load(packed + base + x, mask=mask, other=0)
+            tl.store(ptr + address, value, mask=mask)
+        else:
+            value = tl.load(ptr + address, mask=mask, other=0)
+            tl.store(packed + base + x, value, mask=mask)
+
+    return _rearrange_kv_cache_kernel
+
+
+@cache
+def warmup_staging_kernels(*, device, num_slots, page_size, scatter):
+    """Compile and load legal source CP page geometries before serving requests.
+
+    Byte widths, head offsets and strides are already read from metadata. Only
+    slot count, page geometry and direction specialize the kernel. Decode may
+    receive any source CP divisor of its logical page size, so cover each one.
+    Mock tensor arguments compile without allocating or reading live KV state.
+    """
+    started = time.monotonic()
+    variants = 0
+    cp_sizes = (
+        [cp for cp in range(1, page_size + 1) if page_size % cp == 0]
+        if scatter
+        else [1]
+    )
+    with torch.cuda.device(device):
+        for cp_size in cp_sizes:
+            for index_dtype in (torch.int32, torch.int64):
+                for has_mask in (False, True) if scatter else (False,):
+                    compiled = _get_kv_rearrange_kernel().warmup(
+                        torch.int64,
+                        torch.int64,
+                        index_dtype,
+                        torch.uint8,
+                        torch.bool if has_mask else None,
+                        num_slots,
+                        page_size // cp_size,
+                        cp_size,
+                        1,
+                        scatter,
+                        has_mask,
+                        1024,
+                        grid=(num_slots * cp_size, 1),
+                    )
+                    # Triton warmup leaves module and launcher handles lazy.
+                    # Accessing run loads both without executing the kernel.
+                    _ = compiled.run
+                    variants += 1
+    logger.info(
+        "KV bulk kernel warmup complete: device=%s direction=%s slots=%d "
+        "logical_page=%d variants=%d dynamic_token_lengths=True elapsed=%.3fs",
+        device,
+        "scatter" if scatter else "gather",
+        num_slots,
+        page_size,
+        variants,
+        time.monotonic() - started,
+    )
+
+
+def compute_head_slice_params(
+    src_attn_tp_size: int,
+    dst_attn_tp_size: int,
+    src_tp_rank: int,
+    dst_tp_rank: int,
+    total_kv_heads: int,
+) -> Tuple[int, int, int, int]:
+    """Compute head slicing parameters for heterogeneous TP transfer.
+
+    Returns:
+        (src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send)
+    """
+    src_heads_per_rank = max(1, total_kv_heads // src_attn_tp_size)
+    dst_heads_per_rank = max(1, total_kv_heads // dst_attn_tp_size)
+
+    local_tp_rank = src_tp_rank % src_attn_tp_size
+    dst_tp_rank_in_group = dst_tp_rank % dst_attn_tp_size
+
+    if src_attn_tp_size > dst_attn_tp_size:
+        src_head_start = 0
+        num_heads_to_send = src_heads_per_rank
+        src_replication = max(1, src_attn_tp_size // total_kv_heads)
+        unique_head_idx = local_tp_rank // src_replication
+        dst_head_start = (unique_head_idx * src_heads_per_rank) % dst_heads_per_rank
+    else:
+        # GQA replication: consecutive decode ranks share a KV head
+        # (tp_rank // num_kv_head_replicas), so map by integer division not modulo.
+        dst_replication = max(1, dst_attn_tp_size // total_kv_heads)
+        unique_dst_head_idx = dst_tp_rank_in_group // dst_replication
+        src_head_start = (unique_dst_head_idx * dst_heads_per_rank) % src_heads_per_rank
+        num_heads_to_send = dst_heads_per_rank
+        dst_head_start = 0
+
+    return src_head_start, num_heads_to_send, dst_head_start, num_heads_to_send

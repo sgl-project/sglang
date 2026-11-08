@@ -159,3 +159,122 @@ class TransportExit:
 
     def _record(self, output):
         return self.stream.record(output, self.update)
+
+
+def launch_cp_residual_exchange(metadata):
+    """Submit at the model's compute window, before its output collective."""
+    if metadata.queued_residual is None:
+        return
+    destination, plan, residual, ready = metadata.queued_residual
+    pending = metadata.residual_exchange.submit(
+        plan, residual, ready=ready, restore_order=metadata.moe_tp
+    )
+    metadata.pending_residual = (destination, pending)
+    metadata.queued_residual = None
+
+
+def finish_sharded_cp_ffn(hidden_states, residual, *, forward_batch, update=None):
+    """Complete the TP sum while returning rows for the next hybrid layer."""
+    metadata = forward_batch.layer_cp_metadata
+    if metadata.queued_residual is not None:
+        raise RuntimeError("Deferred residual exchange missed its MoE compute window")
+    if metadata.moe_tp:
+        destination = metadata.mlp_destination
+        if destination is not None and destination != metadata.current:
+            hidden_states = metadata.moe_output_plans[
+                metadata.current, destination
+            ].apply(hidden_states)
+            metadata.current = destination
+        else:
+            hidden_states = metadata.token_collectives().reduce_scatter(
+                hidden_states, rank_ordered=True
+            )
+        forward_batch.num_token_non_padded = metadata.local_token_count(
+            hidden_states.shape[0]
+        )
+    if metadata.mapped_moe_output:
+        destination = metadata.mlp_destination
+        if (
+            metadata.pending_residual is None
+            or metadata.pending_residual[0] != destination
+        ):
+            raise RuntimeError("Mapped MoE output has no matching residual transfer")
+        pending = metadata.pending_residual[1]
+        if update is not None and not update.is_plain_add:
+            residual = update.rearrange_residual(residual, lambda _: pending.wait())
+        else:
+            residual = pending.wait()
+        metadata.pending_residual = None
+        metadata.current = destination
+        metadata.mapped_moe_output = False
+    if update is not None and update.applied_at_exit:
+        hidden_states = update.update(hidden_states, residual)
+        residual = None
+        if metadata.current == metadata.layout_names["attention"]:
+            from sglang.srt.layers.cp.padding import pad_local_rows
+
+            hidden_states = pad_local_rows(
+                hidden_states, forward_batch.attn_cp_metadata, dim=0
+            )
+    metadata.mlp_destination = None
+    return hidden_states, residual
+
+
+class ContiguousContextParallelTransport(ComputeTransport):
+    """Move only the attention operand; HC residuals retain their source rows."""
+
+    def __init__(self, hidden_states, batch, context, rows, overlapped):
+        from sglang.srt.layers.cp.utils import is_cp_active
+
+        self.rows = rows
+        self.metadata = batch.prefill_cp_metadata
+        self.source_rows = hidden_states.shape[0]
+        self.input = hidden_states
+        self.sharded = is_cp_active(batch)
+        if self.metadata is None:
+            if not batch.forward_mode.is_idle():
+                raise RuntimeError("GDN CP compute requires prepared batch metadata")
+            return
+        metadata = self.metadata
+        if self.sharded:
+            valid_rows = len(metadata.attention[metadata.rank])
+            self.input = metadata.route("attention", "contiguous")(
+                hidden_states[:valid_rows]
+            )
+        else:
+            plan = metadata.gather_scatter_plans[metadata.layout_names["contiguous"]]
+            indices = plan.reduce_indices.narrow(
+                0, metadata.rank * plan.padded_rows, plan.local_rows
+            )
+            self.input = hidden_states.index_select(0, indices)
+
+    def return_output(self, output):
+        if self.metadata is None:
+            return output
+        if self.sharded:
+            output = self.metadata.route("contiguous", "attention")(output)
+        else:
+            output = self.metadata.gather_scatter_plans[
+                self.metadata.layout_names["contiguous"]
+            ].gather(output)
+        if output.shape[0] < self.source_rows:
+            import torch.nn.functional as F
+
+            output = F.pad(output, (0, 0, 0, self.source_rows - output.shape[0]))
+        return output
+
+
+def contiguous_context_parallel_transport():
+    """Declare full-head attention on contiguous CP rows with source-row return."""
+    from sglang.srt.layers.layer_boundary.factories import _row_layouts
+
+    rows = {}
+    _, compute, _, _ = _row_layouts(BatchVariant.CONTEXT_PARALLEL)
+    for variant in (
+        BatchVariant.ORDINARY,
+        BatchVariant.CONTEXT_PARALLEL,
+        BatchVariant.UNPADDED,
+    ):
+        _, source, _, _ = _row_layouts(variant)
+        rows[variant] = TransportRows(source=source, compute=compute, returned=source)
+    return RowTransport(rows, ContiguousContextParallelTransport)

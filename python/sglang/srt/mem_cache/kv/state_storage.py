@@ -240,6 +240,9 @@ class StateStorage:
     ) -> None:
         """Gives back the request's state slot and its ping-pong slots, except
         the one kept for the radix cache."""
+        for _, slot in req.kv.mamba_pending_checkpoints:
+            self.slots.free(slot)
+        req.kv.mamba_pending_checkpoints = []
         mamba_index = req.kv.mamba_pool_idx
         assert mamba_index is not None, "double free? mamba_index is None"
         self.slots.free(mamba_index.unsqueeze(0))

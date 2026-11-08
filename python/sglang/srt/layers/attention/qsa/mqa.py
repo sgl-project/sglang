@@ -7,7 +7,8 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.utils.device import is_hip
+from sglang.srt.utils.common import is_hip
+from sglang.srt.utils.nvtx_pytorch_hooks import profile_method, profile_range
 
 try:
     import flashinfer.comm  # noqa: F401
@@ -150,7 +151,7 @@ if HAS_TILELANG:
         keys = T.dynamic("keys")
 
         @T.prim_func
-        def kernel(
+        def qsa_mqa_prefill_scores(
             Q: T.Tensor([rows * heads, head_dim], dtype),  # type: ignore
             K: T.Tensor([keys, head_dim], dtype),  # type: ignore
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
@@ -193,7 +194,7 @@ if HAS_TILELANG:
                             n, qi
                         ]
 
-        return kernel
+        return qsa_mqa_prefill_scores
 
     @tilelang.jit(
         pass_configs={
@@ -282,7 +283,7 @@ if HAS_TILELANG:
         keys = T.dynamic("keys")
 
         @T.prim_func
-        def kernel(
+        def qsa_mqa_mask_scores(
             Logits: T.Tensor([rows, keys], T.float32),  # type: ignore
             Starts: T.Tensor([rows], T.int32),  # type: ignore
             Ends: T.Tensor([rows], T.int32),  # type: ignore
@@ -295,7 +296,7 @@ if HAS_TILELANG:
                         if column < Starts[bx] or column >= Ends[bx]:
                             Logits[bx, column] = -T.infinity(T.float32)
 
-        return kernel
+        return qsa_mqa_mask_scores
 
     @tilelang.jit(
         pass_configs={
@@ -323,7 +324,7 @@ if HAS_TILELANG:
         max_model_len = T.dynamic("max_model_len")
 
         @T.prim_func
-        def kernel(
+        def qsa_mqa_decode_scores(
             Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
             KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
             PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
@@ -380,9 +381,10 @@ if HAS_TILELANG:
                                 if position < context_len:
                                     Logits[bx, position] = reduced[token] / Scale
 
-        return kernel
+        return qsa_mqa_decode_scores
 
 
+@profile_method("sglang.attention.qsa.mqa.prefill")
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -434,7 +436,8 @@ def tilelang_qsa_mqa_prefill(
     # contiguous, so do not copy this large matrix again when removing padding.
     logits = logits[:rows]
     logits.div_(score_scale or math.sqrt(head_dim))
-    _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
+    with profile_range("sglang.attention.qsa.mqa.mask"):
+        _tilelang_qsa_mqa_mask_kernel()(logits, starts[:rows], ends[:rows])
     return logits
 
 
@@ -554,6 +557,7 @@ def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
     return _DECODE_CTAS_PER_ROW_LEVELS[-1]
 
 
+@profile_method("sglang.attention.qsa.mqa.decode")
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -682,6 +686,17 @@ def qsa_mqa_decode(
     return torch_qsa_mqa_decode(
         q, k_cache, page_table, context_lens, max_model_len, score_scale
     )
+
+
+@functools.cache
+def warmup_qsa_mqa_prefill(*, device, dtype, heads, head_dim):
+    """Compile and load the enabled prefill scorer using independent scratch."""
+    rows = max(1, 128 // heads)
+    q = torch.zeros((rows, heads, head_dim), device=device, dtype=dtype)
+    k = torch.zeros((64, 1, head_dim), device=device, dtype=dtype)
+    starts = torch.zeros(rows, device=device, dtype=torch.int32)
+    ends = torch.full_like(starts, 64)
+    tilelang_qsa_mqa_prefill(q, k, starts, ends, rank_only=True)
 
 
 __all__ = [

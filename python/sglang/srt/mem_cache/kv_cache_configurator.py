@@ -41,6 +41,7 @@ from sglang.srt.configs.model_config import (
 )
 from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
+from sglang.srt.layers.cp.utils import is_gdn_cp_enabled, is_sharded_cp_enabled
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     get_kv_cache_quant_method,
     resolve_kv_cache_quant,
@@ -112,6 +113,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_schedule,
+    get_server_args,
     get_spec,
     mamba_cache_chunk_size,
     max_speculative_num_draft_tokens,
@@ -1616,6 +1618,11 @@ class KVCacheConfigurator:
     ) -> ReqToTokenPool:
         self._validate_replay_spec_algorithm()
         req_to_token_pool = HybridReqToTokenPool(
+            context_parallel_group=(
+                get_parallel().attn_cp_group.device_group
+                if is_gdn_cp_enabled()
+                else None
+            ),
             size=max_num_reqs,
             mamba_size=get_schedule().max_mamba_cache_size,
             mamba_spec_state_size=max_num_reqs,
@@ -2648,6 +2655,9 @@ class KVCacheConfigurator:
             )
         if qsa_profile is None:
             pool_class = HybridLinearKVPool
+            extra_args["full_attention_cp_size"] = (
+                get_parallel().attn_cp_size if is_sharded_cp_enabled() else 1
+            )
             extra_args["use_mla"] = self.use_mla_backend
         else:
             pool_class = QSATokenToKVPool
@@ -3519,6 +3529,13 @@ class KVCacheConfigurator:
                     ),
                 )
 
+        cp_size = get_parallel().attn_cp_size if is_gdn_cp_enabled() else 1
+        if cp_size > 1 and get_server_args().max_mamba_cache_size is None:
+            get_context().override(
+                "mamba_pool.cp_memory_budget",
+                max_mamba_cache_size=get_schedule().max_mamba_cache_size * cp_size,
+            )
+
         # Validate: max_mamba_cache_size must be positive after memory allocation.
         # A non-positive value means GPU memory is insufficient for the requested
         # configuration. Fail fast with actionable advice instead of silently
@@ -3537,7 +3554,8 @@ class KVCacheConfigurator:
 
         # +1 accounts for each pool's padding slot.
         mamba_state_memory = (
-            (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
+            ((get_schedule().max_mamba_cache_size + cp_size - 1) // cp_size + 1)
+            * (stage_per_req + extra_per_slot)
             + replayssm_fixed_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory

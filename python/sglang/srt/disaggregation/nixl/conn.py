@@ -3092,6 +3092,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         dst_state_dim_per_tensor = dst_state_dim_per_tensor or []
         dst_state_layer_ids = dst_state_layer_ids or []
 
+        if self.kv_args.state_cp_size > 1:
+            prefill_state_indices = [
+                self.local_mamba_state_indices(indices)
+                if st == StateType.MAMBA and indices
+                else indices
+                for st, indices in zip(state_types, prefill_state_indices)
+            ]
         plan = self._prepared_state_plans.get(peer_name)
         if plan is not None:
             yield from self._send_prepared_states(

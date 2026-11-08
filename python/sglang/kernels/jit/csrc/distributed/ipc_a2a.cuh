@@ -5,9 +5,57 @@
 
 #include <sgl_kernel/utils.cuh>
 
+#include <tvm/ffi/container/array.h>
+
 #include <cstdint>
+#include <cuda.h>
 
 namespace sglang::ipc_a2a {
+
+inline void check_driver(CUresult result) {
+  if (result != CUDA_SUCCESS) {
+    const char* name = nullptr;
+    cuGetErrorName(result, &name);
+    host::RuntimeCheck(false, "Peer copy submission failed: ", name ? name : "unknown");
+  }
+}
+
+// The caller retains every mapping until the consumer stream has completed.
+// Batch host submission only: payloads use CE and waits remain stream ordered.
+inline void copy_peer_strided(
+    const tvm::ffi::Array<int64_t>& signals,
+    const tvm::ffi::Array<int64_t>& copies,
+    int64_t stream_ptr,
+    int64_t generation) {
+  host::RuntimeCheck(signals.size() % 4 == 0 && copies.size() % 6 == 0, "Invalid peer copy commands");
+  auto stream = reinterpret_cast<CUstream>(stream_ptr);
+  const auto value = static_cast<uint32_t>(generation);
+  // Each peer supplies credit-write, credit-wait, arrival-write, arrival-wait.
+  for (size_t i = 0; i < signals.size(); i += 4) {
+    check_driver(cuStreamWriteValue32(stream, signals[i], value, 0));
+  }
+  for (size_t i = 0; i < signals.size(); i += 4) {
+    check_driver(cuStreamWaitValue32(stream, signals[i + 1], value, 0));
+  }
+  for (size_t i = 0; i < copies.size(); i += 6) {
+    CUDA_MEMCPY2D copy{};
+    copy.srcMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.dstMemoryType = CU_MEMORYTYPE_DEVICE;
+    copy.srcDevice = copies[i];
+    copy.dstDevice = copies[i + 1];
+    copy.WidthInBytes = copies[i + 2];
+    copy.Height = copies[i + 3];
+    copy.srcPitch = copies[i + 4];
+    copy.dstPitch = copies[i + 5];
+    check_driver(cuMemcpy2DAsync(&copy, stream));
+  }
+  for (size_t i = 0; i < signals.size(); i += 4) {
+    check_driver(cuStreamWriteValue32(stream, signals[i + 2], value, 0));
+  }
+  for (size_t i = 0; i < signals.size(); i += 4) {
+    check_driver(cuStreamWaitValue32(stream, signals[i + 3], value, 0));
+  }
+}
 
 __device__ __forceinline__ unsigned long long now_ns() {
   unsigned long long t;

@@ -37,6 +37,25 @@ def merge_state(
         _is_cuda
         and _supported_dtypes(prefix_output)
         and _supported_headdim(prefix_output)
+        and suffix_output.dtype == prefix_output.dtype
+        and (output is None or output.dtype == prefix_output.dtype)
+        and all(
+            tensor is None or tensor.is_contiguous()
+            for tensor in (
+                prefix_output,
+                prefix_lse,
+                suffix_output,
+                suffix_lse,
+                output,
+                output_lse,
+            )
+        )
+        # The vectorized AOT kernel cannot update its input LSE in place safely.
+        and (
+            output_lse is None
+            or output_lse.data_ptr()
+            not in (prefix_lse.data_ptr(), suffix_lse.data_ptr())
+        )
     ):
         return merge_state_v2(
             prefix_output, prefix_lse, suffix_output, suffix_lse, output, output_lse

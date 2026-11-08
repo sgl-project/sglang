@@ -66,6 +66,14 @@ def _layer():
 
 
 class TestFlashAttentionPagedMHA(unittest.TestCase):
+    def test_layout_metadata_does_not_bypass_fa3_capability_checks(self):
+        # QSA/GDN also carry a common token plan. Its presence must not select
+        # the physically sharded KV implementation on an ordinary FA backend.
+        backend = _backend()
+        batch = SimpleNamespace(prefill_cp_metadata=object())
+        with self.assertRaisesRegex(RuntimeError, "score_mod.*FA4"):
+            backend.forward_extend(None, None, None, None, batch, score_mod=object())
+
     def test_get_paged_mha_kv_cache_supports_head_groups(self):
         backend = _backend()
         backend.token_to_kv_pool = _pool_reading(

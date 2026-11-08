@@ -79,6 +79,41 @@ def test_hc_combine_correctness(dtype, num_tokens):
     torch.testing.assert_close(out, expected, **_TOLERANCES[dtype])
 
 
+@pytest.mark.parametrize("num_tokens", [1, 17, 127, 1025])
+def test_hc_combine_after_residual_rearrangement(num_tokens):
+    from sglang.srt.layers.hyperconnection import GroupedGemmaRMSNorm
+
+    block, residual, _, weight = _make_inputs(num_tokens, torch.bfloat16)
+    norm = GroupedGemmaRMSNorm(HC_COUNT * HIDDEN_SIZE, group_size=HIDDEN_SIZE).to(
+        device="cuda", dtype=torch.bfloat16
+    )
+    norm.weight.data.uniform_(-0.25, 0.25)
+    normalized = norm(residual)
+    expected = hc_combine(block, residual, normalized, weight, HC_COUNT, HIDDEN_SIZE)
+    # Moving whole residual rows must preserve their normalization and gates,
+    # including an uneven destination shard with a different row count.
+    for rank in range(2):
+        indices = torch.arange(rank, num_tokens, 2, device="cuda")
+        if indices.numel() == 0:
+            continue
+        moved = residual.index_select(0, indices)
+        recomputed = norm(moved)
+        torch.testing.assert_close(
+            recomputed, normalized.index_select(0, indices), rtol=0, atol=0
+        )
+        actual = hc_combine(
+            block.index_select(0, indices),
+            moved,
+            recomputed,
+            weight,
+            HC_COUNT,
+            HIDDEN_SIZE,
+        )
+        torch.testing.assert_close(
+            actual, expected.index_select(0, indices), rtol=0, atol=0
+        )
+
+
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
 def test_hc_combine_out_param(dtype):
     block_output, residual, normed_residual, inject_weight = _make_inputs(64, dtype)

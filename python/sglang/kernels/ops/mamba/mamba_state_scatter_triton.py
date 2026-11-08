@@ -942,3 +942,130 @@ def track_mamba_states_all_layers(
         ssm_states_pool[0, 0].numel(),
         check_freed_slots,
     )
+
+
+@triton.jit(do_not_specialize=["layer_offset", "src_indices", "dst_indices"])
+def _sharded_mamba_state_slots_kernel(
+    pool,
+    peers,
+    src_indices,
+    dst_indices,
+    values,
+    layer_offset,
+    pool_layer_stride: tl.constexpr,
+    pool_slot_stride: tl.constexpr,
+    value_layer_stride: tl.constexpr,
+    value_slot_stride: tl.constexpr,
+    elements: tl.constexpr,
+    rank: tl.constexpr,
+    world: tl.constexpr,
+    operation: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    request = tl.program_id(0)
+    layer = tl.program_id(1).to(tl.int64)
+    offset = tl.program_id(2).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+    mask = offset < elements
+    if operation != "gather":
+        dst = tl.load(dst_indices + request).to(tl.int64)
+        if dst <= 0 or (dst - 1) % world != rank:
+            return
+        dst_slot = (dst - 1) // world + 1
+        destination = (
+            pool
+            + (layer + layer_offset) * pool_layer_stride
+            + dst_slot * pool_slot_stride
+            + offset
+        )
+    else:
+        destination = (
+            values + layer * value_layer_stride + request * value_slot_stride + offset
+        )
+
+    if operation == "clear":
+        data = tl.full((BLOCK,), 0, pool.dtype.element_ty)
+    elif operation == "scatter":
+        source = (
+            values + layer * value_layer_stride + request * value_slot_stride + offset
+        )
+        data = tl.load(source, mask=mask, other=0)
+    else:
+        src = tl.load(src_indices + request).to(tl.int64)
+        owner = tl.maximum(src - 1, 0) % world
+        src_slot = tl.where(src > 0, (src - 1) // world + 1, 0)
+        peer = tl.load(peers + owner).to(tl.pointer_type(pool.dtype.element_ty))
+        source = (
+            peer
+            + (layer + layer_offset) * pool_layer_stride
+            + src_slot * pool_slot_stride
+            + offset
+        )
+        data = tl.load(source, mask=mask & (src > 0), other=0)
+    tl.store(destination, data, mask=mask)
+
+
+def transfer_sharded_mamba_state_slots(
+    pool: torch.Tensor,
+    peer_ptrs: torch.Tensor,
+    *,
+    operation: str,
+    rank: int,
+    world: int,
+    src_indices: torch.Tensor = None,
+    dst_indices: torch.Tensor = None,
+    values: torch.Tensor = None,
+    layer: int = None,
+):
+    """Gather/scatter logical state slots, or clear/COW their owning rank.
+
+    Slot zero is reserved. Positive logical slot i resides at
+    rank=(i-1)%world, local_slot=(i-1)//world+1. Indices stay on device.
+    The caller orders peer writes/reads through the pool's symmetric barrier.
+    """
+    if operation not in ("gather", "scatter", "copy", "clear"):
+        raise ValueError(f"Invalid Mamba slot operation: {operation}")
+    if not pool.is_cuda or not pool.is_contiguous() or not 0 <= rank < world:
+        raise ValueError("Sharded Mamba slots require contiguous CUDA storage")
+    indices = src_indices if operation == "gather" else dst_indices
+    if indices is None or indices.ndim != 1 or indices.device != pool.device:
+        raise ValueError("Mamba slot indices must be a vector on the pool device")
+    count = indices.numel()
+    layers = pool.shape[0] if layer is None else 1
+    if layer is not None and not 0 <= layer < pool.shape[0]:
+        raise ValueError("Mamba layer index exceeds the state pool")
+    if operation == "copy" and (
+        src_indices is None
+        or src_indices.shape != indices.shape
+        or src_indices.device != pool.device
+    ):
+        raise ValueError("Mamba COW requires paired source/destination slots")
+    if operation == "gather":
+        values = pool.new_empty((layers, count, *pool.shape[2:]))
+    if operation in ("gather", "scatter") and (
+        values is None
+        or values.shape != (layers, count, *pool.shape[2:])
+        or not values.is_contiguous()
+        or values.device != pool.device
+    ):
+        raise ValueError("Mamba slot payload does not match the selected layers/slots")
+    if not count or not layers:
+        return values
+    elements = pool.stride(1)
+    _sharded_mamba_state_slots_kernel[(count, layers, triton.cdiv(elements, 1024))](
+        pool,
+        peer_ptrs,
+        src_indices,
+        dst_indices,
+        values,
+        layer or 0,
+        pool.stride(0),
+        pool.stride(1),
+        values.stride(0) if values is not None else 0,
+        values.stride(1) if values is not None else 0,
+        elements,
+        rank,
+        world,
+        operation,
+        1024,
+    )
+    return values

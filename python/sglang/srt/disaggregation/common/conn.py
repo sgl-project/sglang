@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import logging
+import struct
 import threading
 import time
 from collections import defaultdict
@@ -129,6 +130,8 @@ class PrefillServerInfo:
     page_size: Optional[int]
     kv_cache_dtype: Optional[str]
     follow_bootstrap_room: bool
+    ring_cp_sharded: bool = False
+    state_cp_size: int = 1
     enable_dsa_cache_layer_split: bool = False
     dsv41_spec_layout: Optional[dict] = None
     spec_kv_layout: Optional[dict] = None
@@ -361,6 +364,9 @@ class CommonKVManager(BaseKVManager):
         self.attn_tp_rank = parallel.attn_tp_rank
         self.attn_cp_size = parallel.attn_cp_size
         self.attn_cp_rank = parallel.attn_cp_rank
+        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+        self.ring_cp_sharded = is_sharded_cp_enabled()
         # The TP width the transferred state is laid out over, which decode
         # pairs with: attention TP, or the TP group under CP-TP group sharing,
         # where the GDN heads are partitioned over it and QSA/PLE state is whole
@@ -392,9 +398,13 @@ class CommonKVManager(BaseKVManager):
         # CP-TP group sharing: CP rank r holds every KV head, the CP-replicated
         # state and linear-attention head shard r. It transfers as TP rank r of
         # a CP-1 prefill (see register_to_bootstrap), not as a CP replica.
-        cp_tp_group_sharing = parallel.enable_cp_tp_group_sharing
+        cp_tp_group_sharing = (
+            parallel.enable_cp_tp_group_sharing and self.kv_args.state_cp_size == 1
+        )
         self.enable_all_cp_ranks_for_transfer = not cp_tp_group_sharing and (
             envs.SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER.get()
+            or self.ring_cp_sharded
+            or self.kv_args.state_cp_size > 1
             or cp_sharded_prefill
             or hybrid_decode_pulls_all_ranks
             # No sharded rank holds a full page, so every CP rank sends.
@@ -530,10 +540,12 @@ class CommonKVManager(BaseKVManager):
         exception because each CP rank owns different state layers. Page-sharded
         DSA indexer state likewise needs every owner; Mooncake filters its page
         lists before transfer instead of suppressing whole ranks.
+        Sharded Mamba pools elect their sender by logical slot ownership instead.
         """
         return (
             self.attn_cp_size > 1
             and self.attn_cp_rank != 0
+            and self.kv_args.state_cp_size == 1
             and not get_parallel().enable_dsa_cache_layer_split
             and not get_parallel().enable_cp_tp_group_sharing
             and getattr(self, "kv_shard_size", 1) <= 1
@@ -859,6 +871,9 @@ class CommonKVManager(BaseKVManager):
         num_pages: int,
         writer_id: str,
         targets: List[Tuple[str, int]],
+        staged: bool = True,
+        writer_index: Optional[int] = None,
+        slot_indices: Optional[List[int]] = None,
     ) -> None:
         """Notify decode that a staging chunk RDMA is complete (every chunk;
         scatter is arrival-driven)."""
@@ -871,6 +886,15 @@ class CommonKVManager(BaseKVManager):
             writer_id.encode("ascii"),
             str(self._prefill_unique_rank()).encode("ascii"),
         ]
+        if writer_index is not None:
+            slots = slot_indices or []
+            parts.extend(
+                [
+                    b"1" if staged else b"0",
+                    str(writer_index).encode("ascii"),
+                    struct.pack(f"{len(slots)}I", *slots),
+                ]
+            )
         for endpoint, port in targets:
             na = NetworkAddress(endpoint, port)
             self._send_multipart_locked(na.to_tcp(), parts, is_ipv6=na.is_ipv6)
@@ -882,8 +906,17 @@ class CommonKVManager(BaseKVManager):
             room, chunk_idx, page_start, num_pages = (
                 int(part.decode("ascii")) for part in msg[1:5]
             )
-            writer_id = msg[5].decode("ascii")
-        except (IndexError, ValueError, UnicodeDecodeError):
+            writer_id = (
+                msg[6].decode("ascii") if len(msg) > 6 else msg[5].decode("ascii")
+            )
+            completion = {}
+            if len(msg) > 8:
+                completion = dict(
+                    staged=msg[7] == b"1",
+                    writer_index=int(msg[8]),
+                    slot_indices=list(struct.unpack(f"{len(msg[9]) // 4}I", msg[9])),
+                )
+        except (IndexError, ValueError, UnicodeDecodeError, struct.error):
             logger.warning("Dropping malformed CHUNK_READY message")
             return True
         if room not in self.request_status:
@@ -892,7 +925,9 @@ class CommonKVManager(BaseKVManager):
         if handler is None:
             logger.warning("CHUNK_READY for room %s without a staging handler", room)
             return True
-        handler.handle_chunk_arrived(room, chunk_idx, page_start, num_pages, writer_id)
+        handler.handle_chunk_arrived(
+            room, chunk_idx, page_start, num_pages, writer_id, **completion
+        )
         return True
 
     def conclude_transfer(
@@ -1563,6 +1598,8 @@ class CommonKVManager(BaseKVManager):
             target_cp_ranks = list(range(info.attn_cp_size))
             pull_from_all_cp_ranks = (
                 self.enable_all_cp_ranks_for_transfer
+                or info.ring_cp_sharded
+                or info.state_cp_size > 1
                 or info.enable_dsa_cache_layer_split
                 or info.enable_kv_cache_sharding
             )
@@ -1639,7 +1676,10 @@ class CommonKVManager(BaseKVManager):
         url = f"{bootstrap_na.to_url()}/route"
         attn_tp = (self.attn_tp_size, self.attn_tp_rank)
         attn_cp = (self.attn_cp_size, self.attn_cp_rank)
-        if get_parallel().enable_cp_tp_group_sharing:
+        if (
+            get_parallel().enable_cp_tp_group_sharing
+            and self.kv_args.state_cp_size == 1
+        ):
             # Decode pairs its TP rank r with this CP rank r (see __init__).
             attn_tp, attn_cp = attn_cp, (1, 0)
         payload = {
@@ -1656,6 +1696,8 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
+            "ring_cp_sharded": self.ring_cp_sharded,
+            "state_cp_size": self.kv_args.state_cp_size,
             "kv_cache_dtype": self.kv_cache_dtype_str,
             "kv_layout": self.kv_layout,
             "dsv41_spec_layout": self.dsv41_spec_layout,
@@ -2348,6 +2390,9 @@ class CommonKVSender(BaseKVSender):
                 return kv_indices, index_slice, is_last_chunk, True
         elif (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
+            # Physically sharded pages have a local slice on every CP rank.
+            # Filtering whole logical pages would omit writers and KV slices.
+            and not self.kv_mgr.ring_cp_sharded
             and not get_parallel().enable_dsa_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
@@ -2625,8 +2670,13 @@ class CommonKVReceiver(BaseKVReceiver):
 
         if self.kv_mgr.enable_staging:
             self.require_staging = (
-                self.prefill_info.attn_tp_size != 0
-                and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+                self.prefill_info.ring_cp_sharded
+                or get_disagg().disaggregation_require_bulk
+                or envs.SGLANG_DISAGG_REQUIRE_BULK.get()
+                or (
+                    self.prefill_info.attn_tp_size != 0
+                    and self.prefill_info.attn_tp_size != self.kv_mgr.attn_tp_size
+                )
             )
 
         self.prefill_dp_rank = prefill_dp_rank
@@ -3102,6 +3152,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.dsv41_spec_layout: Optional[dict] = None
         self.spec_kv_layout: Optional[dict] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.ring_cp_sharded: Optional[bool] = None
+        self.state_cp_size: Optional[int] = None
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
         self.stores_to_linker: Optional[bool] = None
@@ -3233,6 +3285,22 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
             )
             self.follow_bootstrap_room = load_balance_method == "follow_bootstrap_room"
 
+        state_cp_size = int(data.get("state_cp_size", 1))
+        if state_cp_size not in (1, attn_cp_size):
+            return web.json_response({"error": "Invalid state CP size"}, status=400)
+        if self.state_cp_size is None:
+            self.state_cp_size = state_cp_size
+        elif self.state_cp_size != state_cp_size:
+            return web.json_response(
+                {"error": "State ownership differs across prefill ranks"}, status=400
+            )
+        ring_cp = bool(data.get("ring_cp_sharded", False))
+        if self.ring_cp_sharded is None:
+            self.ring_cp_sharded = ring_cp
+        elif self.ring_cp_sharded != ring_cp:
+            return web.json_response(
+                {"error": "CP storage layout differs across prefill ranks"}, status=400
+            )
         if self.enable_dsa_cache_layer_split is None:
             self.enable_dsa_cache_layer_split = bool(
                 data.get("enable_dsa_cache_layer_split", False)
@@ -3312,6 +3380,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                     if self.follow_bootstrap_room is not None
                     else True
                 ),
+                ring_cp_sharded=bool(self.ring_cp_sharded),
+                state_cp_size=self.state_cp_size,
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 stores_to_linker=bool(self.stores_to_linker),
@@ -3319,6 +3389,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 decode_allocation_policy=self.decode_allocation_policy,
             )
             payload = dataclasses.asdict(info)
+            if info.state_cp_size == 1:
+                payload.pop("state_cp_size")
             if info.dsv41_spec_layout is None:
                 payload.pop("dsv41_spec_layout")
             if info.spec_kv_layout is None:

@@ -4,13 +4,19 @@ produce correct results when a/b inputs are non-contiguous,
 as happens with Qwen3.5-27B (v_per_group=3) via mixed_ba.split().
 """
 
+import itertools
 import unittest
 
 import torch
 
+from sglang.kernels.ops.attention import triton_gdn_fused_proj as fused_gdn_projection
+from sglang.kernels.ops.attention.fla import layernorm_gated
 from sglang.kernels.ops.attention.linear.fused_gdn_gating import fused_gdn_gating
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
+    warmup_gdn_projection_norm,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -250,6 +256,286 @@ class TestFusedSigmoidGatingKDAStride(unittest.TestCase):
             torch.allclose(ssm_test, ssm_ref, rtol=0, atol=0),
             f"KDA state mismatch: max diff = {(ssm_test - ssm_ref).abs().max().item()}",
         )
+
+
+def reference_norm(
+    x,
+    weight,
+    z=None,
+    *,
+    bias=None,
+    group_size=None,
+    before=True,
+    activation="swish",
+    is_rms_norm=True,
+    eps=1e-6,
+):
+    values = x.float()
+    gate = None
+    if z is not None:
+        gate = z.reshape_as(x).float()
+        gate = (
+            gate * torch.sigmoid(gate) if activation == "swish" else torch.sigmoid(gate)
+        )
+        if not before:
+            values = values * gate
+    grouped = values.reshape(values.shape[0], -1, group_size or values.shape[1])
+    if not is_rms_norm:
+        grouped = grouped - grouped.mean(-1, keepdim=True)
+    normalized = grouped * torch.rsqrt(grouped.square().mean(-1, keepdim=True) + eps)
+    output = normalized.reshape_as(values) * weight.float()
+    if bias is not None:
+        output = output + bias.float()
+    if gate is not None and before:
+        output = output * gate
+    return output.to(x.dtype)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "CUDA is required")
+class TestGDNProjectionViews(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.device = torch.device("cuda", torch.cuda.current_device())
+        cls.generator = torch.Generator(device=cls.device).manual_seed(397)
+
+    def random(self, *shape, dtype):
+        return torch.randn(
+            *shape, device=self.device, dtype=dtype, generator=self.generator
+        )
+
+    def check_oracle(self, actual, expected):
+        tolerance = (
+            dict(rtol=1e-2, atol=1.5625e-2)
+            if actual.dtype == torch.bfloat16
+            else dict(rtol=2e-3, atol=2e-3)
+        )
+        torch.testing.assert_close(actual, expected, **tolerance)
+
+    def test_00_warmup_covers_actual_projection_layout(self):
+        kernel = layernorm_gated._layer_norm_fwd_1pass_kernel
+        device_index = self.device.index
+        with torch.inference_mode():
+            for dtype, weight_dtype in (
+                (torch.bfloat16, torch.bfloat16),
+                (torch.bfloat16, torch.float32),
+                (torch.float16, torch.float16),
+                (torch.float16, torch.float32),
+            ):
+                self.assertTrue(
+                    warmup_gdn_projection_norm(
+                        device=self.device,
+                        dtype=dtype,
+                        weight_dtype=weight_dtype,
+                        num_heads_qk=16,
+                        num_heads_v=64,
+                        head_qk=128,
+                        head_v=128,
+                        eps=1e-6,
+                        group_size=None,
+                        norm_before_gate=True,
+                        activation="swish",
+                    )
+                )
+                variants = set(kernel.device_caches[device_index][0])
+                self.assertTrue(variants)
+                for tokens in (2, 3, 5, 17, 65, 4096):
+                    packed = torch.zeros(
+                        (tokens, 20480), device=self.device, dtype=dtype
+                    )
+                    z = packed[:, 12288:].view(tokens, 64, 128)
+                    x = torch.zeros((tokens * 64, 128), device=self.device, dtype=dtype)
+                    weight = torch.ones(128, device=self.device, dtype=weight_dtype)
+                    output = layernorm_gated.rms_norm_gated(
+                        x=x,
+                        weight=weight,
+                        bias=None,
+                        z=z,
+                        is_rms_norm=True,
+                    )
+                    torch.testing.assert_close(output, x, rtol=0, atol=0)
+                torch.cuda.synchronize(self.device)
+                self.assertEqual(variants, set(kernel.device_caches[device_index][0]))
+                for compiled in kernel.device_caches[device_index][0].values():
+                    self.assertIsNotNone(compiled.module)
+                    self.assertIsNotNone(compiled.function)
+                    self.assertTrue(callable(compiled._run))
+
+    def test_interleaved_projection_matches_torch_split(self):
+        with torch.inference_mode():
+            for dtype, tokens, geometry in itertools.product(
+                (torch.bfloat16, torch.float16),
+                (1, 17),
+                ((2, 4, 64, 128), (4, 16, 128, 64)),
+            ):
+                kh, vh, kd, vd = geometry
+                v_per_group = vh // kh
+                packed = self.random(tokens, 2 * kh * kd + 2 * vh * vd, dtype=dtype)
+                gates = self.random(tokens, 2 * vh, dtype=dtype)
+                q, k, v, z = packed.view(tokens, kh, -1).split(
+                    (kd, kd, v_per_group * vd, v_per_group * vd), dim=-1
+                )
+                b, a = gates.view(tokens, kh, 2 * v_per_group).chunk(2, dim=-1)
+                expected = (
+                    torch.cat([x.reshape(tokens, -1) for x in (q, k, v)], dim=-1),
+                    z.reshape(tokens, vh, vd),
+                    b.reshape(tokens, vh),
+                    a.reshape(tokens, vh),
+                )
+                actual = fused_gdn_projection.fused_qkvzba_split_reshape_cat(
+                    packed, gates, *geometry
+                )
+                for value, reference in zip(actual, expected):
+                    torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+    def test_projection_views_match_copy_helper(self):
+        count = 0
+        with torch.inference_mode():
+            for dtype, tokens, geometry, padding in itertools.product(
+                (torch.bfloat16, torch.float16),
+                (0, 1, 17),
+                (
+                    (2, 2, 64, 128),
+                    (2, 4, 128, 64),
+                    (8, 24, 128, 128),
+                    (16, 64, 128, 128),
+                ),
+                (0, 16),
+            ):
+                kh, vh, kd, vd = geometry
+                width = 2 * kh * kd + 2 * vh * vd
+                packed = self.random(tokens, width + padding, dtype=dtype)[:, :width]
+                gates = self.random(
+                    tokens, 2 * vh + padding, dtype=torch.float32 if padding else dtype
+                )[:, : 2 * vh]
+                saved_packed, saved_gates = packed.clone(), gates.clone()
+                actual = fused_gdn_projection.qwen3_5_gdn_prefill_projection_views(
+                    packed, gates, *geometry
+                )
+                if tokens:
+                    expected = (
+                        fused_gdn_projection.fused_qkvzba_split_reshape_cat_contiguous(
+                            packed.contiguous(), gates.contiguous(), *geometry
+                        )
+                    )
+                    for output, reference in zip(actual, expected):
+                        torch.testing.assert_close(output, reference, rtol=0, atol=0)
+                    for output in actual[:2]:
+                        self.assertEqual(
+                            output.untyped_storage().data_ptr(),
+                            packed.untyped_storage().data_ptr(),
+                        )
+                    for output in actual[2:]:
+                        self.assertEqual(
+                            output.untyped_storage().data_ptr(),
+                            gates.untyped_storage().data_ptr(),
+                        )
+                else:
+                    self.assertEqual(tuple(actual[1].shape), (0, vh, vd))
+                torch.testing.assert_close(packed, saved_packed, rtol=0, atol=0)
+                torch.testing.assert_close(gates, saved_gates, rtol=0, atol=0)
+                count += 1
+        self.assertEqual(count, 48)
+
+    def test_3d_z_matches_2d_and_torch(self):
+        count = 0
+        with torch.inference_mode():
+            for dtype, shape, before, activation, group in itertools.product(
+                (torch.bfloat16, torch.float16),
+                ((1, 4), (17, 4), (97, 3)),
+                (False, True),
+                ("swish", "sigmoid"),
+                (None, 64),
+            ):
+                tokens, heads = shape
+                with self.subTest(
+                    dtype=dtype,
+                    shape=shape,
+                    before=before,
+                    activation=activation,
+                    group=group,
+                ):
+                    packed = self.random(tokens, 256 + heads * 128, dtype=dtype)
+                    z = packed[:, 256:].view(tokens, heads, 128)
+                    x = self.random(tokens * heads, 128, dtype=dtype)
+                    weight = self.random(128, dtype=dtype if before else torch.float32)
+                    arguments = dict(
+                        x=x,
+                        weight=weight,
+                        bias=None,
+                        group_size=group,
+                        norm_before_gate=before,
+                        is_rms_norm=True,
+                        activation=activation,
+                    )
+                    expected = layernorm_gated.rms_norm_gated(
+                        z=z.reshape_as(x), **arguments
+                    )
+                    actual = layernorm_gated.rms_norm_gated(z=z, **arguments)
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                    self.check_oracle(
+                        actual,
+                        reference_norm(
+                            x,
+                            weight,
+                            z,
+                            group_size=group,
+                            before=before,
+                            activation=activation,
+                        ),
+                    )
+                    count += 1
+        self.assertEqual(count, 48)
+
+    def test_model_sized_norm(self):
+        with torch.inference_mode():
+            for dtype in (torch.bfloat16, torch.float16):
+                packed = self.random(4096, 20480, dtype=dtype)
+                z = packed[:, 12288:].view(4096, 64, 128)
+                x = self.random(4096 * 64, 128, dtype=dtype)
+                weight = self.random(128, dtype=dtype)
+                expected = layernorm_gated.rms_norm_gated(
+                    x=x, weight=weight, bias=None, z=z.reshape_as(x), is_rms_norm=True
+                )
+                actual = layernorm_gated.rms_norm_gated(
+                    x=x, weight=weight, bias=None, z=z, is_rms_norm=True
+                )
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_shared_2d_layernorm_bias_and_strides(self):
+        count = 0
+        with torch.inference_mode():
+            for dtype, has_gate, strided in itertools.product(
+                (torch.bfloat16, torch.float16), (False, True), (False, True)
+            ):
+                x = self.random(35, 256 if strided else 128, dtype=dtype)[:, :128]
+                z = self.random(35, 256, dtype=dtype)[:, :128] if has_gate else None
+                weight, bias = (self.random(128, dtype=torch.float32) for _ in range(2))
+                group = 64 if strided else None
+                saved_x, saved_z = x.clone(), z.clone() if z is not None else None
+                actual = layernorm_gated.rms_norm_gated(
+                    x=x, weight=weight, bias=bias, z=z, group_size=group
+                )
+                expected = reference_norm(
+                    x, weight, z, bias=bias, group_size=group, is_rms_norm=False
+                )
+                self.check_oracle(actual, expected)
+                torch.testing.assert_close(x, saved_x, rtol=0, atol=0)
+                if z is not None:
+                    torch.testing.assert_close(z, saved_z, rtol=0, atol=0)
+                count += 1
+        self.assertEqual(count, 8)
+
+    def test_backward_remains_unsupported(self):
+        for strided in (False, True):
+            packed = self.random(2, 20480, dtype=torch.bfloat16)
+            z = packed[:, 12288:].view(2, 64, 128)
+            x = self.random(128, 128, dtype=torch.bfloat16).requires_grad_()
+            weight = self.random(128, dtype=torch.bfloat16).requires_grad_()
+            output = layernorm_gated.layernorm_fn(
+                x, weight, None, z=z if strided else z.reshape_as(x), is_rms_norm=True
+            )
+            with self.assertRaisesRegex(NotImplementedError, "backward|vjp"):
+                output.float().sum().backward()
 
 
 if __name__ == "__main__":

@@ -366,6 +366,7 @@ def handle_encoder_disaggregation(server_args: Any):
         "Qwen3VLMoeForConditionalGeneration",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3_5MoeForConditionalGeneration",
+        "Qwen4ExpForConditionalGeneration",
         "InternS2PreviewForConditionalGeneration",
         "Qwen3OmniMoeForConditionalGeneration",
         "Qwen2AudioForConditionalGeneration",
@@ -382,7 +383,7 @@ def handle_encoder_disaggregation(server_args: Any):
     ]:
         raise ValueError(
             f"Model type {model_arch} is not supported for encoder disaggregation. "
-            f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, InternS2, "
+            f"Supported architectures: Qwen2VL, Qwen3VL, Qwen3.5, Qwen4Exp, InternS2, "
             f"Qwen2Audio, Qwen2.5Omni, Dots3-Note, Kimi, MiMoV2, GLM5Next, MiniMax-M3, MuseSpark."
         )
 

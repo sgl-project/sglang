@@ -13,6 +13,7 @@ from functools import lru_cache
 from typing import Dict, Optional, Tuple
 
 import msgspec
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -44,8 +45,10 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
+from sglang.srt.layers.cp.interleave import attn_cp_interleave_gather
 from sglang.srt.layers.cp.utils import (
     ContextParallelStrategyKind,
+    RingKVExchange,
     cp_materialize_global_token_order,
     get_cp_strategy,
     is_cp_active,
@@ -55,6 +58,7 @@ from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
+from sglang.srt.utils.nvtx_utils import profile_method
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +84,12 @@ def _resolve_trtllm_sparse_decode():
 
 @lru_cache(maxsize=1)
 def _resolve_flash_attn_varlen_func():
-    from sglang.srt.utils import is_hip, is_sm121
+    from sglang.srt.utils import is_hip, is_sm90_supported, is_sm121
+
+    if is_sm90_supported():
+        from sglang.kernels.ops.attention.flash_attention import flash_attn_varlen_func
+
+        return flash_attn_varlen_func
 
     if is_sm121():
         from sglang.kernels.ops.attention import (
@@ -144,6 +153,27 @@ def _gather_cp_kv(
     return k_full, v_full
 
 
+class QSAExtendAttnInputs(msgspec.Struct, frozen=True):
+    """Chunk-prefill launch inputs shared by every QSA layer of a forward.
+
+    ``lengths_key`` holds the host-side (extend, sequence) lengths they were
+    built from; a layer only reuses them when its batch reports the same.
+    """
+
+    lengths_key: Tuple[Tuple[int, ...], Tuple[int, ...]]
+    cu_seqlens_q: torch.Tensor
+    cu_seqlens_k: torch.Tensor
+    kv_lens: torch.Tensor
+    max_q: int
+    cp_size: int = 1
+    cp_first_positions: Optional[torch.Tensor] = None
+    cp_prefix_lens: Optional[torch.Tensor] = None
+    cp_extend_starts: Optional[torch.Tensor] = None
+    cp_num_queries: int = 0
+    cp_num_tokens: int = 0
+    cp_prefix_tokens: int = 0
+
+
 class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     """Per-forward metadata consumed by core sparse attention."""
 
@@ -151,6 +181,7 @@ class QwenSparseAttnMetadata(msgspec.Struct, frozen=True):
     token_to_batch_idx: torch.Tensor
     token_slot_table: torch.Tensor
     indexer_metadata: QSAIndexerMetadata
+    extend_attn_inputs: Optional[QSAExtendAttnInputs] = None
     row_req_pool_indices: Optional[torch.Tensor] = None
     is_cuda_graph: bool = False
     fa2_valid_counts: Optional[torch.Tensor] = None
@@ -225,6 +256,7 @@ class QwenSparseAttnBackend(AttentionBackend):
     needs_cpu_seq_lens: bool = False
 
     def __init__(self, runner=None) -> None:
+        self.cp_key_exchange = None
         self.runner = runner
         self.token_to_kv_pool = getattr(runner, "token_to_kv_pool", None)
         self._fused_kv_pool_eligible = self._supports_fused_kv_pool(
@@ -276,6 +308,37 @@ class QwenSparseAttnBackend(AttentionBackend):
         # (layer_id, k_full, v_full) of the prefill-CP K/V gather prefetch_cp_kv
         # started; that layer's _forward_extend_cp joins it.
         self._cp_kv_pending: Optional[Tuple[int, torch.Tensor, torch.Tensor]] = None
+
+    def warmup(self, model_runner):
+        strategy = get_cp_strategy()
+        if strategy is None or strategy.kind != ContextParallelStrategyKind.INTERLEAVE:
+            return
+        from sglang.srt.layers.attention.qsa.mqa import warmup_qsa_mqa_prefill
+        from sglang.srt.layers.attention.qsa.sparse_attn import (
+            warmup_cp_sparse_attention,
+        )
+
+        config = model_runner.model_config.hf_text_config
+        args = model_runner.server_args
+        tokens = args.chunked_prefill_size
+        if tokens is None or tokens <= 0:
+            raise ValueError("QSA ring warmup requires a positive prefill chunk size")
+        warmup_cp_sparse_attention(
+            device=self.device,
+            dtype=model_runner.dtype,
+            q_heads=config.num_attention_heads,
+            kv_heads=config.num_key_value_heads,
+            head_dim=config.head_dim,
+            topk=config.indexer_budget + config.indexer_compress_ratio - 1,
+            cp_size=strategy.cp_size,
+            max_local_tokens=(tokens + strategy.cp_size - 1) // strategy.cp_size,
+        )
+        warmup_qsa_mqa_prefill(
+            device=self.device,
+            dtype=self.token_to_kv_pool.qsa_compressed_dtype,
+            heads=config.indexer_n_heads,
+            head_dim=config.indexer_head_dim,
+        )
 
     @staticmethod
     def _is_speculative_paged_mode(forward_mode) -> bool:
@@ -502,6 +565,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
+            extend_attn_inputs=self._extend_attn_inputs_from_batch(forward_batch),
             row_req_pool_indices=torch.zeros(0, dtype=torch.int32, device=device),
         )
 
@@ -774,6 +838,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             pending_ring_slots=pending_ring_slots,
             compress_group_ring_locs=compress_group_ring_locs,
             extend_rope_matrix=extend_rope_matrix,
+            cp_key_exchange=self.cp_key_exchange,
             defer_block_expansion=(
                 self._can_defer_block_expansion(forward_batch.forward_mode)
                 and decode_logical_positions is not None
@@ -785,6 +850,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             token_to_batch_idx=token_to_batch_idx,
             token_slot_table=token_slot_table,
             indexer_metadata=indexer_metadata,
+            extend_attn_inputs=self._extend_attn_inputs_from_batch(forward_batch),
             row_req_pool_indices=row_req_pool_indices,
         )
 
@@ -797,7 +863,93 @@ class QwenSparseAttnBackend(AttentionBackend):
         if forward_batch.forward_mode.is_idle():
             self.forward_metadata = None
             return
+        self._prepare_cp_exchanges(forward_batch)
         self.forward_metadata = self._metadata_from_forward_batch(forward_batch)
+
+    def _prepare_cp_exchanges(self, forward_batch):
+        strategy = get_cp_strategy()
+        if not (
+            strategy is not None
+            and strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+            and is_cp_active(forward_batch)
+        ):
+            return
+        if self.cp_key_exchange is not None:
+            return
+        from sglang.srt.distributed import get_attn_cp_group
+
+        config = self.runner.model_config.hf_text_config
+        args = self.runner.server_args
+        capacity = (
+            args.chunked_prefill_size + strategy.cp_size - 1
+        ) // strategy.cp_size
+        if capacity <= 0:
+            raise ValueError(
+                "QSA ring CP requires a bounded positive prefill chunk size"
+            )
+        common = dict(
+            group=get_attn_cp_group().device_group,
+            capacity=capacity,
+            device=forward_batch.input_ids.device,
+            dtype=self.runner.dtype,
+            overlap=True,
+            transport=args.attn_cp_transport,
+        )
+        self.cp_key_exchange = RingKVExchange(
+            **common,
+            kv_heads=config.indexer_kv_heads,
+            head_dim=config.indexer_head_dim,
+            planes=1,
+        )
+
+    @staticmethod
+    def _extend_attn_inputs_from_batch(forward_batch) -> Optional[QSAExtendAttnInputs]:
+        strategy = get_cp_strategy()
+        if not (
+            strategy is not None
+            and strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+            and is_cp_active(forward_batch)
+        ):
+            return None
+        if (
+            forward_batch.extend_seq_lens_cpu is None
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.extend_seq_lens is None
+        ):
+            return None
+        extend = [int(x) for x in forward_batch.extend_seq_lens_cpu]
+        lengths = [int(x) for x in forward_batch.seq_lens_cpu]
+        device = forward_batch.seq_lens.device
+        size, rank = strategy.cp_size, strategy.cp_rank
+        ext = np.asarray(extend, dtype=np.int32)
+        seq = np.asarray(lengths, dtype=np.int32)
+        prefix = seq - ext
+        starts = np.concatenate(([0], np.cumsum(ext, dtype=np.int32)))[:-1]
+        first = (rank - starts) % size
+        counts = np.maximum(0, (ext - first + size - 1) // size)
+        # One pinned host allocation / H2D for all per-request sparse attention inputs.
+        host = np.zeros((6, len(extend) + 1), dtype=np.int32)
+        host[0, 1:] = np.cumsum(counts)
+        host[1, 1:] = np.cumsum(seq)
+        host[2, :-1] = seq
+        host[3, :-1] = prefix + first
+        host[4, :-1] = prefix
+        host[5, :-1] = starts
+        packed = torch.from_numpy(host).pin_memory().to(device, non_blocking=True)
+        return QSAExtendAttnInputs(
+            lengths_key=(tuple(extend), tuple(lengths)),
+            cu_seqlens_q=packed[0],
+            cu_seqlens_k=packed[1],
+            kv_lens=packed[2, :-1],
+            max_q=int(counts.max(initial=0)),
+            cp_size=size,
+            cp_first_positions=packed[3, :-1],
+            cp_prefix_lens=packed[4, :-1],
+            cp_extend_starts=packed[5, :-1],
+            cp_num_queries=int(counts.sum()),
+            cp_num_tokens=int(ext.sum()),
+            cp_prefix_tokens=int(prefix.sum()),
+        )
 
     def init_forward_metadata_out_graph(
         self,
@@ -1458,6 +1610,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             new_kv=(k, v, loc, width),
         )
 
+    @profile_method("sglang.attention.qsa.extend")
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1601,10 +1754,17 @@ class QwenSparseAttnBackend(AttentionBackend):
         base row in the packed full K/V, and ``topk_indices`` are per-request
         logical positions exactly as in the non-CP path."""
         strategy = get_cp_strategy()
+        if (
+            strategy is not None
+            and strategy.kind == ContextParallelStrategyKind.INTERLEAVE
+        ):
+            return self._forward_extend_interleaved(
+                q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+            )
         if strategy is None or strategy.kind != ContextParallelStrategyKind.ZIGZAG:
             strategy_name = strategy.name if strategy is not None else "none"
             raise NotImplementedError(
-                "QSA prefill CP only supports the zigzag strategy; "
+                "QSA prefill CP supports zigzag and interleave strategies; "
                 f"got {strategy_name}."
             )
         meta = forward_batch.attn_cp_metadata
@@ -1699,6 +1859,86 @@ class QwenSparseAttnBackend(AttentionBackend):
             # The gathered K/V live in the side stream's pool; order their
             # release there (unmap, cudaFreeAsync) after this stream's reads.
             get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
+        return self._pad_extend_output(output, num_output_rows)
+
+    def _forward_extend_interleaved(
+        self, q, k, v, layer, forward_batch, topk_indices, save_kv_cache
+    ):
+        """Gather new KV once, then score local round-robin queries in one pass."""
+        plan = self.forward_metadata.extend_attn_inputs
+        if plan is None or plan.cp_size <= 1:
+            raise RuntimeError("QSA CP inputs must be prepared before layer execution")
+        q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
+        num_output_rows = q.shape[0]
+        q = q[: plan.cp_num_queries].contiguous()
+        k = k.reshape(-1, layer.tp_k_head_num, layer.qk_head_dim)
+        v = v.reshape(-1, layer.tp_v_head_num, layer.v_head_dim)
+        k_width, v_width = k.shape[1] * k.shape[2], v.shape[1] * v.shape[2]
+        kv_local = torch.cat((k.flatten(1), v.flatten(1)), dim=-1)
+        pool = self.token_to_kv_pool
+        kb, vb = pool.layer_router.read(layer.layer_id).kv()
+        fuse_cache = (
+            self._fused_kv_pool_eligible
+            and kb.ndim == 3
+            and vb.shape == kb.shape
+            and isinstance(forward_batch.out_cache_loc, torch.Tensor)
+            and forward_batch.out_cache_loc.is_contiguous()
+        )
+        if fuse_cache:
+            metadata = forward_batch.attn_cp_metadata
+            rank_rows = max(metadata.per_rank_actual_token)
+            if kv_local.shape[0] < rank_rows:
+                kv_local = F.pad(kv_local, (0, 0, 0, rank_rows - kv_local.shape[0]))
+            kv_full = attn_cp_interleave_gather(kv_local[:rank_rows])
+            k_full, v_full = kv_full.split((k_width, v_width), dim=-1)
+            k_full = k_full.view(-1, k.shape[1], k.shape[2])
+            v_full = v_full.view(-1, v.shape[1], v.shape[2])
+        else:
+            kv_full = cp_materialize_global_token_order(kv_local, forward_batch)
+            k_full, v_full = kv_full.split((k_width, v_width), dim=-1)
+            k_full = k_full.reshape(-1, k.shape[1], k.shape[2]).contiguous()
+            v_full = v_full.reshape(-1, v.shape[1], v.shape[2]).contiguous()
+            if save_kv_cache:
+                self.kv_layers.layer(layer.layer_id).store(
+                    layer, forward_batch.out_cache_loc, k_full, v_full
+                )
+        if fuse_cache or plan.cp_prefix_tokens:
+            # Only cached prefix rows are read from the pool. Preserve current
+            # BF16 KV even when the cache is FP8 or cache writes are disabled.
+            k_full, v_full = pack_qsa_prefill_kv(
+                k=kb,
+                v=vb,
+                req_to_token=self.req_to_token_pool.req_to_token,
+                req_indices=forward_batch.req_pool_indices,
+                cu_k=plan.cu_seqlens_k,
+                total_k=plan.cp_prefix_tokens + plan.cp_num_tokens,
+                max_k=max(plan.lengths_key[1], default=0),
+                output_dtype=q.dtype,
+                new_kv=(k_full, v_full),
+                prefix_lens=plan.cp_prefix_lens,
+                extend_starts=plan.cp_extend_starts,
+                new_kv_cp_size=plan.cp_size if fuse_cache else 1,
+                new_kv_token_indices=metadata.gather_index if fuse_cache else None,
+                cache_loc=forward_batch.out_cache_loc
+                if fuse_cache and save_kv_cache
+                else None,
+            )
+        output = sparse_gqa_fwd_interface_triton_ck(
+            q,
+            k_full,
+            v_full,
+            topk_indices[: plan.cp_num_queries].to(torch.int32).contiguous(),
+            plan.cu_seqlens_q,
+            plan.cu_seqlens_k,
+            plan.kv_lens,
+            layer.scaling,
+            max_q=plan.max_q,
+            cp_size=plan.cp_size,
+            cp_mode=3,
+            q_first_positions=plan.cp_first_positions,
+            prefix_lens=plan.cp_prefix_lens,
+            extend_starts=plan.cp_extend_starts,
+        )
         return self._pad_extend_output(output, num_output_rows)
 
     @staticmethod

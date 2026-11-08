@@ -68,6 +68,53 @@ class TestRegisterToBootstrap(CustomTestCase):
         # An empty layout never goes on the wire as a new field.
         self.assertIsNone(payload["spec_kv_layout"])
 
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_cp_tp_group_sharing_registers_cp_rank_as_tp_rank(
+        self, mock_put, mock_time
+    ):
+        # A sharing prefill CP rank holds every KV head and its own
+        # linear-attention shard: decode pairs with it as a CP-1 TP rank.
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+        mgr = self._make_manager()
+        mgr.attn_cp_size, mgr.attn_cp_rank = 4, 2
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            mgr.register_to_bootstrap()
+
+        payload = mock_put.call_args[1]["json"]
+        self.assertEqual([payload[k] for k in ("attn_tp_size", "attn_tp_rank")], [4, 2])
+        self.assertEqual([payload[k] for k in ("attn_cp_size", "attn_cp_rank")], [1, 0])
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_slot_owned_gdn_state_registers_real_cp_topology(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        mock_put.return_value = MagicMock(status_code=200)
+        mgr = self._make_manager()
+        mgr.attn_cp_size, mgr.attn_cp_rank = 2, 1
+        mgr.kv_args.state_cp_size = 2
+        with get_context().override_server_args(enable_cp_tp_group_sharing=True):
+            mgr.register_to_bootstrap()
+        payload = mock_put.call_args.kwargs["json"]
+        self.assertEqual((payload["attn_tp_size"], payload["attn_tp_rank"]), (1, 0))
+        self.assertEqual((payload["attn_cp_size"], payload["attn_cp_rank"]), (2, 1))
+        self.assertEqual(payload["state_cp_size"], 2)
+
+    @patch("sglang.srt.disaggregation.common.conn.time")
+    @patch("sglang.srt.disaggregation.common.conn.requests.put")
+    def test_url_with_dist_init_addr(self, mock_put, mock_time):
+        mock_time.monotonic.return_value = 0.0
+        success_resp = MagicMock()
+        success_resp.status_code = 200
+        mock_put.return_value = success_resp
+
+        mgr = self._make_manager(dist_init_addr="10.0.0.1:12345")
+        mgr.register_to_bootstrap()
+
+        url_used = mock_put.call_args[0][0]
+        self.assertIn("10.0.0.1", url_used)
+
     @patch("sglang.srt.disaggregation.common.conn.requests.put")
     def test_rust_attention_dp_replicates_complete_topology_across_hosts(
         self, mock_put
@@ -215,10 +262,14 @@ class TestRegisterToBootstrap(CustomTestCase):
         mgr.spec_kv_layout = {}
 
         mgr.kv_args = MagicMock()
+        mgr.kv_args.state_cp_size = 1
         mgr.kv_args.page_size = 16
         mgr.kv_args.rust_http_port = None
         # Resolved per-runner value threaded through KVArgs (the payload field).
         mgr.kv_cache_dtype_str = "auto"
+        mgr.ring_cp_sharded = False
+        mgr.dsv41_spec_layout = None
+        mgr.decode_allocation_policy = "early"
 
         return mgr
 

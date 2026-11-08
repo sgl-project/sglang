@@ -94,6 +94,7 @@ class QSAIndexerMetadata(msgspec.Struct, frozen=True):
     extend_rope_matrix: Optional[torch.Tensor] = None
     graph_ring_group_locs: Optional[torch.Tensor] = None
     defer_block_expansion: bool = False
+    cp_key_exchange: Optional[object] = None
     # Host copy of the extend sequence_lengths; lets prefill MQA skip a device sync.
     prefill_sequence_lengths_cpu: Optional[Tuple[int, ...]] = None
 

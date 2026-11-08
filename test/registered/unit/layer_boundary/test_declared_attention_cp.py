@@ -64,6 +64,11 @@ def group(name, ranks):
 
 class TestAttentionCpBoundary(CustomTestCase):
     def setUp(self):
+        from sglang.srt.runtime_context import get_context
+
+        config = get_context().override_server_args()
+        config.install()
+        self.addCleanup(config.restore)
         generator = torch.Generator().manual_seed(0)
         self.values = [
             torch.randint(-8, 8, (ROWS, HIDDEN), generator=generator).double()
@@ -402,6 +407,108 @@ class TestAttentionCpBoundary(CustomTestCase):
                         torch.testing.assert_close(
                             stream.residual, self.residuals[cp], rtol=0, atol=0
                         )
+
+
+class TestShardedCPExpertPartitions(CustomTestCase):
+    def test_gdn_cp_requires_declared_row_transport_without_an_architecture_list(self):
+        from sglang.srt.layers.layer_boundary import declare_attn, declare_ffn
+        from sglang.srt.layers.layer_boundary.factories import _reject_unsupported
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(
+            tp_size=4,
+            attn_cp_size=4,
+            linear_attn_prefill_backend="flashqla",
+            disaggregation_mode="prefill",
+        ):
+            for stage in (declare_attn(), declare_ffn()):
+                with self.assertRaisesRegex(
+                    NotImplementedError, "declare its CP token layout"
+                ):
+                    _reject_unsupported(stage)
+            for stage in (
+                declare_attn(cp_layout="contiguous"),
+                declare_ffn(cp_layout="current"),
+            ):
+                _reject_unsupported(stage)
+
+    def test_ordinary_ep_still_gathers_tokens_and_reduces_partial_expert_outputs(self):
+        """EP=CP with no A2A still owes a sum, despite a one-rank MoE-TP group."""
+        from sglang.srt.layers.cp.utils import ShardedContextParallelMetadata
+        from sglang.srt.layers.layer_boundary.prepare import prepare_sharded_cp_ffn
+        from sglang.srt.layers.layer_boundary.row_transport import finish_sharded_cp_ffn
+        from sglang.srt.layers.moe import MoeA2ABackend
+        from sglang.srt.runtime_context import get_context, get_flags, get_parallel
+
+        world = 4
+        original = torch.arange(512 * HIDDEN).reshape(512, HIDDEN).float()
+        shards = [original[rank::world] for rank in range(world)]
+        rank_ordered = torch.cat(shards)
+        for ep, backend in ((1, "none"), (2, "none"), (4, "none"), (4, "deepep")):
+            for rank in range(world):
+                with self.subTest(ep=ep, backend=backend, rank=rank):
+                    group = SimpleNamespace(
+                        device_group=object(), rank_in_group=rank, world_size=world
+                    )
+
+                    def gather(out, value, **kwargs):
+                        torch.testing.assert_close(value, shards[rank])
+                        out.copy_(rank_ordered)
+
+                    def reduce_scatter(out, value, **kwargs):
+                        torch.testing.assert_close(value, rank_ordered * (rank + 1))
+                        out.copy_(shards[rank] * sum(range(1, world + 1)))
+
+                    with (
+                        get_context().override_server_args(
+                            tp_size=world,
+                            attn_cp_size=world,
+                            ep_size=ep,
+                            moe_a2a_backend=backend,
+                        ),
+                        get_parallel().override(
+                            attn_cp_group=group,
+                            moe_tp_group=SimpleNamespace(world_size=world // ep),
+                        ),
+                        get_flags().moe.override(a2a_backend=MoeA2ABackend(backend)),
+                        patch("torch.distributed.get_world_size", return_value=world),
+                        patch("torch.distributed.get_rank", return_value=rank),
+                        patch(
+                            "torch.distributed.all_gather_into_tensor",
+                            side_effect=gather,
+                        ),
+                        patch(
+                            "torch.distributed.reduce_scatter_tensor",
+                            side_effect=reduce_scatter,
+                        ),
+                    ):
+                        metadata = ShardedContextParallelMetadata.plan_prefill(
+                            (512,),
+                            (0,),
+                            torch.device("cpu"),
+                            cp_mode="round-robin-split",
+                        )
+                        metadata.current = metadata.layout_names["attention"]
+                        batch = SimpleNamespace(layer_cp_metadata=metadata)
+                        stream = ResidualStream()
+                        inputs = prepare_sharded_cp_ffn(
+                            shards[rank],
+                            stream,
+                            batch,
+                            lambda hidden, residual: (hidden, hidden.clone()),
+                        )
+                        expected = rank_ordered if backend == "none" else shards[rank]
+                        torch.testing.assert_close(inputs, expected)
+                        # Ordinary experts return partials; an A2A combine already
+                        # completes them and returns only the source rank's rows.
+                        outputs = inputs * (rank + 1 if backend == "none" else 10)
+                        result, residual = finish_sharded_cp_ffn(
+                            outputs,
+                            stream.residual,
+                            forward_batch=batch,
+                        )
+                        torch.testing.assert_close(result, shards[rank] * 10)
+                        torch.testing.assert_close(residual, shards[rank])
 
 
 if __name__ == "__main__":

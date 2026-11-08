@@ -13,7 +13,9 @@ Sliding window and attention sink features are supported.
 """
 
 import contextlib
+import inspect
 import logging
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
@@ -170,6 +172,38 @@ def _trtllm_native_nvfp4_kv_buffer(token_to_kv_pool, layer_id: int):
     )
 
 
+def get_trtllm_workspace(device):
+    global global_zero_init_workspace_buffer
+    if global_zero_init_workspace_buffer is None:
+        setting = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
+        size = (
+            setting.get()
+            if setting.is_set()
+            else DEFAULT_WORKSPACE_SIZE_MB * 1024 * 1024
+        )
+        global_zero_init_workspace_buffer = torch.zeros(
+            size, dtype=torch.uint8, device=device
+        )
+    return global_zero_init_workspace_buffer
+
+
+def validate_cp_attention_support(*, head_dim, q_heads, kv_heads, dtype):
+    if (
+        head_dim != 256
+        or kv_heads < 1
+        or q_heads != 16 * kv_heads
+        or dtype not in (torch.bfloat16, torch.float8_e4m3fn)
+    ):
+        raise ValueError("TRT-LLM CP requires head_dim=256, GQA=16 and BF16/FP8 E4M3")
+    from flashinfer.prefill import trtllm_ragged_attention_deepseek
+
+    parameters = inspect.signature(trtllm_ragged_attention_deepseek).parameters
+    if not {"q_seq_lens_cpu", "kv_seq_lens_cpu"} <= parameters.keys():
+        raise RuntimeError(
+            "TRT-LLM CP requires the FlashInfer hd256 ragged API with CPU sequence-length mirrors; update the external FlashInfer dependency"
+        )
+
+
 @dataclass
 class TRTLLMMHAMetadata:
     # Sequence lengths for the forward batch
@@ -244,6 +278,11 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         speculative_step_id: int = 0,
         window_kv_indptr_buf: Optional[torch.Tensor] = None,
     ):
+        self.cp_exchange = getattr(model_runner, "cp_kv_exchange", None)
+        if self.cp_exchange is not None:
+            self._init_cp_attention(model_runner, packed_kv=True)
+            self.workspace_buffer = get_trtllm_workspace(model_runner.device)
+            return
         # Capture workspace size before super().__init__() to preserve user's
         # SGLANG_FLASHINFER_WORKSPACE_SIZE setting (may be overridden by parent)
         env_var = envs.SGLANG_FLASHINFER_WORKSPACE_SIZE
@@ -1362,6 +1401,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize the metadata for a forward pass."""
+        if self.cp_exchange is not None:
+            return self._init_cp_forward_metadata(forward_batch)
 
         if self.decode_split_hoist:
             self._decode_group_plans.reset()
@@ -1835,6 +1876,61 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
 
         return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _forward_cp_shard(
+        self, *, q, kv, segments, scale, k_descale=None, v_descale=None
+    ):
+        """TRT-LLM partial attention; return natural-log LSE for CP merging."""
+        packed = (
+            kv[:, segments.kv_slice[0] : segments.kv_slice[1]]
+            if segments.kv_slice is not None
+            else kv.index_select(1, segments.packed_kv_indices)
+        )
+        key, value = packed[0], packed[1]
+        if q.dtype == torch.float8_e4m3fn:
+            # The SM100 hd256 kernel has no scalar FP8 descale support.
+            # Preserve quantized transport, then evaluate dequantized BF16.
+            q, key, value = (x.to(torch.bfloat16) for x in (q, key, value))
+            if k_descale is not None:
+                key = (
+                    key.float()
+                    * k_descale.index_select(0, segments.packed_kv_sequences).unsqueeze(
+                        -1
+                    )
+                ).to(key.dtype)
+            if v_descale is not None:
+                value = (
+                    value.float()
+                    * v_descale.index_select(0, segments.packed_kv_sequences).unsqueeze(
+                        -1
+                    )
+                ).to(value.dtype)
+            k_descale = v_descale = None
+        from flashinfer.prefill import trtllm_ragged_attention_deepseek
+
+        partial, partial_lse = trtllm_ragged_attention_deepseek(
+            query=q,
+            key=key,
+            value=value,
+            workspace_buffer=self.workspace_buffer,
+            seq_lens=segments.kv_lens,
+            max_q_len=segments.max_q,
+            max_kv_len=segments.max_k,
+            bmm1_scale=scale,
+            bmm2_scale=1.0,
+            o_sf_scale=1.0,
+            batch_size=segments.cu_q.numel() - 1,
+            window_left=-1,
+            cum_seq_lens_q=segments.cu_q,
+            cum_seq_lens_kv=segments.cu_k,
+            enable_pdl=None,
+            is_causal=True,
+            return_lse=True,
+            q_seq_lens_cpu=segments.q_lens_cpu,
+            kv_seq_lens_cpu=segments.kv_lens_cpu,
+        )
+        # TRT-LLM returns [tokens, heads] log2 LSE; merge_state uses natural logs.
+        return partial, partial_lse * math.log(2.0)
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1845,6 +1941,8 @@ class TRTLLMHAAttnBackend(FlashInferAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        if self.cp_exchange is not None:
+            return self.forward_cp(q, k, v, layer, forward_batch, save_kv_cache)
         cp_active = is_cp_active(forward_batch)
         uses_native_fp4 = self._forward_extend_uses_native_fp4(forward_batch)
         if uses_native_fp4 and cp_active:

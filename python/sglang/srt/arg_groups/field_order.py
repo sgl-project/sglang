@@ -559,6 +559,9 @@ POSITIONAL_FIELD_ORDER = (
     "uocr_doc_split",
     "uocr_doc_page_window",
     "uocr_max_page_tokens",
+    "disaggregation_require_bulk",
+    "enable_mxfp4_mega",
+    "attn_cp_transport",
     "enable_fp4_indexer",
     "paged_experts_enable_disk",
 )

@@ -94,6 +94,91 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     return {}
 
 
+def _resolve_sharded_hybrid_cp(server_args):
+    """Validate GDN CP and the full-attention storage/layout contract."""
+    import torch
+
+    from sglang.srt.arg_groups.model_override_base import attention_backends_of
+    from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
+
+    cfg = resolving_view(server_args)
+    active = (
+        cfg.attn_cp_size > 1
+        and cfg.linear_attn_prefill_backend == "flashqla"
+        and not cfg.encoder_only
+    )
+    if not active:
+        return
+    config = model_config_of(server_args)
+    gdn = hybrid_gdn_config(config)
+    if gdn is None:
+        raise ValueError(
+            "--linear-attn-prefill-backend flashqla with CP requires GDN layers"
+        )
+    if gdn.linear_key_head_dim != 128 or gdn.linear_value_head_dim != 128:
+        raise ValueError("FlashQLA GDN CP requires key/value head dimensions of 128")
+    if (
+        config.hf_config.architectures[0] == "Qwen4ExpForConditionalGeneration"
+        and not cfg.enable_prefill_cp
+    ):
+        raise ValueError("Qwen4Exp CP requires --enable-prefill-cp")
+    # These row plans span the whole TP group; they do not yet compose with
+    # a head-sharded attention group or a pipeline-stage boundary.
+    if (
+        cfg.attn_cp_size != cfg.tp_size
+        or cfg.dp_size != 1
+        or cfg.attn_dp_size != 1
+        or cfg.pp_size != 1
+        or cfg.moe_dp_size != 1
+        or cfg.dcp_size != 1
+        or cfg.disaggregation_mode != "prefill"
+    ):
+        raise ValueError(
+            "GDN CP row transport currently requires PD prefill, CP=TP>=2, "
+            "DP=attention-DP=PP=MoE-DP=DCP=1"
+        )
+    if cfg.disaggregation_transfer_backend not in ("mooncake", "mooncake_tcp"):
+        raise ValueError("Sharded CP KV transfer requires Mooncake")
+    if config.is_multimodal and not cfg.language_only:
+        raise ValueError(
+            "Sharded CP multimodal prefill requires --language-only; inline vision encoding is unsupported"
+        )
+    if (
+        cfg.speculative_algorithm is not None
+        or cfg.enable_lora
+        or cfg.enable_hierarchical_cache
+        or cfg.enable_unified_memory
+        or cfg.enable_int8_mamba_checkpoint
+        or cfg.enable_linear_replayssm
+        or cfg.enable_memory_saver
+        or not cfg.page_size
+        or cfg.page_size % cfg.attn_cp_size
+        or config.dtype != torch.bfloat16
+        or not cfg.max_running_requests
+    ):
+        raise ValueError(
+            "Sharded CP requires BF16, a page size divisible by CP, explicit max-running-requests, and ordinary KV/Mamba pools without speculation, LoRA, HiCache or state compression"
+        )
+    prefill = attention_backends_of(cfg)[0]
+    if not cfg.enable_cp_tp_group_sharing and prefill not in ("fa3", "trtllm_mha"):
+        raise ValueError("Sharded CP uses fa3 on Hopper or trtllm_mha on Blackwell")
+    if prefill == "fa3" and cfg.kv_cache_dtype == "fp8_e5m2":
+        raise ValueError("FlashAttention3 does not support fp8_e5m2")
+    if cfg.decode_attention_backend not in (None, prefill):
+        raise ValueError(
+            "Sharded CP prefill does not use a separate decode attention backend"
+        )
+    graph = cfg.cuda_graph_config
+    for phase in Phase.ALL:
+        graph = with_phase(graph, phase, backend=Backend.DISABLED)
+    declare_resolution(
+        server_args,
+        "sharded_hybrid_cp",
+        attention_backend=prefill,
+        cuda_graph_config=graph,
+    )
+
+
 def handle_context_parallelism(server_args: Any):
     # Through the registry, not a bare call: an out-of-tree replacement of
     # `validate_prefill_cp_platform` registered at its own (earlier) pipeline
@@ -150,6 +235,8 @@ def handle_context_parallelism(server_args: Any):
                     "--language-only."
                 )
         resolve_cp_tp_group_sharing(server_args, model_config)
+
+    _resolve_sharded_hybrid_cp(server_args)
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
         raise ValueError(

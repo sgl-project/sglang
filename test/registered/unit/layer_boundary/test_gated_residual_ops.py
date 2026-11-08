@@ -6,6 +6,10 @@ import test_declared_decoder_boundary as fixture
 import torch
 
 from sglang.srt.layers.layer_boundary import layer_stack
+from sglang.srt.layers.layer_boundary.prepare import (
+    prepare_sharded_cp_attention,
+    prepare_sharded_cp_ffn,
+)
 from sglang.srt.layers.layer_boundary.residual.gated import GatedResidualState
 from sglang.srt.layers.layer_boundary.residual.stream import ResidualStream
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -137,6 +141,59 @@ class TestGatedResidualOps(CustomTestCase):
         # Nothing survives the layer: the next layer's read produces its own.
         self.assertIsNone(state.normed)
 
+    def test_ffn_destination_rows_recompute_their_own_injection_state(self):
+        state = _state()
+        state.ffn_norm = lambda rows: _normalize(rows, 2)
+        ops = state.residual_ops()
+        residual = _expand(self.hidden)
+        ops.attn_readout.read(residual, None)
+        _, residual = ops.ffn_readout.update_and_read(
+            ops.attn_update, self.output, residual, None
+        )
+        output = torch.arange(2 * HIDDEN, dtype=torch.float32).reshape(2, HIDDEN)
+        expected = _combine(output, (residual, state.normed, None)).flip(0)
+        moved = ops.ffn_update.rearrange_residual(residual, lambda rows: rows.flip(0))
+        torch.testing.assert_close(
+            ops.ffn_update.update(output.flip(0), moved), expected
+        )
+        self.assertIsNone(state.normed)
+        self.assertIsNone(state.gate_partials)
+
+    def test_cp_gdn_strips_padding_when_attention_ownership_is_identical(self):
+        for rows in (0, 1, 17):
+            with self.subTest(rows=rows):
+                state = _state()
+                ops = state.residual_ops()
+                tokens = tuple(range(rows))
+                metadata = SimpleNamespace(
+                    current="contiguous",
+                    rank=1,
+                    layout_names={
+                        "attention": "contiguous",
+                        "contiguous": "contiguous",
+                    },
+                    token_layouts={"contiguous": ((), tokens)},
+                    pending_residual=None,
+                    local_token_count=lambda count: torch.tensor(count),
+                )
+                batch = SimpleNamespace(layer_cp_metadata=metadata)
+                stream = ResidualStream()
+                padded = torch.arange((rows + 1) * WIDE, dtype=torch.float32).reshape(
+                    rows + 1, WIDE
+                )
+                actual = prepare_sharded_cp_attention(
+                    padded,
+                    stream,
+                    batch,
+                    None,
+                    layout="contiguous",
+                    read=ops.attn_readout,
+                )
+                expected, _ = _mix(1)(padded[:rows])
+                torch.testing.assert_close(actual, expected)
+                torch.testing.assert_close(stream.residual, padded[:rows])
+                self.assertEqual(batch.num_token_non_padded.item(), rows)
+
     def test_gate_partials_follow_their_read_and_are_cleared_after_write_back(self):
         def mix(seed):
             def read(residual):
@@ -216,6 +273,67 @@ class TestGatedResidualOps(CustomTestCase):
         torch.testing.assert_close(got_residual, want_residual)
         torch.testing.assert_close(got_input, want_input)
         torch.testing.assert_close(state.normed, want_normed)
+
+    def test_cp_residual_is_published_after_combine_before_mix(self):
+        for moe_tp in (False, True):
+            calls = []
+            state = _state()
+
+            def mix(value):
+                calls.append("mix")
+                return _mix(2)(value)
+
+            state.ffn_mix = mix
+            ops = state.residual_ops()
+            residual = _expand(self.hidden)
+            ops.attn_readout.read(residual, None)
+            expected = _combine(self.output, (residual, state.normed, None))
+            stream = ResidualStream(residual)
+            hidden = stream.record(self.output, ops.attn_update)
+            plan, pending, event = object(), object(), object()
+
+            def submit(actual_plan, value, *, ready, restore_order):
+                calls.append("transfer")
+                self.assertIs(actual_plan, plan)
+                self.assertIs(ready, event)
+                torch.testing.assert_close(value, expected)
+                return pending
+
+            def gather(value, **kwargs):
+                calls.append("gather")
+                return value
+
+            metadata = SimpleNamespace(
+                residual_exchange=SimpleNamespace(submit=submit),
+                current="source",
+                layout_names={"target": "target"},
+                token_layouts={"source": ((0, 1),)},
+                rank=0,
+                pending_residual=None,
+                queued_residual=None,
+                moe_tp=moe_tp,
+                total_non_padded=torch.tensor(2),
+                exchange_plan=lambda *_: plan,
+                token_collectives=lambda: SimpleNamespace(gather=gather),
+            )
+            with patch("torch.cuda.current_stream") as current:
+                current.return_value.record_event.return_value = event
+                actual = prepare_sharded_cp_ffn(
+                    hidden,
+                    stream,
+                    SimpleNamespace(layer_cp_metadata=metadata),
+                    None,
+                    next_layout="target",
+                    read=ops.ffn_readout,
+                    defer_cp_residual=True,
+                )
+            torch.testing.assert_close(actual, _mix(2)(expected)[0])
+            self.assertEqual(
+                calls, ["mix", "gather"] if moe_tp else ["transfer", "mix"]
+            )
+            if not moe_tp:
+                self.assertEqual(metadata.pending_residual, ("target", pending))
+                self.assertIsNone(metadata.queued_residual)
 
     def test_a_read_may_contribute_to_the_streams_before_mixing(self):
         """A layer whose own contribution joins the streams ahead of its read

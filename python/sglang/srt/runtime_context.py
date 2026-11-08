@@ -478,7 +478,13 @@ def linear_attn_parallel_group() -> str:
     """The group linear attention partitions its heads over: the attention-TP
     group, or the TP group under CP-TP group sharing, where the attention-TP
     group is one rank wide."""
-    return "tp" if get_parallel().enable_cp_tp_group_sharing else "attn_tp"
+    from sglang.srt.layers.cp.utils import is_gdn_cp_enabled
+
+    return (
+        "tp"
+        if get_parallel().enable_cp_tp_group_sharing and not is_gdn_cp_enabled()
+        else "attn_tp"
+    )
 
 
 def linear_attn_tp_size() -> int:

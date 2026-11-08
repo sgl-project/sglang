@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, call, patch
 
 import msgspec
 import msgspec.structs
+import torch
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
@@ -807,6 +808,7 @@ class TestPrepareServerArgs(CustomTestCase):
                 speculative_num_draft_tokens=6,
                 moe_a2a_backend="megamoe",
                 disaggregation_mode="decode",
+                enable_mxfp4_mega=False,
             )
 
         self.assertEqual(
@@ -5741,6 +5743,531 @@ class TestPagedExpertsNumResident(unittest.TestCase):
         for bad in ("0", "-1", "abc", "max", "AUTO", " 12"):
             with self.assertRaises(argparse.ArgumentTypeError):
                 _paged_experts_num_resident(bad)
+
+
+class TestRingCPEPD(CustomTestCase):
+    def setUp(self):
+        from sglang.srt.configs.qwen3_5 import Qwen3_5MoeConfig
+
+        self.config = SimpleNamespace(
+            hf_config=Qwen3_5MoeConfig(
+                architectures=["Qwen3_5MoeForConditionalGeneration"]
+            ),
+            is_multimodal=False,
+            is_draft_model=False,
+            linear_attn_registry_result=None,
+            dtype=torch.bfloat16,
+        )
+
+    def _parse(self, *options):
+        args = prepare_server_args(
+            ["--model-path", "dummy", "--device", "cpu", *options]
+        )
+        args._model_config = self.config
+        args.cuda_graph_config = CudaGraphConfig()
+        self.config.is_multimodal = bool(args.enable_multimodal)
+        if args.dtype != "auto":
+            self.config.dtype = getattr(torch, args.dtype)
+        return args
+
+    def _ring_args(self, *options, backend="none", world=2):
+        return self._parse(
+            "--attention-backend",
+            "fa3",
+            "--linear-attn-prefill-backend",
+            "flashqla",
+            "--disaggregation-mode",
+            "prefill",
+            "--tp-size",
+            str(world),
+            "--attn-cp-size",
+            str(world),
+            "--ep-size",
+            str(1 if backend == "none" else world),
+            "--moe-a2a-backend",
+            backend,
+            "--dtype",
+            "bfloat16",
+            "--page-size",
+            "64",
+            "--max-running-requests",
+            "8",
+            *options,
+        )
+
+    def _epd_args(self, *options, **kwargs):
+        return self._ring_args(
+            "--enable-multimodal",
+            "--language-only",
+            "--encoder-urls",
+            "http://encoder.invalid:30000",
+            *options,
+            **kwargs,
+        )
+
+    @staticmethod
+    def _validate(args):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+        from sglang.srt.arg_groups.parallel_hook import _resolve_sharded_hybrid_cp
+        from sglang.srt.arg_groups.pd_disaggregation_hook import (
+            handle_encoder_disaggregation,
+        )
+
+        resolve_cp_tp_group_sharing(args, args._model_config)
+        _resolve_sharded_hybrid_cp(args)
+        handle_encoder_disaggregation(args)
+
+    def test_bulk_env_and_cli_preserve_legacy_policy(self):
+        for legacy in (False, True):
+            for cli in (False, True):
+                with (
+                    self.subTest(legacy=legacy, cli=cli),
+                    envs.SGLANG_DISAGG_REQUIRE_BULK.override(legacy),
+                ):
+                    args = self._parse(
+                        *(["--disaggregation-require-bulk"] if cli else [])
+                    )
+                    self.assertEqual(args.disaggregation_require_bulk, cli)
+                    from sglang.srt.disaggregation.mooncake.conn import (
+                        _check_direct_kv_allowed,
+                    )
+
+                    with patch(
+                        "sglang.srt.disaggregation.mooncake.conn.get_disagg",
+                        return_value=args,
+                    ):
+                        if legacy or cli:
+                            with self.assertRaisesRegex(
+                                RuntimeError, "direct writes are disabled"
+                            ):
+                                _check_direct_kv_allowed()
+                        else:
+                            _check_direct_kv_allowed()
+
+    def test_fa3_e5m2_keeps_warning_and_fallback(self):
+        self.config.is_encoder_decoder = False
+        for cp_size in (1, 4):
+            args = self._parse(
+                "--attention-backend",
+                "fa3",
+                "--kv-cache-dtype",
+                "fp8_e5m2",
+                "--attn-cp-size",
+                str(cp_size),
+                "--linear-attn-prefill-backend",
+                "flashqla",
+            )
+            with (
+                self.assertLogs(
+                    "sglang.srt.arg_groups.overrides", level="WARNING"
+                ) as logs,
+            ):
+                from sglang.srt.arg_groups.overrides import (
+                    _attention_backend_fa3_fp8_fallback,
+                )
+
+                overrides = _attention_backend_fa3_fp8_fallback(args)
+            self.assertEqual(overrides["attention_backend"], "triton")
+            self.assertTrue(
+                any("only supports fp8_e4m3" in message for message in logs.output)
+            )
+        for dtype in ("bf16", "fp8_e4m3"):
+            args = self._ring_args("--kv-cache-dtype", dtype)
+            self._validate(args)
+            self.assertEqual(args.attention_backend, "fa3")
+        args = self._ring_args(
+            "--prefill-attention-backend", "fa3", "--kv-cache-dtype", "fp8_e5m2"
+        )
+        with self.assertRaisesRegex(ValueError, "does not support fp8_e5m2"):
+            self._validate(args)
+
+    def test_text_cp_keeps_supported_moe_combinations(self):
+        for backend in ("none", "deepep", "megamoe"):
+            with self.subTest(backend=backend):
+                args = self._ring_args(backend=backend)
+                self._validate(args)
+                self.assertFalse(self.config.is_multimodal)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").decode.backend,
+                    Backend.DISABLED,
+                )
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").prefill.backend,
+                    Backend.DISABLED,
+                )
+                self.assertEqual(args.moe_a2a_backend, backend)
+
+    def test_prefill_split_defaults_and_explicit_override(self):
+        for strategy in (None, "zigzag", "interleave"):
+            with self.subTest(strategy=strategy):
+                options = ["--cp-strategy", strategy] if strategy else []
+                args = self._ring_args(*options, world=4)
+                self._validate(args)
+                self.assertEqual(args.cp_strategy, strategy)
+
+    def test_epd_multimodal_cp_keeps_supported_moe_combinations(self):
+        for world in (2, 4):
+            for backend in ("none", "deepep", "megamoe"):
+                with self.subTest(world=world, backend=backend):
+                    args = self._epd_args(backend=backend, world=world)
+                    self._validate(args)
+                    self.assertTrue(args.enable_multimodal)
+                    self.assertTrue(args.language_only)
+                    self.assertFalse(args.encoder_only)
+                    self.assertEqual(args.attn_cp_size, world)
+                    self.assertEqual(args.moe_a2a_backend, backend)
+                    self.assertEqual(
+                        args.encoder_urls, ["http://encoder.invalid:30000"]
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "cuda_graph_config").decode.backend,
+                        Backend.DISABLED,
+                    )
+                    self.assertEqual(
+                        resolution_result(args, "cuda_graph_config").prefill.backend,
+                        Backend.DISABLED,
+                    )
+
+    def test_deepep_default_ep_size_keeps_later_normalization(self):
+        for world in (2, 4):
+            with self.subTest(world=world):
+                args = self._epd_args("--ep-size", "1", backend="deepep", world=world)
+                self.assertEqual(args.ep_size, 1)
+                self._validate(args)
+                # CP validation must not eagerly change the a2a configuration.
+                self.assertEqual(args.ep_size, 1)
+                handle_a2a_moe(args)
+                self.assertEqual(resolution_result(args, "ep_size"), world)
+
+    def test_mxfp4_workspace_does_not_use_deepgemm_token_limit(self):
+        from sglang.srt.arg_groups.mega_moe_hook import validate_mega_moe_token_budget
+
+        args = self._ring_args("--enable-mxfp4-mega", backend="megamoe")
+        self._validate(args)
+        with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.override(1):
+            validate_mega_moe_token_budget(args, "Qwen3_5MoeForConditionalGeneration")
+
+    def test_auto_dtype_accepts_resolved_bfloat16(self):
+        args = self._ring_args("--dtype", "auto")
+        self.config.dtype = torch.bfloat16
+        self._validate(args)
+        self.assertEqual(args.dtype, "auto")
+
+    def test_resolved_non_bfloat16_dtype_is_rejected(self):
+        for requested, resolved in (
+            ("auto", torch.float16),
+            ("auto", torch.float32),
+            ("float16", torch.float16),
+            ("float32", torch.float32),
+        ):
+            with self.subTest(requested=requested, resolved=resolved):
+                args = self._epd_args("--dtype", requested)
+                self.config.dtype = resolved
+                with self.assertRaisesRegex(ValueError, "BF16"):
+                    self._validate(args)
+
+    def test_epd_backend_overrides_keep_ring_prefill(self):
+        for options in (
+            ("--attention-backend", "fa3", "--prefill-attention-backend", "trtllm_mha"),
+            ("--decode-attention-backend", "fa3"),
+        ):
+            with self.subTest(options=options):
+                args = self._epd_args(*options)
+                self._validate(args)
+                self.assertEqual(
+                    resolution_result(args, "cuda_graph_config").decode.backend,
+                    Backend.DISABLED,
+                )
+
+    def test_ring_cp_rejects_incompatible_backend_overrides(self):
+        # Physical CP KV storage cannot be used by a non-CP prefill backend.
+        # An explicit decode-only selection must also fail before allocation.
+        for options in (
+            ("--decode-attention-backend", "trtllm_mha"),
+            ("--attention-backend", "fa4", "--decode-attention-backend", "fa3"),
+            ("--prefill-attention-backend", "triton"),
+        ):
+            with self.subTest(options=options):
+                args = self._ring_args(*options)
+                with self.assertRaisesRegex(ValueError, "Sharded CP"):
+                    self._validate(args)
+
+    def test_encoder_url_can_register_dynamically(self):
+        args = self._ring_args("--enable-multimodal", "--language-only")
+        self._validate(args)
+        self.assertEqual(args.encoder_urls, [])
+
+    def test_inline_vision_is_rejected_even_with_an_encoder_url(self):
+        args = self._ring_args(
+            "--enable-multimodal",
+            "--encoder-urls",
+            "http://encoder.invalid:30000",
+        )
+        with self.assertRaisesRegex(ValueError, "language-only"):
+            self._validate(args)
+
+    def test_encoder_and_decode_roles_do_not_inherit_ring_cp(self):
+        roles = (
+            ("--encoder-only",),
+            (
+                "--language-only",
+                "--disaggregation-mode",
+                "decode",
+                "--encoder-urls",
+                "http://encoder.invalid:30000",
+            ),
+        )
+        for options in roles:
+            with self.subTest(options=options):
+                args = self._parse("--enable-multimodal", *options)
+                self._validate(args)
+                self.assertTrue(args.enable_multimodal)
+                self.assertEqual(args.attn_cp_size, 1)
+                self.assertNotIn(
+                    "ring_cp",
+                    (
+                        args.attention_backend,
+                        args.prefill_attention_backend,
+                        args.decode_attention_backend,
+                    ),
+                )
+                self.assertNotEqual(
+                    resolution_result(args, "cuda_graph_config").decode.backend,
+                    Backend.DISABLED,
+                )
+                if args.encoder_only:
+                    self.assertEqual(args.disaggregation_mode, "null")
+
+    def test_encoder_role_does_not_enable_sharded_prefill(self):
+        from sglang.srt.layers.cp.utils import is_sharded_cp_enabled
+
+        args = self._ring_args(
+            "--enable-multimodal",
+            "--encoder-only",
+            "--disaggregation-mode",
+            "null",
+        )
+        self._validate(args)
+        self.assertFalse(is_sharded_cp_enabled(args))
+
+    def test_ring_cp_rejects_non_prefill_roles(self):
+        for role in ("null", "decode"):
+            with self.subTest(role=role):
+                args = self._epd_args("--disaggregation-mode", role)
+                with self.assertRaisesRegex(ValueError, "PD prefill"):
+                    self._validate(args)
+
+    def test_ring_cp_topology_restrictions_remain(self):
+        invalid = (
+            ("tp_size", 4),
+            ("dp_size", 2),
+            ("pp_size", 2),
+            ("moe_dp_size", 2),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name, value=value):
+                args = self._epd_args()
+                setattr(args, name, value)
+                with self.assertRaisesRegex(ValueError, "CP=TP"):
+                    self._validate(args)
+
+    def test_gdn_cp_is_independent_of_architecture_name_and_expert_partition(self):
+        from sglang.srt.configs.qwen3_5 import Qwen3_5Config, Qwen3_5MoeConfig
+
+        for config_type in (Qwen3_5Config, Qwen3_5MoeConfig):
+            for ep in (1, 2, 4):
+                with self.subTest(config=config_type, ep=ep):
+                    self.config.hf_config = config_type(architectures=["CustomGDN"])
+                    args = self._ring_args("--ep-size", str(ep), world=4)
+                    self._validate(args)
+                    handle_a2a_moe(args)
+                    self.assertEqual(resolution_result(args, "ep_size"), ep)
+
+    def test_flashqla_with_cp_rejects_non_gdn_and_unsupported_head_dimensions(self):
+        from transformers import PretrainedConfig
+
+        args = self._ring_args()
+        self.config.hf_config.text_config.linear_key_head_dim = 64
+        with self.assertRaisesRegex(ValueError, "head dimensions of 128"):
+            self._validate(args)
+        self.config.hf_config = PretrainedConfig(architectures=["CustomAttention"])
+        with self.assertRaisesRegex(ValueError, "requires GDN layers"):
+            self._validate(args)
+
+    def _qwen4_args(self, *options, gdn=True, heads=16):
+        from sglang.srt.configs.qwen4_exp import Qwen4ExpConfig
+
+        self.config.hf_config = Qwen4ExpConfig(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            text_config=dict(
+                indexer_n_heads=8,
+                indexer_kv_heads=1,
+                indexer_head_dim=128,
+                indexer_budget=2048,
+                indexer_compress_ratio=4,
+                linear_num_key_heads=heads,
+                linear_num_value_heads=heads * 2,
+            ),
+        )
+        return self._ring_args(
+            "--enable-prefill-cp",
+            "--cp-strategy",
+            "interleave",
+            "--attention-backend",
+            "qsa",
+            "--linear-attn-prefill-backend",
+            "flashqla" if gdn else "triton",
+            *options,
+        )
+
+    def test_qwen4_group_sharing_does_not_depend_on_qsa_profile_or_ep(self):
+        for gdn in (False, True):
+            for ep in (1, 2):
+                for strategy in ("zigzag", "interleave"):
+                    for indexer_heads in (None, 8):
+                        with self.subTest(
+                            gdn=gdn, ep=ep, strategy=strategy, heads=indexer_heads
+                        ):
+                            args = self._qwen4_args(
+                                "--ep-size", str(ep), "--cp-strategy", strategy, gdn=gdn
+                            )
+                            self.config.hf_config.text_config.indexer_n_heads = (
+                                indexer_heads
+                            )
+                            self._validate(args)
+                            handle_a2a_moe(args)
+                            self.assertTrue(
+                                resolution_result(args, "enable_cp_tp_group_sharing")
+                            )
+                            self.assertEqual(resolution_result(args, "ep_size"), ep)
+
+    def test_qsa_gdn_cp_keeps_full_heads_but_tp_requires_divisibility(self):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+
+        args = self._qwen4_args(heads=3)
+        self._validate(args)
+        resolve_cp_tp_group_sharing(args, self.config)
+        self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
+        args = self._qwen4_args(gdn=False, heads=3)
+        with self.assertRaisesRegex(ValueError, "must be divisible"):
+            resolve_cp_tp_group_sharing(args, self.config)
+
+    def test_cp_validation_does_not_parse_sparse_attention_kernel_config(self):
+        args = self._qwen4_args("--attention-backend", "fa3")
+        self.config.hf_config.text_config.indexer_compress_ratio = 3
+        self._validate(args)
+        self.assertTrue(resolution_result(args, "enable_cp_tp_group_sharing"))
+
+    def test_qsa_profile_does_not_enable_an_unintegrated_architecture(self):
+        from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
+            resolve_cp_tp_group_sharing,
+        )
+
+        args = self._qwen4_args(gdn=False)
+        self.config.hf_config.architectures = ["CustomCompressedAttention"]
+        resolve_cp_tp_group_sharing(args, self.config)
+        self.assertFalse(resolution_result(args, "enable_cp_tp_group_sharing"))
+
+    def test_mega_constraints_run_after_ep_normalization(self):
+        for qsa in (False, True):
+            with self.subTest(qsa=qsa):
+                make_args = self._qwen4_args if qsa else self._ring_args
+                args = make_args("--enable-mxfp4-mega", "--moe-a2a-backend", "megamoe")
+                self.assertEqual(args.ep_size, 1)
+                self._validate(args)
+                handle_a2a_moe(args)
+                self.assertEqual(resolution_result(args, "ep_size"), args.tp_size)
+        args = self._qwen4_args("--enable-mxfp4-mega")
+        self._validate(args)
+        with self.assertRaisesRegex(ValueError, "requires --moe-a2a-backend megamoe"):
+            handle_a2a_moe(args)
+        args = self._qwen4_args(
+            "--enable-mxfp4-mega",
+            "--moe-a2a-backend",
+            "megamoe",
+            "--tp-size",
+            "4",
+            gdn=False,
+        )
+        with self.assertRaisesRegex(
+            ValueError, "mapped combine requires a shared CP/EP group"
+        ):
+            handle_a2a_moe(args)
+
+    def test_mega_layout_contract_does_not_select_attention_or_model(self):
+        """An unchanged MoE row topology must not require GDN or a QSA model."""
+        from transformers import PretrainedConfig
+
+        self.config.hf_config = PretrainedConfig(architectures=["UnrelatedMoE"])
+        for attention, linear in (
+            ("fa3", "triton"),
+            ("triton", "flashinfer"),
+            ("qsa", "flashqla"),
+        ):
+            with self.subTest(attention=attention, linear=linear):
+                args = self._ring_args(
+                    "--enable-mxfp4-mega",
+                    "--attention-backend",
+                    attention,
+                    "--linear-attn-prefill-backend",
+                    linear,
+                    "--ep-size",
+                    "1",
+                    backend="megamoe",
+                    world=4,
+                )
+                handle_a2a_moe(args)
+                self.assertEqual(resolution_result(args, "ep_size"), 4)
+                self.assertEqual(
+                    resolution_result(args, "attention_backend"), attention
+                )
+                self.assertEqual(
+                    resolution_result(args, "linear_attn_prefill_backend"), linear
+                )
+
+    def test_page_size_and_capacity_restrictions_remain(self):
+        invalid = (
+            ("page_size", 65),
+            ("page_size", None),
+            ("max_running_requests", None),
+            ("max_running_requests", 0),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name, value=value):
+                args = self._epd_args()
+                setattr(args, name, value)
+                with self.assertRaisesRegex(ValueError, "BF16"):
+                    self._validate(args)
+
+    def test_unrelated_unsupported_features_remain_rejected(self):
+        invalid = (
+            ("speculative_algorithm", "EAGLE"),
+            ("enable_lora", True),
+            ("enable_hierarchical_cache", True),
+        )
+        for name, value in invalid:
+            with self.subTest(name=name):
+                args = self._epd_args()
+                setattr(args, name, value)
+                with self.assertRaisesRegex(ValueError, "speculation, LoRA, HiCache"):
+                    self._validate(args)
+
+    def test_encoder_role_conflicts_remain_rejected(self):
+        for options, message in (
+            (("--encoder-only", "--language-only"), "together"),
+            (
+                ("--encoder-only", "--disaggregation-mode", "prefill"),
+                "prefill/decode",
+            ),
+        ):
+            with self.subTest(options=options):
+                args = self._parse("--enable-multimodal", *options)
+                with self.assertRaisesRegex(ValueError, message):
+                    self._validate(args)
 
 
 if __name__ == "__main__":

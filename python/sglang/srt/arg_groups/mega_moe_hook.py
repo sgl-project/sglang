@@ -44,6 +44,32 @@ def check_mega_moe_compat(server_args: ServerArgs) -> None:
         )
 
 
+def validate_mxfp4_mega_compat(server_args: ServerArgs) -> None:
+    """Validate the fused workspace/combine contract after EP normalization."""
+    cfg = resolving_view(server_args)
+    if not cfg.enable_mxfp4_mega or cfg.encoder_only:
+        return
+    if cfg.moe_a2a_backend != "megamoe":
+        raise ValueError("--enable-mxfp4-mega requires --moe-a2a-backend megamoe")
+    if (
+        cfg.attn_cp_size <= 1
+        or not (cfg.attn_cp_size == cfg.tp_size == cfg.ep_size)
+        or cfg.attn_dp_size != 1
+        or cfg.moe_dp_size != 1
+        or cfg.pp_size != 1
+        or cfg.dp_size != 1
+        or cfg.disaggregation_mode != "prefill"
+    ):
+        raise ValueError(
+            "MXFP4 MegaMoE mapped combine requires a shared CP/EP group spanning "
+            "TP, CP=EP=TP>=2, DP=attention-DP=MoE-DP=PP=1, and PD prefill"
+        )
+    if not cfg.max_running_requests or cfg.max_running_requests < 0:
+        raise ValueError(
+            "MXFP4 MegaMoE workspace requires positive max-running-requests"
+        )
+
+
 # MoE blocks with no fused-MoE fallback under megamoe.
 MEGA_MOE_NO_FALLBACK_ARCHS = frozenset(
     {
@@ -158,6 +184,11 @@ def validate_flydsl_decode_capacity(server_args: ServerArgs) -> None:
 def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) -> None:
     cfg = resolving_view(server_args)
     if cfg.moe_a2a_backend != "megamoe":
+        return
+    if cfg.enable_mxfp4_mega:
+        # This implementation sizes its own workspace from CP shard padding,
+        # chunk/context limits and request capacity. The DeepGEMM buffer budget
+        # below belongs to the other MegaMoE implementation.
         return
     if get_platform().is_hip:
         return
