@@ -173,6 +173,7 @@ class KVArgsRegisterInfo:
     dst_dcp_rank: int = 0
     requires_dcp_relayout: bool = False
     dcp_token_item_lens: Optional[List[int]] = None
+    dst_draft_rows_dcp_collapsed: bool = False
     dst_kv_item_lens: List[int] = dataclasses.field(default_factory=list)
     staging_base_ptr: int = 0
     staging_total_size: int = 0
@@ -230,6 +231,7 @@ class KVArgsRegisterInfo:
                 if len(msg) > 20 and msg[20]
                 else []
             ),
+            dst_draft_rows_dcp_collapsed=(len(msg) > 21 and msg[21] == b"1"),
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -1063,6 +1065,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Use the manager's captured target layout, not scoped CP flags.
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
+            # A DCP-collapsed MLA draft (Kimi-K3.1) is replicated like the
+            # target and goes through the DCP send path.
+            and not registration_info.dst_draft_rows_dcp_collapsed
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
@@ -1650,6 +1655,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: Optional[List[int]] = None,
         dst_tp_rank: int = 0,
         dst_attn_tp_size: Optional[int] = None,
+        draft_rows_collapsed: bool = False,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
         if num_kv_tokens is None:
@@ -1691,6 +1697,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             src_page_offset=src_page_offset,
             decode_prefix_len=decode_prefix_len,
             num_kv_tokens=num_kv_tokens,
+            draft_rows_collapsed=draft_rows_collapsed,
         )
         if plan.empty():
             return 0
@@ -1756,8 +1763,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 src_width = dcp_token_item_lens[entry]
                 dst_width = src_width
                 if dst_kv_item_lens:
+                    draft_page_scale = physical_page_size * (
+                        1 if draft_rows_collapsed else dst_dcp_size
+                    )
                     dst_width, remainder = divmod(
-                        dst_kv_item_lens[entry], physical_page_size * dst_dcp_size
+                        dst_kv_item_lens[entry], draft_page_scale
                     )
                     if remainder or dst_width <= 0:
                         raise ValueError("Invalid PD DCP draft destination token width")
@@ -2960,6 +2970,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 ),
                                 pack_buffer=pack_buffer,
                                 dst_kv_item_lens=target_rank_registration_info.dst_kv_item_lens,
+                                draft_rows_collapsed=target_rank_registration_info.dst_draft_rows_dcp_collapsed,
                                 dst_tp_rank=target_rank_registration_info.dst_tp_rank,
                                 dst_attn_tp_size=target_rank_registration_info.dst_attn_tp_size,
                                 dsa_index_k=self.dsa_index_k_dcp_entries(
@@ -3268,11 +3279,10 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         dst_item_lens: List[Optional[int]] = [
                             decode_kv_args.dst_kv_item_len
                         ] * (num_entries - num_draft) + [None] * num_draft
-                        decode_kv_args.dcp_token_item_lens = (
-                            self.prepare_dcp_token_item_lens(
-                                dst_item_lens,
-                                decode_kv_args.dst_dcp_size,
-                            )
+                        decode_kv_args.dcp_token_item_lens = self.prepare_dcp_token_item_lens(
+                            dst_item_lens,
+                            decode_kv_args.dst_dcp_size,
+                            draft_rows_collapsed=decode_kv_args.dst_draft_rows_dcp_collapsed,
                         )
                         self._init_dcp_pack_buffers_once(
                             decode_kv_args.dst_dcp_size, include_draft=True
@@ -3564,6 +3574,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 f"{len(self.kv_args.kv_item_lens)}Q",
                 *self.kv_args.kv_item_lens,
             ),
+            b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
         ]
 
     def build_receiver_metadata_message(
