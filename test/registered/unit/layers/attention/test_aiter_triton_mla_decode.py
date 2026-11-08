@@ -1,12 +1,15 @@
 """When the aiter backend sends MLA decode to aiter's Triton mla_decode_fwd on gfx1250."""
 
+import os
 import sys
 import types
 import unittest
+import warnings
 from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention import aiter_backend
 from sglang.srt.layers.attention import aiter_triton_mla as atm
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
@@ -131,6 +134,120 @@ class TestSupportsAiterTritonMlaDecode(CustomTestCase):
         ):
             with self.subTest(**kwargs):
                 self.assertFalse(self._supports(**kwargs))
+
+
+class TestResolveAiterMlaDecodeBackend(CustomTestCase):
+    def _resolve(self, value, gfx1250=True, **overrides):
+        kwargs = dict(
+            use_mla=True,
+            input_dtype=torch.bfloat16,
+            dcp_world_size=1,
+            qk_rope_head_dim=_ROPE_DIM,
+        )
+        kwargs.update(overrides)
+        with mock.patch.object(atm, "is_gfx1250_supported", return_value=gfx1250):
+            return atm.resolve_aiter_mla_decode_backend(value, **kwargs)
+
+    def _env_value(self, **env):
+        names = (
+            "SGLANG_AITER_MLA_DECODE_BACKEND",
+            "SGLANG_AITER_MLA_DCP_DECODE_BACKEND",
+        )
+        with mock.patch.dict(os.environ):
+            for name in names:
+                os.environ.pop(name, None)
+            os.environ.update(env)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", DeprecationWarning)
+                return envs.SGLANG_AITER_MLA_DECODE_BACKEND.get()
+
+    def test_unset_env_runs_aiter_triton_mla_on_gfx1250(self):
+        self.assertEqual(self._resolve(self._env_value()), "triton")
+
+    def test_unset_env_keeps_asm_off_gfx1250(self):
+        for kwargs in (dict(gfx1250=False), dict(use_mla=False)):
+            with self.subTest(**kwargs):
+                self.assertEqual(self._resolve(self._env_value(), **kwargs), "asm")
+
+    def test_auto_keeps_asm_where_the_triton_kernel_cannot_serve(self):
+        """The cases supports_aiter_triton_mla_decode declines keep the
+        existing dispatch, as before the env had a triton value."""
+        for kwargs in (
+            dict(dcp_world_size=2),
+            dict(input_dtype=torch.float16),
+            dict(qk_rope_head_dim=0),
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(self._resolve("auto", **kwargs), "asm")
+
+    def test_explicit_triton_and_the_deprecated_name(self):
+        self.assertEqual(self._resolve("triton"), "triton")
+        self.assertEqual(self._resolve("TRITON"), "triton")
+        value = self._env_value(SGLANG_AITER_MLA_DCP_DECODE_BACKEND="triton")
+        self.assertEqual(self._resolve(value), "triton")
+
+    def test_triton_the_kernel_cannot_serve_raises(self):
+        for kwargs in (
+            dict(gfx1250=False),
+            dict(gfx1250=False, use_mla=False),
+            dict(dcp_world_size=2),
+            dict(input_dtype=torch.float16),
+            dict(qk_rope_head_dim=0),
+        ):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, "=triton"):
+                    self._resolve("triton", **kwargs)
+
+    def test_asm_and_gluon_are_ignored_on_gfx1250_bf16(self):
+        """aiter's gfx1250 ASM decode takes only an fp8 query and its own
+        64-token page layout, and mla_gluon asserts gfx950, so these values keep
+        the Triton decode and log that they are ignored."""
+        for value in ("asm", "gluon", "ASM"):
+            with self.subTest(value=value):
+                with mock.patch.object(atm, "print_info_once") as log:
+                    self.assertEqual(self._resolve(value), "triton")
+                log.assert_called_once()
+                self.assertIn("ignored", log.call_args.args[0])
+
+    def test_auto_and_triton_do_not_log_ignored(self):
+        for value in ("auto", "triton"):
+            with self.subTest(value=value):
+                with mock.patch.object(atm, "print_info_once") as log:
+                    self.assertEqual(self._resolve(value), "triton")
+                log.assert_not_called()
+
+    def test_asm_keeps_the_existing_dispatch_where_triton_cannot_serve(self):
+        """Including the DCP ASM PS decode on gfx1250."""
+        for kwargs in (
+            dict(dcp_world_size=2),
+            dict(input_dtype=torch.float16),
+            dict(qk_rope_head_dim=0),
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(self._resolve("asm", **kwargs), "asm")
+
+    def test_gluon_raises_on_gfx1250_where_triton_cannot_serve(self):
+        """aiter's mla_gluon asserts gfx950."""
+        for kwargs in (dict(dcp_world_size=2), dict(input_dtype=torch.float16)):
+            with self.subTest(**kwargs):
+                with self.assertRaisesRegex(ValueError, "=gluon"):
+                    self._resolve("gluon", **kwargs)
+
+    def test_other_archs_keep_asm_and_gluon(self):
+        for value in ("asm", "gluon", "ASM", "Gluon"):
+            for kwargs in (
+                dict(gfx1250=False),
+                dict(gfx1250=False, dcp_world_size=2),
+                dict(gfx1250=False, use_mla=False),
+            ):
+                with self.subTest(value=value, **kwargs):
+                    self.assertEqual(self._resolve(value, **kwargs), value.lower())
+
+    def test_invalid_value_raises(self):
+        for gfx1250 in (True, False):
+            with self.subTest(gfx1250=gfx1250):
+                with self.assertRaisesRegex(ValueError, "must be 'auto'"):
+                    self._resolve("aiter", gfx1250=gfx1250)
 
 
 class TestTritonMlaBlockSize(CustomTestCase):
@@ -488,6 +605,36 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
             "aiter gfx1250: MLA layers with logit_cap=30.0 skip the aiter Triton "
             "MLA decode"
         )
+
+    def test_soft_capped_layer_keeps_the_asm_ps_preference_under_triton(self):
+        """A "triton" backend's batches outside the Triton kernel prefer ASM PS
+        over mla_gluon as "asm" does; only "gluon" holds them on mla_gluon."""
+        layer = _layer()
+        layer.logit_cap = 30.0
+        gluon_out = torch.full((1, _HEADS, _KV_LORA_RANK), 5.0)
+        for value, expected in (
+            ("triton", self.asm_out),
+            ("asm", self.asm_out),
+            ("gluon", gluon_out),
+        ):
+            with (
+                self.subTest(value),
+                mock.patch.multiple(
+                    aiter_backend,
+                    prefer_mla_gluon_decode=lambda **_: True,
+                    mla_gluon_decode=lambda **_: gluon_out,
+                    _use_mla_ps_kernel=True,
+                ),
+                mock.patch.multiple(
+                    aiter_backend.AiterAttnBackend,
+                    _asm_ps_supports_qlen=lambda self, q_len: True,
+                    _resolve_mla_gluon_min_kv_seq_len=lambda self, fb: 1,
+                ),
+            ):
+                backend = _backend()
+                backend.mla_decode_backend = value
+                self.assertIs(self._decode(backend, layer, 1), expected)
+        self.assertEqual(self.kernel.calls, [])
 
     def test_kv_descale_matches_the_asm_decode(self):
         """The MLA store writes K unscaled; only an fp8 cache takes the k_scale."""

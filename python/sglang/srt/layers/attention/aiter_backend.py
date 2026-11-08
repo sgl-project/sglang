@@ -102,7 +102,7 @@ from sglang.srt.layers.attention.aiter_mla_gluon import (
 )
 from sglang.srt.layers.attention.aiter_triton_mla import (
     aiter_triton_mla_decode,
-    supports_aiter_triton_mla_decode,
+    resolve_aiter_mla_decode_backend,
     triton_mla_block_size,
     triton_mla_block_tables,
 )
@@ -469,12 +469,15 @@ class AiterAttnBackend(AttentionBackend):
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
 
         self.dcp_world_size = get_parallel().attn_dcp_size
-        self.mla_decode_backend = envs.SGLANG_AITER_MLA_DECODE_BACKEND.get().lower()
-        if self.mla_decode_backend not in ("gluon", "asm"):
-            raise ValueError(
-                "SGLANG_AITER_MLA_DECODE_BACKEND must be 'gluon' or 'asm', "
-                f"got {self.mla_decode_backend!r}"
-            )
+        self.mla_decode_backend = resolve_aiter_mla_decode_backend(
+            envs.SGLANG_AITER_MLA_DECODE_BACKEND.get(),
+            use_mla=self.use_mla,
+            input_dtype=self.input_dtype,
+            dcp_world_size=self.dcp_world_size,
+            qk_rope_head_dim=(
+                model_runner.model_config.qk_rope_head_dim if self.use_mla else 0
+            ),
+        )
         self.use_mla_dcp_asm = (
             self.use_mla
             and self.dcp_world_size > 1
@@ -763,15 +766,11 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # Batches on the aiter Triton MLA decode do not read
-            # SGLANG_AITER_MLA_DECODE_BACKEND, SGLANG_AITER_MLA_GLUON or
-            # SGLANG_AITER_MLA_PERSIST.
+            # SGLANG_AITER_MLA_DECODE_BACKEND=triton (the gfx1250 default) runs
+            # aiter.ops.triton.attention.mla.mla_decode_fwd; its batches do not
+            # read SGLANG_AITER_MLA_GLUON or SGLANG_AITER_MLA_PERSIST.
             if is_gfx1250_supported():
-                self.use_aiter_triton_mla_decode = supports_aiter_triton_mla_decode(
-                    input_dtype=self.input_dtype,
-                    dcp_world_size=self.dcp_world_size,
-                    qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
-                )
+                self.use_aiter_triton_mla_decode = self.mla_decode_backend == "triton"
                 logger.info(
                     "aiter gfx1250 Triton MLA decode is %s",
                     (
@@ -1760,13 +1759,15 @@ class AiterAttnBackend(AttentionBackend):
 
         max_q_len = self.forward_metadata.max_q_len or 1
 
+        # "triton" batches that reach here (soft cap, draft decode) keep the
+        # ASM PS preference "asm" gives them.
         if prefer_mla_gluon_decode(
             head_pad_mode=getattr(self, "head_pad_mode", "none"),
             num_head=getattr(self, "num_head", layer.tp_q_head_num),
             kv_cache_dtype=self.kv_cache_dtype,
         ) and not (
             _use_mla_ps_kernel
-            and self.mla_decode_backend == "asm"
+            and self.mla_decode_backend != "gluon"
             and self._asm_ps_supports_qlen(max_q_len)
         ):
             return mla_gluon_decode(
