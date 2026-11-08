@@ -421,7 +421,6 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache_arr = []
     prefix_kv_cache = torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
-    # Host lists: indexing the CPU tensors per request costs an item() each.
     padded_list = padded_lens.tolist()
     left_list = left_pads.tolist()
     local_list = local_kv_lens.tolist()

@@ -19,15 +19,8 @@ if TYPE_CHECKING:
 
 
 def seed_cu_seqlens_contents(cu_seqlens: torch.Tensor, extend_seq_lens_cpu) -> None:
-    """Give FlashInfer the host contents of this forward's cu_seqlens.
-
-    FlashInfer's KDA prefill reads cu_seqlens to the host once per tensor
-    (kda_chunked_bt16._cu_seqlens_contents), a device-to-host copy that
-    synchronizes the stream on the first KDA layer of every forward. The
-    scheduler already has the lengths on the host, so fill FlashInfer's memo
-    for this tensor instead. Skipped when the shapes disagree or the memo is
-    absent (other FlashInfer versions).
-    """
+    # Pre-fill FlashInfer's cu_seqlens memo and plan cache from host lengths so
+    # its KDA prefill skips a D2H read and a pageable H2D copy (stream syncs).
     if (
         extend_seq_lens_cpu is None
         or len(extend_seq_lens_cpu) + 1 != cu_seqlens.numel()
@@ -47,9 +40,6 @@ def seed_cu_seqlens_contents(cu_seqlens: torch.Tensor, extend_seq_lens_cpu) -> N
         version = None
     memo[cu_seqlens.data_ptr()] = (weakref.ref(cu_seqlens), version, contents)
 
-    # FlashInfer's _plan builds its chunk-prefix tensor with torch.tensor(list,
-    # device=cuda) on a cache miss (new lengths every forward): a pageable copy
-    # that waits for the stream. Fill the same cache entry from pinned memory.
     plan_cache = getattr(fi_kda, "_PLAN_CACHE", None)
     bt = getattr(fi_kda, "BT", None)
     if plan_cache is None or bt is None:
@@ -65,7 +55,6 @@ def seed_cu_seqlens_contents(cu_seqlens: torch.Tensor, extend_seq_lens_cpu) -> N
         "total_chunks": cu_chunks[-1],
         "cu_chunks": host.to(cu_seqlens.device, non_blocking=True),
         "cu_list": list(contents),
-        # Keeps the pinned source alive until the copy has run.
         "_host_cu_chunks": host,
     }
 
