@@ -9,7 +9,7 @@ transport backends are supported:
 
 **SHM mode** (single-node, default)::
 
-    Scheduler  ──ShmLoadSnapshotWriter──▶  /dev/shm mmap file
+    Scheduler  ──ShmLoadSnapshotWriter──▶  node-local mmap file
                                                ▲
     TokenizerManager  ──ShmLoadSnapshotReader───┘  (for /v1/loads)
     DataParallelController  ──ShmLoadSnapshotReader─┘  (for dispatch)
@@ -27,7 +27,7 @@ write a node-local file.
     ZmqShmLoadSnapshotReader (PULL, node 0)  ◀─────────────────┘
         │  drains zmq, writes to SHM
         ▼
-    /dev/shm mmap file (node 0)
+    node-local mmap file (node 0)
         ▲
     TokenizerManager / DataParallelController  ──ShmLoadSnapshotReader──┘
 
@@ -37,6 +37,9 @@ receives snapshots from all schedulers via zmq PUSH/PULL and writes them
 into the local SHM file.  All readers (TokenizerManager,
 DataParallelController) on
 node 0 then read from SHM.
+
+The mmap files live in ``/dev/shm`` on Linux and the temporary directory
+on macOS, which does not provide ``/dev/shm``.
 
 ``zmq_reader_owner()`` decides which process on node 0 binds the zmq
 PULL socket (only one can bind); the other reads plain SHM.
@@ -50,6 +53,8 @@ import logging
 import mmap
 import os
 import struct
+import sys
+import tempfile
 from contextlib import contextmanager
 from typing import Optional
 
@@ -310,7 +315,8 @@ def shm_path_for(ipc_name: str) -> str:
     name = os.path.basename(ipc_name.rstrip("/")) or "default"
     safe_name = "".join(c if c.isalnum() or c in "._-" else "_" for c in name)
     digest = hashlib.blake2s(ipc_name.encode(), digest_size=4).hexdigest()
-    return f"/dev/shm/sglang_loads_{safe_name}_{digest}.shm"
+    directory = tempfile.gettempdir() if sys.platform == "darwin" else "/dev/shm"
+    return os.path.join(directory, f"sglang_loads_{safe_name}_{digest}.shm")
 
 
 def file_size(dp_size: int, slot_size: int = SLOT_SIZE) -> int:
