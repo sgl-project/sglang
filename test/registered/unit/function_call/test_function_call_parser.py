@@ -3657,11 +3657,34 @@ class TestGlm47MoeDetector(unittest.TestCase):
 
         self.assertEqual(len(result.calls), 1)
         params = json.loads(result.calls[0].parameters)
-        self.assertEqual(params["city"], r"\C|\.")
+        self.assertEqual(params["city"], r'"\C|\."')
         self.assertFalse(
             any(isinstance(w.message, SyntaxWarning) for w in caught),
             [str(w.message) for w in caught],
         )
+
+    def test_string_argument_keeps_quoted_literal_verbatim(self):
+        """The chat template writes string values raw, so quotes are part of the value."""
+        for value in ['"hello"', "'hello'", '""', '"a" + "b"', '"123"', '"null"']:
+            with self.subTest(value=value):
+                text = (
+                    f"<tool_call>get_weather<arg_key>city</arg_key><arg_value>{value}</arg_value>"
+                    "<arg_key>date</arg_key><arg_value>2024-06-27</arg_value></tool_call>"
+                )
+                result = Glm47MoeDetector().detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 1)
+                params = json.loads(result.calls[0].parameters)
+                self.assertEqual(params["city"], value)
+
+                detector = Glm47MoeDetector()
+                streamed = ""
+                for i in range(0, len(text), 4):
+                    chunk = detector.parse_streaming_increment(
+                        text[i : i + 4], self.tools
+                    )
+                    streamed += "".join(c.parameters or "" for c in chunk.calls)
+                self.assertEqual(json.loads(streamed), params)
+                self.assertEqual(detector.prev_tool_call_arr[0]["arguments"], params)
 
     def test_parse_arguments_preserves_underscore_in_string_args(self):
         """Same PEP 515 guard as the GLM-4 detector, on the GLM-4.7 parser."""
