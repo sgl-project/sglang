@@ -1163,10 +1163,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -2945,7 +2942,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU and runs stage 2 "
                 "on the one with the distilled LoRA merged in. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(
