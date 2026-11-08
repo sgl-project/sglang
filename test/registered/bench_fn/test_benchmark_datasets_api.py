@@ -31,7 +31,11 @@ from sglang.benchmark.datasets.agentic_trace import (
     DEFAULT_AGENTIC_OUTPUT_LEN,
     AgenticTraceDataset,
 )
-from sglang.benchmark.datasets.common import DatasetRow, gen_mm_prompt
+from sglang.benchmark.datasets.common import (
+    DatasetRow,
+    compute_random_lens,
+    gen_mm_prompt,
+)
 from sglang.benchmark.datasets.custom import sample_custom_requests
 from sglang.benchmark.datasets.generated_shared_prefix import (
     GeneratedSharedPrefixDataset,
@@ -538,6 +542,35 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
         )
         self.assertTrue(all(isinstance(row, DatasetRow) for row in rows_text))
         self.assertTrue(all(isinstance(row.prompt, list) for row in rows_ids))
+
+    def test_compute_random_lens_accepts_the_whole_valid_ratio_range(self):
+        # 0 leaves the lengths free and 1 pins them to full_len; both are the
+        # documented ends of the range and both appear as flag defaults.
+        for ratio in (0.0, 0.5, 1.0):
+            lens = compute_random_lens(full_len=100, range_ratio=ratio, num=4)
+            self.assertEqual(len(lens), 4)
+            lower = max(int(100 * ratio), 1)
+            self.assertTrue(
+                all(lower <= value <= 100 for value in lens),
+                f"ratio={ratio} produced {lens} outside [{lower}, 100]",
+            )
+        self.assertEqual(compute_random_lens(100, 1.0, 3), [100, 100, 100])
+
+    def test_compute_random_lens_rejects_a_ratio_outside_the_range(self):
+        # Above 1 the lower bound passes the upper one, so numpy used to raise
+        # "low >= high" from inside a length draw; the flag name and the value
+        # never appeared in that message.
+        for ratio in (1.01, 2.0, -0.5):
+            with self.assertRaises(ValueError) as caught:
+                compute_random_lens(full_len=100, range_ratio=ratio, num=4)
+            message = str(caught.exception)
+            self.assertIn("range_ratio", message)
+            self.assertIn(repr(ratio), message)
+
+    def test_compute_random_lens_keeps_zero_length_free(self):
+        # Embedding benchmarks pass full_len=0 and expect zeros, not a ratio
+        # error, whichever ratio came with them.
+        self.assertEqual(compute_random_lens(0, 0.0, 3), [0, 0, 0])
 
     def test_custom_sampler(self):
         dataset_path = self._write_custom_jsonl()
