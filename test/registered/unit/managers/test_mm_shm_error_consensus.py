@@ -29,6 +29,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 )
 from sglang.srt.managers.mm_utils import (  # noqa: E402
     ShmPointerMMData,
+    strip_mm_features_for_pp_relay,
     wrap_shm_features,
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
@@ -337,7 +338,7 @@ class TestShmPointerFailureCleanup(CustomTestCase):
                 patch.object(
                     handle, "unlink", side_effect=PermissionError("unlink denied")
                 ),
-                self.assertLogs("sglang.utils", level="WARNING"),
+                self.assertLogs("sglang.srt.managers.mm_utils", level="WARNING"),
             ):
                 result = pointer.materialize()
             self.assertTrue(torch.equal(result, torch.ones(1)))
@@ -424,15 +425,14 @@ class TestModelSpecificDataShmWrap(CustomTestCase):
         self._gate(True)
         item = self._item()
         item.set("tiny", torch.zeros(16))  # 64 bytes, below the threshold
+        tiny = item.model_specific_data["tiny"]
         small = item.model_specific_data["images_crop"]  # 3*3*8*8*4 = 2304 bytes
 
         self._wrap(item)
         self._track(item)
 
         self.assertIsInstance(item.model_specific_data["images_crop"], torch.Tensor)
-        self.assertIs(
-            item.model_specific_data["tiny"], item.model_specific_data["tiny"]
-        )
+        self.assertIs(item.model_specific_data["tiny"], tiny)
         self.assertEqual(small.shape, item.model_specific_data["images_crop"].shape)
 
     def test_gate_off_leaves_other_models_untouched(self):
@@ -653,6 +653,40 @@ class TestShmRequestFailureConsensus(CustomTestCase):
 
         self.assertIsInstance(failed_req.mm_inputs, MMInputsProcessError)
         self.assertIsInstance(healthy_req.mm_inputs, MultimodalProcessorOutput)
+
+
+class TestPipelineRelayDropsRawFeatures(unittest.TestCase):
+    def test_relay_drops_hashed_pixels_and_keeps_the_first_stage_request(self):
+        """Relayed PP requests must not carry raw pixels later stages never use;
+        the first stage keeps its features and unhashed items stay hashable downstream."""
+        pixels = torch.ones(3, 8, 8, dtype=torch.uint8)
+        req = TokenizedEmbeddingReqInput(
+            rid="vlm-request",
+            input_text="",
+            input_ids=array("q", [1]),
+            mm_inputs=MultimodalProcessorOutput(
+                mm_items=[
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=pixels, hash=7),
+                    MultimodalDataItem(modality=Modality.IMAGE, feature=pixels),
+                ]
+            ),
+            token_type_ids=None,
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        batched_req = _request(pixels, rid="batched")
+        batched_req.mm_inputs.mm_items[0].hash = 9
+
+        relayed_req, relayed_batch = strip_mm_features_for_pp_relay(
+            [req, BatchTokenizedEmbeddingReqInput(batch=[batched_req])]
+        )
+
+        hashed, unhashed = relayed_req.mm_inputs.mm_items
+        self.assertIsNone(hashed.feature)
+        self.assertEqual(hashed.hash, 7)
+        self.assertIs(unhashed.feature, pixels)
+        self.assertIsNone(relayed_batch.batch[0].mm_inputs.mm_items[0].feature)
+        self.assertIs(req.mm_inputs.mm_items[0].feature, pixels)
+        self.assertIs(batched_req.mm_inputs.mm_items[0].feature, pixels)
 
 
 if __name__ == "__main__":
