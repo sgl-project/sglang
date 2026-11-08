@@ -33,15 +33,6 @@ on:
         type: string
         default: 'false'
 
-# Workflow-level env is NOT inherited from the caller in reusable workflows.
-# The github context (including github.event_name) IS inherited from the caller.
-env:
-  SGLANG_IS_IN_CI: true
-  NCCL_NVLS_ENABLE: "0"
-  SGLANG_CUDA_COREDUMP: "1"
-  PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check == 'true' }}
-
 jobs:
   compute-diffusion-partitions:
     if: inputs.multimodal_gen == 'true'
@@ -77,7 +68,7 @@ jobs:
     with:
       runner_config: diffusion-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 240
+      job_timeout_minutes: 240
       run_timeout_minutes: 240
       partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-1gpu }}
     secrets: inherit
@@ -90,10 +81,9 @@ jobs:
     with:
       runner_config: diffusion-1-gpu-5090
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 180
+      job_timeout_minutes: 180
       run_timeout_minutes: 120
-      pre_test_timeout_minutes: 10
-      pre_test_command: |
+      pre_suite_commands: |
         # SM120-only diffusion unit tests
         (cd python && python3 -m pytest -v -rs \
           sglang/multimodal_gen/test/unit/test_fp8_fa_sm120_attn.py \
@@ -108,7 +98,7 @@ jobs:
     with:
       runner_config: diffusion-bcg-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 90
+      job_timeout_minutes: 90
       run_timeout_minutes: 60
     secrets: inherit
 
@@ -124,7 +114,7 @@ jobs:
     with:
       runner_config: diffusion-2-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 55
+      job_timeout_minutes: 55
       run_timeout_minutes: 55
       retry_deadline_seconds: 3000
       partition_plan: ${{ needs.compute-diffusion-partitions.outputs.plan-2gpu }}
@@ -138,7 +128,7 @@ jobs:
     with:
       runner_config: diffusion-component-2-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 240
+      job_timeout_minutes: 240
       run_timeout_minutes: 240
     secrets: inherit
 
@@ -150,10 +140,10 @@ jobs:
     with:
       runner_config: diffusion-1-gpu-b200
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 240
+      job_timeout_minutes: 240
       run_timeout_minutes: 240
-      pre_test_timeout_minutes: 55
-      pre_test_command: |
+      pre_suite_timeout_minutes: 55
+      pre_suite_commands: |
         # VAE parallel-group regression
         python3 -m pytest -v python/sglang/multimodal_gen/test/single_test_file/test_wan_vae_parallel_groups_4_gpu.py
 
@@ -188,16 +178,14 @@ jobs:
     with:
       runner_config: diffusion-unit-1-gpu-h100
       caller_inputs: ${{ toJson(inputs) }}
-      timeout_minutes: 120
+      job_timeout_minutes: 120
       run_timeout_minutes: 60
-      pre_test_timeout_minutes: 10
-      pre_test_command: |
+      pre_suite_commands: |
         # quant-videogen pins an incompatible torch, so install it without deps
         # plus the import-time deps of the diffusion-qvg extra.
         uv pip install --no-deps quant-videogen==0.1.0 "loguru>=0.7" "termcolor>=2.3"
         uv pip install --no-deps comfy-kitchen==0.2.36
     secrets: inherit
-
 
   diffusion-coverage-check:
     needs: [multimodal-gen-test-1-gpu, multimodal-gen-test-2-gpu]
@@ -226,8 +214,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: reports/
-          pattern: diffusion-report-*
-          merge-multiple: true
+          pattern: diffusion-report-diffusion-?-gpu-h100-*
+          merge-multiple: false
 
       - name: Verify coverage
         run: |

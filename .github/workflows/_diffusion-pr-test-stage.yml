@@ -15,8 +15,8 @@ on:
         description: 'toJson(inputs) from pr-test-multimodal-gen.yml. Read via fromJson(...).runs_on_map / sgl_kernel / continue_on_error / git_ref / skip_pr_test_health_check.'
         required: true
         type: string
-      timeout_minutes:
-        description: 'Job timeout.'
+      job_timeout_minutes:
+        description: 'Timeout of the whole job, covering install, pre-suite commands, and the suite.'
         required: true
         type: number
       run_timeout_minutes:
@@ -28,12 +28,13 @@ on:
         required: false
         type: string
         default: ''
-      pre_test_command:
+      pre_suite_commands:
         description: 'Commands run from the repo root after install, before the suite.'
         required: false
         type: string
         default: ''
-      pre_test_timeout_minutes:
+      pre_suite_timeout_minutes:
+        description: 'Timeout of the pre-suite commands step.'
         required: false
         type: number
         default: 10
@@ -55,10 +56,11 @@ jobs:
   run:
     name: ${{ inputs.runner_config }} (${{ matrix.part }})
     runs-on: ${{ fromJson(fromJson(inputs.caller_inputs).runs_on_map)[inputs.runner_config] }}
-    timeout-minutes: ${{ inputs.timeout_minutes }}
+    timeout-minutes: ${{ inputs.job_timeout_minutes }}
     strategy:
       fail-fast: false
       matrix:
+        # One job per plan part; an unpartitioned lane runs as a single part 0.
         part: ${{ fromJson(inputs.partition_plan || '{"partitions":[{"part":0}]}').partitions.*.part }}
     steps:
       - name: Record retry deadline
@@ -99,10 +101,10 @@ jobs:
         run: |
           CUSTOM_BUILD_SGL_KERNEL=${{ fromJson(inputs.caller_inputs).sgl_kernel }} bash ${{ steps.rc.outputs.install }}
 
-      - name: Run pre-test commands
-        if: inputs.pre_test_command != ''
-        timeout-minutes: ${{ inputs.pre_test_timeout_minutes }}
-        run: ${{ inputs.pre_test_command }}
+      - name: Run pre-suite commands
+        if: inputs.pre_suite_commands != ''
+        timeout-minutes: ${{ inputs.pre_suite_timeout_minutes }}
+        run: ${{ inputs.pre_suite_commands }}
 
       - name: Run diffusion suite
         timeout-minutes: ${{ inputs.run_timeout_minutes }}
@@ -111,8 +113,7 @@ jobs:
           HUGGING_FACE_HUB_TOKEN: ${{ secrets.SGLANG_DIFFUSION_CI_HF_TOKEN || secrets.HF_TOKEN }}
           RUNAI_STREAMER_MEMORY_LIMIT: 0
           DIFFUSION_CONTINUE_ON_ERROR: ${{ fromJson(inputs.caller_inputs).continue_on_error }}
-          # An unpartitioned lane passes empty values, which the suite bridge
-          # skips. format() keeps part 0 and the count from reading as false.
+          # Empty when unpartitioned, so diffusion_suite_bridge.py omits the flags; format() keeps part 0 from reading as false.
           DIFFUSION_PARTITION_ID: ${{ inputs.partition_plan != '' && format('{0}', matrix.part) || '' }}
           DIFFUSION_TOTAL_PARTITIONS: ${{ inputs.partition_plan != '' && format('{0}', fromJson(inputs.partition_plan).partition_count) || '' }}
           DIFFUSION_PARTITION_PLAN_JSON: ${{ inputs.partition_plan }}
