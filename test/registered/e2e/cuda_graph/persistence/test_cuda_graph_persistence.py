@@ -8,11 +8,14 @@ must produce the same greedy tokens as native, restore every archived graph
 Two cases: test_restore_replays_every_archived_graph and
 test_greedy_output_matches_native.
 
-Qwen3.5-2B (hybrid gated DeltaNet) runs decode graphs only: its full-backend
-prefill capture fails in SGLang (the GDN out-of-graph metadata is decode-only).
-test_cuda_graph_persistence_nightly.py covers full-backend prefill plus decode
-graphs with Qwen3-1.7B and the EAGLE3 decode-type graph kinds with
-Qwen3-30B-A3B-FP8.
+Two configurations: Qwen3.5-2B (hybrid gated DeltaNet) with decode graphs
+only, since its full-backend prefill capture fails in SGLang (the GDN
+out-of-graph metadata is decode-only); and Qwen3-30B-A3B-FP8 with EAGLE3
+speculative decoding plus full-backend prefill graphs, which exercises the
+prefill set and the three decode-type graph kinds. Every engine runs with the
+environment pins of Foundry's recipes (_ENGINE_ENV).
+test_cuda_graph_persistence_nightly.py covers full-backend prefill graphs on a
+dense model (Qwen3-1.7B).
 
 Needs the optional dependency sglang[foundry] (the CUDA CI installs it).
 
@@ -37,8 +40,21 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=215, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
 
+# The environment Foundry's recipes (recipe/sglang/set_env.sh) give every engine, set
+# here for native, SAVE and LOAD alike so the three start from the same pins:
+# dynamo off (Foundry pins it on SAVE / LOAD anyway), no DeepGEMM precompile sweep,
+# and host-registered pinned buffers (the FlashInfer decode wrapper pins 8 MiB per
+# captured shape; registering is ~1.5x faster than one cudaHostAlloc each).
+_ENGINE_ENV = {
+    "TORCHDYNAMO_DISABLE": "1",
+    "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
+    "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
+    ),
+}
 _PROMPTS = [
     "The capital of France is",
     "1, 2, 3, 4, 5,",
@@ -169,6 +185,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=cls.server_args + cls._persistence_args(mode),
+                env=_ENGINE_ENV,
                 return_stdout_stderr=(out, err),
             )
             try:
@@ -277,6 +294,40 @@ class TestFoundryGraphPersistence(CustomTestCase):
             for kind in ("sequential", "batched"):
                 with self.subTest(engine=engine, kind=kind):
                     self.assertEqual(self.runs[engine][kind], self.runs["native"][kind])
+
+
+class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
+    """EAGLE3 speculative decoding plus full-backend prefill graphs: the archive
+    holds the prefill graphs and the three decode-type kinds the EAGLE worker
+    captures (target_verify, draft_decode, draft_extend) in place of the target
+    decode graphs, and LOAD restores each set. A small chain (3 steps, top-k 1, 4
+    draft tokens) keeps the run short; greedy outputs stay deterministic. Dummy
+    weights (--load-format dummy, target and draft) keep CI from downloading
+    31 GB: the graphs, their restore and the target's outputs are exercised,
+    draft acceptance is not (a random draft accepts no token)."""
+
+    # Ungated target and draft (the default EAGLE3 pair's Llama target is gated).
+    model = "Qwen/Qwen3-30B-A3B-FP8"
+    attention_backend = "flashinfer"
+    decode_bs = [1, 2, 4, 8]
+    # Tokens per bucket. A prefill replays only when bucket padding is at most 2x,
+    # so the smallest bucket must cover the 5-12 token prompts.
+    prefill_bs = [8, 16, 32, 64]
+    decode_kinds = ["target_verify", "draft_decode", "draft_extend"]
+    extra_server_args = [
+        "--speculative-algorithm",
+        "EAGLE3",
+        "--speculative-draft-model-path",
+        "Tengyunw/qwen3_30b_moe_eagle3",
+        "--speculative-num-steps",
+        "3",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "4",
+        "--load-format",
+        "dummy",
+    ]
 
 
 if __name__ == "__main__":
