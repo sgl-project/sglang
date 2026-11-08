@@ -318,6 +318,11 @@ Please refer to our dedicated guide on [constrained decoding](../advanced_featur
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[List[Optional[Dict[str, Any]]]] = None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Used when employing `CustomLogitProcessor`. For usage, see below.</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>ngram_corpus_ids</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[List[str]] = None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>NGRAM speculative decoding only: draft from these external corpora (ids from `/add_external_corpus`). `None` uses every loaded corpus, `[]` uses none. Ids that are not loaded are ignored.</td>
+    </tr>
   </tbody>
 </table>
 

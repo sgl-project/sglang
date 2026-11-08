@@ -19,10 +19,17 @@ from sglang.srt.speculative.ngram_worker import NGRAMWorker
 
 class TestNgramWorkerPrompt(CustomTestCase):
     def test_multimodal_padding_stays_out_of_corpus(self):
-        for last_round_pending in [False, True]:
+        for last_round_pending, prompt_sam_budget in [
+            (False, 0),
+            (True, 0),
+            (False, 2),
+            (True, 2),
+        ]:
             for multimodal in [False, True]:
                 with self.subTest(
-                    last_round_pending=last_round_pending, multimodal=multimodal
+                    last_round_pending=last_round_pending,
+                    multimodal=multimodal,
+                    prompt_sam_budget=prompt_sam_budget,
                 ):
                     worker = object.__new__(NGRAMWorker)
                     worker.max_trie_depth = 12
@@ -33,6 +40,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         max_bfs_breadth=1,
                         draft_token_num=4,
                         capacity=1000,
+                        prompt_sam_budget=prompt_sam_budget,
                     )
                     req = Req("prompt", "", array("q", [1, 2, 3]), SamplingParams())
                     if multimodal:
@@ -57,6 +65,7 @@ class TestNgramWorkerPrompt(CustomTestCase):
                         max_bfs_breadth=1,
                         draft_token_num=4,
                         capacity=1000,
+                        prompt_sam_budget=prompt_sam_budget,
                     )
                     reference.batch_put([sequence])
                     reference.synchronize()
@@ -68,7 +77,10 @@ class TestNgramWorkerPrompt(CustomTestCase):
                             + ([5] if last_round_pending else [])
                         )
                         expected = reference.batch_get(
-                            [req.rid], [tokens], [len(tokens)]
+                            [req.rid],
+                            [tokens],
+                            [len(tokens)],
+                            prompt_ids=[req.origin_input_ids_unpadded],
                         )
                         actual = worker._prepare_draft_tokens(batch)
                         np.testing.assert_array_equal(actual[0], expected[0])

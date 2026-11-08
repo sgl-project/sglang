@@ -310,6 +310,10 @@ pub struct SamplingParams {
     /// grammar compilation, matching the legacy native gRPC contract.
     #[prost(string, repeated, tag = "28")]
     pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// NGRAM speculative decoding: external corpus ids to draft from. Absent uses
+    /// every loaded corpus; an empty list uses none.
+    #[prost(message, optional, tag = "29")]
+    pub ngram_corpus_ids: ::core::option::Option<StringList>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {
