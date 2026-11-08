@@ -44,6 +44,7 @@ import sglang.multimodal_gen.runtime.models.dits.ltx_2 as ltx2_module
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 import sglang.multimodal_gen.runtime.models.dits.qwen_image21 as qwen_image21
 import sglang.multimodal_gen.runtime.models.dits.sana as sana
+import sglang.multimodal_gen.runtime.models.dits.sana_video2 as sana_video2
 from sglang.kernels.ops.diffusion import (
     FUSED_LN_MODULATE,
     HUNYUAN_QKNORM,
@@ -980,6 +981,38 @@ def test_longcat_qknorm_rope_is_bit_exact():
     assert torch.equal(k_out, k_ref)
     assert longcat_image._LONGCAT_QKNORM_ROPE.verified
     assert not longcat_image._LONGCAT_QKNORM_ROPE.disabled
+
+
+# -------------------------------------------------------------------------
+# SANA-Video 2.0 -- paired fp64 RoPE on the model's q/k views (bit-exact)
+# -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("heads,head_dim", [(20, 128), (10, 256)])
+def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
+    """The fused path must equal the eager complex128 chain on the exact views the
+    linear (head_dim 128) and softmax (head_dim 256) blocks pass: [B, H, S, D]
+    views of contiguous [B, S, H, D] bf16 activations, complex128 3D tables."""
+    torch.manual_seed(5)
+    gate = sana_video2._SANA_VIDEO2_ROPE
+    gate.disabled = False
+    gate.verified = False
+    batch, frames, height, width = 2, 3, 4, 5
+    rope = sana_video2.SanaVideo2RotaryPosEmbed(head_dim, (1, 1, 1)).to("cuda")
+    freqs = rope((frames, height, width), torch.device("cuda"))
+    tables = (freqs, *sana_video2._rope_tables(freqs))
+    tokens = frames * height * width
+    x = torch.randn(batch, tokens, heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    q = x.reshape(batch, tokens, heads, head_dim).transpose(1, 2)
+    k = x.flip(1).reshape(batch, tokens, heads, head_dim).transpose(1, 2)
+    with torch.no_grad():
+        q_out, k_out = sana_video2._apply_rope_pair(q, k, tables)
+        q_ref, k_ref = sana_video2._apply_rope(q, freqs), sana_video2._apply_rope(k, freqs)
+    assert torch.equal(q_out, q_ref)
+    assert torch.equal(k_out, k_ref)
+    assert q_out.stride() == q_ref.stride()
+    assert gate.verified
+    assert not gate.disabled
 
 
 # -------------------------------------------------------------------------
