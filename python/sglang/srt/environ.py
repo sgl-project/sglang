@@ -1760,6 +1760,9 @@ class Envs:
     SGLANG_RESIZE_RESAMPLE = EnvStr("")
     SGLANG_MM_BUFFER_SIZE_MB = EnvInt(0)
     SGLANG_MM_PRECOMPUTE_HASH = EnvBool(False)
+    # Read by the Rust preprocessing extension (rust/sglang-mm), not by Python:
+    # its CPU pool's thread count. None = unset = min(8, CPU cores).
+    SGLANG_MM_RS_THREADS = EnvInt(None)
     SGLANG_VIT_ENABLE_CUDA_GRAPH = EnvBool(False)
     # Use the fully-vectorized ViT position-embedding interpolation (no per-image
     # Python loop / CPU<->GPU sync). Bit-exact with the legacy implementation;
