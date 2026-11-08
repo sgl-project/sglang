@@ -1406,7 +1406,9 @@ class Scheduler(
             send_output=self.send_control_output,
         )
         self._last_logged_elastic_radix_namespace: Optional[str] = None
-        self.session_controller = SessionController(self.tree_cache)
+        self.session_controller = SessionController(
+            self.tree_cache, get_request_lists=self.request_lists
+        )
         self.forward_sleep_time = None
 
     def init_pause_state(self):

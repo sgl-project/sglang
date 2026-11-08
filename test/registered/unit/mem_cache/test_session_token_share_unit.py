@@ -6,6 +6,9 @@
   turn that aborted before finishing (mid-turn and first-turn aborts);
 - max_new_tokens overshoot falls back to a fill_ids rebuild instead of
   carrying an inconsistent array.
+
+And for non-streaming sessions, that a close (explicit or by the timeout
+reaper) does not free media an unfinished request reads.
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -15,23 +18,38 @@ register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 import unittest
 from array import array
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
+import torch
+
+from sglang.srt.environ import envs
+from sglang.srt.managers.io_struct import CloseSessionReqInput
+from sglang.srt.managers.req_types import (
+    FINISH_LENGTH,
+    MultimodalDataItem,
+    MultimodalInputs,
+)
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.sampling.sampling_params import SamplingParams
-from sglang.srt.session.session_controller import Session
+from sglang.srt.session.session_controller import Session, SessionController
 from sglang.test.test_utils import CustomTestCase
 
 VOCAB = 1 << 20
 
 
-def _recv(rid, input_ids, max_new_tokens=8):
+def _recv(rid, input_ids, max_new_tokens=8, parent=None):
     return SimpleNamespace(
         rid=rid,
         input_ids=array("q", input_ids),
         mm_inputs=None,
         session_params=SimpleNamespace(
-            id="s", rid=None, offset=None, replace=False, drop_previous_output=False
+            id="s",
+            rid=parent,
+            offset=None,
+            replace=False,
+            drop_previous_output=False,
         ),
         sampling_params=SamplingParams(max_new_tokens=max_new_tokens),
         lora_id=None,
@@ -207,6 +225,92 @@ class TestSessionTokenShare(CustomTestCase):
         self.assertEqual(len(r2.full_untruncated_fill_ids), 0)  # carry skipped
         r2.refresh_fill_ids()
         self.assertEqual(list(r2.full_untruncated_fill_ids), list(r2.origin_input_ids))
+
+
+class TestSessionTeardown(CustomTestCase):
+    """A non-streaming session's turns share their parents' media items; the
+    session frees them all at close."""
+
+    def setUp(self):
+        # The scheduler's request lists: every request created stays listed.
+        self.listed = []
+        self.controller = SessionController(
+            MagicMock(), get_request_lists=lambda: {ListKind.WAITING: self.listed}
+        )
+        self.controller.open(
+            SimpleNamespace(
+                session_id="s", capacity_of_str_len=0, streaming=False, timeout=None
+            )
+        )
+        self.session = self.controller.get("s")
+        self.now = 0.0
+
+    def _create(self, rid, parent=None, image=None):
+        req = self.session.create_req(
+            _recv(rid, [1, 2], parent=parent),
+            tokenizer=None,
+            vocab_size=VOCAB,
+        )
+        if image is not None:
+            req.extend_image_inputs(
+                MultimodalInputs(
+                    mm_items=[
+                        MultimodalDataItem(
+                            modality=Modality.IMAGE,
+                            identity=image * 32,
+                            feature=torch.ones(1),
+                        )
+                    ]
+                )
+            )
+        self.listed.append(req)
+        return req
+
+    @staticmethod
+    def _finish(req):
+        req.finish_outside_step(FINISH_LENGTH(length=1))
+
+    def _reap(self):
+        self.now += 2.0
+        self.controller.maybe_reap(self.now)
+
+    def _close(self):
+        self.controller.close(CloseSessionReqInput(session_id="s"))
+
+    def test_close_waits_for_unfinished_reader(self):
+        """A close, explicit or by timeout, freed the parent's image under a
+        queued child that reads it."""
+        for by_timeout in (False, True):
+            with self.subTest(by_timeout=by_timeout):
+                self.setUp()
+                parent = self._create("parent", image=b"A")
+                self._finish(parent)
+                child = self._create("child", parent="parent")
+                [item] = child.multimodal_inputs.mm_items
+                if by_timeout:
+                    self.session.timeout = 1.0
+                    self.session.last_active_time -= 2.0
+                    self._reap()
+                else:
+                    self._close()
+                self.assertIn("s", self.controller)
+                self.assertIsNotNone(item.feature)
+                self._finish(child)
+                self._reap()
+                self.assertNotIn("s", self.controller)
+                self.assertIsNone(item.feature)
+
+    def test_media_check_flags_a_reader_outside_the_session(self):
+        """The CI check reads the scheduler's lists, not the session's
+        bookkeeping, so it catches a reader the session does not track."""
+        parent = self._create("parent", image=b"A")
+        self._finish(parent)
+        stray = Req("stray", "", [1], SamplingParams())
+        stray.multimodal_inputs = parent.multimodal_inputs
+        self.listed.append(stray)
+        with envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True):
+            with self.assertRaisesRegex(RuntimeError, "stray"):
+                self._close()
 
 
 if __name__ == "__main__":
