@@ -1,6 +1,3 @@
-"""K3.1 prefill SP tail: per-forward eligibility, this rank's padded row block,
-and the NCCL fallback of the reduce-scatter / all-gather helpers."""
-
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -18,9 +15,6 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class _Group:
-    """A TP group of ``world_size`` ranks whose collectives this rank sees as
-    if every rank held ``x`` (all_gather) / summed ``x`` (reduce_scatter)."""
-
     def __init__(self, world_size=8, rank=3):
         self.world_size = world_size
         self.rank_in_group = rank
@@ -42,8 +36,6 @@ def _parallel(world_size=8, rank=3):
 
 
 class _Model:
-    """Just what KimiK3LinearModel._prefill_sp_begin reads."""
-
     _prefill_sp_first_layer = 1
     _prefill_sp_begin = kimi_k3.KimiK3LinearModel._prefill_sp_begin
 
@@ -78,12 +70,9 @@ class TestK31PrefillSPTail(CustomTestCase):
         self.assertIsNone(self._begin(2048))
 
     def test_padding_to_whole_latent_rows(self):
-        # padded to a multiple of 2 * tp so the [padded, 3584] latent
-        # reduce-scatters on whole rows
         sp = self._begin(12345)
         self.assertEqual((sp.padded, sp.local), (12352, 1544))
         self.assertEqual(sp.rows, slice(3 * 1544, 4 * 1544))
-        # past the K3 symmetric buffers' rows: replicated layout
         self.assertIsNone(self._begin(16380, max_rows=16376))
 
     def test_other_modes_graphs_and_kill_switch(self):

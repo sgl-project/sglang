@@ -462,23 +462,12 @@ def attn_res_all_gather(
     return output
 
 
-# ---------------------------------------------------------------------------
-# Kimi-K3.1 prefill sequence-parallel tail on plain-TP attention (no EP
-# all-to-all). The model keeps the residual stream on each TP rank's 1/tp of
-# the rows and gathers them only for full-row consumers (the attention and the
-# MoE front). These reuse the pull RS / direct AG kernels above on the TP
-# group's CustomAllReduceV2, and fall back to NCCL when it is unavailable.
-# See KimiK3LinearModel._prefill_sp_begin.
-# ---------------------------------------------------------------------------
-
-_PREFILL_SP_AG = "prefill_sp_all_gather"  # direct AG output; each gather overwrites it
+_PREFILL_SP_AG = "prefill_sp_all_gather"
 _PREFILL_SP_COMM = None
 _PREFILL_SP_COMM_INIT = False
 
 
 def prefill_sp_comm():
-    """The TP group's CustomAllReduceV2, registered with the SP collective
-    kernels, or None if the prefill SP tail must use NCCL."""
     global _PREFILL_SP_COMM, _PREFILL_SP_COMM_INIT
     if _PREFILL_SP_COMM_INIT:
         return _PREFILL_SP_COMM
@@ -503,8 +492,6 @@ def prefill_sp_comm():
         return None
     from sglang.kernels.ops.communication import sp_collective
 
-    # One communicator per world size per process: SP-MoE registers the
-    # attention-TP group's, which is this one whenever both can run.
     sp_collective.register_comm(comm.obj)
     _PREFILL_SP_COMM = comm
     logger.info(
@@ -532,10 +519,6 @@ def prefill_sp_reduce_scatter(
     num_blocks: int,
     block_size: int = 1024,
 ) -> torch.Tensor:
-    """``out = reduce_scatter(x) + residual`` over the TP group, rows split
-    rank-major: ``x`` is ``[rows, ...]``; ``out`` and ``residual`` are this
-    rank's ``[rows / tp, ...]`` block. Uses the NVLS pull when ``x`` lies in a
-    K3 symmetric buffer, NCCL otherwise."""
     group = get_parallel().tp_group
     comm = prefill_sp_comm()
     mc_ptr = k3_ar_fusion.find_mc_ptr(x) if comm is not None else None
@@ -559,10 +542,6 @@ def prefill_sp_reduce_scatter(
 def prefill_sp_all_gather(
     x: torch.Tensor, *, num_blocks: int, block_size: int = 1024
 ) -> torch.Tensor:
-    """Gather each rank's ``[rows, H]`` block into ``[tp * rows, H]``,
-    rank-major. The multicast path writes into one persistent K3 symmetric
-    buffer that the next call overwrites; copy the result if it must outlive
-    that."""
     group = get_parallel().tp_group
     rows = x.shape[0] * group.world_size
     comm = prefill_sp_comm()

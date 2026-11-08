@@ -507,26 +507,12 @@ def _uses_ep_a2a() -> bool:
     )
 
 
-# CTAs per prefill SP collective kernel, capped by the communicator's
-# num_pull_blocks. The shared experts' reduce-scatter runs beside the routed
-# experts on the side stream, so it gets fewer.
 _PREFILL_SP_RS_BLOCKS = 96
 _PREFILL_SP_AG_BLOCKS = 32
 _PREFILL_SP_SHARED_RS_BLOCKS = 16
 
 
 class _PrefillSP:
-    """Row layout of one eager prefill forward that runs the sequence-parallel
-    tail (see KimiK3LinearModel._prefill_sp_begin).
-
-    From ``first_layer`` on, the residual stream and the attention-residual
-    bank hold only this TP rank's contiguous ``rows`` of the batch, padded to
-    ``padded`` rows. ``padded`` is a multiple of 2 * tp so the [padded, 3584]
-    latent also splits on whole rows. Pad rows start as zero, never reach a
-    full-row consumer, and are dropped by every gather. Whether a forward takes
-    this path depends only on the batch size and the env, so all TP ranks
-    issue the same collectives."""
-
     __slots__ = (
         "num_tokens",
         "padded",
@@ -545,15 +531,10 @@ class _PrefillSP:
         start = group.rank_in_group * self.local
         self.rows = slice(start, start + self.local)
         self.first_layer = first_layer
-        # The bank's padded storage while the replicated layers before
-        # first_layer use its first num_tokens rows (None: no padding).
         self.bank_storage: Optional[torch.Tensor] = None
         self.entered = False
 
     def gather(self, x: torch.Tensor, *, owned: bool = False) -> torch.Tensor:
-        """Gather this rank's ``[local, H]`` block into ``[num_tokens, H]``.
-        Unless ``owned``, the result is a view of a persistent buffer that the
-        next gather overwrites."""
         full = k3_sp_collective.prefill_sp_all_gather(
             x, num_blocks=_PREFILL_SP_AG_BLOCKS
         )
@@ -569,16 +550,11 @@ class _PrefillSP:
         *,
         num_blocks: int = _PREFILL_SP_RS_BLOCKS,
     ) -> torch.Tensor:
-        """Write this rank's rows of the TP sum of ``x`` (``[padded, ...]``)
-        into ``out``, plus ``residual`` (this rank's rows) if given."""
         return k3_sp_collective.prefill_sp_reduce_scatter(
             x, out, residual, num_blocks=num_blocks
         )
 
     def padded_rows(self, x: torch.Tensor, name: str) -> torch.Tensor:
-        """Return K3 symmetric buffer ``name`` as ``[padded, H]`` with ``x`` in
-        its first num_tokens rows and the pad rows zeroed. o_proj normally
-        writes ``x`` there already; otherwise ``x`` is copied in."""
         full = k3_ar_fusion.symm_buffer(name, self.padded, x.shape[1], x.dtype)
         if x.data_ptr() != full.data_ptr():
             full[: self.num_tokens].copy_(x)
@@ -1786,9 +1762,6 @@ class KimiK3MoE(nn.Module):
 
     @property
     def prefill_sp_capable(self) -> bool:
-        """Whether this MoE can run the prefill SP tail: it needs the fused
-        front, side-stream shared experts and the fused-norm latent tail,
-        whose all-reduce the tail replaces with a reduce-scatter."""
         return (
             self._eligible_for_fused_front
             and self.fuse_ar_norm
@@ -1804,14 +1777,6 @@ class KimiK3MoE(nn.Module):
         prefix_sum: torch.Tensor,
         sp: _PrefillSP,
     ) -> torch.Tensor:
-        """MoE for the prefill SP tail. ``normed`` and ``prefix_sum`` are this
-        rank's rows of the FFN input and of the stream; returns this rank's
-        rows of the next stream.
-
-        The front and the experts run on the gathered rows, as in
-        _forward_fused. The routed latent sum and the shared experts' sum are
-        reduce-scattered instead of all-reduced, so the latent norm, up_proj
-        and tail add run on local rows only."""
         if TYPE_CHECKING:
             assert (
                 self.routed_expert_up_proj is not None and self.alt_stream is not None
@@ -1821,8 +1786,6 @@ class KimiK3MoE(nn.Module):
         num_tokens, padded = sp.num_tokens, sp.padded
         hidden_states = sp.gather(normed)
         gate_up, router_logits, routed_input = self._fused_front(hidden_states)
-        # [latent | shared] TP partials of `padded` rows each, in the symmetric
-        # buffer that the pull reduce-scatter reads through its multicast alias.
         buf = k3_ar_fusion.symm_buffer(
             k3_ar_fusion.MOE_LATENT_SHARED,
             padded,
@@ -1846,8 +1809,7 @@ class KimiK3MoE(nn.Module):
             sp.reduce_scatter(
                 shared_full, shared_local, num_blocks=_PREFILL_SP_SHARED_RS_BLOCKS
             )
-        # The latent and shared reduce-scatters share pull semaphores, so the
-        # latent one must wait for the side stream (as the replicated AR does).
+        # The latent and shared reduce-scatters share pull semaphores.
         current_stream.wait_stream(self.alt_stream)
         latent_local = sp.reduce_scatter(
             latent_full, normed.new_empty((sp.local, latent_size))
@@ -3151,7 +3113,6 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
-        # The stack's bank holder, which the prefill SP tail reads directly.
         self._attn_bank = attn_bank
         self._declare_stages(config, layer_idx, attn_bank)
 
@@ -3237,9 +3198,6 @@ class KimiK3DecoderLayer(nn.Module):
 
     @property
     def prefill_sp_capable(self) -> bool:
-        """Whether this layer can run the prefill SP tail: a latent MoE layer
-        on the attention-residual bank whose FFN writes the next stream, with
-        o_proj writing its TP partial into K3's symmetric buffer."""
         return (
             self._is_moe_layer
             and not self._sp_moe
@@ -3259,15 +3217,7 @@ class KimiK3DecoderLayer(nn.Module):
         zero_allocator: BumpAllocator,
         sp: _PrefillSP,
     ) -> torch.Tensor:
-        """Run this layer on this rank's ``[sp.local, H]`` rows of the stream.
-
-        Same steps as the replicated path (bank read, attention, o_proj sum
-        plus residual, bank read, MoE), but the row-wise steps run on local
-        rows and the full rows are gathered only for the attention and the
-        MoE front."""
         bank = self._attn_bank.require()
-        # A write layer snapshots the local rows into the bank, after which the
-        # running residual restarts empty.
         normed, prefix = bank.forward(
             stream,
             None,
@@ -3281,8 +3231,6 @@ class KimiK3DecoderLayer(nn.Module):
         partial = self._run_self_attn(
             sp.gather(normed), positions, forward_batch, zero_allocator
         )
-        # Reduce-scatter o_proj's TP partial onto the local rows, fusing the
-        # residual add.
         prefix = sp.reduce_scatter(
             sp.padded_rows(partial, k3_ar_fusion.ATTN_O_PROJ),
             stream.new_empty((sp.local, stream.shape[1])),
@@ -3488,8 +3436,6 @@ class KimiK3LinearModel(nn.Module):
                 else pp_proxy_tensors["attn_res_bank"]
             )
             if sp is not None and sp.padded != sp.num_tokens:
-                # The prefill SP tail banks padded rows; the replicated layers
-                # before it bank the leading num_tokens of the same storage.
                 bank = self.attn_bank.open(
                     hidden_states[:1].expand(sp.padded, -1), attn_res_block_num
                 )
@@ -3599,11 +3545,6 @@ class KimiK3LinearModel(nn.Module):
 
     @cached_property
     def _prefill_sp_first_layer(self) -> Optional[int]:
-        """First layer of the prefill SP tail, or None if this stack cannot
-        run it. Needs a single pipeline rank, plain-TP attention (no attention
-        DP or CP), K3's fused all-reduce, the attention-residual bank, and
-        every layer from the first MoE layer on to be prefill_sp_capable.
-        Read only after weight loading, which builds the fused front."""
         parallel = get_parallel()
         if (
             self.attn_bank is None
@@ -3629,14 +3570,9 @@ class KimiK3LinearModel(nn.Module):
     def _prefill_sp_begin(
         self, forward_batch: ForwardBatch, hidden_states: torch.Tensor
     ) -> Optional[_PrefillSP]:
-        """Return the SP tail layout for this forward, or None to keep the
-        replicated layout. Only eager EXTEND batches qualify (no CUDA graph
-        capture or breakable-graph replay, no CP) with at least
-        SGLANG_K31_PREFILL_SP_TAIL_MIN_TOKENS rows, and only if they still fit
-        K3's symmetric buffers after padding to a multiple of 2 * tp. Decode,
-        target-verify and draft passes keep the replicated layout."""
         from sglang.srt.model_executor.forward_mode import ForwardMode
 
+        # Depends only on the batch size and env, so all TP ranks issue the same collectives.
         if (
             not envs.SGLANG_K31_PREFILL_SP_TAIL.get()
             or forward_batch.forward_mode != ForwardMode.EXTEND
@@ -3659,10 +3595,6 @@ class KimiK3LinearModel(nn.Module):
     def _prefill_sp_enter(
         self, hidden_states, forward_batch: ForwardBatch, sp: _PrefillSP
     ) -> torch.Tensor:
-        """Switch from the replicated layers to the SP tail: fold the last FFN
-        output into the stream (as a pipeline handoff does), close the
-        replicated residual stream, move the bank onto its padded storage, and
-        keep this rank's rows of the stream (zero-filled past num_tokens)."""
         stream = residual_batch.fold(hidden_states, forward_batch)
         residual_batch.clear(forward_batch)
         sp.entered = True
@@ -3679,8 +3611,6 @@ class KimiK3LinearModel(nn.Module):
     def _prefill_sp_capture_stream(
         self, layer_idx: int, stream: torch.Tensor, sp: _PrefillSP
     ) -> torch.Tensor:
-        """_dspark_capture_stream for the SP tail: the pre-norm mixture of
-        this rank's rows, gathered into owned storage."""
         if layer_idx + 1 < self.end_layer:
             next_layer = self.layers[layer_idx + 1]
             score_proj = next_layer.self_attention_res_proj
@@ -3699,8 +3629,6 @@ class KimiK3LinearModel(nn.Module):
     def _prefill_sp_final_read(
         self, stream: torch.Tensor, sp: _PrefillSP
     ) -> torch.Tensor:
-        """The final bank read (AttnBankOutputRead) on this rank's rows,
-        gathered into owned storage."""
         normed, _ = self.attn_bank.require().forward(
             stream,
             None,

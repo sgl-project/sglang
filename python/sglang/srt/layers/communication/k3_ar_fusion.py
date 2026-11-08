@@ -140,7 +140,6 @@ def _max_buffer_rows() -> int:
 
 
 def symm_buffer_max_rows() -> int:
-    """Rows every :func:`symm_buffer` holds (the largest prefill batch)."""
     return _max_buffer_rows()
 
 
