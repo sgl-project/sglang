@@ -34,7 +34,8 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (

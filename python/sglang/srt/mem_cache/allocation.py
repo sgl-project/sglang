@@ -179,7 +179,7 @@ def retire_window(
     """Retire the window rows of a running request behind ``frontier``,
     keeping what the prefix tree still needs of the window."""
     storage = _storage(tree_cache)
-    for component, window, floor in tree_cache.window_retention(req):
+    for sub_pool, window, floor in tree_cache.window_retention(req):
         storage.advance(
             req,
             frontier,
@@ -187,7 +187,7 @@ def retire_window(
             retain_floor=floor,
             shares_prefixes=tree_cache.supports_prefix_sharing(),
             eviction_interval=eviction_interval,
-            component_type=component,
+            window_sub_pool=sub_pool,
         )
 
 

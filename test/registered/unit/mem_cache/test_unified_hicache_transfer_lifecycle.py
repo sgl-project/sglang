@@ -46,6 +46,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
     _swa_allocation_callbacks,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.pool_host import common as host_memory
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -55,7 +56,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots, window_evictable
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     build_tri_pool,
@@ -67,7 +68,7 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 PAGE = 4
 D2H = ("controller", "write")
 H2D = ("controller", "load")
-FULL, SWA = ComponentType.FULL, ComponentType.SWA
+FULL = ComponentType.FULL
 
 
 def _python_inspector(params, components):
@@ -420,9 +421,7 @@ class _UnifiedHiCacheCase(_ConfigCase):
             page_size=PAGE,
             disable=False,
             sliding_window_size=self.window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA), window=self.window
-            ),
+            tree_slots=storage_tree_slots(self.allocator.storage, window=self.window),
         )
         with mock.patch.dict(
             _TREE_CORE_REGISTRY, {"python": _python_inspector, "rust": _rust_inspector}
@@ -537,13 +536,13 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         req.output_ids = []
         req.sampling_params = SimpleNamespace(max_new_tokens=PAGE, ignore_eos=False)
         req.host_hit_length = match.host_hit_length
-        req.swa_host_hit_length = match.swa_host_hit_length
+        req.matched_window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.mamba_host_hit_length = 0
         req.storage_hit_length = 0
         req.storage_hit_start = None
         req.host_hit_is_storage = False
         req.host_loaded_length = 0
-        req.auxiliary_swa_host_hit_length = 0
+        req.window_host_hit_lengths = dict(match.window_host_hit_lengths)
         req.retracted_stain = False
         req.needs_host_load_back.return_value = True
         req.finished.return_value = False
@@ -562,7 +561,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         return (
             core.get_component_device_lock_ref(node, FULL),
             core.get_component_host_lock_ref(node, FULL),
-            core.get_component_host_lock_ref(node, SWA),
+            core.get_component_host_lock_ref(node, self.cache.slot_id(TREE_WINDOW)),
         )
 
     def _host_pressure(self):
@@ -621,7 +620,15 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         _, expected = self._insert(tokens, 100)
         self.cache.flush_pending_backups()
         self.cache.writing_check()
-        self.cache.evict(EvictParams(swa_num_tokens=len(tokens)))
+        self.cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    self.cache.window_sub_pool_of_slot(
+                        self.cache.slot_id(TREE_WINDOW)
+                    ): len(tokens)
+                }
+            )
+        )
         req = self._request(tokens + list(range(17, 21)))
         # A running request locks its whole path; only its SWA past the window
         # can be reclaimed.
@@ -631,7 +638,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.cache.writing_check()
         running_node = self._match(running).last_device_node
         pin = self.cache.inc_lock_ref(running_node).to_dec_params()
-        reclaimable_swa = self.cache.swa_evictable_size()
+        reclaimable_swa = window_evictable(self.cache)
         # The batch's decode tokens are pending demand on both bands. With
         # them, the load fits the shared gap only after that SWA is reclaimed.
         decode = 6 * PAGE
@@ -654,7 +661,7 @@ class TestLoadBackAdmission(_UnifiedHiCacheCase):
         self.assertEqual(len(moves), moved)
         # That room came from reclaiming the running request's out-of-window
         # SWA; its FULL rows and its window stay.
-        self.assertLess(self.cache.swa_evictable_size(), reclaimable_swa)
+        self.assertLess(window_evictable(self.cache), reclaimable_swa)
         self._assert_rows(running_ids, running_expected, swa_tail=self.window)
 
         self.cache.ready_to_load_host_cache()

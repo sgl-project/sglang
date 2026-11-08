@@ -42,7 +42,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
-from sglang.test.tree_slots import tree_slots_of
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_mamba_cache,
@@ -901,8 +901,10 @@ def _own_table_cache(*, window):
             token_to_kv_pool_allocator=allocator,
             page_size=1,
             sliding_window_size=window,
-            tree_slots=tree_slots_of(
-                (ComponentType.FULL, ComponentType.SWA), window=window
+            tree_slots=storage_tree_slots(
+                allocator.storage,
+                window=window,
+                components=(ComponentType.FULL, ComponentType.SWA),
             ),
         )
     )
@@ -1005,7 +1007,9 @@ class TestCacheOperationsOverPendingFrees(CustomTestCase):
 
         launch = _launch(steps)  # decode W reads the window
         cache.release_swa(lock)  # preparing W + 1
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=1000))
+        cache.evict(
+            EvictParams(num_tokens=0, window_num_tokens={window.sub_pool_name: 1000})
+        )
         evicted = physical - {p for p in physical if p <= 0}
         self.assertTrue(evicted <= _pending(window))
         self.assertFalse(evicted & set(window._free_phys_pages.tolist()))

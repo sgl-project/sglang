@@ -93,8 +93,8 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
-    kv_private_swa_tokens,
     kv_private_tokens,
+    kv_private_window_tokens,
 )
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
@@ -141,7 +141,6 @@ from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, kv_storage_of
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.observability.req_time_stats import (
     set_schedule_time_batch,
@@ -2369,12 +2368,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for an incoming transfer, not yet in the running batch. Pages are
         charged the way the pool stats charge a request's private KV."""
         page_size = self.token_to_kv_pool_allocator.page_size
+        window = window_sub_pool_of(self.token_to_kv_pool_allocator)
         full_tokens = swa_tokens = 0
         for decode_req in self.transfer_queue.queue.items():
             if decode_req.host_staged:
                 continue
             full_tokens += kv_private_tokens(decode_req.req.kv, page_size)
-            swa_tokens += kv_private_swa_tokens(decode_req.req.kv, page_size)
+            swa_tokens += kv_private_window_tokens(decode_req.req.kv, page_size, window)
         return full_tokens, swa_tokens
 
     def _need_space_for_single_req(
@@ -2560,7 +2560,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         swa_evictable = (
             0
             if is_swa_req_ring(self.token_to_kv_pool_allocator)
-            else self.tree_cache.swa_evictable_size()
+            else self.tree_cache.window_evictable_size(window_sub_pool_of(allocator))
         )
         swa_used = swa_total - swa_available - swa_evictable
         swa_growth_potential = max(0, n_active * window_size - swa_used)
@@ -2611,10 +2611,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         # Every window other than the target's (whose tail the scheduler's
         # window gives) keeps its own tail, by the same rule: a fused draft's
         # band retains its own length.
+        target = window_sub_pool_of(allocator)
         stated_window_tails = {
             name: (self._swa_tail_len(kwargs["fill_len"], window), component)
             for name, (window, component) in storage.stated_window_lengths().items()
-            if component != ComponentType.SWA.name
+            if name != target
         }
         return alloc_for_decode_prealloc(
             storage, allocator, stated_window_tails=stated_window_tails, **kwargs
@@ -2758,7 +2759,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             f"required_alloc={required_alloc_tokens}, delta={delta_len}, "
             f"fill={fill_len}, prefix={prefix_len}, total_prefix={total_prefix_len}, "
             f"swa_available={allocator.swa_available_size() if swa_pages_charged else -1}, "
-            f"swa_evictable={self.tree_cache.swa_evictable_size() if swa_pages_charged else -1}, "
+            f"swa_evictable={self.tree_cache.window_evictable_size(window_sub_pool_of(allocator)) if swa_pages_charged else -1}, "
             f"required_swa={required_swa_tokens}, swa_tail_len={swa_tail_len}, "
             f"page_size={allocator.page_size}, "
             f"req={req.rid}"
@@ -2815,7 +2816,7 @@ def alloc_for_decode_prealloc_hisparse(
         )
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        req.kv.set_evicted_seqlen(window_sub_pool_of(allocator), swa_evicted_seqlen)
     else:
         kv_loc = allocator.alloc_logical_only(
             prefix_lens=prefix_lens,
@@ -2892,13 +2893,13 @@ def alloc_for_decode_prealloc(
         ),
     )
     if uses_swa_tail:
-        tails = {ComponentType.SWA: swa_tail_len}
-        for tail, component in stated_window_tails.values():
-            tails[ComponentType[component]] = tail
-        for component, tail in tails.items():
+        tails = {window_sub_pool_of(allocator): swa_tail_len}
+        for name, (tail, _) in stated_window_tails.items():
+            tails[name] = tail
+        for name, tail in tails.items():
             evicted_seqlen = fill_len - tail
             assert evicted_seqlen >= 0 and evicted_seqlen % allocator.page_size == 0
-            req.kv.set_evicted_seqlen(component, evicted_seqlen)
+            req.kv.set_evicted_seqlen(name, evicted_seqlen)
     return kv_loc
 
 
@@ -2941,7 +2942,7 @@ def _alloc_for_decode_prealloc_dsv4(
         )
         swa_evicted_seqlen = fill_len - swa_tail_len
         assert swa_evicted_seqlen >= 0 and swa_evicted_seqlen % allocator.page_size == 0
-        req.kv.set_evicted_seqlen(ComponentType.SWA, swa_evicted_seqlen)
+        req.kv.set_evicted_seqlen(window_sub_pool_of(allocator), swa_evicted_seqlen)
     else:
         kv_loc = allocator.alloc_extend(
             prefix_lens=async_h2d([total_prefix_len], dtype=torch.int64, device=device),

@@ -4694,7 +4694,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.shield_swa_prefill(req.extend_end)
+                req.kv.shield_window_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -6047,10 +6047,10 @@ class Scheduler(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
 
+        from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         tree_cache = self.tree_cache
@@ -6068,13 +6068,16 @@ class Scheduler(
             )
 
         sidecar_pool_specs = ()
-        swa = None
+        window = None
         if isinstance(tree_cache, UnifiedRadixCache):
             sidecar_pool_specs = tree_cache.sidecar_pool_specs
-            swa = tree_cache.components.get(ComponentType.SWA)
+            # By family: a unified window's slot is named by its sub-pool.
+            window = tree_cache.component_of(TREE_WINDOW)
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
-            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            swa_trailing_pages=(
+                window.full_window_pages if window is not None else None
+            ),
             page_size=self.page_size,
         )
 

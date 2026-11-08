@@ -35,7 +35,9 @@ from sglang.test.unified_allocator_fixtures import (
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
+def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None, window=8):
+    """A full + window pool whose window states no length: ``window`` is the
+    length the cache builder binds for it, as for a model that resolves it."""
     setup_allocator_context()
     # `pool_tokens` sizes both sub-pools directly, for a test whose arithmetic
     # needs an exact token count rather than whatever a byte budget buys.
@@ -46,7 +48,7 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         if pool_tokens is not None
         else dict(total_bytes=total_bytes)
     )
-    return build_test_unified_pools(
+    allocator = build_test_unified_pools(
         device="cpu",
         kv_cache_dtype=torch.float16,
         head_num=1,
@@ -65,6 +67,8 @@ def _shared_allocator(*, page_size=4, total_bytes=2048, pool_tokens=None):
         lazy_compaction=True,
         **sized,
     ).token_to_kv_pool_allocator
+    allocator.storage.bind_window_retention(window, None)
+    return allocator
 
 
 def _cache():
@@ -72,8 +76,7 @@ def _cache():
         sliding_window_size=8,
         window_retain_size=lambda component: 32,
         full_evictable_size=lambda: 0,
-        swa_evictable_size=lambda: 0,
-        auxiliary_swa_evictable_size=lambda: 0,
+        window_evictable_size=lambda component: 0,
         supports_prefix_sharing=lambda: True,
     )
 
@@ -235,7 +238,6 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     total_tokens=reserved_tokens,
                     max_new_tokens=0,
                     input_tokens=prompt_tokens,
-                    swa_host_hit_length=0,
                     chunk_limit=None,
                     state_slots=slots_per_request,
                 )
@@ -329,7 +331,6 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
                     full_tokens=12,
                     extend_input_len=8,
                     max_new_tokens=0,
-                    swa_host_hit_length=0,
                     chunk_limit=None,
                     state_slots=2,
                 )
@@ -347,7 +348,6 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
             total_tokens=20,
             max_new_tokens=4,
             input_tokens=12,
-            swa_host_hit_length=0,
             chunk_limit=16,
         )
 
@@ -382,11 +382,11 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
     def test_prefix_lock_changes_admission_without_rebuilding_budget(self):
         self.assertIsNotNone(self.allocator.alloc(24))
         self.cache.full_evictable_size = lambda: 24
-        self.cache.swa_evictable_size = lambda: 24
+        self.cache.window_evictable_size = lambda name: 24
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
         # Locking the cached prefix removes its eviction credit.
         self.cache.full_evictable_size = lambda: 0
-        self.cache.swa_evictable_size = lambda: 0
+        self.cache.window_evictable_size = lambda name: 0
         self.assertEqual(self.budget.check_prefill(**self.request), (False, None))
 
     def test_final_chunk_reserves_decode_headroom(self):
@@ -399,7 +399,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 
     def test_host_swa_load_is_part_of_joint_demand(self):
         self.assertEqual(self.budget.check_prefill(**self.request), (True, 16))
-        request = {**self.request, "swa_host_hit_length": 32}
+        request = {**self.request, "window_host_hit_lengths": {"window": 32}}
         self.assertEqual(self.budget.check_prefill(**request), (False, None))
 
     def test_prompt_clipping_uses_the_empty_pool(self):
@@ -431,7 +431,7 @@ class TestSharedPrefillMemoryBudget(unittest.TestCase):
 class TestSharedPrefillAdmission(unittest.TestCase):
     def _new_admission(self, page_size, pool_pages, *, ignore_eos=False):
         allocator = _shared_allocator(
-            page_size=page_size, pool_tokens=pool_pages * page_size
+            page_size=page_size, pool_tokens=pool_pages * page_size, window=page_size
         )
         # Each end may borrow the other's unused initial share.
         self.assertEqual(allocator.size_full, 2 * pool_pages * page_size)
@@ -458,8 +458,7 @@ class TestSharedPrefillAdmission(unittest.TestCase):
             sliding_window_size=page_size,
             disable=True,
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
-            auxiliary_swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda component: 0,
             supports_prefix_sharing=lambda: False,
             supports_mamba=lambda: False,
         )
@@ -564,7 +563,7 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
         allocator._swa_req_ring = True
         allocator._swa_ring_cost = 32
         cache = _cache()
-        cache.swa_evictable_size = lambda: 1000
+        cache.window_evictable_size = lambda name: 1000
         budget = allocator.create_prefill_budget(cache)
         budget.reserve(12, 4, chunk_limit=16)
         self.assertEqual(budget.remaining_swa, 32)
@@ -577,7 +576,6 @@ class TestFixedPrefillMemoryBudget(unittest.TestCase):
                 total_tokens=12,
                 max_new_tokens=4,
                 input_tokens=4,
-                swa_host_hit_length=0,
                 chunk_limit=16,
             ),
             (True, 16),
