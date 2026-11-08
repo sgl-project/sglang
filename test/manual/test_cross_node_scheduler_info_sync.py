@@ -153,7 +153,7 @@ def test_api(test_case: TestCase) -> bool:
     for rank in range(test_case.expected_ranks):
         try:
             resp = requests.get(
-                f"{base_url}/get_remote_instance_transfer_engine_info",
+                f"{base_url}/remote_instance_transfer_engine_info",
                 params={"rank": rank},
                 timeout=5,
             )
