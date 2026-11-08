@@ -45,6 +45,7 @@ def release_only_retirer(
         hisparse_coordinator=hisparse_coordinator,
         uocr_runtime=None,
         send_abort_output=None,
+        stream_output=None,
     )
 
 

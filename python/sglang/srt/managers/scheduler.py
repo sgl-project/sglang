@@ -112,6 +112,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    decode_offloads_kvcache,
     disagg_transfers_in_flight,
     get_dsa_seed_metadata_dim,
     prepare_abort,
@@ -344,6 +345,10 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.common import checkpoint_kv_cache, storage_prefetch_end
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.kv.alloc.forward_steps import (
+    ForwardLaunch,
+    forward_steps_of,
+)
 from sglang.srt.mem_cache.kv_weight_version_tracker import KvWeightVersionTracker
 from sglang.srt.mem_cache.static_kv_storage import StaticPoolShape, kv_storage_of
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
@@ -666,15 +671,6 @@ class Scheduler(
                 cache_controller.write_fence_stream = (
                     self.tp_worker.model_runner.forward_stream
                 )
-                # Keep device rows stable until host transfers are acknowledged.
-                # Queue reads and relocation both run on the scheduler thread.
-                storage = kv_storage_of(
-                    self.req_to_token_pool, self.token_to_kv_pool_allocator
-                )
-                storage.add_pin_source(
-                    storage.sub_pool_names(),
-                    cache_controller.has_inflight_device_transfers,
-                )
         self.emit_metrics_constants()
         self.maybe_init_hccl_dp_prewarm()
 
@@ -683,25 +679,13 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=self.dp_tp_cpu_group,
-                tree_cache=self.tree_cache,
-            )
-        else:
-            self.decode_offload_manager = None
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
         # its copies behind that forward; the decode offload controller has none.
         self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream = (
             self.enable_hierarchical_cache
             and self.tree_cache.cache_controller is not None
-            and self.decode_offload_manager is None
+            and not decode_offloads_kvcache()
         )
 
         # Init running status
@@ -778,8 +762,6 @@ class Scheduler(
 
         self.maybe_init_mm_feature_receive_budget()
 
-        self.init_request_receiver()
-
         self.init_dp_attn_adapter()
 
         self.init_pool_stats_observer()
@@ -799,6 +781,10 @@ class Scheduler(
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.init_request_receiver()
+
+        self.maybe_init_decode_offload_manager()
 
         self.init_batch_result_processor()
 
@@ -2191,12 +2177,11 @@ class Scheduler(
                 pop_and_process()
                 # Opportunistic flush at the early-processing sync boundary:
                 # forward_stream is idle (prev forward drained, next not launched),
-                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
+                # so `_flush`'s non-urgent guard compacts freely. Sync-free. A
+                # failure propagates: a move that stopped midway leaves the pool's
+                # page tables and ledger inconsistent.
                 if self.enable_unified_memory:
-                    try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
-                    except Exception:
-                        pass
+                    self.token_to_kv_pool_allocator.flush_opportunistic()
 
             # Get the next batch to run
             plan = self.get_next_batch_to_run(
@@ -2661,7 +2646,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            stream_output=lambda *a, **kw: self.output_streamer.stream_output(*a, **kw),
+            request_retirer=self.request_retirer,
             get_last_batch=lambda: self.last_batch,
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
@@ -2898,7 +2883,19 @@ class Scheduler(
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
+            stream_output=self.output_streamer.stream_output,
         )
+
+    def maybe_init_decode_offload_manager(self) -> None:
+        self.decode_offload_manager = None
+        if decode_offloads_kvcache():
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=self.dp_tp_cpu_group,
+                tree_cache=self.tree_cache,
+                request_retirer=self.request_retirer,
+            )
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
@@ -3295,7 +3292,7 @@ class Scheduler(
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    self.request_retirer.retire_unadmitted(req)
                     return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -3309,12 +3306,8 @@ class Scheduler(
                         f"bootstrap room id. {req.rid=}"
                     )
                     logger.error(error_msg)
-                    if not envs.SGLANG_RUST_SERVER.get():
-                        recv_req.time_stats.trace_ctx.abort(
-                            abort_info={"reason": error_msg}
-                        )
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.output_streamer.stream_output([req], req.return_logprob)
+                    self.request_retirer.retire_unadmitted(req)
                     return
 
         elif (
@@ -3382,17 +3375,17 @@ class Scheduler(
             return
 
         if error_msg := self.validate_dllm_request(req):
-            abort_req = make_abort_req(
+            finished_reason = {
+                "type": "abort",
+                "status_code": HTTPStatus.BAD_REQUEST,
+                "message": error_msg,
+            }
+            req.time_stats.trace_ctx.abort(abort_info=finished_reason)
+            self.request_retirer.abort(
                 req,
-                finished_reason={
-                    "type": "abort",
-                    "status_code": HTTPStatus.BAD_REQUEST,
-                    "message": error_msg,
-                },
+                reason=FINISH_ABORT(error_msg, HTTPStatus.BAD_REQUEST),
+                finished_reason=finished_reason,
             )
-            req.time_stats.trace_ctx.abort(abort_info=abort_req.finished_reason)
-            self._release_rejected_session(req)
-            self.send_abort_output(abort_req, req)
             return
 
         if self.spec_algorithm.is_dflash_family():
@@ -3738,22 +3731,6 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
-    def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request the disaggregation queues rejected at their door."""
-        # `update_finish_state` returns early once `finished()`, so an already
-        # set `finished_reason` is what the client receives; report the same.
-        reason = req.finished_reason or req.to_finish
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.update_finish_state()
-        # Holds no memory, but the detach still matters: `create_req` marked its
-        # streaming session in flight, and PREFILL's `_prefetch_kvcache` armed
-        # the cache's paced retry for its handle; nothing else clears either.
-        self.request_retirer.release(req, checkpoint=False)
-        # Like `find_active_slot`, the detached request also leaves its session.
-        if req.session is not None and req.session.streaming:
-            req.session = None
-        self.output_streamer.stream_output([req], req.return_logprob)
-
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         # Every request the scheduler keeps is taken here; one rejected at intake
         # without being queued sends its output in the call that built it.
@@ -3796,16 +3773,8 @@ class Scheduler(
     def _reject_sampling_mask_request(self, req: Req, error_msg: str) -> None:
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
-        req.time_stats.trace_ctx.abort(abort_info={"reason": error_msg})
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self._release_rejected_session(req)
-        self.output_streamer.stream_output([req], req.return_logprob)
-
-    def _release_rejected_session(self, req: Req) -> None:
-        """`create_req` marked the streaming session in flight; release it for a
-        request rejected before it was queued."""
-        if req.session is not None and req.session.streaming:
-            req.session.abort_req()
+        self.request_retirer.retire_unadmitted(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""
@@ -4695,7 +4664,7 @@ class Scheduler(
 
         if self.tp_worker.model_runner.prefill_aware_swa:
             for req in can_run_list:
-                req.kv.shield_swa_prefill(req.extend_end)
+                req.kv.shield_window_prefill(req.extend_end)
 
         # Record prefill stats for logging after forward.
         new_batch.prefill_stats = PrefillStats.from_adder(
@@ -4843,8 +4812,10 @@ class Scheduler(
             or req in self.chunked_reqs
         )
 
-    def _on_step_launch(self, batch: ScheduleBatch) -> None:
-        """The bookkeeping of every step launch, before its forward is issued."""
+    def _on_step_launch(self, batch: ScheduleBatch) -> Optional[ForwardLaunch]:
+        """The bookkeeping of every step launch, before its forward is issued.
+        Returns the unified pool's launch record, which the step's result
+        carries to `_on_step_processed`."""
         self.metrics_reporter.record_scheduler_active(time.monotonic_ns())
         self.forward_ct += 1
         batch.forward_iter = self.forward_ct
@@ -4862,13 +4833,45 @@ class Scheduler(
         # Whether to run the profiler; a capture it starts here covers this step.
         self.profiler_manager._profile_batch_predicate(batch)
         batch.add_inflight_step()
+        # A pool that hands freed pages out from the schedule stream keeps the
+        # pages freed while this step's forward runs pending until processed.
+        forward_steps = forward_steps_of(
+            getattr(self, "token_to_kv_pool_allocator", None)
+        )
+        launch = None if forward_steps is None else forward_steps.forward_launched()
         self._join_prefill_launched(batch)
         self.invariant_checker.run(CheckPhase.LAUNCH, batch)
+        return launch
 
-    def _on_step_processed(self, batch: ScheduleBatch) -> None:
+    def _on_step_forward_recorded(self, forward_done) -> bool:
+        """The launched step's forward is enqueued and ``forward_done`` records
+        its end; pages freed from now on wait for it. Returns whether the pool
+        keeps them pending on it."""
+        forward_steps = forward_steps_of(
+            getattr(self, "token_to_kv_pool_allocator", None)
+        )
+        if forward_steps is None:
+            return False
+        forward_steps.forward_recorded(forward_done)
+        return True
+
+    def _on_step_processed(
+        self,
+        batch: ScheduleBatch,
+        result: Optional[Union[GenerationBatchResult, EmbeddingBatchResult]],
+    ) -> None:
         """The bookkeeping of every step once its result is processed."""
         self.invariant_checker.run(CheckPhase.RESULT, batch)
         batch.drop_inflight_step()
+        # The pages freed while the forward ran join the free lists. Every
+        # result processor has already synchronized an event recorded behind
+        # the step's `forward_done`: its `copy_done`, or on a pipeline stage its
+        # `d2h_event` (see `_pp_make_skip_output_result` for skipped outputs).
+        forward_steps = forward_steps_of(
+            getattr(self, "token_to_kv_pool_allocator", None)
+        )
+        if forward_steps is not None:
+            forward_steps.forward_processed(getattr(result, "forward_launch", None))
         # Requests finish only in a step's processing.
         self.running_reqs.leave_finished()
         self.prefill_launched_reqs.leave_finished()
@@ -5044,6 +5047,41 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
+    def _record_unified_forward(
+        self,
+        *,
+        batch: ScheduleBatch,
+        stream,
+        written_tokens: Optional[torch.Tensor],
+    ):
+        """Record a forward just launched on ``stream`` with the unified pool,
+        so that no page move races it, and return the event that marks its end.
+
+        The write set is gathered on the schedule stream, where compaction
+        reads it. A speculative forward writes draft and verify slots past
+        ``written_tokens`` and produces its tracking slots on another stream,
+        so its token and state writes are recorded as unknown."""
+        forward_done = self.device_module.Event()
+        forward_done.record(stream=stream)
+        writes_unknown = not batch.spec_algorithm.is_none()
+        with self.device_module.stream(self.schedule_stream):
+            kv_storage_of(
+                self.req_to_token_pool, self.token_to_kv_pool_allocator
+            ).record_forward(
+                forward_done,
+                written_tokens=written_tokens,
+                token_writes_unknown=writes_unknown,
+                req_pool_indices=batch.req_pool_indices,
+                state_slots=(
+                    ()
+                    if writes_unknown
+                    else (batch.mamba_track_indices, batch.mamba_cow_dst_indices)
+                ),
+                state_writes_unknown=writes_unknown,
+            )
+        self._on_step_forward_recorded(forward_done)
+        return forward_done
+
     @scheduler_stage_method(SCHEDULER_STAGE_RUN_BATCH)
     def run_batch(
         self,
@@ -5051,7 +5089,7 @@ class Scheduler(
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[GenerationBatchResult, EmbeddingBatchResult]:
         """Run a batch."""
-        self._on_step_launch(batch)
+        launch = self._on_step_launch(batch)
 
         if self.forward_sleep_time is not None:
             logger.info(f"Scheduler.run_batch sleep {self.forward_sleep_time}s")
@@ -5059,7 +5097,12 @@ class Scheduler(
 
         # Place holder handling for pd-disagg decode event loop
         if batch.forward_mode.is_prebuilt():
-            return self._run_batch_prebuilt(batch)
+            ret = self._run_batch_prebuilt(batch)
+            # An inner idle batch ran as its own step: its result carries its
+            # own launch.
+            if ret.forward_launch is None:
+                ret.forward_launch = launch
+            return ret
 
         # PD prefill: early-send cached prefix KV, overlapping the suffix forward.
         if self.disaggregation_mode == DisaggregationMode.PREFILL:
@@ -5136,21 +5179,13 @@ class Scheduler(
                                 batch_result.extra_keep_alive_refs
                             )
                         if self.enable_unified_memory:
-                            # Record a `forward_done` event after the forward (before
-                            # copy_to_cpu); lazy-compaction `_flush` gates src reuse on
-                            # it, and writers of reused pages follow this stream. Only
-                            # the unified pool's allocator exposes these hooks.
-                            allocator = self.token_to_kv_pool_allocator
-                            forward_done = self.device_module.Event()
-                            forward_done.record(stream=self.forward_stream)
-                            allocator.set_latest_forward_done_event(
-                                forward_done, self.forward_stream
-                            )
-                            # Write-set classification: hand the allocator this
-                            # forward's virtual out_cache_loc as a tensor ref (no GPU work).
-                            allocator.set_inflight_forward(
-                                forward_done,
-                                batch.out_cache_loc,
+                            # Before copy_to_cpu, so the event covers only the forward.
+                            batch_result.unified_forward_done = (
+                                self._record_unified_forward(
+                                    batch=batch,
+                                    stream=self.forward_stream,
+                                    written_tokens=batch.out_cache_loc,
+                                )
                             )
                         # FIXME(lsyin): maybe move this to forward_batch_generation
                         batch_result.copy_done = self.device_module.Event()
@@ -5305,6 +5340,21 @@ class Scheduler(
             if self.uocr_runtime is not None:
                 # Commit the overlap text before the next batch is built from this one.
                 self.uocr_runtime.after_forward(batch, chunked_req=self.chunked_req)
+            if (
+                self.enable_unified_memory
+                and not self.enable_overlap
+                and get_parallel().pp_size > 1
+            ):
+                # A pipeline stage schedules its next microbatch while this
+                # forward runs; the current stream is the one the forward ran on.
+                # A single stage runs the forward on the schedule stream and
+                # processes its result before the next allocation, so it records
+                # nothing.
+                batch_result.unified_forward_done = self._record_unified_forward(
+                    batch=batch,
+                    stream=self.device_module.current_stream(),
+                    written_tokens=batch.out_cache_loc,
+                )
 
             # These 2 values are needed for processing the output, but the values can be
             # modified by overlap schedule. So we have to copy them here so that
@@ -5338,6 +5388,13 @@ class Scheduler(
                         pooled_hidden_states=pooler_output.pooled_hidden_states,
                         can_run_cuda_graph=can_run_cuda_graph,
                     )
+                    if self.enable_unified_memory:
+                        # Before copy_to_cpu, so the event covers only the forward.
+                        ret.unified_forward_done = self._record_unified_forward(
+                            batch=batch,
+                            stream=self.forward_stream,
+                            written_tokens=batch.out_cache_loc,
+                        )
                     ret.copy_to_cpu()
             else:
                 self.resolve_forward_inputs(batch, self.future_map)
@@ -5359,6 +5416,7 @@ class Scheduler(
 
         self._maybe_report_active_ranks()
 
+        ret.forward_launch = launch
         return ret
 
     def _maybe_report_active_ranks(self) -> None:
@@ -5538,10 +5596,16 @@ class Scheduler(
             else:
                 self.batch_result_processor.process_batch_result_prefill(batch, result)
         elif batch.forward_mode.is_prebuilt():
+            # An inner idle batch ran a forward (`_run_batch_prebuilt`), and
+            # its launch is this result's: the host sees that forward end
+            # before the step is processed.
+            copy_done = getattr(result, "copy_done", None)
+            if copy_done is not None:
+                copy_done.synchronize()
             self.batch_result_processor.process_batch_result_prebuilt(batch)
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
-        self._on_step_processed(batch)
+        self._on_step_processed(batch, result)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5712,10 +5776,7 @@ class Scheduler(
         self.metrics_reporter.record_scheduler_idle()
 
         if self.enable_unified_memory:
-            try:
-                self.token_to_kv_pool_allocator.flush_opportunistic()
-            except Exception:
-                pass
+            self.token_to_kv_pool_allocator.flush_opportunistic()
 
         self.invariant_checker.run(CheckPhase.IDLE)
 
@@ -5996,10 +6057,10 @@ class Scheduler(
                 "Hierarchical cache is disabled", page_size=self.page_size
             )
 
+        from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
             MooncakeStore,
         )
-        from sglang.srt.mem_cache.unified_cache.components import ComponentType
         from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
         tree_cache = self.tree_cache
@@ -6017,13 +6078,16 @@ class Scheduler(
             )
 
         sidecar_pool_specs = ()
-        swa = None
+        window = None
         if isinstance(tree_cache, UnifiedRadixCache):
             sidecar_pool_specs = tree_cache.sidecar_pool_specs
-            swa = tree_cache.components.get(ComponentType.SWA)
+            # By family: a unified window's slot is named by its sub-pool.
+            window = tree_cache.component_of(TREE_WINDOW)
         return storage_backend.describe_l3_object_layout(
             sidecar_pool_specs=sidecar_pool_specs,
-            swa_trailing_pages=swa.full_window_pages if swa is not None else None,
+            swa_trailing_pages=(
+                window.full_window_pages if window is not None else None
+            ),
             page_size=self.page_size,
         )
 

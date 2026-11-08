@@ -741,6 +741,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 self.scheduler._fpm_publisher.metrics.clear()
                 timer, interval = DeviceTimer(), FakeInterval(9)
                 receiver = SchedulerPPMixin()
+                # No unified pool: nothing keeps freed pages on the forward.
+                receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
