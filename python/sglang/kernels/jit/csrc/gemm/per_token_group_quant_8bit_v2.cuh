@@ -493,7 +493,7 @@ struct PerTokenGroupQuant8bitV2Kernel {
       int64_t scale_hidden_stride) {
     // Validate the BF16 group32 FP8 fallback used by the FP32-scale trait path.
     if (std::is_same_v<T, bf16_t> && std::is_same_v<DST_DTYPE, fp8_e4m3_t> && group_size == 32 && scale_ue8m0 &&
-        !is_column_major && !fuse_silu_and_mul && !masked_layout) {
+        !is_column_major && !fuse_silu_and_mul && !masked_layout && input.dim() == 2) {
       using namespace host;
       auto device = SymbolicDevice{};
       device.set_options<kDLGPU>();

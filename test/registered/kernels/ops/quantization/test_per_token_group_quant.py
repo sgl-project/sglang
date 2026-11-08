@@ -129,6 +129,18 @@ def test_fp32_pow2_group32(shape, public):
     _check_fp32_pow2(x, public)
 
 
+def test_fp32_pow2_public_batched():
+    """Unmasked batched inputs retain their shape and row-major FP32 scales."""
+    torch.manual_seed(42)
+    x = torch.randn(2, 3, 64, device="cuda", dtype=torch.bfloat16)
+    q, s = sglang_per_token_group_quant_fp8(x, 32, scale_ue8m0=True)
+    q_ref, s_ref = ref_fp8_fp32_pow2(x)
+    assert q.shape == x.shape
+    assert s.shape == (2, 3, 2)
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(s.view(torch.int32), s_ref.view(torch.int32))
+
+
 @pytest.mark.parametrize("offset", [8, 16])
 def test_fp32_pow2_public_offset_view(offset):
     # v2 admits a 16B-aligned view; the trait kernel requires 32B alignment.
