@@ -469,6 +469,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     Store the requests that are preallocating.
     """
 
+    # Whether the metadata slots ran out with failed receives holding some,
+    # logged once until a slot frees.
+    _metadata_exhaustion_reported: bool = False
+
     _defer_publish: bool = False
 
     def __init__(
@@ -1640,6 +1644,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         for decode_req, prefill_dp_rank in resolved:
             self._init_receiver(decode_req, prefill_dp_rank)
 
+    def _report_metadata_exhaustion(self) -> None:
+        """No metadata slot is free; if failed receives with unproven drains hold some
+        (a late write may reach them), log it loudly once until a slot frees."""
+        held = self.transfer_queue.num_undrained_receives()
+        if not held or self._metadata_exhaustion_reported:
+            return
+        self._metadata_exhaustion_reported = True
+        logger.error(
+            "Decode metadata slots are exhausted (%d in all) and %d are held by "
+            "failed KV transfers whose prefill peers never acknowledged a drain; "
+            "new receives wait for a slot. Restart the instance if those peers "
+            "are gone.",
+            self.req_to_metadata_buffer_idx_allocator.size,
+            held,
+        )
+
     def pop_preallocated(
         self,
         rids_to_check: Optional[List[str]] = None,
@@ -1768,7 +1788,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 continue
 
             if self.req_to_metadata_buffer_idx_allocator.available_size() <= 0:
+                self._report_metadata_exhaustion()
                 break
+            self._metadata_exhaustion_reported = False
 
             if self.scheduler.enable_lora and not self.scheduler.can_schedule_lora_req(
                 decode_req.req, running_loras
@@ -4034,8 +4056,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
     def has_pending_deferred_releases(self) -> bool:
         return bool(self._deferred_releases)
 
+    def num_undrained_receives(self) -> int:
+        """Failed receives given back with their drain unproven: each holds
+        its metadata slot until the drain."""
+        return len(self._undrained_receives)
+
     def num_pending_deferred_releases(self) -> int:
-        return len(self._deferred_releases)
+        """Failed receives whose KV release waits for a drain: held, or given
+        back with their rows fenced and their metadata slot held."""
+        return len(self._deferred_releases) + self.num_undrained_receives()
 
     def _observe_deferred_kv_release(
         self, duration_seconds: float, outcome: str

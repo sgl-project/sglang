@@ -275,6 +275,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = []
         queue._deferred_releases = [object(), object(), object()]
+        queue._undrained_receives = []
         reporter = SchedulerMetricsReporter.__new__(SchedulerMetricsReporter)
         reporter.scheduler = SimpleNamespace(
             enable_hierarchical_cache=False,
@@ -349,6 +350,7 @@ class TestDeferredKVReleaseMetrics(CustomTestCase):
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
         queue.queue = []
         queue._deferred_releases = [object(), object()]
+        queue._undrained_receives = []
         batch = SimpleNamespace(
             reqs=[],
             seq_lens_cpu=None,

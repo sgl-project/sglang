@@ -1054,6 +1054,30 @@ class TestAFailedReceiveIsGivenBackAtOnce(CustomTestCase):
         self.assertEqual(queue._undrained_receives, [])
 
 
+class TestMetadataSlotsHeldByUndrainedReceives(CustomTestCase):
+    """A failed receive with an unproven drain keeps its metadata slot; when dead peers
+    exhaust the slots, new receives wait, and the cause is logged once and counted."""
+
+    def test_exhaustion_is_logged_once_and_counted(self):
+        from sglang.srt.disaggregation.decode import DecodePreallocQueue
+
+        transfer = DecodeTransferQueue.__new__(DecodeTransferQueue)
+        transfer._deferred_releases = IndexedReqList(
+            ListKind.PD_RELEASING, req_of=lambda x: x[0].req
+        )
+        transfer._undrained_receives = [object(), object()]
+        self.assertEqual(transfer.num_pending_deferred_releases(), 2)
+        prealloc = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        prealloc.transfer_queue = transfer
+        prealloc.req_to_metadata_buffer_idx_allocator = SimpleNamespace(size=4)
+        with self.assertLogs(decode_mod.logger, level="ERROR") as logs:
+            prealloc._report_metadata_exhaustion()
+            prealloc._report_metadata_exhaustion()
+            decode_mod.logger.error("sentinel")
+        self.assertEqual(len(logs.output), 2)
+        self.assertIn("2 are held by failed KV transfers", logs.output[0])
+
+
 class TestMemoryReleaseWaitsForUnprovenTransfers(CustomTestCase):
     def test_memory_is_not_released_under_an_unproven_transfer(self):
         """Released and resumed memory would be handed out under a remote
