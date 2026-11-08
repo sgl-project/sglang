@@ -2024,6 +2024,9 @@ class ModelRunner:
         ):
             state = self.token_to_kv_pool_allocator.state
             if state.ckpt_pool is not None:
+                # The codec reads every layer, including checkpoints just
+                # restored from host on the transfer stream.
+                self.token_to_kv_pool.layer_router.wait_for_part(STATE_PART)
                 # int8 checkpoints: dequantize src int8 ckpt slot into the active bf16 dst.
                 state.ckpt_pool.load_to_active(
                     state.pool,

@@ -456,6 +456,15 @@ class HybridCacheController(BaseHiCacheController):
         storage_backend_extra_config: Optional[dict] = None,
         host_pools: Optional[list[PoolEntry]] = None,
     ):
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointDevicePool
+
+        if isinstance(self.mem_pool_host, HostPoolGroup) and any(
+            isinstance(entry.device_pool, MambaCheckpointDevicePool)
+            for entry in self.mem_pool_host.entries
+        ):
+            raise ValueError(
+                "INT8 Mamba HiCache supports L1/L2 only; L3 attachment is unsupported."
+            )
         if any(
             isinstance(entry.host_pool, UnifiedPageEnvelopeHostPool)
             for entry in self.mem_pool_host.entry_map.values()

@@ -1431,7 +1431,64 @@ class TestMambaCacheStochasticRounding(unittest.TestCase):
             handle_mamba_backend(server_args)
 
 
-class TestInt8MambaCheckpointCompatibility(unittest.TestCase):
+class TestInt8MambaCheckpointCompatibility(CustomTestCase):
+    @staticmethod
+    def hicache_args(**overrides):
+        values = dict(
+            model_path="dummy",
+            enable_int8_mamba_checkpoint=True,
+            enable_hierarchical_cache=True,
+            hicache_io_backend="kernel",
+            hicache_mem_layout="page_first",
+            hicache_write_policy="write_through",
+            hicache_host_memory_mode="cache",
+            mamba_radix_cache_strategy="extra_buffer_lazy",
+            mamba_ssm_dtype="bfloat16",
+            tp_size=2,
+        )
+        values.update(overrides)
+        return ServerArgs(**values)
+
+    @override_platform(is_cuda=True)
+    def test_accepts_checkpoint_aware_l1_l2(self):
+        handle_int8_mamba_checkpoint(self.hicache_args())
+
+    @override_platform(is_cuda=True)
+    def test_rejects_unsupported_hicache_owners_and_movers(self):
+        for field, value in (
+            ("hicache_io_backend", "direct"),
+            ("hicache_mem_layout", "layer_first"),
+            ("hicache_write_policy", "write_back"),
+            ("hicache_host_memory_mode", "buffer_only"),
+            ("hicache_storage_backend", "file"),
+            ("enable_linear_replayssm", True),
+            ("enable_linear_replayssm_spec", True),
+            ("mamba_radix_cache_strategy", "no_buffer"),
+            ("mamba_ssm_dtype", "float32"),
+            ("disaggregation_mode", "prefill"),
+            ("speculative_algorithm", "EAGLE"),
+            ("pp_size", 2),
+            ("dp_size", 2),
+            ("dcp_size", 2),
+            ("nnodes", 2),
+            ("enable_unified_memory", True),
+            ("enable_lmcache", True),
+            ("radix_cache_backend", "custom"),
+        ):
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                handle_int8_mamba_checkpoint(self.hicache_args(**{field: value}))
+
+    @override_platform(is_cuda=False)
+    def test_rejects_non_cuda_hicache(self):
+        with self.assertRaisesRegex(ValueError, "CUDA"):
+            handle_int8_mamba_checkpoint(self.hicache_args())
+
+    @override_platform(is_cuda=True)
+    def test_rejects_host_only_checkpoint_policy(self):
+        with envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.override(True):
+            with self.assertRaisesRegex(ValueError, "host-only"):
+                handle_int8_mamba_checkpoint(self.hicache_args())
+
     def test_rejects_unified_memory(self):
         """The unified pool has no int8 checkpoint pool; the flag used to be
         accepted and then silently ignored."""

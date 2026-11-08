@@ -2263,7 +2263,14 @@ class UnifiedRadixCache(BasePrefixCache):
         host_anchor_params: DecLockRefParams,
     ) -> bool:
         # Build the KV + per-component aux transfers.
-        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(node_id, req=req)
+        int8_checkpoint = (
+            self.supports_mamba() and self.kv_storage().quantizes_checkpoints("mamba")
+        )
+        # Compressed bytes belong to the node's checkpoint pool. The request
+        # restores them through deferred CoW into its separate active slot.
+        kv_xfer, comp_xfers = self.tree_core.build_load_back_spec(
+            node_id, req=None if int8_checkpoint else req
+        )
         kv_tokens = len(kv_xfer.host_indices)
         sidecar_xfers = self._build_sidecar_transfers(
             CacheTransferPhase.LOAD_BACK, kv_xfer, comp_xfers
@@ -2326,6 +2333,14 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         )
         self.name_loaded_window_rows_by_owner(aux_xfers)
+
+        if int8_checkpoint and req is not None:
+            checkpoint = self.tree_core.get_component_device_value(
+                node_id, ComponentType.MAMBA
+            )
+            if checkpoint is not None:
+                req.kv.mamba_cow_src_index = checkpoint
+                req.kv.mamba_needs_clear = False
 
         receipt = _OngoingLoadBack(
             node_id,

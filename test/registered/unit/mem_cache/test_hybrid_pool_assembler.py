@@ -284,6 +284,92 @@ class TestHybridStageLayerMappings(CustomTestCase):
                     self.assertEqual(kvcache.layers_mapping, layers_mapping)
 
 
+class TestInt8MambaHostInputs(CustomTestCase):
+    def make_inputs(self):
+        from sglang.srt.mem_cache.mamba_checkpoint_pool import MambaCheckpointPool
+
+        checkpoint = MambaCheckpointPool(
+            num_layers=2,
+            num_slots=6,
+            num_heads=2,
+            head_v_dim=16,
+            head_k_dim=16,
+            conv_shapes=[(3, 8)],
+            conv_dtype=torch.bfloat16,
+            temporal_dtype=torch.bfloat16,
+            device="cpu",
+        )
+        active = SimpleNamespace(_slot_siblings=[], mamba_layer_ids=[2, 4])
+        params = SimpleNamespace(
+            mtp_draft_mamba_pools=(),
+            token_to_kv_pool_allocator=SimpleNamespace(
+                state=SimpleNamespace(ckpt_pool=checkpoint),
+                state_slots=None,
+            ),
+        )
+        return params, active, checkpoint
+
+    def test_host_descriptor_and_allocator_use_checkpoint_namespace(self):
+        params, active, ckpt = self.make_inputs()
+        pool, allocator = hybrid_pool_assembler._mamba_checkpoint_host_inputs(
+            params, active
+        )
+        (info,) = pool.get_device_pool_infos()
+        self.assertIs(allocator, ckpt)
+        self.assertIs(info.buffer_info.temporal, ckpt.temporal.qdata)
+        self.assertEqual(info.layer_ids, (2, 4))
+        self.assertEqual(pool.host_capacity_bytes, ckpt.mem_usage_bytes())
+        self.assertEqual(pool.host_capacity_tokens, 6)
+        self.assertEqual(len(info.buffer_info.extra_checkpoint_buffers), 2)
+        self.assertEqual(
+            info.buffer_info.extra_checkpoint_buffers[1].data_ptr(),
+            ckpt.temporal.scale[1].data_ptr(),
+        )
+        reserved = allocator.alloc(6)
+        self.assertEqual(reserved.tolist(), list(range(1, 7)))
+        allocator.free(reserved)
+        self.assertEqual(ckpt.available_size(), 6)
+
+    def test_active_capacity_does_not_hide_checkpoint_shortfall(self):
+        params, _, ckpt = self.make_inputs()
+        ckpt.alloc(6)
+        reclaimed = []
+
+        def evict(p):
+            reclaimed.append(p.mamba_num)
+            ckpt.free(torch.tensor([6]))
+
+        params.token_to_kv_pool_allocator.state_slots = SimpleNamespace(
+            schedulable_available_size=lambda: 10
+        )
+        cache = SimpleNamespace(
+            token_to_kv_pool_allocator=params.token_to_kv_pool_allocator, evict=evict
+        )
+        hybrid_pool_assembler._evict_mamba_for_device_alloc(cache, 1)
+        self.assertEqual(reclaimed, [1])
+        self.assertEqual(ckpt.available_size(), 1)
+
+    def test_rejects_packed_drafts_and_unrepresented_model_state(self):
+        params, active, _ = self.make_inputs()
+        params.mtp_draft_mamba_pools = (object(),)
+        with self.assertRaisesRegex(ValueError, "MTP"):
+            hybrid_pool_assembler._mamba_checkpoint_host_inputs(params, active)
+        params.mtp_draft_mamba_pools = ()
+        active._slot_siblings = [object()]
+        with self.assertRaisesRegex(ValueError, "side states"):
+            hybrid_pool_assembler._mamba_checkpoint_host_inputs(params, active)
+
+    def test_runtime_storage_attach_rejects_compressed_pool(self):
+        params, active, _ = self.make_inputs()
+        pool, _ = hybrid_pool_assembler._mamba_checkpoint_host_inputs(params, active)
+        controller = object.__new__(HybridCacheController)
+        group = object.__new__(HostPoolGroup)
+        group.entries = [SimpleNamespace(device_pool=pool)]
+        controller.mem_pool_host = group
+        with self.assertRaisesRegex(ValueError, "L1/L2"):
+            controller.attach_storage_backend("file")
+
+
 class TestMambaInfoRouting(CustomTestCase):
     def test_checkpoint_axis_routes_stage_layers_for_both_stacks(self):
         for tri_pool in (False, True):
@@ -352,7 +438,9 @@ class TestMambaInfoRouting(CustomTestCase):
                             mtp_draft_device_pools=(),
                             mtp_draft_mamba_pools=drafts,
                             token_to_kv_pool_allocator=SimpleNamespace(
-                                swa_attn_allocator=allocator, state_slots=allocator
+                                swa_attn_allocator=allocator,
+                                state_slots=allocator,
+                                state=SimpleNamespace(ckpt_pool=None),
                             ),
                             tp_cache_group=None,
                             pp_cache_group=None,
@@ -1213,7 +1301,8 @@ class TestHybridMambaDeclaredIndexer(CustomTestCase):
             mtp_draft_device_pools=(),
             mtp_draft_mamba_pools=(),
             token_to_kv_pool_allocator=SimpleNamespace(
-                state_slots=SimpleNamespace(alloc=lambda n: None, free=lambda x: None)
+                state_slots=SimpleNamespace(alloc=lambda n: None, free=lambda x: None),
+                state=SimpleNamespace(ckpt_pool=None),
             ),
             tp_cache_group=None,
             attn_cp_cache_group=None,
