@@ -391,6 +391,8 @@ class DSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    # Prefill CP (interleave): the rows are this rank's token shard.
+    prefill_cp_sharded: bool = False
 
     pooled_index_kpool: int = 1
     pooled_cache_seqlens_int32: Optional[torch.Tensor] = None
@@ -633,6 +635,8 @@ class DeepseekSparseAttnBackend(
         )
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
+        # Every model's PAGED extend takes the packed v2 top-k for an unsharded
+        # batch; this flag also sends prefill-CP shards to it (DSATopKBackend).
         self.dsa_packed_extend_topk = _is_hip or is_kimi_k31(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.physical_page_size = model_runner.page_size // self.dsa_index_kpool
@@ -1618,6 +1622,7 @@ class DeepseekSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            prefill_cp_sharded=bs_idx_cpu is not None,
             topk_v2_plan=self._build_topk_v2_plan(seqlens_expanded),
             dcp_topk_length=self._dcp_topk_length_buffer(
                 forward_batch.forward_mode, seqlens_expanded
