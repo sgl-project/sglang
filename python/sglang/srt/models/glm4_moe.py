@@ -36,7 +36,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
 from sglang.srt.layers.dp_attention import (
@@ -60,21 +60,25 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
+    get_moe_runner_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.kt_ep_wrapper import KTEPWrapperMethod
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, is_routed_scaling_factor_fused_in_topk
 from sglang.srt.layers.moe.utils import (
     RoutingMethodType,
     filter_moe_weight_param_global_expert,
-    is_shared_experts_fusion_disabled,
+    get_num_fused_shared_experts,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import precompile_sm107_splitk_tactics
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -87,7 +91,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_device_sm,
@@ -96,9 +99,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     log_info_on_rank0,
-    make_pp_layers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
@@ -414,9 +415,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         self.tp_size = get_parallel().tp_size
         self.routed_scaling_factor = config.routed_scaling_factor
         self.n_shared_experts = config.n_shared_experts
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else config.n_shared_experts
-        )
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
 
         self.config = config
         self.layer_id = layer_id
@@ -450,7 +449,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         )
 
         self.topk = TopK(
-            top_k=self.top_k + self.num_fused_shared_experts,
+            top_k=self.top_k,
             layer_id=self.layer_id,
             renormalize=config.norm_topk_prob,
             use_grouped_topk=True,
@@ -458,11 +457,14 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_group=config.topk_group,
             correction_bias=self.gate.e_score_correction_bias,
             routed_scaling_factor=self.routed_scaling_factor,
-            num_fused_shared_experts=self.num_fused_shared_experts,
             apply_routed_scaling_factor_on_output=getattr(
                 self.experts, "should_fuse_routed_scaling_factor_in_topk", False
             ),
             fused_shared_experts_scaling_factor=1,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         self.shared_experts_is_int8 = False
@@ -652,10 +654,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -667,16 +665,16 @@ class Glm4MoeSparseMoeBlock(nn.Module):
         if enable_npu_dual_stream:
             wait_share_stream()
 
+        fused_in_topk = is_routed_scaling_factor_fused_in_topk(self.topk.topk_config)
         if shared_output is not None:
             x = shared_output
-            if self.experts.should_fuse_routed_scaling_factor_in_topk:
+            if fused_in_topk:
                 x.add_(final_hidden_states)
             else:
                 x.add_(final_hidden_states, alpha=self.routed_scaling_factor)
             final_hidden_states = x
-        else:
-            if not self.experts.should_fuse_routed_scaling_factor_in_topk:
-                final_hidden_states *= self.routed_scaling_factor
+        elif not fused_in_topk:
+            final_hidden_states *= self.routed_scaling_factor
 
         return final_hidden_states
 
@@ -734,8 +732,8 @@ class Glm4MoeDecoderLayer(nn.Module):
             alt_stream=alt_stream,
         )
 
-        self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
-        is_next_layer_sparse = self._is_layer_sparse(layer_id + 1, is_nextn=False)
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = Glm4MoeSparseMoeBlock(
@@ -763,14 +761,8 @@ class Glm4MoeDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
         )
 
         # Detect if QKV uses aiter FP8 per-token quant so we can fuse
@@ -818,10 +810,29 @@ class Glm4MoeDecoderLayer(nn.Module):
             self.self_attn.qkv_proj, "attn"
         )
 
-    def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id, is_nextn=is_nextn),
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id + 1, is_nextn=False
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
+    ) -> bool:
         return is_nextn or (
-            self.config.n_routed_experts is not None
-            and layer_id >= self.config.first_k_dense_replace
+            config.n_routed_experts is not None
+            and layer_id >= config.first_k_dense_replace
         )
 
     def forward(
@@ -893,6 +904,7 @@ class Glm4MoeModel(nn.Module):
                 alt_stream=self.alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: Glm4MoeDecoderLayer.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
@@ -981,8 +993,8 @@ class Glm4MoeForCausalLM(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
-        self.num_fused_shared_experts = 0
-        self.determine_num_fused_shared_experts()
+        # The weight loader reads this after the build.
+        self.num_fused_shared_experts = get_num_fused_shared_experts()
         self.model = Glm4MoeModel(
             config, quant_config, prefix=add_prefix("model", prefix)
         )
@@ -1019,11 +1031,10 @@ class Glm4MoeForCausalLM(nn.Module):
             return "GLM-4.5 W4AFP8 model uses different quant method for routed experts and shared experts."
         return None
 
-    def determine_num_fused_shared_experts(self):
-        # The decision was installed by the loader; this only reads it.
-        self.num_fused_shared_experts = (
-            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
-        )
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        """Shared experts fused as routed slots when fusion is on."""
+        return hf_config.n_shared_experts or 0
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
@@ -1275,8 +1286,22 @@ class Glm4MoeForCausalLM(nn.Module):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     fused_shared_experts_architecture = "GlmMoeDsaForCausalLM"
 
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The GLM target Gluon kernels consume the rank-local appended shared
+        # expert directly. Keep the generic DeepSeek Gluon+EP guard scoped to
+        # models whose kernels have not implemented that ABI.
+        return hf_config.n_shared_experts or 0
+
+    def precompile_kernels_after_loading(self) -> None:
+        if precompile_sm107_splitk_tactics():
+            logger.info("Precompiled SM107 BF16 split-K GEMM tactics for GLM-5")
+
 
 class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
+    # ModelConfig rewrites a GLM draft's architecture to this class's own name,
+    # so the inherited DeepSeek name would never match what the gate compares.
+    fused_shared_experts_architecture = "GlmMoeDsaForCausalLMNextN"
     # GLM-5.2's MTP layer index differs from DeepSeek's (61), so the inherited
     # substr mapping would wrongly rewrite GLM's real layer-61 weights.
     # exclude_layers remapping for the MTP layer is handled explicitly in
@@ -1284,6 +1309,23 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
     hf_to_sglang_mapper = WeightsMapper()
 
     _NEXTN_SPEC_WEIGHT_NAMES = ("shared_head.norm", "eh_proj", "enorm", "hnorm")
+
+    @classmethod
+    def num_fusable_shared_experts(cls, hf_config) -> int:
+        # The Gluon draft kernel keeps the BF16 shared expert native. Pin the
+        # model-level loader decision as well as the layer-level decision so
+        # the checkpoint remap cannot append it to the routed expert bank.
+        if get_moe_runner_backend().is_gluon():
+            return 0
+        return super().num_fusable_shared_experts(hf_config)
+
+    @classmethod
+    def shared_experts_fusion_disable_reason(cls, hf_config, quant_config):
+        # The PTPC cast only rewrites routed experts, so the shared expert never
+        # matches the FP8 per-channel slot it would be fused into.
+        if should_apply_glm_nextn_moe_ptpc(quant_config, hf_config.num_hidden_layers):
+            return "GLM NextN PTPC does not support shared experts fusion."
+        return super().shared_experts_fusion_disable_reason(hf_config, quant_config)
 
     @classmethod
     def _map_mtp_ckpt_name(cls, name: str, layer_prefix: str) -> str:
@@ -1373,16 +1415,22 @@ class GlmMoeDsaForCausalLMNextN(DeepseekV3ForCausalLMNextN):
         if not mtp_excluded:
             return quant_config
 
+        apply_ptpc = should_apply_glm_nextn_moe_ptpc(
+            quant_config, config.num_hidden_layers
+        )
+        routed_experts_prefix = "model.decoder.mlp.experts."
         names = set(quant_config.exclude_layers)
         for name in mtp_excluded:
-            names.add(self._map_mtp_ckpt_name(name, layer_prefix))
+            mapped = self._map_mtp_ckpt_name(name, layer_prefix)
+            # Keep checkpoint excludes for the loader, but let the converted
+            # runtime experts use the PTPC scheme below.
+            if apply_ptpc and mapped.startswith(routed_experts_prefix):
+                continue
+            names.add(mapped)
 
-        # Fused routed experts are queried by the coarse module prefix
-        # "model.decoder.mlp.experts", which expanded per-expert leaf excludes
-        # do not match. So that module needs its own entry: bf16 as in the
-        # checkpoint, or the scheme matching the on-load PTPC-FP8 cast.
-        # Same gate as the weight-loader cast (Quark-excluded = bf16 in ckpt).
-        if should_apply_glm_nextn_moe_ptpc(quant_config, config.num_hidden_layers):
+        # Match the runtime scheme to the weight-loader cast; otherwise keep
+        # the checkpoint's BF16 routed experts excluded.
+        if apply_ptpc:
             mtp_layer_quant_config = quant_config.quant_config.setdefault(
                 "layer_quant_config", {}
             )

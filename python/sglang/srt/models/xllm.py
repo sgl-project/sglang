@@ -28,6 +28,7 @@
 
 import math
 from contextlib import nullcontext
+from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple, Union
 
 import torch
@@ -37,7 +38,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import (
@@ -72,6 +72,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -84,7 +86,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers
 
 _XLLM_SOURCE_ROUTER_PARTITIONS_CONFIG_KEY = "xllm_source_router_gemm_partitions"
 _XLLM_SOURCE_ROUTER_PARTITIONS_MISSING = object()
@@ -941,6 +942,10 @@ class XllmSparseMoeBlock(nn.Module):
             prefix=add_prefix("experts", prefix),
             routing_method_type=RoutingMethodType.RenormalizeNaive,
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Shared expert (no gating — output added directly)
         num_shared_experts = getattr(config, "num_shared_experts", 0)
@@ -995,10 +1000,6 @@ class XllmSparseMoeBlock(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=(
-                    ExpertLocationDispatchInfo.init_new(layer_id=self.layer_id)
-                ),
             )
             # Apply router scaling factor after renormalization
             if self.router_scaling_factor != 1.0:
@@ -1009,7 +1010,7 @@ class XllmSparseMoeBlock(nn.Module):
                     topk_output.topk_weights = scaled_weights
         else:
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
         final_hidden_states = self.experts(
             hidden_states=hidden_states,
@@ -1046,7 +1047,7 @@ class XllmSparseMoeBlock(nn.Module):
         if hidden_states.shape[0] == 0:
             shared_output = None
             topk_output = self.topk.empty_topk_output(
-                hidden_states.device, layer_id=self.layer_id
+                hidden_states.device,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
         else:
@@ -1433,15 +1434,7 @@ class XllmDecoderLayer(nn.Module):
 
         self.layer_id = layer_id
 
-        # Determine if this layer is sparse (MoE) or dense
-        mlp_only_layers = getattr(config, "mlp_only_layers", [])
-        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
-        if (layer_id not in mlp_only_layers) and (
-            config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
-        ):
-            self.is_layer_sparse = True
-        else:
-            self.is_layer_sparse = False
+        self.is_layer_sparse = self._is_layer_sparse(config, layer_id)
 
         is_mova_config = getattr(config, "num_values", 0) > 0
         is_mova_attention = is_mova_config and layer_id >= config.num_dense_layers
@@ -1475,16 +1468,6 @@ class XllmDecoderLayer(nn.Module):
                 prefix=add_prefix("self_attn", prefix),
             )
 
-        # Check neighbors for scatter modes
-        def _is_sparse(lid):
-            if lid < 0 or lid >= config.num_hidden_layers:
-                return False
-            return (lid not in mlp_only_layers) and (
-                config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
-            )
-
-        is_next_layer_sparse = _is_sparse(layer_id + 1)
-
         if self.is_layer_sparse:
             self.mlp = XllmSparseMoeBlock(
                 layer_id=layer_id,
@@ -1506,15 +1489,47 @@ class XllmDecoderLayer(nn.Module):
 
         self.input_layernorm = _make_norm(config)
         self.post_attention_layernorm = _make_norm(config)
+        attn, ffn = self.stage_facts(config, layer_id)
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(cls, config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(config, layer_id),
+                next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
             ),
+        )
+
+    @staticmethod
+    def _is_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        # Determine if this layer is sparse (MoE) or dense
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        if (layer_id not in mlp_only_layers) and (
+            config.num_experts > 0 and (layer_id + 1) % decoder_sparse_step == 0
+        ):
+            return True
+        else:
+            return False
+
+    @staticmethod
+    def _is_next_layer_sparse(config: PretrainedConfig, layer_id: int) -> bool:
+        # Check neighbors for scatter modes
+        mlp_only_layers = getattr(config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(config, "decoder_sparse_step", 1)
+        lid = layer_id + 1
+        if lid < 0 or lid >= config.num_hidden_layers:
+            return False
+        return (lid not in mlp_only_layers) and (
+            config.num_experts > 0 and (lid + 1) % decoder_sparse_step == 0
         )
 
     def forward(
@@ -1576,6 +1591,7 @@ class XllmModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(XllmDecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = _make_norm(config)

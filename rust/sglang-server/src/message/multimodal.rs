@@ -11,18 +11,27 @@ use crate::utils::error::Error;
 pub enum MmItem {
     /// URL, `file://` / absolute path, `data:` URI, or bare base64 (Python `str`).
     Source(String),
-    /// Python `ImageData` / `VideoData` (`{"url": …, …}`). Only `url` is kept:
-    /// the hint keys (`detail`, `max_dynamic_patch`, `preprocess_kwargs`, ...)
-    /// are read by model families this pipeline does not run, and Python's
-    /// `load_image` itself reduces the item to `.url`.
-    Ref { url: String },
+    /// Python `ImageData` / `VideoData` (`{"url": …, …}`): the source plus the
+    /// hints a processor may read.
+    Ref { url: String, hints: MediaHints },
+}
+
+/// The `MediaRef` hints a processor may read, grown as processors need them;
+/// the rest serve Python-side model families the Rust pipeline does not run.
+/// A bare source carries none, and the built-in families ignore them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MediaHints {
+    /// Video: the requested frame sampling rate.
+    pub fps: Option<f64>,
+    /// Image: the requested detail level ("auto" | "low" | "high").
+    pub detail: Option<String>,
 }
 
 impl MmItem {
     /// The raw source string for the modality pipeline.
     pub fn source(&self) -> Option<&str> {
         match self {
-            MmItem::Source(source) | MmItem::Ref { url: source } => Some(source),
+            MmItem::Source(source) | MmItem::Ref { url: source, .. } => Some(source),
         }
     }
 }
@@ -30,7 +39,8 @@ impl MmItem {
 impl HeapBytes for MmItem {
     fn heap_bytes(&self) -> usize {
         match self {
-            MmItem::Source(s) | MmItem::Ref { url: s } => s.len(),
+            MmItem::Source(s) => s.len(),
+            MmItem::Ref { url, hints } => url.len() + hints.detail.as_ref().map_or(0, String::len),
         }
     }
 }
@@ -146,14 +156,21 @@ mod tests {
         );
     }
 
-    /// Object items are typed `MediaRef`s: only `url` reaches this pipeline, a
-    /// hint the schema does not name is an error, and a preprocessed-input
-    /// dict is not a wire shape at all (its values are tensors; Engine-only).
+    /// Object items are typed `MediaRef`s: the `url` and the hints a processor
+    /// reads ride along (`max_dynamic_patch` does not), a hint the schema does
+    /// not name is an error, and a preprocessed-input dict is not a wire shape
+    /// at all (its values are tensors; Engine-only).
     #[test]
     fn parses_item_objects() {
         assert_eq!(
-            parse(r#"{"url": "u", "detail": "high"}"#).unwrap(),
-            MmDataInput::One(MmItem::Ref { url: "u".into() })
+            parse(r#"{"url": "u", "detail": "low", "max_dynamic_patch": 6}"#).unwrap(),
+            MmDataInput::One(MmItem::Ref {
+                url: "u".into(),
+                hints: MediaHints {
+                    detail: Some("low".into()),
+                    ..Default::default()
+                },
+            })
         );
         let err = parse(r#"{"url": "u", "detai": "high"}"#)
             .unwrap_err()
@@ -194,6 +211,25 @@ mod tests {
         );
         let err = fan_out(Some(parse(r#"[["a"]]"#).unwrap()), 1, false, "image_data").unwrap_err();
         assert!(err.to_string().contains("batch form"), "{err}");
+    }
+
+    /// A broadcast clones an item's hints with its url, so both count against
+    /// the clone budget.
+    #[test]
+    fn broadcast_budget_counts_hints() {
+        let item = MmItem::Ref {
+            url: "u".into(),
+            hints: MediaHints {
+                detail: Some("x".repeat(1 << 20)),
+                ..Default::default()
+            },
+        };
+        assert_eq!(item.heap_bytes(), 1 + (1 << 20));
+        let err = fan_out(Some(MmDataInput::One(item)), 4096, true, "video_data").unwrap_err();
+        assert!(
+            err.to_string().contains("broadcast to 4096 prompts"),
+            "{err}"
+        );
     }
 
     #[test]

@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 import torch
 
-from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, saturate_to_fp8_range
 
 
 def make_kv_cache(total_slots, row_dim, dtype=fp8_dtype, device="cuda"):
@@ -45,7 +45,14 @@ def assert_prefix_commit(
             value.div_(scale)
         scaled.append(value)
         target = cache.contiguous().view(torch.uint8).clone()
-        target[dst] = value.to(cache.dtype).contiguous().view(torch.uint8)[src]
+        # The commit path saturates out-of-range values rather than reproducing
+        # the eager cast, which returns NaN on float8_e4m3fnuz. See #42981.
+        quantized = (
+            saturate_to_fp8_range(value, cache.dtype)
+            if cache.dtype == fp8_dtype
+            else value
+        )
+        target[dst] = quantized.to(cache.dtype).contiguous().view(torch.uint8)[src]
         expected.append(target)
 
     yield

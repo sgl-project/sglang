@@ -26,6 +26,8 @@ pub struct RouterConfig {
     pub worker_startup_timeout_secs: u64,
     pub worker_startup_check_interval_secs: u64,
     pub dp_aware: bool,
+    #[serde(default)]
+    pub decode_dispatch_limit: Option<usize>,
     pub api_key: Option<String>,
     pub discovery: Option<DiscoveryConfig>,
     pub metrics: Option<MetricsConfig>,
@@ -514,6 +516,7 @@ impl Default for RouterConfig {
             worker_startup_timeout_secs: 1800, // 30 minutes for large model loading
             worker_startup_check_interval_secs: 30,
             dp_aware: false,
+            decode_dispatch_limit: None,
             api_key: None,
             discovery: None,
             metrics: None,

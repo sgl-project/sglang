@@ -97,6 +97,15 @@ SM121_GEMM_PLANS: Dict[Tuple[int, int], Dict[int, SkinnyGemmConfig]] = {
         2: SkinnyGemmConfig(2, 256, 1, vector_width=2, static_k=2560),
         8: SkinnyGemmConfig(8, 128, 1, vector_width=4, static_k=2560),
         3: SkinnyGemmConfig(3, 64, 1, k_unroll=4, vector_width=4, static_k=2560),
+        # M=4: NEXTN verify (4 draft tokens); also the replicated QSA indexer Q/K.
+        4: SkinnyGemmConfig(4, 64, 2, k_unroll=4, vector_width=4, static_k=2560),
+    },
+    # Shared-expert down, TP=2 (K = 640 / 2). M >= 8 loses to cuBLAS.
+    (2560, 320): {
+        1: SkinnyGemmConfig(1, 32, 2, vector_width=2, static_k=320),
+        2: SkinnyGemmConfig(2, 32, 2, vector_width=2, static_k=320),
+        3: SkinnyGemmConfig(3, 32, 2, vector_width=2, static_k=320),
+        4: SkinnyGemmConfig(4, 32, 2, vector_width=2, static_k=320),
     },
     # Shared-expert fused gate/up, TP=1.
     (1280, 2560): {

@@ -178,7 +178,7 @@ def minimax_sparse_prefill(
         # the scratch gather reads pool slots without the HiSparse remap
         and loc_mapping is None
     ):
-        from .gluon_prefill import (
+        from sglang.kernels.ops.attention.minimax_sparse.prefill.gluon_prefill import (
             GluonPrefillUnavailableError,
             can_use_gluon_prefill,
             gluon_sparse_prefill,
@@ -209,6 +209,8 @@ def minimax_sparse_prefill(
                     seq_lens_cpu=seq_lens_cpu,
                     block_size_k=block_size_k,
                     sm_scale=sm_scale,
+                    k_scale=k_scale,
+                    v_scale=v_scale,
                 )
             except GluonPrefillUnavailableError as err:
                 _warn_gluon_fallback(str(err))
@@ -327,6 +329,7 @@ def minimax_sparse_decode(
     topk_out: Optional[torch.Tensor] = None,
     hisparse_swap_in_fn: Optional[Callable] = None,
     indexer_cp=None,
+    packed_queries: int = 1,  # consecutive rows sharing one request (EAGLE verify)
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     # Index top-k sharing for DECODE. A group's source layer passes ``topk_out``
     # (a persistent buffer) and publishes its reduced top-k there; the group's
@@ -362,6 +365,7 @@ def minimax_sparse_decode(
             idx_sm_scale,
             idx_q_scale,
             idx_k_scale,
+            packed_queries=packed_queries,
         )
         _skip_reduce = True
     else:

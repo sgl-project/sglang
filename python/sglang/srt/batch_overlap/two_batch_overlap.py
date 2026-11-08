@@ -35,12 +35,9 @@ from sglang.srt.layers.moe.token_dispatcher import (
 )
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    compute_position,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, compute_position
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     attention_backends,
     get_device,
@@ -677,6 +674,10 @@ class TboForwardBatchPreparer:
         assert end_token_index >= start_token_index, (
             f"{end_token_index=}, {start_token_index=}, batch={batch}"
         )
+        assert batch.logical_forward_mode == batch.forward_mode, (
+            "Two-batch overlap does not support hybrid-SSM decode batches "
+            "relabeled as extend for DP padding."
+        )
         num_tokens = batch.input_ids.shape[0]
         num_seqs = batch.batch_size
 
@@ -701,10 +702,10 @@ class TboForwardBatchPreparer:
         # Unified memory refuses two-batch overlap, so the plan's reads stay in
         # `req_to_token`, which each child indexes at its own rows; each child
         # writes its own tokens of the plan's window.
-        output_dict["kv_loc_plan"] = batch.kv_loc_plan
-        if batch.kv_loc_plan is not None:
-            output_dict["kv_loc_cols"] = batch.kv_loc_plan.cols_slice(
-                batch.kv_loc_cols, slice(start_token_index, end_token_index)
+        output_dict["iteration_ids"] = batch.iteration_ids
+        if batch.iteration_ids is not None:
+            output_dict["iteration_cols"] = batch.iteration_ids.cols_slice(
+                batch.iteration_cols, slice(start_token_index, end_token_index)
             )
 
         attention_tp_size = get_parallel().attn_tp_size
@@ -724,6 +725,7 @@ class TboForwardBatchPreparer:
             "extend_prefix_lens_cpu",
             "extend_seq_lens_cpu",
             "extend_logprob_start_lens_cpu",
+            "extend_is_final_cpu",
             "lora_ids",
             "rids",
         ]:
@@ -771,10 +773,12 @@ class TboForwardBatchPreparer:
             "dp_padding_mode",
             "global_forward_mode",
             "is_prefill_only",
+            "contains_last_prefill_chunk",
             "spec_algorithm",
             "capture_hidden_mode",
             "defer_logits_to_eager",  # forward-level flag, inherited by both child batches
-            "split_index",  # for split prefill
+            "full_prefill_cuda_graph_capture",  # forward-level flag, inherited by both child batches
+            "input_ids_from_graph",
             "orig_seq_lens",  # only used by qwen-1m, thus not care
             "return_pooled_hidden_states",
             "reuse_dsa_topk_indices",  # forward-level flag, inherited by both child batches
@@ -851,6 +855,8 @@ class TboForwardBatchPreparer:
                 next_token_logits_buffer=None,
                 # The aux packer runs in the parent model forward, not per child.
                 aux_hidden_states_buffer=None,
+                # A one-request batch's bound; a split batch has none to give.
+                attention_kv_len_lower_bound=None,
                 return_hidden_states_before_norm=False,
                 # TBO children start unplanned — planned by the TBO-aware init
                 # flow; a stale parent "ready" would wrongly skip that.
@@ -1119,37 +1125,44 @@ def _model_forward_tbo_merge_outputs(output_a, output_b, original_len):
             output["hidden_states"]
         )
 
-    def _handle_key(name):
-        value_a = output_a[name]
-        value_b = output_b[name]
-        assert (value_a is None) == (value_b is None)
-        if value_a is None:
-            return None
-        s0, t0 = output_a["forward_batch"].tbo_parent_token_range
-        s1, t1 = output_b["forward_batch"].tbo_parent_token_range
-        res = torch.zeros(
-            (original_len, *value_a.shape[1:]),
-            dtype=value_a.dtype,
-            device=value_a.device,
-        )
-        res[slice(s0, t0)] = value_a[: t0 - s0]
-        res[slice(s1, t1)] = value_b[: t1 - s1]
-        return res
-
-    hidden, residual = _handle_key("hidden_states"), _handle_key("residual")
+    hidden = _model_forward_tbo_merge_key(
+        output_a, output_b, "hidden_states", original_len
+    )
+    residual = _model_forward_tbo_merge_key(
+        output_a, output_b, "residual", original_len
+    )
     return ResidualStream.from_handoff(hidden, residual, update)
+
+
+def _model_forward_tbo_merge_key(output_a, output_b, name, original_len):
+    value_a = output_a[name]
+    value_b = output_b[name]
+    assert (value_a is None) == (value_b is None)
+    if value_a is None:
+        return None
+    s0, t0 = output_a["forward_batch"].tbo_parent_token_range
+    s1, t1 = output_b["forward_batch"].tbo_parent_token_range
+    res = torch.zeros(
+        (original_len, *value_a.shape[1:]),
+        dtype=value_a.dtype,
+        device=value_a.device,
+    )
+    res[slice(s0, t0)] = value_a[: t0 - s0]
+    res[slice(s1, t1)] = value_b[: t1 - s1]
+    return res
 
 
 # -------------------------------- Utilities and wrappers ---------------------------------------
 
 
 class MaybeTboDeepEPDispatcher(BaseDispatcher):
-    def __init__(self, **kwargs):
+    def __init__(self, runner_backend=None, **kwargs):
         super().__init__()
         num_inner_dispatchers = 2 if is_tbo_enabled() else 1
         if get_moe_a2a_backend().is_deepep():
             self._inners = [
-                DeepEPDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                DeepEPDispatcher(runner_backend=runner_backend, **kwargs)
+                for _ in range(num_inner_dispatchers)
             ]
         elif get_moe_a2a_backend().is_mooncake():
             self._inners = [
@@ -1166,7 +1179,8 @@ class MaybeTboDeepEPDispatcher(BaseDispatcher):
             ]
         elif get_moe_a2a_backend().is_pplx():
             self._inners = [
-                PplxDispatcher(**kwargs) for _ in range(num_inner_dispatchers)
+                PplxDispatcher(runner_backend=runner_backend, **kwargs)
+                for _ in range(num_inner_dispatchers)
             ]
 
     @property

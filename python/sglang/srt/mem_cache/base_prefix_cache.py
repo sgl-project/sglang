@@ -18,6 +18,8 @@ from typing import (
 
 import torch
 
+from sglang.srt.layers.cp.base import is_cp_sharded_padded
+from sglang.srt.layers.cp.utils import from_cp_sharded
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.events import KVCacheEventRecorder
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -58,6 +60,7 @@ class PrefixCacheTrait(Protocol):
     req_to_token_pool: ReqToTokenPool
     token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator
     page_size: int
+    logical_page_size: int
     disable: bool
 
 
@@ -81,6 +84,15 @@ class InsertParams:
 
     # Mamba specific
     mamba_value: Optional[torch.Tensor] = None
+    # Host-only checkpoint: hicache host-pool index. The radix node keeps this
+    # and no GPU slot. Mutually exclusive with mamba_value.
+    mamba_host_value: Optional[torch.Tensor] = None
+    # GPU slot to copy into the host pool. Set by prepare; the copy itself
+    # waits until the insert key is known, so a leaf that already has mamba
+    # never pays the D2H.
+    mamba_host_src: Optional[torch.Tensor] = None
+    # Both mamba values stay empty and the leaf already holds the checkpoint.
+    allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
 
@@ -158,6 +170,7 @@ class EvictParams:
     num_tokens: int = 0
     swa_num_tokens: int = 0
     mamba_num: int = 0
+    auxiliary_swa_num_tokens: int = 0
 
 
 @dataclasses.dataclass
@@ -167,6 +180,7 @@ class EvictResult:
     num_tokens_evicted: int = 0
     swa_num_tokens_evicted: int = 0
     mamba_num_evicted: int = 0
+    auxiliary_swa_num_tokens_evicted: int = 0
 
 
 @dataclasses.dataclass
@@ -218,8 +232,9 @@ class DecLockRefParams:
 
     A segment release requires its component's boundary entry; a missing
     entry must not be treated as a lock reaching the root. ``node_id`` is
-    ``None`` only for receipts that never came from a unified-tree acquire
-    (legacy caches, session sentinels).
+    ``None`` only for legacy caches; the unified tree rejects such a receipt.
+    ``skipped_lock_components`` also records components released individually
+    before the remaining receipt is unlocked.
     """
 
     node_id: Optional[int] = None
@@ -316,13 +331,19 @@ class MatchResult(NamedTuple):
     full_kv_hit_length: int = 0
     # Actions the Controller applies: CacheActions itself, ComponentActions routed to the owning component.
     cache_actions: Sequence[CacheAction | ComponentAction] = ()
+    # Deepest non-root node visited, including nodes rejected by validators.
+    last_visited_node_id: Optional[int] = None
+    # Reusable prefix length in FULL's device-value scan, before node-boundary
+    # or auxiliary constraints. None means no shorter prefix was reported.
+    full_device_match_len: Optional[int] = None
+    auxiliary_swa_host_hit_length: int = 0
 
 
 def zero_match_result(
     tree_cache, match_result: MatchResult, extra_key: Optional[str] = None
 ) -> MatchResult:
     if not tree_cache.supports_prefix_sharing():
-        # match_prefix already returns a miss; no root_node to walk back to.
+        # A non-sharing cache's match is already a miss; pass it through.
         return match_result
     root = tree_cache.root_node_handle(extra_key=extra_key)
     return match_result._replace(
@@ -332,9 +353,12 @@ def zero_match_result(
         best_match_node=root,
         host_hit_length=0,
         swa_host_hit_length=0,
+        auxiliary_swa_host_hit_length=0,
         swa_branching_seqlen=None,
         mamba_host_hit_length=0,
         full_kv_hit_length=0,
+        last_visited_node_id=None,
+        full_device_match_len=None,
     )
 
 
@@ -392,6 +416,8 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     storage_prefetch_retries: Optional[StoragePrefetchRetries] = None
     # Set by caches that publish KV placement events; None means they don't.
     kv_events: Optional[KVCacheEventRecorder] = None
+    # Additional reader reaches keyed by actual storage band, not attention role.
+    draft_window_reaches: Optional[dict[str, int]] = None
 
     def init_metrics_collector(self):
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -421,13 +447,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         tens of seconds (see HostKVCache.destroy). Idempotent.
         """
 
-    def release_aborted_request(self, handle: CacheRequestHandle) -> None:
+    def _abandon_attempt(self, handle: CacheRequestHandle) -> None:
         """Release attempt state; caches without prefetch state have nothing to drop."""
 
     def finish(self, handle: CacheRequestHandle, outcome: CacheRequestOutcome) -> None:
         """Finish an attempt without cancelling successful asynchronous cache work."""
         if outcome != CacheRequestOutcome.SUCCESS:
-            self.release_aborted_request(handle)
+            self._abandon_attempt(handle)
 
     @abstractmethod
     def reset(self):
@@ -439,6 +465,10 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def supports_fast_match_prefix(self) -> bool:
         return False
+
+    def touch_prefix(self, key: RadixKey) -> None:
+        """Bump LRU recency along ``key``'s cached path. Unlike ``match_prefix``,
+        never allocates, loads, or queries external tiers."""
 
     def dfs_weight_order(self, node_handles: Sequence[Any]) -> list[int]:
         """Return request indices in depth-first, subtree-weight order."""
@@ -463,7 +493,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         """Logical-page KV sharding: the rotation base stamped on ``node``.
 
         ``node`` is whatever this cache stores in ``req.last_node`` (a NodeId
-        for the unified tree, None for caches without tree nodes). None means
+        for the unified tree). None means
         "no base available here", which sends the alloc path to the base the
         request recorded at its previous alloc. Tree caches that keep the
         per-chain base override this. See UnifiedTreeNode.rotation_base.
@@ -491,25 +521,38 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         row = self.req_to_token_pool.req_to_token[kv.req_pool_idx]
         # Adjacent pieces whose seam falls inside one (DCP-widened) page would
         # free that page twice; the allocator rejects that, so merge them first.
+        global_page_size = self.logical_page_size
         free_kv_row_segments(
             allocator,
             [(row[start:end], start) for start, end in coalesce_ranges(ranges)],
             swa_evicted_seqlen=kv.get_evicted_seqlen(ComponentType.SWA),
-            swa_dead_lo=kv.swa_dead_lo(allocator.page_size),
+            swa_dead_lo=kv.swa_dead_lo(global_page_size),
         )
 
     @abstractmethod
     def evict(self, params: EvictParams) -> EvictResult:
         pass
 
-    def evict_for_alloc(self, params: EvictParams) -> EvictResult:
-        """Evict cache entries to cover allocator shortfalls.
+    def evict_for_alloc(
+        self,
+        params: EvictParams,
+        *,
+        allocation_reclaim_satisfied: Optional[Callable[[], bool]] = None,
+    ) -> EvictResult:
+        """Evict for allocation using shortfalls or joint-reclaim quotas.
 
-        The default implementation preserves the component-count semantics of
-        :meth:`evict`. Multi-component caches backed by shared memory can
-        override this entry point to stop once collateral frees make the
-        requested allocation feasible.
+        Without ``allocation_reclaim_satisfied``, callers pass component
+        shortfalls in ``params``. The default implementation forwards these
+        counts to :meth:`evict`; multi-component caches may stop earlier when
+        collateral frees satisfy the requested allocation.
+
+        With ``allocation_reclaim_satisfied``, ``params`` instead contains
+        cumulative reclaim quotas. Supporting caches may stop at the pure
+        predicate before reaching those quotas. The allocator still owns
+        preparation and the actual capacity check after the walk.
         """
+        if allocation_reclaim_satisfied is not None:
+            raise NotImplementedError("This cache does not support joint reclaim")
         return self.evict(params)
 
     @abstractmethod
@@ -564,6 +607,9 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def swa_evictable_size(self):
         return 0
 
+    def auxiliary_swa_evictable_size(self):
+        return 0
+
     def protected_size(self):
         return 0
 
@@ -592,6 +638,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         auxiliary-only load or a recompute fallback."""
         raise NotImplementedError()
 
+    def load_back_is_cache_owned(self) -> bool:
+        """Whether the slots loaded by ``init_load_back`` belong to this cache.
+
+        False means they belong to the request, which inserts them like any
+        computed KV once its forward confirms the load.
+        """
+        return True
+
     def finish_storage_prefetch_admission(
         self,
         handle: CacheRequestHandle,
@@ -605,6 +659,12 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def discard_storage_prefetch_accounting(self, handle: CacheRequestHandle) -> None:
         """Forget storage-hit lifecycle state without emitting a result."""
+
+    def waiting_storage_span(
+        self, request: CacheRequestHandle
+    ) -> Optional[tuple[int, int]]:
+        """Expected storage-hit span in logical tokens for a waiting request."""
+        return None
 
     def pop_prefetch_loaded_span(
         self, handle: CacheRequestHandle
@@ -640,22 +700,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def supports_auxiliary_swa(self) -> bool:
         return False
 
-    def evict_sliding_windows(
-        self, req: Req, pre_len: int, *, eviction_interval: int = 1
-    ) -> None:
-        """Slide request-owned windows at the scheduler's safe eviction frontier."""
-        from sglang.srt.mem_cache.common import free_swa_out_of_window_slots
-
-        free_swa_out_of_window_slots(
-            req,
-            pre_len,
-            sliding_window_size=self.sliding_window_size,
-            page_size=self.page_size,
-            req_to_token_pool=self.req_to_token_pool,
-            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-            supports_prefix_sharing=self.supports_prefix_sharing(),
-            retain_floor=self.swa_retain_floor(req),
-            eviction_interval=eviction_interval,
+    @property
+    def swa_retain_window(self) -> Optional[int]:
+        # What the frees and unlocks of a running request's SWA keep behind it;
+        # every other SWA rule uses sliding_window_size.
+        if self.sliding_window_size is None:
+            return None
+        return max(
+            self.sliding_window_size, (self.draft_window_reaches or {}).get("swa", 0)
         )
 
     def swa_retain_floor(self, req) -> int | None:
@@ -665,10 +717,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         # nothing deeper than the tail to protect.
         return None
 
-    def swa_reprefill_tail_tokens(self) -> int:
-        # Only the unified_kv compress-only HiCache layout needs to hold back a
-        # trailing sliding window for re-prefill; every other cache keeps SWA
-        # content-stable and overrides this where relevant.
+    def window_retention(self, req):
+        """Running-request window components, retention lengths and prefix floors."""
+        return (
+            (ComponentType.SWA, self.swa_retain_window, self.swa_retain_floor(req)),
+        )
+
+    def swa_reprefill_tail_tokens(self, req=None) -> int:
+        # Caches whose matched SWA is not reusable as is override this.
         return 0
 
     def supports_mamba(self) -> bool:
@@ -679,6 +735,14 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def release_radix_session(self, session_id: str) -> None:
         pass
+
+    def retained_window_tokens(self) -> int:
+        """KV tokens held outside the prefix tree and streaming-session records"""
+        return 0
+
+    def retained_window_req_count(self) -> int:
+        """request rows retained outside streaming-session records"""
+        return 0
 
     def session_records(self) -> dict[str, ReqKvInfo]:
         """The KV records sessions own, by session id. Pool accounting counts them
@@ -692,5 +756,7 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
 
     def available_and_evictable_str(self) -> str:
         available_size = self.token_to_kv_pool_allocator.available_size()
+        if is_cp_sharded_padded():
+            available_size = from_cp_sharded(available_size)
         evictable_size = self.evictable_size()
         return f"Available tokens: {available_size + evictable_size} ({available_size=} + {evictable_size=})\n"

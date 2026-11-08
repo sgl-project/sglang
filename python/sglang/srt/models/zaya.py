@@ -75,6 +75,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,7 +85,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, make_pp_layers, set_weight_attrs
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +134,13 @@ class _ResidualMergeRead:
     sum as the new residual, and the input norm of that sum in the model
     dtype. The producer's update must be a plain add."""
 
+    bind = None
+
     is_plain_norm = False
+    completing_fusions = ()
+    gathering_reads = ()
     reads_before_dp_gather = False
+    reads_after_attn_tp_gather = False
 
     def __init__(self, res_scale: Optional[ResidualScaling]):
         self.res_scale = res_scale
@@ -1314,10 +1320,15 @@ class ZayaDecoderATTLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.attn_boundary,) = append_stages(
-            (declare_attn(read=_ResidualMergeRead(self.res_scale)), self.input_norm),
-        )
+        (attn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.attn_boundary,) = append_stages((attn, self.input_norm))
         self.entry_boundary = self.attn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an attention layer declares: its attention, read
+        through ``res_scale``."""
+        return (declare_attn(read=_ResidualMergeRead(res_scale)),)
 
     @staticmethod
     def _build_norm(config: ZayaConfig) -> nn.Module:
@@ -1365,17 +1376,21 @@ class ZayaDecoderMLPLayer(nn.Module):
             self.res_scale = ResidualScaling(config, layer_id)
         else:
             self.res_scale = None
-        (self.ffn_boundary,) = append_stages(
-            (
-                declare_ffn(
-                    sparse=True,
-                    next_layer_sparse=True,
-                    read=_ResidualMergeRead(self.res_scale),
-                ),
-                self.input_norm,
+        (ffn,) = self.stage_facts(res_scale=self.res_scale)
+        (self.ffn_boundary,) = append_stages((ffn, self.input_norm))
+        self.entry_boundary = self.ffn_boundary
+
+    @staticmethod
+    def stage_facts(*, res_scale: Optional[ResidualScaling] = None):
+        """The one stage an MoE layer declares: its MoE, read through
+        ``res_scale``."""
+        return (
+            declare_ffn(
+                sparse=True,
+                next_layer_sparse=True,
+                read=_ResidualMergeRead(res_scale),
             ),
         )
-        self.entry_boundary = self.ffn_boundary
 
     def forward(
         self,
@@ -1397,28 +1412,34 @@ class ZayaDecoderMLPLayer(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+def _layer_class(layer_id: int):
+    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
+    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
+    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
+    if layer_id % 2 == 0:
+        return ZayaDecoderATTLayer
+    return ZayaDecoderMLPLayer
+
+
 def _build_layer(
     layer_id: int,
     config: ZayaConfig,
     quant_config: Optional[QuantizationConfig],
     prefix: str,
 ) -> nn.Module:
-    # Even layer ids are attention, odd layer ids are MoE. This matches the HF
-    # checkpoint keys: ``model.layers.<2k>.self_attn.*`` (CCA) versus
-    # ``model.layers.<2k+1>.zaya_block.*`` (MoE).
-    if layer_id % 2 == 0:
-        return ZayaDecoderATTLayer(
-            config=config,
-            layer_id=layer_id,
-            quant_config=quant_config,
-            prefix=prefix,
-        )
-    return ZayaDecoderMLPLayer(
+    return _layer_class(layer_id)(
         config=config,
         layer_id=layer_id,
         quant_config=quant_config,
         prefix=prefix,
     )
+
+
+def stage_facts(layer_id: int):
+    """The one stage the layer at ``layer_id`` declares, from its kind alone:
+    the model's shared declaration function, which its layers declare with
+    too (see make_layers)."""
+    return _layer_class(layer_id).stage_facts()
 
 
 class ZayaModel(nn.Module):
@@ -1453,6 +1474,7 @@ class ZayaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=stage_facts,
         )
 
         if self.pp_group.is_last_rank:

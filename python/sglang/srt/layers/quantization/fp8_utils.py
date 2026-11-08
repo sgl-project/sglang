@@ -13,6 +13,11 @@ from sglang.kernels.ops.gemm.fp8_kernel import (
     w8a8_block_fp8_matmul_deepgemm,
     w8a8_block_fp8_matmul_triton,
 )
+from sglang.kernels.ops.gemm.hopper_fp8_block_gemv import (
+    hopper_fp8_block_gemv,
+    use_hopper_fp8_block_gemv,
+    use_hopper_fp8_block_gemv_side,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     dequant_group_fp8_to_bf16,
     fp8_dtype,
@@ -28,7 +33,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-from sglang.srt.layers import deep_gemm_wrapper
+from sglang.srt.layers import deep_gemm_wrapper, offloader
 from sglang.srt.layers.quantization.mxfp4_tensor import MXFP4QuantizeUtil
 from sglang.srt.runtime_context import (
     get_exec,
@@ -45,14 +50,15 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
     is_xpu,
-    offloader,
 )
 from sglang.srt.utils.common import torch_release
 from sglang.srt.utils.custom_op import register_custom_op
+from sglang.srt.utils.log_utils import print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.layers.linear import LinearBase
@@ -74,6 +80,7 @@ _use_aiter = (
     get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
 )
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
+_use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 # Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
 # MiniMax-M3 TP4 gfx950 shapes, but lost past M=64 on narrow ones (K=768).
 MXFP8_DENSE_PTPC_DECODE_MAX_M = 128
@@ -116,6 +123,121 @@ _FORCE_CK_W8A8: bool = False
 def set_force_ck_w8a8(enabled: bool = True) -> None:
     global _FORCE_CK_W8A8
     _FORCE_CK_W8A8 = enabled
+
+
+# DeepSeek-V4 dense 128x128 block-fp8 linears on aiter's e8m0 mxscale bpreshuffle
+# GEMM (SGLANG_DSV4_DENSE_MXSCALE). DeepseekV4 enables it via
+# set_dense_mxscale(True) before its weights load, like set_force_ck_w8a8.
+_DENSE_MXSCALE: bool = False
+
+# (N, K) where the e8m0 GEMM (with aiter's dsv4 mxscale tuned rows) beats the
+# fp32-scale bpreshuffle GEMM (incl. aiter #6004/#6029 tuned rows) on gfx950,
+# cold-weight, over the decode M range. See dsv4_perf_opt reports/dense_gemm.md.
+# (512, 7168) (DSpark draft wkv) is untuned on the e8m0 side and loses at M>=96.
+DSV4_DENSE_MXSCALE_DEFAULT_SHAPES = frozenset(
+    {
+        (2048, 7168),  # wqkv_a
+        (1536, 7168),  # wq_a (unfused: DSpark draft)
+        (8192, 1536),  # wq_b TP8, indexer wq_b
+        (16384, 1536),  # wq_b TP4
+        (65536, 1536),  # wq_b attn-TP1 (DP attention)
+        (7168, 2048),  # wo_b TP8
+        (7168, 4096),  # wo_b TP4
+        (7168, 16384),  # wo_b attn-TP1 (DP attention)
+        (6144, 7168),  # shared expert w13, TP1
+        (7168, 3072),  # shared expert w2, TP1
+        (768, 7168),  # shared expert w13, TP8
+        (7168, 384),  # shared expert w2, TP8
+        (7168, 21504),  # DSpark main_proj
+    }
+)
+
+
+@lru_cache(maxsize=1)
+def aiter_has_dense_mxscale() -> bool:
+    """Whether the installed aiter dispatches e8m0 block scales in
+    gemm_a8w8_blockscale_bpreshuffle. Older aiter takes the e8m0 bytes as fp32
+    scales and silently returns wrong results."""
+    try:
+        from aiter.ops.gemm_op_a8w8 import get_mxscale_bpreshuffle_config  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def set_dense_mxscale(enabled: bool = True) -> None:
+    global _DENSE_MXSCALE
+    if enabled and not aiter_has_dense_mxscale():
+        logger.warning(
+            "SGLANG_DSV4_DENSE_MXSCALE is set but the installed aiter has no e8m0 "
+            "mxscale bpreshuffle GEMM; keeping the fp32-scale GEMM."
+        )
+        enabled = False
+    _DENSE_MXSCALE = enabled
+
+
+@lru_cache(maxsize=1)
+def _dense_mxscale_shapes() -> Optional[frozenset]:
+    """The (N, K) whitelist, or None for every shape."""
+    spec = envs.SGLANG_DSV4_DENSE_MXSCALE_SHAPES.get().strip()
+    if not spec:
+        return DSV4_DENSE_MXSCALE_DEFAULT_SHAPES
+    if spec.lower() == "all":
+        return None
+    shapes = set()
+    for item in spec.split(","):
+        n, k = item.strip().split(":")
+        shapes.add((int(n), int(k)))
+    return frozenset(shapes)
+
+
+def dense_mxscale_wanted(n: int, k: int) -> bool:
+    if not (_DENSE_MXSCALE and _use_aiter_bpreshuffle_gfx95):
+        return False
+    shapes = _dense_mxscale_shapes()
+    return shapes is None or (n, k) in shapes
+
+
+def block_fp8_scale_to_e8m0_128(scale: torch.Tensor) -> Optional[torch.Tensor]:
+    """fp32 128x128 block scales [N/128, K/128] -> e8m0 bytes of the same shape,
+    or None if any scale is not a positive normal power of two (not lossless)."""
+    s = scale.detach().float().contiguous()
+    bits = s.view(torch.int32)
+    exp = (bits >> 23) & 0xFF
+    ok = (s > 0) & ((bits & 0x7FFFFF) == 0) & (exp > 0) & (exp < 0xFF)
+    if not bool(ok.all()):
+        return None
+    return exp.to(torch.uint8).view(torch.float8_e8m0fnu).contiguous()
+
+
+def is_e8m0_scale(scale: Optional[torch.Tensor]) -> bool:
+    return scale is not None and scale.dtype == torch.float8_e8m0fnu
+
+
+def dense_mxscale_ready(*linears) -> bool:
+    """Whether every given linear consumes e8m0 (mxscale) activations, i.e. a
+    shared producer of their fp8 operand should emit ue8m0 scales."""
+    if not _DENSE_MXSCALE:
+        return False
+    for linear in linears:
+        if linear is None:
+            continue
+        weight = getattr(linear, "weight", None)
+        if getattr(weight, "_mxscale_w_scale", None) is None:
+            return False
+    return True
+
+
+def quant_fp8_e8m0_128(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-token 1x128 fp8 quant with ue8m0 scales, the scale bytes column-major
+    ([K/128, M] storage viewed as [M, K/128]) as the mxscale GEMM reads them."""
+    return per_group_quant_hip(
+        x,
+        quant_dtype=aiter.dtypes.fp8,
+        group_size=128,
+        transpose_scale=True,
+        scale_type=torch.float8_e8m0fnu,
+    )
 
 
 def materialize_bpreshuffle_fp8_scale(scale: torch.Tensor) -> torch.Tensor:
@@ -194,7 +316,7 @@ def emit_transposed_bpreshuffle_scale(m: int, *, on_bpreshuffle_gfx95: bool) -> 
     zero-copy path is only taken on gfx95 bpreshuffle and only for M(tokens) >= 2:
     at M == 1 the ``[1, G]`` and ``[G, 1]`` byte orders coincide, so the transposed
     emit buys nothing and the materialize path is used. Centralizes the gate shared
-    by the MoE-down and MLA o_proj producer sites.
+    by the gfx95 bpreshuffle producer sites.
     """
     return on_bpreshuffle_gfx95 and m >= 2
 
@@ -232,6 +354,8 @@ if _use_aiter:
     )
 
     aiter_per1x128_quant = get_hip_quant(aiter.QuantType.per_1x128)
+    from aiter.ops.quant import per_group_quant_hip
+
     from sglang.kernels.ops.gemm.smallm_fp8_gfx950 import (
         smallm_fp8_gemm,
         smallm_fp8_gemm_supported,
@@ -250,36 +374,6 @@ if _is_cuda:
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
 
-    from flashinfer import bmm_fp8 as _raw_bmm_fp8_batched
-
-    @register_custom_op(op_name="flashinfer_bmm_fp8_batched", mutates_args=["out"])
-    def _bmm_fp8_batched_op(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        out: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-    ) -> None:
-        _raw_bmm_fp8_batched(A, B, A_scale, B_scale, out.dtype, out)
-
-    def bmm_fp8(
-        A: torch.Tensor,
-        B: torch.Tensor,
-        A_scale: torch.Tensor,
-        B_scale: torch.Tensor,
-        dtype: torch.dtype,
-        out: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Batched (3D) per-tensor-scale FP8 matmul, via flashinfer's cuBLAS backend."""
-        if out is None:
-            out = torch.empty(
-                (A.shape[0], A.shape[1], B.shape[2]),
-                device=A.device,
-                dtype=dtype,
-            )
-        _bmm_fp8_batched_op(A, B, out, A_scale, B_scale)
-        return out
-
 
 use_triton_w8a8_fp8_kernel = get_bool_env_var("USE_TRITON_W8A8_FP8_KERNEL")
 
@@ -295,6 +389,9 @@ def use_rowwise_torch_scaled_mm():
         # The condition is determined once as the operations
         # are time consuming.
         return get_device_capability() >= (9, 4) and torch_release >= (2, 7)
+    if _is_xpu:
+        # XPU's torch._scaled_mm backend supports rowwise scaling.
+        return True
     return False
 
 
@@ -350,6 +447,8 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
+    HALOPS = "halops"
+    XPU_SCALED_MM = "xpu_scaled_mm"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -378,6 +477,12 @@ class Fp8GemmRunnerBackend(Enum):
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
 
+    def is_halops(self) -> bool:
+        return self == Fp8GemmRunnerBackend.HALOPS
+
+    def is_xpu_scaled_mm(self) -> bool:
+        return self == Fp8GemmRunnerBackend.XPU_SCALED_MM
+
 
 class Mxfp8DenseGemmBackend(Enum):
     """Enum for MXFP8 dense linear backend selection, resolved separately from
@@ -387,11 +492,14 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
+    HALOPS = "halops"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
     # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
     # gfx950 aiter MXFP8 GEMM: plain fp8 weight + compact 32x32 ue8m0 block scale bytes
     GFX95_MXFP8_AITER = "gfx95_mxfp8_aiter"
+    # Intel XPU: torch scaled_mm BlockWise1x32 on plain fp8 weight + [N, K // 32] ue8m0 bytes
+    XPU_SCALED_MM = "xpu_scaled_mm"
     UNSUPPORTED = "unsupported"
 
     def is_flashinfer_cutlass(self) -> bool:
@@ -409,6 +517,9 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_deep_gemm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.DEEP_GEMM
 
+    def is_halops(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.HALOPS
+
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
 
@@ -424,6 +535,9 @@ class Mxfp8DenseGemmBackend(Enum):
             Mxfp8DenseGemmBackend.GFX95_MXFP8_NATIVE,
             Mxfp8DenseGemmBackend.GFX95_MXFP8_AITER,
         )
+
+    def is_xpu_scaled_mm(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.XPU_SCALED_MM
 
     def is_unsupported(self) -> bool:
         return self == Mxfp8DenseGemmBackend.UNSUPPORTED
@@ -492,6 +606,12 @@ if get_platform().is_blackwell and is_flashinfer_available():
     from flashinfer import mm_mxfp8 as _raw_flashinfer_mm_mxfp8
     from flashinfer import mxfp8_quantize as _raw_flashinfer_mxfp8_quantize
     from flashinfer.gemm import gemm_fp8_nt_groupwise as _raw_gemm_fp8_nt_groupwise
+
+    from sglang.srt.layers.quantization.mxfp8_dispatch_cache import (
+        maybe_cache_mxfp8_dispatch,
+    )
+
+    _flashinfer_mm_mxfp8_impl = maybe_cache_mxfp8_dispatch(_raw_flashinfer_mm_mxfp8)
 
     @lru_cache(maxsize=1)
     def _get_flashinfer_groupwise_backend() -> str:
@@ -587,7 +707,7 @@ if get_platform().is_blackwell and is_flashinfer_available():
         use_8x4_sf_layout: bool = False,
         backend: str = "auto",
     ) -> torch.Tensor:
-        return _raw_flashinfer_mm_mxfp8(
+        return _flashinfer_mm_mxfp8_impl(
             q_input,
             weight_t,
             x_scale_u8,
@@ -614,19 +734,42 @@ def dispatch_w8a8_block_fp8_linear(
     1. The --fp8-gemm-backend server argument (preferred)
     2. Auto-detection based on hardware capabilities
     """
-    # Only Triton reads the block size at launch; DeepGEMM, the FlashInfer
-    # groupwise kernels and CUTLASS take 128-wide K blocks only.
-    if weight_block_size is not None and weight_block_size[1] != 128:
-        return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
-
     backend = get_fp8_gemm_runner_backend()
+    # Native block32 DeepGEMM is the default on SM90. SM100 DeepGEMM casts the
+    # weight scales to UE8M0, so it takes only UE8M0 checkpoints, on request.
+    if (
+        weight_block_size == [32, 32]
+        and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+        and (
+            (get_platform().is_sm90 and (backend.is_auto() or backend.is_deep_gemm()))
+            or (get_platform().is_sm100 and backend.is_deep_gemm() and act_scale_ue8m0)
+        )
+    ):
+        return partial(
+            deepgemm_w8a8_block_fp8_linear_with_fallback,
+            act_scale_ue8m0=act_scale_ue8m0,
+        )
+
+    # Other non-128 layouts still require Triton or the separate MXFP8 route.
+    if weight_block_size is not None and weight_block_size[1] != 128:
+        if backend.is_deep_gemm():
+            print_warning_once(
+                f"--fp8-gemm-backend=deep_gemm cannot serve {weight_block_size} "
+                "block FP8 weights on this setup; using Triton. DeepGEMM takes "
+                "[32, 32] blocks on SM90, and on SM100 with UE8M0 scales."
+            )
+        return partial(triton_w8a8_block_fp8_linear, act_scale_ue8m0=act_scale_ue8m0)
 
     # Handle explicit backend selection via --fp8-gemm-backend
     if not backend.is_auto():
-        return _dispatch_explicit_backend(backend)
-
-    # Auto mode: Select based purely on hardware/backend availability
-    return _dispatch_auto_backend()
+        linear = _dispatch_explicit_backend(backend)
+    else:
+        # Auto mode: Select based purely on hardware/backend availability
+        linear = _dispatch_auto_backend(act_scale_ue8m0=act_scale_ue8m0)
+    # Preserve the unwrapped callable when no activation policy needs binding.
+    if act_scale_ue8m0 and linear is deepgemm_w8a8_block_fp8_linear_with_fallback:
+        return partial(linear, act_scale_ue8m0=True)
+    return linear
 
 
 def torch_w8a8_block_fp8_linear(
@@ -681,6 +824,35 @@ def torch_w8a8_block_fp8_linear(
     return output.view(*input.shape[:-1], weight.shape[0])
 
 
+def prepare_xpu_block_scale_for_scaled_mm(
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    linear_fn: Callable,
+) -> torch.Tensor:
+    """Materialize the XPU block scale layout consumed by scaled_mm once."""
+    # Keep logical [N-blocks, K-blocks] shape, but use
+    # transpose-contiguous storage. For [1, 128], scaled_mm transposes
+    # scale_b internally; for [128, 128], the wrapper passes scale_b.t().
+    # This avoids a per-forward contiguous/copy in either path.
+    if (
+        linear_fn is not torch_w8a8_block_fp8_linear
+        or not isinstance(block_size, (list, tuple))
+        or tuple(block_size) not in ((1, 128), (128, 128))
+        or weight_scale.ndim != 2
+        or weight_scale.t().is_contiguous()
+    ):
+        return weight_scale
+
+    reordered = torch.empty_strided(
+        weight_scale.shape,
+        (1, weight_scale.shape[0]),
+        dtype=weight_scale.dtype,
+        device=weight_scale.device,
+    )
+    reordered.copy_(weight_scale)
+    return reordered
+
+
 def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
     """Pick the MXFP8 dense linear backend, honoring `--fp8-gemm-backend` only when it
     names a backend that owns an MXFP8 dense kernel."""
@@ -725,8 +897,31 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.DEEP_GEMM
 
+    if backend.is_halops():
+        if not get_platform().is_sm100:
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=halops, but "
+                "the HALOps kernels are built for SM100 only."
+            )
+        from sglang.srt.layers.quantization.halops_mxfp8 import load_halops_gemm
+
+        # Raises with an install hint when the `halops` wheel is missing.
+        load_halops_gemm()
+        return Mxfp8DenseGemmBackend.HALOPS
+
+    if backend.is_xpu_scaled_mm():
+        if not _is_xpu:
+            raise RuntimeError(
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=xpu_scaled_mm, "
+                "but that kernel requires an Intel XPU."
+            )
+        return Mxfp8DenseGemmBackend.XPU_SCALED_MM
+
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
+
+    if _is_xpu:
+        return Mxfp8DenseGemmBackend.XPU_SCALED_MM
 
     if get_platform().is_blackwell and is_flashinfer_available():
         if _raw_flashinfer_mm_mxfp8.is_backend_supported("cute-dsl", get_device_sm()):
@@ -743,7 +938,7 @@ def _unsupported_mxfp8_linear(*args, **kwargs) -> torch.Tensor:
     raise RuntimeError(
         "No MXFP8 dense GEMM kernel is available on this device. MXFP8 dense linear "
         "requires Blackwell (SM100/SM103/SM110/SM120) with FlashInfer, Hopper (SM90) "
-        "with DeepGEMM, or ROCm gfx95."
+        "with DeepGEMM, ROCm gfx95, or Intel XPU."
     )
 
 
@@ -791,19 +986,19 @@ def dispatch_block_fp8_mxfp8_linear(backend: Mxfp8DenseGemmBackend) -> Callable:
             flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl", pin_tactic=True
         )
     if backend.is_gfx95_dot_scaled():
-        from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
             dot_scaled_mxfp8_blockscaled_linear,
         )
 
         return dot_scaled_mxfp8_blockscaled_linear
     if backend.is_gfx95_mxfp8_native():
-        from sglang.kernels.ops.quantization.mxfp8_native_amd_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_native_amd_gfx95 import (
             mxfp8_native_blockscaled_linear,
         )
 
         return mxfp8_native_blockscaled_linear
     if backend.is_gfx95_mxfp8_aiter():
-        from sglang.kernels.ops.quantization.mxfp8_aiter_gfx95 import (
+        from sglang.kernels.ops.gemm.mxfp8_aiter_gfx95 import (
             aiter_mxfp8_blockscaled_linear,
         )
 
@@ -839,27 +1034,110 @@ def block_fp8_scale_to_mxfp8_e8m0(
     return e8m0.repeat_interleave(block_n, dim=0)[:n].contiguous()
 
 
+def pack_mxfp8_weight_scale_for_deepgemm(
+    scale_u8: torch.Tensor, n: int, k: int
+) -> torch.Tensor:
+    """UE8M0 bytes [N, K // 32] -> DeepGEMM's MN-major TMA-aligned packed scale."""
+    import deep_gemm.utils.layout
+
+    scale_fp32 = (
+        (scale_u8.contiguous().view(-1).to(torch.int32) << 23)
+        .view(torch.float32)
+        .view(n, k // 32)
+    )
+    return deep_gemm.utils.layout.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+        scale_fp32
+    )
+
+
 def dispatch_w8a8_mxfp8_linear() -> Callable:
     backend = resolve_mxfp8_dense_gemm_backend()
     if backend.is_deep_gemm():
-        return _deepgemm_w8a8_mxfp8_linear_with_fallback
+        return deepgemm_w8a8_mxfp8_linear_with_fallback
     elif backend.is_flashinfer_trtllm():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="trtllm")
     elif backend.is_flashinfer_cutlass():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
+    elif backend.is_halops():
+        from sglang.srt.layers.quantization.halops_mxfp8_linear import (
+            halops_w8a8_mxfp8_linear_with_fallback,
+        )
+
+        return halops_w8a8_mxfp8_linear_with_fallback
+    elif backend.is_xpu_scaled_mm():
+        return xpu_mxfp8_scaled_mm_linear
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
-    from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    from sglang.kernels.ops.gemm.mxfp8_amd_gfx95 import (
         dot_scaled_mxfp8_blockscaled_linear,
     )
 
     return dot_scaled_mxfp8_blockscaled_linear
 
 
-def _deepgemm_w8a8_mxfp8_linear_with_fallback(
+def xpu_mxfp8_scaled_mm_linear(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """MXFP8 dense linear on Intel XPU via torch scaled_mm BlockWise1x32: weight is
+    [N, K] e4m3, weight_scale is row-major [N, K // 32] ue8m0 bytes."""
+    group_size = 32
+    input_2d = input.reshape(-1, input.shape[-1]).contiguous()
+    m, k = input_2d.shape
+    if k % group_size != 0:
+        raise ValueError(f"K={k} must be divisible by {group_size} for MXFP8.")
+
+    if input_scale is None:
+        output_dtype = input.dtype
+        if input_2d.dtype not in (torch.bfloat16, torch.float16):
+            input_2d = input_2d.to(torch.bfloat16)
+        from sgl_kernel import sgl_per_token_group_quant_8bit
+
+        fp8_info = torch.finfo(torch.float8_e4m3fn)
+        q_input = torch.empty(m, k, dtype=torch.float8_e4m3fn, device=input.device)
+        # Row-major [M, K // 32] e8m0, the layout the BlockWise1x32 probe expects; needs
+        # sgl-kernel-xpu row-major ue8m0 output (port of sgl-project/sgl-kernel-xpu#357).
+        x_scale = torch.empty(
+            m, k // group_size, dtype=torch.float8_e8m0fnu, device=input.device
+        )
+        sgl_per_token_group_quant_8bit(
+            input=input_2d,
+            output_q=q_input,
+            output_s=x_scale,
+            group_size=group_size,
+            eps=1e-10,
+            fp8_min=fp8_info.min,
+            fp8_max=fp8_info.max,
+            scale_ue8m0=True,
+            enable_v2=True,
+        )
+    else:
+        output_dtype = torch.bfloat16
+        q_input = input_2d
+        x_scale = input_scale.view(torch.float8_e8m0fnu)
+
+    # A reinterpreting view: the bytes are already e8m0 exponents.
+    weight_scale_e8m0 = weight_scale.contiguous().view(torch.float8_e8m0fnu)
+    output = torch.nn.functional.scaled_mm(
+        q_input,
+        weight.t(),
+        x_scale,
+        torch.nn.functional.ScalingType.BlockWise1x32,
+        weight_scale_e8m0,
+        torch.nn.functional.ScalingType.BlockWise1x32,
+        bias=bias,
+        output_dtype=output_dtype,
+    )
+    return output.view(*input.shape[:-1], weight.shape[0])
+
+
+def deepgemm_w8a8_mxfp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
@@ -872,13 +1150,18 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
         sglang_per_token_group_quant_fp8,
     )
 
-    assert input_scale is None
-    output_dtype = input.dtype
+    pre_quantized = input_scale is not None
+    output_dtype = torch.bfloat16 if pre_quantized else input.dtype
 
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
     dtype_supported = output_dtype == torch.bfloat16
 
     if not (shape_supported and dtype_supported):
+        if pre_quantized:
+            raise ValueError(
+                "Pre-quantized DeepGEMM input requires N % 64 == 0 and K % 128 == 0; "
+                "its packed scales cannot be used by the FlashInfer fallback."
+            )
         if weight_scale_swizzled is None:
             raise RuntimeError(
                 f"DeepGEMM cannot serve this MXFP8 GEMM ({shape_supported=}, "
@@ -896,13 +1179,32 @@ def _deepgemm_w8a8_mxfp8_linear_with_fallback(
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    q_input, x_scale = sglang_per_token_group_quant_fp8(
-        input_2d,
-        32,
-        column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-        scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
-    )
+    if pre_quantized:
+        m, k = input_2d.shape
+        if not (
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            and input.ndim == 2
+            and input.is_contiguous()
+            and input.dtype == torch.float8_e4m3fn
+            and input_scale.dtype == torch.int32
+            and input_scale.device == input.device
+            and input_scale.shape == (m, k // 128)
+            and input_scale.stride() == (1, ceil_align(m, 4))
+            and k == weight.shape[1]
+        ):
+            raise ValueError(
+                "Expected 2D contiguous FP8 input with packed, MN-major, "
+                "TMA-aligned UE8M0 scales for DeepGEMM MXFP8."
+            )
+        q_input, x_scale = input_2d, input_scale
+    else:
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d,
+            32,
+            column_major_scales=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_tma_aligned=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+            scale_ue8m0=deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
 
     # weight_scale format is set per-backend by _process_mxfp8_linear_weight_scale
     # (int32 packed TMA-aligned on Blackwell, float32 on Hopper); NOT uint8 — Triton form is routed to the fallback above.
@@ -973,11 +1275,32 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
 
+    elif backend.is_halops():
+        # HALOps has no block-128 FP8 GEMM: its dense kernel takes group-32 MXFP8
+        # operands only. Reaching here means a block-fp8 checkpoint was combined
+        # with --fp8-gemm-backend=halops, which would otherwise silently run this
+        # layer on a kernel the flag did not ask for.
+        raise RuntimeError(
+            "--fp8-gemm-backend=halops requires MXFP8 (group-32) weights, but this "
+            "layer came from a block-fp8 checkpoint, which HALOps cannot serve. "
+            "Run a BF16 checkpoint with --quantization mxfp8 (the online MXFP8 "
+            "quantization), or use --fp8-gemm-backend=deep_gemm / flashinfer_cutlass "
+            "for the block-fp8 checkpoint."
+        )
+
+    elif backend.is_xpu_scaled_mm():
+        if not _is_xpu:
+            raise RuntimeError(
+                "FP8 GEMM requested via --fp8-gemm-backend=xpu_scaled_mm, "
+                "but that backend requires an Intel XPU."
+            )
+        return torch_w8a8_block_fp8_linear
+
     else:
         raise ValueError(f"Unknown FP8 GEMM backend: {backend}")
 
 
-def _dispatch_auto_backend() -> Callable:
+def _dispatch_auto_backend(act_scale_ue8m0: bool = False) -> Callable:
     """Auto-select the best backend based on hardware capabilities."""
     # Priority order for auto selection:
     # 1. DeepGEMM (if enabled and available)
@@ -996,7 +1319,13 @@ def _dispatch_auto_backend() -> Callable:
         return cutlass_w8a8_block_fp8_linear_with_fallback
     elif _use_aiter:
         return aiter_w8a8_block_fp8_linear
-    elif is_npu_arch35():
+    elif is_npu_arch35() and (
+        # UE8M0 checkpoints are served in the MXFP8 layout losslessly; plain
+        # block-FP8 ones (fp32 scales) only join them when load-time
+        # requantization is explicitly enabled (lossy, see
+        # process_npu_arch35_mxfp8_linear_weights), else Triton emulates.
+        act_scale_ue8m0 or envs.SGLANG_NPU_ARCH35_REQUANT_BLOCK_FP8.get()
+    ):
         from sglang.srt.hardware_backend.npu.quantization.linear_method_npu import (
             npu_w8a8_mxfp8_linear,
         )
@@ -1018,6 +1347,8 @@ def initialize_fp8_gemm_config() -> None:
     elif backend == "auto" and get_platform().is_sm110:
         # DeepGEMM's block-FP8 kernel does not support SM110.
         backend = "triton"
+    elif backend == "auto" and get_platform().is_xpu:
+        backend = "xpu_scaled_mm"
 
     backend = Fp8GemmRunnerBackend(backend)
 
@@ -1238,6 +1569,154 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+def _ue8m0_deepgemm_skips_block32(
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor],
+) -> bool:
+    # UE8M0 DeepGEMM casts block32 fp32 scales itself: it takes only weights the
+    # load found power-of-two scaled, and no pre-quantized input, which nothing checks.
+    if list(block_size) != [32, 32] or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0:
+        return False
+    return input_scale is not None or not getattr(weight_scale, "power_of_two", False)
+
+
+def _fp8_block_gemv_enabled() -> bool:
+    return envs.SGLANG_ENABLE_FP8_BLOCK_GEMV.get() and get_platform().is_sm90
+
+
+def _use_fp8_block_gemv(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+) -> bool:
+    return (
+        _fp8_block_gemv_enabled()
+        and input_2d.is_cuda
+        and input_2d.dtype in (torch.bfloat16, torch.float8_e4m3fn)
+        and weight.dtype == torch.float8_e4m3fn
+        and weight_scale.dtype == torch.float32
+        and weight.device == input_2d.device == weight_scale.device
+        and weight.is_contiguous()
+        and weight_scale.is_contiguous()
+        and input_2d.is_contiguous()
+        and input_2d.shape[1] == weight.shape[1]
+        and weight_scale.shape
+        == ((weight.shape[0] + 127) // 128, weight.shape[1] // 128)
+        and use_hopper_fp8_block_gemv(
+            input_2d.shape[0], weight.shape[0], weight.shape[1], block_size
+        )
+    )
+
+
+def can_use_fused_kda_output_quant(
+    linear: LinearBase,
+    m: int,
+    k: int,
+    input_dtype: torch.dtype,
+) -> bool:
+    if not envs.SGLANG_ENABLE_FUSED_KDA_OUTPUT_QUANT.get() or not 1 <= m <= 8:
+        return False
+    # Import lazily: fp8.py imports this module while defining Fp8LinearMethod.
+    from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
+
+    quant_method = linear.quant_method
+    if not isinstance(quant_method, Fp8LinearMethod):
+        return False
+    if not (
+        input_dtype == torch.bfloat16
+        and quant_method.block_quant
+        and not quant_method.use_marlin
+        and not quant_method.use_mxfp8
+        and not quant_method.block_fp8_as_mxfp8
+        and not (
+            isinstance(quant_method.quant_config, Fp8Config)
+            and quant_method.quant_config.scale_fmt == "ue8m0"
+        )
+        and quant_method.w8a8_block_fp8_linear
+        is deepgemm_w8a8_block_fp8_linear_with_fallback
+        and tuple(quant_method.weight_block_size) == (128, 128)
+        and linear.bias is None
+    ):
+        return False
+
+    weight = linear.weight
+    weight_scale = linear.weight_scale_inv
+    if weight.ndim != 2:
+        return False
+    n = weight.shape[0]
+    if not (
+        weight.dtype == torch.float8_e4m3fn
+        and weight.is_cuda
+        and weight.device == weight_scale.device
+        and weight.shape[1] == k
+        and weight.is_contiguous()
+        and weight_scale.dtype == torch.float32
+        and weight_scale.shape == ((n + 127) // 128, k // 128)
+        and weight_scale.is_contiguous()
+    ):
+        return False
+    return _fp8_block_gemv_enabled() and use_hopper_fp8_block_gemv(
+        m, n, k, quant_method.weight_block_size
+    )
+
+
+def fp8_block_gemv_with_side(
+    input_2d: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    block_size: List[int],
+    side_weight: torch.Tensor,
+    act_scale_ue8m0: bool = False,
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    if not (
+        input_2d.dtype == torch.bfloat16
+        and _use_fp8_block_gemv(input_2d, weight, weight_scale, block_size)
+        and side_weight.device == input_2d.device
+        and use_hopper_fp8_block_gemv_side(side_weight, input_2d.shape[1])
+    ):
+        return None
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d, block_size[1], scale_ue8m0=act_scale_ue8m0
+    )
+    return hopper_fp8_block_gemv(
+        q_input, x_scale, weight, weight_scale, x_bf16=input_2d, side_w=side_weight
+    )
+
+
+def _deepgemm_block_fp8_supported(
+    weight_shape: Tuple[int, int], block_size: List[int], output_dtype: torch.dtype
+) -> bool:
+    if output_dtype != torch.bfloat16:
+        return False
+    n, k = weight_shape
+    if list(block_size) == [32, 32] and (
+        get_platform().is_sm90 or get_platform().is_sm100
+    ):
+        return n % 8 == 0 and k % 32 == 0
+    return list(block_size) == [128, 128] and n % 64 == 0 and k % 128 == 0
+
+
+def _deepgemm_packed_input_valid(input, weight, input_scale, weight_scale) -> bool:
+    """Validate the group-128, column-major TMA layout for packed activations."""
+    if input.ndim != 2 or weight.ndim != 2:
+        return False
+    m, k = input.shape
+    packed_groups = ceil_div(k // 128, 4)
+    padded_m = ceil_align(m, 4)
+    return (
+        input.is_cuda
+        and input.is_contiguous()
+        and k == weight.shape[1]
+        and input.device == weight.device == input_scale.device == weight_scale.device
+        and input_scale.shape == (m, packed_groups)
+        and input_scale.stride() == (1, padded_m)
+        and input.data_ptr() % 16 == 0
+        and input_scale.data_ptr() % 16 == 0
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1245,43 +1724,77 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     weight_scale: torch.Tensor,
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
+    act_scale_ue8m0: bool = False,
+    weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if input_scale is not None:
-        # Pre-quantized activation (SGLANG_OPT_MOE_QUANT_ONCE): ``input`` is
-        # the fp8 per-token-group-128 q with rows padded to a multiple of 4
-        # and ``input_scale`` the matching column-major fp32 scales
-        # (stride == (1, padded_rows)) -- identical to the MN-major
-        # TMA-aligned layout this path's own quant would produce below.
-        # Output keeps the padded row count; the caller slices back.
-        # UE8M0 packed scales (Blackwell DeepGEMM) use a different layout;
-        # the caller gates on it.
-        assert not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
-        assert input.dtype == torch.float8_e4m3fn
-        assert weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0, (
-            "pre-quantized fp8 input requires DeepGEMM-supported weight shapes "
-            f"(got {tuple(weight.shape)})"
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    input_2d = input.view(-1, input.shape[-1])
+    if (
+        input_scale is not None
+        and input_scale.dtype == torch.float32
+        and input_scale.device == input.device
+        and input_scale.shape == (input_2d.shape[0], input_2d.shape[1] // block_size[1])
+        and input_scale.is_contiguous()
+        and _use_fp8_block_gemv(input_2d, weight, weight_scale, block_size)
+    ):
+        output = hopper_fp8_block_gemv(input_2d, input_scale, weight, weight_scale)
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
+    if input_scale is None and _use_fp8_block_gemv(
+        input_2d, weight, weight_scale, block_size
+    ):
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], scale_ue8m0=act_scale_ue8m0
         )
-        input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
-            input_2d,
-            weight,
-            input_scale,
-            weight_scale,
-            block_size,
-            output_dtype=torch.bfloat16,
-        )
+        output = hopper_fp8_block_gemv(q_input, x_scale, weight, weight_scale)
         if bias is not None:
             output += bias
         return output.view(*input.shape[:-1], weight.shape[0])
 
-    output_dtype = input.dtype
-    dtype_supported = output_dtype == torch.bfloat16
-
+    # DeepGEMM accepts a partial final K block when both operands carry ceil(K / 128)
+    # scales; its TMA descriptors need 16-byte-aligned base pointers and fp8 row strides.
+    prequant_k_tail = (
+        input_scale is not None
+        and list(block_size) == [128, 128]
+        and weight.shape[0] % 64 == 0
+        and weight.shape[1] % block_size[1] != 0
+        and weight.shape[1] % 16 == 0
+        and input.is_contiguous()
+        and weight.is_contiguous()
+        and input.data_ptr() % 16 == 0
+        and weight.data_ptr() % 16 == 0
+    )
+    deepgemm_supported = weight.ndim == 2 and (
+        prequant_k_tail
+        or _deepgemm_block_fp8_supported(weight.shape, block_size, output_dtype)
+    )
+    if input_scale is not None:
+        if input_scale.dtype == torch.int32:
+            # Packed activation scales cannot go through the Triton fallback.
+            if not (
+                deepgemm_supported
+                and deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+                and list(block_size) == [128, 128]
+                and _deepgemm_packed_input_valid(
+                    input, weight, input_scale, weight_scale
+                )
+            ):
+                raise ValueError(
+                    "Pre-quantized DeepGEMM block-FP8 input requires supported "
+                    "[128, 128] weights and TMA-aligned, column-major packed UE8M0 scales"
+                )
+        else:
+            # Block32 pre-quantized input uses the Triton fallback.
+            assert (
+                list(block_size) == [32, 32]
+                or not deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0
+            )
+        assert input.dtype == torch.float8_e4m3fn
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
-    shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
-    block_supported = list(block_size) == [128, 128]
-
-    if not (shape_supported and dtype_supported and block_supported):
+    if not deepgemm_supported or _ue8m0_deepgemm_skips_block32(
+        block_size, weight_scale, input_scale
+    ):
         # fall back to triton
         # If weight_scale is in UE8M0 packed format (int32), convert back to float32
         # UE8M0 format has shape (N, K//block_k//4) with dtype int32
@@ -1291,13 +1804,42 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
                 weight_scale, weight.shape, block_size
             )
         return triton_w8a8_block_fp8_linear(
-            input, weight, block_size, weight_scale, input_scale, bias
+            input,
+            weight,
+            block_size,
+            weight_scale,
+            input_scale,
+            bias,
+            act_scale_ue8m0=act_scale_ue8m0,
+            weight_bf16=weight_bf16,
         )
+
+    if input_scale is not None:
+        # Pre-quantized activations retain their group size and scale format.
+        # DeepGEMM aligns fp32 scale storage for TMA when needed.
+        input_2d = input.view(-1, input.shape[-1])
+        output = w8a8_block_fp8_matmul_deepgemm(
+            input_2d,
+            weight,
+            input_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
+        if bias is not None:
+            output += bias
+        return output.view(*input.shape[:-1], weight.shape[0])
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
 
-    if not _is_musa:
+    if get_platform().is_sm90 and act_scale_ue8m0:
+        # Keep the checkpoint's power-of-two activation quantization. SM90
+        # consumes fp32 scales; DeepGEMM aligns their storage for TMA.
+        q_input, x_scale = sglang_per_token_group_quant_fp8(
+            input_2d, block_size[1], scale_ue8m0=True
+        )
+    elif not _is_musa:
         q_input, x_scale = sglang_per_token_group_quant_fp8(
             input_2d,
             block_size[1],
@@ -1391,6 +1933,11 @@ def aiter_w8a8_block_fp8_linear(
     # assert input_scale is None
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+    output_dtype = torch.bfloat16 if input_scale is not None else input.dtype
+    # DP-attention idle ranks run zero-token forwards (eager has no padded graph
+    # bucket); CK blockscale GEMM fails M == 0 with invalid configuration argument.
+    if input_2d.shape[0] == 0:
+        return input.new_empty(output_shape, dtype=output_dtype)
 
     # dense linears converted from MXFP8 carry a rowwise-fp8 copy; its ptpc GEMM
     # beats the block-fp8 GEMMs at decode-sized M
@@ -1408,7 +1955,39 @@ def aiter_w8a8_block_fp8_linear(
             )
             return out.to(input.dtype).view(*output_shape)
 
+    # DeepSeek-V4 e8m0 mxscale route (SGLANG_DSV4_DENSE_MXSCALE): same
+    # (16, 16)-preshuffled weight, e8m0 copy of its scale. A producer that
+    # already emitted an fp32-scale operand keeps the fp32 GEMM below.
+    mx_w_scale = getattr(weight, "_mxscale_w_scale", None)
+    if is_e8m0_scale(input_scale) or (mx_w_scale is not None and input_scale is None):
+        if mx_w_scale is None:
+            raise RuntimeError(
+                "e8m0-scaled fp8 activation reached a linear without an e8m0 "
+                f"weight scale (weight {tuple(weight.shape)})"
+            )
+        out_dtype = torch.bfloat16 if input_scale is not None else input_2d.dtype
+        if input_2d.shape[0] == 0:
+            return input_2d.new_empty(output_shape, dtype=out_dtype)
+        if input_scale is None:
+            q_input, x_scale = quant_fp8_e8m0_128(input_2d)
+        else:
+            q_input, x_scale = input_2d, input_scale
+        output = gemm_a8w8_blockscale_bpreshuffle(
+            q_input, weight, x_scale, mx_w_scale, dtype=torch.bfloat16
+        )
+        if bias is not None:
+            output += bias
+        return output.to(dtype=out_dtype).view(*output_shape)
+
     n, k = weight.shape
+
+    # decode-sized M on gfx950: the 1x128 activation quant fused into the GEMM
+    if _use_aiter_bpreshuffle_gfx95 and input_scale is None and bias is None:
+        from sglang.kernels.ops.gemm import smallm_fp8_blockscale_gfx950 as smallm
+
+        out = smallm.try_smallm_fp8_bs_linear(input_2d, weight, weight_scale)
+        if out is not None:
+            return out.view(*output_shape)
 
     if _use_aiter_bpreshuffle_gfx95:
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k)
@@ -1420,6 +1999,8 @@ def aiter_w8a8_block_fp8_linear(
         use_triton = use_aiter_triton_gemm_w8a8_tuned_gfx950(n, k) or (
             _ck_safe_m is not None and input_2d.shape[0] > _ck_safe_m
         )
+    elif _use_aiter_gfx942:
+        use_triton = not envs.SGLANG_AITER_GFX942_BLOCKSCALE_USE_CK.get()
     else:
         use_triton = True
 
@@ -1464,15 +2045,13 @@ def aiter_w8a8_block_fp8_linear(
         weight,
         x_scale,
         weight_scale,
-        dtype=torch.bfloat16 if input_scale is not None else input.dtype,
+        dtype=output_dtype,
     )
 
     if bias is not None:
         output += bias
 
-    return output.to(
-        dtype=torch.bfloat16 if input_scale is not None else input_2d.dtype
-    ).view(*output_shape)
+    return output.to(dtype=output_dtype).view(*output_shape)
 
 
 def triton_w8a8_block_fp8_linear(
@@ -1565,6 +2144,20 @@ def mxfp8_group_quantize(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     return q_input.contiguous(), scale_u8.contiguous()
 
 
+# (N, K) of the dense MXFP8 GEMMs where cuDNN's SM107 kernel beats the CuTe-DSL one at
+# prefill sizes (wo_b, Engram KV); the two backends are bitwise equal.
+_SM107_CUDNN_MXFP8_NK = ((5120, 8192), (25600, 6144))
+_SM107_CUDNN_MXFP8_MIN_M = 8192
+
+
+@lru_cache(maxsize=1)
+def _cudnn_mxfp8_reuses_graphs() -> bool:
+    # Without override-shape support cuDNN builds a new graph for every distinct M.
+    from flashinfer.gemm import gemm_base
+
+    return getattr(gemm_base, "_is_cudnn_override_shape_available", lambda: False)()
+
+
 def flashinfer_mxfp8_blockscaled_linear(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1606,6 +2199,15 @@ def flashinfer_mxfp8_blockscaled_linear(
             output_dtype = input_2d.dtype
         else:
             output_dtype = torch.bfloat16
+
+    if (
+        backend == "cute-dsl"
+        and input_2d.shape[0] >= _SM107_CUDNN_MXFP8_MIN_M
+        and (weight.shape[0], k) in _SM107_CUDNN_MXFP8_NK
+        and get_platform().device_sm == 107
+        and _cudnn_mxfp8_reuses_graphs()
+    ):
+        backend = "cudnn"
 
     if backend == "trtllm":
         weight_scale_t = weight_scale.view(-1)
@@ -1849,6 +2451,8 @@ def requant_block_scale_ue8m0_for_deepgemm(
     use_deepgemm_runner: bool,
     output_dtype: Optional[torch.dtype] = None,
     weight_shape=None,
+    *,
+    grouped_moe: bool = False,
 ) -> bool:
     """Requantize block-FP8 weight scales to UE8M0 in place for DeepGEMM.
 
@@ -1867,6 +2471,7 @@ def requant_block_scale_ue8m0_for_deepgemm(
             weight_block_size=weight_block_size,
             output_dtype=output_dtype,
             weight_shape=weight_shape,
+            grouped_moe=grouped_moe,
         )
     ):
         return False
@@ -2157,7 +2762,9 @@ def _apply_fallback_scaled_mm(
     )
 
     output = _process_scaled_mm_output(output, input_2d_shape, output_shape)
-    x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
+    # A single scale has no row dimension to trim, regardless of its shape.
+    if x_scale.numel() > 1:
+        x_scale = torch.narrow(x_scale, 0, 0, input_2d_shape[0])
 
     output = output * x_scale * weight_scale.t()
     if bias is not None:
@@ -2174,20 +2781,56 @@ def use_aiter_bpreshuffle_gemm(output_size: int) -> bool:
     return _use_aiter and output_size % 64 == 0
 
 
+# Measured on SM120: a tuned bmm_fp8 + add beat the bias epilogue by up to 1.6x
+# at small M and by 7% at 4096 rows; from 8192 rows on, the epilogue always won.
+_FP8_BIAS_EPILOGUE_MIN_ROWS = 8192
+
+
 def apply_fp8_linear_bmm_flashinfer(
     input: torch.Tensor,
     weight: torch.Tensor,
     weight_scale: torch.Tensor,
     input_scale: torch.Tensor,
     bias: Optional[torch.Tensor] = None,
+    *,
+    pre_quant_output_dtype: Optional[torch.dtype] = None,
 ) -> torch.Tensor:
-    """Per-tensor static fp8 linear via flashinfer bmm_fp8 (SM90 and newer)."""
+    """Per-tensor static FP8 linear via FlashInfer BMM.
+
+    An E4M3 input is already quantized with ``input_scale`` by its producer.  Match
+    :func:`apply_fp8_linear`'s generic prequantized-input contract: do not quantize
+    its byte codes a second time.  Since FP8 does not carry the producer's
+    activation dtype, a prequantized caller must pass it explicitly.
+    """
     output_shape = [*input.shape[:-1], weight.shape[1]]
     input_2d = input.view(-1, input.shape[-1])
-    qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
-    output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, input.dtype)
-    if bias is not None:
-        output = output + bias
+    if input_2d.dtype == torch.float8_e4m3fn:
+        if pre_quant_output_dtype not in (torch.bfloat16, torch.float16):
+            raise ValueError(
+                "prequantized FP8 FlashInfer BMM requires an explicit "
+                "BF16 or FP16 output dtype"
+            )
+        qinput, x_scale = input_2d, input_scale
+        output_dtype = pre_quant_output_dtype
+    else:
+        qinput, x_scale = static_quant_fp8(input_2d, input_scale, repeat_scale=False)
+        output_dtype = input.dtype
+    if bias is not None and qinput.shape[0] >= _FP8_BIAS_EPILOGUE_MIN_ROWS:
+        # bmm_fp8 takes no bias; torch._scaled_mm runs the same cuBLASLt GEMM
+        # and adds the bias in its epilogue instead of in a separate kernel.
+        output = torch._scaled_mm(
+            qinput,
+            weight,
+            out_dtype=output_dtype,
+            scale_a=x_scale,
+            scale_b=weight_scale,
+            bias=bias,
+            use_fast_accum=True,  # bmm_fp8 sets cuBLASLt fast accumulation too
+        )
+    else:
+        output = flashinfer_bmm_fp8(qinput, weight, x_scale, weight_scale, output_dtype)
+        if bias is not None:
+            output = output + bias
     return output.view(*output_shape)
 
 
@@ -2220,9 +2863,9 @@ def apply_fp8_linear(
     output_shape = [*input.shape[:-1], weight.shape[1]]
 
     # A pre-quantized fp8 activation (e.g. from a fused RMSNorm+quant kernel)
-    # carries no original dtype: skip re-quant, reuse the supplied per-tensor
-    # input_scale, and emit ``pre_quant_output_dtype`` (the model's activation
-    # dtype, propagated by the producer) or bf16 if it was not provided.
+    # carries no original dtype: skip re-quant, reuse its supplied per-tensor
+    # or per-token input scale, and emit ``pre_quant_output_dtype`` (the model's
+    # activation dtype, propagated by the producer) or bf16 if omitted.
     input_prequantized = input_2d.dtype in (
         torch.float8_e4m3fn,
         torch.float8_e4m3fnuz,
@@ -2239,22 +2882,21 @@ def apply_fp8_linear(
     use_cutlass_channelwise_gemm = (
         channelwise_cutlass and cutlass_compatible_b and not use_triton_w8a8_fp8_kernel
     )
-    # Consider a tuned Triton tile only where the shape would otherwise go to
-    # CUTLASS (that is the path the offline sweep tuned against). On by default;
-    # SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE=0 is the kill switch.
-    use_tuned_triton_channelwise = (
-        use_cutlass_channelwise_gemm and envs.SGLANG_ENABLE_FP8_GEMM_CONFIG_TUNE.get()
-    )
     native_scalar_a_scale = use_cutlass_channelwise_gemm and (
         get_platform().is_sm90 or get_platform().is_sm100 or get_platform().is_sm120
     )
 
     if input_prequantized:
-        assert input_scale is not None and (
-            input_scale.numel() == 1 or (_use_aiter and use_per_token_if_dynamic)
+        assert input_scale is not None and input_scale.numel() in (
+            1,
+            input_2d.shape[0],
         )
         qinput = input_2d
-        if channelwise_cutlass and not native_scalar_a_scale:
+        if (
+            input_scale.numel() == 1
+            and channelwise_cutlass
+            and not native_scalar_a_scale
+        ):
             # Unsupported CUTLASS epilogues require one A scale per row.
             x_scale = input_scale.repeat(input_2d.shape[0]).view(-1, 1)
         else:
@@ -2329,12 +2971,14 @@ def apply_fp8_linear(
     if channelwise_cutlass:
         # A tuned config exists only for shapes where tuned Triton beat the
         # CUTLASS dispatch on this GPU; otherwise this is None and the backend
-        # choice below is unchanged. weight is [K, N] here.
+        # choice below is unchanged. Only shapes that would otherwise go to
+        # CUTLASS consult it (the path the offline sweep tuned against).
+        # weight is [K, N] here.
         tuned_config = (
             get_w8a8_channelwise_fp8_config(
                 N=weight.shape[1], K=weight.shape[0], M=qinput.shape[0]
             )
-            if use_tuned_triton_channelwise
+            if use_cutlass_channelwise_gemm
             else None
         )
         if not use_cutlass_channelwise_gemm:
@@ -2376,12 +3020,22 @@ def apply_fp8_linear(
     # When the number of token is 1,
     # per-token scale has shape (1, 1), per-tensor scale has shape (1) or ().
     per_tensor_activations = (x_scale.numel() == 1) and x_scale.dim() < 2
-
+    rowwise_scale_layout_supported = not _is_xpu or (
+        x_scale.ndim == 2
+        and x_scale.shape[1] == 1
+        and x_scale.is_contiguous()
+        and weight_scale.ndim == 2
+        and weight_scale.shape[1] == 1
+        and weight_scale.t().is_contiguous()
+    )
     if (
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (
+            (USE_ROWWISE_TORCH_SCALED_MM and rowwise_scale_layout_supported)
+            or _use_aiter
+        )
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor

@@ -29,7 +29,6 @@ from transformers import PretrainedConfig
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -61,7 +60,10 @@ from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import TopK
-from sglang.srt.layers.moe.utils import filter_moe_weight_param_global_expert
+from sglang.srt.layers.moe.utils import (
+    RoutingMethodType,
+    filter_moe_weight_param_global_expert,
+)
 from sglang.srt.layers.multi_gate import (
     create_multi_gate_mm_indices,
     multi_gate_triton_kernel,
@@ -70,6 +72,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -81,14 +85,10 @@ from sglang.srt.models.utils import (
     apply_qk_norm,
     create_fused_set_kv_buffer_arg,
     enable_fused_set_kv_buffer,
+    is_non_idle_and_non_empty,
 )
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    is_non_idle_and_non_empty,
-    make_pp_layers,
-)
+from sglang.srt.utils import is_cuda
 
 LoraConfig = None
 logger = logging.getLogger(__name__)
@@ -170,10 +170,7 @@ class BailingMoEGate(nn.Module):
             self.expert_bias = None
 
     def forward(self, hidden_states):
-        logits = F.linear(hidden_states.to(self.weight.dtype), self.weight, None).to(
-            hidden_states.dtype
-        )
-        return logits
+        return F.linear(hidden_states.to(self.weight.dtype), self.weight, None)
 
 
 class BailingMoESparseMoeBlock(nn.Module):
@@ -300,6 +297,13 @@ class BailingMoESparseMoeBlock(nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
         )
 
+        routing_method_type = None
+        if self.norm_topk_prob:
+            if self.use_grouped_topk and self.correction_bias is not None:
+                routing_method_type = RoutingMethodType.DeepSeekV3
+            elif not self.use_grouped_topk and self.correction_bias is None:
+                routing_method_type = RoutingMethodType.RenormalizeNaive
+
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=self.num_experts,
             top_k=self.top_k,
@@ -308,7 +312,15 @@ class BailingMoESparseMoeBlock(nn.Module):
             intermediate_size=config.moe_intermediate_size,
             quant_config=quant_config,
             routed_scaling_factor=self.routed_scaling_factor,
+            routing_method_type=routing_method_type,
             prefix=add_prefix("experts", prefix),
+        )
+        self.topk.topk_config.apply_routed_scaling_factor_on_output = (
+            self.experts.should_fuse_routed_scaling_factor_in_topk
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
         # shared expert
         if config.num_shared_experts is not None:
@@ -474,10 +486,6 @@ class BailingMoESparseMoeBlock(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(hidden_states.device)
@@ -655,12 +663,8 @@ class BailingMoEBlock(nn.Module):
         )
         self.layer_id = layer_id
 
-        self.is_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id, is_nextn=is_nextn
-        )
-        is_next_layer_sparse = self._is_layer_sparse(
-            config, layer_id=layer_id + 1, is_nextn=False
-        )
+        attn, ffn = self.stage_facts(config, layer_id, is_nextn=is_nextn)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = BailingMoESparseMoeBlock(
@@ -684,18 +688,31 @@ class BailingMoEBlock(nn.Module):
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=config.rms_norm_eps)
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @classmethod
+    def stage_facts(
+        cls, config: PretrainedConfig, layer_id: int, is_nextn: bool = False
+    ):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=cls._is_layer_sparse(
+                    config, layer_id=layer_id, is_nextn=is_nextn
                 ),
-                self.post_attention_layernorm,
+                next_layer_sparse=cls._is_layer_sparse(
+                    config, layer_id=layer_id + 1, is_nextn=False
+                ),
             ),
         )
 
+    @staticmethod
     def _is_layer_sparse(
-        self, config: PretrainedConfig, layer_id: int, is_nextn: bool
+        config: PretrainedConfig, layer_id: int, is_nextn: bool
     ) -> bool:
         return is_nextn or (
             config.num_experts is not None and layer_id >= config.first_k_dense_replace
@@ -774,6 +791,7 @@ class BailingMoEModel(nn.Module):
                 alt_stream=alt_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: BailingMoEBlock.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(self.embed_dim, eps=config.rms_norm_eps)
