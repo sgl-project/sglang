@@ -191,6 +191,28 @@ class _UIConverter:
                     return graph, node
         return None
 
+    def promoted(self, g, node, widget):
+        """The subgraph input ``node``'s ``widget`` is promoted to, by link."""
+        inp = next(
+            (i for i in node.get("inputs") or [] if i.get("name") == widget), None
+        )
+        link = g.links.get(inp.get("link")) if inp else None
+        if link and _lget(link, "origin_id") == SG_INPUT:
+            return g.data["inputs"][_lget(link, "origin_slot")]["name"]
+        return None
+
+    @staticmethod
+    def instance_index(inst, node, widget, promoted):
+        """Where a subgraph instance keeps ``node``'s promoted ``widget`` in its
+        widgets_values: a proxyWidgets entry or a widget input (v1 exports)."""
+        proxies = (inst.get("properties") or {}).get("proxyWidgets") or []
+        widgets = [i["name"] for i in inst.get("inputs") or [] if i.get("widget")]
+        if [str(node["id"]), widget] in proxies:
+            return proxies.index([str(node["id"]), widget])
+        if promoted is not None and promoted in widgets:
+            return widgets.index(promoted)
+        return None
+
     def model_names(self, g, node):
         """The file a loader loads, once per subgraph instance when the name is a
         promoted widget (the inner widget then holds a stale value)."""
@@ -198,28 +220,59 @@ class _UIConverter:
         own = values[0] if isinstance(values, list) and values else None
         if g is self.root:
             return [own]
-        inp = next(
-            (i for i in node.get("inputs") or [] if i.get("name") == "unet_name"), None
-        )
-        link = g.links.get(inp.get("link")) if inp else None
-        promoted = (
-            g.data["inputs"][_lget(link, "origin_slot")]["name"]
-            if link and _lget(link, "origin_id") == SG_INPUT
-            else None
-        )
+        promoted = self.promoted(g, node, "unet_name")
         names = []
         for _, inst in self.instances(g):
             values = inst.get("widgets_values") or []
-            proxies = (inst.get("properties") or {}).get("proxyWidgets") or []
-            widgets = [i["name"] for i in inst.get("inputs") or [] if i.get("widget")]
-            if [str(node["id"]), "unet_name"] in proxies:
-                idx = proxies.index([str(node["id"]), "unet_name"])
-            elif promoted in widgets:
-                idx = widgets.index(promoted)
-            else:
-                idx = None
+            idx = self.instance_index(inst, node, "unet_name", promoted)
             names.append(values[idx] if idx is not None and idx < len(values) else own)
         return names or [own]
+
+    def reset_weight_dtype(self, g, node, where):
+        """weight_dtype set from outside the loader's widget would override the
+        'default' the SGLD loader needs: a link (e.g. a PrimitiveNode) is dropped,
+        a promoted value is reset on every subgraph instance."""
+        inp = next(
+            (i for i in node.get("inputs") or [] if i.get("name") == "weight_dtype"),
+            None,
+        )
+        promoted = self.promoted(g, node, "weight_dtype")
+        if inp and inp.get("link") is not None and promoted is None:
+            g.drop_link(inp["link"])
+            inp["link"] = None
+            _note_weight_dtype(self.report, where, None, "its input link was removed")
+        if g is self.root:
+            return
+        for pg, inst in self.instances(g):
+            idx = self.instance_index(inst, node, "weight_dtype", promoted)
+            values = inst.get("widgets_values") or []
+            if idx is None or idx >= len(values):
+                continue
+            at = _label(f"{pg.where}{inst['id']}", inst)
+            outer = next(
+                (
+                    i
+                    for i in inst.get("inputs") or []
+                    if promoted and i.get("name") == promoted
+                ),
+                None,
+            )
+            link = pg.links.get(outer.get("link")) if outer else None
+            if link and _lget(link, "origin_id") == SG_INPUT:
+                self.report.reminders.append(
+                    f"{where}: weight_dtype is promoted through {at} to an outer "
+                    "subgraph; set it to `default` there by hand."
+                )
+                continue
+            if link:
+                pg.drop_link(outer["link"])
+                outer["link"] = None
+                source = f"its input link on subgraph instance {at} was removed"
+                _note_weight_dtype(self.report, where, None, source)
+            elif values[idx] not in ("default", None):
+                source = f"set on subgraph instance {at}"
+                _note_weight_dtype(self.report, where, values[idx], source)
+            values[idx] = "default"
 
     def swap_loaders(self):
         for g in self.graphs:
@@ -240,8 +293,11 @@ class _UIConverter:
                 values = list(node.get("widgets_values") or [names[0]])
                 # SGLDUNETLoader has UNETLoader's widgets (the GGUF loader lacks
                 # weight_dtype); the SGLD worker serves only weight_dtype 'default'.
-                _note_weight_dtype(self.report, where, values[1:2])
+                _note_weight_dtype(
+                    self.report, where, values[1] if len(values) > 1 else None
+                )
                 node["widgets_values"] = [values[0], "default"]
+                self.reset_weight_dtype(g, node, where)
                 _retype(node, rules.SGLD_LOADER)
                 inputs = node.setdefault("inputs", [])
                 if not any(i.get("name") == "sgld_options" for i in inputs):
@@ -330,13 +386,20 @@ class _UIConverter:
                     _remind(self.report, where, kind, "MODEL" in outputs)
 
 
-def _note_weight_dtype(report, where, dtype):
-    if dtype and dtype[0] not in ("default", None):
-        report.reminders.append(
-            f"{where}: weight_dtype `{dtype[0]}` reset to `default`; the SGLD worker "
-            "loads the file's own dtype. For lower memory, use an FP8 or INT8 file "
-            "or SGLDOptions quantization."
-        )
+def _note_weight_dtype(report, where, dtype, source=None):
+    """Reminder for a weight_dtype reset to 'default'; ``source`` says where a
+    value that overrides the widget came from (a link, a subgraph instance)."""
+    if source is None and dtype in ("default", None):
+        return
+    what = (
+        f"weight_dtype `{dtype}`" if dtype not in ("default", None) else "weight_dtype"
+    )
+    report.reminders.append(
+        f"{where}: {what} reset to `default`"
+        + (f" ({source})" if source else "")
+        + "; the SGLD worker loads the file's own dtype. For lower memory, use an "
+        "FP8 or INT8 file or SGLDOptions quantization."
+    )
 
 
 def _remind(report, where, kind, outputs_model):
@@ -387,7 +450,16 @@ def convert_api(prompt):
                 f"{_label(nid, node)} -> SGLDUNETLoader (`{rules.file_name(name)}`)"
             )
             node["class_type"] = rules.SGLD_LOADER
-            _note_weight_dtype(report, _label(nid, node), [inputs.get("weight_dtype")])
+            dtype = inputs.get("weight_dtype")
+            if _is_link(dtype):
+                _note_weight_dtype(
+                    report,
+                    _label(nid, node),
+                    None,
+                    f"it was connected to node {dtype[0]}",
+                )
+            else:
+                _note_weight_dtype(report, _label(nid, node), dtype)
             inputs["weight_dtype"] = "default"
     if not any(n.get("class_type") in rules.SGLD_LOADERS for n in prompt.values()):
         return prompt, report

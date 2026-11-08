@@ -262,6 +262,96 @@ def test_loader_in_subgraph_uses_the_promoted_model_name() -> None:
     assert out["state"]["lastNodeId"] >= max(n["id"] for n in out["nodes"])
 
 
+def test_weight_dtype_from_a_primitive_is_disconnected() -> None:
+    """A linked weight_dtype overrides the saved widget value at run time."""
+    b = _Builder()
+    loader = b.node(
+        "UNETLoader", [H3, "fp8_e4m3fn"], [("weight_dtype", "COMBO")], ["MODEL"]
+    )
+    loader["inputs"][0]["widget"] = {"name": "weight_dtype"}
+    prim = b.node("PrimitiveNode", ["fp8_e4m3fn"], outputs=["COMBO"])
+    other = b.node(
+        "UNETLoader", [LTX, "fp8_e4m3fn"], [("weight_dtype", "COMBO")], ["MODEL"]
+    )
+    to_loader, to_other = b.link(prim, 0, loader, 0), b.link(prim, 0, other, 0)
+    _model_chain(b, loader)
+    out, report = convert_workflow(b.wf)
+    nodes = _nodes(out)
+    assert nodes[loader["id"]]["type"] == "SGLDUNETLoader"
+    assert nodes[loader["id"]]["widgets_values"] == [H3, "default"]
+    assert nodes[loader["id"]]["inputs"][0]["link"] is None
+    assert all(l[0] != to_loader for l in out["links"])
+    # The LTX loader stays stock and keeps its connection.
+    assert nodes[prim["id"]]["outputs"][0]["links"] == [to_other]
+    assert nodes[other["id"]]["inputs"][0]["link"] == to_other
+    assert any("input link was removed" in r for r in report.reminders)
+
+
+def _promoted_dtype_workflow(proxy):
+    """The loader subgraph with weight_dtype promoted as well, used twice."""
+    wf = _subgraph_workflow()
+    sg = wf["definitions"]["subgraphs"][0]
+    inner = sg["nodes"][0]
+    inner["inputs"].append({"name": "weight_dtype", "type": "COMBO",
+                            "widget": {"name": "weight_dtype"}, "link": None})  # fmt: skip
+    first = wf["nodes"][0]
+    if proxy:  # newer frontend: proxyWidgets name the inner widgets directly
+        first["inputs"] = []
+        first["properties"]["proxyWidgets"] = [
+            ["3", "unet_name"],
+            ["3", "weight_dtype"],
+        ]
+    else:  # v1: a subgraph input linked to the inner widget
+        inner["inputs"][1]["link"] = 4
+        sg["inputs"].append(
+            {"id": "in-2", "name": "weight_dtype", "type": "COMBO", "linkIds": [4]}
+        )
+        sg["links"].append({"id": 4, "origin_id": -10, "origin_slot": 1, "target_id": 3,
+                            "target_slot": 1, "type": "COMBO"})  # fmt: skip
+        first["inputs"].append({"name": "weight_dtype", "type": "COMBO",
+                                "widget": {"name": "weight_dtype"}, "link": None})  # fmt: skip
+    first["widgets_values"] = [H3, "fp8_e4m3fn"]
+    second = copy.deepcopy(first)
+    second.update(id=8, outputs=[{"name": "MODEL", "type": "MODEL", "links": []}])
+    second["widgets_values"] = [H3, "fp8_e5m2"]
+    wf["nodes"].append(second)
+    wf["state"]["lastNodeId"] = 8
+    return wf
+
+
+def test_promoted_weight_dtype_is_reset_on_every_instance() -> None:
+    for proxy in (True, False):
+        out, report = convert_workflow(_promoted_dtype_workflow(proxy))
+        nodes = _nodes(out)
+        assert nodes[5]["widgets_values"] == [H3, "default"]
+        assert nodes[8]["widgets_values"] == [H3, "default"]
+        inner = _nodes(out["definitions"]["subgraphs"][0])[3]
+        assert inner["type"] == "SGLDUNETLoader"
+        notes = [r for r in report.reminders if "weight_dtype" in r]
+        assert any("fp8_e4m3fn" in r for r in notes) and any(
+            "fp8_e5m2" in r for r in notes
+        )
+
+
+def test_promoted_weight_dtype_fed_by_a_link_outside_is_disconnected() -> None:
+    wf = _promoted_dtype_workflow(proxy=False)
+    prim = {"id": 9, "type": "PrimitiveNode", "mode": 0, "inputs": [],
+            "outputs": [{"name": "COMBO", "type": "COMBO", "links": [13]}],
+            "properties": {}, "widgets_values": ["fp8_e4m3fn"]}  # fmt: skip
+    wf["nodes"].append(prim)
+    wf["nodes"][0]["inputs"][1]["link"] = 13
+    wf["links"].append({"id": 13, "origin_id": 9, "origin_slot": 0, "target_id": 5, "target_slot": 1, "type": "COMBO"})  # fmt: skip
+    wf["state"].update(lastNodeId=9, lastLinkId=13)
+    out, report = convert_workflow(wf)
+    nodes = _nodes(out)
+    assert (
+        nodes[5]["inputs"][1]["link"] is None and nodes[9]["outputs"][0]["links"] == []
+    )
+    assert all(l["id"] != 13 for l in out["links"])
+    assert nodes[5]["widgets_values"] == [H3, "default"]
+    assert any("input link on subgraph instance" in r for r in report.reminders)
+
+
 def test_lora_inside_subgraph_traces_its_model_through_the_instance() -> None:
     """Subgraph that takes MODEL in: its LoRA is on an SGLD model only via the parent."""
     wf = _subgraph_workflow()
@@ -324,6 +414,13 @@ def test_api_prompt() -> None:
     assert "fp8_e5m2" in dtype and "CLIP half" in clip
     assert "PathchSageAttentionKJ" in sage
     assert convert_api(out)[0] == out
+
+    linked = {"9": {"class_type": "PrimitiveNode", "inputs": {}},
+              "1": {"class_type": "UNETLoader", "inputs": {"unet_name": H3, "weight_dtype": ["9", 0]}}}  # fmt: skip
+    out, report = convert_api(linked)
+    assert out["1"]["inputs"]["weight_dtype"] == "default"
+    (note,) = report.reminders
+    assert "connected to node 9" in note and "['9'" not in note
 
 
 def test_bundled_sgld_workflows_need_no_changes() -> None:
