@@ -162,7 +162,7 @@ class EnvInt(EnvField):
 
 class _DeprecatedEnvFallback:
     """Mixin for EnvField subclasses: if the canonical env var is not set,
-    check *deprecated_name* and emit DeprecationWarning before reading it.
+    check *deprecated_name* and emit a FutureWarning before reading it.
 
     Usage:
         SGLANG_NEW_NAME = EnvBoolWithAlias(True, deprecated_name="SGLANG_OLD_NAME")
@@ -180,7 +180,9 @@ class _DeprecatedEnvFallback:
                     f"Environment variable '{self.deprecated_name}' is deprecated; "
                     f"use '{self.name}' instead. "
                     "The alias will be removed in a future release.",
-                    DeprecationWarning,
+                    # FutureWarning is shown by default; a DeprecationWarning
+                    # raised from library code is hidden from users.
+                    FutureWarning,
                     stacklevel=2,
                 )
                 os.environ[self.name] = fallback
@@ -2504,6 +2506,10 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
     ),
     "SGLANG_PREFILL_DELAYER_TOKEN_USAGE_LOW_WATERMARK": _DeprecatedEnv(
         note="Please use '--prefill-delayer-token-usage-low-watermark' instead."
+    ),
+    "SGLANG_USE_SGL_XPU": _DeprecatedEnv(
+        note="Intel XPU always uses the sgl-kernel MoE kernels; pass "
+        "'--moe-runner-backend triton' for the Triton path."
     ),
 }
 
