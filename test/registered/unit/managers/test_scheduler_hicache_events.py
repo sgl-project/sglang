@@ -104,6 +104,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
         s.pp_loop_size = 1
+        s._engine_paused = False
+        s._deferred_input_requests = []
+        s.mbs = [None]
         enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]

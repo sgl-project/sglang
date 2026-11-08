@@ -50,8 +50,8 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 from sglang.srt.utils.async_probe import maybe_detect_oob
-from sglang.srt.utils.common import async_d2h as _async_d2h
 from sglang.srt.utils.common import fast_topk
+from sglang.srt.utils.device import async_d2h as _async_d2h
 from sglang.srt.utils.nvtx_utils import profile_range
 
 _is_cuda = is_cuda()

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -24,12 +23,12 @@ from sglang.srt.layers.quantization.mxfp4 import (
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
 from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
     get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
-    set_weight_attrs,
 )
 
 NVFP4_BLOCK_SIZE = 16
@@ -105,21 +104,6 @@ def _rank_chunk_padding_loader(weight_loader, *, tp_size: int):
 # gfx950. Using the wrong layout silently corrupts the dequant scales.
 _is_gfx1250 = is_gfx1250_supported()
 
-# The gfx1250 a8w4 grouped MoE kernel consumes (16,16)-preshuffled FP4 weights
-# (see aiter op_tests/test_flydsl_grouped_gemm_gfx1250.py, which always does
-# shuffle_weight(w, layout=(16,16)); the DSv4 fp8.py path shuffles the same way
-# when AITER_FORCE_A8W4 is set). Historically this scheme only shuffled on gfx95
-# (_is_shuffle_moe_mxfp4), so on gfx1250 the raw (unshuffled) weight layout was
-# fed to a kernel expecting the shuffled one -> garbage. Mirror DSv4: shuffle
-# whenever the a8w4 path is forced on gfx1250. SGLANG_MOE_SHUFFLE_GFX1250=false
-# reproduces the old (unshuffled) behavior for A/B comparison.
-_use_aiter_a8w4 = get_bool_env_var("AITER_FORCE_A8W4", "false")
-_shuffle_moe_gfx1250 = (
-    _is_gfx1250
-    and _use_aiter_a8w4
-    and get_bool_env_var("SGLANG_MOE_SHUFFLE_GFX1250", "true")
-)
-
 if _is_hip:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
@@ -131,9 +115,9 @@ OCP_MX_BLOCK_SIZE = 32
 # the AITER path cannot run there: its scales are laid out for gfx950 and its
 # kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
 # weights and upcast them inside triton_kernels' matmul, with bf16 activations.
-# SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 opts out.
-_is_gfx1151 = _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
-_use_triton_w4a16 = _is_gfx1151 and envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.get()
+_use_triton_w4a16 = (
+    _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
+)
 _TRITON_W4A16_NUM_WARPS = 8
 
 
@@ -1203,7 +1187,7 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         logger.info_once(
             "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
             "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
-            "triton_kernels). Set SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 to disable."
+            "triton_kernels)."
         )
         self.num_experts = layer.w13_weight.shape[0]
         self.intermediate_size = layer.w13_weight.shape[1] // 2
