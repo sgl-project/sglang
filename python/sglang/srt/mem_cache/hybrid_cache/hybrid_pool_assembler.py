@@ -1718,7 +1718,6 @@ def _build_mha_mla_host_pool(
         end_layer=pool.end_layer,
         target_layer_num=pool.layer_num,
         override_kv_cache_dim=pool.kv_cache_dim,
-        # Only the MLA host pool translates at the transfer boundary.
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
         write_back_staging=pool.hicache_write_back_staging,
@@ -1760,14 +1759,13 @@ def build_full_draft_pools(
         )
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
-    parallel = get_parallel()
     if (
-        parallel.dcp_enabled
-        and isinstance(pool, MLATokenToKVPool)
+        isinstance(pool, MLATokenToKVPool)
         and not pool.dcp_replicated
+        and get_parallel().dcp_enabled
     ):
-        # A DCP-sharded MLA draft holds only its own rows, so its host pool
-        # translates with dcp_size like the target's.
+        # A DCP-sharded MLA draft holds only its own rows, like the target.
+        parallel = get_parallel()
         draft_host_pool = _build_mha_mla_host_pool(
             pool=pool,
             buffer_info=buffer_info,

@@ -539,8 +539,6 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
         self.assertIs(entries[0].host_pool, draft_host_pool)
 
     def test_full_builder_translates_dcp_sharded_mla_draft(self):
-        """Under DCP a sharded MLA draft host pool pages physical rows with the
-        target's dcp_size/rank; a replicated draft keeps the logical space."""
         from sglang.srt.runtime_context import publish, reset_context
         from sglang.srt.server_args import ServerArgs
 
@@ -716,6 +714,11 @@ class TestDraftSidecarPoolDispatch(CustomTestCase):
                         hybrid_pool_assembler,
                         "get_memory",
                         return_value=SimpleNamespace(hicache_mem_layout="page_first"),
+                    ),
+                    patch.object(
+                        hybrid_pool_assembler,
+                        "get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=False),
                     ),
                     patch.object(
                         hybrid_pool_assembler,
