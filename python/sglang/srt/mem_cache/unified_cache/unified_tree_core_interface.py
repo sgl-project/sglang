@@ -11,6 +11,7 @@ from collections import defaultdict
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import msgspec
+
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 
 # Tree node id -- the node handle used outside the TreeCore. The concrete tree
@@ -131,6 +132,7 @@ class InsertStepResult(msgspec.Struct, frozen=True):
 
 if TYPE_CHECKING:
     import torch
+
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.base_prefix_cache import (
         DecLockRefParams,

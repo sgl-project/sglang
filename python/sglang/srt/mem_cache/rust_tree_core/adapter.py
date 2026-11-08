@@ -8,6 +8,7 @@ from array import array
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 import torch
+
 from sglang.srt.disaggregation.kv_events import (
     AllBlocksCleared,
     BlockRemoved,
