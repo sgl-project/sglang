@@ -1317,7 +1317,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 cls._terminate_weight_cache_daemons(weight_cache_daemon_procs)
                 raise
 
-            if os.getenv("SGLANG_BLOCK_NONZERO_RANK_CHILDREN") == "0":
+            if not envs.SGLANG_BLOCK_NONZERO_RANK_CHILDREN.get():
                 # When using `Engine` as a Python API, we don't want to block here.
                 return (
                     None,

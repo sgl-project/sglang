@@ -828,6 +828,11 @@ class Envs:
     # Distributed and model-parallel runtime
     # ===================================================================
     SGLANG_ONE_VISIBLE_DEVICE_PER_PROCESS = EnvBool(False)
+    # Trust the driver's P2P report instead of probing each peer in a subprocess.
+    SGLANG_SKIP_P2P_CHECK = EnvBool(False)
+    # Launch on node_rank >= 1 blocks until its schedulers exit; False returns
+    # instead, for an Engine used as a Python API.
+    SGLANG_BLOCK_NONZERO_RANK_CHILDREN = EnvBool(True)
     # Comma-separated bundle indices for Ray Custom PG mode (e.g., "0,1,2,7").
     SGLANG_RAY_BUNDLE_INDICES = EnvStr("")
     # Override the distributed init method used by torch.distributed.init_process_group.
@@ -1109,6 +1114,8 @@ class Envs:
     # decode without runtime permutes.
     SGLANG_AITER_KV_CACHE_LAYOUT = EnvStr("nhd")
     SGLANG_ROCM_FUSED_DECODE_MLA = EnvBool(False)
+    # Apply RoPE inside the ROCm fused MLA decode kernel instead of before it.
+    SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION = EnvBool(True)
     # Send Qwen3.8's 512-expert softmax router back to aiter `fused_topk`
     # instead of `topk_gating`.
     SGLANG_ROCM_DISABLE_AITER_TOPK_GATING = EnvBool(False)
