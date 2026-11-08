@@ -71,9 +71,6 @@ def try_pack_dcp_src(
         return None
 
     pack = pack_buffer.buffer.narrow(0, pack_offset_bytes, required)
-    # Transfer worker threads start on device 0: leaving torch.cuda.stream()
-    # would restore it and create a stray context on GPU 0 in every rank.
-    torch.cuda.set_device(pack.device)
     row_indices = torch.as_tensor(
         src_token_indices, device=pack.device, dtype=torch.int64
     )
@@ -95,9 +92,7 @@ def try_pack_dcp_src(
 
 
 def dsa_index_k_item_lens(kv_args) -> List[int]:
-    """Page bytes of the DSA index-K buffers a PD DCP relayout moves token by
-    token, or [] when the pool has none it can move that way."""
-    if getattr(kv_args, "dsa_index_k_token_bytes", None) is None:
+    if kv_args.dsa_index_k_token_bytes is None:
         return []
     from sglang.srt.disaggregation.base.conn import StateType
 

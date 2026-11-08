@@ -351,10 +351,6 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
 
 
 class TestDcpDsaIndexKTransfer(unittest.TestCase):
-    """A DCP decode shards the DSA index-K by token like its KV (Kimi-K3.1):
-    each token's key and scale move with its KV row into the page layout of
-    the owning rank (keys of a page, then their scales)."""
-
     def test_moves_keys_and_scales_to_owner_rows(self):
         page_size, value_bytes, scale_bytes, dcp = 64, 8, 4, 8
         page_bytes = page_size * (value_bytes + scale_bytes)

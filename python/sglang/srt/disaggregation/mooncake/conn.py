@@ -1539,30 +1539,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pack_buffer,
         pack_offset_bytes: int,
     ) -> list:
-        """Transfer params moving index-K rows ``src_rows`` to ``dst_rows``.
-
-        An index-K page holds the fp8 keys of its tokens, then their scales, so
-        a token's row is two pieces: each is addressed in units of its own
-        width, which the page bytes are a multiple of. The source pieces are
-        packed in destination order when the pack buffer has room."""
         src_ptrs, dst_ptrs, page_bytes = dsa_index_k
         page_size = self.kv_args.page_size
         value_bytes, scale_bytes = self.kv_args.dsa_index_k_token_bytes
-        if page_bytes % value_bytes or (page_size * value_bytes) % scale_bytes:
+        if (
+            page_bytes != page_size * (value_bytes + scale_bytes)
+            or (page_size * value_bytes) % scale_bytes
+        ):
             raise ValueError(
                 f"DSA index-K page of {page_bytes} bytes does not split into "
                 f"{value_bytes}-byte keys and {scale_bytes}-byte scales"
             )
         params = []
+        # A page holds its tokens' keys, then their scales, each addressed in its width.
         for width, offset in ((value_bytes, 0), (scale_bytes, page_size * value_bytes)):
-            pages_per_unit = page_bytes // width
+            units_per_page = page_bytes // width
             src_units = (
-                src_rows // page_size * pages_per_unit
+                src_rows // page_size * units_per_page
                 + (offset // width)
                 + src_rows % page_size
             )
             dst_units = (
-                dst_rows // page_size * pages_per_unit
+                dst_rows // page_size * units_per_page
                 + (offset // width)
                 + dst_rows % page_size
             )
@@ -1590,9 +1588,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
     def dsa_index_k_dcp_entries(
         self, registration_info: KVArgsRegisterInfo
     ) -> Optional[Tuple[List[int], List[int], int]]:
-        """The DSA index-K a PD DCP relayout moves with the KV: (source,
-        destination buffers, page bytes), or None when the pool has none."""
-        state_types = getattr(self.kv_args, "state_types", [])
+        state_types = self.kv_args.state_types
         if StateType.DSA not in state_types:
             return None
         if self.kv_args.dsa_index_k_token_bytes is None:
@@ -1656,9 +1652,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_attn_tp_size: Optional[int] = None,
         dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
     ) -> int:
-        """``dsa_index_k``: (source, destination buffers, page bytes) of a DSA
-        index-K the decode shards by token like its KV (Kimi-K3.1); its rows
-        move with the target KV rows."""
         if num_kv_tokens is None:
             raise ValueError("PD DCP transfer requires num_kv_tokens")
         physical_page_size = self.kv_args.page_size

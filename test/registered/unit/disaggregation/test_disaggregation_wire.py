@@ -1146,6 +1146,35 @@ class TestPollCollectives(CustomTestCase):
         all_reduce.assert_not_called()
 
 
+class TestDsaIndexKTokenBytes(unittest.TestCase):
+    def test_static_dsa_pool_reports_its_key_and_scale_bytes(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        for use_fp4_indexer, kpool, expected in (
+            (False, 1, (128, 4)),
+            (True, 1, (64, 4)),
+            (False, 4, None),
+        ):
+            with self.subTest(use_fp4_indexer=use_fp4_indexer, kpool=kpool):
+                pool = object.__new__(DSATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 1
+                pool.index_head_dim = 128
+                pool.use_fp4_indexer = use_fp4_indexer
+                pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+                    128, use_fp4_indexer
+                )
+                pool.index_kpool = kpool
+                pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+                pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, _static_storage(pool))
+
+                self.assertEqual(kv_args.state_types, [StateType.DSA])
+                self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
+
+
 class TestCPReplicatedStateTransfer(unittest.TestCase):
     def test_only_nonzero_cp_ranks_without_layer_split_skip_state(self):
         # Under CP-TP group sharing each CP rank owns its own linear-attention

@@ -32,6 +32,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             page_size=page_size,
             gpu_id=0,
             state_types=[StateType.MAMBA],
+            dsa_index_k_token_bytes=None,
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -219,7 +220,11 @@ class TestInitDcpPackBuffers(CustomTestCase):
     still get them, not silently fall back."""
 
     _KV_ARGS = SimpleNamespace(
-        kv_item_lens=[64 * 16], page_size=64, num_draft_entries=0, gpu_id=3
+        kv_item_lens=[64 * 16],
+        page_size=64,
+        num_draft_entries=0,
+        gpu_id=3,
+        dsa_index_k_token_bytes=None,
     )
 
     def test_non_triton_device_gets_no_buffers(self):
