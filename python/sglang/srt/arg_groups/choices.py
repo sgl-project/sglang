@@ -76,7 +76,6 @@ ATTENTION_BACKEND_CHOICES = [
     "qsa",
     "unlimited_ocr_v2",
     "dsv4",
-    "compressed",  # Deprecated alias for "dsv4"
     "ernie55",
     # NVIDIA specific
     "fa3",

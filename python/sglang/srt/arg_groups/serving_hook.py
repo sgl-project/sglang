@@ -297,7 +297,7 @@ def handle_deprecated_args(server_args: Any):
         enable_flashinfer_allreduce_fusion=False,
     )
     # Deprecated attention-backend aliases.
-    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
+    aliases = {"tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
