@@ -163,11 +163,12 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
     class _Peer:
         def __init__(self, sources):
             self.lazy_compaction = True
-            self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
             self._load_pinned_pages = 0
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
-            self._unsettled_free = ()  # no frees held for an in-flight forward
+
+        def _reusable_pages(self):
+            return 4  # four holes, nothing pending
 
         def _is_frontier_transparent(self):
             return False
@@ -175,7 +176,6 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
         # Exercise the production predicates when checking each source.
         moves_blocked = Band.moves_blocked
         pinned_by_source = Band.pinned_by_source
-        _unsettled_page_count = Band._unsettled_page_count
 
     class _Owner:
         """Stands in for a grow-up END pool: the credit walks the chain from

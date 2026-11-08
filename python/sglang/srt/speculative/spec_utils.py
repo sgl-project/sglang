@@ -1186,6 +1186,15 @@ def commit_mamba_states_after_verify(
     if mambaish_config(model_runner.model_config) is None:
         return
 
+    # FIXME: when the target runner is the forward's last shared reader, this
+    # ReplaySSM branch reads the request pool's Mamba indices and the state map
+    # after the declared shared-read end. The schedule stream may then reuse and
+    # rewrite a finished request's row or state slot while this commit still
+    # reads it. Declare a later read end for this path, or gather the indices
+    # during metadata preparation. The same holds for EAGLE v2's post-verify
+    # graphs: they replay this commit on a side stream joined only after draft
+    # extend, while draft extend's declared read end (pre-, in- or post-replay)
+    # is recorded before that join; only its whole-forward fallback covers it.
     # ReplaySSM spec-verify path (Part B of #28511): the accepted drafts already
     # live in the per-slot circular ring (written during verify). Instead of
     # scattering an intermediate full SSM state into `temporal`, advance the

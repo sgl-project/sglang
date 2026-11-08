@@ -16,11 +16,12 @@ limitations under the License.
 from __future__ import annotations
 
 import abc
-from typing import TYPE_CHECKING, Dict, Hashable, List, Optional, Protocol
+from typing import TYPE_CHECKING, Dict, Hashable, Optional, Protocol
 
 import torch
 
 if TYPE_CHECKING:
+    from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
     from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
     from sglang.srt.mem_cache.kv.state_storage import StateStorage
     from sglang.srt.mem_cache.kv.storage import KVStorage
@@ -50,6 +51,8 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
     state: Optional[StateStorage] = None
     # A unified pool's sub-pools as host and peer transfers read them.
     storage: Optional[KVStorage] = None
+    # The steps a lazily compacting unified pool's freed pages wait for.
+    forward_steps: Optional[ForwardSteps] = None
 
     @property
     def state_slots(self):
@@ -103,12 +106,6 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         from sglang.srt.mem_cache.kv.alloc.id_space import state_id_space
 
         return state_id_space(self.state_id_spaces(), sub_pool)
-
-    def reuse_fences(self) -> List[torch.cuda.Event]:
-        """Events a writer that follows no stream (e.g. an RDMA into a published
-        destination) waits for before writing the pages handed out so far. Empty
-        when handed-out pages may be written at once."""
-        return []
 
     # -- scheduler-facing capacity hooks --
     # The scheduler calls these unconditionally, with no allocator-type branches

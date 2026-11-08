@@ -1612,6 +1612,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        # FIXME: on the PP stable-rows path this reads the request rows and
+        # translates state indices after the forward's declared shared-read
+        # end. A row or state slot reused on the schedule stream meanwhile is
+        # read with its new owner's values. Declare a later read end, or gather
+        # the indices during metadata preparation.
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
