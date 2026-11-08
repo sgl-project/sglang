@@ -441,6 +441,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -893,6 +894,17 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
+def _load_draft_hf_config(cfg):
+    from sglang.srt.hf_transformers import get_config
+
+    return get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+        model_override_args=json.loads(cfg.json_model_override_args),
+    )
+
+
 def _keep_mla_draft_off_trtllm_mha(
     draft_backend: Optional[str], *, is_mla: bool
 ) -> Optional[str]:
@@ -928,6 +940,11 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     Consumed by ModelRunner's `is_draft_worker` override (one backend for all
     draft modes).
     """
+    from sglang.srt.speculative.dflash_utils import is_dflash_mla_draft_config
+    from sglang.srt.speculative.draft_worker_common import (
+        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    )
+
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
@@ -937,17 +954,10 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             return current_platform.supports_speculative_draft_attention_backend(
                 "DFLASH", backend
             )
-        if backend == "cutedsl_mla":
-            from sglang.srt.hf_transformers import get_config
-            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
-
-            draft_hf_config = get_config(
-                cfg.speculative_draft_model_path,
-                trust_remote_code=cfg.trust_remote_code,
-                revision=cfg.speculative_draft_model_revision,
-                model_override_args=json.loads(cfg.json_model_override_args),
-            )
-            return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+        if backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+            # These serve only MLA layers: a draft verify window through the
+            # target's MLA decode kernels (DCP owner rows under DCP).
+            return is_dflash_mla_draft_config(_load_draft_hf_config(cfg))
         return backend in supported_draft_backends
 
     def get_fallback_backend() -> str:
@@ -1042,6 +1052,50 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
         "_resolve_dflash_draft_attention_backend",
         speculative_draft_attention_backend=draft_backend,
     )
+
+
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Keep the compact draft table (``--speculative-draft-window-size``) off
+    the MLA-only draft backends where it cannot be read; see
+    ``resolve_mla_draft_compact_window``. Runs after the draft backend is final."""
+    from sglang.srt.speculative.dflash_utils import (
+        is_dflash_mla_draft_config,
+        resolve_mla_draft_compact_window,
+    )
+    from sglang.srt.speculative.draft_worker_common import (
+        DFLASH_MLA_ONLY_DRAFT_BACKENDS,
+    )
+
+    cfg = resolving_view(server_args)
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
+        return
+    draft_hf_config = _load_draft_hf_config(cfg)
+    if not is_dflash_mla_draft_config(draft_hf_config):
+        return
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=int(window_size),
+        dcp_size=cfg.dcp_size,
+        # Unresolved (None) here means the default page size of 1.
+        page_size=cfg.page_size or 1,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            int(window_size),
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
+        )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

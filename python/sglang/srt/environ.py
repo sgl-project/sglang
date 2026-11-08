@@ -1723,6 +1723,12 @@ class Envs:
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
     # A/B: keep the DFLASH draft greedy head eager (not folded in-graph).
     SGLANG_DFLASH_EAGER_DRAFT_SAMPLER = EnvBool(False)
+    # Disable the compact-slot SWA window lookup for compact MLA drafts; off by default.
+    SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW = EnvBool(False)
+    # Skip the SWA draft's LSE and zero-KV fixup when DCP is off.
+    SGLANG_OPT_DFLASH_SWA_SKIP_LSE = EnvBool(
+        SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION.get
+    )
     SGLANG_ENABLE_LILICORR_SAMPLING = EnvBool(False)
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
