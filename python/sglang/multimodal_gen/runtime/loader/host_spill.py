@@ -16,7 +16,7 @@ import hashlib
 import os
 import shutil
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Iterable
 
 import torch
 
@@ -30,10 +30,6 @@ logger = init_logger(__name__)
 MIN_SPILL_BYTES = 64 << 20
 # Free space to leave on the spill filesystem after a write.
 SPILL_DISK_RESERVE_BYTES = 2 << 30
-
-FusedTensorFactory = Callable[
-    [str, torch.Size, torch.dtype], "tuple[torch.Tensor, bool] | None"
-]
 
 
 def checkpoint_fingerprint(weight_dirs: Iterable[str]) -> str:

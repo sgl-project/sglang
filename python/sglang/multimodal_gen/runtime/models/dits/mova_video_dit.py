@@ -47,11 +47,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# @torch.compile(fullgraph=True)
-def modulate(x: torch.Tensor, shift: torch.Tensor, scale: torch.Tensor):
-    return x * (1 + scale) + shift
-
-
 def sinusoidal_embedding_1d(dim, position):
     sinusoid = torch.outer(
         position.type(torch.float64),
