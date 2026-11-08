@@ -136,7 +136,10 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
 
     def make_buffer_cache(self):
         cache, nodes = self.make_cache()
-        cache.components = {ComponentType.MAMBA: MagicMock()}
+        cache.components = {
+            ComponentType.FULL: MagicMock(spec=FullComponent),
+            ComponentType.MAMBA: MagicMock(spec=MambaComponent),
+        }
         cache.sidecar_pool_specs = []
         cache.storage_existence_cache = StorageExistenceCache()
         cache.token_to_kv_pool_allocator = MagicMock()
@@ -207,6 +210,79 @@ class TestCacheModeMambaSelectiveBackup(CustomTestCase):
             states[0].keys, cache.tree_core.get_hash_values(nodes[-1])[-1:]
         )
         self.assertEqual(len(p.pending_write_queue), 3)
+
+    def test_finished_request_backs_up_previously_donated_checkpoint(self):
+        """Finishing before a new tracking boundary must persist the tree state."""
+        for buffer_mode in (False, True):
+            with self.subTest(buffer_mode=buffer_mode):
+                if buffer_mode:
+                    cache, nodes, _ = self.make_buffer_cache()
+                else:
+                    cache, nodes = self.make_cache()
+                cache.disable = False
+                cache.enable_mamba_extra_buffer = True
+                cache.req_to_token_pool = SimpleNamespace(
+                    req_to_token=torch.arange(8).reshape(1, 8),
+                    get_mamba_ping_pong_keep_idx=lambda req: 0,
+                )
+                storage = MagicMock()
+                storage.quantizes_checkpoints.return_value = False
+                cache.kv_storage = lambda storage=storage: storage
+                params = CacheInitParams(
+                    disable=False,
+                    page_size=1,
+                    enable_mamba_extra_buffer=True,
+                    req_to_token_pool=MagicMock(spec=HybridReqToTokenPool),
+                    token_to_kv_pool_allocator=None,
+                    tree_slots=tree_slots_of(
+                        (ComponentType.FULL, ComponentType.MAMBA),
+                        checkpoint_interval=256,
+                    ),
+                )
+                with get_context().override_server_args(
+                    _mamba_cache_chunk_size=256, mamba_max_states_per_path=-1
+                ):
+                    component = MambaComponent(
+                        cache, params, slot_of(params, ComponentType.MAMBA)
+                    )
+                cache._components_tuple = (component,)
+                req = SimpleNamespace(
+                    rid="short-decode",
+                    finished=lambda: True,
+                    full_untruncated_fill_ids=list(range(6)),
+                    extra_key=None,
+                    cache_salt=None,
+                    priority=0,
+                    session_id=None,
+                    kv_rotation_base=None,
+                    last_node=nodes[-1],
+                    kv=SimpleNamespace(
+                        req_pool_idx=0,
+                        cache_protected_len=4,
+                        cache_inserted_len=4,
+                        mamba_last_track_seqlen=4,
+                        mamba_prev_track_seqlen=2,
+                        mamba_ping_pong_track_buffer=torch.tensor([10, 11]),
+                    ),
+                )
+                component.cleanup_after_caching_req(
+                    req, is_finished=False, insert_params=InsertParams()
+                )
+                self.assertIsNone(req.kv.mamba_last_track_seqlen)
+                cache.checkpoint_into_tree(req, up_to=6)
+                if buffer_mode:
+                    states = [
+                        i.snapshot.node_id
+                        for i in cache.buffer_pipeline.pending_write_queue
+                        if i.pool == PoolName.MAMBA
+                    ]
+                else:
+                    states = [
+                        node
+                        for node, _, pools in cache.writes
+                        if ComponentType.MAMBA in pools
+                    ]
+                self.assertEqual(states, [nodes[-1]])
 
     def test_intermediate_then_endpoint_adds_only_missing_mamba(self):
         """An existing KV backup must not hide a newly eligible endpoint state."""

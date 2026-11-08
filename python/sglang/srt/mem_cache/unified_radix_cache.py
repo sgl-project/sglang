@@ -1548,6 +1548,11 @@ class UnifiedRadixCache(BasePrefixCache):
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
+            if is_finished:
+                # A mid-flight donate cleared the request's tracked checkpoint.
+                # Its state still belongs to the protected tree endpoint, even
+                # when decode never crossed another tracking boundary.
+                self._backup_request_end_mamba(req.last_node)
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
@@ -2078,25 +2083,37 @@ class UnifiedRadixCache(BasePrefixCache):
         # An earlier KV backup may have skipped this endpoint's Mamba state.
         params = self._insert_params
         if (
-            not self._mamba_request_end_only
-            or self.cache_controller is None
-            or params is None
+            params is None
             or params.is_request_end is not True
             or result.rotation_tail_declined
-            or self.is_write_back
         ):
             return
-        node_id = result.last_device_node
+        self._backup_request_end_mamba(result.last_device_node)
+
+    def _backup_request_end_mamba(self, node_id: NodeId) -> None:
+        if (
+            not self._mamba_request_end_only
+            or self.cache_controller is None
+            or self.is_write_back
+            or self.tree_core.is_root(node_id)
+        ):
+            return
         if self.tree_core.node_hit_count(node_id) < self.write_through_threshold:
             return
         self._execute_and_commit_kv_backup(
-            self.tree_core.build_backup_kv_action(node_id)
+            self.tree_core.build_backup_kv_action(node_id), mamba_endpoint=node_id
         )
         if self.buffer_pipeline is not None:
-            self.buffer_pipeline.enqueue_backup_intent(node_id, recheck=True)
+            self.buffer_pipeline.enqueue_backup_intent(
+                node_id, recheck=True, backup_mamba=True
+            )
 
     def _execute_and_commit_kv_backup(
-        self, action: BackupKV, write_back: bool = False
+        self,
+        action: BackupKV,
+        write_back: bool = False,
+        *,
+        mamba_endpoint: Optional[NodeId] = None,
     ) -> int:
         """Run a backup action top-down, stopping at the first failed backup."""
         if self.buffer_pipeline is not None:
@@ -2105,12 +2122,24 @@ class UnifiedRadixCache(BasePrefixCache):
             # FIFO ordering instead (BackupKV chains are parent-before-child
             # and every pipeline stage drains in order).
             for node_id in action.node_ids:
-                self.buffer_pipeline.enqueue_backup_intent(node_id)
+                self.buffer_pipeline.enqueue_backup_intent(
+                    node_id,
+                    backup_mamba=(
+                        node_id == mamba_endpoint
+                        if mamba_endpoint is not None
+                        else self._should_backup_mamba(node_id)
+                    ),
+                )
             return 0
         written = 0
         for node_id in action.node_ids:
             device_value, comp_xfers = self.tree_core.build_backup_spec(node_id)
-            if not self._should_backup_mamba(node_id):
+            backup_mamba = (
+                node_id == mamba_endpoint
+                if mamba_endpoint is not None
+                else self._should_backup_mamba(node_id)
+            )
+            if not backup_mamba:
                 comp_xfers.pop(ComponentType.MAMBA, None)
             # Overlapping chain actions may revisit nodes with Full KV already
             # backed up. Skip only when no transfer remains.

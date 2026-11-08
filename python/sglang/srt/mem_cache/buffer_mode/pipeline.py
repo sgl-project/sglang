@@ -690,7 +690,9 @@ class BufferModePipeline:
     def end_insert_walk(self) -> None:
         self._walk_admitted = None
 
-    def enqueue_backup_intent(self, node_id: NodeId, *, recheck: bool = False) -> None:
+    def enqueue_backup_intent(
+        self, node_id: NodeId, *, recheck: bool = False, backup_mamba: bool = True
+    ) -> None:
         """Queue one intent per pool with something to write; rejected intents
         are counted and the node re-triggers on a later hit."""
         if not self._cache.enable_storage:
@@ -720,7 +722,7 @@ class BufferModePipeline:
         page_size = self._cache.page_size
         span = (snapshot.node_id, len(snapshot.key))
         for pool, keys in intents:
-            if pool == PoolName.MAMBA and not self._cache._should_backup_mamba(node_id):
+            if pool == PoolName.MAMBA and not backup_mamba:
                 continue
             if pool in pending:
                 continue
