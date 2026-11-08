@@ -1578,6 +1578,20 @@ class SchedulerBatchResultProcessor:
                 known_boundary=not lazy and known_mamba_boundary is True,
             )
 
+        # Prefill can skip the anticipatory swap.
+        # Use the completed batch's slot to avoid swapping twice.
+        if completed_mamba_boundary and not lazy:
+            kv_storage_of(
+                batch.req_to_token_pool, batch.token_to_kv_pool_allocator
+            ).advance(
+                req,
+                tracking=TrackingAdvance(
+                    next_position=batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                        batch.mamba_track_buffer_indices[i]
+                    )
+                ),
+            )
+
         if (
             get_disagg().disaggregation_decode_enable_offload_kvcache
             and not req.finished()
