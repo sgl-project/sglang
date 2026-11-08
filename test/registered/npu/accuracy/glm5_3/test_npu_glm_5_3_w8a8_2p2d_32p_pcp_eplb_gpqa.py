@@ -97,11 +97,10 @@ GLM_5_3_PCP_EPLB_PD_SEP_PREFILL_ARGS = [
     65536,
     "--context-length",
     220000,
-    # AO-A2A-01: ascend_ops with explicit all-default config, plus EPLB below
     "--moe-a2a-backend",
-    "ascend_ops",
-    "--moe-ascend-ops-config",
-    '{"prefill":"alltoallv","decode":"low_latency","ll_dispatch_alg":"fullmesh_v1","ll_combine_alg":""}',
+    "deepep",
+    "--deepep-mode",
+    "normal",
     "--disable-shared-experts-fusion",
     "--disable-cuda-graph",
     "--dtype",
@@ -152,7 +151,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "--mem-fraction-static",
     0.88,
     "--max-running-requests",
-    56,
+    48,
     "--attention-backend",
     "ascend",
     "--device",
@@ -166,11 +165,10 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "--tool-call-parser",
     "glm47",
     "--enable-metrics",
-    # AO-A2A-01: ascend_ops with explicit all-default config, plus EPLB below
     "--moe-a2a-backend",
-    "ascend_ops",
-    "--moe-ascend-ops-config",
-    '{"prefill":"alltoallv","decode":"low_latency","ll_dispatch_alg":"fullmesh_v1","ll_combine_alg":""}',
+    "deepep",
+    "--deepep-mode",
+    "low_latency",
     "--cuda-graph-max-bs-decode",
     8,
     "--disaggregation-transfer-backend",
@@ -228,8 +226,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_MODEL_CONFIG = {
 # PCP variant with EPLB
 # 4-node PD separation, prefill tp8 + attn-cp8 (interleave) + pp4,
 # decode tp32/dp32/ep32, EPLB enabled on both P and D with GLM-5.3-w8a8
-# MoE A2A backend: AO-A2A-01 ascend_ops (all-default: prefill=alltoallv,
-# decode=low_latency) on both P and D
+# MoE A2A backend: deepep (prefill=normal, decode=low_latency) on both P and D
 class TestNPUGLM5_3_W8A8_2P2D_PCP_EPLB_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase):
     """Test NPU accuracy for GLM-5.3-w8a8 PD separation 2p2d with PCP and EPLB on gpqa_diamond"""
 
@@ -244,7 +241,7 @@ class TestNPUGLM5_3_W8A8_2P2D_PCP_EPLB_GPQA(TestNpuAccuracyMultiNodePdSepTestCas
             "system_prompt": "Your response should be in the following format:\nExplanation: {your explanation for your final answer}\nExact Answer: {your succinct, final answer}\nConfidence: {your confidence score between 0% and 100% for your answer}.",
         }
     }
-    eval_batch_size = 56
+    eval_batch_size = 48
     generation_config = {
         "max_tokens": 131072,
         "temperature": 1.0,
