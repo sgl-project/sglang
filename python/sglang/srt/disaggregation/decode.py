@@ -124,6 +124,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     evictable_by_sub_pool,
     window_sub_pool_of,
 )
+from sglang.srt.mem_cache.capacity import capacity_decision
 from sglang.srt.mem_cache.common import (
     RetractionBackup,
     discard_kv_cache_backup,
@@ -609,6 +610,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             and hasattr(self.token_to_kv_pool_allocator, "alloc_extend_swa_tail")
         )
 
+    def _budgets_count_from_zero(self) -> bool:
+        """Whether the preallocation budgets count from zero: over a shared memory each
+        is minus what it holds back, priced beside the request (`prealloc_fits`)."""
+        from sglang.srt.mem_cache.capacity import shares_memory
+
+        return shares_memory(self.token_to_kv_pool_allocator)
+
     def _uses_swa_reservation(self) -> bool:
         """Whether the scheduler's window budget prices preallocations: with
         tail preallocation, or when windows share the owner's bytes."""
@@ -629,6 +637,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             - retractable_tokens,
         )
 
+    @capacity_decision
     def _prealloc_reservation_fits(
         self,
         demand: KVDemand,
@@ -644,6 +653,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             window_budget_tokens=window_allocatable_tokens,
         )
 
+    @capacity_decision
     def _admit_preallocation(
         self,
         req: Req,
@@ -2755,6 +2765,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             reserved_tokens=reserved_tokens,
         )
 
+    @capacity_decision
     def _allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
@@ -2769,7 +2780,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 extra_reserved_reqs=extra_reserved_reqs
             )
 
-        if self.scheduler.enable_hisparse:
+        if self._budgets_count_from_zero():
+            # The admission prices the reservation beside each request
+            # (`ChainAllocator.prealloc_fits`): no scalar is read.
+            available_size = 0
+        elif self.scheduler.enable_hisparse:
             logical_allocator = self.token_to_kv_pool_allocator.logical_attn_allocator
             if self._uses_swa_tail_prealloc() and hasattr(
                 logical_allocator, "full_available_size"
@@ -2810,6 +2825,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         allocatable_tokens -= hicache_reserved_tokens
         return allocatable_tokens
 
+    @capacity_decision
     def _window_allocatable_token_budgets(
         self,
         retractable_tokens: Optional[int] = None,
@@ -2854,6 +2870,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     stats.max_window_req_tokens = max_window_req_tokens
             else:
                 max_window_req_tokens = stats.max_window_req_tokens
+        count_from_zero = self._budgets_count_from_zero()
         budgets = {}
         for name in allocator.window_pool_names():
             need_single_req = self._need_space_for_single_req(retractable_tokens)
@@ -2864,7 +2881,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             # A window stops growing once a request's footprint reaches its
             # retained length: cap the linear reservation by that headroom.
             window_size = retained.get(name) or 0
-            total, available = allocator.window_capacity_and_available(name)
             # Per-request window ring: cached prefixes still report evictable
             # window tokens, but evicting them frees no ring space.
             evictable = (
@@ -2872,12 +2888,15 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 if is_swa_req_ring(allocator)
                 else self.tree_cache.window_evictable_size(name)
             )
-            used = total - available - evictable
+            if count_from_zero:
+                held, reach = allocator.held_units(name), 0
+            else:
+                total, available = allocator.window_capacity_and_available(name)
+                held, reach = total - available, available + evictable
+            used = held - evictable
             growth_potential = max(0, n_active * window_size - used)
-            budget = (
-                available
-                + evictable
-                - max(min(reserved_tokens, growth_potential), need_single_req)
+            budget = reach - max(
+                min(reserved_tokens, growth_potential), need_single_req
             )
             # If the last prebuilt extend just finished and `pop_preallocated`
             # runs next, that batch is in no queue: count its slots here.
@@ -2960,9 +2979,19 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             fill_len=fill_len, prefix_len=prefix_len
         )
 
+        allocator = self.token_to_kv_pool_allocator
+        uses_swa_tail = self._uses_swa_tail_prealloc()
+        window_tails = self._window_tails(fill_len)
+        swa_pages_charged = (
+            uses_swa_tail
+            and not is_swa_req_ring(allocator)
+            and not self.scheduler.enable_hisparse
+        )
+        counts_from_zero = self._budgets_count_from_zero()
         # Evict cached entries if the pool doesn't have enough free pages.
         if (
             get_disagg().disaggregation_decode_enable_radix_cache
+            and not counts_from_zero
             and self._radix_full_available() < required_alloc_tokens
         ):
             result = self.tree_cache.evict_for_alloc(
@@ -2981,17 +3010,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     f"req={req.rid}"
                 )
 
-        allocator = self.token_to_kv_pool_allocator
-        uses_swa_tail = self._uses_swa_tail_prealloc()
-        window_tails = self._window_tails(fill_len)
-        swa_pages_charged = (
-            uses_swa_tail
-            and not is_swa_req_ring(allocator)
-            and not self.scheduler.enable_hisparse
-        )
-        if get_disagg().disaggregation_decode_enable_radix_cache and swa_pages_charged:
+        if get_disagg().disaggregation_decode_enable_radix_cache and (
+            swa_pages_charged or counts_from_zero
+        ):
             # Admission includes evictable pages; allocation needs free pages.
-            # Separate-pool resumes skip the caller's unified-only reclaim.
+            # Separate-pool resumes skip the caller's unified-only reclaim. A
+            # shared memory reclaims the take's whole demand here.
             reclaim_error = self._reclaim_prealloc_capacity(
                 self._prealloc_demand(
                     req,

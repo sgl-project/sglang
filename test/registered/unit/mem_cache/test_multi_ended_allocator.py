@@ -31,6 +31,7 @@ from sglang.test.unified_allocator_fixtures import (
     build_paged_band_pair,
     build_window_chain,
     hold_band,
+    largest_take,
     release_band,
     stand_in_views,
 )
@@ -1584,11 +1585,11 @@ class TestPagedBand(unittest.TestCase):
             )
             * self.PAGE_SIZE
         )
-        self.assertEqual(allocator.available_size(), expected)
+        self.assertEqual(largest_take(allocator), expected)
         # The joint cost is heavier than either single-side cost, so the joint
         # budget can never exceed either sub-pool's own available_size.
         self.assertLessEqual(
-            allocator.available_size(),
+            largest_take(allocator),
             min(fa.available_size(), sa.available_size()),
         )
 
@@ -3359,7 +3360,8 @@ class TestDcpWidening(unittest.TestCase):
                     allocator.mamba_allocator,
                     device=_DEV,
                     take=allocator.alloc_state_slots,
-                    capacity=allocator.state_slots_available,
+                    fits=allocator.state_slots_fit,
+                    estimate=allocator.estimated_state_slots_available,
                 )
 
                 # Fill Full to its page-granular frontier, then consume any
@@ -3373,11 +3375,11 @@ class TestDcpWidening(unittest.TestCase):
                         break
                     full_leaves.append(indices)
                 self.assertTrue(full_leaves)
-                residual_mamba = mamba_slots.schedulable_available_size()
+                residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
                 if residual_mamba:
                     self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
                 self.assertGreater(mamba_slots.available_size(), 0)
-                self.assertEqual(mamba_slots.schedulable_available_size(), 0)
+                self.assertFalse(mamba_slots.slots_fit(1))
                 self.assertIsNone(mamba_slots.alloc(1))
 
                 gap_before = allocator.mamba_allocator._current_gap_bytes()
@@ -3400,7 +3402,7 @@ class TestDcpWidening(unittest.TestCase):
                     expected_leaves * allocator.page_size,
                 )
                 self.assertEqual(result.mamba_num_evicted, 0)
-                self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 1)
+                self.assertTrue(mamba_slots.slots_fit(1))
                 allocated_mamba = mamba_slots.alloc(1)
                 self.assertIsNotNone(allocated_mamba)
                 self.assertEqual(allocator.verify_byte_accounting(), [])
@@ -3420,7 +3422,8 @@ class TestDcpWidening(unittest.TestCase):
                 allocator.mamba_allocator,
                 device=_DEV,
                 take=allocator.alloc_state_slots,
-                capacity=allocator.state_slots_available,
+                fits=allocator.state_slots_fit,
+                estimate=allocator.estimated_state_slots_available,
             )
 
             full_leaves = []
@@ -3429,7 +3432,7 @@ class TestDcpWidening(unittest.TestCase):
                 if indices is None:
                     break
                 full_leaves.append(indices)
-            residual_mamba = mamba_slots.schedulable_available_size()
+            residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
             if residual_mamba:
                 self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
 
@@ -3445,7 +3448,7 @@ class TestDcpWidening(unittest.TestCase):
             self.assertEqual(result.num_tokens_evicted, walk["freed_leaves"])
             # The walk's stop is a layout search: no victim compacts the band.
             self.assertEqual(full.flush_for_allocation.call_count, 0)
-            self.assertGreaterEqual(mamba_slots.schedulable_available_size(), 4)
+            self.assertTrue(mamba_slots.slots_fit(4))
             self.assertIsNotNone(mamba_slots.alloc(4))
             # The take lays the chain out once for every freed leaf.
             self.assertLessEqual(full.flush_for_allocation.call_count, 1)
@@ -3461,7 +3464,8 @@ class TestDcpWidening(unittest.TestCase):
                 allocator.mamba_allocator,
                 device=_DEV,
                 take=allocator.alloc_state_slots,
-                capacity=allocator.state_slots_available,
+                fits=allocator.state_slots_fit,
+                estimate=allocator.estimated_state_slots_available,
             )
             full_leaves = []
             while True:
@@ -3469,7 +3473,7 @@ class TestDcpWidening(unittest.TestCase):
                 if indices is None:
                     break
                 full_leaves.append(indices)
-            residual_mamba = mamba_slots.schedulable_available_size()
+            residual_mamba = largest_take(allocator, allocator.sub_pool_roles()[2])
             if residual_mamba:
                 self.assertIsNotNone(mamba_slots.alloc(residual_mamba))
             self.assertIsNone(mamba_slots.alloc(1))

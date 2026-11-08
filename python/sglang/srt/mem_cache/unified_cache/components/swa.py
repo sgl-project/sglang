@@ -1266,7 +1266,7 @@ class SWAComponent(TreeComponent):
         if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             storage, sub_pool = self.storage_and_sub_pool()
-            if storage.available_units(sub_pool) < num_tokens:
+            if not storage.units_fit(sub_pool, num_tokens):
                 self.cache.evict_for_alloc(
                     KVDemand(window_tokens={sub_pool: num_tokens})
                 )

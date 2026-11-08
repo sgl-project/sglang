@@ -33,6 +33,7 @@ from sglang.test.token_demand import demand_windows, token_demand
 from sglang.test.unified_allocator_fixtures import (
     build_test_unified_pools,
     hold_band,
+    largest_take,
     setup_allocator_context,
 )
 
@@ -470,8 +471,8 @@ class TestChainRealize(CustomTestCase):
         self.assertEqual(outcomes, {False, True})
 
     def _check_reads_are_takes(self, device, seed, count):
-        # Each sub-pool's read is the largest demand of it alone that the take
-        # admits, and the joint token read the largest every token sub-pool takes.
+        # Each sub-pool's largest take alone succeeds and the observers' estimate
+        # never falls below it; the joint largest take of every token sub-pool too.
         rng = random.Random(seed)
         shared = 0
         for _ in range(count):
@@ -490,9 +491,12 @@ class TestChainRealize(CustomTestCase):
                     if n == 0 or allocator.units_fit({name: n})
                 )
                 unit = 1 if band is allocator.mamba_allocator else page
-                self.assertEqual(allocator.units_available(name), largest * unit)
+                self.assertEqual(largest_take(allocator, name), largest * unit)
+                self.assertGreaterEqual(
+                    allocator.estimated_units_available(name), largest * unit
+                )
                 units[name] = largest
-            joint = allocator.available_size()
+            joint = largest_take(allocator)
             # Bands share bytes: the joint read can be below every one alone.
             tokens = [
                 units[b.sub_pool_name] * page

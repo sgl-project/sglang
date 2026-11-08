@@ -630,6 +630,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         disaggregation_mode="null",
         attn_dp_size=1,
         enable_hierarchical_cache=False,
+        enable_unified_memory=False,
     ):
         args = SimpleNamespace(
             attention_backend=attention_backend,
@@ -639,6 +640,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=attn_dp_size,
             ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
+            enable_unified_memory=enable_unified_memory,
         )
         mixer_types = []
         if sparse_attention:
@@ -728,6 +730,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             attn_dp_size=1,
             ep_join_mode=None,
             enable_hierarchical_cache=False,
+            enable_unified_memory=False,
         )
         config = SimpleNamespace(
             has_minicpm_sparse_attention=True,
