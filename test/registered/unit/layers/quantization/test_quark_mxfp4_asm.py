@@ -240,21 +240,85 @@ class TestQuarkMxfp4AsmTupleInput(CustomTestCase):
         expected[:rows, :cols] = scale
         torch.testing.assert_close(unshuffled, expected, rtol=0, atol=0)
 
-    def test_only_quantized_pair_is_accepted(self):
+    def test_quantized_pair_is_passed_through(self):
         rows, k = 4, 64
         x_q = torch.zeros((rows, k // 2), dtype=torch.uint8)
         x_scales = torch.full((rows, k // 32), 0x7F, dtype=torch.uint8)
 
-        a, a_scales = _asm_fp4_prequantized_input((x_q, x_scales))
+        a, a_scales = _asm_fp4_prequantized_input(x_q, x_scales)
         self.assertEqual(a.dtype, torch.float4_e2m1fn_x2)
         self.assertEqual(a.data_ptr(), x_q.data_ptr())
         self.assertEqual(tuple(a_scales.shape), (256, 8))
 
-        # The 3- and 5-tuples ask for Triton-only fused epilogues; they must not
-        # be silently unpacked as (x, x_scales).
-        for fused in ((x_q, x_scales, torch.empty(0)), (x_q,) * 5):
-            with self.assertRaises(NotImplementedError):
-                _asm_fp4_prequantized_input(fused)
+
+class TestQuarkMxfp4AsmFusedEpilogueInputs(CustomTestCase):
+    """The ASM path runs the Triton-only fused epilogues unfused, so every tuple
+    input the Triton path accepts works on a layer that uses gemm_a4w4."""
+
+    M, K, HEADS, S1, S2, ROPE = 3, 64, 2, 4, 6, 5
+
+    def _apply(self, x):
+        n = self.HEADS * (self.S1 + self.S2)
+        layer = _make_mxfp4_layer(n, self.K)
+        layer.use_aiter_asm_fp4_gemm = True
+        self.gemm_out = torch.randn(self.M, n, dtype=torch.bfloat16)
+        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4.__new__(
+            quark_w4a4_mxfp4.QuarkW4A4MXFP4
+        )
+        scheme.out_dtype = torch.bfloat16
+        quantized = (torch.empty(self.M, self.K // 2), torch.empty(self.M, 1))
+        quant = mock.Mock(return_value=quantized)
+        with (
+            mock.patch.object(
+                quark_w4a4_mxfp4, "per_1x32_f4_quant", quant, create=True
+            ),
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "_asm_fp4_prequantized_input",
+                return_value=quantized,
+            ) as prequant,
+            mock.patch.object(
+                quark_w4a4_mxfp4,
+                "gemm_a4w4",
+                return_value=self.gemm_out,
+                create=True,
+            ),
+        ):
+            out = scheme.apply_weights(layer, x)
+        return out, quant, prequant
+
+    def test_three_tuple_drops_the_preallocated_output(self):
+        x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        unused = torch.zeros(self.M, self.HEADS * (self.S1 + self.S2))
+        out, quant, prequant = self._apply((x, None, unused))
+        quant.assert_called_once()
+        self.assertIs(quant.call_args.args[0], x)
+        prequant.assert_not_called()
+        self.assertIs(out, self.gemm_out)
+
+    def test_three_tuple_with_scales_uses_them(self):
+        x_q = torch.zeros(self.M, self.K // 2, dtype=torch.uint8)
+        x_s = torch.zeros(self.M, self.K // 32, dtype=torch.uint8)
+        out, quant, prequant = self._apply((x_q, x_s, torch.empty(0)))
+        quant.assert_not_called()
+        prequant.assert_called_once_with(x_q, x_s)
+        self.assertIs(out, self.gemm_out)
+
+    def test_five_tuple_matches_split_cat_reference(self):
+        x = torch.randn(self.M, self.K, dtype=torch.bfloat16)
+        k_pe = torch.randn(self.M, 1, self.ROPE, dtype=torch.bfloat16).expand(
+            -1, self.HEADS, -1
+        )
+        (k, v), _, _ = self._apply((x, k_pe, self.S1, self.S2, torch.float32))
+
+        # The docstring reference of aiter's fused_gemm_afp4wfp4_split_cat; like
+        # the Triton path, the outputs take k_pe's dtype.
+        c = self.gemm_out.view(-1, self.HEADS, self.S1 + self.S2)
+        c1, c2 = c.split([self.S1, self.S2], dim=-1)
+        torch.testing.assert_close(k, torch.cat([c1, k_pe], dim=-1), rtol=0, atol=0)
+        torch.testing.assert_close(v, c2, rtol=0, atol=0)
+        self.assertEqual((k.dtype, v.dtype), (k_pe.dtype, k_pe.dtype))
+        self.assertTrue(v.is_contiguous())
 
 
 def _make_mxfp4_layer(n, k):
@@ -306,10 +370,9 @@ class TestQuarkMxfp4AutoLayerSelection(CustomTestCase):
         saved = fp4_utils.FP4_GEMM_RUNNER_BACKEND
         self.addCleanup(setattr, fp4_utils, "FP4_GEMM_RUNNER_BACKEND", saved)
 
-    def _process(self, backend, tuned_shapes, requires_triton=False, n=None):
+    def _process(self, backend, tuned_shapes, n=None):
         fp4_utils.FP4_GEMM_RUNNER_BACKEND = backend
         layer = _make_mxfp4_layer(n or self.N, self.K)
-        layer.requires_triton_mxfp4_gemm = requires_triton
         self.loaded_weight = layer.weight
         with (
             mock.patch.object(quark_w4a4_mxfp4, "_is_hip", True),
@@ -346,12 +409,6 @@ class TestQuarkMxfp4AutoLayerSelection(CustomTestCase):
         self.assertTrue(
             self._process(Fp4GemmRunnerBackend.AITER, set()).use_aiter_asm_fp4_gemm
         )
-
-    def test_requires_triton_layer_stays_on_triton(self):
-        for backend in (Fp4GemmRunnerBackend.AUTO, Fp4GemmRunnerBackend.AITER):
-            with self.subTest(backend=backend):
-                layer = self._process(backend, {(self.N, self.K)}, requires_triton=True)
-                self.assertFalse(layer.use_aiter_asm_fp4_gemm)
 
     def test_narrow_layer_stays_on_triton(self):
         """With --fp4-gemm-backend aiter, a layer with N <= 128 (Qwen3.8 GDN
