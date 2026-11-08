@@ -630,6 +630,8 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    rows_are_dcp_collapsed = False
+
     def __init__(
         self,
         size: int,
