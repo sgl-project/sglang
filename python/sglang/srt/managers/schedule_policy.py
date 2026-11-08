@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import get_cp_strategy, is_cp_sharded_padded
@@ -848,16 +849,23 @@ class PrefillAdder:
     def ceil_paged_tokens(self, tokens: int) -> int:
         return -(-tokens // self.page_size) * self.page_size
 
-    def floor_chunked_tokens(self, trunc_len: int, remaining: int) -> int:
-        """Round a *truncated* chunk down to the mamba kernel chunk grid.
+    def floor_chunked_tokens(
+        self,
+        trunc_len: int,
+        remaining: int,
+        truncation_align_size: Optional[int] = None,
+    ) -> int:
+        """Align intermediate chunks; the final chunk may have any length.
 
-        The chunk that finishes a request may stop anywhere, so only shorten
-        when `trunc_len` really is a cut. Leave the cut alone when rounding
-        would empty it: making no progress is worse than losing a donation.
+        An explicit alignment is a correctness constraint: defer a cut that
+        rounds to zero. DCP's checkpoint-only grid remains best effort when
+        no explicit alignment is requested.
         """
-        if self.mamba_chunk_grid <= 1 or trunc_len >= remaining:
+        if trunc_len >= remaining:
             return trunc_len
-        return trunc_len // self.mamba_chunk_grid * self.mamba_chunk_grid or trunc_len
+        grid = math.lcm(self.mamba_chunk_grid, truncation_align_size or 1)
+        aligned = trunc_len // grid * grid
+        return aligned if truncation_align_size is not None else aligned or trunc_len
 
     def budget_state(self):
         no_token = (
@@ -1132,7 +1140,7 @@ class PrefillAdder:
             else AddReqResult.CONTINUE
         )
 
-    def add_chunked_req(self, req: Req):
+    def add_chunked_req(self, req: Req, truncation_align_size: Optional[int] = None):
         if self.dllm_config is not None:
             _rem_tokens = self._get_dllm_remain_tokens(req)
         else:
@@ -1180,8 +1188,12 @@ class PrefillAdder:
             return req
         truncated = cand_extend_input_len > _rem_tokens
         new_len = self.floor_chunked_tokens(
-            min(cand_extend_input_len, _rem_tokens), cand_extend_input_len
+            min(cand_extend_input_len, _rem_tokens),
+            cand_extend_input_len,
+            truncation_align_size,
         )
+        if new_len <= 0:
+            return req
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1241,7 +1253,9 @@ class PrefillAdder:
             if host_lock_params is not None:
                 self.tree_cache.dec_host_lock_ref(last_node, host_lock_params)
 
-    def add_one_req_ignore_eos(self, req: Req):
+    def add_one_req_ignore_eos(
+        self, req: Req, truncation_align_size: Optional[int] = None
+    ):
         cand_extend_input_len = len(req.full_untruncated_fill_ids) - req.prefix_len
         if is_cp_sharded_padded():
             # One physical page on each rank reserves a complete logical group.
@@ -1361,8 +1375,11 @@ class PrefillAdder:
 
             # Chunked prefill
             trunc_len = self.floor_chunked_tokens(
-                self.rem_chunk_tokens, cand_extend_input_len
+                self.rem_chunk_tokens, cand_extend_input_len, truncation_align_size
             )
+
+            if trunc_len <= 0:
+                return AddReqResult.OTHER
 
             if (tile_stop := self._check_prefill_tile_budget(trunc_len)) is not None:
                 return tile_stop
@@ -1421,7 +1438,7 @@ class PrefillAdder:
             return AddReqResult.OTHER
 
         if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
-            return self.add_one_req_ignore_eos(req)
+            return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         # Reserve page_size for page-alignment overhead: the paged allocator may
         # consume one extra page per request (see alloc_extend), which
@@ -1683,16 +1700,14 @@ class PrefillAdder:
                 # limit rather than rem_chunk_tokens so an SWA-capped chunk stays
                 # capped.
                 extend_len = chunk_tokens_limit
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
             else:
                 extend_len = chunk_tokens_limit // self.page_size * self.page_size
-                if truncation_align_size is not None:
-                    extend_len = (
-                        extend_len // truncation_align_size * truncation_align_size
-                    )
+            extend_len = self.floor_chunked_tokens(
+                extend_len,
+                len(req.full_untruncated_fill_ids) - prefix_len,
+                truncation_align_size,
+            )
+            if not self.exact_chunk_fill:
                 end = (prefix_len + extend_len) // self.page_size * self.page_size
                 extend_len = end - prefix_len
             if extend_len <= 0:

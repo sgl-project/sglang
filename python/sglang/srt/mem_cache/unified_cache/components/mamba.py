@@ -752,6 +752,11 @@ class MambaComponent(TreeComponent):
     def _select_finished_checkpoint(
         self, req: Req, token_ids_len: int
     ) -> Optional[tuple[int, int]]:
+        # Decode and prefill need not produce bitwise-identical states/KV.
+        # Retaining decode KV in the radix tree can poison a later prefill's
+        # prefix through deduplication, even when its SSM snapshot is exact.
+        if get_exec().deterministic.enable_deterministic_inference:
+            token_ids_len = min(token_ids_len, len(req.origin_input_ids))
         # None means donate nothing, not "no slot found".
         pool = self.cache.req_to_token_pool
         keep_idx = pool.get_mamba_ping_pong_keep_idx(req)

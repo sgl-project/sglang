@@ -42,6 +42,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # CPU/NPU use external chunk kernels; XPU overrides the h kernel.
+    supports_track_state_snapshot: bool = not is_cpu() and not is_npu() and not is_xpu()
 
     def packed_decode(
         self,
@@ -207,6 +209,13 @@ class TritonGDNKernel(LinearAttnKernelBase):
             # control. Its existing behavior is equivalent to True.
             inplace_update_args = {}
 
+        snapshot_args = {}
+        if kwargs.get("track_state") is not None:
+            assert self.supports_track_state_snapshot
+            snapshot_args = dict(
+                track_state=kwargs["track_state"],
+                track_chunk_idx=kwargs["track_chunk_idx"],
+            )
         return chunk_gated_delta_rule(
             q=q,
             k=k,
@@ -220,6 +229,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
             **recurrent_state_indices_args,
             **inplace_update_args,
             **graph_table_args,
+            **snapshot_args,
         )
 
     def target_verify(

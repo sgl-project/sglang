@@ -1187,6 +1187,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
         ).transpose(0, 1)
         query, key, value = self._split_prefill_qkv(layer, mixed_qkv)
         g, beta = self._prefill_gates(layer, a, b)
+        h_track_buf = None
+        if (
+            meta.track
+            and self.kernel_dispatcher.extend_kernel.supports_track_state_snapshot
+        ):
+            # Match eager tracking: preserve the selected FP32 accumulator,
+            # rather than restoring from the BF16 h used by attention output.
+            h_track_buf = torch.empty(
+                (meta.max_seqs, *ssm_states.shape[1:]),
+                dtype=torch.float32,
+                device=ssm_states.device,
+            )
         core_attn_out, _, h = self.kernel_dispatcher.extend(
             q=query,
             k=key,
@@ -1198,15 +1210,18 @@ class GDNAttnBackend(MambaAttnBackendBase):
             query_start_loc=meta.cu_seqlens,
             chunk_indices=meta.chunk_indices,
             chunk_offsets=meta.chunk_offsets,
+            track_state=h_track_buf,
+            track_chunk_idx=meta.track_chunk_idx if h_track_buf is not None else None,
         )
         if meta.track:
             gdn_track_ssm_state(
                 ssm_pool=ssm_states,
-                h=h,
+                h=h_track_buf.unsqueeze(0) if h_track_buf is not None else h,
                 track_mode=meta.track_mode,
                 track_h_row=meta.track_h_row,
                 track_dst=meta.track_dst,
                 cache_indices=meta.cache_indices,
+                h_is_per_sequence=h_track_buf is not None,
             )
         return core_attn_out
 

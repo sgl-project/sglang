@@ -74,6 +74,7 @@ def _gdn_track_ssm_kernel(
     stride_h_row,
     numel,
     BLOCK: tl.constexpr,
+    H_PER_SEQUENCE: tl.constexpr,
 ):
     r = tl.program_id(0)
     mode = tl.load(track_mode + r)
@@ -86,7 +87,9 @@ def _gdn_track_ssm_kernel(
         src = tl.load(cache_indices + r).to(tl.int64)
         val = tl.load(ssm_pool + src * stride_ssm_slot + offs, mask=mask)
     else:
-        row = tl.load(track_h_row + r).to(tl.int64)
+        row = (
+            r.to(tl.int64) if H_PER_SEQUENCE else tl.load(track_h_row + r).to(tl.int64)
+        )
         val = tl.load(h + row * stride_h_row + offs, mask=mask)
         val = val.to(ssm_pool.dtype.element_ty)
     tl.store(ssm_pool + dst * stride_ssm_slot + offs, val, mask=mask)
@@ -130,9 +133,13 @@ def gdn_track_ssm_state(
     track_h_row: torch.Tensor,
     track_dst: torch.Tensor,
     cache_indices: torch.Tensor,
+    h_is_per_sequence: bool = False,
 ) -> None:
     """Snapshot the tracked rows' SSM state into their track slots (mode 1:
-    the row's final state, mode 2: its chunk-boundary state in ``h``)."""
+    the row's final state, mode 2: its chunk-boundary state in ``h``).
+    ``h_is_per_sequence`` selects the FP32 snapshot for each row instead of
+    the activation-dtype, per-chunk h buffer.
+    """
     rows = track_mode.shape[0]
     numel = ssm_pool[0].numel()
     assert ssm_pool[0].is_contiguous(), "per-slot SSM state must be contiguous"
@@ -150,4 +157,5 @@ def gdn_track_ssm_state(
         h.stride(0),
         numel,
         BLOCK=block,
+        H_PER_SEQUENCE=h_is_per_sequence,
     )
