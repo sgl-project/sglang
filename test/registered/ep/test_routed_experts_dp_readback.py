@@ -1,6 +1,7 @@
-"""DP>1 routed-expert readback parity for DeepEP-family A2A backends."""
+"""DP>1 routed-expert readback parity for A2A backends."""
 
 import concurrent.futures
+import importlib.util
 import json
 import os
 import unittest
@@ -95,6 +96,7 @@ class _ReadbackMixin:
                 **_DUMMY_WEIGHT_ENV,
                 "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
                 "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
+                "SGLANG_NIXL_EP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "256",
             },
         )
 
@@ -154,7 +156,7 @@ class _ReadbackMixin:
                 0.9,
                 f"req{i}: only {frac:.1%} of per-token expert sets match the "
                 "solo baseline — the capturer is reading rows that belong to "
-                "other tokens (DeepEP-class backend misclassification)",
+                "other tokens (A2A backend misclassification)",
             )
 
 
@@ -184,6 +186,18 @@ class TestRoutedExpertsReadbackDeepEPv2(_ReadbackMixin, CustomTestCase):
         "deepep_v2",
         "--deepep-v2-mode",
         "direct",
+        "--moe-runner-backend",
+        "deep_gemm",
+    ]
+
+
+@unittest.skipUnless(importlib.util.find_spec("nixl_ep"), "NIXL EP not installed")
+class TestRoutedExpertsReadbackNixl(_ReadbackMixin, CustomTestCase):
+    backend_args = [
+        "--moe-a2a-backend",
+        "nixl",
+        "--deepep-mode",
+        "low_latency",
         "--moe-runner-backend",
         "deep_gemm",
     ]
