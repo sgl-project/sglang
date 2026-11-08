@@ -267,6 +267,7 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
     DynamicChunkSizer,
 )
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
@@ -2359,6 +2360,7 @@ class Scheduler(
     def send_abort_output(self, abort_req: AbortReq, req: Req) -> None:
         """Report a request the scheduler ends outside the output stream
         (aborted while queued, preempted, retracted or rejected)."""
+        record_send(req, "abort")
         if self.rust_server is not None:
             # The zmq tokenizer socket is not consumed in Rust mode.
             self.rust_server.push_abort(abort_req, req)

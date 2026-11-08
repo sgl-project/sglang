@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.req_types import BaseFinishReason
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 from sglang.srt.runtime_context import (
     get_observability,
@@ -577,6 +578,7 @@ class _GenerationStreamAccumulator:
         if req.finished():
             assert not req.finished_output
             req.finished_output = True
+            record_send(req, "stream")
             if req.finished_len is None:
                 req.finished_len = len(req.output_ids)
             should_output = True
