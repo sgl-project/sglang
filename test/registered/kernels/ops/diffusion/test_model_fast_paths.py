@@ -1003,12 +1003,17 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     freqs = rope((frames, height, width), torch.device("cuda"))
     tables = (freqs, *sana_video2._rope_tables(freqs))
     tokens = frames * height * width
-    x = torch.randn(batch, tokens, heads * head_dim, device="cuda", dtype=torch.bfloat16)
+    x = torch.randn(
+        batch, tokens, heads * head_dim, device="cuda", dtype=torch.bfloat16
+    )
     q = x.reshape(batch, tokens, heads, head_dim).transpose(1, 2)
     k = x.flip(1).reshape(batch, tokens, heads, head_dim).transpose(1, 2)
     with torch.no_grad():
         q_out, k_out = sana_video2._apply_rope_pair(q, k, tables)
-        q_ref, k_ref = sana_video2._apply_rope(q, freqs), sana_video2._apply_rope(k, freqs)
+        q_ref, k_ref = (
+            sana_video2._apply_rope(q, freqs),
+            sana_video2._apply_rope(k, freqs),
+        )
     assert torch.equal(q_out, q_ref)
     assert torch.equal(k_out, k_ref)
     assert q_out.stride() == q_ref.stride()
@@ -1016,7 +1021,9 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     assert gate.is_verified(sig)
     assert not gate.disabled
     # a different token count is a new signature and is verified on its own
-    assert not gate.is_verified((tuple(q.shape[:2]) + (tokens + 1, head_dim),) + sig[1:])
+    assert not gate.is_verified(
+        (tuple(q.shape[:2]) + (tokens + 1, head_dim),) + sig[1:]
+    )
 
 
 # -------------------------------------------------------------------------

@@ -54,7 +54,9 @@ def _rope_tables(freqs: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def _apply_rope_pair(
-    q: torch.Tensor, k: torch.Tensor, rope: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    q: torch.Tensor,
+    k: torch.Tensor,
+    rope: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Rotate q and k [B, H, S, D] in one launch when both are bf16 CUDA views of
     contiguous [B, S, H, D] tensors; the fused kernel keeps the fp64 multiply,
@@ -131,7 +133,9 @@ class GatedLinearAttention(nn.Module):
         )
         v = v.transpose(-1, -2).reshape(batch, self.heads, self.dim, tokens)
         if rotary_emb is not None:
-            q, k = _apply_rope_pair(q.transpose(-1, -2), k.transpose(-1, -2), rotary_emb)
+            q, k = _apply_rope_pair(
+                q.transpose(-1, -2), k.transpose(-1, -2), rotary_emb
+            )
             q, k = q.transpose(-1, -2), k.transpose(-1, -2)
         beta = self.beta_proj(x).sigmoid().transpose(1, 2).unsqueeze(2)
         k = k * beta
