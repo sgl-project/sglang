@@ -26,7 +26,7 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW4A16Mxfp4MoE,
     CompressedTensorsW4A16Nvfp4MoE,
 )
-from sglang.srt.utils.common import (
+from sglang.srt.utils.device import (
     is_sm80_supported,
     is_sm90_supported,
     is_sm100_supported,

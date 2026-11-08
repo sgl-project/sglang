@@ -26,7 +26,8 @@ from sglang.srt.managers.io_struct import (
     row_output_ids,
     unwrap_from_pickle,
 )
-from sglang.srt.managers.schedule_batch import FINISH_LENGTH, Req
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )

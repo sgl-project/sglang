@@ -381,6 +381,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.pause_generation.side_effect = Scheduler.pause_generation.__get__(
             scheduler
         )
+        scheduler._retract_running_batch.side_effect = (
+            Scheduler._retract_running_batch.__get__(scheduler)
+        )
 
         req = MagicMock()
         req.rid = "r1"
@@ -390,6 +393,9 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         batch.return_logprob = False
         batch.forward_mode.is_extend.return_value = False
         batch.copy.side_effect = lambda: MagicMock(reqs=list(batch.reqs))
+        batch.filter_batch.side_effect = lambda keep_indices: setattr(
+            batch, "reqs", [batch.reqs[i] for i in keep_indices]
+        )
         scheduler.running_batch = batch
 
         def get_next_batch_to_run(running_batch, last_batch):
@@ -439,6 +445,10 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
 
         with (
             patch("sglang.srt.managers.scheduler.retract_all", fake_retract_all),
+            patch(
+                "sglang.srt.managers.scheduler.get_parallel",
+                return_value=MagicMock(pp_size=1),
+            ),
             patch(
                 "sglang.srt.hardware_backend.mlx.scheduler_mixin.resolve_forward_inputs"
             ),
