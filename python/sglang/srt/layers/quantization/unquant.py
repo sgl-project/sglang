@@ -328,40 +328,62 @@ def _bf16_splitk_gemm(
     return out.view(*x.shape[:-1], weight.shape[0])
 
 
-def _bf16_low_m_autotune(
-    x: torch.Tensor,
-    weight: torch.Tensor,
-    bias: Optional[torch.Tensor],
-    out: Optional[torch.Tensor] = None,
-) -> Optional[torch.Tensor]:
-    """Run M <= 32 through FlashInfer's autotuned low-M kernels; None if not taken.
-
-    Inside FlashInfer autotune, a larger M profiles the M <= 32 buckets instead.
-    """
-    if not (
+def _supports_bf16_low_m_autotune(x: torch.Tensor, weight: torch.Tensor) -> bool:
+    return (
         _mm_bf16 is not None
-        and (bias is None or bias.dtype == torch.bfloat16)
         and x.is_cuda
         and x.dtype == torch.bfloat16
         and weight.dtype == torch.bfloat16
         and x.is_contiguous()
         and weight.is_contiguous()
         and not weight.requires_grad
-    ):
-        return None
-    x_2d = x.view(-1, x.shape[-1])
-    m = x_2d.shape[0]
-    if 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
-        output = _mm_bf16(x_2d, weight.T, bias, pdl=True, out=out, backend="auto")
-        return output.view(*x.shape[:-1], weight.shape[0])
-    if m > _BF16_LOW_M_AUTOTUNE_MAX_M and _flashinfer_autotuner.get().is_tuning_mode:
+    )
+
+
+def _is_bf16_low_m_tuning() -> bool:
+    return (
+        _mm_bf16 is not None
+        and not torch.compiler.is_compiling()
+        and _flashinfer_autotuner.get().is_tuning_mode
+    )
+
+
+def _profile_bf16_low_m_autotune(x: torch.Tensor, weight: torch.Tensor) -> None:
+    """Profile the M <= 32 buckets on up to 32 rows of x, always without a bias.
+
+    RowParallelLinear passes its bias on TP rank 0 only, and FlashInfer syncs
+    every tuning call across the TP group, so the calls must not depend on it.
+    """
+    if _supports_bf16_low_m_autotune(x, weight) and x.numel() > 0:
         _mm_bf16(
-            x_2d[:_BF16_LOW_M_AUTOTUNE_MAX_M],
+            x.view(-1, x.shape[-1])[:_BF16_LOW_M_AUTOTUNE_MAX_M],
             weight.T,
-            bias,
+            None,
             pdl=True,
             backend="auto",
         )
+
+
+def _bf16_low_m_autotune(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: Optional[torch.Tensor],
+    out: Optional[torch.Tensor] = None,
+) -> Optional[torch.Tensor]:
+    """Run a bias-free M <= 32 call through FlashInfer's autotuned low-M kernels.
+
+    Returns None if not taken. In tuning mode, a call not taken profiles the
+    M <= 32 buckets instead.
+    """
+    if not _supports_bf16_low_m_autotune(x, weight):
+        return None
+    x_2d = x.view(-1, x.shape[-1])
+    m = x_2d.shape[0]
+    if bias is None and 0 < m <= _BF16_LOW_M_AUTOTUNE_MAX_M:
+        output = _mm_bf16(x_2d, weight.T, None, pdl=True, out=out, backend="auto")
+        return output.view(*x.shape[:-1], weight.shape[0])
+    if _is_bf16_low_m_tuning():
+        _profile_bf16_low_m_autotune(x, weight)
     return None
 
 
@@ -668,6 +690,10 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        if bias is not None and _is_bf16_low_m_tuning():
+            # RowParallelLinear passes its bias on TP rank 0 only, so rank 0 lands
+            # here while the other ranks profile in the dispatch above.
+            _profile_bf16_low_m_autotune(x, layer.weight)
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
