@@ -1017,6 +1017,12 @@ class TestDeclaredParts(CustomTestCase):
         storage.release_row(req)
         other = SimpleNamespace(kv=_RequestKV())
         self.assertEqual(storage.acquire([other]), [row])
+        # Handing the row out resets nothing; the next forward does.
+        for part in memory.parts:
+            self.assertTrue(
+                torch.all(memory.tensors[part.name].select(part.row_axis, row) == 19)
+            )
+        storage.reset_new_rows()
         for part in memory.parts:
             self.assertTrue(
                 torch.all(
@@ -1617,6 +1623,7 @@ class TestDeclaredParts(CustomTestCase):
                 ).fill_(23)
         storage.release_rows([row])
         self.assertEqual(storage.take_rows(1), [row])
+        storage.reset_new_rows()
         for part in storage._request_memory.parts:
             with self.subTest(part=part.name):
                 self.assertTrue(
@@ -3728,6 +3735,7 @@ class TestDeclaredParts(CustomTestCase):
                 source = allocator.alloc(16)
                 state_ids = allocator.alloc_state_slots(1) if with_state else None
                 (request_row,) = storage.take_rows(1)
+                storage.reset_new_rows()
                 storage.request_memory.tensors["pending"][request_row].fill_(97)
                 original = {}
                 for n, band in enumerate(allocator.members):
@@ -3794,6 +3802,8 @@ class TestDeclaredParts(CustomTestCase):
                     destination[::4] // 4
                 ]
                 self.assertTrue(torch.all(blob[:, pages] == 83))
+                # The restore wrote the new row whole; the next forward keeps it.
+                storage.reset_new_rows()
                 self.assertTrue(
                     torch.all(storage.request_memory.tensors["pending"][new_row] == 97)
                 )
@@ -3863,6 +3873,7 @@ class TestDeclaredParts(CustomTestCase):
         for declared in plan.request_parts:
             storage._request_memory.tensors[declared.part.name].fill_(9)
         row = storage.take_rows(1)[0]
+        storage.reset_new_rows()
         for declared in plan.request_parts:
             part = declared.part
             tensor = storage._request_memory.tensors[part.name]
@@ -3876,6 +3887,7 @@ class TestDeclaredParts(CustomTestCase):
                 11
             )
         self.assertEqual(storage.take_rows(1), [row])
+        storage.reset_new_rows()
         for declared in plan.request_parts:
             part = declared.part
             self.assertTrue(
