@@ -118,7 +118,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
     manager.offload_inflight = WeakKeyDict()
-    manager.release_request = release_only_retirer(tree_cache).release
+    manager.request_retirer = release_only_retirer(tree_cache)
 
     return manager, freed_indices
 

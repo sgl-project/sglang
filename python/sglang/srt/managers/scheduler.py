@@ -683,27 +683,13 @@ class Scheduler(
 
         self.init_hisparse_coordinator()
 
-        if (
-            get_disagg().disaggregation_mode == "decode"
-            and get_disagg().disaggregation_decode_enable_offload_kvcache
-        ):
-            self.decode_offload_manager = DecodeKVCacheOffloadManager(
-                req_to_token_pool=self.req_to_token_pool,
-                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
-                tp_group=self.dp_tp_cpu_group,
-                tree_cache=self.tree_cache,
-                # Bound late: `init_request_retirer` runs after this.
-                release_request=lambda *a, **kw: self.request_retirer.release(*a, **kw),
-            )
-        else:
-            self.decode_offload_manager = None
         # Prefill read-done lets the schedule stream run ahead of the forward that
         # writes a stashed chunk. The cache controller's fence streams above order
         # its copies behind that forward; the decode offload controller has none.
         self.tp_worker.model_runner.kv_offload_fenced_on_forward_stream = (
             self.enable_hierarchical_cache
             and self.tree_cache.cache_controller is not None
-            and self.decode_offload_manager is None
+            and not self._decode_offloads_kvcache()
         )
 
         # Init running status
@@ -801,6 +787,8 @@ class Scheduler(
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.maybe_init_decode_offload_manager()
 
         self.init_batch_result_processor()
 
@@ -2901,6 +2889,24 @@ class Scheduler(
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
         )
+
+    @staticmethod
+    def _decode_offloads_kvcache() -> bool:
+        return (
+            get_disagg().disaggregation_mode == "decode"
+            and get_disagg().disaggregation_decode_enable_offload_kvcache
+        )
+
+    def maybe_init_decode_offload_manager(self) -> None:
+        self.decode_offload_manager = None
+        if self._decode_offloads_kvcache():
+            self.decode_offload_manager = DecodeKVCacheOffloadManager(
+                req_to_token_pool=self.req_to_token_pool,
+                token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+                tp_group=self.dp_tp_cpu_group,
+                tree_cache=self.tree_cache,
+                request_retirer=self.request_retirer,
+            )
 
     def init_batch_result_processor(self) -> None:
         self.batch_result_processor = SchedulerBatchResultProcessor(
