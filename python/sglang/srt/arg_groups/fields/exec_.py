@@ -859,6 +859,10 @@ class ExecMoe(msgspec.Struct):
         fn="sglang.srt.arg_groups.model_override_base.ep_scale_joiner_of",
         doc="Whether it is a scale-up joiner specifically.",
     )
+    disable_router_gate_matvec: A[
+        bool,
+        "Disable the small-token Bailing router matvec and use F.linear in both ordinary and deterministic inference.",
+    ] = False
     enable_fused_moe_sum_all_reduce: A[
         bool,
         "Enable fused moe triton and sum all reduce.",

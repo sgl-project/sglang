@@ -87,6 +87,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
+    get_exec,
     get_parallel,
     get_platform,
     get_stream,
@@ -393,6 +394,7 @@ class BailingMoEGate(nn.Module):
         if params_dtype is None:
             params_dtype = torch.get_default_dtype()
         self.params_dtype = params_dtype
+        self.enable_router_gate_matvec = not get_exec().moe.disable_router_gate_matvec
         self.weight = nn.Parameter(
             torch.empty(
                 (config.num_experts, config.hidden_size),
@@ -409,7 +411,8 @@ class BailingMoEGate(nn.Module):
 
     def forward(self, hidden_states):
         if (
-            hidden_states.is_cuda
+            self.enable_router_gate_matvec
+            and hidden_states.is_cuda
             and 0 < hidden_states.shape[0] <= ROUTER_GATE_MATVEC_MAX_M
             and self.weight.dtype in (torch.float32, torch.bfloat16)
         ):
