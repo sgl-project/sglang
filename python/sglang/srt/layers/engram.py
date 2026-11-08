@@ -1580,13 +1580,13 @@ def engram_gate(
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
     magnitude = dot.abs().clamp_min(clamp_value).sqrt()
-    if is_npu():
-        # Ascend has no copysign kernel (its fallback copies through the host,
-        # which aclgraph rejects while capturing); `where` is elementwise.
-        # Only a negative-zero dot picks the other sign.
-        gate = torch.sigmoid(torch.where(dot < 0, -magnitude, magnitude))
+    if dot.device.type == "npu":
+        # copysign can fall back to CPU during NPU graph capture. Read the
+        # FP32 sign bit through an integer view to preserve negative zero.
+        signed_root = torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
     else:
-        gate = torch.sigmoid(torch.copysign(magnitude, dot))
+        signed_root = torch.copysign(magnitude, dot)
+    gate = torch.sigmoid(signed_root)
     out = (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
