@@ -51,6 +51,7 @@ from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
     ReqToMetadataIdxAllocator,
     TransferBackend,
+    all_reduce_flags,
     build_kv_layer_ids,
     build_staging_slot_metadata,
     get_dsa_tail_state_indices,
@@ -66,6 +67,7 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce_prefill_pp,
     prepare_abort,
     setup_state_kv_args,
+    validate_source_release_roster,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
@@ -186,7 +188,7 @@ def max_bootstrap_input_len(*, capacity: int, page_size: int, shard_size: int) -
 
 
 def maybe_release_metadata_buffer(
-    req: Req, allocator: ReqToMetadataIdxAllocator
+    req: Req, allocator: ReqToMetadataIdxAllocator, *, expected_index=None
 ) -> None:
     """
     Release the metadata buffer index allocated for a request in prefill disaggregation mode.
@@ -197,6 +199,22 @@ def maybe_release_metadata_buffer(
         req: The request object that may have a metadata_buffer_index allocated
         allocator: The ReqToMetadataIdxAllocator instance to free the index
     """
+    if expected_index is not None and req.metadata_buffer_index != expected_index:
+        raise RuntimeError("Retained metadata ownership changed before source release")
+    index = req.metadata_buffer_index
+    sender = getattr(req, "disagg_kv_sender", None)
+    defer = getattr(type(sender), "defer_source_release", None)
+    if (
+        req.metadata_buffer_index >= 0
+        and defer is not None
+        and defer(
+            sender,
+            req,
+            "metadata",
+            lambda: maybe_release_metadata_buffer(req, allocator, expected_index=index),
+        )
+    ):
+        return
     if req.metadata_buffer_index >= 0:
         allocator.free(req.metadata_buffer_index)
         req.metadata_buffer_index = -1
@@ -601,6 +619,9 @@ class PrefillBootstrapQueue:
         return bootstrapped_reqs
 
     def release_memory_occupation(self):
+        guard = getattr(self.kv_manager, "require_transfer_idle", None)
+        if guard is not None:
+            guard()
         self.queue.clear()
         if hasattr(self.kv_manager, "deregister_buffer_to_engine"):
             self.kv_manager.deregister_buffer_to_engine()
@@ -1301,6 +1322,25 @@ class SchedulerDisaggregationPrefillMixin:
         Only these rids are concluded, and a rid failed on any stage is concluded as
         failed on every stage, whatever this stage's own sender reports.
         """
+        manager = getattr(
+            getattr(self, "disagg_prefill_bootstrap_queue", None), "kv_manager", None
+        )
+        tracker = getattr(manager, "source_release_tracker", None)
+        if tracker is not None:
+            validate_source_release_roster(
+                tuple(sorted(req.bootstrap_room for req in tracker.requests)),
+                self.attn_tp_cpu_group,
+                self.attn_cp_cpu_group,
+            )
+
+            def reduce_release_flags(flags):
+                for group in (self.attn_tp_cpu_group, self.attn_cp_cpu_group):
+                    flags = all_reduce_flags(
+                        flags, group, torch.distributed.ReduceOp.MIN
+                    )
+                return flags
+
+            tracker.collect(manager.source_release_is_safe, reduce_release_flags)
         if len(self.disagg_prefill_transfer_queue) == 0:
             return []
 

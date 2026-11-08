@@ -560,6 +560,29 @@ class TestResolveDeferredReleases(CustomTestCase):
         super().setUp()
         _run_as_single_rank(self)
 
+    def test_mooncake_device_deadline_keeps_destination_and_metadata_until_ack(self):
+        mgr = _make_manager()
+        mgr.requires_abort_drain = True
+        q = _make_queue(timeout=-1)
+        dreq = _make_decode_req(901, 9, mgr)
+        generation = mgr.register_deferred_abort_room(901)
+        q._defer_release(dreq)
+        with patch.object(q.scheduler.request_retirer, "release") as release:
+            q.resolve_deferred_releases()
+            q.resolve_deferred_releases()
+            release.assert_not_called()
+            self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [])
+            self.assertIsNotNone(dreq.kv_receiver)
+            self.assertTrue(q.has_pending_deferred_releases())
+            with self.assertRaisesRegex(RuntimeError, "still owned"):
+                q.release_memory_occupation()
+            # A late ACK proves drain; the expired wall clock did not.
+            mgr.note_abort_ack(901, 0, generation)
+            q.resolve_deferred_releases()
+            release.assert_called_once_with(dreq.req, checkpoint=False)
+        self.assertEqual(q.req_to_metadata_buffer_idx_allocator.freed, [9])
+        self.assertFalse(q.has_pending_deferred_releases())
+
     def test_unpublished_rank_holds_for_peer_without_waiting_for_acks(self):
         mgr = _make_manager()
         queue = _make_queue()

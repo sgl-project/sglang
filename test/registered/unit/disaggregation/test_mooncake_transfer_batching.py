@@ -450,12 +450,14 @@ class TestMooncakeEarlySend(CustomTestCase):
     def test_manager_preserves_event_in_queued_chunk(self):
         queue = SimpleQueue()
         ready = MagicMock()
-        manager = SimpleNamespace(
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.__dict__.update(
             disaggregation_mode=DisaggregationMode.PREFILL,
             request_status={1: KVPoll.WaitingForInput},
             check_status=lambda room: KVPoll.WaitingForInput,
             transfer_infos={1: {"127.0.0.1:80": object()}},
             transfer_queues=[queue],
+            _staging_outstanding=defaultdict(int),
         )
         indices_ready = MagicMock()
         MooncakeKVManager.add_transfer_request(
@@ -495,7 +497,10 @@ class TestMooncakeEarlySend(CustomTestCase):
             dst_aux_ptrs=[2000],
             dst_aux_item_lens=[16],
         )
-        manager = SimpleNamespace(
+        # Exercise the native ownership guard/worker bookkeeping methods too;
+        # __new__ avoids constructing an engine or registering any GPU memory.
+        manager = MooncakeKVManager.__new__(MooncakeKVManager)
+        manager.__dict__.update(
             enable_trace=False,
             enable_staging=False,
             enable_deferred_decode_kv_release=True,
