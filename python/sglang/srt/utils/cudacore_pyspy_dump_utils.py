@@ -29,25 +29,53 @@ import psutil
 logger = logging.getLogger(__name__)
 
 
+def _process_cwd(proc: psutil.Process) -> Path:
+    try:
+        return Path(proc.cwd())
+    except (psutil.Error, OSError):
+        return Path.cwd()
+
+
+def _default_cuda_coredump_pipe_names(pid: int) -> tuple[str, str]:
+    """FIFO names to try when ``CUDA_COREDUMP_PIPE`` is unset.
+
+    libcuda creates ``corepipe_%h_%p``. The CUDA-GDB guide documents
+    ``corepipe.cuda.%h.%p``, which is not the FIFO the driver opens.
+    """
+    host = platform.node()
+    pid_s = str(pid)
+    return (f"corepipe_{host}_{pid_s}", f"corepipe.cuda.{host}.{pid_s}")
+
+
+def _is_fifo(path: Path) -> bool:
+    try:
+        return path.is_fifo()
+    except OSError:
+        return False
+
+
 def _resolve_cuda_coredump_pipe_path(proc: psutil.Process) -> Path:
     pipe_template = os.environ.get("CUDA_COREDUMP_PIPE")
     if pipe_template is None:
-        pipe_path = f"corepipe.cuda.{platform.node()}.{proc.pid}"
-    else:
-        pipe_path = (
-            pipe_template.replace("%h", platform.node())
-            .replace("%p", str(proc.pid))
-            .replace("%t", str(int(time.time())))
-        )
+        # Prefer the FIFO the driver actually created. Fall back to the
+        # documented name for a driver that follows the CUDA-GDB guide.
+        directory = _process_cwd(proc)
+        driver_name, documented_name = _default_cuda_coredump_pipe_names(proc.pid)
+        for name in (driver_name, documented_name):
+            candidate = directory / name
+            if _is_fifo(candidate):
+                return candidate
+        return directory / driver_name
 
+    pipe_path = (
+        pipe_template.replace("%h", platform.node())
+        .replace("%p", str(proc.pid))
+        .replace("%t", str(int(time.time())))
+    )
     path = Path(pipe_path)
     if path.is_absolute():
         return path
-
-    try:
-        return Path(proc.cwd()) / path
-    except (psutil.Error, OSError):
-        return Path.cwd() / path
+    return _process_cwd(proc) / path
 
 
 def _is_sglang_scheduler_process(proc: psutil.Process) -> bool:
