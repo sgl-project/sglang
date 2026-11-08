@@ -1580,51 +1580,6 @@ def test_autoencoder_kl_fastpath_install():
 
 
 @torch.no_grad()
-@pytest.mark.skipif(not is_cuda(), reason="the fused Q/K norm is CUDA-only")
-def test_qwen21_qk_norm_verifies_and_preserves_native_fallback(monkeypatch):
-    x = torch.randn(1, 257, 8, 128, device="cuda", dtype=torch.bfloat16)
-    norm = qwen_image21.RMSNorm(
-        128, 1e-6, cast_x_before_out_mul=True, force_native=True
-    ).to(device=x.device, dtype=x.dtype)
-    norm.weight.normal_()
-    expected = norm(x)
-    gate = BitExactFusionGate("test Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), expected)
-    assert gate.verified and not gate.disabled
-    x.normal_()
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
-
-    gate = BitExactFusionGate("test mismatched Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    monkeypatch.setattr(
-        qwen_image21,
-        "rmsnorm_preserve_reduction",
-        lambda x, weight, eps: torch.zeros_like(x),
-    )
-    assert torch.equal(qwen_image21.apply_qk_norm(x, norm), norm(x))
-    assert gate.disabled and not gate.verified
-
-
-@torch.no_grad()
-def test_qwen21_qk_norm_does_not_verify_during_capture(monkeypatch):
-    x = torch.randn(1, 17, 2, 128, device="cuda", dtype=torch.bfloat16)
-    norm = qwen_image21.RMSNorm(
-        128, 1e-6, cast_x_before_out_mul=True, force_native=True
-    ).to(device=x.device, dtype=x.dtype)
-    norm(x)
-    gate = BitExactFusionGate("test captured Q/K norm")
-    monkeypatch.setattr(qwen_image21, "_QK_NORM_FUSION", gate)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        out = qwen_image21.apply_qk_norm(x, norm)
-    assert not gate.verified and not gate.disabled
-    x.normal_()
-    graph.replay()
-    assert torch.equal(out, norm(x))
-
-
-@torch.no_grad()
 @pytest.mark.skipif(not is_cuda(), reason="the fused LayerNorm modulation is CUDA-only")
 def test_qwen21_modulation_verifies_and_preserves_native_fallback(monkeypatch):
     x = torch.randn(1, 257, 4096, device="cuda", dtype=torch.bfloat16)

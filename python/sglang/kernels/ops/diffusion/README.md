@@ -210,7 +210,6 @@ tensor copy at each residual site.
 | `fused_rope_rotate_half_fp32` | Triton | paired split-half Q/K RoPE with separately rounded FP32 products and sum before the FP16/BF16 cast; Anima verifies each new signature against eager |
 | `flux3_video_qknorm_rope` | Triton | bit-exact vs affine-free ``nn.RMSNorm`` (head dim 64) plus eager rotate-half RoPE; FLUX 3 video VAE, ``eps=1e-5`` |
 | `fused_complex_rope` | Triton | preserves CUDA complex64 multiply rounding for contiguous BSHD inputs; Qwen-Image 2.1 verifies its first call against eager |
-| `rmsnorm_preserve_reduction` | Triton + aten | preserves the FP32 mean reduction and cast-before-weight rounding; fuses only pointwise work for FP16/BF16 inputs and materializes strided inputs as contiguous; Qwen-Image 2.1 verifies its first call |
 | `qknorm_complex_rope_cuda` / `qknorm_complex_rope_pack_` | JIT CUDA | bit-exact vs `RMSNorm(cast_x_before_out_mul=True)` + complex64 RoPE for head_dim 128; both accept token-strided views of a packed QKV buffer; the pack variant normalizes Q and K in place behind a prefix and copies prefix K/V (and optionally V) in the same launch; Qwen-Image 2.1 verifies its first call |
 | `fused_interleaved_rope_fp64` | JIT CUDA | bit-exact vs paired SANA-Video fp64 RoPE |
 | `fused_inplace_helios_qk_rope` | JIT CUDA | bit-exact paired in-place RoPE for Helios' transposed frequency layout |
