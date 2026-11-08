@@ -609,7 +609,6 @@ class DeepseekSparseAttnBackend(
         self.qk_nope_head_dim = model_runner.model_config.qk_nope_head_dim
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
-        self.v_head_dim = model_runner.model_config.v_head_dim
         # FlashMLA cannot tell the 528 B/token zero-RoPE cache from V4.1 by shape.
         self.flashmla_kv_format = "V32_NO_ROPE" if self.qk_rope_head_dim == 0 else "V32"
 
@@ -1575,12 +1574,19 @@ class DeepseekSparseAttnBackend(
         return is_dsa_dcp_gathered_prefill(forward_batch.attn_dcp_metadata)
 
     def _init_dcp_prefill_crossover(self, model_runner) -> float:
+        # Without DCP there is no owned route to weigh the gathered one
+        # against, and a zero crossover never chooses it. Ask before reading
+        # the model config: the two routes are the only reason this backend
+        # wants ``v_head_dim``, and a caller that cannot reach them is not
+        # obliged to carry it.
+        if self.attn_dcp_size == 1:
+            return 0.0
         parallel = get_parallel()
         # The partials are projected before the merge, and the query is built
         # locally, only on the a2a backend with q-replicate on.
         a2a = parallel.dcp_comm_backend in ("a2a", "fi_a2a")
         crossover = dcp_gathered_prefill_crossover(
-            v_head_dim=self.v_head_dim,
+            v_head_dim=model_runner.model_config.v_head_dim,
             kv_lora_rank=self.kv_lora_rank,
             qk_rope_head_dim=self.qk_rope_head_dim,
             # The owned route's a2a carries the partials in the model dtype.
@@ -1589,12 +1595,11 @@ class DeepseekSparseAttnBackend(
             project_before_merge=a2a,
             q_all_gather=not (a2a and parallel.dcp_replicate_q_proj),
         )
-        if self.attn_dcp_size > 1:
-            logger.info(
-                "dsa dcp gathered prefill: crossover %.3f prefix tokens per "
-                "extend token and gathered head",
-                crossover,
-            )
+        logger.info(
+            "dsa dcp gathered prefill: crossover %.3f prefix tokens per "
+            "extend token and gathered head",
+            crossover,
+        )
         return crossover
 
     def _plan_dcp_gathered_prefill(
