@@ -1688,7 +1688,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         success_count = 0
         for i in range(len(keys)):
-            if exist_result[i] == 0:
+            # A short existence reply is normalized to -1 (unknown), which is
+            # not a stored state. Only an explicit 1 counts as success.
+            if exist_result[i] != 1:
                 break
             success_count += 1
         # TODO: return the number of consecutive successful operations from the start.

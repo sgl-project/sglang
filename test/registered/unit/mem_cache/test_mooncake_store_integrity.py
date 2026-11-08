@@ -9,7 +9,6 @@ import unittest
 
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -49,7 +48,7 @@ def _store(fake):
     return obj
 
 
-class TestMooncakeStoreIntegrity(CustomTestCase):
+class TestMooncakeStoreIntegrity(unittest.TestCase):
     def test_short_read_is_not_a_hit(self):
         checked = MooncakeStore._checked_io_results([16], [32], is_set=False)
         self.assertEqual(checked, [-1])
@@ -107,6 +106,18 @@ class TestMooncakeStoreIntegrity(CustomTestCase):
         fake = _FakeStore(exist_results=[1])
         store = _store(fake)
         self.assertEqual(store._batch_exist(["a", "b"]), [-1, -1])
+
+    def test_batch_set_does_not_acknowledge_failed_puts(self):
+        # A short existence reply becomes [-1, -1]. Before the fix the public
+        # batch_set only stopped on 0, so two failed puts still returned True.
+        fake = _FakeStore(exist_results=[0], put_results=[16, 15])
+        store = _store(fake)
+        store.enable_storage_metrics = False
+        got = store.batch_set(
+            ["a", "b"], target_locations=[100, 200], target_sizes=[16, 16]
+        )
+        self.assertFalse(got)
+        self.assertEqual(fake.put_calls, 1)
 
 
 if __name__ == "__main__":

@@ -338,7 +338,7 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         store.mem_pool_host = SimpleNamespace(kv_buffer=object(), page_size=1)
         store._batch_preprocess = lambda keys, hi: (
             list(keys),
-            [0] * len(keys),
+            [0x1000] * len(keys),
             [4096] * len(keys),
         )
         store._batch_postprocess = (
