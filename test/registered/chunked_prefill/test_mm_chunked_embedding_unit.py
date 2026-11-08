@@ -327,10 +327,13 @@ def test_batched_colliding_hashes_with_different_lengths_are_not_deduplicated():
 
 
 @pytest.mark.parametrize("backend", ["cuda", "npu", "hip", "xpu"])
-def test_cross_request_image_batching_by_backend(monkeypatch, backend):
+def test_cross_request_image_batching_by_backend(request, backend):
     """CUDA/NPU merge misses; HIP/XPU keep per-request encoding and output order."""
-    for name in ("hip", "npu", "xpu"):
-        monkeypatch.setattr(mm_schedule, f"_is_{name}", backend == name)
+    platform_override = override_platform(
+        **{f"is_{name}": backend == name for name in ("hip", "npu", "xpu")}
+    )
+    platform_override.install()
+    request.addfinalizer(platform_override.restore)
     mm_schedule.init_mm_embedding_cache(1 << 30)
     items = _make_items()[:2]
     encoder = Mock(side_effect=_encoder_tensor)
