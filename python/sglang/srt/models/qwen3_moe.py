@@ -233,6 +233,28 @@ def compute_yarn_parameters(
     return factor, low, high, attention_factor
 
 
+# Formats whose config says, per layer, whether the router is stored quantized.
+_ROUTER_QUANT_FORMATS = ("modelslim", "compressed_tensors")
+
+
+def _router_quant_config(
+    quant_config: Optional[QuantizationConfig],
+) -> Optional[QuantizationConfig]:
+    """The quantization config that the MoE router (``mlp.gate``) is built with.
+
+    ModelSlim carries a per-layer quant_model_description, and compressed-tensors
+    an ``ignore`` list, so for these formats the config decides: a router the
+    checkpoint stores quantized (for example as W4A16 ``weight_packed`` and
+    ``weight_scale``) is loaded and dequantized with its scales, and one the
+    config ignores stays BF16. Without the config, the stored names have no
+    parameter and the router keeps its initial weight. Other formats, such as
+    online FP8/MXFP8, keep the router in BF16.
+    """
+    if quant_config is not None and quant_config.get_name() in _ROUTER_QUANT_FORMATS:
+        return quant_config
+    return None
+
+
 class Qwen3MoeSparseMoeBlock(nn.Module):
     def __init__(
         self,
@@ -268,21 +290,11 @@ class Qwen3MoeSparseMoeBlock(nn.Module):
             routing_method_type=RoutingMethodType.Renormalize,
         )
 
-        # Router gate: description-driven quant. Only the offline ModelSlim path
-        # (which carries a per-layer quant_model_description) may quantise the
-        # gate — if the checkpoint stored it as MXFP8 it is loaded
-        # and dequantised correctly instead of cast to bf16 without its block scale.
-        # The online Fp8/mxfp8 path keeps the gate in bf16 (unchanged, verified).
-        gate_quant_config = (
-            quant_config
-            if (quant_config is not None and quant_config.get_name() == "modelslim")
-            else None
-        )
         self.gate = ReplicatedLinear(
             config.hidden_size,
             config.num_experts,
             bias=False,
-            quant_config=gate_quant_config,
+            quant_config=_router_quant_config(quant_config),
             prefix=add_prefix("gate", prefix),
         )
         self.topk = self._make_topk(config, layer_id, norm_topk_prob)
