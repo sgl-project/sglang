@@ -4,7 +4,8 @@
   Q; the first Q head of each GQA group also normalizes and rotates its K and stores K/V into the FP8 cache
   (optionally through the full -> SWA slot mapping).
 * ``qkv_proj_qk_norm_rope_cache``: the same epilogue fed straight from the BF16 split-K partials of the fused
-  QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate.
+  QKV + output-gate projection (``bf16_splitk_gemm``), which also emits V and the gate; there each K/V head has
+  its own program instead of riding on the first Q head of its group.
 * ``qk_norm_rope_cache_extend``: extend, one program per token over all its heads; the norm is
   ``fused_qk_norm``'s body verbatim (same [heads, D] tile, reduction and warps), so it lowers to the same
   reduction and matches the unfused extend (``fused_qk_norm``, RoPE, cache write) bit for bit.
@@ -21,6 +22,38 @@ from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 
 
 @triton.jit
+def _rope_table(COS, pos, D: tl.constexpr, COS_STRIDE: tl.constexpr):
+    d = tl.arange(0, D)
+    # Day0 pos_enc.cu stores the FP32 cache loads in scalar_t (BF16),
+    # and its BF16 operators round both products before the final add.
+    cosine = tl.load(COS + pos * COS_STRIDE + d // 2).to(tl.bfloat16).to(tl.float32)
+    sine = (
+        tl.load(COS + pos * COS_STRIDE + D // 2 + d // 2).to(tl.bfloat16).to(tl.float32)
+    )
+    return cosine, sine
+
+
+@triton.jit
+def _rms_scale(x, eps, scale, D: tl.constexpr, Q_SCALE: tl.constexpr):
+    f = x.to(tl.float32)
+    inv = tl.rsqrt(tl.sum(f * f, axis=0) / D + eps)
+    value = (f * inv).to(tl.bfloat16).to(tl.float32)
+    if Q_SCALE:
+        value = (value * scale).to(tl.bfloat16).to(tl.float32)
+    return value
+
+
+@triton.jit
+def _rotate(value, cosine, sine, D: tl.constexpr):
+    d = tl.arange(0, D)
+    other = tl.reshape(tl.flip(tl.reshape(value, (D // 2, 2)), 1), (D,))
+    rotated = tl.where(d % 2 == 0, -other, other)
+    first = (value * cosine).to(tl.bfloat16).to(tl.float32)
+    second = (rotated * sine).to(tl.bfloat16).to(tl.float32)
+    return first + second
+
+
+@triton.jit
 def _norm_rope(
     x,
     COS,
@@ -32,27 +65,10 @@ def _norm_rope(
     Q_SCALE: tl.constexpr,
     COS_STRIDE: tl.constexpr,
 ):
-    d = tl.arange(0, D)
-    f = x.to(tl.float32)
-    inv = tl.rsqrt(tl.sum(f * f, axis=0) / D + eps)
-    value = (f * inv).to(tl.bfloat16).to(tl.float32)
-    if Q_SCALE:
-        value = (value * scale).to(tl.bfloat16).to(tl.float32)
+    value = _rms_scale(x, eps, scale, D, Q_SCALE)
     if ROPE:
-        pos = tl.load(POS + tl.program_id(0))
-        # Day0 pos_enc.cu stores the FP32 cache loads in scalar_t (BF16),
-        # and its BF16 operators round both products before the final add.
-        cosine = tl.load(COS + pos * COS_STRIDE + d // 2).to(tl.bfloat16).to(tl.float32)
-        sine = (
-            tl.load(COS + pos * COS_STRIDE + D // 2 + d // 2)
-            .to(tl.bfloat16)
-            .to(tl.float32)
-        )
-        other = tl.reshape(tl.flip(tl.reshape(value, (D // 2, 2)), 1), (D,))
-        rotated = tl.where(d % 2 == 0, -other, other)
-        first = (value * cosine).to(tl.bfloat16).to(tl.float32)
-        second = (rotated * sine).to(tl.bfloat16).to(tl.float32)
-        value = first + second
+        cosine, sine = _rope_table(COS, tl.load(POS + tl.program_id(0)), D, COS_STRIDE)
+        value = _rotate(value, cosine, sine, D)
     return value.to(tl.bfloat16)
 
 
@@ -197,10 +213,17 @@ def _project_slice(
 ):
     split = tl.arange(0, SK)
     col = FIRST + tl.arange(0, D)
-    partial = tl.load(P + split[:, None] * M * N + TOKEN * N + col[None, :])
+    return tl.load(P + split[:, None] * M * N + TOKEN * N + col[None, :])
+
+
+@triton.jit
+def _sum_slice(partial):
     return tl.sum(partial, axis=0).to(tl.bfloat16)
 
 
+# Programs [0, HQ) of a token own one Q head and its gate; programs [HQ, HQ + HK) own one K/V head and its cache
+# store. Each program issues all of its global loads before any math: the kernel is latency bound at the decode /
+# verify widths it serves.
 @triton.jit
 def _qkv_epilogue(
     P,
@@ -230,26 +253,40 @@ def _qkv_epilogue(
 ):
     token, head = tl.program_id(0), tl.program_id(1)
     d = tl.arange(0, D)
-    gate = _project_slice(P, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
-    tl.store(GO + token * HQ * D + head * D + d, gate)
-    q = _project_slice(P, token, head * D, M, N, SK, D)
-    q = _norm_rope(q, COS, POS, EPS, SCALE, D, ROPE, True, COS_STRIDE)
-    tl.store(QO + token * HQ * D + head * D + d, q)
-    if head % (HQ // HK) == 0:
-        kh = head // (HQ // HK)
+    if head < HQ:
+        gate = _project_slice(P, token, (HQ + 2 * HK) * D + head * D, M, N, SK, D)
+        q = _project_slice(P, token, head * D, M, N, SK, D)
+        if ROPE:
+            cosine, sine = _rope_table(COS, tl.load(POS + token), D, COS_STRIDE)
+        tl.store(GO + token * HQ * D + head * D + d, _sum_slice(gate))
+        q = _rms_scale(_sum_slice(q), EPS, SCALE, D, True)
+        if ROPE:
+            q = _rotate(q, cosine, sine, D)
+        tl.store(QO + token * HQ * D + head * D + d, q.to(tl.bfloat16))
+    else:
+        kh = head - HQ
         k = _project_slice(P, token, HQ * D + kh * D, M, N, SK, D)
         v = _project_slice(P, token, (HQ + HK) * D + kh * D, M, N, SK, D)
-        k = _norm_rope(k, COS, POS, EPS, 1.0, D, ROPE, False, COS_STRIDE)
+        k_scale = tl.load(KS)
+        v_scale = tl.load(VS)
+        slot = tl.load(LOC + token).to(tl.int64)
+        if HAS_MAP:
+            slot = tl.where(
+                slot >= 0, tl.load(MAP + tl.maximum(slot, 0)).to(tl.int64), slot
+            )
+        if ROPE:
+            cosine, sine = _rope_table(COS, tl.load(POS + token), D, COS_STRIDE)
+        k = _rms_scale(_sum_slice(k), EPS, 1.0, D, False)
+        if ROPE:
+            k = _rotate(k, cosine, sine, D)
+        k = k.to(tl.bfloat16)
+        v = _sum_slice(v)
         tl.store(KO + token * HK * D + kh * D + d, k)
         tl.store(VO + token * HK * D + kh * D + d, v)
-        slot = tl.load(LOC + token).to(tl.int64)
         if slot >= 0:
-            if HAS_MAP:
-                slot = tl.load(MAP + slot).to(tl.int64)
-            if slot >= 0:
-                offset = slot * HK * D + kh * D + d
-                tl.store(KC + offset, k.to(tl.float32) / tl.load(KS))
-                tl.store(VC + offset, v.to(tl.float32) / tl.load(VS))
+            offset = slot * HK * D + kh * D + d
+            tl.store(KC + offset, k.to(tl.float32) / k_scale)
+            tl.store(VC + offset, v.to(tl.float32) / v_scale)
 
 
 def qk_norm_rope_cache(
@@ -419,7 +456,7 @@ def qkv_proj_qk_norm_rope_cache(
     ko = torch.empty((m, hk * d), device=x.device, dtype=torch.bfloat16)
     vo = torch.empty_like(ko)
     go = torch.empty_like(qo)
-    _qkv_epilogue[(m, hq)](
+    _qkv_epilogue[(m, hq + hk)](
         partials,
         positions,
         cos_sin,

@@ -21,7 +21,9 @@ F8 = torch.float8_e4m3fn
 
 @pytest.mark.parametrize("heads", [(16, 2), (32, 4)])
 @pytest.mark.parametrize("m", [1, 8, 24, 32])
-def test_fused_projection_matches_unfused(heads, m):
+@pytest.mark.parametrize("rope", [True, False])
+@pytest.mark.parametrize("swa", [False, True])
+def test_fused_projection_matches_unfused(heads, m, rope, swa):
     from sglang.kernels.ops.attention.qk_norm_rope_cache import (
         qk_norm_rope_cache,
         qkv_proj_qk_norm_rope_cache,
@@ -35,8 +37,13 @@ def test_fused_projection_matches_unfused(heads, m):
         torch.bfloat16
     )
     positions = torch.randint(0, 4096, (m,), device=dev)
-    cos_sin = torch.rand(4096, 64, device=dev) * 2 - 1
+    cos_sin = torch.rand(4096, 64, device=dev) * 2 - 1 if rope else None
     loc = torch.randperm(1024, device=dev)[:m]
+    loc[1::3] = -1
+    mapping = None
+    if swa:
+        mapping = torch.randperm(1024, device=dev).to(torch.int32)
+        mapping[::4] = -1
     ks = torch.tensor([0.5], device=dev)
     vs = torch.tensor([0.75], device=dev)
     caches = [torch.zeros(1024, hk, 64, device=dev, dtype=F8) for _ in range(4)]
@@ -50,7 +57,7 @@ def test_fused_projection_matches_unfused(heads, m):
         caches[0],
         caches[1],
         loc,
-        None,
+        mapping,
         eps,
         q_scale,
         ks,
@@ -68,7 +75,7 @@ def test_fused_projection_matches_unfused(heads, m):
         caches[2],
         caches[3],
         loc,
-        None,
+        mapping,
         eps,
         q_scale,
         ks,
@@ -77,10 +84,9 @@ def test_fused_projection_matches_unfused(heads, m):
     # Split-K FP32 partials vs one BF16 GEMM: projections differ by at most a BF16 ulp.
     for got, ref in ((go, g), (vo, v), (qo, rq), (ko, rk)):
         torch.testing.assert_close(got.float(), ref.float(), rtol=2e-2, atol=2e-2)
+    # Whole caches: skipped rows (location or mapping -1) stay zero in both.
     for got, ref in ((caches[0], caches[2]), (caches[1], caches[3])):
-        torch.testing.assert_close(
-            got[loc].float(), ref[loc].float(), rtol=0.13, atol=0.07
-        )
+        torch.testing.assert_close(got.float(), ref.float(), rtol=0.13, atol=0.07)
 
 
 @pytest.mark.parametrize("heads", [(16, 2), (32, 4)])
