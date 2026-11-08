@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -24,6 +25,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -74,7 +76,6 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -139,7 +140,7 @@ class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPhase.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
@@ -388,6 +389,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
@@ -399,6 +401,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()
