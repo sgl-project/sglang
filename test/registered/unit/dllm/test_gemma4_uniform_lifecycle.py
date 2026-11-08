@@ -163,7 +163,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         )
         cache = SimpleNamespace(
             full_evictable_size=lambda: 0,
-            swa_evictable_size=lambda: 0,
+            window_evictable_size=lambda name: 0,
         )
         budget = SWAPrefillBudget(allocator, cache)
         adder = object.__new__(PrefillAdder)
@@ -207,7 +207,7 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
             req,
             total_tokens=1024,
             host_hit_length=0,
-            swa_host_hit_length=0,
+            window_host_hit_lengths={},
             truncation_align_size=None,
         )
         self.assertEqual((admission.prefix_len, admission.extend_len), (0, 300))
@@ -395,6 +395,11 @@ class TestGemma4RequestValidation(unittest.TestCase):
         sender = Mock()
         scheduler.ipc_channels = SimpleNamespace(send_to_tokenizer=sender)
         scheduler.rust_server = None
+        scheduler.tree_cache = Mock()
+        scheduler.beam_coordinator = Mock()
+        scheduler.hisparse_coordinator = None
+        scheduler.uocr_runtime = None
+        scheduler.init_request_retirer()
         recv_req = MagicMock(
             session_params=None,
             session_id=None,
