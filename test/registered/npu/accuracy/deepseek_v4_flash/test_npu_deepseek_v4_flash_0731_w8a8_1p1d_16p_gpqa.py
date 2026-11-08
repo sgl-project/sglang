@@ -276,7 +276,7 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
     accuracy = 0.874
     datasets = ["gpqa_diamond"]
     generation_config = DEEPSEEK_V4_FLASH_0731_W8A8_GENERATION_CONFIG_HIGH
-    eval_batch_size = 64
+    eval_batch_size = 128
     # percent: each tier's baseline is set independently so L2 and L3 can be
     # tuned separately; both are enforced by assert_metrics via this dict.
     min_hit_rate_pcts = {
@@ -284,9 +284,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         "storage": 0,  # L3 storage hit rate baseline
     }
 
-    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-    #     self.run_accuracy()
+    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+        self.run_accuracy()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates"""

@@ -339,13 +339,13 @@ jobs:
             test_type: 'accuracy'
             prefill_decode_deployment: 'separation'
           # deepseek_v4_pro accuracy tests
-#          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
-#            prefill_size: 2
-#            decode_size: 2
-#            router_size: 1
-#            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
-#            test_type: 'accuracy'
-#            prefill_decode_deployment: 'separation'
+          - name: deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa
+            prefill_size: 2
+            decode_size: 2
+            router_size: 1
+            test_case: test/registered/npu/accuracy/deepseek_v4_pro/test_npu_deepseek_v4_pro_0813_w4a8_1p1d_32p_gpqa.py
+            test_type: 'accuracy'
+            prefill_decode_deployment: 'separation'
           # glm_5_2 accuracy tests (2 prefill + 2 decode nodes)
 #          - name: glm_5_2_w8a8_2p2d_32p_dcp_gpqa
 #            prefill_size: 2
