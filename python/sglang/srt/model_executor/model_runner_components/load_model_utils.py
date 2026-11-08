@@ -27,6 +27,7 @@ from sglang.srt.debug_utils.tensor_dump_forward_hook import (
     register_forward_hook_for_model,
 )
 from sglang.srt.distributed.parallel_state import monkey_patch_vllm_parallel_state
+from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.model_loader.loader import get_model_loader
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -39,8 +40,9 @@ from sglang.srt.runtime_context import (
     get_model,
     get_observability,
     get_parallel,
+    get_spec,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 from sglang.srt.utils.network import NetworkAddress
 
 if TYPE_CHECKING:
@@ -54,6 +56,49 @@ _is_npu = is_npu()
 
 
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
+
+
+def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+    """Pre-expand RoPE cache for long sequences and speculative decoding.
+
+    Runs inside `ModelRunner`, past publish, so the three config inputs come
+    from the bags: the context length and the two speculative counts are
+    resolution's answers.
+    """
+    from sglang.srt.environ import envs
+
+    SAFETY_FACTOR = envs.SGLANG_SPEC_EXPANSION_SAFETY_FACTOR.get()
+    MARGIN = envs.SGLANG_ROPE_CACHE_SAFETY_MARGIN.get()
+    ALIGN = envs.SGLANG_ROPE_CACHE_ALIGN.get()
+
+    # 1) Estimate base context upper bound
+    base_ctx = (
+        get_model().context_length
+        or getattr(model_config, "context_len", None)
+        or getattr(model_config, "max_model_len", None)
+        or getattr(model_config.hf_text_config, "max_position_embeddings", None)
+        or 2048
+    )
+
+    # 2) Speculative decoding expansion
+    steps = int(get_spec().speculative_num_steps or 0)
+    draft = int(get_spec().speculative_num_draft_tokens or 0)
+    reserve = base_ctx + steps * draft * SAFETY_FACTOR + MARGIN
+
+    # 3) Align to reduce reallocation frequency
+    reserve = (reserve + ALIGN - 1) // ALIGN * ALIGN
+
+    # Recursively expand all RoPE layers
+    def reserve_rope_cache_recursive(module):
+        for child in module.children():
+            if hasattr(child, "_ensure_cos_sin_cache_length") and hasattr(
+                child, "cos_sin_cache"
+            ):
+                child._ensure_cos_sin_cache_length(reserve - 1)
+            else:
+                reserve_rope_cache_recursive(child)
+
+    reserve_rope_cache_recursive(model)
 
 
 def maybe_precompile_model_kernels_after_loading(model, device: str) -> None:
@@ -116,7 +161,25 @@ def maybe_trigger_remote_instance_nccl_send_group(
             t.start()
 
 
-def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
+def _kv_cache_scales_to_tensors(model, device: str) -> None:
+    """The models' ``load_kv_cache_scales`` assign float scales, while attention
+    backends read a device tensor plus its host copy, the way
+    ``BaseKVCacheMethod`` stores checkpoint scales."""
+    for module in model.modules():
+        if not isinstance(module, RadixAttention):
+            continue
+        for name in ("k_scale", "v_scale"):
+            scale = getattr(module, name)
+            if isinstance(scale, float):
+                setattr(module, f"{name}_float", scale)
+                setattr(
+                    module,
+                    name,
+                    torch.tensor(scale, dtype=torch.float32, device=device),
+                )
+
+
+def load_kv_cache_scales(*, model, kv_cache_dtype: str, device: str) -> None:
     """``kv_cache_dtype`` is the caller's resolved value. Required rather than
     defaulted: a fallback to ``server_args`` would be a hidden global read for
     any future caller that forgets to pass one."""
@@ -130,6 +193,7 @@ def load_kv_cache_scales(*, model, kv_cache_dtype: str) -> None:
         if get_model().quantization_param_path is not None:
             if callable(getattr(model, "load_kv_cache_scales", None)):
                 model.load_kv_cache_scales(get_model().quantization_param_path)
+                _kv_cache_scales_to_tensors(model, device)
                 logger.info(
                     "Loaded KV cache scaling factors from %s",
                     get_model().quantization_param_path,

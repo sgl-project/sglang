@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -24,10 +25,7 @@ from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.managers.scheduler_components.request_list import (
-    ListKind,
-    _RequestList,
-)
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -78,7 +76,6 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -139,30 +136,11 @@ def _launch(s, batch):
         pass
 
 
-class TestRequestList(CustomTestCase):
-    def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
-        a, b, c, outsider = (_req(rid) for rid in "abcx")
-        running = _RequestList(ListKind.DECODING)
-        running.join([a, b])
-        running.join([c, b])
-        _finish(b)
-
-        seen = []
-        for req in running:
-            seen.append(req)
-            running.leave_finished()
-            running.leave([a, outsider])
-
-        self.assertEqual(seen, [a, b, c])
-        self.assertEqual(list(running), [c])
-        self.assertNotIn(a, running)
-
-
 class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPhase.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
@@ -173,7 +151,7 @@ class TestRequestListsCheck(CustomTestCase):
     def test_fails_a_request_in_two_lists(self):
         req = _req("a")
         self.s.running_reqs.join([req])
-        self.s.waiting_queue.append(req)
+        self.s.waiting_queue.join([req])
 
         with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
             self.check(ScheduleBatch(reqs=[]))
@@ -189,7 +167,7 @@ class TestRequestListsCheck(CustomTestCase):
         decoding, retracted, chunk = _req("r"), _req("w"), _req("c")
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
-        self.s.waiting_queue.append(retracted)
+        self.s.waiting_queue.join([retracted])
         self.s.chunked_req = chunk
 
         with self.assertRaisesRegex(
@@ -400,10 +378,10 @@ class TestRunningReqsHooks(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = True
         s.is_hybrid_swa = False
-        s.waiting_queue = [waiting]
+        s.waiting_queue.join([waiting])
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -411,6 +389,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
@@ -422,6 +401,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()
