@@ -16,7 +16,7 @@ register_npu_ci(
     nightly=True,
 )
 
-CASE_ID = "test_npu_glm_5_2_w8a8c8_mxfp8_4p_gsm8k_a5_overlap"
+CASE_ID = "test_npu_glm_5_2_w8a8c8_mxfp8_8p_gsm8k_a5_overlap"
 
 # Based on the GLM-5.2-w4a8 launch scripts in PR #45949.
 GLM_5_2_W4A8_4P_ENVS = {
@@ -52,9 +52,9 @@ GLM_5_2_W4A8_4P_OTHER_ARGS = [
     "--device",
     "npu",
     "--tp-size",
-    4,
+    8,
     "--dp-size",
-    2,
+    4,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--trust-remote-code",
