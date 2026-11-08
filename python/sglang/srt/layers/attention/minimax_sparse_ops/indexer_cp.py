@@ -19,9 +19,9 @@ logger = logging.getLogger(__name__)
 # gather and candidate exchange cost more than the index-K reads CP saves (TP4, graphs)
 CP_MIN_VERIFY_REQS = 12
 
-# Arbitrary cap on decode rows for the multimem buffers (2 MB + 8 MB at W=8);
+# Largest batch the two multimem gathers were timed at (H200, W=4 and W=8);
 # larger batches gather through the communicator.
-MULTIMEM_MAX_ROWS = 1024
+MULTIMEM_MAX_ROWS = 128
 
 
 def unsupported_reason(
