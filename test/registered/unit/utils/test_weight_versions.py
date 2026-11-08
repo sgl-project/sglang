@@ -17,13 +17,13 @@ from sglang.srt.utils.weight_versions import (
     weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.scheduler_test_utils import FakeReq, empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class _ReqStub:
+class _ReqStub(FakeReq):
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []

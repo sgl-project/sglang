@@ -690,6 +690,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # This DP rank's first row in the parent's gathered layout; non-EP DP TBO only.
+    tbo_parent_dp_offset: Optional[int] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 

@@ -78,6 +78,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ReqList,
     move,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
@@ -642,8 +643,8 @@ class SchedulerDisaggregationPrefillMixin:
         self: Scheduler, req: Req, *, abort_sender: bool
     ) -> None:
         """Release a retiring request's KV send: its pending chunk entry and
-        metadata buffer. ``abort_sender`` stops a live sender; a failed one
-        already concluded through ``failure_exception``."""
+        metadata buffer. ``abort_sender`` aborts a live sender and clears its
+        room; a failed one already concluded through ``failure_exception``."""
         self.clear_pending_chunk_send(req)
         if abort_sender and req.disagg_kv_sender is not None:
             try:
@@ -652,6 +653,10 @@ class SchedulerDisaggregationPrefillMixin:
                 # Transport notification is best effort; local ownership must
                 # still be released or the next idle invariant check will fail.
                 logger.exception("Failed to notify KV sender of abort for %s", req.rid)
+            try:
+                req.disagg_kv_sender.clear()
+            except Exception:
+                logger.exception("Failed to clear KV sender for %s", req.rid)
         maybe_release_metadata_buffer(req, self.req_to_metadata_buffer_idx_allocator)
         req.pending_bootstrap = False
 
@@ -740,7 +745,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.waiting_queue.join(
@@ -772,6 +777,7 @@ class SchedulerDisaggregationPrefillMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _supports_result_wait_polling(self: Scheduler) -> bool:
         """Whether the overlap loop can wait for a result without blocking.
@@ -878,7 +884,7 @@ class SchedulerDisaggregationPrefillMixin:
             received_inputs = should_ingest_requests and self.ingest_requests(
                 stop_at_pause=waiting_for_batch_result
             )
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 self._yield_gil_if_needed()
                 continue
@@ -902,7 +908,7 @@ class SchedulerDisaggregationPrefillMixin:
                     not self.gracefully_exit
                     or self.dp_attn_adapter.shutdown_vote_pending()
                 )
-                and not self._deferred_input_requests
+                and self.pause_state.may_launch()
                 and not skip_batch_creation
             ):
                 # Get the next batch to run
@@ -996,6 +1002,7 @@ class SchedulerDisaggregationPrefillMixin:
             self._sched_idled = batch is None
             self.last_batch = batch
             waiting_for_batch_result = False
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def is_disagg_prefill_batch_result_ready(
         self: Scheduler,
