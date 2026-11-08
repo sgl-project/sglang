@@ -337,6 +337,13 @@ class AscendAttnBackend(AttentionBackend):
         self.page_size = model_runner.page_size
         self.model_dtype = model_runner.model_config.dtype
         self.kv_cache_dtype = model_runner.kv_cache_dtype
+        # aclnn paged attention requires a block table whose page size is a
+        # multiple of 16 within [16, 512]. Finer pages - e.g. a frame-level
+        # page_size=1 - have no fused kernel, so take the torch reference
+        # attention instead of failing inside the op's tiling.
+        self.use_native_sdpa = self.page_size % 16 != 0 or not (
+            16 <= self.page_size <= 512
+        )
         self.use_mla = model_runner.model_config.attention_arch == AttentionArch.MLA
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
@@ -3229,6 +3236,22 @@ class AscendAttnBackend(AttentionBackend):
         q_descale: Optional[torch.Tensor] = None,
     ):
         modelslim_kv_scheme = getattr(layer, "scheme", None)
+        if getattr(self, "use_native_sdpa", False):
+            # The torch reference attention reads tensor values on the host,
+            # which is illegal inside a graph capture; decode eagerly instead.
+            return self.forward_decode(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                q_rope=q_rope,
+                k_rope=k_rope,
+                topk_indices=None,
+                sinks=sinks,
+                q_descale=q_descale,
+            )
 
         if save_kv_cache:
             if self.use_mla:
@@ -3749,7 +3772,11 @@ class AscendAttnBackend(AttentionBackend):
                 )
             # there are some accuracy issues in cross attention scene to use torch_npu._npu_flash_attention_qlens
             # forward_batch.encoder_lens is not None in cross attention scend, we add native attn to solve accuracy issues
-            elif forward_batch.encoder_lens is None and layer.logit_cap == 0:
+            elif (
+                forward_batch.encoder_lens is None
+                and layer.logit_cap == 0
+                and not getattr(self, "use_native_sdpa", False)
+            ):
                 query = q.reshape(-1, layer.tp_q_head_num, layer.qk_head_dim)
                 num_tokens = query.shape[0]
                 if not self.use_alibi:
