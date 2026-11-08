@@ -462,7 +462,7 @@ struct FlashCompress128OnlineKernel {
 
     auto B = SymbolicSize{"batch_size"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({-1, 1, kHeadDim * 3})  // kv score buffer (max, sum, kv)
         .with_dtype<BufferFloat>()
@@ -509,7 +509,7 @@ struct FlashCompress128OnlineKernel {
     auto C = SymbolicSize{"num_c_plans"};
     auto W = SymbolicSize{"num_w_plans"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     TensorMatcher({-1, 1, kHeadDim * 3})  // kv score buffer
         .with_dtype<BufferFloat>()
@@ -622,7 +622,7 @@ inline void plan_online_decode(
     const int32_t state_slot_offset) {
   auto B = SymbolicSize{"batch_size"};
   auto device_ = SymbolicDevice{};
-  device_.set_options<kDLCUDA>();
+  device_.set_options<kDLGPU>();
 
   auto seq_dtype = SymbolicDType{};
   TensorMatcher({B})  //
@@ -768,8 +768,8 @@ inline OnlinePrefillPlan plan_online_prefill(
   auto N = SymbolicSize{"num_q_tokens"};
   auto cpu = SymbolicDevice{};
   auto device_ = SymbolicDevice{};
-  cpu.set_options<kDLCPU, kDLCUDAHost>();
-  device_.set_options<kDLCUDA>();
+  cpu.set_options<kDLCPU, kDLGPUHost>();
+  device_.set_options<kDLGPU>();
 
   TensorMatcher({B})  //
       .with_dtype<int64_t>()

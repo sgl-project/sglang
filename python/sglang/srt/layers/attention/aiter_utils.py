@@ -105,6 +105,7 @@ def forward_extend_vectorized_5d(
             kv_indices_lin,
             max_q,
             max_q,
+            softmax_scale=layer.scaling,
             causal=True,
             logits_soft_cap=backend.logits_soft_cap,
             alibi_slopes=None,
@@ -137,15 +138,10 @@ def forward_extend_vectorized_5d(
     else:
         slot_ids = backend.forward_metadata.kv_indices[:total_kv]
 
-    # Resolve the raw 5D K/V buffer for this layer (going through the
-    # SWA→sub-pool mapping when applicable).
-    pool = backend.token_to_kv_pool
-    if hasattr(pool, "layers_mapping"):
-        sub_layer_id, sub_is_swa = pool.layers_mapping[layer.layer_id]
-        sub_pool = pool.swa_kv_pool if sub_is_swa else pool.full_kv_pool
-    else:
-        sub_pool = pool
-        sub_layer_id = layer.layer_id
+    # Resolve the raw 5D K/V buffer for this layer from the view holding it.
+    kv = backend.token_to_kv_pool.layer_router.layer(layer.layer_id)
+    sub_pool = kv.view
+    sub_layer_id = kv.view_layer_id
     k_buf = sub_pool.k_buffer[sub_layer_id - sub_pool.start_layer]
     v_buf = sub_pool.v_buffer[sub_layer_id - sub_pool.start_layer]
 
@@ -162,10 +158,7 @@ def forward_extend_vectorized_5d(
     # For fp8 K/V we hand the raw fp8 tensors and the layer's per-tensor
     # descales straight to aiter.
     if sub_pool.dtype == fp8_dtype:
-        q_local = q.to(fp8_dtype)
-        q_descale_local = (
-            layer.k_scale if layer.k_scale is not None else backend.k_scale
-        )
+        q_local, q_descale_local = backend._quantize_q_fp8(q)
         k_descale_local = (
             layer.k_scale if layer.k_scale is not None else backend.k_scale
         )
@@ -192,6 +185,7 @@ def forward_extend_vectorized_5d(
         kv_indices_lin,
         max_q,
         max_kv,
+        softmax_scale=layer.scaling,
         causal=True,
         logits_soft_cap=backend.logits_soft_cap,
         alibi_slopes=None,

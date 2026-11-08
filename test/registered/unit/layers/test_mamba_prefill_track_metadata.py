@@ -15,11 +15,9 @@ from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     Mamba2Metadata,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative import spec_utils
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -72,10 +70,9 @@ def make_metadata_backend():
     backend = object.__new__(MambaAttnBackendBase)
     backend.device = "cpu"
     backend.topk = 1
-    backend.req_to_token_pool = SimpleNamespace(
-        get_mamba_indices=lambda rows: rows,
-        translate_mamba_indices=lambda slots: slots,
-    )
+    backend.req_to_token_pool = SimpleNamespace(get_mamba_indices=lambda rows: rows)
+    backend.state_pool = None
+    backend._state_ids = IdSpace(key=("mamba", None))
     return backend
 
 
@@ -109,6 +106,48 @@ def make_relabeled_decode_batch(seq_lens, num_tokens, track_mask=None):
 
 
 class TestMambaPrefillTrackMetadata(unittest.TestCase):
+    def test_short_conv_cpu_capture_without_cuda_tracking_buffer(self):
+        """CPU capture must initialize conv metadata without CUDA-only tracking."""
+        from sglang.srt.layers.attention.linear.short_conv_backend import (
+            ShortConvAttnBackend,
+        )
+
+        backend = object.__new__(ShortConvAttnBackend)
+        backend.device = "cpu"
+        backend.pad_slot_id = -1
+        backend.topk = 1
+        backend.state_indices_list = []
+        backend.query_start_loc_list = []
+        backend.mamba_track_indices_buf = None
+        backend.replayssm_write_pos_list = None
+        backend.replayssm_force_flush_list = None
+        backend._cache_indices_buf = None
+        backend.state_pool = None
+        backend._state_ids = SimpleNamespace(ids=lambda ids: ids)
+        mapping = torch.tensor([0, 7, 3], dtype=torch.int32)
+        backend.req_to_token_pool = SimpleNamespace(
+            get_mamba_indices=lambda rows: mapping[rows]
+        )
+        backend.init_cpu_graph_state(2, 2)
+        backend.init_forward_metadata_capture_cpu_graph(
+            bs=2,
+            num_tokens=2,
+            req_pool_indices=torch.tensor([1, 2]),
+            seq_lens=torch.tensor([8, 9]),
+            out_cache_loc=torch.tensor([4, 5]),
+            encoder_lens=None,
+            forward_mode=ForwardMode.DECODE,
+            spec_info=None,
+        )
+        torch.testing.assert_close(
+            backend._cache_indices, torch.tensor([7, 3], dtype=torch.int64)
+        )
+        torch.testing.assert_close(
+            backend.forward_metadata.query_start_loc,
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+        )
+        self.assertIsNone(backend.state_tracking_indices)
+
     def test_cpu_plan_matches_existing_tensor_planner(self):
         rng = random.Random(2026)
         for backend_type in (MambaAttnBackendBase, Mamba2AttnBackend):
@@ -216,9 +255,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     lengths, [0, 3][: len(lengths)], [100, 200], mode
                 )
                 if mode == ForwardMode.TARGET_VERIFY:
-                    batch.spec_info = SimpleNamespace(
-                        ragged_verify_layout=None, draft_token_num=3
-                    )
+                    batch.spec_info = SimpleNamespace(draft_token_num=3)
                 with patch.object(
                     torch.Tensor,
                     "__int__",
@@ -269,7 +306,7 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                 requires_mm_token_modalities=False, model_is_mrope=False
             ),
             # A pass-through runner: its plan hands the batch its ids untouched.
-            kv_index_translator=SimpleNamespace(
+            runner_ids=SimpleNamespace(
                 own_plan=lambda batch: SimpleNamespace(
                     bind=lambda batch, reader, cols=None: None
                 )
@@ -462,7 +499,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
                 enable_mamba_extra_buffer=True, enable_mamba_extra_buffer_lazy=lazy
             )
         )
-        # reuse: the process's indices under SGLANG_Q35MF_MKH_N3B, None without it
+        # reuse: the process's indices under SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS, None without it
         with (
             patch.object(spec_utils, "get_exec", return_value=settings),
             patch.object(spec_utils, "_VERIFY_TRACK_INDICES", reuse),
@@ -521,7 +558,7 @@ class TestVerifyTrackIndexReuse(unittest.TestCase):
         batch, reuse = make_verify_batch(), spec_utils.VerifyTrackIndices()
         self._prepare(batch, reuse)
         self.assertEqual(
-            self._prepare(batch, reuse, lazy=True), ([31, -1, 20], [1, 0, 0])
+            self._prepare(batch, reuse, lazy=True), ([31, 0, 20], [1, 0, 0])
         )
 
 

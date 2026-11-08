@@ -29,6 +29,10 @@ from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ReportingTqdm,
     get_progress_reporter,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import (
+    is_request_cancel_enabled,
+    raise_if_cancelled,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.dedup import StageDedupMixin
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -96,10 +100,6 @@ class PipelineStage(StageDedupMixin, ABC):
         """Logs a warning message with the stage name as a prefix."""
         logger.warning(f"[{self.__class__.__name__}] {msg}", *args)
 
-    def log_error(self, msg, *args):
-        """Logs an error message with the stage name as a prefix."""
-        logger.error(f"[{self.__class__.__name__}] {msg}", *args)
-
     def log_debug(self, msg, *args):
         """Logs a debug message with the stage name as a prefix."""
         logger.debug(f"[{self.__class__.__name__}] {msg}", *args)
@@ -119,6 +119,7 @@ class PipelineStage(StageDedupMixin, ABC):
         # report even when the bar is hidden: the first rank of replica N>0 is
         # not world rank 0
         reporter = get_progress_reporter()
+        request_ids = []
         if (
             reporter is not None
             and batch is not None
@@ -126,17 +127,31 @@ class PipelineStage(StageDedupMixin, ABC):
             and not batch.is_warmup
         ):
             request_ids = batch.client_request_ids()
-            if request_ids:
-                return ReportingTqdm(
-                    iterable=iterable,
-                    total=total,
-                    disable=disable,
-                    reporter=reporter,
-                    request_ids=request_ids,
-                    progress_range=self._progress_range,
-                    **kwargs,
-                )
+        if request_ids:
+            return ReportingTqdm(
+                iterable=iterable,
+                total=total,
+                disable=disable,
+                reporter=reporter,
+                request_ids=request_ids,
+                progress_range=self._progress_range,
+                **kwargs,
+            )
         return tqdm(iterable=iterable, total=total, disable=disable, **kwargs)
+
+    def check_cancelled(self, batch: Req | list[Req]) -> None:
+        """Check between sampling steps, independently of progress reporting.
+
+        Every participating rank must reach this point in the same order.
+        Rank-only stages rely on the executor's stage boundaries instead.
+        """
+        if not is_request_cancel_enabled():
+            return
+        if self.parallelism_type_for(batch) not in (
+            StageParallelismType.MAIN_RANK_ONLY,
+            StageParallelismType.MAIN_RANK_ONLY_AND_SEND_TO_OTHERS,
+        ):
+            raise_if_cancelled(batch if isinstance(batch, list) else [batch])
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:
         """

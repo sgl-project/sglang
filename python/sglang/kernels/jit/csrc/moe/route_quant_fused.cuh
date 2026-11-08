@@ -82,7 +82,7 @@ struct RouteQuantFusedKernel {
     auto N_ = SymbolicSize{"num_experts"};
     auto K_ = SymbolicSize{"topk"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     auto score_dtype = SymbolicDType{};
     TensorMatcher({M_, N_})
