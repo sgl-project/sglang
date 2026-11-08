@@ -941,7 +941,11 @@ class DataParallelController:
             self.dp_budget.capacity,
             forced_rank=req.routed_dp_rank,
         )
-        self.dp_budget.total_tokens[rank] += input_tokens + output_tokens
+        # Match native snapshots: used KV plus queued prompt tokens. The
+        # placement policy prices decode reserves separately; charging the
+        # whole output allowance here would create false capacity spills
+        # until a newer snapshot replaces this dispatch estimate.
+        self.dp_budget.total_tokens[rank] += input_tokens
         self.dp_budget.total_requests[rank] += 1
         if not already_sent:
             sock_send(self.workers[rank], req)
