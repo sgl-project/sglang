@@ -343,15 +343,15 @@ class TestPrefillHiddenStateOffsets(CustomTestCase):
                 self.assertEqual(last.hidden_states, [[22.0]])
 
 
-class TestDeadRows(CustomTestCase):
-    def test_dead_row_commits_nothing_and_keeps_live_row_aligned(self):
+class TestRowsStillInBatch(CustomTestCase):
+    def test_only_rows_still_in_batch_commit(self):
         """A request that left the batch after launch gets no token, hidden state,
         logprob or streamed row, yet the row still in the batch reads its own slice
         of the step's result."""
-        self._check_dead_prefill_row()
-        self._check_dead_decode_row()
+        self._check_prefill()
+        self._check_decode()
 
-    def _check_dead_prefill_row(self):
+    def _check_prefill(self):
         cases = (
             (
                 "full",
@@ -363,10 +363,10 @@ class TestDeadRows(CustomTestCase):
 
         for server_mode, capture_mode, hidden_states in cases:
             with self.subTest(server_mode=server_mode):
-                dead = _PrefillReq(rid="dead", return_hidden_states="last")
-                live = _PrefillReq(rid="live", return_hidden_states="last")
+                left = _PrefillReq(rid="left", return_hidden_states="last")
+                kept = _PrefillReq(rid="kept", return_hidden_states="last")
                 batch = SimpleNamespace(
-                    reqs=[dead, live],
+                    reqs=[left, kept],
                     chunked_req=None,
                     decoding_reqs=[],
                     return_logprob=False,
@@ -396,7 +396,7 @@ class TestDeadRows(CustomTestCase):
                 )
                 processor = replace(
                     _make_processor(self, server_mode),
-                    still_in_batch=lambda req, live=live: req is live,
+                    still_in_batch=lambda req, kept=kept: req is kept,
                 )
 
                 with (
@@ -412,22 +412,22 @@ class TestDeadRows(CustomTestCase):
                 ):
                     processor.process_batch_result_prefill(batch, result)
 
-                self.assertEqual(dead.output_ids, [])
-                self.assertEqual(dead.hidden_states, [])
-                self.assertEqual(live.output_ids, [8])
-                self.assertEqual(live.hidden_states, [[22.0]])
+                self.assertEqual(left.output_ids, [])
+                self.assertEqual(left.hidden_states, [])
+                self.assertEqual(kept.output_ids, [8])
+                self.assertEqual(kept.hidden_states, [[22.0]])
                 processor.output_streamer.stream_output.assert_called_once_with(
-                    [live], False, None
+                    [kept], False, None
                 )
 
-    def _check_dead_decode_row(self):
-        dead = _DecodeReq()
-        live = _DecodeReq()
-        for req in (dead, live):
+    def _check_decode(self):
+        left = _DecodeReq()
+        kept = _DecodeReq()
+        for req in (left, kept):
             req.return_hidden_states = False
             req.return_logprob = True
         batch = SimpleNamespace(
-            reqs=[dead, live],
+            reqs=[left, kept],
             return_logprob=True,
             spec_algorithm=SimpleNamespace(is_none=lambda: True),
             batch_size=lambda: 2,
@@ -442,7 +442,7 @@ class TestDeadRows(CustomTestCase):
         )
         processor = replace(
             _make_processor(self),
-            still_in_batch=lambda req: req is live,
+            still_in_batch=lambda req: req is kept,
             logprob_result_processor=Mock(),
         )
 
@@ -456,17 +456,17 @@ class TestDeadRows(CustomTestCase):
         ):
             processor.process_batch_result_decode(batch, result)
 
-        self.assertEqual(dead.output_ids, [])
-        self.assertEqual(live.output_ids, [8])
+        self.assertEqual(left.output_ids, [])
+        self.assertEqual(kept.output_ids, [8])
         append = processor.logprob_result_processor.append_output_token_logprobs
         append.assert_called_once()
         args, kwargs = append.call_args
-        self.assertEqual(args, (live, 8, -2.0))
+        self.assertEqual(args, (kept, 8, -2.0))
         self.assertEqual(kwargs["row"], 1)
         processor.beam_coordinator.commit_decode.assert_called_once_with(
-            [live], batch.forward_iter
+            [kept], batch.forward_iter
         )
-        processor.output_streamer.stream_output.assert_called_once_with([live], True)
+        processor.output_streamer.stream_output.assert_called_once_with([kept], True)
 
 
 class TestPrefillSkippedOutput(CustomTestCase):
