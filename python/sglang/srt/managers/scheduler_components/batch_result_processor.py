@@ -1555,20 +1555,35 @@ class SchedulerBatchResultProcessor:
                 known_mamba_boundary = bool(batch.mamba_track_mask_next_cpu[i])
 
             if completed_mamba_boundary and not lazy:
+                track_idx = batch.mamba_track_buffer_indices[i]
                 kv_storage_of(
                     batch.req_to_token_pool, batch.token_to_kv_pool_allocator
                 ).advance(
                     req,
                     tracking=TrackingAdvance(
                         boundary=req.kv.kv_committed_len - lookahead,
-                        last_position=batch.mamba_track_buffer_indices[i],
+                        last_position=track_idx,
+                        # Set from the slot this boundary wrote, not toggled: the
+                        # lookahead-1 flip below sees it only if this step launched
+                        # before the previous result was processed, so toggles alone
+                        # skip or repeat a boundary.
+                        next_position=batch.req_to_token_pool.get_mamba_ping_pong_other_idx(
+                            track_idx
+                        ),
                         preserve_previous=True,
                     ),
                 )
 
         # Called here (after update_finish_state) so req.finished() is valid
         # for mamba_lazy_post_decode_at_boundary inside.
-        should_update = completed_mamba_boundary if lazy else known_mamba_boundary
+        if lazy:
+            should_update = completed_mamba_boundary
+        elif lookahead == 0 and known_mamba_boundary is not None:
+            # The latest launched step is the one this result completes,
+            # recorded above.
+            should_update = False
+        else:
+            should_update = known_mamba_boundary
         if should_update is None or should_update:
             self._mamba_prefix_cache_update(
                 req,

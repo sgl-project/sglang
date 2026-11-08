@@ -196,6 +196,119 @@ class TestMambaBoundaryMaskReuse(unittest.TestCase):
                     self.assertTrue(cache_update.call_args.kwargs["known_boundary"])
 
 
+class TestMambaDecodeTrackSlotParity(unittest.TestCase):
+    """A decode track forward never writes the ping-pong slot that holds the latest
+    checkpoint, whatever batches the overlap scheduler runs between decode steps.
+
+    A request that finishes one step before a boundary donates that slot to the
+    tree while the in-flight boundary forward still writes its track slot; when
+    the two coincided, the tree's checkpoint at end - interval held the state
+    at end."""
+
+    def _run_overlap_loop(self, schedule: str):
+        """Drive event_loop_overlap over ``schedule``: 'D' launches the next decode
+        step, 'P' launches a non-decode batch (a prefill elsewhere); returns
+        (seq_len, written slot, latest-checkpoint slot) per boundary forward."""
+        req, batch = _make_batch()
+        req.sampling_params.max_new_tokens = 1 << 10
+        processor = _make_processor()
+        result = _make_result()
+        buffer = torch.tensor([10, 11])
+        batch.req_pool_indices = torch.tensor([0])
+        batch.req_to_token_pool = SimpleNamespace(
+            req_index_to_mamba_ping_pong_track_buffer_mapping=buffer[None, :],
+            get_mamba_ping_pong_other_idx=lambda idx: 1 - idx,
+        )
+        storage = SimpleNamespace()
+        storage.advance = lambda req, tracking: advance_tracking(storage, req, tracking)
+        batch.token_to_kv_pool_allocator = SimpleNamespace(storage=storage)
+        req.kv.req_pool_idx = 0
+        req.kv.mamba_ping_pong_track_buffer = buffer
+        req.kv.mamba_ping_pong_empty = [False, False]
+        req.kv.mamba_next_track_idx = 0
+        req.kv.mamba_last_track_idx = 1
+        writes = []
+
+        def alloc_for_decode(b, token_per_req):
+            for r in b.reqs:
+                r.kv.kv_committed_len += token_per_req
+            return torch.tensor([3], dtype=torch.int64)
+
+        def set_track_indices(b, track_positions=None):
+            set_mamba_track_indices_from_reqs(b, track_positions)
+            seq_len = int(b.seq_lens_cpu[0])
+            if seq_len % TRACK_INTERVAL == 0:
+                writes.append(
+                    (
+                        seq_len,
+                        int(b.mamba_track_indices[0]),
+                        int(buffer[req.kv.mamba_last_track_idx]),
+                    )
+                )
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.gracefully_exit = False
+        scheduler.ingest_requests = MagicMock(
+            side_effect=[[]] * len(schedule) + [StopIteration]
+        )
+        scheduler._engine_paused = False
+        scheduler.running_batch = batch
+        scheduler.should_process_last_batch_early = MagicMock(return_value=False)
+        scheduler.run_batch = MagicMock(return_value=result)
+        scheduler._apply_war_barrier = MagicMock()
+        scheduler.on_idle = MagicMock()
+        scheduler.is_generation = False
+        scheduler.last_batch = None
+        scheduler.invariant_checker = MagicMock()
+        steps = iter(schedule)
+
+        def get_next_batch_to_run(*, running_batch, last_batch):
+            del running_batch, last_batch
+            if next(steps) == "D":
+                batch.prepare_for_decode()
+                return SimpleNamespace(running_batch=batch, batch_to_run=batch)
+            return SimpleNamespace(running_batch=batch, batch_to_run=None)
+
+        scheduler.get_next_batch_to_run = get_next_batch_to_run
+        scheduler.process_batch_result = processor.process_batch_result_decode
+        with (
+            get_context().override_server_args(
+                mamba_radix_cache_strategy="extra_buffer",
+                mamba_track_interval=TRACK_INTERVAL,
+                _mamba_cache_chunk_size=TRACK_INTERVAL,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.alloc_for_decode",
+                side_effect=alloc_for_decode,
+            ),
+            patch(
+                "sglang.srt.managers.schedule_batch.set_mamba_track_indices_from_reqs",
+                side_effect=set_track_indices,
+            ),
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+        ):
+            with self.assertRaises(StopIteration):
+                scheduler.event_loop_overlap()
+        return writes
+
+    def test_boundary_forward_spares_the_latest_checkpoint(self):
+        # Seq lens run 3, 4, 5, ...: boundaries at 4, 8, 12, 16. One non-decode
+        # batch lands at each offset around the boundary at 8 (and one schedule
+        # has none); the boundary at 12 must still write the other slot.
+        schedules = ["D" * 14] + ["D" * j + "P" + "D" * (14 - j) for j in range(3, 9)]
+        for schedule in schedules:
+            with self.subTest(schedule=schedule):
+                writes = self._run_overlap_loop(schedule)
+                self.assertEqual([w[0] for w in writes], [4, 8, 12, 16])
+                for seq_len, written, latest in writes:
+                    self.assertNotEqual(
+                        written,
+                        latest,
+                        f"boundary forward at {seq_len} overwrites the checkpoint "
+                        f"slot {latest}: {writes}",
+                    )
+
+
 class TestMambaPrevTrackSeqlen(unittest.TestCase):
     def test_flip_names_the_checkpoint_in_the_other_slot(self):
         req, batch = _make_batch()
