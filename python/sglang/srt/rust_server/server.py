@@ -498,6 +498,7 @@ class RustServer:
                 default_max_new_tokens=cls._default_max_new_tokens(scheduler),
                 request_class=cls._request_input_class(),
                 server_added_custom_params=cls._server_added_custom_params(),
+                port_offset=port_offset,
             ),
             # None runs unpinned; otherwise the list carries the pinning decision.
             cores=server_cores,
