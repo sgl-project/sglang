@@ -1,10 +1,12 @@
 """gfx1250 MLA decode through aiter's Triton ``mla_decode_fwd``.
 
 ``aiter.ops.triton.attention.mla.mla_decode_fwd`` reads the MLA KV pool through
-block tables with a bf16 query; aiter picks the kernel behind it. Needs aiter
-with ROCm/aiter#5935. There is no other aiter kernel for a bf16 query on
-gfx1250, so no env turns it off; ``--decode-attention-backend triton`` leaves
-aiter.
+block tables with a bf16 query; aiter picks the kernel behind it. aiter without
+ROCm/aiter#5935 computes wrong outputs for batches it runs with one KV segment
+per sequence. aiter's ASM ``mla_decode_fwd`` also has a bf16-query FlyDSL kernel
+on gfx1250, but only in persistent mode at page size 1 with
+``AITER_MLA_DECODE_PS1_FLYDSL`` set; this path does not read that switch and has
+no env switch of its own. ``--decode-attention-backend triton`` leaves aiter.
 """
 
 from __future__ import annotations

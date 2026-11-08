@@ -58,6 +58,8 @@ def _backend(kv_dtype=torch.bfloat16, bs=1, triton=True):
     """An AiterAttnBackend holding only what MLA decode reads."""
     kv_buffer = torch.zeros((1024, 1, _KV_LORA_RANK + _ROPE_DIM), dtype=kv_dtype)
     backend = aiter_backend.AiterAttnBackend.__new__(aiter_backend.AiterAttnBackend)
+    if triton:
+        backend.use_aiter_triton_mla_decode = True
     backend.use_mla = True
     backend.input_dtype = torch.bfloat16
     backend.page_size = _PAGE_SIZE
@@ -455,6 +457,22 @@ class TestAiterGfx1250MlaDecodeDispatch(CustomTestCase):
     def test_no_triton_metadata_runs_the_asm_decode(self):
         """Batches without a block table must reach the ASM decode."""
         backend = _backend(triton=False)
+        self.assertIs(self._decode(backend, _layer(), 1), self.asm_out)
+        self.assertEqual(self.kernel.calls, [])
+
+    def test_metadata_without_triton_fields_runs_the_asm_decode(self):
+        """A backend built without __init__ and metadata without the gfx1250
+        fields, as test_aiter_fp8_q_unified_attention.py builds them, keep the
+        ASM decode."""
+        backend = _backend(triton=False)
+        fm = backend.forward_metadata
+        backend.forward_metadata = types.SimpleNamespace(
+            **{
+                name: getattr(fm, name)
+                for name in vars(fm)
+                if not name.startswith("triton_mla_")
+            }
+        )
         self.assertIs(self._decode(backend, _layer(), 1), self.asm_out)
         self.assertEqual(self.kernel.calls, [])
 

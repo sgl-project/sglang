@@ -426,6 +426,7 @@ class AiterAttnBackend(AttentionBackend):
 
     # declare here to avoid CI failure in test_aiter_fp8_q_unified_attention.py
     use_mla_auto_kv_splits: bool = False
+    use_aiter_triton_mla_decode: bool = False
 
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
@@ -762,6 +763,9 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
+            # Batches on the aiter Triton MLA decode do not read
+            # SGLANG_AITER_MLA_DECODE_BACKEND, SGLANG_AITER_MLA_GLUON or
+            # SGLANG_AITER_MLA_PERSIST.
             if is_gfx1250_supported():
                 self.use_aiter_triton_mla_decode = supports_aiter_triton_mla_decode(
                     input_dtype=self.input_dtype,
@@ -778,8 +782,8 @@ class AiterAttnBackend(AttentionBackend):
                         "qk_rope_head_dim > 0)"
                     ),
                 )
-            # gfx1250 does not use mla_gluon (_gluon_fn), so the gfx950 PS switch
-            # and capability log below are skipped there.
+            # aiter's mla_gluon asserts gfx950, so the gfx950 PS switch and
+            # capability log below do not apply on gfx1250.
             elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
@@ -1724,14 +1728,17 @@ class AiterAttnBackend(AttentionBackend):
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
         fm = self.forward_metadata
+        use_triton_mla = (
+            self.use_aiter_triton_mla_decode and fm.triton_mla_block_tables is not None
+        )
         # aiter's Triton mla_decode_fwd has no soft-cap argument, so a capped
         # layer would silently drop it. The ASM mla_decode_fwd asserts on one.
-        if fm.triton_mla_block_tables is not None and layer.logit_cap:
+        if use_triton_mla and layer.logit_cap:
             print_info_once(
                 "aiter gfx1250: MLA layers with logit_cap="
                 f"{layer.logit_cap} skip the aiter Triton MLA decode"
             )
-        if fm.triton_mla_block_tables is not None and not layer.logit_cap:
+        if use_triton_mla and not layer.logit_cap:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
