@@ -30,25 +30,43 @@ def _cfg(**kw):
     return SimpleNamespace(**base)
 
 
+def _platform(is_hip=False, is_sm120=False):
+    return SimpleNamespace(is_hip=is_hip, is_sm120=is_sm120)
+
+
 def _backends(overrides):
     return overrides.get("dsa_prefill_backend"), overrides.get("dsa_decode_backend")
 
 
 class TestDsaDcpBackendDefaults(CustomTestCase):
     def test_hip_defaults_to_triton(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=_platform(is_hip=True)):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("triton", "triton")
             )
 
     def test_cuda_defaults_to_trtllm(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=False)):
+        with patch(_PLATFORM, return_value=_platform()):
             self.assertEqual(
                 _backends(_dsa_dcp_overrides(_cfg())), ("trtllm", "trtllm")
             )
 
+    def test_sm120_defaults_to_flashinfer_sparse_mla(self):
+        with patch(_PLATFORM, return_value=_platform(is_sm120=True)):
+            self.assertEqual(
+                _backends(_dsa_dcp_overrides(_cfg())),
+                ("flashinfer_sparse_mla", "flashinfer_sparse_mla"),
+            )
+
+    def test_sm120_rejects_backends_without_partial_lse(self):
+        for name in ("dsa_prefill_backend", "dsa_decode_backend"):
+            with self.subTest(name=name):
+                with patch(_PLATFORM, return_value=_platform(is_sm120=True)):
+                    with self.assertRaisesRegex(ValueError, "SM120 DSA DCP"):
+                        _dsa_dcp_overrides(_cfg(**{name: "trtllm"}))
+
     def test_explicit_backend_is_kept(self):
-        with patch(_PLATFORM, return_value=SimpleNamespace(is_hip=True)):
+        with patch(_PLATFORM, return_value=_platform(is_hip=True)):
             overrides = _dsa_dcp_overrides(_cfg(dsa_decode_backend="triton"))
         self.assertEqual(_backends(overrides), ("triton", None))
 

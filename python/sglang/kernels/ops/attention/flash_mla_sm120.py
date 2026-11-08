@@ -727,7 +727,8 @@ def flashinfer_sparse_mla_forward(
     qk_rope_head_dim: int,
     sm_scale: float,
     skip_softmax_threshold_scale_factor: float | None,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Run FlashInfer's SM120 sparse MLA kernel on SGLang's packed DSA cache."""
     from flashinfer.mla import trtllm_batch_decode_with_kv_cache_mla
 
@@ -749,5 +750,21 @@ def flashinfer_sparse_mla_forward(
         bmm2_scale=1.0,
         kv_scale_format="arbitrary_fp32",
         skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        return_lse=return_lse,
     )
+    if return_lse:
+        output, lse = result
+        output = output.squeeze(1)
+        # SM120 kernels may use a finite negative sentinel for empty shards.
+        # DCP's cross-rank softmax merge requires the exact neutral state.
+        from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+
+        fixup_zero_kv_rows(
+            output,
+            lse,
+            seq_lens,
+            torch.arange(q.shape[0] + 1, dtype=torch.int32, device=q.device),
+            1,
+        )
+        return output, lse
     return result.squeeze(1)

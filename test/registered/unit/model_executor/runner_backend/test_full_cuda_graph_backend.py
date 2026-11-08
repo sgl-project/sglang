@@ -249,5 +249,41 @@ class TestCleanup(CustomTestCase):
         self.assertIsNone(backend._pool)
 
 
+class TestCaptureWorkspaceLifetime(CustomTestCase):
+    def test_cuda_workspace_clear_is_after_warmup_before_capture(self):
+        events = []
+        runner = _make_runner(enable_profile=False, profiler=None)
+        runner.device_module.synchronize.side_effect = lambda: events.append("sync")
+        backend = _make_backend(runner)
+        with (
+            mock.patch("torch.version.cuda", "13.0"),
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+            mock.patch.object(
+                torch._C,
+                "_cuda_clearCublasWorkspaces",
+                create=True,
+                side_effect=lambda: events.append("clear"),
+            ) as clear,
+        ):
+            backend.capture_one(ShapeKey(size=1), lambda: events.append("forward"))
+        clear.assert_called_once()
+        self.assertEqual(
+            events, ["sync", "forward", "sync", "forward", "sync", "clear", "forward"]
+        )
+
+    def test_non_cuda_build_does_not_clear_cublas(self):
+        runner = _make_runner(enable_profile=False, profiler=None)
+        backend = _make_backend(runner)
+        with (
+            mock.patch("torch.version.cuda", None),
+            mock.patch("torch.cuda.CUDAGraph", return_value="GRAPH"),
+            mock.patch.object(
+                torch._C, "_cuda_clearCublasWorkspaces", create=True
+            ) as clear,
+        ):
+            backend.capture_one(ShapeKey(size=1), lambda: None)
+        clear.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

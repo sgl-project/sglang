@@ -2714,13 +2714,25 @@ class DeepseekSparseAttnBackend(
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if topk_transform_method == TopkTransformMethod.RAGGED:
                 page_table_1 = topk_indices
+            sparse_lengths = metadata.dsa_cache_seqlens_int32
+            if self.dcp_size > 1:
+                page_table_1, sparse_lengths = localize_dcp_page_table(
+                    self._dcp_page_table_cache,
+                    metadata=metadata,
+                    layer_id=layer.layer_id,
+                    topk_indices=shared_topk_indices,
+                    page_table=page_table_1,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
+                )
             return self._forward_flashinfer_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
+                seq_lens=sparse_lengths,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
+                return_lse=self.dcp_size > 1,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -2905,13 +2917,25 @@ class DeepseekSparseAttnBackend(
         elif dsa_impl == "flashinfer_sparse_mla":
             if q_all is None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+            sparse_lengths = metadata.dsa_cache_seqlens_int32
+            if self.dcp_size > 1:
+                page_table_1, sparse_lengths = localize_dcp_page_table(
+                    self._dcp_page_table_cache,
+                    metadata=metadata,
+                    layer_id=layer.layer_id,
+                    topk_indices=shared_topk_indices,
+                    page_table=page_table_1,
+                    dcp_size=self.dcp_size,
+                    dcp_rank=self.dcp_rank,
+                )
             return self._forward_flashinfer_sparse_mla(
                 q_all=q_all,
                 kv_cache=kv_cache,
                 page_table_1=page_table_1,
-                seq_lens=metadata.dsa_cache_seqlens_int32,
+                seq_lens=sparse_lengths,
                 sm_scale=layer.scaling,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+                return_lse=self.dcp_size > 1,
             )
         elif dsa_impl == "flashmla_kv":
             if q_rope is not None:
@@ -3550,7 +3574,8 @@ class DeepseekSparseAttnBackend(
         seq_lens: torch.Tensor,
         sm_scale: float,
         skip_softmax_threshold_scale_factor: float | None,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.flash_mla_sm120 import (
             flashinfer_sparse_mla_forward,
         )
@@ -3569,6 +3594,7 @@ class DeepseekSparseAttnBackend(
             qk_rope_head_dim=self.qk_rope_head_dim,
             sm_scale=sm_scale,
             skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+            return_lse=return_lse,
         )
 
     def _forward_flashmla_kv(
