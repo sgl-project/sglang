@@ -74,20 +74,25 @@ def _rdna_grouped_num_warps(
     kv_dtype: torch.dtype,
     batch: int,
     head_tiles: int,
+    core_count: int,
 ) -> Optional[int]:
     """num_warps for stage 1 on RDNA without the CDNA hints, or None to keep them.
 
     The hints cap waves in flight, so the memory-bound GQA decode reads KV 1.4-2.7x slower
     at batch on gfx1151; served throughput at 64 requests rose 1.08x on gfx1201 and 1.26x on
-    gfx1100 without them. Measured on gfx1151, they still win for MLA, fp8 KV (dequant is emulated) and grids under 8 programs
-    per split, and dropping them is neutral at head_dim 256.
+    gfx1100 without them. Measured on gfx1151, they still win for MLA, fp8 KV (dequant is
+    emulated) and small grids (under 8 programs per split there, scaled up for bigger parts),
+    and dropping them is neutral at head_dim 256.
     """
     if block_dpe > 0 or block_dmodel > 128:
         return None
     if kv_dtype not in (torch.bfloat16, torch.float16):
         return None
     # Under CUDA graphs batch is the captured (padded) size, so this is decided per graph.
-    if batch * head_tiles < 8:
+    # The bar of 8 programs was tuned on gfx1151, which reports 20 cores (WGPs); a bigger part
+    # needs a bigger grid before the hints stop paying (W7900: 1 request on a 16/8 model was
+    # 0.98x at 8 programs). Scaled as a ratio, so it holds whether a part reports CUs or WGPs.
+    if batch * head_tiles < max(8, 8 * core_count // 20):
         return None
     # Batch-dependent, yet deterministic inference stays batch-invariant on this path: a request
     # alone vs in batches of 2-16 was bitwise identical on gfx1151 with Triton 3.6.
@@ -886,6 +891,7 @@ def _decode_grouped_att_m_fwd(
                 kv_dtype=k_buffer.dtype,
                 batch=batch,
                 head_tiles=head_tiles,
+                core_count=current_arch().num_sms,
             )
             if rdna_warps is not None:
                 extra_kargs = {}

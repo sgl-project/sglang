@@ -37,6 +37,7 @@ def _warps(
     kv_dtype=torch.bfloat16,
     batch=16,
     head_tiles=8,
+    core_count=20,
 ):
     return _rdna_grouped_num_warps(
         block_dmodel=block_dmodel,
@@ -44,6 +45,7 @@ def _warps(
         kv_dtype=kv_dtype,
         batch=batch,
         head_tiles=head_tiles,
+        core_count=core_count,
     )
 
 
@@ -84,6 +86,16 @@ class TestRdnaGroupedDecodeLaunch(CustomTestCase):
         self.assertIsNone(_warps(batch=1, head_tiles=4))
         self.assertEqual(_warps(batch=4, head_tiles=2), 2)
         self.assertEqual(_warps(batch=1, head_tiles=8), 2)
+
+    def test_tiny_grid_scales_with_core_count(self):
+        # gfx1151 reports 20 cores and sets the bar at 8 programs; a bigger part needs more.
+        # W7900 (gfx1100, 48 reported): 1 request on a 16/8 model ran 0.98x without the hints.
+        self.assertIsNone(_warps(batch=1, head_tiles=8, core_count=48))
+        self.assertIsNone(_warps(batch=2, head_tiles=8, core_count=48))
+        self.assertEqual(_warps(batch=4, head_tiles=8, core_count=48), 2)
+        # never below 8, even on a smaller part
+        self.assertIsNone(_warps(batch=1, head_tiles=4, core_count=8))
+        self.assertEqual(_warps(batch=1, head_tiles=8, core_count=8), 2)
 
 
 if __name__ == "__main__":
