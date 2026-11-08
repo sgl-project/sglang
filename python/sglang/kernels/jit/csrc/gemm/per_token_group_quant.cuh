@@ -346,21 +346,14 @@ struct QuantTrait {
       }
       const float quant_scale = inv_scale_ue8m0(exp);
       const auto scale2 = cast<T2>(float2{quant_scale, quant_scale});
-      // BF16 can represent the multiplier, so preserve NaNs instead of hiding
-      // them as +448. FP16 retains sanitization because its multiplier can
-      // overflow even for finite inputs (including zero * inf).
-      const auto max_clip = cast<T>(kMaxValue);
-      const auto max_clip2 = T2{max_clip, max_clip};
 #pragma unroll
       for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-        if constexpr (std::is_same_v<T, bf16_t> && !kPackedScale) {
-          // The FP32 scale route replaces v2, which maps NaN to -448.
-          const auto min_clip = cast<T>(-kMaxValue);
-          out[i] = static_cast<Q2>(__hmax2(__hmul2(in[i], scale2), T2{min_clip, min_clip}));
-        } else if constexpr (std::is_same_v<T, bf16_t>) {
-          out[i] = static_cast<Q2>(__hmin2_nan(__hmul2(in[i], scale2), max_clip2));
+        if constexpr (std::is_same_v<T, bf16_t>) {
+          out[i] = static_cast<Q2>(__hmul2(in[i], scale2));
         } else {
-          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), max_clip2));
+          // FP16 scaling can overflow even for finite inputs (zero * inf).
+          const auto max_clip = cast<T>(kMaxValue);
+          out[i] = static_cast<Q2>(__hmin2(__hmul2(in[i], scale2), T2{max_clip, max_clip}));
         }
       }
     } else {
