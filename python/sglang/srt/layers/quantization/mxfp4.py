@@ -952,12 +952,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 requires_grad=False,
             )
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
-                k31_decode_moe_supported,
+                cuda_mxfp4_decode_moe_supported,
             )
 
-            layer.k31_decode_moe = k31_decode_moe_supported(
+            layer.use_cuda_mxfp4_decode_moe = cuda_mxfp4_decode_moe_supported(
                 layer,
-                self.intermediate_size_per_partition,
+                "situ",
+                layer.w13_weight.shape[1] // 2,  # after the 128 padding
                 self.hidden_size,
                 self.with_bias,
                 self.flashinfer_mxfp4_moe_precision,
@@ -1601,7 +1602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
-            k31_decode_moe=layer.k31_decode_moe,
+            use_cuda_mxfp4_decode_moe=layer.use_cuda_mxfp4_decode_moe,
         )
         return self.runner.run(dispatch_output, quant_info)
 

@@ -137,7 +137,7 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
         MatchPrefixParams(key=RadixKey(array("q", prefix)))
     ).last_device_node
     held = cache.lock(base)
-    cache.evict(EvictParams(swa_num_tokens=len(old_suffix)))
+    cache.evict(EvictParams(window_num_tokens={"swa": len(old_suffix)}))
     cache.unlock(held)
 
     tokens = prefix + old_suffix[:8] + list(range(200, 208))
@@ -165,11 +165,11 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
             insert(tokens[:20])
         need = end - req.extend_end
         available = allocator.swa_available_size()
-        assert available + cache.swa_evictable_size() >= need, (
+        assert available + cache.window_evictable_size("swa") >= need, (
             f"prefill stalled at {req.extend_end}, protected={req.kv.cache_protected_len}"
         )
         if available < need:
-            cache.evict(EvictParams(swa_num_tokens=need - available))
+            cache.evict(EvictParams(window_num_tokens={"swa": need - available}))
         sent_before = req.start_send_idx
         row_before = row[:sent_before].clone()
         in_flight = set(sender.in_flight)
@@ -191,7 +191,7 @@ def _drive(backend, chunk_ends, *, sibling, swa_size=128):
                 remapped=not torch.equal(row[:sent_before], row_before),
                 protected=req.kv.cache_protected_len,
                 sent=req.start_send_idx,
-                swa_evicted=req.kv.get_evicted_seqlen(ComponentType.SWA),
+                swa_evicted=req.kv.get_evicted_seqlen("swa"),
             )
         )
 

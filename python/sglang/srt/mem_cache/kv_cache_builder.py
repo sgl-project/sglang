@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.pool_host.base import (
 from sglang.srt.mem_cache.pool_host.mha import prepare_mha_write_back_staging
 from sglang.srt.mem_cache.pool_host.page_unified import resolve_kv_host_geometry
 from sglang.srt.mem_cache.registry import TreeCacheBuildContext, create_tree_cache
+from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_loader.utils import get_resolved_model_impl
 from sglang.srt.runtime_context import (
@@ -392,6 +393,11 @@ def build_kv_cache(
         )
 
     req_to_token_pool, token_to_kv_pool_allocator = tp_worker.get_memory_pool()
+    # The tail a running request keeps of each window, which the prefix tree,
+    # PD peers and admission read from the storage alone.
+    kv_storage_of(req_to_token_pool, token_to_kv_pool_allocator).bind_window_retention(
+        sliding_window_size, draft_window_reaches
+    )
     mtp_draft_device_pools = tp_worker.model_runner.mtp_draft_device_pools
     # SWA the tree does not own must not gate prefix matching: a per-request ring,
     # or paged SWA beside the target's encoder-replay request window, which then
@@ -464,7 +470,6 @@ def build_kv_cache(
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
         swa_gates_prefix_match=swa_gates_prefix_match,
-        draft_window_reaches=draft_window_reaches,
         mtp_draft_device_pools=mtp_draft_device_pools,
         mtp_draft_mamba_pools=tp_worker.model_runner.mtp_draft_mamba_pools,
         sidecar_draft_device_pools=(

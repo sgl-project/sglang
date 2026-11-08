@@ -329,7 +329,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            s._on_step_processed(batch)
+            s._on_step_processed(batch, result)
 
         s.run_batch = run_batch
         s.process_batch_result = process_batch_result
