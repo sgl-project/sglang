@@ -1754,6 +1754,18 @@ class ServerArgs(DisaggServerArgsMixin):
                     "Automatically set kv_gather_degree=sp_degree=2; set "
                     "--ulysses-degree explicitly to keep the Ulysses exchange"
                 )
+            elif self._dit_num_attention_heads() % self.sp_degree:
+                # Ulysses splits attention heads across the SP ranks and fails
+                # at the first all-to-all; K/V gather keeps every head local
+                self.kv_gather_degree = self.sp_degree
+                self.sp_split_auto = True
+                logger.info(
+                    "Automatically set kv_gather_degree=sp_degree=%d: the DiT's "
+                    "%d attention heads do not divide across %d Ulysses ranks",
+                    self.sp_degree,
+                    self._dit_num_attention_heads(),
+                    self.sp_degree,
+                )
             else:
                 self.ulysses_degree = self.sp_degree
                 logger.info(
@@ -1788,6 +1800,12 @@ class ServerArgs(DisaggServerArgsMixin):
             # gather gets a first-class dimension (needed only once it
             # composes with Ulysses).
             self.ulysses_degree = self.kv_gather_degree
+
+    def _dit_num_attention_heads(self) -> int:
+        """Head count from the DiT arch config, or 0 when the config does not set it."""
+        dit_config = getattr(self.pipeline_config, "dit_config", None)
+        arch_config = getattr(dit_config, "arch_config", None)
+        return getattr(arch_config, "num_attention_heads", 0) or 0
 
     def _model_default_uses_cfg(self) -> bool:
         """
