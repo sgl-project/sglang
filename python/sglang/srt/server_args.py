@@ -34,6 +34,7 @@ from sglang.srt.arg_groups.arg_utils import (
     record_fields,
 )
 from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAction,
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
@@ -427,6 +428,17 @@ class ServerArgs:
             "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
             "--monokernel-backend msa.",
         )
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            parser.add_argument(
+                flag,
+                action=DeprecatedAction,
+                default=argparse.SUPPRESS,
+                help="Deprecated. Has no effect.",
+            )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",

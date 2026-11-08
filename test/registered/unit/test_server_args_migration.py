@@ -175,15 +175,33 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
             (True, Backend.DISABLED, Backend.DISABLED),
         )
 
+    def test_no_op_flags_still_parse_and_warn(self):
+        """Retired no-op flags keep old launch lines working: each one warns
+        and leaves the parsed arguments exactly as if it were absent."""
+        baseline = vars(self.parser.parse_args(["--model", "dummy"]))
+        for flag in (
+            "--disable-outlines-disk-cache",
+            "--show-time-cost",
+            "--triton-attention-reduce-in-fp32",
+        ):
+            with self.subTest(flag=flag):
+                with self.assertLogs(
+                    "sglang.srt.arg_groups.argparse_actions", level="WARNING"
+                ) as logs:
+                    args = self.parser.parse_args(["--model", "dummy", flag])
+                self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
+                self.assertEqual(vars(args), baseline)
+
     def test_each_deprecation_shape_does_its_job(self):
         """The four `Deprecated*Action` shapes, on a throwaway parser.
 
-        Only `DeprecatedStoreTrueAction` has registrations in `ServerArgs`
-        today (`--disable-cuda-graph`, covered above, and
-        `--enable-dp-attention`). The other three are kept for the next flag
-        that needs them, which makes this the only thing
-        standing between them and silent rot -- and it doubles as the worked
-        example of which shape to reach for.
+        `ServerArgs` registers `DeprecatedStoreTrueAction`
+        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`)
+        and the no-op form of `DeprecatedAction` (covered above). The other
+        two, and `DeprecatedAction` with `error_message=`, are kept for the
+        next flag that needs them, which makes this the only thing standing
+        between them and silent rot -- and it doubles as the worked example of
+        which shape to reach for.
         """
         from sglang.srt.arg_groups.argparse_actions import (
             DeprecatedAction,
