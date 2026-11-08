@@ -1,4 +1,4 @@
-"""XPU full top-k dispatch and paged-logits argument contracts."""
+"""XPU full top-k and candidate-indexer contracts."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -12,6 +12,8 @@ from sglang.test.ci.ci_register import register_xpu_ci
 register_xpu_ci(est_time=10, suite="stage-b-test-1-gpu-xpu")
 
 pytestmark = pytest.mark.skipif(not is_xpu(), reason="XPU required")
+
+DEVICE = "xpu"
 
 
 class TestXpuFullTopK:
@@ -126,3 +128,121 @@ class TestXpuFullTopK:
         topk_call = next(call for call in self.kernel_calls if call[0] == "topk")
         assert logits_call[3].tolist() == [1, 2, 2, 3]
         assert topk_call[2].tolist() == [[0, 1], [0, 1], [2, 3], [2, 3]]
+
+
+def test_xpu_candidate_prefill_and_decode(monkeypatch):
+    import sgl_kernel
+
+    from sglang.srt.layers.attention.dsv4.v41_indexer import dense_blocks
+
+    storage = torch.empty((3, 4352), dtype=torch.uint8)
+    codes = (torch.arange(64) % 7 + 1) * 17
+    storage[:, :4096] = (
+        codes.to(torch.uint8).reshape(1, 64, 1).expand(3, 64, 64).reshape(3, 4096)
+    )
+    storage[:, 4096:] = 127
+    cache = storage.to(DEVICE).view(3, 64, 1, 68)
+    query = torch.full((2, 1, 32, 64), 0x22, dtype=torch.int8, device=DEVICE)
+    scales = torch.full((2, 1, 32), 0x7F7F7F7F, dtype=torch.int32, device=DEVICE)
+    weights = torch.ones((2, 32), dtype=torch.float32, device=DEVICE)
+    positions = torch.tensor([9, 4], device=DEVICE)
+    lengths = torch.tensor([10, 5], dtype=torch.int32, device=DEVICE)
+    pages = torch.tensor([[2], [1]], dtype=torch.int32, device=DEVICE)
+    out = torch.empty((2, 3), dtype=torch.int32, device=DEVICE)
+    raw = torch.empty_like(out)
+
+    def reset_outputs():
+        out.fill_(-1)
+        raw.fill_(-1)
+
+    pool = SimpleNamespace(page_size=64, get_index_k_page_size=lambda ratio: 64)
+    backend = dense_blocks.DenseBlocksBackend(
+        token_to_kv_pool=pool,
+        req_to_token=None,
+        candidate_topk_blocks=2,
+        candidate_block_size=4,
+        use_deep_gemm_prefill=False,
+    )
+    prefill = SimpleNamespace(
+        positions=positions,
+        seq_lens_cpu=[10, 5],
+        rows_per_request=[1, 1],
+        compress_ratio=1,
+        indexer=object(),
+        x=torch.empty((2, 1), device=DEVICE),
+        q_lora=None,
+        freqs_cis=None,
+        kv_page_table=pages,
+        layer_id=0,
+        out_raw_indices=raw,
+        out_page_indices=out,
+        reset_outputs=reset_outputs,
+    )
+    metadata = SimpleNamespace(
+        rows_per_request=1,
+        page_table=pages,
+        compressed_seq_lens=lengths,
+        max_compressed_seq_len=10,
+        compressed_page_size=64,
+    )
+    decode = SimpleNamespace(
+        positions=positions,
+        paged_metadata=metadata,
+        out_page_indices=out,
+        reset_outputs=reset_outputs,
+    )
+    prepared = SimpleNamespace(q_fp4=query, q_sf=scales, weights=weights, k_cache=cache)
+    monkeypatch.setattr(
+        dense_blocks,
+        "_index_q_and_weights",
+        lambda **kwargs: (query.squeeze(1), scales.squeeze(1), weights),
+    )
+    monkeypatch.setattr(dense_blocks, "get_index_k_cache", lambda **kwargs: cache)
+    monkeypatch.setattr(
+        dense_blocks, "get_deep_gemm_decode_data", lambda *args: prepared
+    )
+
+    def check_output():
+        assert sorted(out[0].cpu().tolist()) == [132, 133, 134]
+        assert sorted(out[1].cpu().tolist()) == [66, 67, 68]
+
+    with patch.object(
+        sgl_kernel, "topk_among_blocks", wraps=sgl_kernel.topk_among_blocks
+    ) as topk:
+        published = backend.publish_prefill(prefill)
+        assert set(published.blocks[0].cpu().tolist()) == {1, 2}
+        assert set(published.blocks[1].cpu().tolist()) == {0, 1}
+        assert sorted(raw[0].cpu().tolist()) == [4, 5, 6]
+        check_output()
+        backend.consume_prefill(prefill, published)
+        check_output()
+        prefill.out_page_indices = None
+        backend.consume_prefill(prefill, published)
+        assert sorted(raw[0].cpu().tolist()) == [4, 5, 6]
+        published = backend.publish_decode(decode)
+        assert set(published.blocks[0].cpu().tolist()) == {1, 2}
+        check_output()
+        backend.consume_decode(decode, published)
+        check_output()
+        assert topk.call_count >= 8
+
+        out = torch.empty((4, 3), dtype=torch.int32, device=DEVICE)
+        raw = torch.empty_like(out)
+        prepared.q_fp4 = query.repeat(2, 1, 1, 1)
+        prepared.q_sf = scales.repeat(2, 1, 1)
+        prepared.weights = weights.repeat(2, 1)
+        metadata.rows_per_request = 2
+        metadata.page_table = torch.tensor(
+            [[2], [2], [1], [1]], dtype=torch.int32, device=DEVICE
+        )
+        metadata.compressed_seq_lens = torch.tensor(
+            [0, 2, 9, 10], dtype=torch.int32, device=DEVICE
+        )
+        decode.positions = torch.tensor([0, 1, 8, 9], device=DEVICE)
+        decode.out_page_indices = out
+        published = backend.publish_decode(decode)
+        assert out[0].cpu().tolist() == [-1, -1, -1]
+        assert sorted(out[1].cpu().tolist()) == [-1, 128, 129]
+        backend.consume_decode(decode, published)
+        assert out[0].cpu().tolist() == [-1, -1, -1]
+        assert sorted(out[1].cpu().tolist()) == [-1, 128, 129]
