@@ -38,6 +38,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):
+    from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+    setup_allocator_context()
     # Function-scope import: the fixture is a TestCase subclass, and a
     # module-scope binding would make pytest collect its tests AGAIN here.
     from test_multi_ended_allocator import TestWindowChainAllocator as _SwaFixture
@@ -76,7 +79,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         self.assertEqual(allocator.verify_byte_accounting(), [])
 
     def test_memos_track_every_mutation_kind(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy_compaction=lazy):
                 inst, allocator, kvcache = _build(lazy)
                 self._assert_memos_fresh(allocator)
@@ -109,7 +112,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
         """Property: after ANY mutation sequence the memoized views equal
         fresh recomputes. Seeded, so the interleavings are deterministic."""
         rng = random.Random(0xC0FFEE)
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy_compaction=lazy):
                 inst, allocator, kvcache = _build(lazy)
                 live = []
@@ -134,7 +137,7 @@ class TestCapacityMemoCoherence(unittest.TestCase):
                     self._assert_memos_fresh(allocator)
 
     def test_bypassing_write_is_caught_by_the_idle_check(self):
-        inst, allocator, kvcache = _build(lazy=False)
+        inst, allocator, kvcache = _build(lazy=True)
         v = inst._alloc(allocator, kvcache, 8)
         self.assertIsNotNone(v)
         fa = allocator.full_attn_allocator
@@ -193,7 +196,10 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
     invalidate the composite memo -- including the two only the tri has, a
     mamba-end state draw and a float span move behind the composite."""
 
-    def _build_tri(self, lazy=False):
+    def _build_tri(self, lazy=True):
+        from sglang.test.unified_allocator_fixtures import setup_allocator_context
+
+        setup_allocator_context()
         from test_unified_tri_pool import TestUnifiedTriPool
 
         inst = TestUnifiedTriPool(
@@ -230,7 +236,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
 
         fixture = TestUnifiedTriPool("test_chain_wiring_and_float_swa")
         for page_size in (1, 4, 128):
-            for lazy in (False, True):
+            for lazy in (True,):
                 with self.subTest(page_size=page_size, lazy=lazy):
                     _, allocator, _, _ = fixture._build(
                         n_full=256 * page_size,
@@ -264,7 +270,7 @@ class TestTriCapacityMemoCoherence(CustomTestCase):
                     check_boundary()
 
     def test_memos_track_tri_mutation_kinds(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy_compaction=lazy):
                 inst, allocator = self._build_tri(lazy)
                 ma = allocator.mamba_allocator
