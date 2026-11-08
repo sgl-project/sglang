@@ -99,6 +99,12 @@ def main() -> int:
     ci_register = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(ci_register)
     cuda = ci_register.HWBackend.CUDA
+    spec = importlib.util.spec_from_file_location(
+        "runner_configs", os.path.join("scripts", "ci", "runner_configs.py")
+    )
+    runner_configs = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(runner_configs)
+    known_runner_configs = set(runner_configs.load())
     # No CUDA/CPU workflow passes `run_suite.py --nightly`, so a nightly=True
     # registration on these backends is filtered out of every run.
     no_nightly_flag = (cuda, ci_register.HWBackend.CPU)
@@ -116,6 +122,7 @@ def main() -> int:
     legacy_shape = []  # (file, suite, stage, runner_config) -- has a -test- split
     non_dispatchable = []  # (file, suite) -- legacy CUDA suite no workflow invokes
     nightly_flagged = []  # (file, backend, suite) -- nightly=True on CUDA/CPU
+    unknown_runner_config = []  # (file, runner_config) -- absent from runner_configs.yml
     dead_tests = []  # (file) -- TestCase classes that `python3 file.py` never runs
     taxonomy_violations = []
     for f in files:
@@ -134,6 +141,12 @@ def main() -> int:
         if _defines_testcase(tree) and not _main_runs_tests(tree):
             dead_tests.append(f)
         for r in registries:
+            if (
+                r.backend == cuda
+                and r.runner_config is not None
+                and r.runner_config not in known_runner_configs
+            ):
+                unknown_runner_config.append((f, r.runner_config))
             if r.nightly and r.backend in no_nightly_flag:
                 nightly_flagged.append((f, r.backend.name, r.effective_suite))
             # Pure legacy form on a CUDA registry: suite set, stage/runner unset.
@@ -184,6 +197,16 @@ def main() -> int:
         )
         for f, suite in non_dispatchable:
             print(f'  {f}\n    suite="{suite}"  ->  stage="...", runner_config="..."')
+        print()
+        exit_code = 1
+    if unknown_runner_config:
+        print(
+            "ERROR: CUDA test(s) register a runner_config missing from "
+            "scripts/ci/runner_configs.yml, so /rerun-test cannot dispatch them. "
+            "Add the runner_config there or register on an existing one:\n"
+        )
+        for f, runner_config in unknown_runner_config:
+            print(f'  {f}\n    runner_config="{runner_config}"')
         print()
         exit_code = 1
     if nightly_flagged:
