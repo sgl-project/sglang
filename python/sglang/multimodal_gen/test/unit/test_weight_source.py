@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
 import pytest
+from huggingface_hub import constants as hf_constants
+from huggingface_hub.errors import HfHubHTTPError, RepositoryNotFoundError
 
 from sglang.multimodal_gen.runtime.weights.source import (
     NoSafetensorsWeightsError,
@@ -269,6 +272,53 @@ def test_remote_safetensors_shards_use_one_pinned_revision(tmp_path):
     assert "transformer/quant_model_description_w8a8.json" in {
         call.kwargs["filename"] for call in hub_download.call_args_list
     }
+
+
+def _cache_snapshot(cache_dir, monkeypatch):
+    """Cache owner/repo@main as an earlier run would have left it."""
+    sha = "a" * 40
+    repo_dir = cache_dir / "models--owner--repo"
+    (repo_dir / "refs").mkdir(parents=True)
+    (repo_dir / "refs" / "main").write_text(sha)
+    snapshot = repo_dir / "snapshots" / sha
+    snapshot.mkdir(parents=True)
+    (snapshot / "model.safetensors").write_bytes(b"cached")
+    monkeypatch.setattr(hf_constants, "HF_HUB_CACHE", str(cache_dir))
+    return sha, snapshot
+
+
+def _hub_error(error_type, status_code):
+    request = httpx.Request("GET", "https://huggingface.co/api/models/owner/repo")
+    return error_type(
+        f"{status_code}", response=httpx.Response(status_code, request=request)
+    )
+
+
+def test_hub_rate_limit_falls_back_to_cached_snapshot(tmp_path, monkeypatch):
+    sha, snapshot = _cache_snapshot(tmp_path, monkeypatch)
+
+    with patch(
+        "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+        side_effect=_hub_error(HfHubHTTPError, 429),
+    ):
+        resolved = resolve_safetensors_weight_set("owner/repo")
+
+    assert resolved.inventory.resolved_revision == sha
+    assert resolved.selected_files == ("model.safetensors",)
+    assert materialize_weight_set(resolved) == (str(snapshot / "model.safetensors"),)
+
+
+def test_hub_repo_not_found_is_not_masked_by_cache(tmp_path, monkeypatch):
+    _cache_snapshot(tmp_path, monkeypatch)
+
+    with (
+        patch(
+            "sglang.multimodal_gen.runtime.weights.source.HfApi.model_info",
+            side_effect=_hub_error(RepositoryNotFoundError, 404),
+        ),
+        pytest.raises(RepositoryNotFoundError),
+    ):
+        resolve_safetensors_weight_set("owner/repo")
 
 
 def test_materialize_local_weight_returns_selected_file(tmp_path):

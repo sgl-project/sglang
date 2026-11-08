@@ -11,9 +11,14 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 from urllib.parse import unquote, urlparse
 
+import httpx
 from huggingface_hub import HfApi, hf_hub_download, snapshot_download
-from huggingface_hub.errors import LocalEntryNotFoundError
+from huggingface_hub.errors import HfHubHTTPError, LocalEntryNotFoundError
 from huggingface_hub.utils import validate_repo_id
+
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
 
 WeightSourceKind = Literal["local", "huggingface"]
 
@@ -275,10 +280,28 @@ def resolve_weight_inventory(source: WeightSource) -> WeightInventory:
         )
 
     assert source.repo_id is not None
-    model_info = HfApi().model_info(
-        source.repo_id,
-        revision=source.revision,
-    )
+    try:
+        model_info = HfApi().model_info(
+            source.repo_id,
+            revision=source.revision,
+        )
+    except (HfHubHTTPError, httpx.TransportError) as error:
+        # Only a rate limit, a server error, or a lost connection falls back; a
+        # missing repo, revision, or access right still fails here.
+        if isinstance(error, HfHubHTTPError) and not (
+            error.response.status_code == 429 or error.response.status_code >= 500
+        ):
+            raise
+        cached = _cached_hub_inventory(source)
+        if cached is None:
+            raise
+        logger.warning(
+            "Hub API lookup of %s failed (%s); using cached snapshot %s",
+            source.repo_id,
+            error,
+            cached.resolved_revision,
+        )
+        return cached
     files = tuple(sibling.rfilename for sibling in model_info.siblings)
     return WeightInventory(
         source=source,
@@ -292,7 +315,8 @@ def _cached_hub_inventory(source: WeightSource) -> WeightInventory | None:
 
     Returns None when the revision is not cached. The listing holds only the
     files downloaded so far, so callers must use it only to find a file they
-    name exactly, never to choose among candidates.
+    name exactly, never to choose among candidates, unless the Hub API cannot
+    be reached and the cached listing is the only one left.
     """
     assert source.repo_id is not None
     try:
