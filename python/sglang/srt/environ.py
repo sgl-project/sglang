@@ -1871,6 +1871,13 @@ class Envs:
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
+    # Handle queued detokenizer outputs in one pass, waking each stream once;
+    # off, streams wake every batch_notify_size rows and after each output.
+    SGLANG_ENABLE_TOKENIZER_OUTPUT_DRAIN = EnvBool(True)
+    # Bounds on one pass, whose first wakeup waits for all of it. Arbitrary;
+    # keep outputs below 20, where incremental streaming warns of a backlog.
+    SGLANG_TOKENIZER_MAX_RECV_PER_DRAIN = EnvInt(16)
+    SGLANG_TOKENIZER_MAX_ROWS_PER_DRAIN = EnvInt(4096)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 
     # ===================================================================
