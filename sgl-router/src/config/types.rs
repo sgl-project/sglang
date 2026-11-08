@@ -381,6 +381,8 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
+    /// Extra `model` values served as `id` (`--model-alias`); only `id` is advertised.
+    pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
     pub tokenizer_path: Option<String>,
@@ -419,6 +421,39 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
+}
+
+impl ModelConfig {
+    /// Canonicalize an alias, preserving an optional LoRA suffix. Match whole
+    /// names before suffixes, then the longest name, so URI colons and aliases
+    /// that extend another alias are not mistaken for adapter separators.
+    pub fn canonical_alias(&self, model: &str) -> Option<String> {
+        if model == self.id {
+            return None;
+        }
+        if self.aliases.iter().any(|alias| alias == model) {
+            return Some(self.id.clone());
+        }
+        let (name, adapter) = std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .filter_map(|name| {
+                model
+                    .strip_prefix(name.as_str())?
+                    .strip_prefix(':')
+                    .map(|adapter| (name, adapter))
+            })
+            .max_by_key(|(name, _)| name.len())?;
+        (name != &self.id).then(|| format!("{}:{adapter}", self.id))
+    }
+
+    /// `model` as served: a `--model-alias` names `id`.
+    pub fn served_name<'a>(&'a self, model: &'a str) -> &'a str {
+        if self.aliases.iter().any(|alias| alias == model) {
+            &self.id
+        } else {
+            model
+        }
+    }
 }
 
 /// External KV Indexer client settings.
@@ -510,6 +545,14 @@ pub struct CacheAwareConfig {
     /// How long a routed prompt credits its worker before KV events confirm
     /// it; 0 disables.
     pub pending_prefix_ttl_ms: u64,
+    /// Max requests one pending stake may attract before later requests fall
+    /// through to the confirmed tree and the load policy; 0 = unlimited.
+    pub pending_prefix_max_followers: u64,
+    /// Confirmed-first mode when set: consult and stake pending prefixes only
+    /// where a stake is strictly deeper than the confirmed match and while that
+    /// match covers less than this share of the prompt. `None` keeps the
+    /// original always-merge behavior.
+    pub pending_prefix_consult_below: Option<f64>,
 }
 
 impl Default for CacheAwareConfig {
@@ -521,6 +564,8 @@ impl Default for CacheAwareConfig {
             bootstrap_fetch_timeout_cap_ms: DEFAULT_KV_BOOTSTRAP_FETCH_TIMEOUT_CAP_MS,
             bootstrap_seed_required: false,
             pending_prefix_ttl_ms: 0,
+            pending_prefix_max_followers: 0,
+            pending_prefix_consult_below: None,
         }
     }
 }

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Tuple
 
 import torch
 
-from sglang.srt.utils import is_cuda
+from sglang.kernels.arch import current_arch
 
 from .full_topk import FullTopKIndexer
 from .types import (
@@ -19,6 +19,7 @@ from .types import (
     DecodeInputs,
     PrefillCandidates,
     PrefillInputs,
+    RowShard,
 )
 
 if TYPE_CHECKING:
@@ -32,18 +33,19 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
+    "RowShard",
     "has_dense_fp4_indexer",
-    "is_sm100_or_newer",
+    "is_sm100",
     "make_candidate_indexer",
     "make_full_topk_indexer",
 ]
 
 
 @functools.cache
-def is_sm100_or_newer() -> bool:
-    # DeepGEMM's fp8_fp4 mqa-logits kernels need SM100+; Hopper and non-CUDA devices
-    # take the torch indexer.
-    return is_cuda() and torch.cuda.get_device_capability()[0] >= 10
+def is_sm100() -> bool:
+    # The DeepGEMM fp8_fp4 mqa-logits paths are SM100-family only; other devices
+    # (Hopper, SM120, non-CUDA) take the torch / Triton indexer.
+    return current_arch().is_sm(10)
 
 
 @functools.cache
@@ -59,18 +61,7 @@ def has_dense_fp4_indexer() -> bool:
 
 @functools.cache
 def _use_deep_gemm_prefill() -> bool:
-    # A CP rank scores rank-local rows, which only DeepGEMM serves, so CP ignores the env.
-    from sglang.srt.environ import envs
-    from sglang.srt.runtime_context import get_parallel
-
-    return (
-        is_sm100_or_newer()
-        and has_dense_fp4_indexer()
-        and (
-            get_parallel().attn_cp_size > 1
-            or not envs.SGLANG_DSV41_TORCH_PREFILL_INDEXER.get()
-        )
-    )
+    return is_sm100() and has_dense_fp4_indexer()
 
 
 def make_full_topk_indexer(
@@ -82,7 +73,7 @@ def make_full_topk_indexer(
         token_to_kv_pool=token_to_kv_pool,
         req_to_token=req_to_token,
         use_deep_gemm_prefill=_use_deep_gemm_prefill(),
-        use_deep_gemm_decode=is_sm100_or_newer(),
+        use_deep_gemm_decode=is_sm100(),
     )
 
 
@@ -107,7 +98,7 @@ def make_candidate_indexer(
         use_deep_gemm_prefill=use_deep_gemm_prefill,
     )
     # Without candidate blocks no layer is a candidate source or consumer.
-    if not is_sm100_or_newer() or candidate_topk_blocks <= 0:
+    if not is_sm100() or candidate_topk_blocks <= 0:
         return dense_blocks, dense_blocks
 
     from sglang.srt.layers.deep_gemm_wrapper.configurer import (
@@ -127,8 +118,8 @@ def make_candidate_indexer(
         candidate_topk_blocks=candidate_topk_blocks,
         candidate_block_size=candidate_block_size,
     )
-    # A CP rank's rows are an interleaved subset of the batch; the torch prefill
-    # env keeps the sparse table on decode only.
+    # A CP rank's rows are an interleaved subset of the batch, and without the dense
+    # fp4 indexer prefill scores on torch: both keep the sparse table on decode only.
     if not use_deep_gemm_prefill or get_parallel().attn_cp_size > 1:
         return dense_blocks, sparse_table
     return sparse_table, sparse_table
