@@ -766,8 +766,6 @@ class Scheduler(
 
         self.maybe_init_mm_feature_receive_budget()
 
-        self.init_request_receiver()
-
         self.init_dp_attn_adapter()
 
         self.init_pool_stats_observer()
@@ -787,6 +785,8 @@ class Scheduler(
         self.init_beam_coordinator()
 
         self.init_request_retirer()
+
+        self.init_request_receiver()
 
         self.maybe_init_decode_offload_manager()
 
@@ -2651,7 +2651,7 @@ class Scheduler(
             server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
-            retire_unadmitted_request=self.retire_unadmitted_request,
+            request_retirer=self.request_retirer,
             get_last_batch=lambda: self.last_batch,
             rust_server_mode=envs.SGLANG_RUST_SERVER.get(),
             scripted_scheduler_hook=self.scripted_scheduler_hook,
@@ -2888,6 +2888,7 @@ class Scheduler(
             hisparse_coordinator=self.hisparse_coordinator,
             uocr_runtime=self.uocr_runtime,
             send_abort_output=self.send_abort_output,
+            stream_output=self.output_streamer.stream_output,
         )
 
     @staticmethod
@@ -3304,7 +3305,7 @@ class Scheduler(
                 if error_msg:
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.retire_unadmitted_request(req)
+                    self.request_retirer.retire_unadmitted(req)
                     return
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
@@ -3319,7 +3320,7 @@ class Scheduler(
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.retire_unadmitted_request(req)
+                    self.request_retirer.retire_unadmitted(req)
                     return
 
         elif (
@@ -3741,24 +3742,6 @@ class Scheduler(
         self._retry_storage_prefetch(req)
         return True
 
-    def retire_unadmitted_request(self, req: Req) -> None:
-        """Finish a request rejected before it was queued: at intake, or at a
-        disaggregation queue's door."""
-        # `update_finish_state` returns early once `finished()`, so an already
-        # set `finished_reason` is what the client receives; report the same.
-        reason = req.finished_reason or req.to_finish
-        req.time_stats.trace_ctx.abort(abort_info={"reason": reason.message})
-        req.update_finish_state()
-        # Holds no device KV, but the release still matters: `create_req` marked
-        # its streaming session in flight, PREFILL's `_prefetch_kvcache` armed the
-        # cache's paced retry for its handle, and a retracted request keeps its
-        # host KV backup; nothing else clears them.
-        self.request_retirer.release(req, checkpoint=False)
-        # Like `find_active_slot`, the detached request also leaves its session.
-        if req.session is not None and req.session.streaming:
-            req.session = None
-        self.output_streamer.stream_output([req], req.return_logprob)
-
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
         if not self._set_or_validate_priority(req):
             return
@@ -3799,7 +3782,7 @@ class Scheduler(
         """Return a sampling-mask validation error without running the model."""
         logger.error(f"{error_msg}, {req.rid=}")
         prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-        self.retire_unadmitted_request(req)
+        self.request_retirer.retire_unadmitted(req)
 
     def _set_or_validate_priority(self, req: Req) -> bool:
         """Set the default priority value, or abort the request based on the priority scheduling mode."""

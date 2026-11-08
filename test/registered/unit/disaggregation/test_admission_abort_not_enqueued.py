@@ -38,6 +38,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.srt.mem_cache.common import RetractionBackup
 from sglang.srt.runtime_context import publish, reset_context
@@ -69,23 +70,23 @@ def _make_req(prompt_len=1500, session=None):
 def _make_scheduler():
     """One stub for both halves.
 
-    `retire_unadmitted_request` is a spy wrapping the real method, so a door
-    test still asserts the call *and* runs the body -- otherwise the doors and
-    the retirement are only ever tested apart, and a step missing from the
+    `request_retirer.retire_unadmitted` is a spy wrapping the real method, so a
+    door test still asserts the call *and* runs the body -- otherwise the doors
+    and the retirement are only ever tested apart, and a step missing from the
     retirement passes every door test.
     """
     beam_coordinator = MagicMock()
-    sched = SimpleNamespace(
-        output_streamer=MagicMock(),
+    output_streamer = MagicMock()
+    retirer = release_only_retirer(MagicMock(), beam_coordinator=beam_coordinator)
+    retirer.stream_output = output_streamer.stream_output
+    retirer.retire_unadmitted = MagicMock(
+        side_effect=lambda req: RequestRetirer.retire_unadmitted(retirer, req)
+    )
+    return SimpleNamespace(
+        output_streamer=output_streamer,
         beam_coordinator=beam_coordinator,
-        request_retirer=release_only_retirer(
-            MagicMock(), beam_coordinator=beam_coordinator
-        ),
+        request_retirer=retirer,
     )
-    sched.retire_unadmitted_request = MagicMock(
-        side_effect=lambda req: Scheduler.retire_unadmitted_request(sched, req)
-    )
-    return sched
 
 
 def _prefill_queue(sched):
@@ -161,7 +162,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     _admit_decode(q, req)
                     q._create_receiver_and_enqueue.assert_not_called()
                     self.assertEqual(q.pending_reqs, [])
-                sched.retire_unadmitted_request.assert_called_once_with(req)
+                sched.request_retirer.retire_unadmitted.assert_called_once_with(req)
 
     def test_reentering_prefill_request_is_not_retired(self):
         """A preempted prefill requeue must reach its queue, which owns release.
@@ -188,7 +189,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                 q = _prefill_queue(sched)
                 _admit_prefill(q, req)
                 self.assertEqual(list(q.queue), [req])
-                sched.retire_unadmitted_request.assert_not_called()
+                sched.request_retirer.retire_unadmitted.assert_not_called()
                 self.assertIsInstance(req.to_finish, FINISH_ABORT)
 
     def test_retracted_decode_request_is_not_retired(self):
@@ -222,7 +223,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     sched = _make_scheduler()
                     q = _decode_queue(sched)
                     _admit_decode(q, req, **{flag: True})
-                    sched.retire_unadmitted_request.assert_not_called()
+                    sched.request_retirer.retire_unadmitted.assert_not_called()
                     self.assertIsInstance(req.to_finish, FINISH_ABORT)
                     if flag == "is_retracted":
                         self.assertEqual(list(q.retracted_queue), [req])
@@ -251,7 +252,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         _admit_decode(q, req, is_retracted=True)
 
         self.assertEqual(list(q.retracted_queue), [])
-        sched.retire_unadmitted_request.assert_called_once_with(req)
+        sched.request_retirer.retire_unadmitted.assert_called_once_with(req)
         tree_cache = sched.request_retirer.tree_cache
         tree_cache.discard_kv_cache_backup.assert_called_once_with(backup)
         self.assertIsNone(req.kv.retraction_backup)
@@ -290,7 +291,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q._create_receiver_and_enqueue.assert_called_once()
                     receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
                     receiver.init.assert_called_once_with(0)
-                sched.retire_unadmitted_request.assert_not_called()
+                sched.request_retirer.retire_unadmitted.assert_not_called()
 
     def test_valid_request_still_admitted(self):
         for door in ("prefill", "decode"):
@@ -307,7 +308,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
                     q._create_receiver_and_enqueue.assert_called_once()
                     receiver = q._create_receiver_and_enqueue.return_value.kv_receiver
                     receiver.init.assert_called_once_with(0)
-                sched.retire_unadmitted_request.assert_not_called()
+                sched.request_retirer.retire_unadmitted.assert_not_called()
 
     def test_null_mode_is_deliberately_untouched(self):
         """The bug is disaggregation-only; NULL mode must keep enqueuing.
@@ -345,7 +346,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
 
         sched = _make_scheduler()
-        Scheduler.retire_unadmitted_request(sched, req)
+        RequestRetirer.retire_unadmitted(sched.request_retirer, req)
 
         # PREFILL arms the cache's paced-retry set via `_prefetch_kvcache`
         # before the door, and only this call clears it again.
@@ -369,7 +370,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
         req.set_finish_with_abort(ERROR_MSG)
 
         sched = _make_scheduler()
-        Scheduler.retire_unadmitted_request(sched, req)
+        RequestRetirer.retire_unadmitted(sched.request_retirer, req)
 
         session.abort_req.assert_not_called()
         self.assertIs(req.session, session)

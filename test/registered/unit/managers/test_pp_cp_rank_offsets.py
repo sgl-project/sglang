@@ -57,7 +57,7 @@ def _make_receiver() -> SchedulerRequestReceiver:
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
-        retire_unadmitted_request=lambda req: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
         rust_server_mode=False,
     )
