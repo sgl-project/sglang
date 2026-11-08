@@ -33,7 +33,9 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 _is_cuda = current_platform.is_cuda()
-_SANA_VIDEO2_ROPE = BitExactFusionGate("SANA-Video 2.0 fused RoPE")
+# Per-signature: the linear (head_dim 128) and softmax (head_dim 256) blocks and
+# every token count are verified against the eager chain independently.
+_SANA_VIDEO2_ROPE = BitExactFusionGate("SANA-Video 2.0 fused RoPE", per_signature=True)
 
 
 def _apply_rope(x: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
@@ -79,7 +81,10 @@ def _apply_rope_pair(
         q_out, k_out = fused_interleaved_rope_fp64(q_bshd, k_bshd, cos, sin)
         return q_out.transpose(1, 2), k_out.transpose(1, 2)
 
-    return _SANA_VIDEO2_ROPE.run(fused, reference, equal=tensors_equal, logger=logger)
+    sig = (tuple(q.shape), tuple(q.stride()), tuple(k.stride()), q.device.index)
+    return _SANA_VIDEO2_ROPE.run(
+        fused, reference, sig=sig, equal=tensors_equal, logger=logger
+    )
 
 
 class SanaVideo2RotaryPosEmbed(WanRotaryPosEmbed):

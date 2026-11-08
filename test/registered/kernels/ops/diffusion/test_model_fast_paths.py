@@ -997,6 +997,7 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     gate = sana_video2._SANA_VIDEO2_ROPE
     gate.disabled = False
     gate.verified = False
+    gate.verified_sigs.clear()
     batch, frames, height, width = 2, 3, 4, 5
     rope = sana_video2.SanaVideo2RotaryPosEmbed(head_dim, (1, 1, 1)).to("cuda")
     freqs = rope((frames, height, width), torch.device("cuda"))
@@ -1011,8 +1012,11 @@ def test_sana_video2_rope_pair_is_bit_exact(heads, head_dim):
     assert torch.equal(q_out, q_ref)
     assert torch.equal(k_out, k_ref)
     assert q_out.stride() == q_ref.stride()
-    assert gate.verified
+    sig = (tuple(q.shape), tuple(q.stride()), tuple(k.stride()), q.device.index)
+    assert gate.is_verified(sig)
     assert not gate.disabled
+    # a different token count is a new signature and is verified on its own
+    assert not gate.is_verified((tuple(q.shape[:2]) + (tokens + 1, head_dim),) + sig[1:])
 
 
 # -------------------------------------------------------------------------
