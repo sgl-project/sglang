@@ -8,7 +8,7 @@ If you want a high-level endpoint that can automatically handle chat templates, 
 
 ## `/generate` Endpoint
 
-The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api). The object is defined at `io_struct.py::GenerateReqInput`. You can also read the source code to find more arguments and docs.
+The `/generate` endpoint accepts the following parameters in JSON format. For detailed usage, see the [native API doc](./native_api). The request object is defined by the `GenerateReqInput` class in [`io_struct.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/managers/io_struct.py), which is the full list of request fields; the table below covers the most common ones. You can also read the source code to find more arguments and docs.
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -32,7 +32,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>input_ids</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[List[List[int]], List[int]]] = None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The token IDs for text; one can specify either text or input_ids.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The token IDs for text; one can specify either text or input_ids. Empty list is not allowed.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>input_embeds</td>
@@ -119,7 +119,7 @@ The `/generate` endpoint accepts the following parameters in JSON format. For de
 
 ## Sampling parameters
 
-The object is defined at `sampling_params.py::SamplingParams`. You can also read the source code to find more arguments and docs.
+The object is defined by the `SamplingParams` class in [`sampling_params.py`](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/sampling/sampling_params.py), which is the full list of sampling parameters; the sections below cover the most common ones. You can also read the source code to find more arguments and docs.
 
 ### Note on defaults
 
