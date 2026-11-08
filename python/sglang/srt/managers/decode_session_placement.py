@@ -92,6 +92,20 @@ class DecodeSessionPlacement:
                                 r,
                             ),
                         )
+                    else:
+                        # All ranks are full: queue behind the smallest KV
+                        # deficit, including queued prompts and decode reserves.
+                        # Preserve the current home on a complete load tie.
+                        home_rank = rank
+                        rank = max(
+                            active,
+                            key=lambda r: (
+                                capacity[r] - projected(r),
+                                -live_requests[r],
+                                r == home_rank,
+                                -r,
+                            ),
+                        )
         if rank is None:
             normalize = all(capacity[r] > 0 for r in active)
 

@@ -69,8 +69,8 @@ class TestDecodeSessionPlacement(CustomTestCase):
         self.assertEqual(placement.sessions[("long-context", None)].rank, 1)
         self.assertEqual(placement.retained, [0, 62023])
 
-    def test_spill_preserves_affinity_without_a_known_fitting_target(self):
-        """Unknown or full targets must not turn pressure relief into churn."""
+    def test_spill_preserves_affinity_without_a_better_known_target(self):
+        """Keep a fitting/better home, unknown capacities and explicit ranks."""
         for live, capacity, forced in (
             ([100000, 0], [291840, 291840], None),
             ([254000, 270000], [291840, 291840], None),
@@ -92,6 +92,55 @@ class TestDecodeSessionPlacement(CustomTestCase):
                 )
                 self.assertEqual(rank, 0)
                 self.assertEqual(placement.retained, [60783, 0])
+
+    def test_all_full_ranks_spill_to_smallest_kv_deficit(self):
+        """An oversubscribed home must not retain a request just because every
+        alternate also needs to wait; that can put short later turns behind
+        long decodes while a much smaller backlog exists elsewhere.
+        """
+        placement = DecodeSessionPlacement(8, reserved_decode_tokens=512)
+        active = list(range(8))
+        capacity = [291840] * 8
+        key = ("queued-turn", None)
+        placement.select(
+            key, 114253, 0, active, [0] * 8, [0] * 8, capacity, forced_rank=3
+        )
+        rank = placement.select(
+            key,
+            114441,
+            0,
+            active,
+            [282267, 215594, 297421, 424238, 393556, 300326, 350710, 392037],
+            [5, 7, 4, 8, 7, 6, 5, 4],
+            capacity,
+        )
+        self.assertEqual(rank, 1)
+        self.assertEqual(placement.sessions[key].rank, 1)
+        self.assertEqual(placement.retained, [0, 114629, 0, 0, 0, 0, 0, 0])
+
+    def test_full_rank_fallback_prices_missing_tokens_not_utilization_ratio(self):
+        """The saturated fallback minimizes the tokens that must be released.
+        With unequal capacities, that can differ from the lowest usage ratio.
+        """
+        placement = DecodeSessionPlacement(2)
+        key = ("unequal-pools", None)
+        self.select(placement, key, prompt=100000, output=0, forced=0)
+        rank = placement.select(
+            key, 100000, 0, [0, 1], [1100000, 150000], [10, 3], [1000000, 100000]
+        )
+        # Rank 0 needs 200k tokens released (120% projected usage); rank 1
+        # needs only 150k (250%). No destination prefix hit is assumed.
+        self.assertEqual(rank, 1)
+
+    def test_all_full_load_tie_keeps_existing_home(self):
+        placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
+        key = ("equal-pressure", None)
+        self.select(placement, key, prompt=60783, output=0, forced=1)
+        rank = placement.select(
+            key, 60783, 0, [0, 1], [270000, 270000], [3, 3], [291840, 291840]
+        )
+        self.assertEqual(rank, 1)
+        self.assertEqual(placement.retained, [0, 60783])
 
     def test_spill_accounts_for_all_active_decode_reservations(self):
         """A raw prompt fit can still exceed KV once decode growth is reserved."""
@@ -166,6 +215,56 @@ class TestDecodeSessionPlacement(CustomTestCase):
         ):
             self.select(placement, None)
         self.assertEqual(placement.retained, [0, 0])
+
+    def test_burst_output_allowance_does_not_create_false_capacity_spill(self):
+        """A dispatch estimate must use the same units as the next native
+        snapshot: used KV plus queued prompts. Decode reserves are already
+        included by the placement policy, not the full max_new_tokens cap.
+        """
+        for output_limit in (0, 32000):
+            with self.subTest(output_limit=output_limit):
+                controller = DataParallelController.__new__(DataParallelController)
+                controller.workers = [Mock(), Mock()]
+                controller._active_workers = [0, 1]
+                controller.dp_budget = DPBudget(2)
+                controller.dp_budget.total_tokens = [220000, 50000]
+                controller.dp_budget.total_requests = [2, 1]
+                controller.dp_budget.capacity = [291840, 291840]
+                controller.decode_sessions = DecodeSessionPlacement(
+                    2, reserved_decode_tokens=512
+                )
+                requests = []
+                for session, prompt in (("first", 40000), ("second", 25000)):
+                    self.select(
+                        controller.decode_sessions,
+                        (session, None),
+                        prompt=prompt,
+                        output=0,
+                        capacity=[291840, 291840],
+                        forced=0,
+                    )
+                    requests.append(
+                        SimpleNamespace(
+                            routed_dp_rank=None,
+                            input_ids=[1] * prompt,
+                            sampling_params=SimpleNamespace(
+                                max_new_tokens=output_limit
+                            ),
+                            session_id=session,
+                            cache_salt=None,
+                        )
+                    )
+                with patch(
+                    "sglang.srt.managers.data_parallel_controller.sock_send"
+                ) as send:
+                    for req in requests:
+                        controller.decode_session_tokens_scheduler(req)
+                    self.assertEqual(
+                        [call.args[0] for call in send.call_args_list],
+                        [controller.workers[0], controller.workers[0]],
+                    )
+                self.assertEqual(controller.dp_budget.total_tokens, [285000, 50000])
+                self.assertEqual(controller.dp_budget.total_requests, [4, 1])
 
     def test_controller_sends_override_once_and_remembers_it(self):
         controller = DataParallelController.__new__(DataParallelController)
