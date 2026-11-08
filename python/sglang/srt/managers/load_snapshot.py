@@ -198,11 +198,29 @@ class QueueMetrics(msgspec.Struct, array_like=True):
     prealloc_ready: int
 
 
-# LoadSnapshot's nested sub-struct fields; every other struct field is a flat
-# scalar returned under "core".
+# LoadSnapshot's nested sub-struct fields; public flat fields are selected by
+# _CORE_KEYS below, excluding internal dispatch-receipt metadata.
 _SECTION_FIELDS = frozenset(
     {"memory", "speculative", "lora", "disaggregation", "queues"}
 )
+
+
+class DispatchLoadAck:
+    """Contiguous dispatch watermark reflected in a scheduler load snapshot."""
+
+    def __init__(self):
+        self.sequence = 0
+        self.cumulative_tokens = 0
+        self.pending = {}
+
+    def observe(self, request):
+        sequence = getattr(request, "dp_dispatch_seq", 0)
+        if sequence <= self.sequence:
+            return
+        self.pending[sequence] = request.dp_dispatch_cum_tokens
+        while self.sequence + 1 in self.pending:
+            self.sequence += 1
+            self.cumulative_tokens = self.pending.pop(self.sequence)
 
 
 class LoadSnapshot(msgspec.Struct, omit_defaults=True):
@@ -237,6 +255,10 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
     disaggregation: Optional[DisaggregationMetrics] = None
     queues: Optional[QueueMetrics] = None
 
+    # None identifies a producer without dispatch-receipt accounting.
+    dp_dispatch_ack_seq: Optional[int] = None
+    dp_dispatch_ack_cum_tokens: Optional[int] = None
+
     VALID_SECTIONS = frozenset(
         {"core", "memory", "spec", "lora", "disagg", "queues", "all"}
     )
@@ -270,9 +292,12 @@ class LoadSnapshot(msgspec.Struct, omit_defaults=True):
         return load
 
 
-# Flat scalar fields returned under "core": every struct field but the sections.
+# Scheduler receipt watermarks are internal IPC metadata, not /v1/loads fields.
 _CORE_KEYS = tuple(
-    f for f in LoadSnapshot.__struct_fields__ if f not in _SECTION_FIELDS
+    f
+    for f in LoadSnapshot.__struct_fields__
+    if f not in _SECTION_FIELDS
+    and f not in ("dp_dispatch_ack_seq", "dp_dispatch_ack_cum_tokens")
 )
 
 

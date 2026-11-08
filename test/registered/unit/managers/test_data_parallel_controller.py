@@ -33,6 +33,7 @@ from sglang.srt.managers.data_parallel_controller import (
     LoadBalanceMethod,
     WorkerPortHandshake,
 )
+from sglang.srt.managers.decode_session_placement import DecodeSessionPlacement
 from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
@@ -325,6 +326,164 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         )
         self.assertEqual(budget.total_requests, [10, 2, 30])
         self.assertEqual(budget.total_tokens, [100, 50, 300])
+
+
+class TestDecodeDispatchReceipts(CustomTestCase):
+    def make_controller(self):
+        ctl = _make_controller(2)
+        ctl.load_balance_method = LoadBalanceMethod.DECODE_SESSION_TOKENS
+        ctl.dp_budget.track_dispatches = True
+        ctl.decode_sessions = DecodeSessionPlacement(2, reserved_decode_tokens=512)
+        return ctl
+
+    def dispatch(self, ctl, size, force=None):
+        req = _req(input_ids=[0] * size, routed_dp_rank=force)
+        req.session_id = "session"
+        req.cache_salt = None
+        req.sampling_params = SimpleNamespace(max_new_tokens=32000)
+        ctl.decode_session_tokens_scheduler(req)
+        return req
+
+    def test_fresh_report_preserves_request_not_yet_received(self):
+        ctl = self.make_controller()
+        self.dispatch(ctl, 56897)
+        ctl.dp_budget.update_budget(
+            [
+                _load(
+                    dp_rank=rank,
+                    timestamp=1,
+                    max_total_num_tokens=60000,
+                    num_total_tokens=10000 if rank else 0,
+                    dp_dispatch_ack_seq=0,
+                    dp_dispatch_ack_cum_tokens=0,
+                )
+                for rank in range(2)
+            ]
+        )
+        self.assertEqual(ctl.dp_budget.total_tokens, [56897, 10000])
+        self.assertEqual(ctl.dp_budget.total_requests, [1, 0])
+        # Even a shrinking turn must not reuse the apparently empty home
+        # while its earlier dispatch is still outside the scheduler snapshot.
+        self.dispatch(ctl, 30000)
+        self.assertEqual(ctl.decode_sessions.sessions[("session", None)].rank, 1)
+        self.assertEqual(ctl.workers[1].send_pyobj.call_count, 1)
+
+    def test_partial_receipt_removes_only_accounted_prompt_estimates(self):
+        ctl = self.make_controller()
+        first = self.dispatch(ctl, 40, force=0)
+        second = self.dispatch(ctl, 25, force=0)
+        self.assertEqual((first.dp_dispatch_seq, first.dp_dispatch_cum_tokens), (1, 40))
+        self.assertEqual(
+            (second.dp_dispatch_seq, second.dp_dispatch_cum_tokens), (2, 65)
+        )
+        ctl.dp_budget.update_budget(
+            [
+                _load(
+                    dp_rank=0,
+                    timestamp=1,
+                    num_total_tokens=45,
+                    num_running_reqs=1,
+                    dp_dispatch_ack_seq=1,
+                    dp_dispatch_ack_cum_tokens=40,
+                )
+            ]
+        )
+        self.assertEqual(ctl.dp_budget.total_tokens[0], 70)
+        self.assertEqual(ctl.dp_budget.total_requests[0], 2)
+        ctl.dp_budget.update_budget(
+            [
+                _load(
+                    dp_rank=0,
+                    timestamp=2,
+                    num_total_tokens=60,
+                    num_running_reqs=2,
+                    dp_dispatch_ack_seq=2,
+                    dp_dispatch_ack_cum_tokens=65,
+                )
+            ]
+        )
+        self.assertEqual(ctl.dp_budget.total_tokens[0], 60)
+        self.assertEqual(ctl.dp_budget.total_requests[0], 2)
+
+    def test_health_override_does_not_create_unreceived_user_load(self):
+        from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
+
+        ctl = self.make_controller()
+        req = _req(input_ids=[0], routed_dp_rank=0)
+        req.rid = HEALTH_CHECK_RID_PREFIX + "receipt"
+        self.assertTrue(ctl.maybe_external_dp_rank_routing(req))
+        self.assertEqual(ctl.dp_budget.sent_sequences, [0, 0])
+        self.assertEqual(ctl.dp_budget.sent_tokens, [0, 0])
+
+    def test_receipt_wire_round_trip_and_legacy_defaults(self):
+        from array import array
+
+        from sglang.srt.managers.io_struct import (
+            TokenizedEmbeddingReqInput,
+            TokenizedGenerateReqInput,
+            msgpack_decode,
+            msgpack_encode,
+        )
+        from sglang.srt.sampling.sampling_params import SamplingParams
+
+        common = dict(
+            input_text="",
+            input_ids=array("q", [1, 2]),
+            mm_inputs=None,
+            token_type_ids=None,
+            sampling_params=SamplingParams(),
+        )
+        requests = [
+            TokenizedEmbeddingReqInput(**common),
+            TokenizedGenerateReqInput(
+                **common,
+                input_embeds=None,
+                return_logprob=False,
+                logprob_start_len=0,
+                top_logprobs_num=0,
+                token_ids_logprob=None,
+                stream=True,
+            ),
+        ]
+        for req in requests:
+            with self.subTest(kind=type(req).__name__):
+                req.dp_dispatch_seq = 3
+                req.dp_dispatch_cum_tokens = 56897
+                decoded = msgpack_decode(
+                    msgpack_encode(msgpack_decode(msgpack_encode(req)))
+                )
+                self.assertEqual(
+                    (decoded.dp_dispatch_seq, decoded.dp_dispatch_cum_tokens),
+                    (3, 56897),
+                )
+                wire = msgspec.msgpack.decode(msgpack_encode(req))
+                self.assertEqual(wire[-2:], [3, 56897])
+                legacy = msgpack_decode(msgspec.msgpack.encode(wire[:-2]))
+                self.assertEqual(
+                    (legacy.dp_dispatch_seq, legacy.dp_dispatch_cum_tokens), (0, 0)
+                )
+                self.assertEqual(list(legacy.input_ids), [1, 2])
+
+    def test_legacy_snapshot_and_untracked_policy_keep_existing_behavior(self):
+        ctl = self.make_controller()
+        self.dispatch(ctl, 40)
+        ctl.dp_budget.update_budget(
+            [_load(dp_rank=0, timestamp=1, num_total_tokens=12)]
+        )
+        self.assertEqual(ctl.dp_budget.total_tokens[0], 12)
+        ctl.dp_budget.track_dispatches = False
+        ctl.dp_budget.update_budget(
+            [
+                _load(
+                    dp_rank=0,
+                    timestamp=2,
+                    num_total_tokens=15,
+                    dp_dispatch_ack_seq=0,
+                    dp_dispatch_ack_cum_tokens=0,
+                )
+            ]
+        )
+        self.assertEqual(ctl.dp_budget.total_tokens[0], 15)
 
 
 class TestRoundRobinScheduler(CustomTestCase):
