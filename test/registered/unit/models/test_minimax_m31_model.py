@@ -23,7 +23,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.models import minimax_m3
+from sglang.srt.models import minimax_m3, minimax_m3_vl
 from sglang.srt.models.dspark_minimax import DSparkMiniMaxDraftModel
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
@@ -296,6 +296,17 @@ class TestMiniMaxM31Rocm(CustomTestCase):
                 _minimax_m3_overrides(rocm_server_args(**quark), MXFP8)
             _minimax_m3_overrides(rocm_server_args(attn_dp_size=2, **quark), MXFP8)
 
+    def test_gfx950_keeps_custom_all_reduce_only_for_the_m31_quark_export(self):
+        """Custom all-reduce is measured faster for the M3.1 Quark export; the M3 export,
+        whose linears are bf16, stays on NCCL."""
+        with gfx950():
+            m31 = _minimax_m3_overrides(
+                rocm_server_args(quantization="quark"), QUARK_M31
+            )
+            m3 = _minimax_m3_overrides(rocm_server_args(quantization="quark"), QUARK_M3)
+        self.assertNotIn("disable_custom_all_reduce", m31)
+        self.assertTrue(m3["disable_custom_all_reduce"])
+
     def test_gfx950_quick_all_reduce_takes_int4_only_where_unset(self):
         """M3.1 gets INT4 when no level is set; a level already set stays, INT8 included,
         since the ROCm images' INT8 cannot be told from one the user chose."""
@@ -422,8 +433,14 @@ class TestMiniMaxM31QuarkScaleNames(CustomTestCase):
         k = torch.full((2,), 127, dtype=torch.uint8)
         o = torch.full((2,), 126, dtype=torch.uint8)
         prefix = "model.layers.0.self_attn."
-        model._load_llm_weight(prefix + "k_proj.weight_scale", k, params, mapping, [])
-        model._load_llm_weight(prefix + "o_proj.weight_scale", o, params, mapping, [])
+        # the alias is ROCm-only; this CPU test runs the HIP loader path
+        with patch.object(minimax_m3_vl, "_is_hip", True):
+            model._load_llm_weight(
+                prefix + "k_proj.weight_scale", k, params, mapping, []
+            )
+            model._load_llm_weight(
+                prefix + "o_proj.weight_scale", o, params, mapping, []
+            )
         self.assertEqual(loaded["qkv"][0], "k")
         self.assertTrue(torch.equal(loaded["qkv"][1], k))
         self.assertIsNone(loaded["o"][0])

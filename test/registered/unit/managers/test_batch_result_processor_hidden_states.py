@@ -20,7 +20,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -77,6 +77,7 @@ class TestPrefillEmbeddingResults(CustomTestCase):
                 time_stats=Mock(),
                 update_finish_state=Mock(),
                 finished_reason=None,
+                exit_via=None,
                 finished=lambda: True,
                 kv=SimpleNamespace(
                     holds_kv=True, holds_mamba=False, retraction_backup=None
@@ -225,7 +226,7 @@ class TestSamplingMaskMaterialization(CustomTestCase):
         self.assertIsNone(output.sampling_mask_output)
 
 
-class _PrefillReq:
+class _PrefillReq(FakeReq):
     def __init__(self, *, rid: str, return_hidden_states):
         self.rid = rid
         self.return_hidden_states = return_hidden_states
@@ -249,7 +250,7 @@ class _PrefillReq:
         return None
 
 
-class _DecodeReq:
+class _DecodeReq(FakeReq):
     request_finish = Req.request_finish
 
     def __init__(self):
