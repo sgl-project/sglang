@@ -4168,7 +4168,6 @@ class DeepseekSparseAttnBackend(
 
         # The BF16 no-RoPE path passes a zero-width q_rope tensor.
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
-        # Sharded DCP: decode and verify return a partial; prefill reads gathered KV.
         sharded_dcp = self.dsa_shards_index_k
         dcp_partial = sharded_dcp and (
             not is_prefill or forward_batch.forward_mode.is_target_verify()
