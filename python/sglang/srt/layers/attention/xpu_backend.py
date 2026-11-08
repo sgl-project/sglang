@@ -5,14 +5,16 @@ from typing import TYPE_CHECKING, Optional, Tuple
 import msgspec
 import torch
 
+from sglang.kernels.ops.attention.metadata import (
+    normal_decode_set_metadata,
+    prepare_swa_spec_page_table_triton,
+)
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.flashattention_backend import (
     FlashAttentionMetadata,
     merge_state_v2_wrapper,
-    normal_decode_set_metadata,
-    prepare_swa_spec_page_table_triton,
 )
 from sglang.srt.layers.attention.local_attention import (
     LocalAttentionMetadata,

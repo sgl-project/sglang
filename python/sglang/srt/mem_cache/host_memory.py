@@ -139,6 +139,13 @@ def _cgroup_memory_headroom(proc_root: Path = Path("/proc")) -> int | None:
     return headroom
 
 
+def host_memory_headroom_bytes() -> int:
+    """Allocatable RAM now, bounded by visible cgroup limits; logs nothing."""
+    available = psutil.virtual_memory().available
+    cgroup_headroom = _cgroup_memory_headroom()
+    return available if cgroup_headroom is None else min(available, cgroup_headroom)
+
+
 def available_host_memory_bytes(*, allow_cgroup_fallback: bool = False) -> int:
     """Allocatable RAM, counting reclaimable page cache as free."""
     available = psutil.virtual_memory().available

@@ -21,12 +21,8 @@ from sglang.srt.managers.incremental_detokenize import (
     DetokenizeState,
     build_detokenize_header,
 )
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    ReqKvInfo,
-    ScheduleBatch,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     SchedulerPoolStatsObserver,
 )
@@ -455,6 +451,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
         owner = object.__new__(UnifiedRadixCache)
         owner.tree_core = SimpleNamespace(page_size=32)
         owner.session = SimpleNamespace(slots={})
+        owner._window_slots = ()
         owner.uocr_doc_reuse = cache.reuse
         observer = SchedulerPoolStatsObserver(
             tree_cache=owner,
@@ -470,7 +467,7 @@ class TestRetainedWindowAccounting(CustomTestCase):
                     entry = cache.reuse.docs.pop("doc")
                     cache.reuse.sources[id(entry)] = entry
                 self.assertEqual(observer.session_held_tokens(), 96)
-                self.assertEqual(observer.session_held_swa_tokens(), 96)
+                self.assertEqual(observer.session_held_window_tokens("swa"), 96)
                 self.assertEqual(observer.session_held_req_count(), 1)
         cache.reuse.reset()
         self.assertEqual(observer.session_held_tokens(), 0)
@@ -1583,7 +1580,7 @@ class TestRetainedWindowClaim(CustomTestCase):
     PROMPT = prompt([(0, 200), (1, 200)])
 
     def _finished(self, origin):
-        from sglang.srt.managers.schedule_batch import FINISH_MATCHED_TOKEN
+        from sglang.srt.managers.req_types import FINISH_MATCHED_TOKEN
 
         out = [PAGE] + list(range(30, 60)) + [EOS]
         committed = len(origin) + len(out) - 1

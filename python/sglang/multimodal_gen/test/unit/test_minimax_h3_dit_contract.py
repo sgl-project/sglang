@@ -14,10 +14,6 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.layers.attention.backends.attention_backend import (
     AttentionRequirements,
 )
@@ -55,17 +51,9 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     _reorder_grouped_qkv_to_qkv,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 from sglang.srt.utils import get_device
 
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graph replay")
@@ -419,7 +407,12 @@ def test_cache_dit_out_of_place_gate_preserves_cuda_input():
     torch.testing.assert_close(output, expected, rtol=0, atol=0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+# DynamicCudnnSDPAImpl is a CUDA-platform backend; on ROCm its FlashAttention
+# fallback needs the flash_attn package, which the ROCm images do not ship.
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires CUDA (DynamicCudnnSDPAImpl is not selected on ROCm)",
+)
 def test_group_attend_skips_only_the_trailing_alignment_rows():
     """The pipelined Ulysses group attention gives the real rows the bytes of
     forward_varlen and leaves the packing's alignment rows zero."""
@@ -503,7 +496,6 @@ def test_cube_backend_advertises_packed_varlen_capability():
 
 
 def test_attention_retains_transformer_scoped_backend():
-    _ensure_single_process_parallel_runtime()
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
@@ -522,7 +514,6 @@ def test_attention_retains_transformer_scoped_backend():
 
 
 def test_model_lazy_resolver_keeps_transformer_scoped_backend():
-    _ensure_single_process_parallel_runtime()
     with (
         patch(
             "sglang.multimodal_gen.runtime.models.dits.minimax_h3."
@@ -602,7 +593,6 @@ def test_token_refiner_routes_cube_selection_to_exact_fa():
 
 
 def test_meta_model_captures_component_attention_override():
-    _ensure_single_process_parallel_runtime()
     with (
         component_attn_backend_context_manager(
             AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN,
@@ -624,7 +614,6 @@ def test_meta_model_captures_component_attention_override():
 
 def test_meta_model_enforces_mixed_precision_weight_contract():
     expected_fp32 = set(MINIMAX_H3_FP32_PARAM_NAMES) | set(MINIMAX_H3_FP32_BUFFER_NAMES)
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -643,7 +632,6 @@ def test_meta_model_enforces_mixed_precision_weight_contract():
 
 
 def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
-    _ensure_single_process_parallel_runtime()
     config = MiniMaxH3DiTConfig(
         arch_config=MiniMaxH3DiTArchConfig(
             adaln_curve_grid=1025,
@@ -664,7 +652,6 @@ def test_pruned_meta_model_preserves_curve_adaln_fp32_island():
 
 
 def test_online_fp8_keeps_fp32_boundaries_and_ignored_layers_unquantized():
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         model = MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(),
@@ -697,7 +684,6 @@ def _block_fp8_quant_config(block: int = 128, **kwargs) -> Fp8Config:
 
 
 def _meta_h3(quant_config) -> MiniMaxH3DiTModel:
-    _ensure_single_process_parallel_runtime()
     with torch.device("meta"):
         return MiniMaxH3DiTModel(
             config=MiniMaxH3DiTConfig(), hf_config={}, quant_config=quant_config
@@ -940,7 +926,6 @@ def test_ulysses_qkv_pack_is_bit_exact():
 
 @pytest.mark.parametrize("compiling", [False, True])
 def test_compiled_attention_runs_its_fused_section_eager(compiling):
-    _ensure_single_process_parallel_runtime()
     arch = MiniMaxH3DiTArchConfig()
     with torch.device("meta"):
         attention = MiniMaxH3Attention(arch, None, prefix="blocks.0.attn")

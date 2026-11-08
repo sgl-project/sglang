@@ -1,5 +1,6 @@
 import unittest
 from array import array
+from functools import partial
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock
 
@@ -17,24 +18,19 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    NextBatchPlan,
-    Req,
-    ScheduleBatch,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.deferred_responses import (
-    DeferredResponses,
-)
 from sglang.srt.managers.scheduler_components.invariant_checker import (
     SchedulerInvariantChecker,
 )
-from sglang.srt.managers.scheduler_components.request_list import RequestList
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.scheduler_test_utils import empty_request_lists
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -81,44 +77,21 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
-        get_running_reqs=lambda: s.running_reqs,
-        get_prefill_launched_reqs=lambda: s.prefill_launched_reqs,
         get_running_batches=lambda: (s.running_batch,),
-    )
-
-
-def _empty_request_lists(s):
-    s.waiting_queue = []
-    s.grammar_manager = SimpleNamespace(grammar_queue=[])
-    s.chunked_req = None
-    s.prefill_launched_reqs = RequestList()
-    s.disagg_prefill_transfer_queue = None
-    s.disagg_prefill_bootstrap_queue = None
-    s.disagg_decode_prealloc_queue = None
-    s.disagg_decode_transfer_queue = None
-    s.dllm_manager = SimpleNamespace(waiting_queue=[])
-    s.hisparse_coordinator = None
-    s.uocr_runtime = None
-    s.deferred_responses = DeferredResponses(
-        disaggregation_mode=DisaggregationMode.NULL,
-        output_streamer=None,
-        send_abort=None,
     )
 
 
 def _scheduler():
     s = _Scheduler.__new__(_Scheduler)
+    empty_request_lists(s)
+    s.dllm_manager = SimpleNamespace(waiting_queue=[])
     s.running_batch = ScheduleBatch(reqs=[])
-    s.running_reqs = RequestList()
     s.invariant_checker = _invariant_checker(s)
     s.disaggregation_mode = DisaggregationMode.NULL
-    s.dllm_config = None
     s.enable_hisparse = False
-    _empty_request_lists(s)
     # run_batch up to the forward
     s.scheduler_stage_metrics = None
     s.metrics_reporter = MagicMock()
@@ -164,30 +137,11 @@ def _launch(s, batch):
         pass
 
 
-class TestRequestList(CustomTestCase):
-    def test_join_keeps_order_and_leaving_mid_iteration_is_safe(self):
-        a, b, c, outsider = (_req(rid) for rid in "abcx")
-        running = RequestList()
-        running.join([a, b])
-        running.join([c, b])
-        _finish(b)
-
-        seen = []
-        for req in running:
-            seen.append(req)
-            running.leave_finished()
-            running.leave([a, outsider])
-
-        self.assertEqual(seen, [a, b, c])
-        self.assertEqual(list(running), [c])
-        self.assertNotIn(a, running)
-
-
 class TestRequestListsCheck(CustomTestCase):
     def setUp(self):
         super().setUp()
         self.s = _scheduler()
-        self.check = self.s.invariant_checker.maybe_check_request_lists
+        self.check = partial(self.s.invariant_checker.run, CheckPhase.LAUNCH)
         enter_scope(self, published_topology())
         enter_scope(self, envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.override(True))
 
@@ -198,9 +152,9 @@ class TestRequestListsCheck(CustomTestCase):
     def test_fails_a_request_in_two_lists(self):
         req = _req("a")
         self.s.running_reqs.join([req])
-        self.s.waiting_queue.append(req)
+        self.s.waiting_queue.join([req])
 
-        with self.assertRaisesRegex(RuntimeError, "a is in both waiting and running"):
+        with self.assertRaisesRegex(RuntimeError, "a is in both WAITING and DECODING"):
             self.check(ScheduleBatch(reqs=[]))
 
     def test_fails_a_launched_row_in_no_list(self):
@@ -214,7 +168,7 @@ class TestRequestListsCheck(CustomTestCase):
         decoding, retracted, chunk = _req("r"), _req("w"), _req("c")
         self._start_running([decoding])
         self.s.running_batch.reqs += [retracted, chunk]
-        self.s.waiting_queue.append(retracted)
+        self.s.waiting_queue.join([retracted])
         self.s.chunked_req = chunk
 
         with self.assertRaisesRegex(
@@ -317,19 +271,17 @@ class TestRunningReqsHooks(CustomTestCase):
         running.spec_algorithm = SpeculativeAlgorithm.NGRAM
         running.has_grammar = True
         s = Scheduler.__new__(Scheduler)
+        empty_request_lists(s)
         s.running_batch = running
         s.last_batch = None
-        s.running_reqs = RequestList()
         s.running_reqs.join(running.reqs)
         s.disaggregation_mode = DisaggregationMode.NULL
-        s.dllm_config = None
         s.enable_hisparse = False
-        _empty_request_lists(s)
         s.invariant_checker = _invariant_checker(s)
         s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
-        s._engine_paused = False
+        s.pause_state = PauseState()
         s.increment_scheduler_iterations = Mock()
         s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
         s.is_generation = True
@@ -377,7 +329,7 @@ class TestRunningReqsHooks(CustomTestCase):
 
         def process_batch_result(batch, result):
             _finish(done)
-            s._on_step_processed(batch)
+            s._on_step_processed(batch, result)
 
         s.run_batch = run_batch
         s.process_batch_result = process_batch_result
@@ -427,10 +379,10 @@ class TestRunningReqsHooks(CustomTestCase):
         s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
         s.enable_priority_preemption = True
         s.is_hybrid_swa = False
-        s.waiting_queue = [waiting]
+        s.waiting_queue.join([waiting])
         s.min_free_slots_delayer = None
         s.get_num_allocatable_reqs = lambda *args, **kwargs: 0
-        s.policy = Mock()
+        s.policy = Mock(calc_priority=lambda waiting, *args, **kwargs: list(waiting))
         s.disagg_prefill_bootstrap_queue = None
         s.chunked_prefill_size = 8192
         s.dynamic_chunk_sizer = None
@@ -438,6 +390,7 @@ class TestRunningReqsHooks(CustomTestCase):
             model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
         )
         s.get_prefill_adder_class = lambda: _Adder
+        s.request_retirer = None
         s.page_size = 1
         s.tree_cache = SimpleNamespace(buffer_pipeline=None)
         s.token_to_kv_pool_allocator = SimpleNamespace(state_slots=None)
@@ -449,6 +402,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()

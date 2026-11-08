@@ -10,43 +10,120 @@ What still differs between chain shapes is the interim capacity policy in
 
 from __future__ import annotations
 
+import functools
 import logging
-from typing import Any, Callable, Dict, Hashable, List, Optional, Sequence, Tuple
+from contextlib import contextmanager
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Hashable,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import msgspec
 import torch
 from torch.profiler import record_function
 
-from sglang.srt.environ import InvariantCheckLevel
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.paged import (
+from sglang.kernels.ops.memory.allocator import (
     alloc_decode_kernel,
     alloc_extend_kernel,
 )
-from sglang.srt.mem_cache.allocator.swa import (
-    UNIFIED_SWA_SEGMENT_BOUND,
-    UNIFIED_SWA_SEGMENT_RELEASED,
-)
+from sglang.srt.environ import InvariantCheckLevel
+from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.band import (
     Band,
     FloatBand,
+    allocator_operation,
     chain_byte_accounting_violations,
     flush_deferred_free_group,
     full_tokens_before_mamba_recheck,
     relieve_for_alloc,
+    settle_pending_for_recovery,
 )
+from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardSteps
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
 from sglang.srt.mem_cache.kv.alloc.interim import (
     ChainAdmissionRules,
     interim_policy_for,
 )
-from sglang.srt.mem_cache.kv.alloc.pricing import ChainSnapshot, snapshot_chain
+from sglang.srt.mem_cache.kv.alloc.invariants import (
+    WINDOW_SEGMENT_BOUND,
+    WINDOW_SEGMENT_RELEASED,
+)
+from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
+from sglang.srt.mem_cache.kv.alloc.pricing import (
+    ChainSnapshot,
+    no_relief_plan,
+    snapshot_chain,
+)
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import get_num_new_pages, next_power_of_2
 from sglang.srt.utils.invariants import expect, resolve_level
 
 logger = logging.getLogger(__name__)
+
+
+def _one_operation(method):
+    """Run a chain allocation as one allocator operation over every member
+    (`band.py::allocator_operation`): its host reads come before its first
+    stream wait, whichever band waits first."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        chain = getattr(self, "allocator", self)
+        with allocator_operation(chain.members):
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
+class _ScopedPhysicalTakes:
+    """Materialize a reservation in any band order without changing its fit.
+
+    Live-page deltas count completed takes, including owner/state fast paths.
+    Existing cancellation returns those pages and restores the pending demand.
+    An unrelated free conservatively restores demand as well. No device ids
+    are inspected, and leaving the scope never rolls back queued transfers.
+    """
+
+    def __init__(self, allocator, demands):
+        self.allocator = allocator
+        self.demands = dict(demands)
+        snapshot = allocator.pricing_snapshot()
+        self.initial_live = {band.name: band.live for band in snapshot.bands}
+        if no_relief_plan(snapshot, tuple(self.demands.items())) is None:
+            raise RuntimeError(
+                "physical reservation needs reclamation before its scope"
+            )
+        self.applying = False
+
+    @_one_operation
+    def take(self, band, pages, consumer=Consumer.FORWARD):
+        snapshot = self.allocator.pricing_snapshot()
+        remaining = {
+            current.name: self.demands.get(current.name, 0)
+            - (current.live - self.initial_live[current.name])
+            for current in snapshot.bands
+        }
+        if pages > remaining[band.sub_pool_name]:
+            return None
+        plan = no_relief_plan(snapshot, tuple(remaining.items()))
+        if plan is None:
+            return None
+        take = plan.takes[band.sub_pool_name].prefix(
+            pages, page_bytes=band.entry_bytes_per_page
+        )
+        self.applying = True
+        try:
+            return band.take_planned_physical_pages(take, consumer)
+        finally:
+            self.applying = False
 
 
 class ChainRoles(msgspec.Struct, frozen=True, kw_only=True):
@@ -56,6 +133,7 @@ class ChainRoles(msgspec.Struct, frozen=True, kw_only=True):
     owner: str
     window: Optional[str] = None
     state: Optional[str] = None
+    windows: Tuple[str, ...] = ()
 
 
 def _chain_order(bands: Sequence[Band]) -> Tuple[Band]:
@@ -81,6 +159,7 @@ def take_new_pages(
     page_tokens: Callable[[torch.Tensor], torch.Tensor],
     *,
     copy_new_pages: bool,
+    physical_pages: Optional[torch.Tensor] = None,
 ) -> Optional[torch.Tensor]:
     """Fill tail pages before taking new virtual pages for each request.
 
@@ -91,7 +170,7 @@ def take_new_pages(
         return None
     # Physical-capacity pre-check; on shortfall run the relief ladder.
     need_tokens = num_new_pages * owner.page_size
-    if need_tokens > owner.available_size():
+    if physical_pages is None and need_tokens > owner.available_size():
         if not relieve_for_alloc(owner, need_tokens):
             return None
     # The free list is only rebound, not mutated in place, so its consumed
@@ -103,8 +182,12 @@ def take_new_pages(
             new_virtual_pages = new_virtual_pages.clone()
     out_indices = page_tokens(owner.free_virtual_ids)
     if new_virtual_pages is not None:
-        if owner.place_pages(new_virtual_pages, num_new_pages) is None:
-            return None  # defensive; the pre-check should have prevented it
+        if physical_pages is None:
+            if owner.place_pages(new_virtual_pages, num_new_pages) is None:
+                return None
+        else:
+            owner.ids.bind(new_virtual_pages, physical_pages)
+            owner._maybe_zero_pages(physical_pages)
     # A rebind moves the capacity epoch; a step within its pages takes none.
     if num_new_pages > 0:
         owner.free_virtual_ids = owner.free_virtual_ids[num_new_pages:]
@@ -136,15 +219,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         page_size: int = 1,
         need_sort: bool = False,
         forward_stream: Optional[torch.cuda.Stream] = None,
-        lazy_compaction: bool = False,
+        lazy_compaction: bool = True,
+        full_cap_tokens: Optional[int] = None,
         full_max_total_num_tokens: Optional[int] = None,
         swa_max_total_num_tokens: Optional[int] = None,
     ):
-        # Only the owner shards under decode context parallelism, and only in a
-        # chain without a window: window chains reject it at argument
-        # validation and never read the width.
-        shards_under_dcp = roles.window is None
-        dcp_size = get_parallel().attn_dcp_size if shards_under_dcp else 1
+        # Token bands share widened virtual pages. A replicated draft carries
+        # every token inside its entries; target views select the rank's rows.
+        shards_under_dcp = True
+        dcp_size = get_parallel().attn_dcp_size
         super().__init__(
             size=0,
             page_size=page_size * dcp_size,
@@ -158,6 +241,9 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self.roles = roles
         # Views used by each band's move, zero and copy operations.
         self.views = dict(views)
+        # The ends compact lazily, behind the forwards that may still read the
+        # pages they move: unified memory has no eager compaction.
+        assert lazy_compaction, "the unified pool's ends compact lazily"
         self.lazy_compaction = lazy_compaction
         band = dict(
             arena=arena,
@@ -173,19 +259,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             lazy_compaction=lazy_compaction,
             **band,
         )
-        self.swa_attn_allocator: Optional[Band] = None
-        if roles.window is not None:
-            floats = arena.band(roles.window).grow_direction == "float"
-            # A float never runs the lazy event pipeline: frees mark holes and
-            # allocations reuse them in place.
-            self.swa_attn_allocator = (FloatBand if floats else Band)(
-                sub_pool_name=roles.window,
-                is_id_owner=False,  # binds the virtual pages the owner mints
+        owner = self.full_attn_allocator
+        owner.max_live_tokens = (
+            None
+            if full_cap_tokens is None
+            else full_cap_tokens * (owner.page_size // owner.pool_page_size)
+        )
+        self.window_allocators: Dict[str, Band] = {}
+        window_names = roles.windows or (
+            () if roles.window is None else (roles.window,)
+        )
+        for name in window_names:
+            floats = arena.band(name).grow_direction == "float"
+            self.window_allocators[name] = (FloatBand if floats else Band)(
+                sub_pool_name=name,
+                is_id_owner=False,
                 page_size=page_size,
+                shards_under_dcp=shards_under_dcp,
                 lazy_compaction=lazy_compaction and not floats,
                 virtual_num_pages=self.full_attn_allocator.ids.num_virtual_ids,
                 **band,
             )
+        self.swa_attn_allocator = self.window_allocators.get(roles.window)
         self.mamba_allocator: Optional[Band] = None
         if roles.state is not None:
             self.mamba_allocator = Band(
@@ -200,16 +295,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             b
             for b in (
                 self.full_attn_allocator,
-                self.swa_attn_allocator,
+                *self.window_allocators.values(),
                 self.mamba_allocator,
             )
             if b is not None
         )
-        self.bands = _chain_order(self.members)
+        # A lazy chain hands a freed page out again from the schedule stream
+        # (zeroing, compaction), so its freed pages wait for the steps in flight.
+        self.forward_steps: Optional[ForwardSteps] = (
+            ForwardSteps(self.members) if lazy_compaction else None
+        )
+        by_name = {band.sub_pool_name: band for band in self.members}
+        self.bands = tuple(by_name[band.name] for band in arena.bands)
         _wire_chain(self.bands)
         self._band_positions = {b.sub_pool_name: i for i, b in enumerate(self.bands)}
         self._snapshot_key: Optional[int] = None
         self._snapshot_memo: Optional[ChainSnapshot] = None
+        self._window_capacity_from_sizing = full_max_total_num_tokens is not None
         self._policy = interim_policy_for(
             self,
             full_max_total_num_tokens=full_max_total_num_tokens,
@@ -239,14 +341,15 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def _size_window_host_pools(self) -> None:
-        """A window chain's host pools are sized in tokens."""
+        """Host views advertise physical rows, before the host layout widens IDs."""
         for band, tokens in (
             (self.full_attn_allocator, self.size_full),
-            (self.swa_attn_allocator, self.size_swa),
+            *((window, self.size_swa) for window in self._windows),
         ):
             pool = self.views[band.sub_pool_name]
-            pool.host_capacity_tokens = tokens
-            pool.host_capacity_bytes = tokens * band.entry_bytes
+            rows = tokens * band.pool_page_size // band.page_size
+            pool.host_capacity_tokens = rows
+            pool.host_capacity_bytes = rows * band.entry_bytes
 
     @property
     def has_window_pool(self) -> bool:
@@ -254,7 +357,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def _windows(self) -> Tuple[Band, ...]:
-        return () if self.swa_attn_allocator is None else (self.swa_attn_allocator,)
+        return tuple(self.window_allocators.values())
 
     # -- capacity views (the interim policy of the chain's shape) --
 
@@ -298,14 +401,30 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return []
         return [f"[chain] stale pricing snapshot: {self._snapshot_memo} != {fresh}"]
 
+    def _cap_full_available(self, tokens):
+        return self.full_attn_allocator.cap_available(tokens)
+
     def available_size(self) -> int:
-        return self._policy.available_size(self)
+        return self._cap_full_available(self._policy.available_size(self))
 
     def full_available_size(self) -> int:
-        return self._policy.full_available_size(self)
+        return self._cap_full_available(self._policy.full_available_size(self))
 
     def swa_available_size(self) -> int:
         return self._policy.swa_available_size(self)
+
+    def window_pool_names(self) -> Tuple[str, ...]:
+        return tuple(window.sub_pool_name for window in self._windows)
+
+    def window_available_size(self, sub_pool: str) -> int:
+        """What a take from window sub-pool ``sub_pool`` can serve now: the
+        target window's as the chain's policy answers it, another window's
+        from its own band."""
+        if sub_pool not in self.window_pool_names():
+            raise KeyError(f"no window sub-pool {sub_pool!r}")
+        if sub_pool == self.roles.window:
+            return self.swa_available_size()
+        return self.window_allocators[sub_pool].schedulable_available_size()
 
     def conserve_full_available_size(self) -> int:
         return self._policy.conserve_full_available_size(self)
@@ -341,14 +460,49 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         dcp_size = get_parallel().attn_dcp_size if owner.shards_under_dcp else 1
         return (owner.max_slots - 1) * dcp_size
 
-    def ensure_capacity(self, full_tokens: int, swa_tokens: int) -> bool:
-        return self._policy.ensure_capacity(self, full_tokens, swa_tokens)
+    def _full_cap_reclaim(self, full_tokens: int, *, empty_pool=False) -> int:
+        owner = self.full_attn_allocator
+        if owner.max_live_tokens is None:
+            return 0
+        demand = int(-(-full_tokens // self.page_size)) * self.page_size
+        live = 0 if empty_pool else owner.allocated_count()
+        return (
+            -(-max(0, live + demand - owner.max_live_tokens) // self.page_size)
+            * self.page_size
+        )
+
+    def ensure_capacity(self, full_tokens: int, swa_tokens: int, **kwargs) -> bool:
+        if self._full_cap_reclaim(full_tokens):
+            return False
+        return self._policy.ensure_capacity(self, full_tokens, swa_tokens, **kwargs)
+
+    def prefill_state_fits(self, full_tokens, swa_tokens, state_slots, **kwargs):
+        """Check native state demand without charging it to the FULL-token cap."""
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
+            return False
+        if self._full_cap_reclaim(full_tokens) > kwargs.get("full_evictable_tokens", 0):
+            return False
+        return self._policy.prefill_state_fits(
+            self, full_tokens, swa_tokens, state_slots, **kwargs
+        )
 
     def can_reserve(self, full_tokens, swa_tokens, **kwargs) -> bool:
+        if self._full_cap_reclaim(full_tokens, empty_pool=True):
+            return False
+        if self._full_cap_reclaim(
+            full_tokens, empty_pool=kwargs.get("empty_pool", False)
+        ) > kwargs.get("full_evictable_tokens", 0):
+            return False
         return self._policy.can_reserve(self, full_tokens, swa_tokens, **kwargs)
 
     def reclaim_plan(self, full_tokens, swa_tokens, **kwargs):
-        return self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
+        cap_reclaim = self._full_cap_reclaim(full_tokens)
+        if cap_reclaim > kwargs.get("full_evictable_tokens", 0):
+            return None
+        plan = self._policy.reclaim_plan(self, full_tokens, swa_tokens, **kwargs)
+        if plan is None:
+            return None
+        return max(plan[0], cap_reclaim), plan[1]
 
     def prealloc_fits_assumes_reclaim(self) -> bool:
         return self._policy.prealloc_fits_assumes_reclaim(self)
@@ -362,10 +516,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         )
 
     def reclaim_for_prealloc(
-        self, tree_cache, full_tokens: int, swa_tokens: int
+        self, tree_cache, full_tokens: int, swa_tokens: int, **kwargs
     ) -> str | None:
         return self._policy.reclaim_for_prealloc(
-            self, tree_cache, full_tokens, swa_tokens
+            self, tree_cache, full_tokens, swa_tokens, **kwargs
         )
 
     def admission_rules(self) -> ChainAdmissionRules:
@@ -404,7 +558,68 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         return self._policy.evict_to_free_tokens(self, tree_cache, num_tokens, **kwargs)
 
     def resize(self, config) -> None:
-        self._policy.resize(self, config)
+        if (
+            not self.arena.backed_after_capture
+            or config.unified_memory_pool_bytes != self.arena.total_bytes
+        ):
+            raise RuntimeError("the arena must be backed before allocator.resize")
+        for band in self.members:
+            if (
+                band.allocated_count()
+                or band.usage.has_pending()
+                or band._pending_until_retire
+            ):
+                raise RuntimeError(
+                    f"cannot resize non-empty band {band.sub_pool_name!r}"
+                )
+        owner = self.full_attn_allocator
+        owner.max_live_tokens = (
+            None
+            if config.unified_full_cap_tokens is None
+            else config.unified_full_cap_tokens
+            * (owner.page_size // owner.pool_page_size)
+        )
+        for band in self.members:
+            band._set_capacity(
+                self.arena.num_entries(band.sub_pool_name),
+                virtual_num_pages=None
+                if band.is_id_owner
+                else owner.ids.num_virtual_ids,
+            )
+        self._policy = interim_policy_for(
+            self,
+            full_max_total_num_tokens=(
+                config.full_max_total_num_tokens
+                if self._window_capacity_from_sizing
+                else None
+            ),
+            swa_max_total_num_tokens=(
+                config.swa_max_total_num_tokens
+                if self._window_capacity_from_sizing
+                else None
+            ),
+        )
+        self.get_kvcache().size = (
+            config.full_max_total_num_tokens
+            if self.swa_attn_allocator is None
+            else owner.max_slots - 1
+        )
+        for band in self.members:
+            view = self.views[band.sub_pool_name]
+            view.size = band.max_slots - band.pool_page_size
+            if band.sub_pool_name == self.roles.state:
+                view.host_capacity_tokens = view.size
+                view.host_capacity_bytes = view.size * band.entry_bytes
+            else:
+                view.num_pages = band.num_pages
+        if self.swa_attn_allocator is not None:
+            self._size_window_host_pools()
+        else:
+            view = self.views[owner.sub_pool_name]
+            view.host_capacity_tokens = config.full_max_total_num_tokens
+            view.host_capacity_bytes = (
+                config.full_max_total_num_tokens * owner.entry_bytes
+            )
 
     def _flush_targets(self):
         return self._policy.flush_targets(self)
@@ -491,7 +706,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         for window in self._windows:
             spaces[window.sub_pool_name] = window.ids.token_space(
                 (window.sub_pool_name, id(self)),
-                widened_writes=False,
+                widened_writes=True,
                 defer_reads=defer_reads,
             )
         return spaces
@@ -542,25 +757,29 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     @property
     def cpu_copy_carries_mamba(self) -> bool:
-        return self._policy.cpu_copy_carries_state
+        return self.roles.state is not None
 
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         """Retraction backup: `Req.offload_kv_cache` hands over `req_to_token`
         rows, which hold VIRTUAL ids here; each sub-pool's view copies its
         physical ones."""
-        return self._policy.get_cpu_copy(
-            self, indices, mamba_indices=mamba_indices, req_pool_index=req_pool_index
+        from sglang.srt.mem_cache.kv.memory.snapshot import copy_to_cpu
+
+        return copy_to_cpu(
+            self, indices, state_indices=mamba_indices, request_row=req_pool_index
         )
 
     def load_cpu_copy(
         self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None
     ):
-        self._policy.load_cpu_copy(
+        from sglang.srt.mem_cache.kv.memory.snapshot import restore_from_cpu
+
+        restore_from_cpu(
             self,
             kv_cache_cpu,
             indices,
-            mamba_indices=mamba_indices,
-            req_pool_index=req_pool_index,
+            state_indices=mamba_indices,
+            request_row=req_pool_index,
         )
 
     # -- ordering with transfers and forwards --
@@ -572,18 +791,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         a DMA initiator whose queues outlive an iteration, registered once. A
         transfer that reaches every sub-pool names every one: a band it leaves
         out would relocate its own pages under the same in-flight copy."""
-        assert self.lazy_compaction, (
-            "Pin sources (PD disaggregation, HiCache) with the unified memory "
-            "pool require lazy compaction (eager free-path compaction moves "
-            "pages under in-flight transfers)."
-        )
         for name in sub_pools:
             self.bands[self._band_positions[name]].add_pin_source(busy)
 
-    def set_hicache_transfer_done_event(self, transfer_key: Hashable, event) -> None:
-        # Every member a pin covers must also order its moves after the copy.
+    def fix_pages(self, sub_pool: str, key: Hashable, pages: Sequence[int]) -> None:
+        """Keep these physical pages of ``sub_pool`` where they are, under
+        ``key``, until `unfix_pages`: a transfer that holds their physical ids,
+        or a page that must not be touched. Moves go around them, and every
+        plan keeps them inside their band."""
+        self.bands[self._band_positions[sub_pool]].fix_pages(key, pages)
+
+    def unfix_pages(
+        self, sub_pool: str, key: Hashable, pages: Optional[Sequence[int]] = None
+    ) -> None:
+        """Release the pages of ``sub_pool`` fixed under ``key``: every one, or
+        ``pages``."""
+        self.bands[self._band_positions[sub_pool]].unfix_pages(key, pages)
+
+    def end_load_reservations(self) -> None:
+        """Submitted host loads order moves of the rows they write through
+        their recorded copies: no member keeps rows reserved for a load."""
         for member in self.members:
-            member.set_hicache_transfer_done_event(transfer_key, event)
+            member.end_load_reservation()
 
     def prewarm_compaction(self) -> None:
         """Prewarm the page-move path of every member that compacts."""
@@ -592,8 +821,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     def compaction_can_run(self) -> bool:
         """Whether bytes freed on either side can serve the other side's next
-        allocation now: compaction is eager, or its moves are unblocked."""
-        return not self.lazy_compaction or all(
+        allocation now: its moves are unblocked."""
+        return all(
             not band.moves_blocked()
             for band in (self.full_attn_allocator, *self._windows)
         )
@@ -618,22 +847,44 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         self,
         forward_done: torch.cuda.Event,
         out_cache_loc_virtual: Optional[torch.Tensor],
+        state_slots_virtual: Optional[torch.Tensor] = None,
+        *,
+        token_writes_unknown: bool = False,
+        state_writes_unknown: bool = False,
     ) -> None:
         """Hand the forward's metadata to every member; token bands translate the
-        write set through their own v2p, and the state band, written by state
-        kernels rather than through `out_cache_loc`, gets None."""
+        write set through their own v2p. The state band, written in place by
+        state kernels rather than through `out_cache_loc`, takes the virtual
+        state slots the forward writes. ``token_writes_unknown`` /
+        ``state_writes_unknown``: the token / state bands cannot read this
+        forward's write ids before it ends."""
         with record_function("ChainAllocator.set_inflight_forward"):
             for member in self.members:
+                is_state = member is self.mamba_allocator
                 member.set_inflight_forward(
                     forward_done,
-                    None if member is self.mamba_allocator else out_cache_loc_virtual,
+                    state_slots_virtual if is_state else out_cache_loc_virtual,
+                    writes_unknown=(
+                        state_writes_unknown if is_state else token_writes_unknown
+                    ),
                 )
+
+    def settle_pending_for_recovery(self, bands=None):
+        """The entry of an urgent recovery over ``bands`` (every member by
+        default): one host read ahead, then every pending page of those bands
+        settles (`band.py::settle_pending_for_recovery`)."""
+        return settle_pending_for_recovery(self.members if bands is None else bands)
+
+    def retire_forward(self, forward_done: torch.cuda.Event) -> None:
+        """The scheduler processed this forward's result; see `Band.retire_forward`."""
+        for member in self.members:
+            member.retire_forward(forward_done)
 
     def flush_opportunistic(self) -> int:
         """Non-urgent flush of every member, ends before floats; sync-free."""
         with record_function("ChainAllocator.flush_opportunistic"):
             if all(
-                m._free_phys_pages.numel() == 0 and not m._pending_reuse
+                m._free_phys_pages.numel() == 0 and not m.usage.has_pending()
                 for m in self.members
             ):
                 return 0
@@ -649,28 +900,67 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
 
     # -- alloc --
 
+    @_one_operation
     def _allocate(
         self,
         *,
         full_tokens: int,
         swa_tokens: int,
         num_owner_pages: int,
-        owner_take: Callable[[], Optional[torch.Tensor]],
+        owner_take: Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]],
         window_pages: Callable[
             [torch.Tensor, torch.Tensor], torch.Tensor
         ] = lambda out, new_pages: new_pages,
+        window_tail_pages: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
-        """Price before taking owner ids, then bind their new window pages."""
+        """Price before taking owner ids, then bind their new window pages.
+
+        With ``window_tail_pages`` (by window sub-pool), each named window
+        binds only the last that many of the new pages, its live tail; an
+        unnamed window binds all of them."""
         owner = self.full_attn_allocator
         if not self._policy.prices_before_take:
             # The owner prices and relieves its own shortfall.
-            return owner_take()
-        if not self.ensure_capacity(full_tokens, swa_tokens):
+            return owner_take(None)
+        if len(self._windows) > 1:
+            pages = self._window_page_counts(
+                num_owner_pages, swa_tokens, window_tail_pages
+            )
+            auxiliary = [
+                n
+                for name, n in pages.items()
+                if name != self.swa_attn_allocator.sub_pool_name
+            ]
+            if not self.ensure_capacity(
+                full_tokens,
+                swa_tokens,
+                auxiliary_swa_tokens=max(auxiliary, default=0) * self.page_size,
+            ):
+                return None
+        elif not self.ensure_capacity(full_tokens, swa_tokens):
             return None
         # free_virtual_ids is rebound (slice/cat), never mutated in place, so
         # this prefix view still names the pages the owner is about to consume.
         new_virtual_pages = owner.free_virtual_ids[:num_owner_pages]
-        out = owner_take()
+        if len(self._windows) > 1:
+            if num_owner_pages > len(owner.free_virtual_ids):
+                return None
+            reserved = self._reserve_token_pages(num_owner_pages, pages)
+            if reserved is None:
+                return None
+            out = owner_take(reserved[owner.sub_pool_name])
+            assert out is not None
+            for window in self._windows:
+                # The extend kernel hands the new pages out in token order, so
+                # a tail's new pages are the last ones.
+                count = pages[window.sub_pool_name]
+                bind = new_virtual_pages[new_virtual_pages.numel() - count :]
+                physical = reserved[window.sub_pool_name]
+                assert bind.numel() == physical.numel()
+                window.ids.bind(bind, physical)
+                window._maybe_zero_pages(physical)
+            return out
+        out = owner_take(None)
         assert out is not None, (
             "ChainAllocator: the owner refused after the joint pre-check "
             "passed -- internal-state inconsistency"
@@ -680,13 +970,113 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             window.alloc_with_virtual(bind)
         return out
 
+    def _window_page_counts(
+        self,
+        owner_pages: int,
+        swa_tokens: int,
+        window_tail_pages: Optional[Mapping[str, int]],
+    ) -> Dict[str, int]:
+        """New pages each window binds: a named window its own tail, the
+        primary window ``swa_tokens`` worth, any other window every new page."""
+        counts = {}
+        for window in self._windows:
+            name = window.sub_pool_name
+            if window_tail_pages is not None and name in window_tail_pages:
+                counts[name] = window_tail_pages[name]
+            elif window is self.swa_attn_allocator:
+                counts[name] = -(-swa_tokens // self.page_size)
+            else:
+                counts[name] = owner_pages
+        return counts
+
+    def _reserve_token_pages(self, owner_pages, window_pages: Mapping[str, int]):
+        bands = (self.full_attn_allocator, *self._windows)
+        plan = no_relief_plan(
+            self.pricing_snapshot(),
+            tuple(
+                (
+                    band.sub_pool_name,
+                    owner_pages
+                    if band is self.full_attn_allocator
+                    else window_pages[band.sub_pool_name],
+                )
+                for band in bands
+            ),
+        )
+        if plan is None:
+            return None
+        saved = []
+        reserved = {}
+        for band in bands:
+            fields = [
+                "watermark_physical",
+                "live_page_count",
+                "_free_phys_pages",
+                "_free_phys_sorted",
+                "_pending_until_retire",
+                "_pending_host",
+            ]
+            if isinstance(band, FloatBand):
+                fields += ["low_wm_page", "high_wm_page", "_next_hole_end"]
+            saved.append((band, {name: getattr(band, name) for name in fields}))
+            physical = band.take_planned_physical_pages(plan.takes[band.sub_pool_name])
+            if physical is None:
+                # No ids or bytes have been published. Restore the host allocation
+                # state; each assignment advances, never rewinds, its epoch.
+                for allocated, fields in saved:
+                    for name, value in fields.items():
+                        setattr(allocated, name, value)
+                return None
+            reserved[band.sub_pool_name] = physical
+        return reserved
+
+    @contextmanager
+    def scoped_physical_takes(
+        self, full_tokens, swa_tokens, *, auxiliary_swa_tokens=None, state_slots=0
+    ):
+        """Consume a pre-realized reservation across independently issued H2D takes."""
+        if len(self._windows) <= 1:
+            yield
+            return
+        if any(band._physical_take_scope is not None for band in self.members):
+            raise RuntimeError("physical reservation scopes cannot be nested")
+        scope = _ScopedPhysicalTakes(
+            self,
+            self._policy._demands(
+                self, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+            ),
+        )
+        for band in self.members:
+            band._physical_take_scope = scope
+        try:
+            yield
+        finally:
+            for band in self.members:
+                band._physical_take_scope = None
+
+    def _take_owner_tokens(self, need_size, physical):
+        owner = self.full_attn_allocator
+        if physical is None:
+            return owner.alloc(need_size)
+        return take_new_pages(
+            owner,
+            need_size // self.page_size,
+            lambda pages: owner._expand_pages_to_tokens(
+                pages[: need_size // self.page_size]
+            ),
+            copy_new_pages=False,
+            physical_pages=physical,
+        )
+
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
         with record_function("ChainAllocator.alloc"):
             return self._allocate(
                 full_tokens=need_size,
                 swa_tokens=need_size,
                 num_owner_pages=need_size // self.page_size,
-                owner_take=lambda: self.full_attn_allocator.alloc(need_size),
+                owner_take=lambda physical: self._take_owner_tokens(
+                    need_size, physical
+                ),
             )
 
     def _paged_take(
@@ -698,7 +1088,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         num_new_pages: int,
-    ) -> Callable[[], Optional[torch.Tensor]]:
+    ) -> Callable[[Optional[torch.Tensor]], Optional[torch.Tensor]]:
         def extend_tokens(free_pages: torch.Tensor) -> torch.Tensor:
             bs = len(prefix_lens)
             out_indices = torch.empty(
@@ -713,18 +1103,19 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     last_loc,
                     free_pages,
                     out_indices,
-                    next_power_of_2(bs),
                     self.full_attn_allocator.page_size,
                 )
             return out_indices
 
-        return lambda: take_new_pages(
+        return lambda physical=None: take_new_pages(
             self.full_attn_allocator,
             num_new_pages,
             extend_tokens,
             copy_new_pages=False,
+            physical_pages=physical,
         )
 
+    @_one_operation
     def alloc_extend(
         self,
         prefix_lens: torch.Tensor,
@@ -772,6 +1163,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 ),
             )
 
+    @_one_operation
     def alloc_extend_swa_tail(
         self,
         prefix_lens: torch.Tensor,
@@ -781,9 +1173,12 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         last_loc: torch.Tensor,
         extend_num_tokens: int,
         swa_tail_len: int,
+        window_tail_lens: Optional[Mapping[str, int]] = None,
     ) -> Optional[torch.Tensor]:
         """Decode-node prealloc: owner KV for the whole sequence, window KV for
-        the live window tail only.
+        the live window tail only. ``swa_tail_len`` is the primary window's
+        tail; ``window_tail_lens`` names the tail of every other window that
+        keeps its own retention (a fused draft's band).
 
         The owner and the window SHARE one virtual id space (a virtual page names
         an owner-physical page and, if bound, a window-physical one), so the tail
@@ -795,18 +1190,28 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         already bound and costs no new window page.
         """
         assert len(prefix_lens_cpu) == 1
-        assert 0 <= swa_tail_len <= extend_num_tokens
+        tails = dict(window_tail_lens or {})
+        tails[self.swa_attn_allocator.sub_pool_name] = swa_tail_len
+        assert all(0 <= tail <= extend_num_tokens for tail in tails.values())
         with record_function("ChainAllocator.alloc_extend_swa_tail"):
             prefix_len = int(prefix_lens_cpu[0])
             seq_len = int(seq_lens_cpu[0])
             first_new_page = (prefix_len + self.page_size - 1) // self.page_size
-            first_tail_page = (seq_len - swa_tail_len) // self.page_size
-            num_swa_pages = (
-                (seq_len + self.page_size - 1) // self.page_size
-                - max(first_new_page, first_tail_page)
-                if swa_tail_len
-                else 0
-            )
+
+            def new_tail_pages(tail_len: int) -> int:
+                # Only NEW pages need binding; a tail page carried in from the
+                # prefix is already bound on the window.
+                if not tail_len:
+                    return 0
+                first_tail_page = (seq_len - tail_len) // self.page_size
+                return (seq_len + self.page_size - 1) // self.page_size - max(
+                    first_new_page, first_tail_page
+                )
+
+            num_swa_pages = new_tail_pages(swa_tail_len)
+            window_tail_pages = {
+                name: new_tail_pages(tail) for name, tail in tails.items()
+            }
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
                 page_size=self.page_size,
@@ -838,8 +1243,10 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                     num_new_pages,
                 ),
                 window_pages=tail_pages,
+                window_tail_pages=window_tail_pages,
             )
 
+    @_one_operation
     def alloc_decode(
         self,
         seq_lens: torch.Tensor,
@@ -862,7 +1269,6 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                         last_loc,
                         free_pages,
                         out_indices,
-                        next_power_of_2(bs),
                         self.full_attn_allocator.page_size,
                     )
                 return out_indices
@@ -872,18 +1278,22 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
                 full_tokens=need_tokens,
                 swa_tokens=need_tokens,
                 num_owner_pages=num_new_pages,
-                owner_take=lambda: take_new_pages(
+                owner_take=lambda physical: take_new_pages(
                     self.full_attn_allocator,
                     num_new_pages,
                     decode_tokens,
                     copy_new_pages=True,
+                    physical_pages=physical,
                 ),
             )
 
+    @_one_operation
     def alloc_state_slots(self, need_size: int) -> Optional[torch.Tensor]:
         """Per-request state slots: the state band prices and relieves its own
-        shortfall (VIRTUAL slot ids)."""
-        return self.mamba_allocator.alloc(need_size)
+        shortfall (VIRTUAL slot ids). A new slot may be written on the schedule
+        stream (a state copy into it) before any forward runs, so it is
+        acquired as a schedule-stream copy's."""
+        return self.mamba_allocator.alloc(need_size, Consumer.SCHEDULE_COPY)
 
     def is_slot_allocated(self, slot: int) -> bool:
         """Token-slot surface = the owner (which owns the virtual ids)."""
@@ -918,50 +1328,48 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             self._clear_inverse_history()
 
     def free_swa(self, free_index: torch.Tensor) -> None:
-        """Window tombstone path: release window-physical, keep the virtual id
-        and owner-physical live; `v2p_page[v_page] = -1` IS the tombstone."""
+        self.free_window(self.roles.window, free_index)
+
+    def free_window(self, name: str, free_index: torch.Tensor) -> None:
         if free_index is None or free_index.numel() == 0:
             return
+        window = self.window_allocators[name]
         v = free_index.detach().to(torch.int64)
-        ps = self.page_size
-        for window in self._windows:
-            # `> 0` strict: -1 = tombstoned, page 0 = padding sink (never freeable).
-            live = v[window.ids.virtual_to_physical[v // ps] > 0]
-            if live.numel() == 0:
-                continue
-            if ps == 1:
-                # token == page and the live filter just deduped against the v2p
-                # table, so these ARE unique page ids -- same skip as `_free_lazy`.
-                window.free(live, _pages=live)
-            else:
-                window.free(live)
+        live = v[window.ids.virtual_to_physical[v // self.page_size] > 0]
+        if live.numel():
+            window.free(live, _pages=live if self.page_size == 1 else None)
             window.clear_inverse_history()
 
     def free_swa_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """free_swa() for a kv-row segment whose window pages are all bound: page
-        reps come from `start_pos`, so it is fixed-shape at every page size."""
+        self.free_window_segment(self.roles.window, free_index, start_pos=start_pos)
+
+    def free_window_segment(
+        self, name: str, free_index: torch.Tensor, *, start_pos: int
+    ) -> None:
         if free_index is None or free_index.numel() == 0:
             return
-        for window in self._windows:
-            reps = window._page_reps(free_index.detach().to(torch.int64), start_pos)
-            self._free_window_page_reps(window, reps)
-            window.clear_inverse_history()
+        window = self.window_allocators[name]
+        reps = window._page_reps(free_index.detach().to(torch.int64), start_pos)
+        self._free_window_page_reps(window, reps)
+        window.clear_inverse_history()
 
     def _free_window_page_reps(self, window: Band, reps: torch.Tensor) -> None:
-        v_pages = reps // self.page_size
+        v_pages = window.virtual_pages_of(reps)
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
             expect(
-                UNIFIED_SWA_SEGMENT_BOUND,
+                WINDOW_SEGMENT_BOUND,
                 window.ids.virtual_to_physical[v_pages] > 0,
                 msg="caller wants free_full_segment",
             )
         window.free(reps, _pages=v_pages)
 
     def free_full(self, free_index: torch.Tensor) -> None:
-        """Release the owner-physical page and the virtual id, leaving the window
-        alone -- the caller already tombstoned it. Without a window this is free()."""
+        """Release owner ids after primary-window retirement.
+
+        Independently retained windows may still own those ids and are released too.
+        """
         if not self._windows:
             self.free(free_index)
             return
@@ -970,12 +1378,14 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         if self.free_group is not None:
             self.full_free_group.append(self._copy_for_free_group(free_index))
             return
-        self.full_attn_allocator.free(free_index.detach().to(torch.int64))
-        self.full_attn_allocator.clear_inverse_history()
+        if len(self._windows) > 1:
+            self.free(free_index)
+        else:
+            self.full_attn_allocator.free(free_index.detach().to(torch.int64))
+            self.full_attn_allocator.clear_inverse_history()
 
     def free_full_segment(self, free_index: torch.Tensor, *, start_pos: int) -> None:
-        """Release a kv-row segment's owner side; its window side is already
-        tombstoned."""
+        """Release a kv-row segment after all its windows were released."""
         if not self._windows:
             BaseTokenToKVPoolAllocator.free_full_segment(
                 self, free_index, start_pos=start_pos
@@ -989,10 +1399,11 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         # Signal-only invariant: avoid launching its lookup and comparison
         # when detection is disabled. This invariant has no recovery action.
         if resolve_level() >= InvariantCheckLevel.WARN:
+            pages = reps // self.page_size
             for window in self._windows:
                 expect(
-                    UNIFIED_SWA_SEGMENT_RELEASED,
-                    window.ids.virtual_to_physical[reps // self.page_size] <= 0,
+                    WINDOW_SEGMENT_RELEASED,
+                    window.ids.virtual_to_physical[pages] <= 0,
                     msg="caller wants free_segment",
                 )
         if self.free_page_reps_group is None:
@@ -1008,7 +1419,8 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         assert full_indices.numel() == swa_indices.numel()
         full_pages = full_indices.to(torch.int64) // self.page_size
         swa_pages = swa_indices.to(torch.int64) // self.page_size
-        self.swa_attn_allocator.ids.bind(full_pages, swa_pages)
+        window = self.swa_attn_allocator
+        window.ids.bind(full_pages, swa_pages)
 
     def clear_full_to_swa_mapping(self, full_indices: torch.Tensor) -> None:
         # Paired with set_full_to_swa_mapping: a shared id space has no mapping tensor.
@@ -1028,8 +1440,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         full_free_group, self.full_free_group = self.full_free_group, []
         super().free_group_end()
         if full_free_group:
-            self.full_attn_allocator.free(torch.cat(full_free_group))
-            self.full_attn_allocator.clear_inverse_history()
+            self.free_full(torch.cat(full_free_group))
         if pending or full_pending:
             self._release_page_reps(pending, full_pending)
 
@@ -1054,15 +1465,16 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
     def _release_page_reps(
         self, both: Sequence[torch.Tensor], full_only: Sequence[torch.Tensor]
     ) -> None:
-        """Free page reps: `both` on every window and the owner, `full_only` on
-        the owner."""
-        if both:
-            reps = both[0] if len(both) == 1 else torch.cat(tuple(both))
-            for window in self._windows:
-                self._free_window_page_reps(window, reps)
+        """Release fully bound segments and segments with no remaining windows."""
         pieces = (*both, *full_only)
         reps = pieces[0] if len(pieces) == 1 else torch.cat(pieces)
-        self.full_attn_allocator.free(reps, _pages=reps // self.page_size)
+        if both:
+            window_reps = both[0] if len(both) == 1 else torch.cat(tuple(both))
+            for window in self._windows:
+                self._free_window_page_reps(window, window_reps)
+        self.full_attn_allocator.free(
+            reps, _pages=self.full_attn_allocator.virtual_pages_of(reps)
+        )
         self._clear_inverse_history()
 
     def clear(self) -> None:

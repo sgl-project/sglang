@@ -47,7 +47,6 @@ model:
     - kimi_k2
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.15.post1-rocm720-mi35x-20260715
   # Kimi uses split attention backends (aiter prefill / triton decode), not a
   # single --attention-backend.
   prefill_attention_backend: aiter
@@ -105,7 +104,7 @@ mtp:
   num_steps: 3
   eagle_topk: 1
   num_draft_tokens: 4
-  draft_model_path: /it-share/model_coverage/models--lightseekorg--kimi-k2.6-eagle3.1-mla
+  draft_model: lightseekorg/kimi-k2.6-eagle3.1-mla
 
 bench:
   # bench_serving --max-concurrency sweep; one result JSON per concurrency.

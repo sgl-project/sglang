@@ -21,16 +21,19 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
+from sglang.srt.mem_cache.kv.plan import TREE_STATE
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeComponentDeviceSlot,
     FreeComponentHostSlot,
     MambaEvictExcessPathStates,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
+from sglang.srt.mem_cache.unified_cache.component_type import (
     BASE_COMPONENT_TYPE,
+    ComponentType,
+)
+from sglang.srt.mem_cache.unified_cache.components.base import (
     BufferLoadBackContext,
     CacheTransferPhase,
-    ComponentType,
     EvictLayer,
     ExternalLinkerLoadPhase,
     InternalStateBackup,
@@ -54,15 +57,14 @@ if TYPE_CHECKING:
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
-        UnifiedTreeNode,
-    )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
+    family = TREE_STATE
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -716,7 +718,9 @@ class MambaComponent(TreeComponent):
         """The storage whose state this component's values are, and the
         sub-pool they are slots of."""
         storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(self.component_type.name)
+        return storage, storage.tree_sub_pool(
+            self.component_type.name, family=self.family
+        )
 
     @property
     def quantizes_checkpoints(self) -> bool:
