@@ -12,6 +12,7 @@ from typing import Optional, TypeGuard
 import torch
 
 from sglang.kernels.ops.kvcache.hicache import (
+    can_use_page_unified_load_back_jit_kernel,
     can_use_page_unified_write_back_jit_kernel,
 )
 from sglang.srt.mem_cache.host_memory import available_host_memory_bytes
@@ -48,11 +49,12 @@ def prepare_page_unified_write_back_staging(
         and can_use_page_unified_write_back_jit_kernel(
             group_bytes=geometry.group_bytes, is_mla=geometry.is_mla
         )
+        and can_use_page_unified_load_back_jit_kernel(group_bytes=geometry.group_bytes)
     ):
         row_kind = "latent" if geometry.is_mla else "head-group"
         raise ValueError(
-            "the 'page_unified' host layout requires the staged "
-            "write-back JIT kernel, which could not be built for a "
+            "the 'page_unified' host layout requires the staged write-back "
+            "and load-back JIT kernels, which could not be built for a "
             f"{geometry.group_bytes}-byte {row_kind} row."
         )
     shape = geometry.page_dims(min(page_capacity, _WRITE_BACK_STAGING_PAGE_CHUNK))
@@ -619,6 +621,20 @@ class HostKVCache(abc.ABC):
     def logical_page_size(self) -> int:
         """Page size in that same logical space (the widened DCP page)."""
         return self.page_size * self.dcp_size
+
+    def _storage_page_index(self, index: int) -> int:
+        """Physical slot of the page an L3 key covers; storage backends address
+        pages by logical (widened) slot, one physical page per rank under DCP."""
+        index = int(index)
+        if self.dcp_size == 1:
+            return index
+        if index < 0 or index % self.logical_page_size != 0:
+            raise ValueError(
+                "DCP L3 page start must be a nonnegative logical page boundary."
+            )
+        if index + self.logical_page_size > self.logical_size:
+            raise IndexError("DCP L3 page is outside the host pool.")
+        return index // self.dcp_size
 
     @synchronized
     def alloc(self, need_size: int) -> Optional[torch.Tensor]:
