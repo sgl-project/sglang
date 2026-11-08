@@ -2673,9 +2673,21 @@ def _post_process_topk_ids(
     _fold_pad_into_append = False
     recorder_was_fused = False
     _fold_pad_weights_into_append = False
-    num_physical_routed_experts = None
-    if moe_load_balancer is not None:
+    # Physical routed-expert count; only shared slots, laid out after these ids, need it.
+    if not num_shared_topk_slots:
+        num_physical_routed_experts = None
+    elif moe_load_balancer is not None:
         from sglang.srt.eplb.expert_location import get_global_expert_location_metadata
+
+        # The balancer drops the dispatch info and routes to physical replicas.
+        num_physical_routed_experts = (
+            get_global_expert_location_metadata().num_physical_experts
+        )
+    elif expert_location_dispatch_info is not None:
+        num_physical_routed_experts = expert_location_dispatch_info.num_physical_experts
+    else:
+        num_physical_routed_experts = router_logits.shape[1]
+    if moe_load_balancer is not None:
         from sglang.srt.eplb.moe_load_balancer_glue import route_topk_with_mlb
 
         # Gate kernels may have appended shared columns, but these IDs have not
@@ -2707,10 +2719,6 @@ def _post_process_topk_ids(
                 else topk_config.routed_scaling_factor or 1.0
             ),
         )
-        if num_shared_topk_slots:
-            num_physical_routed_experts = (
-                get_global_expert_location_metadata().num_physical_experts
-            )
         if router_wrote_shared_cols:
             shared_ids = topk_ids[:, -num_shared_topk_slots:]
             if not use_per_rank_shared_slots:
@@ -2842,12 +2850,6 @@ def _post_process_topk_ids(
         # fused_append_shared_experts() + eager per-rank shared-slot remap pair,
         # collapsing ~6 launch-bound elementwise kernels/layer (div_floor / add /
         # arange / fill / copy) into the one append kernel that already runs.
-        if num_physical_routed_experts is None:
-            num_physical_routed_experts = (
-                expert_location_dispatch_info.num_physical_experts
-                if expert_location_dispatch_info is not None
-                else router_logits.shape[1]
-            )
         ep_size = get_parallel().moe_ep_size
         ep_rank = get_parallel().moe_ep_rank
         num_local_routed = num_physical_routed_experts // ep_size
@@ -2900,12 +2902,6 @@ def _post_process_topk_ids(
     elif use_per_rank_shared_slots:
         # DeepEP/MegaMOE: remap to per-rank shared-slot layout where each
         # rank's shared expert has a unique ID for dispatch routing.
-        if num_physical_routed_experts is None:
-            num_physical_routed_experts = (
-                expert_location_dispatch_info.num_physical_experts
-                if expert_location_dispatch_info is not None
-                else router_logits.shape[1]
-            )
         if router_wrote_shared_cols:
             # Placeholders; the remap appends the real shared columns.
             topk_ids = topk_ids[:, :-num_shared_topk_slots]
