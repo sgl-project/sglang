@@ -1,5 +1,5 @@
 """CI-only check that a request exits and sends its final output at most once.
-The invariant checker checks at idle that a request the scheduler took sent it.
+The invariant checker checks at idle that a request the scheduler kept sent it.
 
 An exit gives the request's resources back (`RequestRetirer.release`,
 `abort_retracted`); a send is its final output (the streams' finished branches,

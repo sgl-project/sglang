@@ -3582,8 +3582,8 @@ class Scheduler(
 
         self._bind_pp_arrival_prefetch(req, recv_req)
 
-        # Taken here too: the grammar queue holds it before it is queued.
-        self.invariant_checker.record_take(req)
+        # Expected here too: the grammar queue holds it before it is queued.
+        self.invariant_checker.expect_output(req)
         added_to_grammar_queue = self.grammar_manager.process_req_with_grammar(req)
         if not added_to_grammar_queue:
             self._add_request_to_queue(req)
@@ -3732,9 +3732,9 @@ class Scheduler(
         return True
 
     def _add_request_to_queue(self, req: Req, is_retracted: bool = False):
-        # Every request the scheduler keeps is taken here; one rejected at intake
-        # without being queued sends its output in the call that built it.
-        self.invariant_checker.record_take(req)
+        # Every request the scheduler keeps owes its output from here; one rejected
+        # at intake without being queued sends it in the call that built it.
+        self.invariant_checker.expect_output(req)
         if not self._set_or_validate_priority(req):
             return
         if is_retracted:

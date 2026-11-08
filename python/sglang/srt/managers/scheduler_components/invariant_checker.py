@@ -79,8 +79,8 @@ class SchedulerInvariantChecker:
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     reporter: FailureReporter = field(default_factory=FailureReporter)
-    # The requests the scheduler took; a sent one leaves at the next idle check.
-    taken_reqs: Set[Req] = field(default_factory=set)
+    # The requests that owe a final output; a sent one leaves at the next idle check.
+    owed_reqs: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -633,18 +633,18 @@ class SchedulerInvariantChecker:
             "Requests in running but in no running batch or step",
         )
 
-    def record_take(self, req: Req) -> None:
-        """Record that the scheduler took `req`, which now owes a final output."""
+    def expect_output(self, req: Req) -> None:
+        """Record that `req`, now kept by the scheduler, owes a final output."""
         if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            self.taken_reqs.add(req)
+            self.owed_reqs.add(req)
 
     def _check_unsent_outputs(self) -> None:
-        """At idle, every request the scheduler took has sent its final output or
+        """At idle, every request the scheduler kept has sent its final output or
         is still in a list: idle leaves some lists full (held, parked, deferred)."""
-        self.taken_reqs = {req for req in self.taken_reqs if req.send_via is None}
+        self.owed_reqs = {req for req in self.owed_reqs if req.send_via is None}
         listed = {req for reqs in self.get_request_lists().values() for req in reqs}
         self._raise_if_any(
-            self.taken_reqs - listed,
+            self.owed_reqs - listed,
             "Requests in no list that never sent their final output",
         )
 
