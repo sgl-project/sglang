@@ -2473,36 +2473,14 @@ _DEPRECATED_ENVS: Dict[str, _DeprecatedEnv] = {
             "backend rather than the CuTe DSL fusion."
         )
     ),
-    "SGLANG_FLASHINFER_MNNVL_CUTEDSL_AR_FUSION_MAX_INSTANCES": _DeprecatedEnv(
-        note="One workspace per process is now an invariant, not a limit."
-    ),
     # Removed without replacement.
-    "SGLANG_ENABLE_CP_V2": _DeprecatedEnv(
-        note="Strategy-based prefill context parallelism is now the only generic implementation."
-    ),
-    "SGLANG_TRACE_QWEN35_FINAL_NORM": _DeprecatedEnv(),
     "SGLANG_DSPARK_FAST_SAMPLING": _DeprecatedEnv(
         note="DSpark draft sampling always uses Gumbel-max."
-    ),
-    "SGLANG_DSPARK_OPT_FUSED_GREEDY_MARKOV": _DeprecatedEnv(
-        note="A one-row step of SGLANG_DSPARK_USE_GREEDY_DRAFT on a vanilla markov "
-        "head fuses the bias GEMV."
     ),
     "SGLANG_DSPARK_FOLDED_SAMPLING": _DeprecatedEnv(
         note="A folded DSpark draft proposal samples; set "
         "SGLANG_DSPARK_USE_GREEDY_DRAFT=1 for an argmax-only draft, or "
         "SGLANG_DSPARK_FOLDED_PROPOSAL=0 to keep the proposal out of the graph."
-    ),
-    "SGLANG_SKIP_RUST_TESTS": _DeprecatedEnv(
-        note="The Rust tests run in pr-test-rust-workspace.yml now."
-    ),
-    "SGLANG_QWEN35_NATIVE_FINAL_NORM": _DeprecatedEnv(),
-    "SGLANG_ENABLE_HICACHE_BUFFER_ANCHOR_LOCK": _DeprecatedEnv(
-        note="Buffer-mode anchor pinning is always on; set "
-        "SGLANG_HICACHE_BUFFER_ANCHOR_LOCK_CAP=0 to disable it."
-    ),
-    "SGLANG_TRITON_PREFILL_TRUNCATION_ALIGN_SIZE": _DeprecatedEnv(
-        note="Deterministic inference on triton no longer aligns prefill chunks."
     ),
     # Replaced by CLI flags.
     "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": _DeprecatedEnv(

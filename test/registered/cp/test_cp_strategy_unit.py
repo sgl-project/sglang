@@ -331,9 +331,8 @@ class TestCPZigzagStrategy(CustomTestCase):
             extend_seq_lens_cpu=[7],
         )
 
-        with patch.dict("os.environ", {"SGLANG_ENABLE_CP_V2": "0"}):
-            self.assertTrue(is_cp_active(active_batch))
-            self.assertFalse(is_cp_active(inactive_batch))
+        self.assertTrue(is_cp_active(active_batch))
+        self.assertFalse(is_cp_active(inactive_batch))
 
     def _expected_metadata(self, *, rank, cp_size, seq_lens, extend_seq_lens):
         bs = len(extend_seq_lens)
