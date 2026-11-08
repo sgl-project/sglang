@@ -100,6 +100,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     ReqList,
 )
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.managers.utils import (
     GenerationBatchResult,
     is_war_barrier_enabled,
@@ -3653,11 +3654,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             self.process_decode_queue()
@@ -3685,6 +3686,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @torch.no_grad()
     def event_loop_overlap_disagg_decode(self: Scheduler):
@@ -3706,11 +3708,11 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Pending rooms from the prior cycle can overlap request intake and
             # the tail of the in-flight decode graph.
-            if not self._engine_paused:
+            if not self.pause_state.paused:
                 self.disagg_decode_prealloc_queue.prefetch_prefill_dp_rank_queries()
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
             prealloc_deferred = self.process_decode_queue(defer_prealloc=defer_prealloc)
@@ -3762,6 +3764,7 @@ class SchedulerDisaggregationDecodeMixin:
 
             # Update last_batch
             self.last_batch = batch
+            self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     def _flush_staging_scatters(self: Scheduler) -> None:
         handler = self.disagg_decode_transfer_queue.staging_handler

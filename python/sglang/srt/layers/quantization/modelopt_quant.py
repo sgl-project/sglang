@@ -3,6 +3,7 @@
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/quantization/modelopt.py
 from __future__ import annotations
 
+import copy
 import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
@@ -816,11 +817,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
         nvfp4a16_config: ModelOptFp4Config,
         mxfp8_config: Fp8Config,
         fp8_block_config: Fp8Config,
+        mxfp8_linear_config: Optional[Fp8Config] = None,
     ) -> None:
         super().__init__(kv_cache_quant_algo, exclude_modules, packed_modules_mapping)
         self.quantized_layers = quantized_layers
         self.fp8_config = fp8_config
         self.mxfp8_config = mxfp8_config
+        self.mxfp8_linear_config = mxfp8_linear_config or mxfp8_config
         self.fp8_block_config = fp8_block_config
         self.nvfp4_config = nvfp4_config
         self.nvfp4a16_config = nvfp4a16_config
@@ -930,6 +933,13 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             packed_modules_mapping=packed_modules_mapping,
             use_mxfp8=True,
         )
+        # On CUDA GPUs other than Blackwell no dense GEMM takes 1x32 MXFP8 scales
+        # (DeepGEMM asserts on them on Hopper), so dense MXFP8 layers are
+        # converted to block-FP8 [128,128] at load. MoE keeps the MXFP8 config.
+        mxfp8_linear_config = mxfp8_config
+        if is_cuda() and not get_platform().is_blackwell:
+            mxfp8_linear_config = copy.copy(mxfp8_config)
+            mxfp8_linear_config.convert_mxfp8_to_block_fp8 = True
         # Block-FP8 (FP8_PB_WO / FP8_BLOCK_SCALES): fp8 weight with a per-block
         # weight_scale_inv; the block size comes from the checkpoint's
         # group_size (128 by default). One config serves Linear and FusedMoE.
@@ -963,6 +973,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             fp8_config=fp8_config,
             mxfp8_config=mxfp8_config,
             fp8_block_config=fp8_block_config,
+            mxfp8_linear_config=mxfp8_linear_config,
             nvfp4_config=nvfp4_config,
             nvfp4a16_config=nvfp4a16_config,
         )
@@ -1054,7 +1065,7 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if quant_algo in _BLOCK_FP8_ALGOS:
                 return Fp8LinearMethod(self.fp8_block_config)
             if quant_algo == "MXFP8":
-                return Fp8LinearMethod(self.mxfp8_config)
+                return Fp8LinearMethod(self.mxfp8_linear_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":

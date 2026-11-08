@@ -23,9 +23,10 @@ from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.invariant_checker import (
-    CheckPhase,
     SchedulerInvariantChecker,
 )
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.state_check import CheckPhase
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -76,7 +77,6 @@ def _invariant_checker(s):
         token_to_kv_pool_allocator=None,
         req_to_token_pool=None,
         pool_stats_observer=None,
-        get_last_batch=Mock(),
         scheduler_stage_metrics=None,
         get_request_lists=s.request_lists,
         get_chunked_req=lambda: s.chunked_req,
@@ -281,7 +281,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s._confidence_budget_prepare = None
         # Event loop
         s.gracefully_exit = False
-        s._engine_paused = False
+        s.pause_state = PauseState()
         s.increment_scheduler_iterations = Mock()
         s.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
         s.is_generation = True

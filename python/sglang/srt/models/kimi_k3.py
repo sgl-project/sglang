@@ -2422,6 +2422,8 @@ class KimiK3DeltaAttention(nn.Module):
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
+    dcp_v_preproject = True
+
     def __init__(
         self,
         config,
@@ -3738,6 +3740,8 @@ class KimiK3LinearForCausalLM(nn.Module):
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
             self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
             self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            if self_attn._dcp_v_weights is not None:
+                self_attn._prepare_dcp_v_weights(get_parallel().dcp_group)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
             if _is_hip and (
                 scale_folded_into_weight

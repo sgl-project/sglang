@@ -189,14 +189,34 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     overrides = {}
     if cfg.dcp_size > 1:
         if (
-            cfg.speculative_algorithm is not None
+            cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH")
             or cfg.disaggregation_mode != "null"
-            or cfg.enable_hierarchical_cache
         ):
             raise ValueError(
-                "Kimi-K3.1 DCP does not support speculative decoding, PD "
-                "disaggregation or HiCache yet."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
+                "decoding, and not PD disaggregation yet."
             )
+        if cfg.speculative_algorithm == "DSPARK":
+            from sglang.srt.speculative.ragged_verify import (
+                RaggedVerifyMode,
+                read_ragged_verify_mode,
+            )
+
+            if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DSPARK requires SGLANG_RAGGED_VERIFY_MODE=static."
+                )
+        if cfg.speculative_algorithm == "DFLASH":
+            if cfg.speculative_draft_attention_backend not in (None, "cutedsl_mla"):
+                raise ValueError(
+                    "Kimi-K3.1 DCP + DFLASH needs "
+                    "--speculative-draft-attention-backend cutedsl_mla."
+                )
+            overrides["speculative_draft_attention_backend"] = "cutedsl_mla"
+        if cfg.speculative_algorithm is not None:
+            # NOTE(yhyang201): DCP target verify runs the DSA decode path; each
+            # rank attends over its KV shard and the (o, lse) partials are merged.
+            overrides["speculative_attention_mode"] = "decode"
         if (
             cfg.dsa_topk_backend != "sgl-kernel"
             or not envs.SGLANG_OPT_USE_TOPK_V2.get()
@@ -206,6 +226,12 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 "Kimi-K3.1 DCP needs the fused sgl-kernel v2 DSA top-k "
                 "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
                 "SGLANG_DSA_FUSE_TOPK on)."
+            )
+        if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+            # the sharded indexer returns only this rank's local KV slots
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+                "or SGLANG_DSA_TOPK_BROADCAST."
             )
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
             "a2a",

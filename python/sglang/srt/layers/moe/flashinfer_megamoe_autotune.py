@@ -15,13 +15,13 @@
 
 from __future__ import annotations
 
+import enum
 import json
 import logging
 import os
 from bisect import bisect_left
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, replace
-from enum import Enum
 from functools import cached_property
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -48,6 +48,9 @@ _active_context: _AutotuneContext | None = None
 # already captured by another layer. These payloads own no weights or tensors.
 _session_winners: dict[tuple[Any, int, str], dict] = {}
 _CACHE_NAMESPACE = "sglang_flashinfer_megamoe"
+# Format of FlashInfer's MegaMoE knob cache file (KNOB_CACHE_VERSION in
+# flashinfer.moe_ep.core.tuning); bump together with the FlashInfer pin.
+_NATIVE_CACHE_VERSION = 2
 
 
 @contextmanager
@@ -142,10 +145,7 @@ def _profile_inputs(tensors, capacity: int, num_experts: int):
 
 
 def _valid_native_cache(payload) -> bool:
-    from flashinfer.moe_ep.core.tuning import KNOB_CACHE_VERSION
-
-    # create_workspace reloads this payload; FlashInfer ignores other versions.
-    if not isinstance(payload, dict) or payload.get("version") != KNOB_CACHE_VERSION:
+    if not isinstance(payload, dict) or payload.get("version") != _NATIVE_CACHE_VERSION:
         return False
     entries = payload.get("entries")
     return (
@@ -202,10 +202,11 @@ class MegaMoeTunedForward:
             ):
                 continue
             value = getattr(self.backend.megakernel, item.name)
-            if isinstance(value, Enum):
-                # The key persists across restarts, so store enums by their stable name.
-                value = value.name
-            if not isinstance(value, torch.Tensor):
+            if isinstance(value, enum.Enum):
+                # Enum fields (e.g. finalize_mode) are not JSON-serializable;
+                # .name stays stable across processes for the cached key.
+                config[item.name] = value.name
+            elif not isinstance(value, torch.Tensor):
                 config[item.name] = value
         # The enclosing flashinfer.autotune context validates runtime/compiler
         # metadata. This key only adds the MegaMoE configuration and geometry.

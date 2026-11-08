@@ -102,8 +102,8 @@ def _load_autotune_module(monkeypatch):
 
 
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
+    import enum
     from dataclasses import dataclass
-    from enum import Enum
 
     module = _load_autotune_module(monkeypatch)
     monkeypatch.setattr(torch.cuda, "is_current_stream_capturing", lambda: False)
@@ -130,15 +130,15 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         def num_tokens(self):
             return self.hidden_states.shape[0]
 
-    # Stands in for FlashInfer's FinalizeMode, an enum field of its configs.
-    class FinalizeMode(Enum):
-        AUTO = 0
+    class FinalizeMode(enum.Enum):
+        AUTO = "auto"
 
     @dataclass
     class Config:
         knobs: str | None = None
         kernel_name: str = "test_backend"
         input_norm_const: float = 1.0
+        # flashinfer's MegaMoE config carries enum fields such as finalize_mode.
         finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     @dataclass
@@ -231,21 +231,13 @@ def test_megamoe_without_tuning_preserves_capture_forward(monkeypatch):
 
 @pytest.mark.parametrize("new_process", [False, True])
 def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
-    """A config with enum fields tunes once, then reuses the winner FlashInfer
-    recorded in its current knob-cache format instead of failing startup."""
     import json
     import os
     from dataclasses import replace
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    fake_tuning = types.ModuleType("flashinfer.moe_ep.core.tuning")
-    # No FlashInfer release writes this version, so only its constant matches.
-    fake_tuning.KNOB_CACHE_VERSION = 37
-    payload = {
-        "version": fake_tuning.KNOB_CACHE_VERSION,
-        "entries": [{"knobs": {"native_tactic": 7}}],
-    }
+    payload = {"version": 2, "entries": [{"knobs": {"native_tactic": 7}}]}
     events = []
     staged = []
     native_paths = []
@@ -308,7 +300,6 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     fake_autotuner.AutoTuner = types.SimpleNamespace(get=lambda: tuner)
     monkeypatch.setitem(sys.modules, "flashinfer", types.ModuleType("flashinfer"))
     monkeypatch.setitem(sys.modules, "flashinfer.moe_ep", fake_moe)
-    monkeypatch.setitem(sys.modules, fake_tuning.__name__, fake_tuning)
     monkeypatch.setitem(sys.modules, "flashinfer.autotuner", fake_autotuner)
     monkeypatch.setenv("FLASHINFER_MOE_EP_KNOB_CACHE", "original-cache.json")
 

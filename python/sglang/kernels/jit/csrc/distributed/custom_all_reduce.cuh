@@ -420,6 +420,19 @@ inline auto choose_block_size(uint32_t num_threads) -> uint32_t {
   return 1024u;
 }
 
+#ifdef USE_ROCM
+inline bool is_gfx1250() {
+  static const bool kIsGfx1250 = [] {
+    int device = 0;
+    CHECK_CUDA(cudaGetDevice(&device));
+    hipDeviceProp_t prop;
+    CHECK_CUDA(hipGetDeviceProperties(&prop, device));
+    return std::strncmp(prop.gcnArchName, "gfx1250", 7) == 0;
+  }();
+  return kIsGfx1250;
+}
+#endif
+
 template <typename T, uint32_t kWorldSize, bool kUsePDL>
 struct AllReduceKernel {
  private:
@@ -471,6 +484,10 @@ struct AllReduceKernel {
       // MI350X: from 128 KB a full block per CU beats the narrower pick for
       // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
       if (!two_shot && num_vecs >= 8192) block_size = 1024u;
+      // MI450 (TP8, 64-block grid): from 512 KB the rule picks 512-1024 threads for
+      // 2shot_push; with ranks arriving skewed 256 is up to 40% faster up to 4 MB.
+      // Larger sizes keep the rule.
+      if (two_shot && is_gfx1250() && nbytes <= int64_t{4} << 20) block_size = 256u;
 #endif
       if (two_shot) {
         // at least `kWorldSize - 1` warps in all, 1 for each peer
