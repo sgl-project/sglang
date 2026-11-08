@@ -192,14 +192,11 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             raise ValueError(
                 "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
-        if cfg.disaggregation_mode != "null" and (
-            cfg.disaggregation_transfer_backend != "mooncake"
-            or cfg.speculative_algorithm is not None
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
         ):
-            raise ValueError(
-                "Kimi-K3.1 DCP supports PD only over Mooncake, "
-                "and not with speculative decoding yet."
-            )
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
