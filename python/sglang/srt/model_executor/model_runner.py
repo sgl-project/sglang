@@ -255,6 +255,7 @@ from sglang.srt.utils import (
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks, enable_nvtx_ranges
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -1377,6 +1378,8 @@ class ModelRunner:
             maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
+        # before the model looks up an aiter GEMM or fused-MoE config
+        install_aiter_tuned_tables()
 
         draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
@@ -1445,6 +1448,7 @@ class ModelRunner:
         load_kv_cache_scales(
             model=self.model,
             kv_cache_dtype=get_model().kv_cache_dtype,
+            device=self.device,
         )
 
         self.sliding_window_size = resolve_sliding_window_size(

@@ -1302,6 +1302,12 @@ class RMSNorm(BaseFusedOp):
         return out, scale, orig_dtype
 
 
+def exact_rms_norm(x: torch.Tensor, norm: RMSNorm) -> torch.Tensor:
+    """``norm`` through torch's rms_norm, which, unlike the fused kernel, matches
+    a trainer that uses it bit for bit."""
+    return F.rms_norm(x, (x.shape[-1],), norm.weight, norm.variance_epsilon)
+
+
 class LayerNorm(BaseFusedOp):
     def __init__(
         self,
@@ -1496,6 +1502,21 @@ class GemmaRMSNorm(BaseFusedOp):
             return rocm_triton_gemma_rmsnorm(x, self.weight.data, self.variance_epsilon)
 
         if not _has_vllm_rms_norm:
+            if _has_rocm_triton_gemma_rms_norm and x.dim() == 2:
+                # one kernel instead of forward_native's op chain, same rounding points
+                if residual is not None:
+                    if post_residual_addition is not None:
+                        residual = residual + post_residual_addition
+                    return rocm_triton_gemma_fused_add_rmsnorm(
+                        x,
+                        residual,
+                        self.weight.data,
+                        self.variance_epsilon,
+                        round_sum=True,
+                    )
+                return rocm_triton_gemma_rmsnorm(
+                    x, self.weight.data, self.variance_epsilon
+                )
             return self.forward_native(x, residual, post_residual_addition)
 
         if _use_aiter:

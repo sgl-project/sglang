@@ -301,8 +301,6 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
-                        is_retracted=length == 200,
-                        finished=lambda length=length: length == 300,
                         grammar=None,
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
@@ -334,7 +332,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
+                    processor, result, batch, [True, False, False]
                 )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])

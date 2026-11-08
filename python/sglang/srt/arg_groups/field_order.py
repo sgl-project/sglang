@@ -562,5 +562,6 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_require_bulk",
     "enable_mxfp4_mega",
     "attn_cp_transport",
+    "enable_fp4_indexer",
 )
 # fmt: on
