@@ -1019,11 +1019,8 @@ class Envs:
     # Kill-switch for the gfx115x kernels (Quark int4 W4A16 GEMMs and row pad, target-verify
     # attention, GDN prefill); each also falls back to the generic path where it does not apply.
     SGLANG_DISABLE_GFX115_KERNELS = EnvBool(False)
-    # DeepSeek-V4 in-tree copies of open aiter tuning PRs, each applied only while the
-    # pinned aiter still ships the pre-PR config (see
-    # models/deepseek_common/amd/aiter_intree_tune.py). 0 = use aiter as is.
-    # TODO(aiter#6004): remove once ROCm/aiter#6004 is in the aiter pin
-    # TODO(aiter#6029): remove once ROCm/aiter#6029 is in the aiter pin
+    # In-tree rows for aiter's GEMM and fused-MoE tuned tables (utils/aiter_tuned_tables.py)
+    # and DeepSeek-V4's in-tree Triton GEMM configs. 0 = use aiter as is.
     SGLANG_AITER_INTREE_GEMM_TUNE = EnvBool(True)
     # TODO(aiter#6030): remove once ROCm/aiter#6030 is in the aiter pin
     SGLANG_AITER_INTREE_MHC_TILE_M16 = EnvBool(True)
@@ -1620,6 +1617,8 @@ class Envs:
     # on links that can drive more channels.
     SGLANG_DETERMINISTIC_NCCL_NCHANNELS = EnvInt(8)
     SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2 = EnvBool(True)
+    # ROCm CustomAllReduceV2 workspace sharing: auto, fabric or posix_fd
+    SGLANG_HIP_VMM_HANDLE_TYPE = EnvStr("auto")
     # Default per-direction workspace cap for CustomAllReduceV2; explicit
     # constructor sizes take precedence over this.
     SGLANG_CUSTOM_ALL_REDUCE_V2_MAX_SIZE_KB = EnvInt(16 * 1024)
@@ -2159,6 +2158,9 @@ class Envs:
     SGLANG_DSA_MQA_LOGITS_FREE_MEM_FRACTION = EnvFloat(0.2)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # DCP8 decode: the indexer's local top-k, candidate exchange, merge and
+    # localization in one kernel (DcpFusedTopK, SM100, multicast).
+    SGLANG_ENABLE_DSA_DCP_FUSED_TOPK = EnvBool(False)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.
