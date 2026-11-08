@@ -110,7 +110,7 @@ class Block(nn.Module):
 
 
 class ViT(nn.Module):
-    """DeepSeek ViT: full bidirectional attention over one image with 2D RoPE."""
+    """DeepSeek ViT: full bidirectional attention within each image, with 2D RoPE."""
 
     def __init__(self, args):
         super().__init__()
@@ -120,15 +120,30 @@ class ViT(nn.Module):
         self.blocks = nn.ModuleList([Block(args) for _ in range(args.vision_n_layers)])
         self.norm = _rms_norm(args.vision_dim)
 
+    @property
+    def attention_backend(self) -> str:
+        return self.blocks[0].attn.qkv_backend_name
+
     def forward(self, patches: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        return self.forward_packed(patches, grids=[(n_h, n_w)])
+
+    def forward_packed(
+        self, patches: torch.Tensor, grids: list[tuple[int, int]]
+    ) -> torch.Tensor:
+        """Encode images whose patches are concatenated row-wise in ``grids`` order."""
         x = self.patch_embed(patches)
-        cos, sin = get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
-        cos, sin = cos.to(x.device), sin.to(x.device)
+        cos_sin = [
+            get_vision_cos_sin(n_h, n_w, self.rope_dim, self.rope_theta)
+            for n_h, n_w in grids
+        ]
+        cos = torch.cat([c for c, _ in cos_sin]).to(x.device)
+        sin = torch.cat([s for _, s in cos_sin]).to(x.device)
+        lengths = [n_h * n_w for n_h, n_w in grids]
+        cu_seqlens = torch.zeros(len(lengths) + 1, dtype=torch.int32)
+        cu_seqlens[1:] = torch.tensor(lengths, dtype=torch.int32).cumsum(0)
         # Passing the known length avoids device-to-host length discovery per layer.
         metadata = prepare_vision_attention_metadata(
-            torch.tensor([0, x.shape[0]], dtype=torch.int32),
-            x.device,
-            max_seqlen=x.shape[0],
+            cu_seqlens, x.device, max_seqlen=max(lengths)
         )
         for block in self.blocks:
             x = block(x, cos, sin, metadata)
@@ -144,8 +159,55 @@ class Aligner(nn.Module):
         self.w2 = nn.Linear(args.dim, args.dim)
 
     def forward(self, x: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
+        return self.forward_packed(x, grids=[(n_h, n_w)])[0]
+
+    def forward_packed(
+        self, x: torch.Tensor, grids: list[tuple[int, int]]
+    ) -> list[torch.Tensor]:
+        """Merge and project each image's ViT rows; returns one tensor per image."""
+        rows = x.split([n_h * n_w for n_h, n_w in grids])
+        merged = [
+            self._merge(rows=image_rows, n_h=n_h, n_w=n_w)
+            for image_rows, (n_h, n_w) in zip(rows, grids, strict=True)
+        ]
+        out = self.w2(F.gelu(self.w1(torch.cat(merged))))
+        return list(out.split([len(m) for m in merged]))
+
+    def _merge(self, rows: torch.Tensor, n_h: int, n_w: int) -> torch.Tensor:
         r = self.downsample_ratio
-        x = x.view(n_h, n_w, -1).permute(2, 0, 1)
+        x = rows.view(n_h, n_w, -1).permute(2, 0, 1)
         x = F.pad(x, (0, -n_w % r, 0, -n_h % r))
-        x = F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
-        return self.w2(F.gelu(self.w1(x)))
+        return F.unfold(x.unsqueeze(0), r, stride=r).squeeze(0).transpose(0, 1)
+
+
+# Kernels that split attention by forward_metadata.cu_seqlens. SDPA ignores that
+# metadata, so packed images would attend across each other.
+_PACKED_ATTENTION_BACKENDS = frozenset({"fa3", "fa4", "triton_attn"})
+# Bounds peak memory on many-image calls; measured on H100,
+# small-image speedup levels off by 8 images per pass.
+_MAX_IMAGES_PER_PASS = 8
+
+
+def encode_images(
+    vision: ViT,
+    aligner: Aligner,
+    patches: list[torch.Tensor],
+    grids: list[tuple[int, int]],
+) -> list[torch.Tensor]:
+    """Return aligner rows per image, sharing ViT passes when the backend allows.
+
+    Packed output may differ from per-image output by rounding, since each
+    matmul sees more rows.
+    """
+    if vision.attention_backend not in _PACKED_ATTENTION_BACKENDS:
+        return [
+            aligner(vision(p, n_h, n_w), n_h, n_w)
+            for p, (n_h, n_w) in zip(patches, grids, strict=True)
+        ]
+    features = []
+    for start in range(0, len(grids), _MAX_IMAGES_PER_PASS):
+        chunk = grids[start : start + _MAX_IMAGES_PER_PASS]
+        chunk_patches = torch.cat(patches[start : start + _MAX_IMAGES_PER_PASS])
+        hidden = vision.forward_packed(chunk_patches, grids=chunk)
+        features.extend(aligner.forward_packed(hidden, grids=chunk))
+    return features

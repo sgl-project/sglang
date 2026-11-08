@@ -200,7 +200,7 @@ from sglang.srt.models.deepseek_v4_replay_tail import (
     bcg_tail_kv_store,
     in_replay_tail_graph,
 )
-from sglang.srt.models.deepseek_v41_vit import Aligner, ViT
+from sglang.srt.models.deepseek_v41_vit import Aligner, ViT, encode_images
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.multimodal.deepseek_v41_image_processing import (
     GPU_PLAN_KEY,
@@ -4952,30 +4952,42 @@ class DeepseekV4ForCausalLM(nn.Module):
     def get_image_feature(self, items):
         """Return complete spans for the shared MM cache and chunk scheduler."""
 
-        spans = []
         device, dtype = self.image_start.device, self.image_start.dtype
+        grids, patches = [], []
         for item in items:
             item.reconstruct(device.index)
-            h, w = int(item.n_vit_h), int(item.n_vit_w)
+            grids.append((int(item.n_vit_h), int(item.n_vit_w)))
             pixels = torch.as_tensor(item.feature, device=device)
             plan = item.model_specific_data.get(GPU_PLAN_KEY)
-            patches = (
+            patches.append(
                 materialize_image_gpu(pixels, plan).to(dtype)
                 if plan is not None
                 else pixels.to(dtype)
             )
-            features = self.aligner(self.vision(patches, h, w), h, w)
-            r = self.config.vision_downsample_ratio
-            types = image_token_types((h + r - 1) // r, (w + r - 1) // r).to(device)
-            span = torch.empty(
-                (len(types), self.config.hidden_size), device=device, dtype=dtype
-            )
-            span[types == 0] = self.image_start
-            span[types == 1] = features.to(dtype)
-            span[types == 2] = self.image_newline
-            span[types == 3] = self.image_end
-            spans.append(span)
-        return spans
+        features = encode_images(
+            vision=self.vision, aligner=self.aligner, patches=patches, grids=grids
+        )
+        return [
+            self._image_span(features=f, n_vit_h=h, n_vit_w=w)
+            for f, (h, w) in zip(features, grids, strict=True)
+        ]
+
+    def _image_span(
+        self, features: torch.Tensor, n_vit_h: int, n_vit_w: int
+    ) -> torch.Tensor:
+        device, dtype = self.image_start.device, self.image_start.dtype
+        r = self.config.vision_downsample_ratio
+        types = image_token_types((n_vit_h + r - 1) // r, (n_vit_w + r - 1) // r).to(
+            device
+        )
+        span = torch.empty(
+            (len(types), self.config.hidden_size), device=device, dtype=dtype
+        )
+        span[types == 0] = self.image_start
+        span[types == 1] = features.to(dtype)
+        span[types == 2] = self.image_newline
+        span[types == 3] = self.image_end
+        return span
 
     def _prepare_mm_embeddings(self, input_ids, forward_batch):
         # Keep scheduler hash IDs intact: the shared embedder clamps its input in place.
