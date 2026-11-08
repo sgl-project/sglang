@@ -201,8 +201,9 @@ class TestAllocationIntegration(CustomTestCase):
         )
 
     def test_lost_decode_fails_its_rooms_before_bootstrap_timeout(self):
-        """Rooms bound to a decode whose connection drops fail at once, parked or
-        still queued for prefill; a room bound to a live decode keeps waiting."""
+        """Rooms bound to a decode whose connection drops fail at once: parked, still
+        queued for prefill, or not yet given a sender. A room bound to a live decode
+        keeps waiting."""
         self.use_real_status_channel()
         lost, lost_port = self.decode_endpoint()
         live, live_port = self.decode_endpoint()
@@ -210,6 +211,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.register(1, lost_port)
         self.register(2, lost_port)
         self.register(3, live_port)
+        self.register(4, lost_port)
         parked.mark_prefill_complete()
         other.mark_prefill_complete()
         self.assertTrue(lost.poll(5000) and live.poll(5000))
@@ -220,6 +222,7 @@ class TestAllocationIntegration(CustomTestCase):
         self.assertEqual(other.poll(), KVPoll.Bootstrapping)
         with self.assertRaisesRegex(KVTransferError, "Lost connection with decode"):
             parked.failure_exception()
+        self.assertEqual(self.sender(4).poll(), KVPoll.Failed)
 
     def test_decode_gone_before_first_ready_fails_room(self):
         """A decode that died before prefill first connected to it must not swallow
