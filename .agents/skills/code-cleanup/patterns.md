@@ -116,7 +116,7 @@ Spot: names under `docs/` or the cookbook with no reader; `os.environ.get`,
 for deleted vars; cookbook flags equal to the default (verify before dropping).
 Not this pattern: a recipe pinned to a preview image runs that image's code, not main's;
 read the image's source before editing its cells (#48399 removed b12x selectors that the
-DGX Spark preview image still reads). A flag equal to a default can still be needed: #28731
+DGX Spark preview image still reads; #49171 restored them). A flag equal to a default can still be needed: #28731
 kept `--mem-fraction-static` (dropping it OOMed) and `--page-size 128`.
 Proof: check each documented name against the real parser and `envs`; a static guard test
 keeps a doc list in sync with the code (#36987).
@@ -127,14 +127,14 @@ Examples: #44690, #48366, #48399, #28731, #36987.
 `ForwardMode.SPLIT_PREFILL`, `forward_split_prefill` in 18 model files, the per-stream graph
 keys and the AOT `spatial` extension. #32114 removed the Dual Chunk Attention backend and
 its auto-selection hook but left `DualChunkRotaryEmbedding`, its config check and the
-`get_rope` plumbing in five models, so such a checkpoint still builds a RoPE only the
-deleted backend could read.
+`get_rope` plumbing in five models, so such a checkpoint built a RoPE only the deleted
+backend could read and failed at the first forward (#49171 removed the rest).
 Spot: enum values, forward modes, model methods and `get_rope` arguments named after the
 feature; `@register_post_process` hooks that read an `hf_config` field; an AOT extension or
 dependency with a single consumer.
 Not this pattern: config fields or helpers another feature still reads; check every
 consumer of the field first.
-Examples: #43898, #32114.
+Examples: #43898, #32114 / #49171.
 
 ---
 
