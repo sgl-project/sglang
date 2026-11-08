@@ -213,12 +213,7 @@ impl CoreHandle {
         // A body is a batch here even with one item (a list); the core's own
         // requests are one only when they are several.
         let batch = matches!(received, ReceivedAs::Body(_)) || requests.len() > 1;
-        let mut records = self
-            .receive(&requests, received, batch, true)
-            .into_iter()
-            .map(Some)
-            .collect::<Vec<_>>();
-        records.resize_with(requests.len(), || None);
+        let mut records = self.receive(&requests, received, batch, true).into_iter();
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
@@ -246,12 +241,12 @@ impl CoreHandle {
         .await?;
 
         let mut calls = Vec::with_capacity(requests.len());
-        for (((request, generation), in_flight), record) in requests
-            .into_iter()
-            .zip(generations)
-            .zip(in_flight)
-            .zip(records)
+        for ((request, generation), in_flight) in
+            requests.into_iter().zip(generations).zip(in_flight)
         {
+            // With diagnostics disabled the iterator is empty; do not allocate
+            // one `None` record per request just to preserve the batch's length.
+            let record = records.next();
             let rid = request.rid.clone();
             let metrics = self.request_metrics(&request, created_at);
             let call = match self.submit_generation(request, generation).await {

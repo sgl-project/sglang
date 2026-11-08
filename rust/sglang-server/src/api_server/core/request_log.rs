@@ -63,7 +63,17 @@ pub(crate) struct RequestLog {
 }
 
 /// The whitelisted request headers a request's lines carry.
-pub(crate) type LoggedHeaders = Arc<Vec<(String, String)>>;
+/// Empty headers need no allocation, including when diagnostics are disabled.
+#[derive(Clone, Default)]
+pub(crate) struct LoggedHeaders(Option<Arc<Vec<(String, String)>>>);
+
+impl std::ops::Deref for LoggedHeaders {
+    type Target = [(String, String)];
+
+    fn deref(&self) -> &Self::Target {
+        self.0.as_deref().map(Vec::as_slice).unwrap_or_default()
+    }
+}
 
 /// A native `/generate` body captured before the launch-time sampling defaults
 /// are merged into it (Python merges them into a copy), for the request's log
@@ -229,17 +239,16 @@ impl RequestLog {
         let Some(logger) = &self.logger else {
             return LoggedHeaders::default();
         };
-        Arc::new(
-            logger
-                .config
-                .headers
-                .iter()
-                .filter_map(|name| {
-                    let value = headers.get(name)?.to_str().ok()?;
-                    (!value.is_empty()).then(|| (name.clone(), value.to_owned()))
-                })
-                .collect(),
-        )
+        let headers: Vec<_> = logger
+            .config
+            .headers
+            .iter()
+            .filter_map(|name| {
+                let value = headers.get(name)?.to_str().ok()?;
+                (!value.is_empty()).then(|| (name.clone(), value.to_owned()))
+            })
+            .collect();
+        LoggedHeaders((!headers.is_empty()).then(|| Arc::new(headers)))
     }
 
     /// Whether OpenAI requests get their own line (from level 2).
