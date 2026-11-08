@@ -1732,7 +1732,7 @@ def build_full_draft_pools(
     tree_cache: Any,
 ) -> tuple[list[SidecarPoolSpec], list[PoolEntry]]:
     """Build draft KV and its sidecars, whose indices follow target full KV."""
-    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 
     pool = draft_kv_pool
     inner = pool.layer_router.wrapped_view()
@@ -1761,10 +1761,13 @@ def build_full_draft_pools(
     buffer_info = config.pool_infos[PoolName.KV].buffer_info
 
     parallel = get_parallel()
-    if not isinstance(pool, MHATokenToKVPool) and parallel.dcp_enabled:
-        # An MLA draft holds only its own rows, so its sidecar is physical too
-        # and translates with dcp_size like the target's. Built without it, the
-        # L2 transfer copied raw widened rows the draft never reads.
+    if (
+        parallel.dcp_enabled
+        and isinstance(pool, MLATokenToKVPool)
+        and not pool.dcp_replicated
+    ):
+        # A DCP-sharded MLA draft holds only its own rows, so its host pool
+        # translates with dcp_size like the target's.
         draft_host_pool = _build_mha_mla_host_pool(
             pool=pool,
             buffer_info=buffer_info,
