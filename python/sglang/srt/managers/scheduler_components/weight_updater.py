@@ -27,6 +27,7 @@ from sglang.srt.constants import (
     GPU_MEMORY_TYPE_WEIGHTS,
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
     BeginWeightUpdateReqOutput,
@@ -474,6 +475,8 @@ class SchedulerWeightUpdaterManager:
                 "running or queued. Finish them, or pause generation in retract "
                 "mode, then retry.",
             )
+        # A weights-only release does not reach flush_cache.
+        mm_schedule.release_prefill_rows()
 
         tags = recv_req.tags
 

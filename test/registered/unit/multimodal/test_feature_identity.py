@@ -404,12 +404,12 @@ class TestFeatureIdentity(CustomTestCase):
         with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(4096)):
             for item in (a, b, a, b):
                 output = mm_schedule._get_chunked_embedding_by_item(
-                    encode, [item], 0, 1, torch.device("cpu")
+                    encode, [item], 0, 1, torch.device("cpu"), owner=None
                 )[0]
                 self.assertTrue(torch.equal(output, item.feature.reshape(1, 1)))
         with patch.object(mm_schedule, "embedding_cache", MultiModalStaticCache(4096)):
             reqs = [
-                mm_schedule.PerImageRequestInfo(i, [item], [(0, 0)], 0, 1)
+                mm_schedule.PerImageRequestInfo(i, [item], [(0, 0)], 0, 1, owner=None)
                 for i, item in enumerate((a, b, a))
             ]
             result = mm_schedule._batch_encode_per_image_misses(

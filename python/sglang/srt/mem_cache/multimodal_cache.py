@@ -136,6 +136,10 @@ class MultiModalStaticCache(MultimodalCache):
             self.mm_cache.move_to_end(mm_hash)
         return embedding
 
+    def peek(self, mm_hash: Hashable) -> Optional[EmbeddingResult]:
+        """Return the entry without changing the LRU order."""
+        return self.mm_cache.get(mm_hash)
+
     def has(self, mm_hash: Hashable) -> bool:
         return mm_hash in self.mm_cache
 

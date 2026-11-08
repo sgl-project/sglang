@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Callable, List, Optional, Set, Union
 
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.req import DllmReqPhase
+from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.req_types import FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -39,6 +40,8 @@ class SchedulerDllmMixin:
 
     def _abort_dllm_req(self: Scheduler, req: Req) -> None:
         self.request_retirer.abort(req)
+        # Other dLLM contexts stay part-way prefilled, so keep their rows.
+        mm_schedule.release_prefill_rows(rids=[req.rid])
         logger.debug(f"Abort dLLM queued request. {req.rid=}")
 
     def validate_dllm_request(self: Scheduler, req: Req) -> Optional[str]:
@@ -483,6 +486,12 @@ class DllmManager:
     def any_staging_reqs(self) -> bool:
         """Check if there are requests in staging queue."""
         return self.dllm_config is not None and len(self.staging_queue) > 0
+
+    def any_context_in_progress(self) -> bool:
+        return any(
+            req.dllm_phase == DllmReqPhase.STAGING_PREFILL and req.prefix_len > 0
+            for req in self.waiting_queue
+        )
 
     def is_empty(self) -> bool:
         """Check if both queues are empty or DLLM is not configured."""
