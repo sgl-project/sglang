@@ -173,12 +173,8 @@ class TestEncoderPrefixCacheBatch(unittest.TestCase):
         )
         self.assertEqual(len(built), 2)
         self._run(encoder, ctx)
-        reordered = self._run(
-            encoder, _ctx([self.b, self.a], forward, itemwise=True)
-        )
-        partial = self._run(
-            encoder, _ctx([self.a, self.c], forward, itemwise=True)
-        )
+        reordered = self._run(encoder, _ctx([self.b, self.a], forward, itemwise=True))
+        partial = self._run(encoder, _ctx([self.a, self.c], forward, itemwise=True))
         self.assertTrue(torch.equal(reordered, torch.cat([self.b, self.a])))
         self.assertTrue(torch.equal(partial, torch.cat([self.a, self.c])))
         self.assertEqual([len(items) for items in forward.calls], [2, 1])
