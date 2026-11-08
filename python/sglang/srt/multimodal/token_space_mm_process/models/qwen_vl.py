@@ -71,6 +71,8 @@ class QwenTokenSpaceServingSpec(TokenSpaceServingSpec):
 
 
 class QwenTokenSpaceProcessStrategy(TokenSpaceProcessStrategy):
+    # qwen_vl_utils composites alpha onto white; the HF processor alone would drop it.
+    rgb_conversion = "white"
     models = (
         "Qwen2VLForConditionalGeneration",
         "Qwen2_5_VLForConditionalGeneration",

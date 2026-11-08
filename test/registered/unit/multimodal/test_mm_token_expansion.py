@@ -54,7 +54,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import torch
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PretrainedConfig, PreTrainedTokenizerFast
 
@@ -70,13 +70,13 @@ from sglang.srt.multimodal.cache import DiskPreprocessCache, MultimodalPreproces
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
 from sglang.srt.multimodal.token_space_mm_process.process_strategy import (
     TokenSpaceProcessStrategy,
 )
-from sglang.srt.multimodal.token_space_mm_process import processor as processor_module
 from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
@@ -535,32 +535,56 @@ class TestTokenSpaceProcessor(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "must be a list or None"):
             asyncio.run(self._processor().process("image.png", input_ids=[1, IMAGE]))
 
-    def test_strategy_loading_options_reach_the_loader(self):
-        class LoaderOptionsStrategy(_ImageWidthStrategy):
+    def test_strategy_loader_options_reach_the_decoded_media(self):
+        """The strategy's loader options act on the IO path itself: what `process_image` receives
+        is decided by the strategy's attributes and the server's config, not by kwargs the core forwards."""
+        seen = []
+
+        class _RecordingStrategy(_ImageWidthStrategy):
             audio_sample_rate = 24000
+
+            def process_image(self, image, processor, preprocess_kwargs, **kwargs):
+                seen.append((image.mode, image.getpixel((0, 0))))
+                return super().process_image(
+                    image, processor, preprocess_kwargs, **kwargs
+                )
+
+        class _KeepAlphaStrategy(_RecordingStrategy):
             discard_alpha_channel = False
 
-        processor = self._processor(LoaderOptionsStrategy)
-        load = AsyncMock(return_value=([Image.new("RGB", (1, 1))], [], []))
-        with patch.object(processor, "_load_media_lists", load):
-            asyncio.run(processor.process(["image"], input_ids=[1, IMAGE]))
-        load.assert_awaited_once_with(
-            ["image"],
-            None,
-            None,
-            audio_sample_rate=24000,
-            discard_alpha_channel=False,
-            video_decode_device=None,
-        )
+        rgba = io.BytesIO()
+        Image.new("RGBA", (2, 1), (10, 20, 30, 0)).save(rgba, format="PNG")
+        for strategy_class, mm_process_config, expected in (
+            (_RecordingStrategy, None, ("RGB", (10, 20, 30))),
+            (
+                _RecordingStrategy,
+                {"image_rgb_conversion": "white"},
+                ("RGB", (255, 255, 255)),
+            ),
+            (_KeepAlphaStrategy, None, ("RGBA", (10, 20, 30, 0))),
+        ):
+            seen.clear()
+            processor = self._processor(
+                strategy_class, mm_process_config=mm_process_config
+            )
+            asyncio.run(processor.process([rgba.getvalue()], input_ids=[1, IMAGE]))
+            self.assertEqual(seen, [expected])
+        with patch(
+            "sglang.srt.multimodal.multimodal_processor_mixin.load_audio"
+        ) as load_audio:
+            _RecordingStrategy(None, None).load_audio("clip.wav")
+        load_audio.assert_called_once_with("clip.wav", 24000)
 
 
 # Class attributes the media loader and worker pools read.
 _LOADER_ATTRIBUTES = (
     "gpu_image_decode",
-    "smart_rgb_conversion",
+    "rgb_conversion",
     "video_preprocessing_device",
     "supports_mm_processor_concurrency",
 )
+# A strategy that composites alpha as the model's reference pipeline does, where the legacy processor only drops it.
+_STRATEGY_RGB_CONVERSION = {"QwenTokenSpaceProcessStrategy": "white"}
 
 
 class _StopInit(Exception):
@@ -575,7 +599,14 @@ def _legacy_defaults(processor_cls, hf_config):
         contextlib.suppress(_StopInit),
     ):
         processor_cls.__init__(processor, hf_config, None, None)
-    defaults = {name: getattr(processor, name) for name in _LOADER_ATTRIBUTES}
+    defaults = {
+        name: getattr(processor, name)
+        for name in _LOADER_ATTRIBUTES
+        if name != "rgb_conversion"
+    }
+    defaults["rgb_conversion"] = (
+        "smart" if processor.smart_rgb_conversion else "convert"
+    )
     # None and an unset worker default both mean the base's own choice.
     defaults["auto_mm_processor_worker_num"] = (
         processor.auto_mm_processor_worker_num or 2
@@ -586,13 +617,17 @@ def _legacy_defaults(processor_cls, hf_config):
 
 def _token_space_defaults(strategy_class, hf_config):
     core_cls = TokenSpaceProcessor.for_strategy(strategy_class)
-    defaults = {name: getattr(core_cls, name) for name in _LOADER_ATTRIBUTES}
+    defaults = {
+        "supports_mm_processor_concurrency": core_cls.supports_mm_processor_concurrency
+    }
     # The wrapper's auto count when preprocessing does not compete with the scheduler.
     defaults["auto_mm_processor_worker_num"] = 2
     # Serving takes the IO thread default from the serving spec, not the core.
     serving_spec = serving_spec_for(hf_config)(hf_config)
     defaults["auto_mm_io_worker_num"] = serving_spec.auto_mm_io_worker_num
-    defaults["video_preprocessing_device"] = strategy_class.video_preprocessing_device
+    # The strategy's loader defaults apply per instance; the core class keeps the mixin's.
+    for name in ("gpu_image_decode", "rgb_conversion", "video_preprocessing_device"):
+        defaults[name] = getattr(strategy_class, name)
     return defaults
 
 
@@ -612,7 +647,8 @@ _MODEL_TYPES_BY_ARCH = {
 
 class TestTokenSpaceSGLangProcessor(unittest.TestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
-        """A token-space model loads and schedules media like the legacy processor it replaces."""
+        """A token-space model loads and schedules media like the legacy processor it replaces,
+        except the alpha compositing `_STRATEGY_RGB_CONVERSION` records for it."""
         import_processors("sglang.srt.multimodal.processors")
         register_token_space_models()
         legacy = {
@@ -625,6 +661,9 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
                 hf_config = SimpleNamespace(model_type=model_type, architectures=[arch])
                 hf_config.thinker_config = hf_config
                 expected = _legacy_defaults(legacy[arch], hf_config)
+                expected["rgb_conversion"] = _STRATEGY_RGB_CONVERSION.get(
+                    strategy_class.__name__, expected["rgb_conversion"]
+                )
                 with self.subTest(arch=arch, model_type=model_type):
                     self.assertEqual(
                         _token_space_defaults(strategy_class, hf_config), expected
@@ -943,6 +982,58 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             self._item_hash(_PixelShapeStrategy, (1, 2)),
             self._item_hash(_PixelShapeStrategy, (2, 1)),
         )
+
+
+class TestStrategyLoaders(unittest.TestCase):
+    """The IO path decodes every source with the strategy's loaders, the shared ones by default."""
+
+    def _processor(self, strategy_class):
+        processor = TokenSpaceProcessor.for_strategy(strategy_class)(
+            None,
+            _bare_tokenizer(),
+            processor_config=MultimodalProcessorConfig(mm_processor_worker_num=1),
+        )
+        self.addCleanup(processor.shutdown)
+        return processor
+
+    def test_sources_go_through_the_strategy_loaders(self):
+        png = io.BytesIO()
+        Image.new("RGB", (3, 1)).save(png, format="PNG")
+
+        class _ReversedImageStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                return Image.open(io.BytesIO(source)).transpose(Image.ROTATE_90)
+
+        # Default: the shared loader decodes the bytes; override: the strategy's own decode.
+        for strategy_class, width in (
+            (_ImageWidthStrategy, 3),
+            (_ReversedImageStrategy, 1),
+        ):
+            output = asyncio.run(
+                self._processor(strategy_class).process(
+                    [png.getvalue()], input_ids=[1, IMAGE]
+                )
+            )
+            self.assertEqual(output["input_ids"].tolist(), [[1] + [IMAGE] * width])
+
+    def test_loader_failures_classify_as_the_mixins(self):
+        """A client media error becomes a ValueError; anything else a RuntimeError, as legacy loading.
+
+        An undecodable image is an OSError subclass that the mixin lists as a client error, so the
+        classification must come from `media_load_errors`, not from the core's own except clauses.
+        """
+
+        class _FailingStrategy(_ImageWidthStrategy):
+            def load_image(self, source):
+                raise {"bad": UnidentifiedImageError, "io": OSError}[source](
+                    "cannot decode"
+                )
+
+        processor = self._processor(_FailingStrategy)
+        with self.assertRaises(ValueError):
+            asyncio.run(processor.process(["bad"], input_ids=[1, IMAGE]))
+        with self.assertRaises(RuntimeError):
+            asyncio.run(processor.process(["io"], input_ids=[1, IMAGE]))
 
 
 if __name__ == "__main__":
