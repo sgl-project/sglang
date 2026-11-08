@@ -440,7 +440,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         regions = self._registerable_regions()
         if regions:
             ptrs, lens = zip(*regions)
-            self.engine.batch_register(list(ptrs), list(lens))
+            ret = self.engine.batch_register(list(ptrs), list(lens))
+            if ret != 0:
+                raise RuntimeError(
+                    f"Mooncake KV cache memory registration failed (ret={ret})"
+                )
 
     def deregister_buffer_to_engine(self):
         regions = self._registerable_regions()
@@ -565,7 +569,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         }
 
     def _register_staging_memory(self, ptr: int, size: int) -> None:
-        self.engine.batch_register([ptr], [size])
+        ret = self.engine.batch_register([ptr], [size])
+        if ret != 0:
+            raise RuntimeError(
+                f"Mooncake staging memory registration failed (ret={ret})"
+            )
 
     def _init_staging_buffers(self, count: int):
         from sglang.srt.disaggregation.common.staging_handler import (
