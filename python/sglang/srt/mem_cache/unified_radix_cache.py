@@ -123,7 +123,8 @@ from sglang.srt.runtime_context import (
     get_observability,
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
-from sglang.srt.utils.common import ceil_align, get_device_module
+from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import get_device_module
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:

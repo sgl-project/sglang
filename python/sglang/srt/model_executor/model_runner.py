@@ -91,7 +91,7 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     is_mla_cp_enabled,
 )
-from sglang.srt.layers.dp_attention import get_dp_tp_group
+from sglang.srt.layers.dp_attention import get_dp_tp_group, require_gathered_buffer
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.offloader import (
@@ -174,6 +174,7 @@ from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_register_debug_tensor_dump_hook,
     maybe_trigger_remote_instance_nccl_send_group,
     report_online_quantization,
+    reserve_rope_cache_for_long_sequences,
     resolve_sliding_window_size,
 )
 from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
@@ -251,11 +252,10 @@ from sglang.srt.utils import (
     get_available_gpu_memory,
     is_host_cpu_arm64,
     is_npu,
-    require_gathered_buffer,
-    reserve_rope_cache_for_long_sequences,
     set_cuda_arch,
     slow_rank_detector,
 )
+from sglang.srt.utils.aiter_tuned_tables import install_aiter_tuned_tables
 from sglang.srt.utils.device_timer import device_timer_ctx
 from sglang.srt.utils.nvtx_pytorch_hooks import PytHooks
 from sglang.srt.utils.nvtx_utils import profile_range
@@ -1353,6 +1353,8 @@ class ModelRunner:
             maybe_downgrade_dtype_for_legacy_gpu(model_config=self.model_config)
 
         set_cuda_arch()
+        # before the model looks up an aiter GEMM or fused-MoE config
+        install_aiter_tuned_tables()
 
         draft_load_format = self.draft_load_format
         self.load_config = build_load_config(
@@ -1420,6 +1422,7 @@ class ModelRunner:
         load_kv_cache_scales(
             model=self.model,
             kv_cache_dtype=get_model().kv_cache_dtype,
+            device=self.device,
         )
 
         self.sliding_window_size = resolve_sliding_window_size(

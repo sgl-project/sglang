@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_hip = is_hip()
 if _is_hip:
@@ -488,6 +488,7 @@ def mhc_pre_big_fuse_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     num_tokens = T.dynamic("num_tokens")
     hc_mult3 = hc_mult * (2 + hc_mult)
@@ -516,7 +517,10 @@ def mhc_pre_big_fuse_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -911,6 +915,7 @@ def mhc_pre_big_fuse_with_norm_tilelang(
     n_splits: int = 16,
     hc_mult: int = 4,
     gemm_last_dim: int = -1,
+    eps_outside_sqrt: bool = False,
 ):
     """Fused mhc_pre big_fuse + RMSNorm of layer_input.
 
@@ -947,7 +952,10 @@ def mhc_pre_big_fuse_with_norm_tilelang(
 
         for i_split in T.serial(n_splits):
             rms[0] += gemm_out_sqrsum[i_split, i]
-        rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
+        if eps_outside_sqrt:
+            rms[0] = 1.0 / (T.sqrt(rms[0] / (hc_mult * hidden_size)) + rms_eps)
+        else:
+            rms[0] = T.rsqrt(rms[0] / (hc_mult * hidden_size) + rms_eps)
         for j in T.Parallel(hc_mult3):
             mixes[j] = 0
             for i_split in T.serial(n_splits):
@@ -1071,7 +1079,10 @@ def mhc_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    eps_outside_sqrt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``eps_outside_sqrt`` normalizes by ``1 / (sqrt(mean_sq) + eps)`` instead of
+    ``rsqrt(mean_sq + eps)``; set it to the formula the checkpoint was trained with."""
     assert residual.dtype == torch.bfloat16
     assert fn.dtype == torch.float32
     assert hc_scale.dtype == torch.float32
@@ -1235,6 +1246,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
     else:
         mhc_pre_big_fuse_tilelang(
@@ -1255,6 +1267,7 @@ def mhc_pre(
             big_fuse_n_splits,
             hc_mult,
             gemm_last_dim,
+            eps_outside_sqrt,
         )
 
     post_mix = post_mix.view(*outer_shape, hc_mult, 1)
