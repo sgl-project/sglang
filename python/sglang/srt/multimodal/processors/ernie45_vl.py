@@ -19,6 +19,11 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.processors.base_processor import (
     MultimodalSpecialTokens,
 )
+from sglang.srt.multimodal.processors.qwen_vl import (
+    ceil_by_factor,
+    floor_by_factor,
+    round_by_factor,
+)
 from sglang.srt.utils import is_cpu, is_npu, logger
 
 _is_npu = is_npu()
@@ -99,18 +104,6 @@ def resize_image(
     )
     image = image.resize((resized_width, resized_height), resample=RESIZE_RESAMPLE)
     return image
-
-
-def round_by_factor(number: int | float, factor: int) -> int:
-    return round(number / factor) * factor
-
-
-def ceil_by_factor(number: int | float, factor: int) -> int:
-    return math.ceil(number / factor) * factor
-
-
-def floor_by_factor(number: int | float, factor: int) -> int:
-    return math.floor(number / factor) * factor
 
 
 async def resize_image_async(
