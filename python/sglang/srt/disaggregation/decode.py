@@ -2211,6 +2211,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if StateType.DSV4_REQUEST_STATE in state_types and isinstance(
             self.token_to_kv_pool, DeepSeekV4TokenToKVPool
         ):
+            # TODO(ch-wan): this C128 ring and pending-pair reset races the row's
+            # previous forward; order it after that forward, before the transfer.
             self.token_to_kv_pool.clear_request_scoped_state(
                 int(decode_req.req.kv.req_pool_idx)
             )

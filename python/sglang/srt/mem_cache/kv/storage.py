@@ -47,8 +47,9 @@ from sglang.srt.mem_cache.kv.plan import (
     TreeSlot,
     WireEntry,
 )
-from sglang.srt.mem_cache.kv.requests import RowState
+from sglang.srt.mem_cache.kv.requests import RowResets, RowState
 from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
@@ -143,6 +144,16 @@ class KVStorage:
         self.requests = requests
         self.scratch = scratch
         self._request_memory = request_memory
+        # Rows handed out whose request memory the next forward resets.
+        # TODO(ch-wan): a request part a PD transfer delivers (one declared with
+        # a wire, as DeepSeek-V4's would be; unified memory refuses DeepSeek-V4
+        # today) would be reset after the transfer wrote it; order its reset
+        # after the row's previous forward and before the transfer instead.
+        self._row_resets = RowResets(
+            self._reset_request_rows
+            if request_memory is not None and request_memory.parts
+            else None
+        )
         # Keyed by request identity (`_lifetime`), never ``rid``: a retry may
         # reuse a ``rid`` while the earlier request is in deferred release.
         # Network transfers in flight, per request, one per send or receive:
@@ -261,11 +272,25 @@ class KVStorage:
         from sglang.srt.mem_cache.static_kv_storage import acquire_rows
 
         return acquire_rows(
-            self.requests,
-            self._allocator.state,
-            reqs,
-            request_memory=self._request_memory,
-            reset_request_parts=False,
+            self.requests, self._allocator.state, reqs, row_resets=self._row_resets
+        )
+
+    def reset_new_rows(self) -> None:
+        """Reset the request memory of the rows handed out since the last
+        call, on the current stream. Every forward calls this before its own
+        kernels (`ModelRunner.forward`), so the reset of a reused row is
+        ordered after its previous request's last forward and before its new
+        request's first (`RowResets`)."""
+        self._row_resets.apply()
+
+    def row_state_restored(self, row: int) -> None:
+        """``row``'s request memory was written whole (a restored retraction
+        backup): the next forward keeps it."""
+        self._row_resets.restored(row)
+
+    def _reset_request_rows(self, rows: List[int]) -> None:
+        self._request_memory.reset_rows(
+            async_h2d(rows, dtype=torch.int64, device=self._request_memory.device)
         )
 
     def take_tokens(
@@ -449,8 +474,8 @@ class KVStorage:
         """Rows bound to no request (beam search members); None when too few
         are free."""
         rows = self.requests.alloc_rows(num_rows, state=RowState.HELD)
-        if rows is not None and self._request_memory is not None:
-            self._request_memory.reset_rows(rows)
+        if rows is not None:
+            self._row_resets.mark(rows)
         return rows
 
     def release_rows(self, rows: List[int]) -> None:

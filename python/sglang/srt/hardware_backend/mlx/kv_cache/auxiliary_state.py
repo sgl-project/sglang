@@ -222,7 +222,7 @@ class MlxAuxiliaryStateStorage(StateStorage):
     them through the token allocator. The MLX table binds a request's slot when
     it binds the row, and release keeps the MLX table's rules."""
 
-    def acquire(self, table, reqs, rows, fresh_rows) -> None:
+    def acquire(self, table, reqs, rows) -> None:
         """Nothing left to bind: the MLX table's ``alloc`` gave each request
         its auxiliary slot, or kept the one it holds, with its row."""
 
