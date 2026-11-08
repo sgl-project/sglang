@@ -136,11 +136,11 @@ def _preload_p1_tokens(
                 )
 
 
-def _p1_x(preload, r_pre, idx, x, tok, i_hv, ch):
+def _p1_x(preload, r_pre, row, i, x, tok, i_hv, lane):
     """Phase-1 input: the preloaded register, or a load at the point of use."""
     if preload:
-        return r_pre[idx]
-    return cutlass.Float32(x[0, tok, i_hv, ch])
+        return r_pre[row * VEC_SIZE + i]
+    return cutlass.Float32(x[0, tok, i_hv, i * 32 + lane])
 
 
 def _issue_state_tile(
@@ -392,54 +392,16 @@ def kda_decode_mtp_kernel(
 
     if cutlass.const_expr(P1_PRELOAD):
         if warp_idx < P1_QKG_WARPS:
+            pre = (r_xc, r_xa, r_xi, bos, n_tok, p1_par, i_hv, in_warp_tid)
             if p1_job == 0:
-                _preload_p1_tokens(
-                    x_q,
-                    r_xc,
-                    r_xa,
-                    r_xi,
-                    bos,
-                    n_tok,
-                    p1_par,
-                    i_hv,
-                    in_warp_tid,
-                    T_LOOP,
-                    P1_JOB_WARPS,
-                    True,
-                )
+                _preload_p1_tokens(x_q, *pre, T_LOOP, P1_JOB_WARPS, True)
             elif p1_job == 1:
-                _preload_p1_tokens(
-                    x_k,
-                    r_xc,
-                    r_xa,
-                    r_xi,
-                    bos,
-                    n_tok,
-                    p1_par,
-                    i_hv,
-                    in_warp_tid,
-                    T_LOOP,
-                    P1_JOB_WARPS,
-                    True,
-                )
+                _preload_p1_tokens(x_k, *pre, T_LOOP, P1_JOB_WARPS, True)
                 for _s in cutlass.range_constexpr(P1_STEPS):
                     _tok = cutlass.min(p1_par + _s * P1_JOB_WARPS, n_tok - 1)
                     r_b[_s] = cutlass.Float32(beta[0, bos + _tok, i_hv])
             else:
-                _preload_p1_tokens(
-                    g,
-                    r_xc,
-                    r_xa,
-                    r_xi,
-                    bos,
-                    n_tok,
-                    p1_par,
-                    i_hv,
-                    in_warp_tid,
-                    T_LOOP,
-                    P1_JOB_WARPS,
-                    False,
-                )
+                _preload_p1_tokens(g, *pre, T_LOOP, P1_JOB_WARPS, False)
 
     # Private weights remove the initial cross-warp dependency.
 
@@ -459,13 +421,7 @@ def kda_decode_mtp_kernel(
                 if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
                         _xn = _p1_x(
-                            P1_PRELOAD,
-                            r_xi,
-                            _pi * VEC_SIZE + i,
-                            x_q,
-                            bos + _pi,
-                            i_hv,
-                            i * 32 + in_warp_tid,
+                            P1_PRELOAD, r_xi, _pi, i, x_q, bos + _pi, i_hv, in_warp_tid
                         )
                         r_state[0 * VEC_SIZE + i] = r_state[1 * VEC_SIZE + i]
                         r_state[1 * VEC_SIZE + i] = r_state[2 * VEC_SIZE + i]
@@ -475,13 +431,7 @@ def kda_decode_mtp_kernel(
                 if _pi < cutlass.min(p1_par, n_tok):
                     for i in range(VEC_SIZE):
                         _xn = _p1_x(
-                            P1_PRELOAD,
-                            r_xi,
-                            _pi * VEC_SIZE + i,
-                            x_k,
-                            bos + _pi,
-                            i_hv,
-                            i * 32 + in_warp_tid,
+                            P1_PRELOAD, r_xi, _pi, i, x_k, bos + _pi, i_hv, in_warp_tid
                         )
                         r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i] = (
                             r_state[(KERNEL_WIDTH - 1) * VEC_SIZE + 1 * VEC_SIZE + i]
@@ -517,20 +467,22 @@ def kda_decode_mtp_kernel(
                                 r_xq_0 = _p1_x(
                                     P1_PRELOAD,
                                     r_xc,
-                                    producer_step * VEC_SIZE + i0,
+                                    producer_step,
+                                    i0,
                                     x_q,
                                     token,
                                     i_hv,
-                                    k_idx0,
+                                    in_warp_tid,
                                 )
                                 r_xq_1 = _p1_x(
                                     P1_PRELOAD,
                                     r_xc,
-                                    producer_step * VEC_SIZE + i1,
+                                    producer_step,
+                                    i1,
                                     x_q,
                                     token,
                                     i_hv,
-                                    k_idx1,
+                                    in_warp_tid,
                                 )
                                 _cwq_last_0 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i0]
                                 _cwq_last_1 = r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i1]
@@ -600,11 +552,12 @@ def kda_decode_mtp_kernel(
                                 r_xk = _p1_x(
                                     P1_PRELOAD,
                                     r_xc,
-                                    producer_step * VEC_SIZE + i,
+                                    producer_step,
+                                    i,
                                     x_k,
                                     token,
                                     i_hv,
-                                    k_idx,
+                                    in_warp_tid,
                                 )
                                 r_conv += r_xk * r_wq[(KERNEL_WIDTH - 1) * VEC_SIZE + i]
                                 r_conv = r_conv * cute.arch.rcp_approx(
@@ -660,17 +613,17 @@ def kda_decode_mtp_kernel(
                                 if cutlass.const_expr(CACHE_RING):
                                     ring_beta[slot, i_hv, i_t] = sBeta[i_t]
                         else:
-                            # Issue the independent channel loads before any ring store.
                             # Gate warps do not otherwise use r_q in this phase.
                             for i in range(VEC_SIZE):
                                 r_q[i] = _p1_x(
                                     P1_PRELOAD,
                                     r_xc,
-                                    producer_step * VEC_SIZE + i,
+                                    producer_step,
+                                    i,
                                     g,
                                     token,
                                     i_hv,
-                                    i * 32 + in_warp_tid,
+                                    in_warp_tid,
                                 )
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
@@ -721,13 +674,12 @@ def kda_decode_mtp_kernel(
                                     _xn = _p1_x(
                                         P1_PRELOAD,
                                         r_xa,
-                                        (producer_step * (P1_JOB_WARPS - 1) + _a)
-                                        * VEC_SIZE
-                                        + i,
+                                        producer_step * (P1_JOB_WARPS - 1) + _a,
+                                        i,
                                         x_q,
                                         _nx,
                                         i_hv,
-                                        i * 32 + in_warp_tid,
+                                        in_warp_tid,
                                     )
                                     r_state[0 * VEC_SIZE + i] = r_state[
                                         1 * VEC_SIZE + i
@@ -743,13 +695,12 @@ def kda_decode_mtp_kernel(
                                     _xn = _p1_x(
                                         P1_PRELOAD,
                                         r_xa,
-                                        (producer_step * (P1_JOB_WARPS - 1) + _a)
-                                        * VEC_SIZE
-                                        + i,
+                                        producer_step * (P1_JOB_WARPS - 1) + _a,
+                                        i,
                                         x_k,
                                         _nx,
                                         i_hv,
-                                        i * 32 + in_warp_tid,
+                                        in_warp_tid,
                                     )
                                     r_state[
                                         (KERNEL_WIDTH - 1) * VEC_SIZE + 0 * VEC_SIZE + i
