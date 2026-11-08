@@ -25,8 +25,10 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.managers import overlap_utils
 from sglang.srt.managers.schedule_batch import ScheduleBatch
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter, PlainPoolRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter, PlainPoolRouter
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.runtime_context import get_context, publish, reset_context
@@ -151,10 +153,11 @@ def _megakernel(**entries):
     """SGLang's side of a draft offering these entries."""
     return EagleMegakernel(
         draft_worker=SimpleNamespace(
+            cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
                 model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
-            )
+            ),
         ),
     )
 
@@ -655,7 +658,7 @@ class TestEagleEntries(CustomTestCase):
         """The megakernel may reuse what its draft extend left behind only when that
         extend produced this round's input: not after another extend, not for other
         requests (a PD decode instance's first round), and only once. The extend's
-        tokens are SGLang's own copy, which the next replay leaves alone."""
+        tokens remain graph-owned until the unchanged next round consumes them."""
         rounds, outs = [], {}
 
         def draft_extend(**buffers):
@@ -698,9 +701,13 @@ class TestEagleEntries(CustomTestCase):
 
         outs["topk_index"][0] = 5  # what the extend's replay wrote
         _, _, topk_index = served_extend("a")
-        outs["topk_index"].zero_()  # the next replay rewrites it
+        self.assertEqual(topk_index.data_ptr(), outs["topk_index"].data_ptr())
         self.assertEqual(topk_index.tolist(), [[5]])
+        draft_input.topk_index = topk_index
         self.assertTrue(begin("a"))
+        self.assertIs(rounds[-1].topk_index, topk_index)
+        outs["topk_index"].zero_()  # a later replay rewrites the shared view
+        self.assertEqual(topk_index.tolist(), [[0]])
         self.assertFalse(begin("a"))
         served_extend("a")
         mk.note_draft_extend()  # an extend the megakernel did not serve
@@ -847,6 +854,79 @@ class TestSpeculativeRuntimeHooks(CustomTestCase):
         self.assertIs(batch.forward_mode, ForwardMode.TARGET_VERIFY)
         self.assertIs(batch.sampling_info, io.sampling_info)
         self.assertIs(batch.req_pool_indices, io.req_pool_indices)
+
+
+class TestSpecRelayBypass(CustomTestCase):
+    @staticmethod
+    def _future_map():
+        future_map = overlap_utils.FutureMap.__new__(overlap_utils.FutureMap)
+        future_map._deferred_relay = None
+        future_map.output_tokens_buf = torch.empty(8, dtype=torch.int64)
+        future_map.spec_algo = SimpleNamespace(is_ngram=lambda: False)
+        return future_map
+
+    @staticmethod
+    def _draft_input(indices):
+        return SimpleNamespace(
+            future_indices=indices,
+            bonus_tokens=torch.tensor([7, 8], dtype=torch.int32),
+            topk_p=torch.tensor([[0.7], [0.8]]),
+            topk_index=torch.tensor([[3], [4]]),
+            hidden_states=torch.arange(8, dtype=torch.float32).view(2, 4),
+            draft_probs=None,
+            dsa_topk_indices=None,
+            future_dsa_topk_indices_available=False,
+        )
+
+    def test_unchanged_batch_consumes_the_draft_input_in_place(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        topk_p, topk_index, hidden = (
+            draft_input.topk_p,
+            draft_input.topk_index,
+            draft_input.hidden_states,
+        )
+        future_map.defer_relay(indices, payload, draft_input)
+        batch = SimpleNamespace(
+            spec_info=draft_input,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=True,
+            spec_algorithm=SimpleNamespace(is_none=lambda: False),
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_not_called()
+        self.assertIsNone(future_map._deferred_relay)
+        self.assertIs(draft_input.topk_p, topk_p)
+        self.assertIs(draft_input.topk_index, topk_index)
+        self.assertIs(draft_input.hidden_states, hidden)
+        self.assertEqual(draft_input.bonus_tokens.dtype, torch.int64)
+        self.assertEqual(draft_input.bonus_tokens.tolist(), [7, 8])
+
+    def test_changed_batch_flushes_before_it_can_overwrite_the_outputs(self):
+        future_map = self._future_map()
+        future_map._stash = MagicMock()
+        indices = torch.tensor([2, 5])
+        draft_input = self._draft_input(indices)
+        payload = overlap_utils.RelayPayload.from_draft_input(draft_input)
+        future_map.defer_relay(indices, payload, draft_input)
+        other = self._draft_input(indices.clone())
+        batch = SimpleNamespace(
+            spec_info=other,
+            prefill_input_ids_cpu=None,
+            input_ids=torch.tensor([0]),
+            enable_overlap=False,
+        )
+
+        overlap_utils.resolve_forward_inputs(batch, future_map)
+
+        future_map._stash.assert_called_once_with(indices, payload)
+        self.assertIsNone(future_map._deferred_relay)
 
 
 if __name__ == "__main__":

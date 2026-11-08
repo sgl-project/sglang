@@ -118,10 +118,44 @@ jobs:
           clean: false
           ref: ${{ inputs.ref || github.ref }}
 
+      - name: Check disk space
+        timeout-minutes: 10
+        run: |
+          # Docker state persists on the box across jobs. A build writes a new
+          # multi-GB image (CPU torch, diffusion extras, the CPU kernel build)
+          # while the previous one still exists, and the HF cache shares the
+          # disk; 30 GB covers both with headroom. A full disk otherwise kills
+          # the build (and the runner) with "No space left on device".
+          MIN_FREE_GB=30
+          DOCKER_ROOT=$(docker info -f '{{.DockerRootDir}}' 2>/dev/null) || true
+          [ -d "$DOCKER_ROOT" ] || DOCKER_ROOT=/
+          free_gb () { df --output=avail -BG "$1" | tail -1 | tr -dc '0-9'; }
+
+          # Dangling images only: tagged images and images used by containers
+          # of concurrent jobs on this box are kept.
+          docker image prune -f
+          docker builder prune -f --filter until=24h
+          if [ "$(free_gb "$DOCKER_ROOT")" -lt "$MIN_FREE_GB" ]; then
+            # This workflow builds with --no-cache, so it never reuses build
+            # cache; drop all of it that no running build holds.
+            docker builder prune -af
+          fi
+
+          df -h "$DOCKER_ROOT" "$GITHUB_WORKSPACE"
+          # Warn rather than fail: the threshold is an estimate, and a build
+          # that fits should still run.
+          for path in "$DOCKER_ROOT" "$GITHUB_WORKSPACE"; do
+            avail=$(free_gb "$path")
+            if [ "$avail" -lt "$MIN_FREE_GB" ]; then
+              echo "::warning::Only ${avail} GB free on ${path} after pruning docker (want ${MIN_FREE_GB} GB); the build may run out of disk."
+            fi
+          done
+
       - name: Build image
         run: |
-          # Fixed tag (no SHA): a new build overwrites the previous image so a
-          # self-hosted box does not accumulate multi-GB images across PRs.
+          # Fixed tag (no SHA): a new build moves the tag, and the previous
+          # image becomes dangling; the prune steps before and after the job
+          # remove it so the self-hosted box does not fill up across PRs.
           # --no-cache keeps the CPU image clean (past sgl-eval/accelerate gaps
           # came from stale layers). One build per job, one container per box.
           PR_REPO=${{ github.event.pull_request.head.repo.clone_url }}
@@ -224,3 +258,8 @@ jobs:
           for c in ci_sglang_${{ matrix.name }} ci_sglang_${{ matrix.name }}_s0 ci_sglang_${{ matrix.name }}_s1; do
             docker rm -f "$c" || true
           done
+          # Dangling images and old build cache only, so a concurrent job's
+          # tagged image and running containers stay intact.
+          docker image prune -f || true
+          docker builder prune -f --filter until=24h || true
+          df -h "$(docker info -f '{{.DockerRootDir}}' 2>/dev/null || echo /)" || true

@@ -33,8 +33,7 @@ def use_fp8_e4b15_for_e4m3fn(
     if cuda_capability is None:
         if is_hip_runtime() or is_musa_runtime() or not torch.cuda.is_available():
             return False
-        cuda = current_arch().cuda
-        cuda_capability = cuda.capability
+        cuda_capability = current_arch().cuda.capability
 
     return cuda_capability_uses_fp8_e4b15(cuda_capability)
 

@@ -11,6 +11,7 @@ from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
@@ -152,6 +153,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         graph_io.relay[indices] = published.to(torch.int64)
         result = SimpleNamespace(
             next_draft_input=None,
+            accept_lens=None,
             has_sampled_token_ids=True,
             next_token_ids=published,
             can_run_cuda_graph=True,
@@ -323,7 +325,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
@@ -334,6 +336,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
