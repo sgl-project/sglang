@@ -345,16 +345,16 @@ cd /workspace/sglang
 # (Optional) Only needed if you modified Python files in the mounted repo without reinstalling.
 export PYTHONPATH=/workspace/sglang/python
 
-/opt/.venv/bin/python -m unittest discover -s test/srt/cpu/rvv -p "test_*.py" -t . -v
+/opt/.venv/bin/python -m unittest discover -s test/manual/cpu/rvv -p "test_*.py" -t . -v
 
 # Run a specific test
-/opt/.venv/bin/python -m unittest test.srt.cpu.rvv.test_rvv_gemm -v
+/opt/.venv/bin/python -m unittest test.manual.cpu.rvv.test_rvv_gemm -v
 ```
 
 Notes:
 
 1. Run from the repository root (`/workspace/sglang`) so `-t .` resolves imports correctly.
-2. The `test_*.py` pattern matches the full RVV unit test set under `test/srt/cpu/rvv/`,
+2. The `test_*.py` pattern matches the full RVV unit test set under `test/manual/cpu/rvv/`,
    including files such as `test_rvv_backend_registration.py`, not just kernel-only tests.
 3. If you already activated the virtual environment, `python` and `/opt/.venv/bin/python`
    are equivalent.
