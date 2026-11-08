@@ -55,7 +55,8 @@ class Mm(msgspec.Struct):
         "Enable broadcast mm-inputs process in scheduler.",
     ] = False
     enable_prefix_mm_cache: A[
-        bool, "Enable prefix multimodal cache. Currently only supports mm-only."
+        bool,
+        "Enable the per-item encoder prefix cache. Repeated images/videos reuse their encoder embedding across requests and fused encoder batches.",
     ] = False
     mm_enable_dp_encoder: A[
         Optional[bool],

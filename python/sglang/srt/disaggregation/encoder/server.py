@@ -1742,7 +1742,6 @@ class MMEncoder:
         modality_str = modality.name.lower()
         try:
             mm_embedding = None
-            mm_hash = None
 
             mm_items = self._build_model_mm_items(
                 ctx.mm_feature,
@@ -1752,37 +1751,87 @@ class MMEncoder:
             )
 
             cache_hit = False
-            # The prefix cache hashes the whole request; a fused multi-request
-            # batch has no per-request key, so only N=1 contexts use it.
+            cached_rows: List[Optional[torch.Tensor]] = [None] * len(mm_items)
+            missing_indices: List[int] = []
             use_mm_cache = (
                 get_mm().enable_prefix_mm_cache
                 and not ctx.is_health_check
                 and not keep_on_gpu
-                and len(ctx.items_per_req) == 1
             )
+            token_counts = ctx.preprocess_result.token_counts
             if use_mm_cache:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
                 mm_hashes = [mm_item.cache_key for mm_item in mm_items]
-                mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
-                    if mm_cache is not None:
-                        mm_embedding = mm_cache.embedding
-                        cache_hit = True
+                    # Cache per media item, not per request.  A request's
+                    # combined hash changes as soon as one item changes, and a
+                    # fused multi-request batch has no single request key.
+                    # Per-item entries keep a repeated image/video reusable in
+                    # both cases and avoid storing the whole request twice.
+                    for index, (item_hash, expected_tokens) in enumerate(
+                        zip(mm_hashes, token_counts)
+                    ):
+                        entry = self.mm_cache.get_single(item_hash)
+                        if entry is None:
+                            missing_indices.append(index)
+                            continue
+                        if entry.embedding.shape[0] != expected_tokens:
+                            # set() keeps an existing key in place, so a stale
+                            # size must be evicted explicitly.
+                            self.mm_cache.free(item_hash, None)
+                            missing_indices.append(index)
+                            continue
+                        cached_rows[index] = entry.embedding
+                if not missing_indices:
+                    mm_embedding = torch.cat(cached_rows, dim=0)
+                    cache_hit = True
 
             if mm_embedding is None:
+                # Re-encode only the items that missed.  A partial hit is
+                # common for a batch with one new screenshot beside already
+                # cached frames; encoding the whole batch would throw away the
+                # cache benefit.
+                items_to_encode = (
+                    [mm_items[index] for index in missing_indices]
+                    if use_mm_cache and cached_rows.count(None) < len(cached_rows)
+                    else mm_items
+                )
+                encode_token_counts = (
+                    [token_counts[index] for index in missing_indices]
+                    if items_to_encode is not mm_items
+                    else token_counts
+                )
                 forward_start = time.perf_counter()
                 with torch.inference_mode():
-                    mm_embedding: torch.Tensor = ctx.get_feature_fn(mm_items)
+                    encoded = ctx.get_feature_fn(items_to_encode)
+                    if isinstance(encoded, list):
+                        if len(encoded) != len(items_to_encode):
+                            raise InternalError(
+                                "Encoder returned a different number of "
+                                "per-item embeddings than requested"
+                            )
+                        encoded_rows = [
+                            row.reshape(-1, row.shape[-1]) for row in encoded
+                        ]
+                    else:
+                        encoded = encoded.reshape(-1, encoded.shape[-1])
+                        encoded_rows = list(
+                            torch.split(encoded, encode_token_counts, dim=0)
+                        )
                     if not keep_on_gpu:
-                        mm_embedding = mm_embedding.cpu()
-                if len(mm_embedding.shape) != 2:
-                    mm_embedding = mm_embedding.reshape(-1, mm_embedding.shape[-1])
+                        encoded_rows = [row.cpu() for row in encoded_rows]
                 if encoder_metrics_collector is not None and not ctx.is_health_check:
                     encoder_metrics_collector.observe_model_forward(
                         time.perf_counter() - forward_start, modality=modality_str
                     )
+                if items_to_encode is mm_items:
+                    cached_rows = list(encoded_rows)
+                    mm_embedding = torch.cat(cached_rows, dim=0)
+                else:
+                    for index, row in zip(missing_indices, encoded_rows):
+                        cached_rows[index] = row
+                    mm_embedding = torch.cat(cached_rows, dim=0)
 
             try:
                 self._validate_embedding_token_count(ctx, mm_embedding)
@@ -1792,33 +1841,42 @@ class MMEncoder:
                 # poison every request for the same media.
                 if cache_hit:
                     async with self.mm_cache_lock:
-                        self.mm_cache.free(mm_hash, None)
+                        for item_hash in mm_hashes:
+                            self.mm_cache.free(item_hash, None)
                 raise
 
             # Per-request cache hit metrics: tokens = embedding rows.
             if use_mm_cache and encoder_metrics_collector is not None:
                 total_tokens = int(mm_embedding.shape[0])
-                hit_tokens = total_tokens if cache_hit else 0
+                hit_tokens = sum(
+                    token_counts[index]
+                    for index, row in enumerate(cached_rows)
+                    if row is not None
+                )
                 encoder_metrics_collector.record_cache_tokens(
                     hit_tokens, total_tokens, modality=modality_str
                 )
                 encoder_metrics_collector.record_cache_files(
-                    len(mm_items) if cache_hit else 0,
+                    sum(row is not None for row in cached_rows),
                     len(mm_items),
                     modality=modality_str,
                 )
 
-            if use_mm_cache:
+            if use_mm_cache and missing_indices:
                 async with self.mm_cache_lock:
                     entries_before = len(self.mm_cache)
-                    already_present = self.mm_cache.has(mm_hash)
-                    inserted = self.mm_cache.set(
-                        mm_hash, EmbeddingResult(embedding=mm_embedding)
-                    )
+                    inserted = 0
+                    for index in missing_indices:
+                        item_hash = mm_hashes[index]
+                        if not self.mm_cache.has(item_hash):
+                            inserted += 1
+                        self.mm_cache.set(
+                            item_hash,
+                            EmbeddingResult(embedding=cached_rows[index].clone()),
+                        )
                     entries_after = len(self.mm_cache)
                     if encoder_metrics_collector is not None:
-                        added = 0 if already_present else (1 if inserted else 0)
-                        evictions = max(0, added - (entries_after - entries_before))
+                        evictions = max(0, inserted - (entries_after - entries_before))
                         if evictions > 0:
                             encoder_metrics_collector.inc_cache_evictions(
                                 modality=modality_str, count=evictions
