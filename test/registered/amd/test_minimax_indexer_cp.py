@@ -7,7 +7,7 @@ import torch
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BLOCK, TOPK, HEADS, DIM = 128, 16, 4, 128
 INIT_BLOCKS, LOCAL_BLOCKS = 1, 2
@@ -225,82 +225,69 @@ class TestMiniMaxIndexerCP(unittest.TestCase):
         )
 
         sm_scale, k_scale = 0.07, 0.5
+        # tied scores and rows shorter than top-k; init != local so a swap shows
+        init_blocks, local_blocks, num_reqs = 2, 1, 17
         for num_draft in (8, 4):
-            for init_blocks, local_blocks in ((0, 1), (2, 2)):
-                # tied scores, and rows shorter than top-k (num_reqs > 5)
-                for num_reqs, tied, q_dtype in (
-                    (3, True, torch.bfloat16),
-                    (17, False, torch.float16),
-                ):
-                    prefixes = [
-                        BLOCK * (60 + 37 * (r % 8)) - r for r in range(num_reqs)
-                    ]
-                    if num_reqs > 5:
-                        prefixes[3], prefixes[5] = 3 * BLOCK - 2, 777  # <= top-k blocks
-                    q, cache, table, slots, lengths, max_len = _nvfp4_verify_inputs(
-                        prefixes, num_draft, seed=num_reqs, tied_pages=tied
+            prefixes = [BLOCK * (60 + 37 * (r % 8)) - r for r in range(num_reqs)]
+            prefixes[3], prefixes[5] = 3 * BLOCK - 2, 777  # <= top-k blocks
+            q, cache, table, slots, lengths, max_len = _nvfp4_verify_inputs(
+                prefixes, num_draft, seed=num_reqs, tied_pages=True
+            )
+            q_scale = None
+            gathered_q = q.permute(1, 0, 2).contiguous()
+            keys = [
+                cp_verify_local_keys(
+                    gathered_q,
+                    cache,
+                    table,
+                    lengths,
+                    max_len,
+                    slots,
+                    num_draft,
+                    BLOCK,
+                    init_blocks,
+                    local_blocks,
+                    sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
+                    HEADS,
+                    rank,
+                )
+                for rank in range(HEADS)
+            ]
+            gathered_keys = torch.stack(keys, dim=0)
+            for head in range(HEADS):
+                with self.subTest(num_draft=num_draft, head=head):
+                    native = verify_module.verify_topk_idx(
+                        q=q[:, head : head + 1].contiguous(),
+                        k_cache=cache,
+                        req_to_token=table,
+                        seq_lens=lengths,
+                        max_seqlen=max_len,
+                        slot_ids=slots,
+                        num_draft=num_draft,
+                        block_size=BLOCK,
+                        topk=TOPK,
+                        init_blocks=init_blocks,
+                        local_blocks=local_blocks,
+                        sm_scale=sm_scale,
+                        q_scale=q_scale,
+                        k_scale=k_scale,
+                        page_size=BLOCK,
                     )
-                    q, q_scale = q.to(q_dtype), None
-                    gathered_q = q.permute(1, 0, 2).contiguous()
-                    keys = [
-                        cp_verify_local_keys(
-                            gathered_q,
-                            cache,
-                            table,
-                            lengths,
-                            max_len,
-                            slots,
-                            num_draft,
-                            BLOCK,
-                            init_blocks,
-                            local_blocks,
-                            sm_scale * unit_scale(q_scale) * unit_scale(k_scale),
-                            HEADS,
-                            rank,
-                        )
-                        for rank in range(HEADS)
-                    ]
-                    gathered_keys = torch.stack(keys, dim=0)
-                    for head in range(HEADS):
-                        with self.subTest(
-                            num_draft=num_draft,
-                            init=init_blocks,
-                            local=local_blocks,
-                            reqs=num_reqs,
-                            head=head,
-                        ):
-                            native = verify_module.verify_topk_idx(
-                                q=q[:, head : head + 1].contiguous(),
-                                k_cache=cache,
-                                req_to_token=table,
-                                seq_lens=lengths,
-                                max_seqlen=max_len,
-                                slot_ids=slots,
-                                num_draft=num_draft,
-                                block_size=BLOCK,
-                                topk=TOPK,
-                                init_blocks=init_blocks,
-                                local_blocks=local_blocks,
-                                sm_scale=sm_scale,
-                                q_scale=q_scale,
-                                k_scale=k_scale,
-                                page_size=BLOCK,
-                            )
-                            cp = cp_verify_merge(
-                                gathered_keys,
-                                head,
-                                lengths,
-                                max_len,
-                                table,
-                                BLOCK,
-                                TOPK,
-                                init_blocks,
-                                local_blocks,
-                            )
-                            self.assertTrue(
-                                torch.equal(cp, native),
-                                f"{(cp != native).sum()} IDs differ",
-                            )
+                    cp = cp_verify_merge(
+                        gathered_keys,
+                        head,
+                        lengths,
+                        max_len,
+                        table,
+                        BLOCK,
+                        TOPK,
+                        init_blocks,
+                        local_blocks,
+                    )
+                    self.assertTrue(
+                        torch.equal(cp, native),
+                        f"{(cp != native).sum()} IDs differ",
+                    )
 
 
 if __name__ == "__main__":

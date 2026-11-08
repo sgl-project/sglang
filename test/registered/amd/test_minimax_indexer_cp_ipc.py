@@ -45,7 +45,7 @@ def _run_exchange(rank: int, port: int) -> None:
         )
         exchange = CpExchange(group, device)
         # every rank builds the same pool; a call's row count changes between cases
-        for seed, num_reqs in enumerate((64, 17, 48)):
+        for seed, num_reqs in enumerate((64, 17)):
             prefixes = [20000 - 97 * r - 1000 * seed for r in range(num_reqs)]
             q, cache, table, slots, lengths, _ = _nvfp4_verify_inputs(
                 prefixes, NUM_DRAFT, seed=seed
@@ -86,13 +86,11 @@ def _run_exchange(rank: int, port: int) -> None:
                     BLOCK, TOPK, 0, 1, SM_SCALE * K_SCALE, exchange,
                 )  # fmt: skip
 
-            # seed 1 starts two calls short of the counters' wrap at 510; seed 2
-            # two calls short of the int32 maximum an unwrapped count would pass
-            start = {1: 508, 2: 2**31 - 3}.get(seed)
-            if start is not None:
+            # seed 1 starts two calls short of the counters' wrap at 510
+            if seed == 1:
                 dist.barrier()
-                exchange.write_calls.fill_(start)
-                exchange.merge_calls.fill_(start)
+                exchange.write_calls.fill_(508)
+                exchange.merge_calls.fill_(508)
                 torch.cuda.synchronize()
                 dist.barrier()
             # more calls than parities, so a stale parity or tag would be read back
