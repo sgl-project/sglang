@@ -153,14 +153,15 @@ def _qem_vertex_quadrics(v: np.ndarray, f: np.ndarray) -> np.ndarray:
     n /= np.maximum(np.linalg.norm(n, axis=1), 1e-20)[:, None]
     plane = np.concatenate([n, -(n * p0).sum(1, keepdims=True)], axis=1)
     idx = f.T.ravel()
-    q = np.empty((len(v), 4, 4), dtype=np.float64)
+    q = np.empty((4, 4, len(v)), dtype=np.float64)
     for i in range(4):
         for j in range(i, 4):
             weights = np.tile(plane[:, i] * plane[:, j], 3)
             total = np.bincount(idx, weights=weights, minlength=len(v))
-            q[:, i, j] = total
-            q[:, j, i] = total
-    return q
+            q[i, j] = total
+            if i != j:
+                q[j, i] = total
+    return np.transpose(q, (2, 0, 1)).copy(order="C")
 
 
 def _qem_unique_edge_keys(f: np.ndarray, nv: int) -> Tuple[np.ndarray, np.ndarray]:

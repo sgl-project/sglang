@@ -371,6 +371,7 @@ class TestHunyuan3DPaintRemesh(unittest.TestCase):
 
                 self.assertEqual(actual.shape, (len(mesh.vertices), 4, 4))
                 self.assertEqual(actual.dtype, np.float64)
+                self.assertTrue(actual.flags.c_contiguous)
                 np.testing.assert_array_equal(
                     actual.view(np.uint64), reference.view(np.uint64)
                 )
