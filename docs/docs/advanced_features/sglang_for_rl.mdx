@@ -68,8 +68,8 @@ Enable memory saver support when launching the server:
 {/* python/sglang/srt/managers/io_struct.py#L1381 currently only supports `kv_cache`, `weights` */}
 **Behavior notes:**
 
-- This call asserts there are no ongoing requests. Ensure the engine is idle before calling it.
-- If `kv_cache` is released, SGLang flushes cache; subsequent requests will rebuild KV cache as needed.
+- By default, this call requires requests to finish or be retracted before releasing memory.
+- Without KV CPU backup, releasing `kv_cache` flushes the cache; subsequent requests rebuild it.
 
 ### Preserve unfinished requests while training
 
@@ -77,7 +77,7 @@ On NVIDIA CUDA, start the server with `--enable-memory-saver`,
 `--enable-weights-cpu-backup`, and `--enable-kv-cache-cpu-backup` to retain
 unfinished requests while a colocated trainer uses the GPUs. This mode requires
 PP=1 and static KV pools; disaggregation, speculative decoding, hierarchical
-caching, LMCache, and unified KV memory are unsupported.
+caching, LMCache, unified KV memory, and IPC weight caching are unsupported.
 
 Pause with `mode="in_place"` before releasing memory. KV and request-pool bytes
 are copied to CPU and restored at the same GPU virtual addresses. The scheduler's
