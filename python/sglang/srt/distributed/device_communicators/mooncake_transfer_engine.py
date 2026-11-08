@@ -167,11 +167,7 @@ class MooncakeTransferEngine:
             )
 
     def batch_register(self, ptrs: List[int], lengths: List[int]) -> None:
-        """Batch register multiple memory regions; raise if any is rejected.
-
-        Mooncake rolls the whole batch back on failure, so a transfer that
-        later touches any of these regions fails with AddressNotRegistered.
-        """
+        """Batch register multiple memory regions."""
         if not hasattr(self.engine, "batch_register_memory"):
             raise RuntimeError(
                 "Mooncake's batch register requires a newer version of "
@@ -190,8 +186,7 @@ class MooncakeTransferEngine:
             raise RuntimeError(f"Mooncake failed to register {what}") from exc
 
         if ret_value == _ERR_ADDRESS_OVERLAPPED:
-            # Already registered, e.g. a resume after a failed deregister. This
-            # was tolerated before; keep it a logged error, not a crash.
+            # A resume after a failed deregister re-registers live regions; not fatal.
             logger.error(
                 f"Mooncake reports {what} already registered (ret={ret_value})"
             )
