@@ -284,6 +284,7 @@ def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
 def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata,
     *,
+    kv_layout: KVLayout,
     q: torch.Tensor,
     indices: torch.Tensor,
     topk_length: Optional[torch.Tensor],
@@ -299,6 +300,13 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if not _fast_flashmla_sched_shape(q):
         return
+    if kv_layout is KVLayout.V4:
+        from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
+
+        # The Blackwell legacy V4 reader uses the same top-k split threshold.
+        # Its unsplit path neither fills nor consumes scheduling metadata.
+        if not _flashmla_splits_kv(indices, extra_indices, SPLIT_KV_MIN_TOPK):
+            return
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
@@ -324,7 +332,7 @@ def _maybe_precompute_flashmla_sched_meta(
     flashmla_metadata.num_splits = num_splits
 
 
-def _flashmla_v41_splits_kv(
+def _flashmla_splits_kv(
     indices: torch.Tensor, extra_indices: Optional[torch.Tensor], min_topk: int
 ) -> bool:
     extra_topk = 0 if extra_indices is None else extra_indices.shape[-1]
@@ -1322,9 +1330,8 @@ class DeepseekV4AttnBackend(
         if is_cuda():
             from sglang.kernels.ops.attention import flash_mla_interface
 
-            self._swa_interleaved = (
-                self.token_to_kv_pool.get_swa_key_layout().is_interleaved
-            )
+            self._swa_kv_layout = self.token_to_kv_pool.get_swa_key_layout()
+            self._swa_interleaved = self._swa_kv_layout.is_interleaved
             self._flash_mla_with_kvcache = functools.partial(
                 flash_mla_interface.flash_mla_with_kvcache,
                 use_legacy=not self._swa_interleaved,
@@ -4553,7 +4560,7 @@ class DeepseekV4AttnBackend(
 
                 if self.is_dsv41 and (
                     not self._swa_interleaved
-                    or _flashmla_v41_splits_kv(
+                    or _flashmla_splits_kv(
                         swa_page_indices,
                         extra_indices,
                         self._flashmla_split_kv_min_topk,
@@ -4561,6 +4568,7 @@ class DeepseekV4AttnBackend(
                 ):
                     _maybe_precompute_flashmla_sched_meta(
                         flashmla_metadata,
+                        kv_layout=self._swa_kv_layout,
                         q=q,
                         indices=swa_page_indices,
                         topk_length=swa_topk_lengths,

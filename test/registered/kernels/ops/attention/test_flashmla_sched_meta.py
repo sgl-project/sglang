@@ -3,8 +3,10 @@ import sys
 import pytest
 import torch
 
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.srt.runtime_context import get_platform
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
@@ -199,6 +201,7 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         meta = SimpleNamespace(tile_scheduler_metadata=None, num_splits=None)
         backend._maybe_precompute_flashmla_sched_meta(
             meta,
+            kv_layout=KVLayout.V41,
             q=SimpleNamespace(shape=(b, 1, 64, 512), device=SimpleNamespace(index=0)),
             indices=None,
             topk_length=None,
@@ -207,6 +210,156 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         )
         assert meta.tile_scheduler_metadata is None
         assert meta.num_splits is None
+
+
+def _v4_decode_case(b, s_q, extra_topk, topk=128):
+    """Finite V4 pages with unit scales and independently encoded fp8/bf16 data."""
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    g = torch.Generator(device="cuda").manual_seed(43 + b + s_q + extra_topk)
+    page, pages = 256, 4
+
+    def cache():
+        layout = KVLayout.V4
+        raw = torch.zeros(
+            (pages, layout.page_bytes(page)), device="cuda", dtype=torch.uint8
+        )
+        values = torch.randn((pages, page, 512), device="cuda", generator=g) / 4
+        data = raw[:, : page * 576].view(pages, page, 576)
+        data[..., :448] = values[..., :448].to(torch.float8_e4m3fn).view(torch.uint8)
+        data[..., 448:] = values[..., 448:].to(torch.bfloat16).view(torch.uint8)
+        raw[:, page * 576 : page * 584].fill_(127)
+        return raw[:, : page * 584].view(pages, page, 1, 584)
+
+    def indices(n):
+        ids = torch.randint(
+            0, pages * page, (b, s_q, n), device="cuda", dtype=torch.int32, generator=g
+        )
+        ids[..., -1] = -1
+        return ids
+
+    kw = dict(
+        q=torch.randn((b, s_q, H_Q, D_QK), device="cuda", generator=g).bfloat16(),
+        k_cache=cache(),
+        block_table=None,
+        cache_seqlens=None,
+        head_dim_v=D_V,
+        softmax_scale=D_QK**-0.5,
+        is_fp8_kvcache=True,
+        indices=indices(topk),
+        topk_length=_lengths(b, topk, "mixed", 17),
+        attn_sink=torch.randn(H_Q, device="cuda", generator=g),
+        extra_k_cache=cache() if extra_topk else None,
+        extra_indices_in_kvcache=indices(extra_topk) if extra_topk else None,
+        extra_topk_length=(
+            _lengths(b, extra_topk, "mixed", 19) if extra_topk else None
+        ),
+    )
+
+    def decode(layout):
+        meta = _v4_schedule_metadata(kw, layout)
+        out = flash_mla_interface.flash_mla_with_kvcache(
+            **kw, tile_scheduler_metadata=meta
+        )[0]
+        return out, meta
+
+    return kw, decode
+
+
+def _v4_schedule_metadata(kw, layout):
+    from sglang.kernels.ops.attention import flash_mla_interface
+    from sglang.srt.layers.attention.deepseek_v4_backend import (
+        _maybe_precompute_flashmla_sched_meta,
+    )
+
+    meta = flash_mla_interface.FlashMLASchedMeta()
+    _maybe_precompute_flashmla_sched_meta(
+        meta,
+        kv_layout=layout,
+        q=kw["q"],
+        indices=kw["indices"],
+        topk_length=kw["topk_length"],
+        extra_indices=kw["extra_indices_in_kvcache"],
+        extra_topk_length=kw["extra_topk_length"],
+    )
+    return meta
+
+
+class TestV4ScheduleMetadata(CustomTestCase):
+    def test_v4_decode_does_not_build_unused_schedule(self):
+        """Unsplit V4 reads no schedule, including verify rows and a second cache.
+
+        Removing the layout guard allocates and launches an unused schedule while
+        leaving attention results unchanged, so numerical parity alone misses it.
+        """
+        for b, s_q, extra_topk in (
+            (1, 1, 0),
+            (8, 3, 512),
+            (64, 1, 512),
+            (149, 1, 512),
+            (256, 1, 512),
+        ):
+            with self.subTest(b=b, s_q=s_q, extra_topk=extra_topk):
+                _, decode = _v4_decode_case(b, s_q, extra_topk)
+                # V41 deliberately forces the old precompute on the same V4 bytes.
+                before, old_meta = decode(KVLayout.V41)
+                after, meta = decode(KVLayout.V4)
+                self.assertIsNotNone(old_meta.tile_scheduler_metadata)
+                self.assertIsNone(meta.tile_scheduler_metadata)
+                self.assertIsNone(meta.num_splits)
+                self.assertTrue(torch.isfinite(after).all())
+                self.assertTrue(torch.equal(before, after))
+
+    def test_v4_split_schedule_is_precomputed(self):
+        """Check before decode: FlashMLA would otherwise silently build a schedule."""
+        from sglang.kernels.ops.attention import flash_mla_interface
+
+        for topk, extra_topk in ((128, 576), (128, 1024), (704, 0)):
+            with self.subTest(topk=topk, extra_topk=extra_topk):
+                kw, _ = _v4_decode_case(64, 1, extra_topk, topk=topk)
+                meta = _v4_schedule_metadata(kw, KVLayout.V4)
+                self.assertIsNotNone(meta.tile_scheduler_metadata)
+                self.assertIsNotNone(meta.num_splits)
+                schedule = meta.tile_scheduler_metadata
+                actual = flash_mla_interface.flash_mla_with_kvcache(
+                    **kw, tile_scheduler_metadata=meta
+                )[0]
+                native = flash_mla_interface.FlashMLASchedMeta()
+                expected = flash_mla_interface.flash_mla_with_kvcache(
+                    **kw, tile_scheduler_metadata=native
+                )[0]
+                self.assertIsNotNone(native.tile_scheduler_metadata)
+                self.assertIs(meta.tile_scheduler_metadata, schedule)
+                self.assertTrue(torch.isfinite(actual).all())
+                self.assertTrue(torch.equal(actual, expected))
+
+    def test_v4_graph_replay_updates_lengths(self):
+        """Split and unsplit V4 paths stay valid across replay with new inputs."""
+        for extra_topk in (512, 1024):
+            with self.subTest(extra_topk=extra_topk):
+                kw, decode = _v4_decode_case(64, 1, extra_topk)
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    decode(KVLayout.V4)
+                    decode(KVLayout.V41)
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    actual, meta = decode(KVLayout.V4)
+                self.assertEqual(
+                    meta.tile_scheduler_metadata is None, extra_topk == 512
+                )
+                for seed in (31, 37):
+                    kw["q"].add_(0.125)
+                    kw["topk_length"].copy_(_lengths(64, 128, "mixed", seed))
+                    kw["extra_topk_length"].copy_(
+                        _lengths(64, extra_topk, "mixed", seed + 1)
+                    )
+                    graph.replay()
+                    expected, _ = decode(KVLayout.V41)
+                    self.assertTrue(torch.isfinite(actual).all())
+                    self.assertTrue(torch.equal(actual, expected))
 
 
 # b = 7 stays below kMinParallelBatch (both walks serial), 8 is the first

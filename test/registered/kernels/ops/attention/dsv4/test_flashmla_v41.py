@@ -7,6 +7,7 @@ import unittest
 import torch
 
 from sglang.kernels.ops.attention import flash_mla_interface
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
 from sglang.kernels.ops.attention.flash_mla_interface import SPLIT_KV_MIN_TOPK
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.dsv41_kv_quant_reference import (
@@ -172,29 +173,38 @@ class TestFlashMLAV41(CustomTestCase):
                 )
 
     def test_precomputed_schedule_matches_own_schedule(self):
-        """The backend's `flashmla_sched_meta` precompute feeds the new kernel."""
+        """V41 block-split and interleaved readers keep their precomputed schedules."""
         from sglang.srt.layers.attention.deepseek_v4_backend import (
             _maybe_precompute_flashmla_sched_meta,
         )
 
         for n, topk, extra_topk in self.SHAPES:
-            with self.subTest(n=n, topk=topk, extra_topk=extra_topk):
-                c = Case(n, topk, extra_topk, seed=11 * n + topk)
-                meta = flash_mla_interface.get_mla_metadata()[0]
-                _maybe_precompute_flashmla_sched_meta(
-                    meta,
-                    q=c.q[:, None],
-                    indices=c.indices[:, None],
-                    topk_length=c.lengths,
-                    extra_indices=c.extra_indices[:, None],
-                    extra_topk_length=c.extra_lengths,
-                )
-                self.assertIsNotNone(meta.tile_scheduler_metadata)
-                self.assertTrue(torch.equal(c.decode(meta), c.decode()))
+            for use_legacy in (False, True):
+                with self.subTest(
+                    n=n, topk=topk, extra_topk=extra_topk, use_legacy=use_legacy
+                ):
+                    c = Case(n, topk, extra_topk, seed=11 * n + topk)
+                    meta = flash_mla_interface.get_mla_metadata()[0]
+                    _maybe_precompute_flashmla_sched_meta(
+                        meta,
+                        kv_layout=KVLayout.V41 if use_legacy else KVLayout.V41_NEW,
+                        q=c.q[:, None],
+                        indices=c.indices[:, None],
+                        topk_length=c.lengths,
+                        extra_indices=c.extra_indices[:, None],
+                        extra_topk_length=c.extra_lengths,
+                    )
+                    self.assertIsNotNone(meta.tile_scheduler_metadata)
+                    self.assertTrue(
+                        torch.equal(
+                            c.decode(meta, use_legacy=use_legacy),
+                            c.decode(use_legacy=use_legacy),
+                        )
+                    )
 
     def test_backend_precomputes_only_split_schedules(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
-            _flashmla_v41_splits_kv,
+            _flashmla_splits_kv,
         )
 
         for n, topk, extra_topk in self.SHAPES:
@@ -204,9 +214,7 @@ class TestFlashMLAV41(CustomTestCase):
                 c.decode(meta)
                 self.assertEqual(
                     meta.tile_scheduler_metadata is not None,
-                    _flashmla_v41_splits_kv(
-                        c.indices, c.extra_indices, SPLIT_KV_MIN_TOPK
-                    ),
+                    _flashmla_splits_kv(c.indices, c.extra_indices, SPLIT_KV_MIN_TOPK),
                 )
 
     def test_schedule_is_shared_across_layers(self):
