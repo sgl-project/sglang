@@ -130,11 +130,7 @@ def resolve_indexer_quant_mode(
         raise ValueError(
             f"Unsupported indexer_kv_cache_dtype: {indexer_kv_cache_dtype}."
         )
-    if main_kv_cache_dtype in (
-        torch.float8_e4m3fn,
-        torch.float8_e4m3fnuz,
-        torch.float8_e5m2,
-    ):
+    if main_kv_cache_dtype == torch.float8_e4m3fn:
         raise ValueError(
             f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
             "non-FP8 main KV cache (--kv-cache-dtype auto or bf16), "

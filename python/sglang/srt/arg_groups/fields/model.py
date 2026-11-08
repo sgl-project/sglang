@@ -225,8 +225,7 @@ class Model(msgspec.Struct):
                 "(Ascend NPU only). None disables the quantized indexer cache "
                 "and keeps the default indexer behavior. \"int8\" stores the "
                 "indexer keys in INT8 with FP16 scales to speed up the "
-                "lightning indexer; it requires a non-FP8 KV cache "
-                "(--kv-cache-dtype auto or bf16)."
+                "lightning indexer."
             ),
             choices=["int8"],
             resolvable=True,
