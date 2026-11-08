@@ -1129,8 +1129,22 @@ class MuseSpark1xMoE(nn.Module):
             if skip_post_expert_proj:
                 return output
             return self.unpool(output, prefill_fp8=prefill_fp8)
+        out = None
+        if use_a4w4 and (sp is not None or self.tp_size > 1):
+            # The expert output feeds exactly the next collective (the TP all-reduce, or the
+            # reduce-scatter of all padded rows): produce it in aiter's registered input pool
+            # so that collective skips its copy-in.
+            out = get_tp_group().ca_input_buffer(
+                (rows, self.expert_hidden_size), torch.bfloat16
+            )
         output = self.run_experts(
-            expert_input, topk_scores, topk_ids, target_verify, use_a4w4, quantized
+            expert_input,
+            topk_scores,
+            topk_ids,
+            target_verify,
+            use_a4w4,
+            quantized,
+            out=out,
         )
         if sp is not None:
             output = sp_reduce_scatter(output, sp.padded)
@@ -1238,8 +1252,10 @@ class MuseSpark1xMoE(nn.Module):
         target_verify: bool,
         use_a4w4: bool,
         quantized=None,
+        out: torch.Tensor | None = None,
     ):
-        """This rank's experts over all given rows; per-token partial sums before the TP reduction."""
+        """This rank's experts over all given rows; per-token partial sums before the TP reduction.
+        The a4w4 path writes them into ``out`` when given; callers use the returned tensor."""
         if use_a4w4:
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)
             assert has_norm and norm_weight is not None
@@ -1253,6 +1269,7 @@ class MuseSpark1xMoE(nn.Module):
                 self.post_expert_norm.eps,
                 gain,
                 quantized=quantized,
+                out=out,
             )
         if self.uses_compact_a4(expert_input.shape[0], target_verify):
             norm_weight, gain, has_norm = _post_expert_norm_args(self.post_expert_norm)

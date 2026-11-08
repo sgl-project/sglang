@@ -42,12 +42,17 @@ __all__ = [
 
 
 def _finalize_per_slot(
-    y, norm_weight, scores, ids, local_start, num_local_experts, eps, gain
+    y, norm_weight, scores, ids, local_start, num_local_experts, eps, gain, out=None
 ):
-    """Muse finalize: per-expert norm (with input scale) and route-weighted sum of per-slot rows."""
+    """Muse finalize: per-expert norm (with input scale) and route-weighted sum of per-slot rows,
+    into ``out`` (a contiguous bf16 [M, H]) when given."""
     m, topk = ids.shape
     h = y.shape[-1]
-    out = torch.empty((m, h), dtype=torch.bfloat16, device=ids.device)
+    if out is None:
+        out = torch.empty((m, h), dtype=torch.bfloat16, device=ids.device)
+    else:
+        assert out.shape == (m, h) and out.dtype == torch.bfloat16, out.shape
+        assert out.is_contiguous()
     fx, runner = muse_moe_flydsl._require_flydsl()
     runner(
         muse_moe_flydsl._cached_finalize_launch(h, topk, True, True, "bf16", 1),
@@ -138,9 +143,20 @@ def quantize_rows(x):
 
 
 def run_a4w4(
-    x, scores, ids, experts, local_start, norm_weight, eps, gain, *, quantized=None
+    x,
+    scores,
+    ids,
+    experts,
+    local_start,
+    norm_weight,
+    eps,
+    gain,
+    *,
+    quantized=None,
+    out=None,
 ):
-    """a4w4 prefill experts of this rank, finalized; ``quantized`` = (fp4, scales) replaces ``x``."""
+    """a4w4 prefill experts of this rank, finalized (into ``out`` when given); ``quantized`` =
+    (fp4, scales) replaces ``x``."""
     from aiter.fused_moe import moe_sorting
     from aiter.ops.flydsl.moe_kernels import flydsl_moe_stage1, flydsl_moe_stage2
     from aiter.utility.fp4_utils import moe_mxfp4_sort
@@ -200,5 +216,5 @@ def run_a4w4(
         return_per_slot=True,
     )
     return _finalize_per_slot(
-        y, norm_weight, scores, ids, local_start, e_local, eps, gain
+        y, norm_weight, scores, ids, local_start, e_local, eps, gain, out=out
     )

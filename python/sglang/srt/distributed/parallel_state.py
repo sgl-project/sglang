@@ -1069,7 +1069,15 @@ class GroupCoordinator:
         assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
         if outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
-            out = ca_comm.custom_all_reduce(input_)
+            if self._in_ca_pool(input_) and not getattr(
+                ca_comm, "_IS_CAPTURING", False
+            ):
+                # Produced at the pool base: the same kernel and bytes, minus the copy-in.
+                self._check_ca_pool_intact("all_reduce")
+                out = ca_comm.all_reduce(input_, registered_input=True)
+            else:
+                self._note_ca_pool_copy_in(ca_comm)
+                out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":
             assert not qr_comm.disabled
             out = qr_comm.quick_all_reduce(input_)
@@ -1225,7 +1233,12 @@ class GroupCoordinator:
                 # True CUDA graph warmup: avoid a different host collective.
                 output.zero_()
             return True
-        ca_comm.reduce_scatter(input, output, registered=False)
+        registered = self._in_ca_pool(input)
+        if registered:
+            self._check_ca_pool_intact("reduce_scatter")
+        else:
+            self._note_ca_pool_copy_in(ca_comm)
+        ca_comm.reduce_scatter(input, output, registered=registered)
         return True
 
     def _all_to_all_single(self, output: torch.Tensor, input: torch.Tensor) -> None:
@@ -1344,6 +1357,7 @@ class GroupCoordinator:
                     output.zero_()
                 return
             else:
+                self._note_ca_pool_copy_in(ca_comm)
                 ca_comm.all_gather_unreg(input, out=output, dim=0)
                 return
 
@@ -1377,6 +1391,93 @@ class GroupCoordinator:
             and hasattr(ca_comm, "all_gather_reg")
             and hasattr(ca_comm, "all_gather_unreg")
         )
+
+    def _ca_input_pool(self) -> Optional[torch.Tensor]:
+        """aiter's registered eager input pool (``ca_comm._pool["input"]``) as a uint8 tensor
+        (cached), or None when the communicator does not expose one."""
+        pool = getattr(self, "_ca_pool_tensor", False)
+        if pool is not False:
+            return pool
+        pool = None
+        try:
+            buf = self.ca_comm._pool["input"]
+            if not buf.uncached:
+                pool = buf._buffer
+                if pool is None:  # raw hipMalloc pool: a non-owning view of it
+                    iface = {
+                        "shape": (buf.max_size,),
+                        "typestr": "|u1",
+                        "data": (buf.data_ptr, False),
+                        "version": 3,
+                    }
+                    holder = type("_Pool", (), {"__cuda_array_interface__": iface})()
+                    pool = torch.as_tensor(holder, device=self.device)
+                if pool.data_ptr() != buf.data_ptr or pool.numel() < buf.max_size:
+                    pool = None
+        except Exception:  # another communicator layout: keep the copy-in
+            pool = None
+        self._ca_pool_tensor = pool
+        return pool
+
+    def ca_input_buffer(self, shape, dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """An uninitialized tensor at the base of aiter's registered eager input pool, or
+        None (allocate normally).
+
+        For a producer whose output feeds exactly the next eager all_reduce or
+        reduce_scatter_tensor of this group and is dead after it: that collective then
+        reads the pool in place instead of copying its input there. Only handed out when
+        that all_reduce takes aiter's out-of-place custom all-reduce, so the reduced
+        result never stays in the pool.
+        """
+        ca_comm = self.ca_comm
+        if (
+            not is_hip()
+            or self.world_size == 1
+            or ca_comm is None
+            or getattr(ca_comm, "disabled", True)
+            or getattr(ca_comm, "_IS_CAPTURING", False)
+            or torch.cuda.is_current_stream_capturing()
+        ):
+            return None
+        pool = self._ca_input_pool()
+        if pool is None:
+            return None
+        nbytes = dtype.itemsize
+        for dim in shape:
+            nbytes *= int(dim)
+        if nbytes == 0 or nbytes % 16 or nbytes > pool.numel():
+            return None
+        buffer = pool[:nbytes].view(dtype).view(*shape)
+        if self._resolve_outplace_all_reduce_method(buffer) != "ca":
+            return None
+        self._ca_pool_overwritten = False
+        return buffer
+
+    def _in_ca_pool(self, t: torch.Tensor) -> bool:
+        """Eager input at the registered pool base, written there through ca_input_buffer."""
+        pool = getattr(self, "_ca_pool_tensor", None)
+        return (
+            pool is not None
+            and t.data_ptr() == pool.data_ptr()
+            and t.numel() * t.element_size() <= pool.numel()
+            and not torch.cuda.is_current_stream_capturing()
+        )
+
+    def _note_ca_pool_copy_in(self, ca_comm) -> None:
+        """An eager aiter collective is about to copy its input over the pool base."""
+        if getattr(self, "_ca_pool_tensor", None) is not None and not getattr(
+            ca_comm, "_IS_CAPTURING", False
+        ):
+            self._ca_pool_overwritten = True
+
+    def _check_ca_pool_intact(self, op: str) -> None:
+        """A ca_input_buffer tensor must feed the next eager collective of this group: no
+        copy-in may have overwritten the pool base since it was handed out."""
+        if getattr(self, "_ca_pool_overwritten", False):
+            raise RuntimeError(
+                f"{op} on a ca_input_buffer tensor after another eager collective of "
+                f"group {self.unique_name!r} copied its input over the registered pool base"
+            )
 
     @staticmethod
     def _deterministic_collectives_enabled() -> bool:
