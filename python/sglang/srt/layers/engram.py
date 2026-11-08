@@ -1580,7 +1580,14 @@ def engram_gate(
     )
     dot = (h * weight * key).sum(-1) * rstd * dim**-0.5
     # Signed square root before the sigmoid, matching the training kernel.
-    gate = torch.sigmoid(torch.copysign(dot.abs().clamp_min(clamp_value).sqrt(), dot))
+    magnitude = dot.abs().clamp_min(clamp_value).sqrt()
+    if dot.device.type == "npu":
+        # copysign can fall back to CPU during NPU graph capture. Read the
+        # FP32 sign bit through an integer view to preserve negative zero.
+        signed_root = torch.where(dot.view(torch.int32) < 0, -magnitude, magnitude)
+    else:
+        signed_root = torch.copysign(magnitude, dot)
+    gate = torch.sigmoid(signed_root)
     out = (residual + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(x.dtype)
     if input_ids is not None:
         out = torch.where((input_ids == image_token_id)[:, None, None], x, out)
