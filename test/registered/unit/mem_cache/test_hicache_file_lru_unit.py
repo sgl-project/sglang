@@ -669,6 +669,7 @@ class TestDcpStorage(unittest.TestCase):
         backend.register_mem_host_pool_v2(
             SimpleNamespace(
                 page_size=1,
+                logical_page_size=1,
                 data=data,
                 get_data_page=lambda index, flat=False: data[index].clone(),
                 get_dummy_flat_data_page=lambda: torch.empty(2, dtype=torch.uint8),

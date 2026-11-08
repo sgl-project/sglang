@@ -367,6 +367,7 @@ class TestMooncakeStoreReadPathWrapping(unittest.TestCase):
         get_store = _make_mooncake_store(get_binding)
         host_pool = SimpleNamespace(
             page_size=1,
+            logical_page_size=1,
             get_page_buffer_meta=lambda hi: ([0x1, 0x2], [4096, 4096]),
         )
         get_store.registered_pools = {PoolName.KV: host_pool}

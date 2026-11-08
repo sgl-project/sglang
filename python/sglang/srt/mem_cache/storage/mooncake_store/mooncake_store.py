@@ -24,7 +24,6 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransferResult,
     SidecarPoolSpec,
     disabled_l3_layout,
-    l3_page_span,
 )
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import DevicePoolEntry
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
@@ -949,7 +948,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             suffixes, _, _ = self._batch_preprocess(
                 [""],
                 torch.arange(
-                    l3_page_span(self.mem_pool_host), dtype=torch.int64, device="cpu"
+                    self.mem_pool_host.logical_page_size,
+                    dtype=torch.int64,
+                    device="cpu",
                 ),
             )
             pools.append(
@@ -1254,7 +1255,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             keys = transfer.keys
             if host_pool is None:
                 raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
-            page_size = l3_page_span(host_pool)
+            page_size = host_pool.logical_page_size
             host_indices = transfer.host_indices
             assert len(keys) > 0
             assert len(keys) == len(host_indices) // page_size
@@ -1364,7 +1365,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if len(missing_pages) * key_multiplier < len(key_strs):
                 # Metadata generation consumes CPU indices anyway, so select
                 # the logical pages there rather than uploading a new index.
-                page_size = l3_page_span(host_pool)
+                page_size = host_pool.logical_page_size
                 host_indices = host_indices.detach().to(device="cpu")
                 host_indices = host_indices.reshape(-1, page_size)[
                     missing_pages
@@ -1473,12 +1474,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
-        page_size = (
-            self.storage_config.logical_page_size
-            if self.dcp_size > 1
-            else self.mem_pool_host.page_size
-        )
-        assert len(keys) == len(host_indices) // page_size
+        assert len(keys) == len(host_indices) // self.mem_pool_host.logical_page_size
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
