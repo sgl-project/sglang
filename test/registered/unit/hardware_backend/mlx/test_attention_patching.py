@@ -1205,8 +1205,6 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=None,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
@@ -1230,6 +1228,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
                 hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             ),
             abort_request=lambda req: None,
+            still_in_batch=lambda req: True,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is
@@ -1247,6 +1246,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
+            exit_via=None,
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None
             ),
