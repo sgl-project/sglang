@@ -200,7 +200,7 @@ GLM_5_3_PCP_EPLB_PD_SEP_DECODE_ARGS = [
     "--ep-num-redundant-experts",
     32,
     "--eplb-rebalance-num-iterations",
-    4000,
+    100000,
     "--expert-distribution-recorder-buffer-size",
     1000,
 ]
