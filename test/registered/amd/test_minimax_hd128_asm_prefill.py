@@ -7,9 +7,29 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+class _Pool:
+    def __init__(self, k_cache, v_cache):
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
+
+    def get_kv_buffer(self, _layer_id):
+        return self.k_cache, self.v_cache
+
+    def get_key_buffer(self, _layer_id):
+        return self.k_cache
+
+    def get_value_buffer(self, _layer_id):
+        return self.v_cache
 
 
 @unittest.skipUnless(torch.version.hip, "ROCm ASM prefill")
