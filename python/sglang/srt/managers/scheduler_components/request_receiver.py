@@ -102,6 +102,14 @@ class SchedulerRequestReceiver:
         """
         return self._recv_requests(local_reqs)
 
+    def broadcast_local_requests(self, local_reqs: List[AbortReq]) -> List[AbortReq]:
+        """Broadcast scheduler-generated aborts without reading external input."""
+        parallel = get_parallel()
+        recv_reqs = (
+            [] if parallel.attn_tp_rank == 0 and parallel.attn_cp_rank == 0 else None
+        )
+        return self._broadcast_reqs_across_ranks(recv_reqs, local_reqs)
+
     def _recv_requests(self, local_reqs: Optional[List[AbortReq]]) -> List:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()

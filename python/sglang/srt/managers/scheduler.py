@@ -1393,6 +1393,7 @@ class Scheduler(
         self._pd_role_switch_unhealthy = False
         # Set by the ShutdownReq handler to break the event loop for graceful shutdown.
         self.gracefully_exit = False
+        self._event_loop_driver: Optional[str] = None
         self.waiting_queue = IndexedReqList(ListKind.WAITING, abort=self._abort_waiting)
         # The running decoding batch for continuous batching
         self.running_batch: ScheduleBatch = ScheduleBatch(reqs=[], batch_is_full=False)
@@ -2075,6 +2076,10 @@ class Scheduler(
 
         The event loop blocks until shutdown.
         """
+        if self._event_loop_driver == "single_iteration":
+            raise RuntimeError("A single-step scheduler cannot enter the event loop")
+        self._event_loop_driver = "continuous"
+
         # Engine init (graph capture, warmups) is done; from here on any
         # Triton kernel device-load is a lazy first-use at serving time.
         triton_load_watch.install()
@@ -2087,6 +2092,12 @@ class Scheduler(
             dispatch_event_loop(self)
             return
 
+        self._prepare_schedule_stream()
+        with self.device_module.StreamContext(self.schedule_stream):
+            self.metrics_reporter.start_scheduler_time_accounting()
+            dispatch_event_loop(self)
+
+    def _prepare_schedule_stream(self) -> None:
         if self.device == "cpu":
             self.schedule_stream.synchronize = lambda: None  # No-op for CPU
         elif (is_cuda() or _is_hip) and (
@@ -2103,9 +2114,59 @@ class Scheduler(
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_war_barrier_enabled()
+
+    @DynamicGradMode()
+    def run_one_iteration(self) -> None:
+        """Advance an in-process scheduler once without receiving external input.
+
+        The caller can pass requests to ``process_input_requests`` inside the
+        ``schedule_stream`` context, and must call this method in the same order
+        on every TP rank. An overlap iteration can leave a forward in flight;
+        returning does not synchronize the GPU or drain pending results.
+        A paused scheduler does not schedule a batch, and a shut-down scheduler
+        does not advance. This driver cannot be mixed with ``run_event_loop``.
+        """
+        if self._event_loop_driver == "continuous":
+            raise RuntimeError("An event-loop scheduler cannot be stepped")
+        if self.gracefully_exit:
+            return
+        if self._event_loop_driver is None:
+            self._init_single_iteration()
+
+        with self.device_module.StreamContext(self.schedule_stream):
+            self.increment_scheduler_iterations()
+            self.ingest_requests(receive_external_requests=False)
+            if self.enable_overlap:
+                self._event_loop_overlap_iteration()
+            else:
+                self._event_loop_normal_iteration()
+
+    def _init_single_iteration(self) -> None:
+        if (
+            get_parallel().pp_size > 1
+            or self.disaggregation_mode != DisaggregationMode.NULL
+            or self.server_args.enable_pd_role_switch
+            or self.enable_overlap_mlx
+            or use_mlx()
+        ):
+            raise NotImplementedError(
+                "Single-iteration scheduling does not support PP, PD, or MLX"
+            )
+
+        previous_stream = self.schedule_stream
+        self._prepare_schedule_stream()
+        if self.schedule_stream is not previous_stream:
+            # Requests may have been injected on the original stream before
+            # the first step made it distinct from the forward stream.
+            self.schedule_stream.wait_stream(previous_stream)
+        self.enable_continuous_input_polling = False
+        self.enable_skip_finishing_decode = self.enable_overlap
+        if self.enable_overlap:
+            self.result_queue = deque()
         with self.device_module.StreamContext(self.schedule_stream):
             self.metrics_reporter.start_scheduler_time_accounting()
-            dispatch_event_loop(self)
+        # The in-process driver does not install process-global Triton hooks.
+        self._event_loop_driver = "single_iteration"
 
     def _apply_war_barrier(self):
         # WAR: keep later schedule_stream writes behind this forward's shared reads.
@@ -2134,30 +2195,33 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
+            self._event_loop_normal_iteration()
 
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
+    def _event_loop_normal_iteration(self) -> None:
+        if self._engine_paused:
+            self._record_scheduler_state_for_paused_engine()
+            return
 
-            # Launch the current batch
-            if batch:
-                result = self.run_batch(batch)
-                self.process_batch_result(batch, result)
-            else:
-                # When the server is idle, do self-check and re-init some states.
-                self._sched_idled = True
-                self.on_idle()
+        # Get the next batch to run
+        plan = self.get_next_batch_to_run(
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+        self.cur_batch_for_debug = batch
 
-            # Update last_batch
-            self.last_batch = batch
-            self.invariant_checker.run(CheckPhase.BUSY, batch)
+        # Launch the current batch
+        if batch:
+            result = self.run_batch(batch)
+            self.process_batch_result(batch, result)
+        else:
+            # When the server is idle, do self-check and re-init some states.
+            self._sched_idled = True
+            self.on_idle()
+
+        # Update last_batch
+        self.last_batch = batch
+        self.invariant_checker.run(CheckPhase.BUSY, batch)
 
     @DynamicGradMode()
     def event_loop_overlap(self):
@@ -2167,11 +2231,6 @@ class Scheduler(
             Tuple[ScheduleBatch, Union[GenerationBatchResult, EmbeddingBatchResult]]
         ] = deque()
 
-        def pop_and_process():
-            # Process the results of the last batch
-            tmp_batch, tmp_result = self.result_queue.popleft()
-            self.process_batch_result(tmp_batch, tmp_result)
-
         while True:
             if self.gracefully_exit:
                 break
@@ -2179,59 +2238,61 @@ class Scheduler(
 
             # Receive requests
             self.ingest_requests()
-            if self._engine_paused:
-                self._record_scheduler_state_for_paused_engine()
-                continue
+            self._event_loop_overlap_iteration()
 
-            process_last_batch_early = self.should_process_last_batch_early(
-                self.last_batch
-            )
-            if process_last_batch_early:
-                pop_and_process()
-                # Opportunistic flush at the early-processing sync boundary:
-                # forward_stream is idle (prev forward drained, next not launched),
-                # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
-                if self.enable_unified_memory:
-                    try:
-                        self.token_to_kv_pool_allocator.flush_opportunistic()
-                    except Exception:
-                        pass
+    def _event_loop_overlap_iteration(self) -> None:
+        if self._engine_paused:
+            self._record_scheduler_state_for_paused_engine()
+            return
 
-            # Get the next batch to run
-            plan = self.get_next_batch_to_run(
-                running_batch=self.running_batch, last_batch=self.last_batch
-            )
-            self.running_batch = plan.running_batch
-            batch = plan.batch_to_run
-            self.cur_batch_for_debug = batch
+        process_last_batch_early = self.should_process_last_batch_early(self.last_batch)
+        if process_last_batch_early:
+            self._process_last_batch_result()
+            # Opportunistic flush at the early-processing sync boundary:
+            # forward_stream is idle (prev forward drained, next not launched),
+            # so `_flush`'s non-urgent guard compacts freely. Sync-free, best-effort.
+            if self.enable_unified_memory:
+                try:
+                    self.token_to_kv_pool_allocator.flush_opportunistic()
+                except Exception:
+                    pass
 
-            # Launch the current batch
-            if batch:
-                batch_result = self.run_batch(batch)
-                # Fence result processing behind this forward's shared reads.
-                self._apply_war_barrier()
-                self.result_queue.append((batch.copy(), batch_result))
-            else:
-                batch_result = None
-                self._sched_idled = True
+        # Get the next batch to run
+        plan = self.get_next_batch_to_run(
+            running_batch=self.running_batch, last_batch=self.last_batch
+        )
+        self.running_batch = plan.running_batch
+        batch = plan.batch_to_run
+        self.cur_batch_for_debug = batch
 
-            # Process the last batch
-            if self.last_batch:
-                if not process_last_batch_early:
-                    pop_and_process()
-            elif batch is None:
-                # When the server is idle, do self-check and re-init some states
-                self.on_idle()
+        # Launch the current batch
+        if batch:
+            batch_result = self.run_batch(batch)
+            # Fence result processing behind this forward's shared reads.
+            self._apply_war_barrier()
+            self.result_queue.append((batch.copy(), batch_result))
+        else:
+            batch_result = None
+            self._sched_idled = True
 
-            # Run sample of the current batch
-            # It depends on the result of the last batch (e.g., grammar), so we run it after the last batch is processed.
-            if self.is_generation:
-                self.launch_batch_sample_if_needed(batch_result, batch)
+        # Process the last batch
+        if self.last_batch:
+            if not process_last_batch_early:
+                self._process_last_batch_result()
+        elif batch is None:
+            # When the server is idle, do self-check and re-init some states
+            self.on_idle()
 
-            # Update last_batch
-            self.last_batch = batch
+        # The current sample depends on the last result (e.g., grammar).
+        if self.is_generation:
+            self.launch_batch_sample_if_needed(batch_result, batch)
 
-            self.invariant_checker.run(CheckPhase.BUSY, batch)
+        self.last_batch = batch
+        self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+    def _process_last_batch_result(self) -> None:
+        batch, result = self.result_queue.popleft()
+        self.process_batch_result(batch, result)
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
@@ -2264,12 +2325,17 @@ class Scheduler(
         for prev_batch, prev_result in self.result_queue:
             self.batch_result_processor.advance_grammar_fsm(prev_result, prev_batch)
 
-    def ingest_requests(self, stop_at_pause: bool = False) -> List:
+    def ingest_requests(
+        self, stop_at_pause: bool = False, *, receive_external_requests: bool = True
+    ) -> List:
         """Receive and broadcast input, then dispatch queued requests in order.
 
         With stop_at_pause, retain the first pause and all following inputs
         until the caller reaches a scheduling boundary. Receiving and broadcasting
         continue each pass; all ranks retain the same suffix.
+
+        Without external input, internal timeout aborts still have to be
+        broadcast to every rank before they are dispatched.
 
         The one place a new per-iteration input source belongs; the return
         value, held requests included, exists for the pipeline stages that
@@ -2289,7 +2355,10 @@ class Scheduler(
         ):
             local_reqs = self._poll_timeout_aborts()
         recv_start_ns = time.monotonic_ns()
-        received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        if receive_external_requests:
+            received_reqs = self.request_receiver.recv_requests(local_reqs=local_reqs)
+        else:
+            received_reqs = self.request_receiver.broadcast_local_requests(local_reqs)
         self._deferred_input_requests.extend(received_reqs)
 
         num_requests_to_process = len(self._deferred_input_requests)
