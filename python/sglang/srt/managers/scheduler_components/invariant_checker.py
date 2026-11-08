@@ -564,6 +564,18 @@ class SchedulerInvariantChecker:
 
         return has_leak, messages
 
+    def check_admitted(self, reqs: Iterable[Req]) -> None:
+        """At admission from the waiting queue: no older step still carries the
+        request. A request never re-enters the batch while one does, which is what
+        lets `Scheduler.still_in_batch` look at the batch lists alone. Gated like
+        the request-list check."""
+        if not envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
+            return
+        self._raise_if_any(
+            {req for req in reqs if req.inflight_steps != 0},
+            "Requests admitted while an older step still carries them",
+        )
+
     def _check_request_lists(self, batch: ScheduleBatch) -> None:
         """At the launch of `batch`: each live request is in exactly one list,
         one that matches its state."""
@@ -672,4 +684,5 @@ def create_scheduler_watchdog(
         watchdog_timeout=watchdog_timeout,
         soft=soft,
         dump_info=dump_info,
+        before_crash=scheduler.dump_requests_before_crash,
     )
