@@ -507,6 +507,10 @@ class GenerateReqInput:
             elif isinstance(self.input_ids[0], int):
                 self.is_single = True
                 self.batch_size = 1
+            elif [] in self.input_ids:
+                raise ValueError(
+                    "input_ids cannot be empty for any prompt in the batch."
+                )
             else:
                 self.is_single = False
                 self.batch_size = len(self.input_ids)

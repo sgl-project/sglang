@@ -1324,6 +1324,22 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             )
             req.normalize_batch_and_arguments()
 
+        # Test when input_ids list is empty
+        with self.assertRaises(ValueError) as cm:
+            req = GenerateReqInput(input_ids=[], sampling_params={"temperature": 0.7})
+            req.normalize_batch_and_arguments()
+        self.assertEqual(str(cm.exception), "input_ids cannot be empty.")
+
+        # Test when input_ids list has empty list element
+        with self.assertRaises(ValueError) as cm:
+            req = GenerateReqInput(
+                input_ids=[[1, 2, 3], []], sampling_params={"temperature": 0.7}
+            )
+            req.normalize_batch_and_arguments()
+        self.assertEqual(
+            str(cm.exception), "input_ids cannot be empty for any prompt in the batch."
+        )
+
     def test_data_parallel_rank_alias_maps_to_routed_dp_rank(self):
         req = GenerateReqInput(text="Hello", sampling_params={}, data_parallel_rank=2)
         req.normalize_batch_and_arguments()
