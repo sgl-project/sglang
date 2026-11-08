@@ -72,10 +72,6 @@ class TestGluonAvailability(CustomTestCase):
 
     def setUp(self):
         mod._gluon_fn.cache_clear()
-        # gfx1250 turns this kernel off; test_aiter_mla_gluon_paged_gate.py covers that.
-        patcher = mock.patch.object(mod, "is_gfx1250_supported", return_value=False)
-        patcher.start()
-        self.addCleanup(patcher.stop)
 
     def tearDown(self):
         mod._gluon_fn.cache_clear()
@@ -237,7 +233,6 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
         from sglang.srt.layers.attention.aiter_backend import AiterAttnBackend
 
         be = AiterAttnBackend.__new__(AiterAttnBackend)
-        be.paged_gluon_mla_decode = None
         be.num_head = 12
         be.kv_cache_dtype = fp8_dtype
         be.head_pad_mode = "zero"
@@ -259,6 +254,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            triton_mla_block_tables=None,
         )
         be.token_to_kv_pool = mock.Mock(
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)

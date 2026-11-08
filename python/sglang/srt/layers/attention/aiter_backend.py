@@ -45,7 +45,11 @@ from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
 )
-from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx1250_supported,
+    print_info_once,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -92,10 +96,15 @@ from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, scaled_fp8_qua
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.aiter_mla_gluon import (
-    PagedGluonMlaDecode,
     log_mla_gluon_capability,
     mla_gluon_decode,
     prefer_mla_gluon_decode,
+)
+from sglang.srt.layers.attention.aiter_triton_mla import (
+    aiter_triton_mla_decode,
+    supports_aiter_triton_mla_decode,
+    triton_mla_block_size,
+    triton_mla_block_tables,
 )
 from sglang.srt.layers.attention.aiter_utils import (
     forward_decode_vectorized_5d,
@@ -262,6 +271,10 @@ class ForwardMetadata:
     cprr_empty_rows: Optional[torch.Tensor] = None
     # paged_attention_ragged grid size; None means max_num_partitions.
     decode_num_partitions: Optional[int] = None
+    # gfx1250 aiter Triton MLA decode; None: MLA decode takes the ASM /
+    # gfx950 mla_gluon dispatch.
+    triton_mla_block_tables: Optional[torch.Tensor] = None
+    triton_mla_seqused_k: Optional[torch.Tensor] = None
 
 
 def _build_paged_kv_view(
@@ -582,7 +595,7 @@ class AiterAttnBackend(AttentionBackend):
             self.swa_kv_pool is not None
             and self.swa_kv_pool.layer_router.routes_to(IdSpaceKind.SLIDING_WINDOW)
         )
-        self.paged_gluon_mla_decode: Optional[PagedGluonMlaDecode] = None
+        self.use_aiter_triton_mla_decode = False
 
         # Detect SHUFFLE 5D ("vectorized") KV cache layout. When active
         # we (a) skip the launch_reshape_and_cache_flash shortcut and always go
@@ -749,12 +762,24 @@ class AiterAttnBackend(AttentionBackend):
                 _use_mla_ps_kernel = False
                 fast_mode = False
                 intra_batch_mode = False
-            # Must run before use_any_mla_persist: it may turn the PS kernel off.
             if is_gfx1250_supported():
-                self.paged_gluon_mla_decode = self._create_paged_gluon_mla_decode(
-                    kv_lora_rank=model_runner.model_config.kv_lora_rank,
+                self.use_aiter_triton_mla_decode = supports_aiter_triton_mla_decode(
+                    input_dtype=self.input_dtype,
+                    dcp_world_size=self.dcp_world_size,
                     qk_rope_head_dim=model_runner.model_config.qk_rope_head_dim,
                 )
+                logger.info(
+                    "aiter gfx1250 Triton MLA decode is %s",
+                    (
+                        f"enabled (page size {self.page_size}, kernel block "
+                        f"size {triton_mla_block_size(self.page_size)})"
+                        if self.use_aiter_triton_mla_decode
+                        else "disabled (needs bf16 activations, no DCP, "
+                        "qk_rope_head_dim > 0)"
+                    ),
+                )
+            # gfx1250 does not use mla_gluon (_gluon_fn), so the gfx950 PS switch
+            # and capability log below are skipped there.
             elif self.head_pad_mode == "zero" and self.kv_cache_dtype == fp8_dtype:
                 # Disable ps only when gluon kernel is selected to avoid falling
                 # back to incorrect aiter kernel
@@ -865,24 +890,30 @@ class AiterAttnBackend(AttentionBackend):
         )
         return q_fp8.view(q.shape), self.q_scale
 
-    def _create_paged_gluon_mla_decode(
-        self, *, kv_lora_rank: int, qk_rope_head_dim: int
-    ) -> Optional[PagedGluonMlaDecode]:
-        """gfx1250 paged Gluon MLA decode, or None when it does not fit.
+    def _uses_aiter_triton_mla_decode(
+        self, forward_mode: ForwardMode, spec_info: Optional[SpecInput]
+    ) -> bool:
+        """Per batch: single-token, non-speculative decode when
+        use_aiter_triton_mla_decode holds (gfx1250); other batches take the
+        existing MLA decode dispatch.
 
-        When created it turns the PS kernel off: aiter ships no persistent-scheduling
-        MLA ASM kernel for gfx1250, and the paged kernel serves decode only, so
-        verify and draft extend run the non-persist ASM decode.
+        Draft decode is DECODE with spec_info. Its KV is one row per topk branch
+        and the length includes the draft step, which a per-request page table
+        and seq_lens cannot describe.
         """
-        global _use_mla_ps_kernel, fast_mode, intra_batch_mode
-        paged = PagedGluonMlaDecode.create(
-            self, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim
+        if (
+            self.use_aiter_triton_mla_decode
+            and spec_info is not None
+            and forward_mode.is_decode()
+        ):
+            print_info_once(
+                "aiter gfx1250: draft decode batches skip the aiter Triton MLA decode"
+            )
+        return (
+            self.use_aiter_triton_mla_decode
+            and spec_info is None
+            and forward_mode.is_decode()
         )
-        if paged is not None:
-            _use_mla_ps_kernel = False
-            fast_mode = False
-            intra_batch_mode = False
-        return paged
 
     def _use_mla_decode_persist_metadata(self) -> bool:
         """Persist MLA metadata for non-DCP PS decode, or DCP ASM decode.
@@ -1692,17 +1723,30 @@ class AiterAttnBackend(AttentionBackend):
         k_buffer = self.kv_layers.read(layer.layer_id).key()
         q = q.view(-1, layer.tp_q_head_num, layer.qk_head_dim)
 
-        paged = self.paged_gluon_mla_decode
-        if paged is not None and paged.accepts(forward_batch=forward_batch):
+        fm = self.forward_metadata
+        # aiter's Triton mla_decode_fwd has no soft-cap argument, so a capped
+        # layer would silently drop it. The ASM mla_decode_fwd asserts on one.
+        if fm.triton_mla_block_tables is not None and layer.logit_cap:
+            print_info_once(
+                "aiter gfx1250: MLA layers with logit_cap="
+                f"{layer.logit_cap} skip the aiter Triton MLA decode"
+            )
+        if fm.triton_mla_block_tables is not None and not layer.logit_cap:
             o = q.new_empty(
                 (q.shape[0], layer.tp_q_head_num, layer.v_head_dim),
                 dtype=self.input_dtype,
             )
-            paged.forward(
+            aiter_triton_mla_decode(
                 q=q,
                 o=o,
-                layer=layer,
-                forward_batch=forward_batch,
+                kv_buffer=k_buffer,
+                block_tables=fm.triton_mla_block_tables,
+                seqused_k=fm.triton_mla_seqused_k,
+                cu_seqlens_q=fm.qo_indptr,
+                page_size=self.page_size,
+                kv_lora_rank=layer.v_head_dim,
+                qk_rope_head_dim=layer.qk_head_dim - layer.v_head_dim,
+                sm_scale=layer.scaling,
                 kv_descale=k_descale,
             )
             return o
@@ -2261,6 +2305,7 @@ class AiterAttnBackend(AttentionBackend):
         global_kv_indptr = None
         use_asm_cprr_verify = False
         cprr_kv_indices = cprr_kv_indptr = cprr_empty_rows = None
+        triton_mla_tables = triton_mla_seqused_k = None
         if forward_batch.forward_mode.is_decode_or_idle():
             if spec_info is None or forward_batch.forward_mode.is_idle():
                 kv_indptr[1 : bs + 1] = torch.cumsum(forward_batch.seq_lens, dim=0)
@@ -2345,7 +2390,21 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if self._uses_aiter_triton_mla_decode(
+                    forward_batch.forward_mode, spec_info
+                ):
+                    triton_mla_tables = triton_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=forward_batch.req_pool_indices[:bs],
+                        max_kv_len=(
+                            self.req_to_token.shape[1]
+                            if max_kv_len is None
+                            else max_kv_len
+                        ),
+                        page_size=self.page_size,
+                    )
+                    triton_mla_seqused_k = forward_batch.seq_lens[:bs].to(torch.int32)
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -2403,6 +2462,8 @@ class AiterAttnBackend(AttentionBackend):
                     if spec_info is None
                     else None
                 ),
+                triton_mla_block_tables=triton_mla_tables,
+                triton_mla_seqused_k=triton_mla_seqused_k,
             )
 
         elif forward_batch.forward_mode.is_draft_extend_v2():
@@ -3045,6 +3106,22 @@ class AiterAttnBackend(AttentionBackend):
                 device=self.device,
             )
 
+        if self.use_aiter_triton_mla_decode:
+            self.cuda_graph_triton_mla_block_tables = torch.zeros(
+                (
+                    max_bs,
+                    triton.cdiv(
+                        self.req_to_token.shape[1],
+                        triton_mla_block_size(self.page_size),
+                    ),
+                ),
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self.cuda_graph_triton_mla_seqused_k = torch.zeros(
+                (max_bs,), dtype=torch.int32, device=self.device
+            )
+
         if not self.skip_prefill:
             self.cuda_graph_custom_mask = torch.zeros(
                 (max_num_tokens * self.max_context_len),
@@ -3164,6 +3241,7 @@ class AiterAttnBackend(AttentionBackend):
         use_asm_cprr_verify = False
 
         swa_page_table = None
+        triton_mla_tables = triton_mla_seqused_k = None
         # Unified verify never reads this host max (replay sizes from
         # max_context_len); torch.max(seq_lens).item() would sync every replay.
         max_kv_len = (
@@ -3269,7 +3347,19 @@ class AiterAttnBackend(AttentionBackend):
                 kv_last_page_len = self.cuda_graph_kv_last_page_len[:bs]
                 max_q_len = 1
 
-                if self._use_mla_decode_persist_metadata():
+                if self._uses_aiter_triton_mla_decode(forward_mode, spec_info):
+                    # Columns past max_kv_len keep stale ids the kernel never reads.
+                    triton_mla_tables = self.cuda_graph_triton_mla_block_tables[:bs]
+                    tables = triton_mla_block_tables(
+                        req_to_token=self.req_to_token,
+                        req_pool_indices=req_pool_indices[:bs],
+                        max_kv_len=max_kv_len,
+                        page_size=self.page_size,
+                    )
+                    triton_mla_tables[:, : tables.shape[1]].copy_(tables)
+                    triton_mla_seqused_k = self.cuda_graph_triton_mla_seqused_k[:bs]
+                    triton_mla_seqused_k.copy_(seq_lens[:bs])
+                elif self._use_mla_decode_persist_metadata():
                     metadata_fast_mode, metadata_intra_batch_mode = (
                         self._mla_decode_metadata_modes()
                     )
@@ -3315,6 +3405,8 @@ class AiterAttnBackend(AttentionBackend):
                 num_kv_splits=num_kv_splits,
                 swa_page_table=swa_page_table,
                 # num_kv_splits_indptr=num_kv_splits_indptr,
+                triton_mla_block_tables=triton_mla_tables,
+                triton_mla_seqused_k=triton_mla_seqused_k,
             )
 
         elif forward_mode.is_target_verify():
