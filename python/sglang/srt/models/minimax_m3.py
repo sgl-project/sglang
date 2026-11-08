@@ -2187,7 +2187,9 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
         loaded_params: Set[str] = set()
         # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
         remap_llm_compressor_experts = (
-            self.quant_config is not None and self.quant_config.get_name() == "quark"
+            _is_hip
+            and self.quant_config is not None
+            and self.quant_config.get_name() == "quark"
         )
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
@@ -2229,7 +2231,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                 name = name.replace(weight_name, param_name)
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                name = mxfp8_linear_scale_alias(name, params_dict)
+                if _is_hip:
+                    name = mxfp8_linear_scale_alias(name, params_dict)
                 if name not in params_dict:
                     continue
 
@@ -2272,7 +2275,8 @@ class MiniMaxM3SparseForCausalLM(nn.Module):
                     if name is None:
                         continue
 
-                    name = mxfp8_linear_scale_alias(name, params_dict)
+                    if _is_hip:
+                        name = mxfp8_linear_scale_alias(name, params_dict)
                     if name in params_dict:
                         param = params_dict[name]
                         weight_loader = getattr(

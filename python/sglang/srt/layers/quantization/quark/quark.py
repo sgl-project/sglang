@@ -284,6 +284,8 @@ def _build_excluded_fp8_config(config: Dict[str, Any]) -> Optional["Fp8Config"]:
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+
 _MOE_SHARED_EXPERT_QUANT_LAYER0_BASES: tuple[str, ...] = (
     "model.layers.0",
     "model.language_model.layers.0",
@@ -455,8 +457,10 @@ class QuarkConfig(QuantizationConfig):
             return None
 
         # Quark's [1, 32] float8_e8m0fnu scales are uint8 e8m0, not fp32, so they load as MXFP8
-        use_mxfp8 = block_size == [1, 32] and "e8m0" in str(
-            weight_config.get("scale_type") or ""
+        use_mxfp8 = (
+            _is_hip
+            and block_size == [1, 32]
+            and "e8m0" in str(weight_config.get("scale_type") or "")
         )
         return Fp8Config(
             is_checkpoint_fp8_serialized=True,
@@ -589,7 +593,7 @@ class QuarkConfig(QuantizationConfig):
 
             from sglang.srt.layers.quantization.quark import mxfp8_base
 
-            if mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
+            if _is_hip and mxfp8_base.is_mxfp8_base_nvfp4_moe_source(config):
                 return mxfp8_base.QuarkMxfp8BaseConfig.from_source(config, hf_config)
 
             nvfp4_src = _detect_nvfp4_source(config)

@@ -434,7 +434,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
 
         # minimax_m3_nvfp4 reads weight_global_scale itself; remapping it inverts the scale twice
         if (
-            self.quant_config is not None
+            _is_hip
+            and self.quant_config is not None
             and self.quant_config.get_name() == "quark"
             and "mlp.experts." in name
         ):
@@ -448,7 +449,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
             new_name = name.replace(weight_name, param_name)
             if new_name.endswith(".bias") and new_name not in params_dict:
                 continue
-            new_name = mxfp8_linear_scale_alias(new_name, params_dict)
+            if _is_hip:
+                new_name = mxfp8_linear_scale_alias(new_name, params_dict)
             if new_name not in params_dict:
                 continue
             param = params_dict[new_name]
@@ -481,7 +483,8 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
         remapped = maybe_remap_kv_scale_name(name, params_dict)
         if remapped is None:
             return
-        remapped = mxfp8_linear_scale_alias(remapped, params_dict)
+        if _is_hip:
+            remapped = mxfp8_linear_scale_alias(remapped, params_dict)
         if remapped not in params_dict:
             logger.warning(f"Parameter {remapped} not found in params_dict")
             return

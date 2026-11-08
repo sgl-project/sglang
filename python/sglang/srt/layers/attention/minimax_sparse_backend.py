@@ -1487,9 +1487,10 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
                 out_quant=out_quant,
             )
         disable_value = layer.layer_id in self.disable_value_layer_ids
-        kv_cached_by_fusion = not save_kv_cache or self._is_sparse_kv_cached_by_fusion(
-            forward_batch, layer.layer_id
-        )
+        # the ROCm fused QK-norm/RoPE store already wrote K/V when it passes save_kv_cache=False
+        kv_cached_by_fusion = (
+            self.is_hip and not save_kv_cache
+        ) or self._is_sparse_kv_cached_by_fusion(forward_batch, layer.layer_id)
         if not kv_cached_by_fusion:
             self.kv_pool.set_fused_kv_index_buffer(
                 layer,
