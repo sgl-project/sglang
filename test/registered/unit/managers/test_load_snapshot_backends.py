@@ -11,6 +11,7 @@ from unittest import mock
 from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import (
     DisaggregationMetrics,
+    DispatchLoadAck,
     LoadSnapshot,
     LoRAMetrics,
     MemoryMetrics,
@@ -86,6 +87,43 @@ def _read_until(read_fn, predicate, attempts=100, interval=0.05):
     raise AssertionError(f"predicate never held; last result: {result!r}")
 
 
+class TestDispatchLoadAck(CustomTestCase):
+    def test_scheduler_publishes_receipt_with_the_same_load_snapshot(self):
+        from sglang.srt.managers.scheduler import Scheduler
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.dispatch_load_ack = DispatchLoadAck()
+        scheduler.observe_dp_dispatch_accounted(
+            SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=56897)
+        )
+        written = []
+        scheduler.load_snapshot_writer = SimpleNamespace(
+            publish_counter=0, publish_interval=1, write=written.append
+        )
+        scheduler.load_inquirer = SimpleNamespace(
+            get_loads=lambda: LoadSnapshot(dp_rank=0, num_total_tokens=57000)
+        )
+        snapshot = scheduler.publish_load_snapshot(force=True)
+        self.assertIs(snapshot, written[0])
+        self.assertEqual(snapshot.num_total_tokens, 57000)
+        self.assertEqual(
+            (snapshot.dp_dispatch_ack_seq, snapshot.dp_dispatch_ack_cum_tokens),
+            (1, 56897),
+        )
+        self.assertNotIn("dp_dispatch_ack_seq", snapshot.to_dict())
+
+    def test_out_of_order_receipts_do_not_ack_a_gap(self):
+        ack = DispatchLoadAck()
+        ack.observe(SimpleNamespace(dp_dispatch_seq=2, dp_dispatch_cum_tokens=65))
+        self.assertEqual((ack.sequence, ack.cumulative_tokens), (0, 0))
+        ack.observe(SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=40))
+        self.assertEqual((ack.sequence, ack.cumulative_tokens), (2, 65))
+        ack.observe(SimpleNamespace(dp_dispatch_seq=1, dp_dispatch_cum_tokens=40))
+        ack.observe(SimpleNamespace())
+        self.assertEqual((ack.sequence, ack.cumulative_tokens), (2, 65))
+        self.assertFalse(ack.pending)
+
+
 class TestShmRoundTrip(CustomTestCase):
     def test_single_rank_write_read(self):
         path = _temp_path()
@@ -101,11 +139,16 @@ class TestShmRoundTrip(CustomTestCase):
                     total_prefill_uncached_tokens=1000,
                     total_prefill_busy_us=250_000,
                     decode_moments=[2, 30, 3000, 500, 50_000, 60],
+                    dp_dispatch_ack_seq=3,
+                    dp_dispatch_ack_cum_tokens=56897,
                 )
             )
             load = reader.read(0)
             self.assertIsNotNone(load)
             self.assertEqual(load.num_running_reqs, 5)
+            self.assertEqual(
+                (load.dp_dispatch_ack_seq, load.dp_dispatch_ack_cum_tokens), (3, 56897)
+            )
             self.assertEqual(load.timestamp, 1.0)
             self.assertEqual(load.num_active_tokens, 4096)
             # The cumulative total_* counters round-trip like any other
