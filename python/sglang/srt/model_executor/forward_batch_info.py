@@ -589,6 +589,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     dllm_prompt_mask: Optional[torch.Tensor] = None
 
     # For extend
+    full_kv_replay: bool = False
     extend_num_tokens: Optional[int] = None
     extend_seq_lens: Optional[torch.Tensor] = None
     extend_prefix_lens: Optional[torch.Tensor] = None
@@ -1202,6 +1203,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 assert isinstance(extend_seq_lens, torch.Tensor)
                 ret.extend_seq_lens = extend_seq_lens
                 ret.extend_prefix_lens = extend_prefix_lens
+            ret.full_kv_replay = batch.full_kv_replay
             ret.extend_num_tokens = batch.extend_num_tokens
             if extend_position_info is None:
                 positions, ret.extend_start_loc = compute_position(

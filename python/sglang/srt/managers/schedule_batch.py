@@ -626,6 +626,7 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        self.full_kv_replay_node = None
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -2072,6 +2073,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # The sum of all sequence lengths
     seq_lens_sum: int = None
+    full_kv_replay: bool = False
     extend_num_tokens: Optional[int] = None
 
     # Diffusion LLM
@@ -2306,6 +2308,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             req.logprob_start_len = max(req.logprob_start_len, encoder_len)
 
     def prepare_for_extend(self):
+        self.full_kv_replay = False
         self.forward_mode = ForwardMode.EXTEND
 
         if self.is_dllm():

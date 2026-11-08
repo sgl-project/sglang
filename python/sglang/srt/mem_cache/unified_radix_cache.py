@@ -1468,6 +1468,9 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["req.rid", "checkpointed"])
     def on_release(self, req: Req, *, checkpointed: bool) -> None:
+        from sglang.srt.mem_cache.gdn_kv_reuse import release_full_kv_pin
+
+        release_full_kv_pin(self, req)
         if checkpointed:
             return
         for comp in self._components_tuple:
@@ -1649,6 +1652,9 @@ class UnifiedRadixCache(BasePrefixCache):
         # Update req fields
         req.kv.protect_prefix(len(new_indices))
         req.last_node = new_last_node
+        from sglang.srt.mem_cache.gdn_kv_reuse import release_full_kv_pin
+
+        release_full_kv_pin(self, req)
 
         # cleanup
         for comp in self._components_tuple:

@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.common import (
     available_and_evictable_str,
     evict_from_tree_cache,
 )
+from sglang.srt.mem_cache.gdn_kv_reuse import release_full_kv_pin, try_borrow_full_kv
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import attention_backends, get_parallel, get_schedule
@@ -392,7 +393,10 @@ def alloc_for_extend(
 
     # Allocate KV cache (throws exception on failure)
     alloc_page_size = _alloc_page_size(batch)
-    if reuse_kv is not None and any(reuse_kv):
+    replay_indices = try_borrow_full_kv(batch)
+    if replay_indices is not None:
+        out_cache_loc = replay_indices
+    elif reuse_kv is not None and any(reuse_kv):
         out_cache_loc = _alloc_extend_loc_with_kv_reuse(
             batch,
             reuse_kv,
@@ -522,9 +526,15 @@ def alloc_for_extend(
             target_seq_lens_cpu=batch.seq_lens_cpu,
         )
     except Exception:
-        if is_cp_sharded_padded():
-            out_cache_loc = physical_out_cache_loc
-        storage.free_tokens(out_cache_loc)
+        if replay_indices is not None:
+            req = batch.reqs[0]
+            req.kv.protect_prefix(batch.prefix_lens[0])
+            release_full_kv_pin(batch.tree_cache, req)
+            batch.full_kv_replay = False
+        else:
+            if is_cp_sharded_padded():
+                out_cache_loc = physical_out_cache_loc
+            storage.free_tokens(out_cache_loc)
         raise
 
     # DSV4-NPU hook: no-op on non-DSV4 paths.

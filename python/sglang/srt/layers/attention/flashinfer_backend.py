@@ -1170,6 +1170,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 use_ragged = (
                     not self.enable_deterministic
+                    and not forward_batch.full_kv_replay
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
                 )
