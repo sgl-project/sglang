@@ -181,6 +181,31 @@ class TestHierarchyBlockRun(unittest.TestCase):
         self.assertEqual(batch.input_ids[1].item(), MASK)
         self.assertEqual(next_ids[0].tolist(), targets[0][3:8])
 
+    def test_exact_logit_ties_pick_the_first_token(self):
+        """Logits carry bf16 precision, so the top two can be exactly equal. The
+        reference takes argmax (the first index), and topk orders ties the other way."""
+
+        class TiedRunner(_OracleRunner):
+            def forward(self, forward_batch, pp_proxy_tensors=None):
+                self.forwards.append(
+                    (self.model.causal, forward_batch.input_ids.clone())
+                )
+                logits = torch.zeros(forward_batch.input_ids.numel(), VOCAB)
+                logits[:, 10] = HIGH
+                logits[:, 60] = HIGH
+                return SimpleNamespace(
+                    logits_output=SimpleNamespace(full_logits=logits),
+                    can_run_graph=False,
+                )
+
+        runner = TiedRunner([[0] * 9], HIGH)
+        batch = _batch([[MASK] * 8])
+
+        _, next_ids, _, states, _ = _algorithm().run(runner, batch, [10])
+
+        self.assertEqual(next_ids[0].tolist(), [10] * 8)
+        self.assertEqual(states, [10])
+
     def test_predicted_mask_token_is_never_emitted(self):
         """A model whose top prediction is the mask token must not stall a step
         or leave a mask token in the output."""
