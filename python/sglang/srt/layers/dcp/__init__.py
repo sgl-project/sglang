@@ -39,6 +39,9 @@ from sglang.srt.layers.dcp.comm import (
     cp_lse_ag_out_rs_mha,
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
+    dcp_push_combine_fits,
+    dcp_push_combine_reduce,
+    init_dcp_push_combine,
     init_fi_a2a_workspace,
 )
 from sglang.srt.layers.dcp.layout import (
@@ -61,6 +64,9 @@ __all__ = [
     "DcpA2aChunkPlanner",
     "DecodeContextParallelMetadata",
     "dcp_a2a_lse_reduce",
+    "dcp_push_combine_fits",
+    "dcp_push_combine_reduce",
+    "init_dcp_push_combine",
     "init_fi_a2a_workspace",
     "all_gather_kv_cache_for_dcp",
     "all_gather_kv_cache_for_mha_chunk_extend",

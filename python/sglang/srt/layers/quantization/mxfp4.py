@@ -43,6 +43,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizeMethodBase,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import (
     get_exec,
     get_platform,
@@ -57,7 +58,6 @@ from sglang.srt.utils import (
     is_triton_kernels_available,
     is_xpu,
     round_up,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
@@ -951,6 +951,18 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 torch.stack(gemm2_bias_shuffled).reshape(E, -1),
                 requires_grad=False,
             )
+            from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
+                cuda_mxfp4_decode_moe_supported,
+            )
+
+            layer.use_cuda_mxfp4_decode_moe = cuda_mxfp4_decode_moe_supported(
+                layer,
+                "situ",
+                layer.w13_weight.shape[1] // 2,  # after the 128 padding
+                self.hidden_size,
+                self.with_bias,
+                self.flashinfer_mxfp4_moe_precision,
+            )
             return
         if _use_aiter:
             if getattr(layer, "w13_weight_bias", None) is not None:
@@ -1590,6 +1602,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             hidden_size=self.hidden_size,
             flashinfer_mxfp4_moe_precision=self.flashinfer_mxfp4_moe_precision,
             routing_bias=routing_bias,
+            use_cuda_mxfp4_decode_moe=layer.use_cuda_mxfp4_decode_moe,
         )
         return self.runner.run(dispatch_output, quant_info)
 

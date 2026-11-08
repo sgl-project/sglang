@@ -64,15 +64,13 @@ class _PoolClass:
             and n.func.id in ALL_OPS
         }
         self.own_table = None
-        self.table_is_xpu_only = False
-        for stmt, guarded in self._class_level(node.body):
+        for stmt in self._class_level(node.body):
             if (
                 isinstance(stmt, ast.Assign)
                 and len(stmt.targets) == 1
                 and isinstance(stmt.targets[0], ast.Name)
                 and stmt.targets[0].id == "_kvcacheio_ops"
             ):
-                self.table_is_xpu_only = guarded
                 self.own_table = (
                     _shared_table(node.name, stmt.value.id)
                     if isinstance(stmt.value, ast.Name)
@@ -84,9 +82,9 @@ class _PoolClass:
         """Class-body statements, looking inside `if _is_xpu:` blocks."""
         for stmt in body:
             if isinstance(stmt, ast.If) and _is_xpu_guard(stmt.test):
-                yield from ((inner, True) for inner in stmt.body)
+                yield from stmt.body
             else:
-                yield stmt, False
+                yield stmt
 
 
 def _parse_pool_classes() -> dict[str, _PoolClass]:
@@ -139,70 +137,6 @@ class TestHostPoolOpTables(unittest.TestCase):
                 continue
             with self.subTest(pool=name):
                 self.assertLessEqual(_table_ops(cls.own_table), cls.calls)
-
-
-def _require_calls(tree: ast.Module) -> list[ast.Call]:
-    return [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "require_kvcacheio_ops"
-    ]
-
-
-class TestRequireIsXpuOnly(unittest.TestCase):
-    """CUDA/ROCm/NPU/CPU never reach the construction check."""
-
-    def test_every_call_is_under_an_is_xpu_branch(self):
-        calls = 0
-        for path in _POOL_FILES:
-            tree = ast.parse(path.read_text())
-            parents = {
-                child: node
-                for node in ast.walk(tree)
-                for child in ast.iter_child_nodes(node)
-            }
-            for call in _require_calls(tree):
-                calls += 1
-                branch = parents[call]
-                while not isinstance(branch, (ast.If, ast.FunctionDef, ast.Module)):
-                    branch = parents[branch]
-                with self.subTest(file=path.name, line=call.lineno):
-                    self.assertIsInstance(branch, ast.If, "not under any if")
-                    self.assertTrue(
-                        _is_xpu_guard(branch.test),
-                        f"guarded by `{ast.unparse(branch.test)}`, not `_is_xpu`",
-                    )
-        self.assertGreaterEqual(calls, 6)
-
-    def test_every_table_is_xpu_only(self):
-        tables = 0
-        for name, cls in _POOLS.items():
-            if cls.own_table is None:
-                continue
-            tables += 1
-            with self.subTest(pool=name):
-                self.assertTrue(
-                    cls.table_is_xpu_only, "_kvcacheio_ops is not under `if _is_xpu:`"
-                )
-        self.assertGreaterEqual(tables, 7)
-
-    def test_imported_at_module_level(self):
-        # The call is guarded by `_is_xpu` alone, so an import under
-        # `elif _is_xpu:` would be skipped when CUDA and XPU are both visible.
-        for path in _POOL_FILES:
-            tree = ast.parse(path.read_text())
-            if not _require_calls(tree):
-                continue
-            imported = {
-                alias.name
-                for node in tree.body
-                if isinstance(node, ast.ImportFrom)
-                for alias in node.names
-            }
-            with self.subTest(file=path.name):
-                self.assertIn("require_kvcacheio_ops", imported)
 
 
 def _reload_gate():

@@ -35,12 +35,31 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 from typing_extensions import Literal
 
 from sglang.srt.entrypoints.openai.protocol import ChatCompletionRequest
-from sglang.srt.utils import (
-    GLM_MEDIA_CONFIG_KEYS,
-    ImageData,
-    VideoData,
-    read_system_prompt_from_file,
-)
+from sglang.srt.multimodal.media_io import GLM_MEDIA_CONFIG_KEYS, ImageData, VideoData
+from sglang.srt.utils.common import find_local_repo_dir
+
+
+def read_system_prompt_from_file(model_name: str) -> str:
+    """Read system prompt from a file in the HuggingFace cache directory.
+
+    Args:
+        model_name: The model name to construct the file path
+
+    Returns:
+        The system prompt content from the file, or empty string if file not found
+    """
+    try:
+        local_repo_dir = find_local_repo_dir(model_name)
+        if local_repo_dir:
+            system_prompt_file = os.path.join(local_repo_dir, "SYSTEM_PROMPT.txt")
+            if os.path.exists(system_prompt_file):
+                with open(system_prompt_file, "r", encoding="utf-8") as f:
+                    return f.read()
+
+        return ""
+    except Exception:
+        # If anything fails, return empty string
+        return ""
 
 
 class SeparatorStyle(IntEnum):
