@@ -17,7 +17,6 @@ from sglang.kernels.ops.diffusion import (
     qknorm_complex_rope_cuda,
     qknorm_complex_rope_pack_,
     residual_gate_add,
-    rmsnorm_preserve_reduction,
     tensors_equal,
 )
 from sglang.kernels.ops.diffusion.rope.qknorm_complex_rope_kv_triton import (
@@ -85,7 +84,6 @@ _KV_PROJECT_INTO_FUSION = BitExactFusionGate(
 _QKV_PACK_FUSION = BitExactFusionGate(
     "Qwen-Image 2.1 packed Q/K/V projection written into the packed QKV buffer"
 )
-_QK_NORM_FUSION = BitExactFusionGate("Qwen-Image 2.1 Q/K RMSNorm")
 _MODULATION_FUSION = BitExactFusionGate("Qwen-Image 2.1 LayerNorm modulation")
 
 
@@ -154,16 +152,6 @@ def apply_rope(x, rope):
             logger=logger,
         )
     return _eager_rope(x, rope)
-
-
-def apply_qk_norm(x, norm):
-    if _is_cuda and x.is_cuda and x.dtype in (torch.float16, torch.bfloat16):
-        return _QK_NORM_FUSION.run(
-            lambda: rmsnorm_preserve_reduction(x, norm.weight, norm.variance_epsilon),
-            lambda: norm(x),
-            logger=logger,
-        )
-    return norm(x)
 
 
 def apply_qk_norm_rope(x, norm, rope):
