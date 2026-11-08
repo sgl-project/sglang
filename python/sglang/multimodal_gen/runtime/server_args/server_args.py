@@ -4179,15 +4179,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
 
-        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
-            has_sp = self.sp_degree > 1
-            has_tp = self.tp_size > 1
-            if has_sp and has_tp:
-                logger.warning(
-                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
-                    "Proceeding anyway (SGLang integration may support this mode)."
-                )
-
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:
             return

@@ -26,8 +26,6 @@ logger = init_logger(__name__)
 
 
 class VMOBAAttentionBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_enum() -> AttentionBackendEnum:
         return AttentionBackendEnum.VMOBA_ATTN

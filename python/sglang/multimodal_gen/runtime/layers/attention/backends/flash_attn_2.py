@@ -18,8 +18,6 @@ logger = init_logger(__name__)
 
 
 class FlashAttention2Backend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [32, 64, 96, 128, 160, 192, 224, 256]

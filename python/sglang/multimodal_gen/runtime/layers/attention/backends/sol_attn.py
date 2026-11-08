@@ -83,8 +83,6 @@ def _get_sol_attn_runtime_config() -> dict:
 
 
 class SolAttnBackend(AttentionBackend):
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [_SOL_ATTN_HEAD_DIM]

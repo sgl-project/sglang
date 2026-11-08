@@ -49,8 +49,6 @@ def _get_cuda_arch(device_index: int) -> str:
 class SparseLinearAttentionBackend(AttentionBackend):
     """Sparse Linear Attention Backend for efficient attention computation."""
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128]
@@ -277,8 +275,6 @@ except ImportError:
 
 class SageSparseLinearAttentionBackend(AttentionBackend):
     """Quantized Sparse-Linear Attention backend using SageAttention kernels."""
-
-    accept_output_buffer: bool = True
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:

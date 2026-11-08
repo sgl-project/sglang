@@ -108,7 +108,6 @@ class MiniMaxH3TaskProfile(msgspec.Struct, frozen=True):
     branches: tuple[dict, ...]
     default_flow_shift: float
     default_audio_flow_shift: float
-    required_components: tuple[str, ...]
     aspect_ratio_forced_auto: bool
     geometry_source: str  # "explicit_target" | "first_keyframe" | "model_default"
     # For ref2va video, target may omit duration_seconds
@@ -135,15 +134,6 @@ class MiniMaxH3TaskProfile(msgspec.Struct, frozen=True):
         )
 
 
-_BASE_COMPONENTS = (
-    "processor",
-    "text_encoder",
-    "tokenizer",
-    "transformer",
-    "video_vae",
-    "audio_vae",
-)
-
 _BRANCHES = tuple(dict(branch) for branch in MINIMAX_H3_DEFAULT_BRANCHES)
 MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
     MINIMAX_H3_TASK_T2VA: MiniMaxH3TaskProfile(
@@ -153,7 +143,6 @@ MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
         branches=_BRANCHES,
         default_flow_shift=12.0,
         default_audio_flow_shift=3.0,
-        required_components=_BASE_COMPONENTS,
         aspect_ratio_forced_auto=False,
         geometry_source="explicit_target",
         auto_aspect_ratio="16:9",
@@ -174,7 +163,6 @@ MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
         branches=_BRANCHES,
         default_flow_shift=12.0,
         default_audio_flow_shift=3.0,
-        required_components=_BASE_COMPONENTS,
         # FL follows the resolved target geometry projected by the caller.
         # Its first/last keyframes are prepared against that target canvas.
         aspect_ratio_forced_auto=False,
@@ -227,7 +215,6 @@ MINIMAX_H3_TASK_PROFILES: dict[str, MiniMaxH3TaskProfile] = {
         branches=_BRANCHES,
         default_flow_shift=12.0,
         default_audio_flow_shift=3.0,
-        required_components=_BASE_COMPONENTS,
         # ref2va video may use an explicit aspect ratio such as "7:4":
         # ref2va allows explicit aspect ratios; "auto" falls back to the
         # policy default (references never bind target geometry).
