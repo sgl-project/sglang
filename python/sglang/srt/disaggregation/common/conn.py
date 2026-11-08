@@ -1979,6 +1979,15 @@ class CommonKVManager(BaseKVManager):
         c128_full = sum(1 for r in mla_ratios if r == 128)
         kv_layout_len = 2 * c4_full + c128_full
 
+        if state_type == StateType.DSV4_C4_STATE:
+            c4_start = sum(r == 4 for r in mla_ratios[:start_layer])
+            c4_end = sum(r == 4 for r in mla_ratios[:end_layer])
+            return src_kv_ptrs, [
+                ptr
+                for offset in (0, c4_full)
+                for ptr in dst_kv_ptrs[offset + c4_start : offset + c4_end]
+            ]
+
         # A DSV4 two-pool peer registers a rope group beside each KV group and
         # doubles the ring, and the switch that turns that on is read per
         # process. Mixed peers would fall into the cuts below, match whichever

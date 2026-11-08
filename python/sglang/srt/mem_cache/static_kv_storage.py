@@ -952,6 +952,13 @@ def _static_state_entries(
             if getattr(token_to_kv_pool, "_unified_kv", False) and hasattr(
                 token_to_kv_pool, "get_unified_swa_ring_buf_infos"
             ):
+                # Keep the component even on a PP stage without C4 layers:
+                # every peer uses the same positional wire schema.
+                if 4 in token_to_kv_pool.compression_ratios:
+                    add(
+                        StateType.DSV4_C4_STATE,
+                        *token_to_kv_pool.get_c4_state_buf_infos(),
+                    )
                 ring_ptrs, ring_lens, ring_item_lens = (
                     token_to_kv_pool.get_unified_swa_ring_buf_infos()
                 )

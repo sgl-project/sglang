@@ -11,6 +11,7 @@ from sglang.srt.disaggregation.common.dcp_pack import (
     dcp_pack_buffer_bytes,
     init_dcp_pack_buffers,
 )
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
 from sglang.srt.disaggregation.nixl.conn import NixlKVManager, NixlKVSender
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
@@ -32,6 +33,7 @@ class TestDcpCachedPrefixSend(CustomTestCase):
             page_size=page_size,
             gpu_id=0,
             state_types=[StateType.MAMBA],
+            state_data_ptrs=[[1]],
         )
         mgr._dcp_pack_buffers = None
         mgr._dcp_pack_max_tokens = None
@@ -130,6 +132,96 @@ class TestDcpCachedPrefixSend(CustomTestCase):
                     all(c.kwargs["state_indices"] is None for c in calls[:-1])
                 )
                 self.assertEqual(int(calls[-1].kwargs["state_indices"][0][0]), 17)
+
+
+class TestEmptyPDStatePayloads(CustomTestCase):
+    @staticmethod
+    def _fixture(empty):
+        pool = SimpleNamespace(
+            request_state_transfer_indices=Mock(
+                return_value=np.array([42], dtype=np.int32)
+            )
+        )
+        allocator = SimpleNamespace(
+            page_size=128,
+            get_kvcache=lambda: pool,
+            translate_kv_indices_for_transfer=lambda x: x,
+        )
+        args = SimpleNamespace(
+            state_types=[StateType.DSV4_REQUEST_STATE],
+            state_data_ptrs=[[] if empty else [1]],
+        )
+        sender = SimpleNamespace(
+            get_max_transfer_tokens=lambda: None,
+            should_send_kv_chunk=lambda *args: True,
+            send=Mock(),
+        )
+        req = SimpleNamespace(
+            rid="empty-state",
+            origin_input_ids=[0] * 13,
+            extend_end=13,
+            start_send_idx=0,
+            disagg_decode_prefix_len=0,
+            disagg_kv_sender=sender,
+            kv=SimpleNamespace(req_pool_idx=0),
+        )
+        table = SimpleNamespace(req_to_token=torch.arange(128, 141).reshape(1, -1))
+        return pool, allocator, args, req, table
+
+    def _check_payload(self, pool, payload, empty):
+        self.assertEqual(len(payload), 1)
+        if empty:
+            self.assertIsNone(payload[0])
+            pool.request_state_transfer_indices.assert_not_called()
+        else:
+            np.testing.assert_array_equal(payload[0], [42])
+            pool.request_state_transfer_indices.assert_called_once_with(0, 13)
+
+    @patch("sglang.srt.disaggregation.prefill._is_npu", False)
+    @patch("sglang.srt.disaggregation.prefill.is_cp_sharded_padded", return_value=False)
+    def test_prefill_skips_empty_state_but_keeps_live_state(self, _):
+        for empty in (True, False):
+            with self.subTest(empty=empty):
+                pool, allocator, args, req, table = self._fixture(empty)
+                scheduler = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=table,
+                    enable_staging=False,
+                    disagg_metadata_buffers=Mock(),
+                    disagg_prefill_bootstrap_queue=SimpleNamespace(
+                        kv_manager=SimpleNamespace(kv_args=args)
+                    ),
+                    disagg_prefill_pending_chunk_rids=set(),
+                )
+                SchedulerDisaggregationPrefillMixin._send_kv_chunk(
+                    scheduler, req, last_chunk=True
+                )
+                payload = req.disagg_kv_sender.send.call_args.args[1]
+                self._check_payload(pool, payload, empty)
+
+    @patch("sglang.srt.disaggregation.decode._is_npu", False)
+    def test_decode_skips_empty_state_but_keeps_live_state(self):
+        for empty in (True, False):
+            with self.subTest(empty=empty):
+                pool, allocator, args, req, table = self._fixture(empty)
+                queue = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    req_to_token_pool=table,
+                    token_to_kv_pool=pool,
+                    scheduler=SimpleNamespace(enable_hisparse=False),
+                    kv_manager=SimpleNamespace(kv_args=args),
+                    _send_kv_metadata=Mock(),
+                )
+                DecodePreallocQueue._publish_destination(
+                    queue,
+                    SimpleNamespace(req=req),
+                    dst_kv_indices=table.req_to_token[0],
+                    prefix_len=0,
+                    total_prefix_len=0,
+                    fill_len=13,
+                )
+                payload = queue._send_kv_metadata.call_args.args[3]
+                self._check_payload(pool, payload, empty)
 
 
 class TestHostTensorIndicesEvent(CustomTestCase):

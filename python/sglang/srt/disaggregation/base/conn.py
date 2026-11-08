@@ -31,6 +31,8 @@ class StateType(str, enum.Enum):
     SWA_RING = "swa_ring"
     # DeepSeek-V4 request-scoped compression state; preserve the legacy wire value.
     DSV4_REQUEST_STATE = "c128_state"
+    # Unified C4 overlap state uses request-local physical rows, not SWA pages.
+    DSV4_C4_STATE = "dsv4_c4_state"
     # One item per request row (req_pool_idx), sent row to row: the DeepSeek-V4
     # DSpark draft's SWA valid-from.
     REQUEST_ROW = "request_row"

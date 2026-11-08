@@ -2008,6 +2008,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             StateType.MINIMAX_INDEX_K: _minimax_payload,
             StateType.MINIMAX_DENSE_KV: _full_kv_pages_payload,
             StateType.SWA_RING: _swa_ring_payload,
+            StateType.DSV4_C4_STATE: lambda: (
+                self.token_to_kv_pool.get_c4_state_transfer_indices(
+                    int(decode_req.req.kv.req_pool_idx), seq_len
+                )
+            ),
             StateType.DSV4_REQUEST_STATE: _request_state_payload,
             StateType.REQUEST_ROW: _request_row_payload,
             StateType.BLOCK_SCALE: _full_kv_pages_payload,
@@ -2028,7 +2033,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 )
             )
         state_indices: Optional[List] = [
-            payloads[st]() if st in payloads else None for st in state_types
+            payloads[st]()
+            if st in payloads and self.kv_manager.kv_args.state_data_ptrs[i]
+            else None
+            for i, st in enumerate(state_types)
         ]
 
         device_page_indices = None
