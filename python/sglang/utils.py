@@ -81,9 +81,16 @@ def execute_once(func):
     return wrapper
 
 
-@execute_once
+_info_once_messages: set[str] = set()
+
+
 def info_once(message: str):
-    logger.info(message)
+    if message not in _info_once_messages:
+        _info_once_messages.add(message)
+        logger.info(message)
+
+
+info_once.cache_clear = _info_once_messages.clear
 
 
 def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
@@ -128,7 +135,7 @@ def is_same_type(values: list):
         return True
     else:
         t = type(values[0])
-        return all(isinstance(v, t) for v in values[1:])
+        return all(type(v) is t for v in values[1:])
 
 
 def read_jsonl(filename: str):
@@ -650,13 +657,18 @@ def trim_overlap(existing_text, new_chunk):
     Finds the largest suffix of 'existing_text' that is a prefix of 'new_chunk'
     and removes that overlap from the start of 'new_chunk'.
     """
-    max_overlap = 0
+    if not existing_text or not new_chunk:
+        return new_chunk
     max_possible = min(len(existing_text), len(new_chunk))
-    for i in range(max_possible, 0, -1):
-        if existing_text.endswith(new_chunk[:i]):
-            max_overlap = i
-            break
-    return new_chunk[max_overlap:]
+    start = len(existing_text) - max_possible
+    first_char = new_chunk[0]
+    pos = existing_text.find(first_char, start)
+    while pos != -1:
+        overlap_len = len(existing_text) - pos
+        if new_chunk.startswith(existing_text[pos:]):
+            return new_chunk[overlap_len:]
+        pos = existing_text.find(first_char, pos + 1)
+    return new_chunk
 
 
 def stream_and_merge(llm, prompt, sampling_params):
