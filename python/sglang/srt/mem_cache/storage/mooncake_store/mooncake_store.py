@@ -453,6 +453,36 @@ class MooncakeBaseStore:
         finally:
             self.clear_request_context()
 
+    @staticmethod
+    def _valid_object_buffers(ptrs, sizes):
+        ptrs = ptrs if isinstance(ptrs, Sequence) else (ptrs,)
+        sizes = sizes if isinstance(sizes, Sequence) else (sizes,)
+        return (
+            bool(ptrs)
+            and len(ptrs) == len(sizes)
+            and all(type(value) is int and value > 0 for value in (*ptrs, *sizes))
+        )
+
+    @staticmethod
+    def _checked_io_results(results, buffer_sizes, *, is_set):
+        if len(results) != len(buffer_sizes):
+            return [-1] * len(buffer_sizes)
+        checked = []
+        for result, size in zip(results, buffer_sizes):
+            expected_bytes = sum(size) if isinstance(size, Sequence) else size
+            valid = (
+                isinstance(result, int)
+                and not isinstance(result, bool)
+                and expected_bytes > 0
+                and (result == 0 if is_set else result == expected_bytes)
+            )
+            checked.append(result if valid else -1)
+        return checked
+
+    def _batch_exist(self, key_strs: List[str]) -> List[int]:
+        results = self.store.batch_is_exist(key_strs)
+        return results if len(results) == len(key_strs) else [-1] * len(key_strs)
+
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     @staticmethod
@@ -1834,36 +1864,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         else:
             results = self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
         return self._checked_io_results(results, buffer_sizes, is_set=False)
-
-    @staticmethod
-    def _valid_object_buffers(ptrs, sizes):
-        ptrs = ptrs if isinstance(ptrs, Sequence) else (ptrs,)
-        sizes = sizes if isinstance(sizes, Sequence) else (sizes,)
-        return (
-            bool(ptrs)
-            and len(ptrs) == len(sizes)
-            and all(type(value) is int and value > 0 for value in (*ptrs, *sizes))
-        )
-
-    @staticmethod
-    def _checked_io_results(results, buffer_sizes, *, is_set):
-        if len(results) != len(buffer_sizes):
-            return [-1] * len(buffer_sizes)
-        checked = []
-        for result, size in zip(results, buffer_sizes):
-            expected_bytes = sum(size) if isinstance(size, Sequence) else size
-            valid = (
-                isinstance(result, int)
-                and not isinstance(result, bool)
-                and expected_bytes > 0
-                and (result == 0 if is_set else result == expected_bytes)
-            )
-            checked.append(result if valid else -1)
-        return checked
-
-    def _batch_exist(self, key_strs: List[str]) -> List[int]:
-        results = self.store.batch_is_exist(key_strs)
-        return results if len(results) == len(key_strs) else [-1] * len(key_strs)
 
     def get_stats(self):
         storage_metrics = StorageMetrics()

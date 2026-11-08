@@ -567,14 +567,14 @@ class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
             ["emb_b"], [[22]], [[4]]
         )
 
-    def test_batch_get_multi_buffers_maps_positive_result_to_true(self):
+    def test_batch_get_multi_buffers_requires_exact_result_bytes(self):
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
             MooncakeEmbeddingStore,
         )
 
         store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
         store.store = MagicMock()
-        store.store.batch_get_into_multi_buffers.return_value = [8, -1]
+        store.store.batch_get_into_multi_buffers.return_value = [4, 8]
 
         results = store.batch_get_into_multi_buffers(
             ["a", "b"],
@@ -583,6 +583,48 @@ class TestMooncakeEmbeddingStoreWrappers(unittest.TestCase):
         )
 
         self.assertEqual(results, [True, False])
+
+    def test_prefetch_rejects_incomplete_embedding_reads(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+            MooncakeEmbeddingStore,
+        )
+
+        # Exercise the actual controller queue, store wrapper and readiness
+        # transition. Only the Mooncake SDK boundary is replaced.
+        for receipts, ready_keys in (
+            ([31, 32], {"b"}),
+            ([32], set()),
+            ([32, 32], {"a", "b"}),
+        ):
+            with self.subTest(receipts=receipts):
+                ctrl = _make_controller(num_pages=4)
+                store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+                store.store = MagicMock()
+                ctrl.embedding_store = store
+
+                def get_into(keys, ptrs, sizes, ctrl=ctrl, receipts=receipts):
+                    self.assertEqual(keys, ["emb_a", "emb_b"])
+                    self.assertEqual(sizes, [[32], [32]])
+                    ctrl.stop_event.set()
+                    return receipts
+
+                store.store.batch_get_into_multi_buffers.side_effect = get_into
+                ctrl.prefetch("req", ["a", "b"], [2, 2], Modality.IMAGE)
+                op = ctrl.ongoing_prefetch["req"]
+                ctrl._io_loop()
+
+                self.assertTrue(op.is_finished)
+                self.assertEqual(op.success, len(ready_keys) == 2)
+                self.assertEqual(set(ctrl.entries), ready_keys)
+                self.assertTrue(
+                    all(
+                        entry.state == EntryState.READY
+                        for entry in ctrl.entries.values()
+                    )
+                )
+                self.assertEqual(
+                    ctrl.vision_pool.allocator.free_pages, 4 - len(ready_keys)
+                )
 
 
 if __name__ == "__main__":

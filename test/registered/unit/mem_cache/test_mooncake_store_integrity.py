@@ -7,6 +7,9 @@ never propagate a short/long result vector into the per-pool hit results.
 
 import unittest
 
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_embedding_store import (
+    MooncakeEmbeddingStore,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -33,7 +36,7 @@ class _FakeStore:
         self.put_calls += 1
         return list(self.put_results)
 
-    def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config):
+    def batch_put_from_multi_buffers(self, keys, ptrs, sizes, config=None):
         self.put_calls += 1
         return list(self.put_results)
 
@@ -118,6 +121,59 @@ class TestMooncakeStoreIntegrity(unittest.TestCase):
         )
         self.assertFalse(got)
         self.assertEqual(fake.put_calls, 1)
+
+
+class TestMooncakeEmbeddingStoreIntegrity(unittest.TestCase):
+    def test_embedding_reads_require_exact_bytes_and_receipt_count(self):
+        for method, ptrs, sizes in (
+            ("batch_get", [100], [16]),
+            ("batch_get_into_multi_buffers", [[100, 200]], [[8, 8]]),
+        ):
+            for receipts, expected in (
+                ([16], [True]),
+                ([15], [False]),
+                ([17], [False]),
+                ([], [False]),
+                ([16, 16], [False]),
+            ):
+                with self.subTest(method=method, receipts=receipts):
+                    store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+                    store.store = _FakeStore(get_results=receipts)
+                    self.assertEqual(
+                        getattr(store, method)(["a"], ptrs, sizes), expected
+                    )
+
+    def test_embedding_puts_do_not_acknowledge_missing_receipts(self):
+        for method, ptrs, sizes in (
+            ("batch_put", [100, 200], [16, 16]),
+            ("batch_put_from_multi_buffers", [[100], [200]], [[16], [16]]),
+        ):
+            for receipts in ([], [0, 0], [16]):
+                with self.subTest(method=method, receipts=receipts):
+                    store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+                    store.store = _FakeStore(put_results=receipts, exist_results=[1, 0])
+                    self.assertEqual(
+                        getattr(store, method)(["a", "b"], ptrs, sizes),
+                        [True, False],
+                    )
+                    self.assertEqual(store.store.put_calls, 1)
+
+    def test_embedding_short_existence_receipts_fail_closed(self):
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = _FakeStore(put_results=[0, 0], exist_results=[1])
+        self.assertEqual(store.batch_is_exist(["a", "b"]), [False, False])
+        self.assertEqual(
+            store.batch_put(["a", "b"], [100, 200], [16, 16]), [False, False]
+        )
+        self.assertEqual(store.store.put_calls, 0)
+
+    def test_embedding_invalid_buffers_do_not_reach_sdk(self):
+        store = MooncakeEmbeddingStore.__new__(MooncakeEmbeddingStore)
+        store.store = _FakeStore(get_results=[16])
+        with self.assertRaisesRegex(ValueError, "counts differ"):
+            store.batch_get(["a", "b"], [100], [16])
+        self.assertEqual(store.batch_get(["a"], [0], [16]), [False])
+        self.assertEqual(store.store.get_calls, 0)
 
 
 if __name__ == "__main__":
