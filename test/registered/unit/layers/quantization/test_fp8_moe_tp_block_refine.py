@@ -7,11 +7,13 @@ to the unsharded layer's output.
 
 import unittest
 from contextlib import contextmanager
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe as fused_moe_module
+import sglang.srt.layers.quantization.fp8 as fp8_module
 from sglang.srt import runtime_context
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
@@ -21,6 +23,9 @@ from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.fp8 import (
     Fp8Config,
     _tp_refined_moe_block_sizes,
+)
+from sglang.srt.model_executor.model_runner_components.moe_ep_setup import (
+    check_quantized_moe_compatibility,
 )
 from sglang.srt.model_executor.weight_checker_comparator import (
     select_comparable_weight,
@@ -121,23 +126,27 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
         ):
             yield
 
-    def _forward(self, backend, shards, x, topk_output, *, tp_size, tp_rank):
+    @staticmethod
+    def _build():
         from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 
+        return FusedMoE(
+            num_experts=E,
+            hidden_size=H,
+            intermediate_size=I,
+            layer_id=0,
+            top_k=TOPK,
+            params_dtype=torch.bfloat16,
+            quant_config=Fp8Config(
+                is_checkpoint_fp8_serialized=True, weight_block_size=[BLOCK, BLOCK]
+            ),
+            prefix="model.layers.0.mlp.experts",
+        )
+
+    def _forward(self, backend, shards, x, topk_output, *, tp_size, tp_rank):
         with self._runtime(backend, tp_size, tp_rank):
             model = torch.nn.Module()
-            model.experts = FusedMoE(
-                num_experts=E,
-                hidden_size=H,
-                intermediate_size=I,
-                layer_id=0,
-                top_k=TOPK,
-                params_dtype=torch.bfloat16,
-                quant_config=Fp8Config(
-                    is_checkpoint_fp8_serialized=True, weight_block_size=[BLOCK, BLOCK]
-                ),
-                prefix="model.layers.0.mlp.experts",
-            ).cuda()
+            model.experts = self._build().cuda()
             _load(model.experts, shards)
             DefaultModelLoader.postprocess_weights(model, DEVICE)
             # The layer may write its result into the input.
@@ -203,6 +212,37 @@ class TestFp8MoETpBlockRefine(CustomTestCase):
                 MoeRunnerBackend.TRITON,
                 blocks=([64, BLOCK], [BLOCK, 64]),
                 num_tokens=33,
+            )
+
+    def test_cpu_keeps_checkpoint_block(self):
+        # CPU AMX experts run a kernel that takes the checkpoint block, so the
+        # split shard must still be rejected at weight creation.
+        with (
+            patch.object(fp8_module, "_is_cpu", True),
+            self._runtime(MoeRunnerBackend.TRITON, tp_size=TP, tp_rank=0),
+            self.assertRaisesRegex(ValueError, "not divisible"),
+        ):
+            self._build()
+
+    def test_startup_check_defers_to_fp8_moe(self):
+        # The startup check runs after weights load; for fp8 checkpoints
+        # Fp8MoEMethod decides at weight creation instead.
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                quantization_config={
+                    "quant_method": "fp8",
+                    "weight_block_size": [BLOCK, BLOCK],
+                }
+            ),
+            hf_text_config=SimpleNamespace(moe_intermediate_size=I),
+        )
+        check_quantized_moe_compatibility(
+            model_config=model_config, tp_size=TP, moe_ep_size=1, moe_dp_size=1
+        )
+        model_config.hf_config.quantization_config["quant_method"] = "other"
+        with self.assertRaisesRegex(ValueError, "weight_block_size_n"):
+            check_quantized_moe_compatibility(
+                model_config=model_config, tp_size=TP, moe_ep_size=1, moe_dp_size=1
             )
 
     @unittest.skipUnless(

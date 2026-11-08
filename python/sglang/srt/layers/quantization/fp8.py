@@ -2110,6 +2110,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not layer.use_presharded_weights
             # A blockwise tail loads the checkpoint grid as is.
             and not self._supports_blockwise_fp8_tail(layer)
+            # apply() sends these to kernels that take the checkpoint block.
+            and not _is_cpu
+            and not (_is_xpu and not get_moe_runner_backend().is_triton())
         ):
             return unrefined
         refined = _tp_refined_moe_block_sizes(
