@@ -16,7 +16,7 @@ register_npu_ci(
     nightly=True,
 )
 
-CASE_ID = "test_npu_deepseek_v4_flash_w8a8_4p_gsm8k_a5_overlap"
+CASE_ID = "test_npu_deepseek_v4_flash_fp8_4p_gsm8k_a5_overlap"
 
 # Based on the DSV4-w8a8 launch scripts in PR #46805.
 DEEPSEEK_V4_FLASH_W8A8_4P_ENVS = {

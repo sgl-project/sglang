@@ -5,7 +5,7 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression, record_pass1
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     BENCHMARK_TOOL_DEFAULT,
-    DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH,
+    GLM_5_2_W8A8C8_MXFP8_MODEL_PATH,
     TestNpuPerformanceTestCaseBase,
 )
 from sglang.test.ci.ci_register import register_npu_ci
@@ -18,103 +18,88 @@ register_npu_ci(
     nightly=True,
 )
 
-CASE_ID = "test_npu_deepseek_v4_flash_w8a8_4p_in16k_out1k_a5_overlap"
+CASE_ID = "test_npu_glm_5_2_w8a8c8_mxfp8_4p_in16k_out1k_a5_overlap"
 
-# Based on the DSV4-w8a8 launch scripts in PR #46805.
-DEEPSEEK_V4_FLASH_W8A8_4P_ENVS = {
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+# Based on the GLM-5.2-w4a8 benchmark scripts in PR #45949.
+GLM_5_2_W4A8_4P_ENVS = {
     "STREAMS_PER_DEVICE": "32",
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "0",
     "ASCEND_USE_FIA": "0",
-    "INF_NAN_MODE_FORCE_DISABLE": "1",
-    "SGLANG_SET_CPU_AFFINITY": "1",
-    "HCCL_SOCKET_IFNAME": "lo",
-    "GLOO_SOCKET_IFNAME": "lo",
-    "HCCL_OP_EXPANSION_MODE": "AIV",
-    # skip gpu branch
-    "SGLANG_OPT_FP8_WO_A_GEMM": "0",
-    "SGLANG_OPT_USE_OVERLAP_STORE_CACHE": "False",
-    "FORCE_DRAFT_MODEL_NON_QUANT": "1",
-    "SGLANG_DSV4_FP4_EXPERTS": "False",
-    "SGLANG_OPT_FUSE_WQA_WKV": "0",
-    "SGLANG_OPT_BF16_FP32_GEMM_ALGO": "torch",
-    "SGLANG_OPT_USE_FUSED_HASH_TOPK": "False",
-    "SGLANG_OPT_USE_TILELANG_MHC_PRE": "False",
-    "SGLANG_OPT_DEEPGEMM_HC_PRENORM": "False",
-    "SGLANG_OPT_USE_TILELANG_MHC_POST": "False",
-    # mtp
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
-    "SGLANG_ENABLE_WAR_BARRIER": "1",
-    "SGLANG_FORCE_COARSE_WAR_BARRIER": "1",
+    "HCCL_BUFFSIZE": "500",
     "DEEPEP_HCCL_BUFFSIZE": "2500",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "96",
-    "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
+    "HCCL_OP_EXPANSION_MODE": "AIV",
+    "HCCL_SOCKET_IFNAME": "lo",
+    "GLOO_SOCKET_IFNAME": "lo",
+    "TRANSFORMERS_VERBOSITY": "error",
+    "DEEPEP_NORMAL_LONG_SEQ_ROUND": "72",
+    "DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS": "1024",
+    "DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ": "1",
+    "SGLANG_SCHEDULER_DECREASE_PREFILL_IDLE": "1",
+    "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
+    "DEEP_NORMAL_MODE_USE_INT8_QUANT": "1",
     "DEEPEP_HYBRID_DEPLOYMENT": "1",
-    "SGLANG_DSPARK_USE_GREEDY_DRAFT": "1",
 }
 
 # Pass 1: ASCEND_USE_FIA left unset (image default), CPU seq_lens mirror kept (1).
-DEEPSEEK_V4_FLASH_W8A8_4P_PASS1_ENVS = {
-    **{k: v for k, v in DEEPSEEK_V4_FLASH_W8A8_4P_ENVS.items() if k != "ASCEND_USE_FIA"},
+GLM_5_2_W4A8_4P_PASS1_ENVS = {
+    **{k: v for k, v in GLM_5_2_W4A8_4P_ENVS.items() if k != "ASCEND_USE_FIA"},
     "SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS": "1",
 }
 
-DEEPSEEK_V4_FLASH_W8A8_4P_OTHER_ARGS = [
-    "--page-size",
-    128,
-    "--tp-size",
-    4,
-    "--trust-remote-code",
+GLM_5_2_W4A8_4P_OTHER_ARGS = [
+    "--attention-backend",
+    "ascend",
     "--device",
     "npu",
-    "--attention-backend",
-    "dsv4",
-    "--mem-fraction-static",
-    0.68,
-    "--prefill-max-requests",
-    192,
-    "--max-prefill-tokens",
-    80000,
-    "--chunked-prefill-size",
-    65536,
-    "--max-running-requests",
-    192,
+    "--tp-size",
+    4,
     "--dp-size",
     2,
     "--enable-dp-attention",
+    "--enable-dp-lm-head",
+    "--trust-remote-code",
+    "--mem-fraction-static",
+    0.8,
+    "--max-running-requests",
+    64,
+    "--quantization",
+    "modelslim",
     "--moe-a2a-backend",
     "deepep",
     "--deepep-mode",
     "auto",
-    "--quantization",
-    "fp8",
-    "--enable-dp-lm-head",
-    "--kv-cache-dtype",
-    "bfloat16",
     "--load-balance-method",
     "round_robin",
-    "--cuda-graph-bs-decode",
-    1,
-    2,
+    "--speculative-algorithm",
+    "NEXTN",
+    "--speculative-num-steps",
     4,
+    "--speculative-eagle-topk",
+    1,
+    "--speculative-num-draft-tokens",
+    5,
+    "--cuda-graph-bs-decode",
     8,
+    16,
+    24,
+    32,
+    "--enable-metrics",
 ]
 
 
-class DeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapBase(TestNpuPerformanceTestCaseBase):
+class Glm52W4A8_4PIn16kOut1kA5OverlapBase(TestNpuPerformanceTestCaseBase):
     """Shared config for the two-pass (FIA unset vs FIA=0) throughput comparison."""
 
     benchmark_tool = BENCHMARK_TOOL_DEFAULT
-    model = DEEPSEEK_V4_FLASH_DEFAULT_MODEL_PATH
-    other_args = DEEPSEEK_V4_FLASH_W8A8_4P_OTHER_ARGS
+    model = GLM_5_2_W8A8C8_MXFP8_MODEL_PATH
+    other_args = GLM_5_2_W4A8_4P_OTHER_ARGS
     dataset_name = "random"
     input_len = 16000
     output_len = 1000
-    num_prompts = 256
-    max_concurrency = 256
+    num_prompts = 16
+    max_concurrency = 4
     random_range_ratio = 1
     request_rate = float("inf")
     seed = 1
@@ -147,27 +132,23 @@ class DeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapBase(TestNpuPerformanceTestCaseBa
         wait_for_server(cls.base_url, timeout=cls.timeout, process=cls.process)
 
 
-class TestNPUDeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapPass1(
-    DeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapBase
-):
+class TestNPUGLM5_2W4A8_4PIn16kOut1kA5OverlapPass1(Glm52W4A8_4PIn16kOut1kA5OverlapBase):
     """Pass 1: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=1, ASCEND_USE_FIA unset."""
 
-    envs = DEEPSEEK_V4_FLASH_W8A8_4P_PASS1_ENVS
+    envs = GLM_5_2_W4A8_4P_PASS1_ENVS
 
-    def test_npu_deepseek_v4_flash_w8a8_4p_in16k_out1k_a5_overlap_pass1(self):
+    def test_npu_glm_5_2_w4a8_4p_in16k_out1k_a5_overlap_pass1(self):
         """Run pass-1 throughput and record the baseline metrics."""
         self.run_throughput()
         record_pass1(CASE_ID, self.last_metrics)
 
 
-class TestNPUDeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapPass2(
-    DeepSeekV4FlashW8A8_4PIn16kOut1kA5OverlapBase
-):
+class TestNPUGLM5_2W4A8_4PIn16kOut1kA5OverlapPass2(Glm52W4A8_4PIn16kOut1kA5OverlapBase):
     """Pass 2: SGLANG_NPU_ATTN_BACKEND_NEEDS_CPU_SEQ_LENS=0, ASCEND_USE_FIA=0."""
 
-    envs = DEEPSEEK_V4_FLASH_W8A8_4P_ENVS
+    envs = GLM_5_2_W4A8_4P_ENVS
 
-    def test_npu_deepseek_v4_flash_w8a8_4p_in16k_out1k_a5_overlap_pass2(self):
+    def test_npu_glm_5_2_w4a8_4p_in16k_out1k_a5_overlap_pass2(self):
         """Run pass-2 throughput and assert no regression vs pass 1."""
         self.run_throughput()
         assert_no_regression(self, CASE_ID, self.last_metrics)
