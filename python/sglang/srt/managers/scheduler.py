@@ -117,9 +117,7 @@ from sglang.srt.disaggregation.utils import (
     prepare_abort,
 )
 from sglang.srt.distributed import bootstrap
-from sglang.srt.distributed.parallel_state import (
-    abort_distributed_environment,
-)
+from sglang.srt.distributed.parallel_state import abort_distributed_environment
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
@@ -890,6 +888,11 @@ class Scheduler(
             and (
                 get_parallel().attn_tp_rank == 0
                 or get_observability().enable_metrics_for_all_schedulers
+            ),
+            detokenizer_router_metrics_enabled=(
+                get_observability().enable_metrics
+                and not self.skip_tokenizer_init
+                and get_serving().detokenizer_worker_num > 1
             ),
             enable_scripted_runtime=envs.SGLANG_TEST_SCRIPTED_RUNTIME.get(),
         )
@@ -1845,10 +1848,7 @@ class Scheduler(
     def init_dsa_kpool_truncation_align(self):
         """Kpool compress-write asserts chunked extends start on pool boundaries.
         Use the LCM to preserve any existing deterministic-inference alignment."""
-        from sglang.srt.configs.model_config import (
-            get_dsa_index_kpool,
-            is_deepseek_dsa,
-        )
+        from sglang.srt.configs.model_config import get_dsa_index_kpool, is_deepseek_dsa
 
         if not is_deepseek_dsa(self.model_config.hf_config):
             return
