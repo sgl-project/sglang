@@ -77,6 +77,10 @@ class ExecFeatures(msgspec.Struct):
         bool,
         "Save model weights (both main model and draft model, if any) to CPU memory during release_weights_occupation and resume_weights_occupation",
     ] = False
+    enable_kv_cache_cpu_backup: A[
+        bool,
+        "Preserve KV and request-pool allocations in CPU memory during a paused release_memory_occupation. Requires memory saver and weights CPU backup. Retained requests continue with their pre-update KV after weight updates.",
+    ] = False
     enable_draft_weights_cpu_backup: A[
         bool,
         "Save draft model weights to CPU memory during release_weights_occupation and resume_weights_occupation",

@@ -71,6 +71,54 @@ Enable memory saver support when launching the server:
 - This call asserts there are no ongoing requests. Ensure the engine is idle before calling it.
 - If `kv_cache` is released, SGLang flushes cache; subsequent requests will rebuild KV cache as needed.
 
+### Preserve unfinished requests while training
+
+On NVIDIA CUDA, start the server with `--enable-memory-saver`,
+`--enable-weights-cpu-backup`, and `--enable-kv-cache-cpu-backup` to retain
+unfinished requests while a colocated trainer uses the GPUs. This mode requires
+PP=1 and static KV pools; disaggregation, speculative decoding, hierarchical
+caching, LMCache, and unified KV memory are unsupported.
+
+Pause with `mode="in_place"` before releasing memory. KV and request-pool bytes
+are copied to CPU and restored at the same GPU virtual addresses. The scheduler's
+requests, radix tree, and slot ownership stay intact. CPU memory must accommodate
+the complete allocated KV and request pools, model weights, and captured graph
+allocations across all local ranks, in addition to the trainer's CPU state.
+
+```python
+import requests
+
+base_url = "http://127.0.0.1:30000"
+
+def control(endpoint, payload):
+    response = requests.post(base_url + endpoint, json=payload, timeout=600)
+    response.raise_for_status()
+    return response
+
+control("/pause_generation", {"mode": "in_place"})
+control("/release_memory_occupation", {})
+# Train, then offload the trainer before restoring the inference weights.
+control("/resume_memory_occupation", {"tags": ["weights"]})
+control("/update_weights_from_disk", {
+    "model_path": "UPDATED_MODEL_PATH",
+    "flush_cache": False,
+    "abort_all_requests": False,
+    "weight_version": "1",
+})
+control("/resume_memory_occupation", {"tags": ["cuda_graph", "kv_cache"]})
+control("/continue_generation", {})
+```
+
+Resume generation only after every rank has restored all released regions and
+finished updating weights. If any operation fails, keep the engine paused.
+Retained requests continue with KV computed by earlier weights; this is an
+explicit stale-KV approximation, not recomputation under the new policy. Supply
+a distinct `cache_salt` for each physical rollout request to prevent sharing such
+prefixes with newly admitted requests. Preserve the original token IDs,
+logprobs, and weight-version spans when assembling the training trajectory.
+
+The backup belongs to the current engine process and does not survive a restart.
+
 ### Resume Memory
 
 **Endpoint:** `POST /resume_memory_occupation`

@@ -2,6 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 
+from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.device import is_xpu
 
 try:
@@ -90,6 +91,11 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
     and cuda_graph() no-ops there; region/pause/resume are fully supported.
     """
 
+    def __init__(self):
+        self._backup_kv_cache = (
+            not is_xpu() and get_exec().features.enable_kv_cache_cpu_backup
+        )
+
     def configure_subprocess(self):
         if is_xpu():
             # Nothing to preload: this LD_PRELOADs the preload-mode .so, which the
@@ -98,7 +104,13 @@ class _TorchMemorySaverAdapterReal(TorchMemorySaverAdapter):
         return torch_memory_saver.configure_subprocess()
 
     def region(self, tag: str, enable_cpu_backup: bool = False):
-        return _memory_saver.region(tag=tag, enable_cpu_backup=enable_cpu_backup)
+        from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
+
+        return _memory_saver.region(
+            tag=tag,
+            enable_cpu_backup=enable_cpu_backup
+            or (self._backup_kv_cache and tag == GPU_MEMORY_TYPE_KV_CACHE),
+        )
 
     def cuda_graph(self, **kwargs):
         if is_xpu():

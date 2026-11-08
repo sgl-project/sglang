@@ -385,6 +385,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_kv_cache_sharding, server_args)
 
     # Validate after all batch-size declarations are visible.
+    run_hook(handle_offload_compatibility, server_args)
     run_hook(validate_deepep_v2_speculative_draft, server_args)
     run_hook(validate_deepep_v2_dispatch_token_budget, server_args)
 

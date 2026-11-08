@@ -58,7 +58,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.runtime_context import get_exec, get_model, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -465,7 +465,13 @@ class SchedulerWeightUpdaterManager:
 
     def release_memory_occupation(self, recv_req: ReleaseMemoryOccupationReqInput):
         scheduler = self.scheduler
-        if not self.is_fully_idle(
+        preserve_kv = get_exec().features.enable_kv_cache_cpu_backup
+        if preserve_kv and (scheduler is None or not scheduler.pause_state.paused):
+            return ReleaseMemoryOccupationReqOutput(
+                success=False,
+                message="KV CPU backup requires a completed pause_generation before memory release.",
+            )
+        if not preserve_kv and not self.is_fully_idle(
             ignore_waiting=scheduler is not None and scheduler.pause_state.paused
         ):
             return ReleaseMemoryOccupationReqOutput(
@@ -480,6 +486,18 @@ class SchedulerWeightUpdaterManager:
         if tags is None or len(tags) == 0:
             tags = GPU_MEMORY_ALL_TYPES
 
+        if preserve_kv and not self.memory_saver_adapter.enabled:
+            return ReleaseMemoryOccupationReqOutput(
+                success=False, message="Memory release requires --enable-memory-saver."
+            )
+        if preserve_kv and set(tags) & self.offload_tags:
+            return ReleaseMemoryOccupationReqOutput(
+                success=False, message="Requested memory is already released."
+            )
+
+        if preserve_kv:
+            # An in-place pause retains overlap results; drain CUDA work before unmapping.
+            torch.get_device_module().synchronize()
         for tag in tags:
             self.offload_tags.add(tag)
 
@@ -498,8 +516,9 @@ class SchedulerWeightUpdaterManager:
                     if queue is not None:
                         queue.release_memory_occupation()
             self.memory_saver_adapter.pause(GPU_MEMORY_TYPE_KV_CACHE)
-            # Cannot be refused: its idle gate is the check at the top.
-            self.flush_cache()
+            if not preserve_kv:
+                # Cannot be refused: its idle gate is the check at the top.
+                self.flush_cache()
 
         if GPU_MEMORY_TYPE_WEIGHTS in tags:
             self._assert_weight_cache_inactive("release_memory_occupation")
