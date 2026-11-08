@@ -168,6 +168,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_2_W8A8C8_MXFP8_MODEL_PATH = "/mnt/share/w00936111/GLM-5.2-W8A8C8-mxfp8"
 GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
 GLM_5_3_FLASH_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-Flash-w8a8"
