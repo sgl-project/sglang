@@ -92,11 +92,10 @@ class DecodeSessionPlacement:
                                 r,
                             ),
                         )
-                    elif growth > 0:
-                        # With no immediately fitting target, preserve locality
-                        # for non-growing context lengths. Growing sessions can
-                        # queue behind the smallest KV deficit; keep the home
-                        # on a complete load tie.
+                    else:
+                        # All ranks are full: queue behind the smallest KV
+                        # deficit, including queued prompts and decode reserves.
+                        # Preserve the current home on a complete load tie.
                         home_rank = rank
                         rank = max(
                             active,

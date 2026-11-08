@@ -124,7 +124,7 @@ class TestDecodeSessionPlacement(CustomTestCase):
         """
         placement = DecodeSessionPlacement(2)
         key = ("unequal-pools", None)
-        self.select(placement, key, prompt=99999, output=0, forced=0)
+        self.select(placement, key, prompt=100000, output=0, forced=0)
         rank = placement.select(
             key, 100000, 0, [0, 1], [1100000, 150000], [10, 3], [1000000, 100000]
         )
@@ -135,37 +135,30 @@ class TestDecodeSessionPlacement(CustomTestCase):
     def test_all_full_load_tie_keeps_existing_home(self):
         placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
         key = ("equal-pressure", None)
-        self.select(placement, key, prompt=60782, output=0, forced=1)
+        self.select(placement, key, prompt=60783, output=0, forced=1)
         rank = placement.select(
             key, 60783, 0, [0, 1], [270000, 270000], [3, 3], [291840, 291840]
         )
         self.assertEqual(rank, 1)
-        self.assertEqual(placement.retained, [0, 60784])
+        self.assertEqual(placement.retained, [0, 60783])
 
-    def test_all_full_repeated_or_shrinking_context_preserves_locality(self):
-        """Without an immediately fitting destination, stable context should
-        retain its home. A growing later turn can still use the deficit fallback.
-        """
-        for repeated_prompt in (60000, 50000):
-            with self.subTest(repeated_prompt=repeated_prompt):
-                placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
-                key = ("stable-prefix", None)
-                self.select(placement, key, prompt=60000, output=0, forced=0)
-                args = ([0, 1], [290000, 250000], [3, 3], [291840, 291840])
-                rank = placement.select(key, repeated_prompt, 0, *args)
-                self.assertEqual(rank, 0)
-                self.assertEqual(placement.retained, [60000, 0])
-                self.assertEqual(placement.select(key, 60001, 0, *args), 1)
-                self.assertEqual(placement.retained, [0, 60002])
-
-    def test_stable_context_still_spills_to_an_immediately_fitting_rank(self):
-        placement = DecodeSessionPlacement(2, reserved_decode_tokens=512)
-        key = ("stable-but-blocked", None)
-        self.select(placement, key, prompt=60000, output=0, forced=0)
+    def test_all_full_shrinking_context_uses_lower_deficit(self):
+        """A shorter context still needs capacity relief from a saturated home."""
+        placement = DecodeSessionPlacement(8, reserved_decode_tokens=512)
+        key = ("shrinking-context", None)
+        active = list(range(8))
+        capacity = [291840] * 8
+        placement.select(key, 45785, 32000, active, [0] * 8, [0] * 8, capacity, 3)
         rank = placement.select(
-            key, 60000, 0, [0, 1], [260000, 0], [2, 0], [291840, 291840]
+            key,
+            45329,
+            32000,
+            active,
+            [358189, 452894, 357885, 344088, 355082, 324968, 387687, 373453],
+            [7, 5, 5, 4, 8, 10, 5, 7],
+            capacity,
         )
-        self.assertEqual(rank, 1)
+        self.assertEqual(rank, 5)
 
     def test_spill_accounts_for_all_active_decode_reservations(self):
         """A raw prompt fit can still exceed KV once decode growth is reserved."""
