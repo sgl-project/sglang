@@ -350,22 +350,6 @@ class ReasonerGrammarObject(BaseGrammarObject):
         else:
             self._finished = finished
 
-    def try_jump_forward(self, tokenizer):
-        if self._is_generation() and self.grammar is not None:
-            return self.grammar.try_jump_forward(tokenizer)
-        return None
-
-    def jump_forward_str_state(self, helper):
-        if self._is_generation() and self.grammar is not None:
-            return self.grammar.jump_forward_str_state(helper)
-        return None
-
-    def jump_and_retokenize(self, old_output_ids, new_output_ids, next_state):
-        if self._is_generation() and self.grammar is not None:
-            return self.grammar.jump_and_retokenize(
-                old_output_ids, new_output_ids, next_state
-            )
-
 
 class ReasonerGrammarBackend(BaseGrammarBackend):
     def __init__(

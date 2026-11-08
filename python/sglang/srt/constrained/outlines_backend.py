@@ -15,7 +15,7 @@
 
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, Optional, Union
 
 import interegular
 import torch
@@ -31,7 +31,6 @@ from sglang.srt.constrained.base_grammar_backend import (
 from sglang.srt.constrained.json_schema_validation import (
     validate_outlines_json_schema,
 )
-from sglang.srt.constrained.outlines_jump_forward import OutlinesJumpForwardMap
 
 try:
     from outlines.fsm.json_schema import build_regex_from_schema
@@ -43,14 +42,9 @@ logger = logging.getLogger(__name__)
 
 
 class OutlinesGrammar(BaseGrammarObject):
-    def __init__(
-        self,
-        guide: RegexGuide,
-        jump_forward_map: Union[OutlinesJumpForwardMap, None],
-    ) -> None:
+    def __init__(self, guide: RegexGuide) -> None:
         super().__init__()
         self.guide = guide
-        self.jump_forward_map = jump_forward_map
         self.state = 0
 
     def accept_token(self, token: int):
@@ -78,40 +72,7 @@ class OutlinesGrammar(BaseGrammarObject):
         logits.masked_fill_(vocab_mask, float("-inf"))
 
     def copy(self):
-        return OutlinesGrammar(self.guide, self.jump_forward_map)
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple]:
-        if not self.jump_forward_map:
-            return None
-
-        jump_forward_bytes = self.jump_forward_map.jump_forward_byte(self.state)
-        if jump_forward_bytes is None or len(jump_forward_bytes) <= 1:
-            return None
-
-        # preprocess the jump forward string
-        suffix_bytes = []
-        continuation_range = range(0x80, 0xC0)
-        cur_state = self.state
-        while (
-            len(jump_forward_bytes) and jump_forward_bytes[0][0] in continuation_range
-        ):
-            # continuation bytes
-            byte_edge = jump_forward_bytes.pop(0)
-            suffix_bytes.append(byte_edge[0])
-            cur_state = byte_edge[1]
-
-        suffix_tokens = [f"<0x{hex(b)[2:].upper()}>" for b in suffix_bytes]
-        suffix_ids = tokenizer.convert_tokens_to_ids(suffix_tokens)
-        return suffix_ids, cur_state
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        _, cur_state = helper
-        return self.jump_forward_map.jump_forward_symbol(cur_state)
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        self.state = next_state
+        return OutlinesGrammar(self.guide)
 
 
 class OutlinesGrammarBackend(BaseGrammarBackend):
@@ -157,8 +118,7 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             logger.error(f"Hit invalid regex schema: {regex=}, {e=}")
             return InvalidGrammarObject(str(e))
 
-        jump_forward_map = None
-        return OutlinesGrammar(guide, jump_forward_map)
+        return OutlinesGrammar(guide)
 
     def dispatch_ebnf(self, key_string: str):
         return super().dispatch_ebnf(key_string)
