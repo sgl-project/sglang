@@ -328,6 +328,7 @@ class TestAdmissionAbortNotEnqueued(CustomTestCase):
             _set_or_validate_priority=MagicMock(return_value=True),
             _abort_on_queued_limit=MagicMock(return_value=False),
             _prefetch_kvcache=MagicMock(),
+            invariant_checker=MagicMock(),
         )
         Scheduler._add_request_to_queue(sched, req)
         self.assertEqual(list(sched.waiting_queue), [req])
