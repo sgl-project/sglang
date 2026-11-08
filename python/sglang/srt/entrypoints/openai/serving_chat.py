@@ -884,7 +884,10 @@ class OpenAIServingChat(OpenAIServingBase):
     def _continuous_usage_cached_details(
         self, content: dict[str, Any]
     ) -> PromptTokensDetails | None:
-        if not get_serving().enable_cache_report:
+        if (
+            not get_serving().enable_cache_report
+            and self.chat_encoding_spec != "kimi_k3"
+        ):
             return None
         return PromptTokensDetails(
             cached_tokens=content["meta_info"].get("cached_tokens", 0)

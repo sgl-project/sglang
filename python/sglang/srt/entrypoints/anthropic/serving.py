@@ -1135,6 +1135,8 @@ class AnthropicServing:
 
             # Usage-only chunk (empty choices with usage info)
             if not chunk.choices and chunk.usage:
+                for frame in _ensure_message_started(chunk.usage):
+                    yield frame
                 continue
 
             if not chunk.choices:
@@ -1163,13 +1165,9 @@ class AnthropicServing:
                 or (delta.content is not None and delta.content != "")
                 or chunk.usage
             )
-            # The finish_reason chunk should also flip message_started so a
-            # zero-content completion (the path that previously fired the
-            # 'Backend produced no content' error) emits the standard
-            # message_start before [DONE] closes the stream.
-            if (
-                has_delta_payload or choice.finish_reason is not None
-            ) and not message_started:
+            # A finish-only chunk carries no usage; the usage summary or
+            # [DONE] starts the message instead.
+            if has_delta_payload and not message_started:
                 yield _emit(_message_start_event(chunk.usage))
                 message_started = True
 
