@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -46,10 +47,19 @@ _cutedsl_logged_scalarize: set = set()
 
 def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
     """Select the same weight and execution layout on Blackwell SM100/SM103."""
-    return device.type == "cuda" and torch.cuda.get_device_capability(device) in (
-        (10, 0),
-        (10, 3),
-    )
+    if device.type != "cuda":
+        return False
+    # Resolve the current device before caching so an unindexed "cuda" device
+    # cannot reuse another GPU's result after torch.cuda.set_device().
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _use_cutedsl_moe_swap_ab(device_index)
+
+
+@lru_cache(maxsize=None)
+def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
 def cutedsl_quant_scale_to_scalar(

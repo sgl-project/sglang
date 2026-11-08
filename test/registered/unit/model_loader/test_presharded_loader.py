@@ -918,21 +918,21 @@ class TestShardConfig(unittest.TestCase):
             ),
         ):
             for a2a in (MoeA2ABackend.NONE, MoeA2ABackend.FLASHINFER):
-                for capability in ((10, 0), (10, 3), (10, 7), (12, 0)):
+                for swap_ab in (False, True):
                     with (
-                        self.subTest(a2a=a2a, capability=capability),
+                        self.subTest(a2a=a2a, swap_ab=swap_ab),
                         get_flags().moe.override(
                             runner_backend=MoeRunnerBackend.FLASHINFER_CUTEDSL,
                             a2a_backend=a2a,
                         ),
                         mock.patch(
-                            "torch.cuda.get_device_capability", return_value=capability
-                        ) as get_capability,
+                            "sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl.use_cutedsl_moe_swap_ab",
+                            return_value=swap_ab,
+                        ) as use_swap_ab,
                     ):
                         cfg = loader._collect_shard_config(model_config, target_device)
-                        swap_ab = capability in ((10, 0), (10, 3))
                         self.assertEqual(cfg["flashinfer_cutedsl_swap_ab"], swap_ab)
-                        get_capability.assert_called_once_with(target_device)
+                        use_swap_ab.assert_called_once_with(target_device)
                         configs[swap_ab] = cfg
             for backend, a2a in (
                 (MoeRunnerBackend.FLASHINFER_CUTLASS, MoeA2ABackend.NONE),
