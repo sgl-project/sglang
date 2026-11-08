@@ -45,7 +45,7 @@ _CONDITIONING_FIELDS = (
     "sigmas",
 )
 _SESSION_SKIP_EXTRA = frozenset(
-    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp"}
+    {"comfyui_session_id", "comfyui_cond_key", "comfyui_cache_fp", "comfyui_control"}
 )
 _SESSIONS: dict[str, dict[str, Any]] = {}
 _RUNS: dict[str, Any] = {}

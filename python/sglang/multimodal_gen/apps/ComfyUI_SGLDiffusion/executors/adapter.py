@@ -30,6 +30,8 @@ class PackedForward:
     prompt_seq_lens: list[list[int]] | None = None
     pooled_embeds: list[torch.Tensor] | None = None
     extra_req: dict[str, Any] = field(default_factory=dict)
+    # Per-step residual tensors (ComfyUI ControlNet); never cached on the worker.
+    control: dict[str, list] | None = None
     unpack_ctx: dict[str, Any] = field(default_factory=dict)
 
 
@@ -88,7 +90,3 @@ def get_adapter_class(model_type: str) -> type[ComfyUIModelAdapter]:
             f"Registered: {sorted(_ADAPTERS)}"
         )
     return _ADAPTERS[model_type]
-
-
-def registered_model_types() -> list[str]:
-    return sorted(_ADAPTERS)

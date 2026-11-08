@@ -10,25 +10,18 @@ import torch
 import sglang.srt.model_executor.model_runner_components.cuda_graph_setup as graph_setup
 import sglang.srt.model_executor.runner.prefill_cuda_graph_runner as runner_module
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.managers.scheduler_components.dp_attn import (
     _local_prefill_cuda_graph_vote,
 )
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     LayerWiseLoadCounter,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     capture_prefill_graph,
@@ -37,6 +30,7 @@ from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -45,11 +39,13 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 def _static_pool_translator():
-    """A static pool's translator: its plans hand every batch its own ids."""
-    return KVIndexTranslator(
+    """A static pool's runner_ids: its plans hand every batch its own ids."""
+    return RunnerIds(
         req_to_token=torch.zeros((1, 8), dtype=torch.int32),
         token_to_kv_pool_allocator=None,
-        token_to_kv_pool=object(),
+        token_to_kv_pool=SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        ),
         page_size=1,
         device="cpu",
     )
@@ -212,7 +208,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             prepare_dummy_forward_batch=lambda batch: prepared.append(batch) or batch,
             attn_tp_sequence_sharded=lambda _: False,
             attn_backend=attention_backend,
-            kv_index_translator=_static_pool_translator(),
+            runner_ids=_static_pool_translator(),
         )
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner.model_runner = model_runner
@@ -392,11 +388,11 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
         runner.max_seq_len = None
         runner._capture_chunked_prefix = False
         runner.buffer_registry = _FakeBatchRegistry()
-        translator = _static_pool_translator()
+        runner_ids = _static_pool_translator()
         runner.model_runner = SimpleNamespace(
             attn_tp_sequence_sharded=lambda _: False,
             prepare_dummy_forward_batch=lambda batch: batch,
-            kv_index_translator=translator,
+            runner_ids=runner_ids,
         )
         runner.enable_cp_bcg_capture = False
         runner._is_full_backend = False
@@ -430,9 +426,9 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
             capture_hidden_mode=CaptureHiddenMode.NULL,
             global_forward_mode=ForwardMode.EXTEND,
         )
-        translator.bind_own_plan(forward_batch)
+        runner_ids.bind_own_plan(forward_batch)
 
-        static_batch = runner.load_batch(forward_batch)
+        static_batch, _ = runner.load_batch(forward_batch)
 
         self.assertIs(static_batch.mm_input_embeds, mm_input_embeds)
 
@@ -688,6 +684,7 @@ class TestPrefillCudaGraphRunnerChunkedPrefix(CustomTestCase):
                     self.assertEqual(
                         _local_prefill_cuda_graph_vote(
                             local_batch=schedule_batch,
+                            num_tokens=4,
                             prefill_graph_runner=runner,
                             coordinated_prefill=True,
                             breakable_prefill=backend == Backend.BREAKABLE,

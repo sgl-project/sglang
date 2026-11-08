@@ -20,7 +20,7 @@ limitations under the License.
 //   out[:, h, 512:576] = fp8_e4m3(q_rope[:, h, :])
 //
 // This is the CUDA replacement for the Triton absorbed_bmm_concat_cast_q_fp8
-// kernel (triton_ops/cache_ops.py).  The epilogue keeps the exact rounding
+// kernel (attention/mla_qk_prep.py).  The epilogue keeps the exact rounding
 // chain of the Triton variants: fp32 WGMMA accumulate -> bf16 round-to-nearest
 // (cublas-equivalent output rounding) -> fp8_e4m3 rn/satfinite on store.  The
 // K dimension is consumed as one in-order chain of k=16 WGMMA steps into a
