@@ -23,7 +23,7 @@ from sglang.srt.configs.model_config import (
 from sglang.srt.environ import envs
 from sglang.srt.layers.layer_boundary.fusions.moe_finalize import MoeDeferredFinalize
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-from sglang.srt.models import minimax_m3
+from sglang.srt.models import minimax_m3, minimax_m3_vl
 from sglang.srt.models.dspark_minimax import DSparkMiniMaxDraftModel
 from sglang.srt.models.minimax_m3 import (
     MiniMaxM3Model,
@@ -433,8 +433,14 @@ class TestMiniMaxM31QuarkScaleNames(CustomTestCase):
         k = torch.full((2,), 127, dtype=torch.uint8)
         o = torch.full((2,), 126, dtype=torch.uint8)
         prefix = "model.layers.0.self_attn."
-        model._load_llm_weight(prefix + "k_proj.weight_scale", k, params, mapping, [])
-        model._load_llm_weight(prefix + "o_proj.weight_scale", o, params, mapping, [])
+        # the alias is ROCm-only; this CPU test runs the HIP loader path
+        with patch.object(minimax_m3_vl, "_is_hip", True):
+            model._load_llm_weight(
+                prefix + "k_proj.weight_scale", k, params, mapping, []
+            )
+            model._load_llm_weight(
+                prefix + "o_proj.weight_scale", o, params, mapping, []
+            )
         self.assertEqual(loaded["qkv"][0], "k")
         self.assertTrue(torch.equal(loaded["qkv"][1], k))
         self.assertIsNone(loaded["o"][0])
