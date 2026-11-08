@@ -161,7 +161,8 @@ def _get_num_stages_for_extend_attention(
     return 1
 
 
-# (BLOCK_M, num_warps) at head_dim 256 on RDNA3.5, where the 4-warp default spills ~390 VGPRs.
+# (BLOCK_M, num_warps) at head_dim 256 on RDNA3.5. The 4-warp default needs ~390 VGPRs more than
+# the 256 it gets, so it spills.
 # Measured on gfx1151: the prefix loop is fastest at BLOCK_M 64, the causal extend loop at 128.
 def _gfx115_head_dim_256_tiles(
     prefix_tokens: int, extend_tokens: int
@@ -1043,6 +1044,8 @@ def extend_attention_fwd(
         and score_mod is None
     ):
         # One kv_indices slot per cached prefix token (an upper bound in gpu_only mode); no sync.
+        # Decided per batch from the totals: a batch mixing long cached chunks with fresh prompts
+        # gets one config, the one that suits its overall prefix/new-token mix.
         BLOCK_M, num_warps = _gfx115_head_dim_256_tiles(
             prefix_tokens=kv_indices.shape[0], extend_tokens=q_extend.shape[0]
         )
