@@ -1382,15 +1382,21 @@ class ModelRunner:
             load_format=draft_load_format,
         )
 
-        with self._load_format_scope(draft_load_format):
-            loaded = load_model_with_memory_saver(
-                model_config=self.model_config,
-                load_config=self.load_config,
-                device=self.device,
-                gpu_id=self.gpu_id,
-                memory_saver_adapter=self.memory_saver_adapter,
-                is_draft_worker=self.is_draft_worker,
-            )
+        try:
+            with self._load_format_scope(draft_load_format):
+                loaded = load_model_with_memory_saver(
+                    model_config=self.model_config,
+                    load_config=self.load_config,
+                    device=self.device,
+                    gpu_id=self.gpu_id,
+                    memory_saver_adapter=self.memory_saver_adapter,
+                    is_draft_worker=self.is_draft_worker,
+                )
+        finally:
+            if get_exec().moe.enable_paged_experts:
+                from sglang.srt.layers.moe.paged_experts import expert_cache
+
+                expert_cache.loading_done()
         self.loader = loaded.loader
         self.model = loaded.model
         current_platform.post_load_model(self.model)

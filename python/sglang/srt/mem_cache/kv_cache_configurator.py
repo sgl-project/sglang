@@ -120,6 +120,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.draft_parallel import legacy_draft_attn_tp_size
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils.common import get_bool_env_var
 from sglang.srt.utils.device import (
     cpu_has_amx_support,
     get_available_gpu_memory,
@@ -429,6 +430,14 @@ class KVCacheConfigurator:
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
+
+    @property
+    def use_combined_kv_buffer(self) -> bool:
+        return (
+            get_bool_env_var("SGLANG_NPU_USE_FLASH_MLA", "False")
+            and self.spec_algorithm.is_dspark()
+            and not self.is_draft_worker
+        )
 
     @property
     def draft_attn_tp_size(self) -> int:
@@ -2187,6 +2196,7 @@ class KVCacheConfigurator:
             enable_memory_saver=get_exec().features.enable_memory_saver,
             start_layer=self.layer_info.start_layer,
             end_layer=self.layer_info.end_layer,
+            use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
         )
         return token_to_kv_pool
@@ -2552,6 +2562,8 @@ class KVCacheConfigurator:
                 "kv_lora_rank": self.model_config.kv_lora_rank,
                 "qk_rope_head_dim": self.model_config.qk_rope_head_dim,
             }
+            if _is_npu:
+                extra_args["use_combined_kv_buffer"] = self.use_combined_kv_buffer
             if is_deepseek_dsa(self.model_config.hf_config):
                 dsa_index_kpool = get_dsa_index_kpool(self.model_config.hf_config)
                 extra_args.update(

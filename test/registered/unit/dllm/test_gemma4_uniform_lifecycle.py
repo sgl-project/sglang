@@ -16,12 +16,12 @@ from sglang.srt.mem_cache.prefill_budget import SWAPrefillBudget
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-class _Req:
+class _Req(FakeReq):
     def __init__(self, context_len=8, block_size=4, *, prefill=False):
         self.origin_input_ids = array("q", range(context_len))
         self.output_ids = array("q")
