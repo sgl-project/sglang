@@ -2605,9 +2605,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
     def _alloc_for_decode_prealloc(
         self, allocator: BaseTokenToKVPoolAllocator, **kwargs
     ) -> torch.Tensor:
-        storage = kv_storage_of(
-            self.req_to_token_pool, allocator, tree_cache=self.tree_cache
-        )
+        storage = kv_storage_of(self.req_to_token_pool, allocator)
         # Every window other than the target's (whose tail the scheduler's
         # window gives) keeps its own tail, by the same rule: a fused draft's
         # band retains its own length.
@@ -2618,7 +2616,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if name != target
         }
         return alloc_for_decode_prealloc(
-            storage, allocator, stated_window_tails=stated_window_tails, **kwargs
+            storage,
+            allocator,
+            stated_window_tails=stated_window_tails,
+            tree_cache=self.tree_cache,
+            **kwargs,
         )
 
     def _transfer_page_indices(
@@ -2648,9 +2650,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_prefix_len = prefix_len
 
         req_pool_indices = kv_storage_of(
-            self.req_to_token_pool,
-            self.token_to_kv_pool_allocator,
-            tree_cache=self.tree_cache,
+            self.req_to_token_pool, self.token_to_kv_pool_allocator
         ).acquire([req])
 
         assert req_pool_indices is not None, (
@@ -2848,9 +2848,11 @@ def alloc_for_decode_prealloc(
     swa_tail_len: int,
     req_to_token_pool: Optional[ReqToTokenPool] = None,
     stated_window_tails: Optional[Dict[str, Tuple[int, str]]] = None,
+    tree_cache=None,
 ) -> torch.Tensor:
     """``stated_window_tails`` names, for each window with its own retention,
-    (tail tokens, tree component)."""
+    (tail tokens, tree component). ``tree_cache`` is the step's prefix cache,
+    for pools that need it."""
     stated_window_tails = stated_window_tails or {}
     req.kv.allocate_prealloc(fill_len)
     if allocator.page_size == 1:
@@ -2891,6 +2893,7 @@ def alloc_for_decode_prealloc(
             if uses_swa_tail
             else None
         ),
+        tree_cache=tree_cache,
     )
     if uses_swa_tail:
         tails = {window_sub_pool_of(allocator): swa_tail_len}
@@ -4071,7 +4074,9 @@ class SchedulerDisaggregationDecodeMixin:
         # write a reused row) and before this iteration's forward, never beside
         # one. The direct backend reads the device indices on the host while
         # preparing a copy, which there would wait for the in-flight forward, so
-        # its copies stay on the transfer engine's streams.
+        # its copies stay on the transfer engine's streams. Either way the ids a
+        # copy is recorded by are built on the schedule stream, where page moves
+        # read them: on the forward stream they would not exist yet.
         on_forward = get_memory().hicache_io_backend == "kernel"
         # As in run_batch: without overlap or PP, forwards run on the schedule
         # stream.
@@ -4080,21 +4085,18 @@ class SchedulerDisaggregationDecodeMixin:
             if self.enable_overlap or get_parallel().pp_size > 1
             else self.schedule_stream
         )
-        if on_forward:
-            # They read rows allocated on the schedule stream.
-            forward_stream.wait_stream(self.schedule_stream)
-        elif self.enable_overlap:
+        if not on_forward and self.enable_overlap:
             # A finished request can still have one redundant forward in flight,
             # and a copy may write a reused row: order the copies after it. Fence
             # only the copy stream, as HiCache loads do: index preparation must
             # not wait for the forward (the direct backend reads it on the host).
             engine.host_to_device_stream.wait_stream(self.forward_stream)
-        with contextlib.ExitStack() as placement:
-            if on_forward:
-                placement.enter_context(torch.cuda.stream(forward_stream))
-                placement.enter_context(engine.on_current_stream())
-            for req in reqs:
-                start_restore_kv_cache(req, self.tree_cache)
+        for req in reqs:
+            start_restore_kv_cache(
+                req,
+                self.tree_cache,
+                copy_stream=forward_stream if on_forward else None,
+            )
 
     def _host_restores_ready(self: Scheduler) -> set[int]:
         """Ids of the waiting requests whose restore copy has finished on every

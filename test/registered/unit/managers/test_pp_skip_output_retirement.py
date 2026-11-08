@@ -1,11 +1,9 @@
-"""A step's processing releases the unified pool's pages pending on its forward,
-so the host must have seen that forward end by then, including for the two
-results that carry no output of their own.
-
-BUG REGRESSION. A pipeline stage that skips a microbatch's output exchange
-recorded the placeholder's completion on the scheduler's current stream, which
-the local forward does not precede, so processing it released pages that
-forward could still read or write.
+"""A step's processing retires its forward in the unified pool and releases
+the pages pending on it, so the host must have seen that forward end by then,
+including for the two results that carry no output of their own: a pipeline
+stage's skipped output, whose completion must be ordered after the forward's
+done event (the scheduler's current stream does not follow the local forward),
+and a prebuilt step's inner idle forward.
 """
 
 import unittest
@@ -71,8 +69,11 @@ class TestSkippedOutputRetirement(CustomTestCase):
     def test_completion_follows_the_local_forward(self):
         stage = _Stage()
         forward_done = object()
-        meta = PPBatchMetadata(can_run_cuda_graph=False, forward_done=forward_done)
-        _, _, completion = stage._pp_make_skip_output_result(_batch(), meta)
+        meta = PPBatchMetadata(
+            can_run_cuda_graph=False, unified_forward_done=forward_done
+        )
+        _, result, completion = stage._pp_make_skip_output_result(_batch(), meta)
+        self.assertIs(result.unified_forward_done, forward_done)
         self.assertIsNot(completion.stream, stage.device_module.current)
         self.assertEqual(completion.stream.waited, [forward_done])
         # The scheduler's own stream takes no dependency on the forward.
@@ -86,7 +87,10 @@ class TestSkippedOutputRetirement(CustomTestCase):
         stage = _Stage()
         for meta in (PPBatchMetadata(can_run_cuda_graph=False), None):
             with self.subTest(meta=meta):
-                _, _, completion = stage._pp_make_skip_output_result(_batch(), meta)
+                _, result, completion = stage._pp_make_skip_output_result(
+                    _batch(), meta
+                )
+                self.assertIsNone(result.unified_forward_done)
                 self.assertIs(completion.stream, stage.device_module.current)
                 self.assertEqual(stage.device_module.made, [])
 

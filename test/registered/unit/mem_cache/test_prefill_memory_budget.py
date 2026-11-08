@@ -82,7 +82,7 @@ def _cache():
 
 
 def _multi_window_state_allocator(
-    *, lazy_compaction=False, extra_buffer=False, lazy_tracking=False
+    *, lazy_compaction=True, extra_buffer=False, lazy_tracking=False
 ):
     from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
     from sglang.srt.mem_cache.kv.decl import MHAGeometry, StateGeometry, kv_layer_decls
@@ -208,7 +208,7 @@ class TestJointStatePrefillMemoryBudget(unittest.TestCase):
         ):
             with self.subTest(lazy=lazy, tracking=tracking):
                 storage = _multi_window_state_allocator(
-                    lazy_compaction=lazy,
+                    lazy_compaction=True,
                     extra_buffer=tracking,
                     lazy_tracking=lazy,
                 )

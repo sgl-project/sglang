@@ -43,6 +43,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
         slots = alloc.state_slots.alloc(8)
         if moved:
             alloc.state_slots.free(slots[:4])
+            alloc.mamba_allocator.flush_for_allocation()
         working, tracking = slots[-1:], slots[-2:-1]
         physical = alloc.mamba_allocator.ids.translate(working)
         track_physical = alloc.mamba_allocator.ids.translate(tracking)

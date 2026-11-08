@@ -84,7 +84,7 @@ def _cache():
 class TestStateAdmissionLimits(unittest.TestCase):
     def test_pending_state_competes_for_bytes_not_full_identities(self):
         for window in (False, True):
-            for lazy in (False, True):
+            for lazy in (True,):
                 with self.subTest(window=window, lazy=lazy):
                     storage = _build(window=window, lazy=lazy)
                     allocator = storage.allocator

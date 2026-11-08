@@ -239,6 +239,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_host = _host_group_stub([], can_use_write_back_jit=False)
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller._l2_transfers.side_effect = lambda *args, **kwargs: (
             HybridCacheController._l2_transfers(controller, *args, **kwargs)
         )
@@ -296,6 +297,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             anchor_entry=entries[PoolName.KV], entry_map=entries
         )
         controller.mem_pool_device_allocator = object()
+        controller.kv_storage = None
         controller.load_queue = []
         return controller
 
@@ -1294,6 +1296,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
@@ -1330,6 +1333,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         controller.move_hybrid_indices = mock.Mock(
@@ -1389,6 +1393,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         )
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.ack_write_queue = []
         controller.write_fence_stream = None
         with mock.patch.object(transfer_module, "device_module", _FakeDeviceModule):
@@ -1482,6 +1487,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.write_fence_stream = None
@@ -1520,6 +1526,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         controller.mem_pool_host = FakeHostPool.__new__(FakeHostPool)
         controller.mem_pool_device = None
         controller.mem_pool_device_allocator = mock.Mock()
+        controller.kv_storage = None
         controller.device = "cuda"
         controller.ack_write_queue = []
         controller.write_fence_stream = None

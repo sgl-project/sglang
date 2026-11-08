@@ -216,10 +216,8 @@ def unified_fp8_for_dsv4_pool(*, is_draft_worker: bool, spec_algorithm) -> bool:
 
 
 def _should_enable_lazy_compaction() -> bool:
-    """Lazy compaction default — ON unless
-    `SGLANG_DISABLE_LAZY_COMPACTION=1` (escape hatch for A/B / rollback).
-    Centralized here so both unified-memory-pool factory call sites stay in sync.
-    """
+    """Whether the unified memory pool compacts lazily: always, since startup
+    refuses `SGLANG_DISABLE_LAZY_COMPACTION=1` with unified memory."""
     return not envs.SGLANG_DISABLE_LAZY_COMPACTION.get()
 
 
@@ -1144,11 +1142,9 @@ class KVCacheConfigurator:
                 end_layer=self.layer_info.end_layer,
                 enable_memory_saver=get_exec().features.enable_memory_saver,
                 need_sort=get_disagg().disaggregation_mode in ("decode", "prefill"),
-                # Lazy compaction: default ON, env-var escape hatch for rollback / A/B.
                 lazy_compaction=_should_enable_lazy_compaction(),
-                # Overlap mode: the allocator's `free` drops a
-                # wait_stream(forward_stream) barrier so eager compaction
-                # serializes after the in-flight forward's v2p/KV reads.
+                # A settle of pending pages whose forward recorded no event
+                # waits this stream.
                 forward_stream=self.forward_stream,
                 post_capture_active=self.post_capture_kv_active,
                 is_draft_worker=self.is_draft_worker,

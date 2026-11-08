@@ -165,6 +165,40 @@ class TestPlanNames(CustomTestCase):
                     slots,
                 )
 
+    def test_a_later_shape_keeps_the_tree_fields_it_leaves_out(self):
+        """The prefix tree binds its window and checkpoint interval, the
+        scheduler the capacities afterwards: the tree's slots stay."""
+        from sglang.srt.mem_cache.static_kv_storage import (
+            StaticKVStorage,
+            StaticPoolShape,
+        )
+
+        storage = StaticKVStorage(None, None)
+        storage.bind_shape(
+            StaticPoolShape(
+                has_window=True,
+                has_state=True,
+                token_capacity=8,
+                window=128,
+                checkpoint_interval=64,
+            )
+        )
+        tree = storage.tree_slots()
+        storage.bind_shape(
+            StaticPoolShape(
+                has_window=True,
+                has_state=True,
+                token_capacity=16,
+                full_tokens_per_layer=16,
+                swa_tokens_per_layer=4,
+            )
+        )
+        self.assertEqual(storage.tree_slots(), tree)
+        self.assertEqual(tree[1].window, 128)
+        self.assertEqual(tree[2].checkpoint_interval, 64)
+        self.assertEqual(storage._shape.token_capacity, 16)
+        self.assertEqual(storage._shape.swa_tokens_per_layer, 4)
+
     def test_static_tree_components_map_to_their_sub_pools(self):
         from sglang.srt.mem_cache.static_kv_storage import (
             StaticKVStorage,
@@ -358,8 +392,8 @@ class TestHostStack(CustomTestCase):
     def test_host_transfers_translate_through_the_storage(self):
         """A host copy maps the controller's ids to rows through the storage's
         id spaces, carried on its entry: the owner's and the state's ids are
-        virtual, a window's host loads bind physical pages. The views hold no
-        allocator callable."""
+        virtual, and a window's are the owner's token ids, so every copy
+        translates when it is submitted. The views hold no allocator callable."""
         for name in ("swa", "mamba", "tri"):
             with self.subTest(chain=name):
                 result, _, cache = self._build(name, backend=None)
@@ -367,11 +401,11 @@ class TestHostStack(CustomTestCase):
                 storage = allocator.storage
                 expected = {
                     storage.owner: allocator.full_attn_allocator.ids.translate,
-                    "window_32": None,
                     "mamba": None
                     if allocator.state is None
                     else allocator.state.slots.translate,
                 }
+                owner_ids = allocator.alloc(2 * allocator.page_size)
                 by_view = {
                     id(storage.view(s.name)): s.name for s in storage.sub_pools()
                 }
@@ -379,6 +413,14 @@ class TestHostStack(CustomTestCase):
                 for entry in result.host_pool_group.entry_map.values():
                     sub_pool = by_view[id(entry.device_pool)]
                     seen.add(sub_pool)
+                    if sub_pool == "window_32":
+                        self.assertTrue(
+                            torch.equal(
+                                entry.device_translate(owner_ids),
+                                storage.window_ids("window_32", owner_ids),
+                            )
+                        )
+                        continue
                     self.assertEqual(entry.device_translate, expected[sub_pool])
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))

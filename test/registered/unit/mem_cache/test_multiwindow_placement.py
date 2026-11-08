@@ -78,7 +78,7 @@ def _restore(saved):
 
 class TestMultiwindowPlacement(unittest.TestCase):
     def test_chunk_budget_crosses_historical_midpoint_fit_island(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 setup_allocator_context()
                 placement = FusedDraftPlacement.from_counts(
@@ -177,7 +177,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
 
     def test_downward_closure_and_physical_realization(self):
         for state, lazy, draft_dim in itertools.product(
-            (False, True), (False, True), (8, 24)
+            (False, True), (True,), (8, 24)
         ):
             allocator = _build(state=state, lazy=lazy, draft_dim=draft_dim)
             if state:
@@ -265,7 +265,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
         self.assertEqual(allocator.pricing_snapshot(), before)
 
     def test_state_first_then_token_transaction_after_end_flush(self):
-        for lazy, tokens in itertools.product((False, True), (4, 8, 16)):
+        for lazy, tokens in itertools.product((True,), (4, 8, 16)):
             with self.subTest(lazy=lazy, tokens=tokens):
                 allocator = _build(state=True, lazy=lazy, draft_dim=24)
                 slots = allocator.alloc_state_slots(3)
@@ -284,7 +284,7 @@ class TestMultiwindowPlacement(unittest.TestCase):
                 self.assertEqual(allocator.verify_byte_accounting(), [])
 
     def test_host_prefix_scope_keeps_future_takes_and_restores_cancellations(self):
-        for lazy in (False, True):
+        for lazy in (True,):
             with self.subTest(lazy=lazy):
                 allocator = _build(state=True, lazy=lazy, draft_dim=24)
                 bootstrap_state = allocator.alloc_state_slots(8)
