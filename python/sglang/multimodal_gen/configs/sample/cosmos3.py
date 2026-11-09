@@ -13,11 +13,8 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.configs.task_type import ModelTaskType
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 
 COSMOS3_DEFAULT_GUIDANCE_SCALE = 4.0
 COSMOS3_EDGE_T2I_GUIDANCE_SCALE = 7.0
