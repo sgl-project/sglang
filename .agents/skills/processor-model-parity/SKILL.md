@@ -183,9 +183,12 @@ writes:
   checkpoint its `chat_template` and the `special_tokens` its template context
   carries (`bos_token`, `eos_token`, `unk_token`), so the test renders offline.
 
-The tokenizer is loaded with SGLang's `get_tokenizer`, whose transformers v5
-fixes the engine's tokenizer gets: a bare `AutoTokenizer` can rebuild the
-pre-tokenizer and drop newlines (StepFun's `LlamaTokenizerFast` declaration).
+The tokenizer is loaded with SGLang's `get_tokenizer`, which restores the
+`tokenizer.json` pipeline a transformers v5 tokenizer class rebuilds
+(`_fix_v5_tokenizer_components`): a bare `AutoTokenizer` can drop newlines
+(StepFun's `LlamaTokenizerFast` declaration). A multimodal engine tokenizes through
+its processor (`hf_transformers/processor.py`), which does not apply that fix, so
+check its tokenizer against `get_tokenizer`'s before trusting the token ids.
 
 ```sh
 cd rust/sglang-processor

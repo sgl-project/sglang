@@ -407,7 +407,9 @@ forward only plain text chat requests (string `content`, no tools, no template
 kwargs or reasoning controls or historical `reasoning_content`, no assistant
 continuation, no consecutive users or non-leading system turns) and warn
 `UNVERIFIED` at startup; every other request shape is rendered for routing
-only.
+only. A `continue_final_message` prefix is tokenized on its own with the special
+tokens the tokenizer adds around a text, less one leading BOS, as SGLang's
+`_append_assistant_prefix_to_prompt_ids` does.
 
 Use matching model files on the router and workers, and set
 the same `--default-chat-template-kwargs`, `SGLANG_DEFAULT_THINKING`,
@@ -637,11 +639,10 @@ Step-3.5-Flash, Step-3.7-Flash and Step-5-Preview render with the checkpoint's
 `chat_template.jinja` through `rust/sglang-processor`, which picks them by the template
 (its `tool_response` turn, `<im_patch>` and Qwen3-Coder tool-call tags) and hands it the
 messages, tools and kwargs SGLang's Jinja path builds. Every text chat forwards
-`input_ids`; a `continue_final_message` prefix keeps the BOS the tokenizer adds, as
-SGLang encodes it. Media, `-0` in tool arguments or schemas, and a `chat_template`,
+`input_ids`. Media, `-0` in tool arguments or schemas, and a `chat_template`,
 `bos_token`, `eos_token` or `unk_token` key in `chat_template_kwargs` render on the
-worker. The processor does not reproduce the `step3p5` reasoning and tool parsers yet,
-so chats keep the engine's route.
+worker. With the cookbook's `step3p5` parsers, which the processor does not reproduce
+yet, chats keep the engine's route.
 
 ## HTTP/2
 

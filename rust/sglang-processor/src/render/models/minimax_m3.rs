@@ -7,7 +7,9 @@ use dynamo_renderer::PromptFormatter;
 use serde_json::{Map, Value, json};
 
 use super::glm53::valid_documents;
-use super::pydantic_dump::{continues_final_message, engine_message, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, parse_tool_arguments, split_continuation,
+};
 use super::qwen38::{prints_unlike_python, template_tools};
 use super::template_context::PreservedRequest;
 use crate::py::{py_truthy, python_float, python_json_compact};
@@ -300,30 +302,6 @@ fn normalize(kwargs: &mut Map<String, Value>, effort: &mut Option<Value>, thinki
         current = None;
     }
     *effort = current.filter(|e| e.as_str().is_some_and(|e| REASONING_EFFORTS.contains(&e)));
-}
-
-/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
-/// parse to a JSON object.
-fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
-    if message["role"] != "assistant" {
-        return Ok(());
-    }
-    let calls = message.get_mut("tool_calls").and_then(Value::as_array_mut);
-    for arguments in calls
-        .into_iter()
-        .flatten()
-        .filter_map(|call| call.get_mut("function")?.get_mut("arguments"))
-    {
-        if let Some(text) = arguments.as_str() {
-            let parsed = serde_json::from_str::<Value>(text)
-                .map_err(|_| "Assistant tool call function.arguments must be valid JSON.")?;
-            if !parsed.is_object() {
-                return Err("Assistant tool call function.arguments must be a JSON object.".into());
-            }
-            *arguments = parsed;
-        }
-    }
-    Ok(())
 }
 
 /// Each assistant tool call's parsed `function.arguments`.

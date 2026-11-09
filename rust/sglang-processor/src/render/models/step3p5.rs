@@ -7,8 +7,9 @@ use std::collections::HashMap;
 use dynamo_renderer::PromptFormatter;
 use serde_json::{Value, json};
 
+use super::glm53::has_negative_zero;
 use super::pydantic_dump::{
-    continues_final_message, engine_message, split_continuation, tool_arguments,
+    continues_final_message, engine_message, parse_tool_arguments, split_continuation,
 };
 use super::qwen38::{template_args, template_tools};
 use super::template_context::PreservedRequest;
@@ -167,35 +168,6 @@ fn coerce_effort(request: &mut Value) -> Result<(), String> {
     }
     request["reasoning_effort"] = float.into();
     Ok(())
-}
-
-/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
-/// parse to a JSON object.
-fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
-    for arguments in tool_arguments(message) {
-        if let Some(text) = arguments.as_str() {
-            let parsed = serde_json::from_str::<Value>(text)
-                .map_err(|_| "Assistant tool call function.arguments must be valid JSON.")?;
-            if !parsed.is_object() {
-                return Err("Assistant tool call function.arguments must be a JSON object.".into());
-            }
-            *arguments = parsed;
-        }
-    }
-    Ok(())
-}
-
-/// orjson reads `-0` as the integer `0`, which serde_json reads as `-0.0`; the
-/// two cannot be told apart once parsed.
-fn has_negative_zero(value: &Value) -> bool {
-    match value {
-        Value::Number(number) => number
-            .as_f64()
-            .is_some_and(|f| f == 0.0 && f.is_sign_negative()),
-        Value::Array(items) => items.iter().any(has_negative_zero),
-        Value::Object(fields) => fields.values().any(has_negative_zero),
-        _ => false,
-    }
 }
 
 /// The message SGLang's Jinja path hands the template: content as

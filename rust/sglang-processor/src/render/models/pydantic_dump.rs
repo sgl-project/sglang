@@ -98,6 +98,30 @@ pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
         .collect()
 }
 
+/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
+/// parse to a JSON object.
+pub(super) fn parse_tool_arguments(message: &mut Value) -> Result<(), String> {
+    if message["role"] != "assistant" {
+        return Ok(());
+    }
+    let calls = message.get_mut("tool_calls").and_then(Value::as_array_mut);
+    for arguments in calls
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.get_mut("function")?.get_mut("arguments"))
+    {
+        if let Some(text) = arguments.as_str() {
+            let parsed = serde_json::from_str::<Value>(text)
+                .map_err(|_| "Assistant tool call function.arguments must be valid JSON.")?;
+            if !parsed.is_object() {
+                return Err("Assistant tool call function.arguments must be a JSON object.".into());
+            }
+            *arguments = parsed;
+        }
+    }
+    Ok(())
+}
+
 /// `protocol.py::Function.model_dump()`, after `Tool._propagate_defer_loading`
 /// and `_validate_request`'s schema-type normalization. `Function._serialize`
 /// keeps the keys in the order the client sent them, then the rest as declared,
