@@ -614,7 +614,6 @@ class GlmImageTextAttention(nn.Module):
         rope_scaling: Optional[Dict[str, Any]] = None,
         max_position_embeddings: int = 131072,
         quant_config: QuantizationConfig | None = None,
-        dual_chunk_attention_config: Optional[dict[str, Any]] = None,
         partial_rotary_factor: float = 0.5,
         prefix: str = "",
     ):

@@ -580,6 +580,8 @@ if not current_arch().is_sm_at_least(9):
 
 Query the GPU through `sglang.kernels.arch.current_arch()` (`.is_sm(...)`, `.is_sm_at_least(...)`, `.num_sms`, `.supports_pdl`, `.smem_per_block_optin`, and `.cuda` / `.hip` to narrow by platform), not `torch.cuda.get_device_*` directly. Call it at call time, not import time.
 
+Name the family the kernel was built for. `is_sm_at_least(10)` also admits SM120/SM121, which have no tcgen05/TMEM, so an SM100-only kernel gates on `is_sm(10)`; an SM120 kernel on `is_sm(12)` (SM121 included). Use `is_sm_at_least` only when every later architecture really supports the path.
+
 ---
 
 ## Step 4: Write tests (required)
