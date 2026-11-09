@@ -285,7 +285,20 @@ class CompressedTensorsConfig(QuantizationConfig):
             weights_config = self.target_scheme_map["Linear"].get("weights")
             if weights_config and hasattr(weights_config, "block_structure"):
                 return weights_config.block_structure
-        return None
+        # llm-compressor can also list each quantized module as a target instead
+        # of "Linear"; their block-quantized weights must still get a block size.
+        blocks = []
+        for scheme in self.target_scheme_map.values():
+            weights_config = scheme.get("weights") if isinstance(scheme, dict) else None
+            block = getattr(weights_config, "block_structure", None)
+            if block and block not in blocks:
+                blocks.append(block)
+        if len(blocks) > 1:
+            raise ValueError(
+                f"Compressed-tensors checkpoints with several weight block sizes "
+                f"({blocks}) are not supported."
+            )
+        return blocks[0] if blocks else None
 
     @classmethod
     def from_config(cls, config: Dict[str, Any]) -> CompressedTensorsConfig:
