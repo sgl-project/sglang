@@ -74,6 +74,7 @@ from sglang.srt.layers.quantization.unquant import (
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -110,7 +111,6 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     ulysses_prepared,
 )
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
-from sglang.srt.utils import add_prefix
 
 logger = logging.getLogger(__name__)
 

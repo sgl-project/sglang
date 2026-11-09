@@ -30,6 +30,7 @@ from sglang.srt.configs.model_config import (
     get_minimax_sparse_layer_ids,
     get_unlimited_ocr_v2_sparse_config,
     is_deepseek_dsa,
+    is_deepseek_v4,
     is_minimax_sparse,
     is_unlimited_ocr_v2,
     uses_compressed_kv_attention,
