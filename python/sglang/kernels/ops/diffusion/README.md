@@ -248,10 +248,11 @@ mismatch; both run at every level. `minimax_h3_vae_denorm_clamp` also takes
 ### MiniMax-H3 online FP8 decoder
 
 Row producers for the online-FP8 ViT decoder: they feed the shared
-`apply_fp8_linear` dispatch through `OnlineFP8Linear` and run whenever the
-MiniMax-H3 FP8 decoder option is installed (the request `quality` tier neither
-selects nor disables them). All four are close-contract
-and gated to SM100+. FP8 epilogues follow `per_token_quant_fp8` (scale = amax /
+`apply_fp8_linear` dispatch through `OnlineFP8Linear`. The decode stage installs
+FP8 linears only for `quality="high"` with `--component-quantizations.video_vae fp8`,
+then restores the original modules on exit. `exact` and `lossless` never use this
+path. All four producers are close-contract and gated to SM100+.
+FP8 epilogues follow `per_token_quant_fp8` (scale = amax /
 448, clamp to +-448, an all-zero row gives scale 0); the fp32 reduction tree
 differs from eager, so the tests assert >= 99.9% identical E4M3 bins plus a
 half-ulp bound on the dequantized values rather than `torch.equal`.

@@ -466,7 +466,7 @@ FP8 is lossy; compare decoded frames against `exact` on your workload before
 serving it. Measurements for one workload are not a universal quality bound.
 
 Measured on one B300 (275,040 MiB VRAM), torch 2.14.1+cu130, CUDA 13.0,
-sglang-kernel 0.4.10 and FlashInfer 0.7.2, with the resident FL2VA checkpoint
+sglang-kernel 0.4.10 and FlashInfer 0.7.3, with the resident FL2VA checkpoint
 at revision `42ed227ee7df40d41602854ae760620d6eb651fe`. These are offline
 T2VA requests at 768p, 16:9, a 4-second target (107 output frames), batch 1,
 `performance_mode="speed"`, compilation off. The host container has 36.55 CPU
@@ -476,13 +476,14 @@ deployment (five measured calls per row):
 
 | Deployment / request quality | Decode | Full request | Runtime peak allocated |
 |---|---:|---:|---:|
-| No FP8 flag / `lossless` | 1.753 s | 15.461 s | 120.98 GiB |
-| FP8 flag / `lossless` | 1.751 s | 15.452 s | 120.98 GiB |
-| FP8 flag / `high` | 1.545 s | 15.268 s | 123.42 GiB |
+| No FP8 flag / `lossless` | 1.754 s | 15.490 s | 120.98 GiB |
+| FP8 flag / `lossless` | 1.754 s | 15.614 s | 120.98 GiB |
+| FP8 flag / `high` | 1.548 s | 15.335 s | 123.42 GiB |
 
 Times are medians, including per-request quantization and restoration; full
 request time also includes output delivery and MP4 writing. High reduced decode
-time by 11.8%, but full-request time by only 1.2%. Against the FP16 `lossless`
+time by 11.8%, but full-request time by only 1.8% within the FP8-enabled
+deployment (1.0% against the no-flag deployment). Against the FP16 `lossless`
 frames, the worst-frame PSNR was 48.07 dB and SSIM 0.99518 across all three
 prompts. Switching back to `exact` / `lossless` produced bit-identical raw
 video to the corresponding no-flag baseline. Audio was checked separately:
@@ -496,8 +497,8 @@ were released before the next request, but the allocator's reserved pool stayed
 [`bench_h3_fp8_quality.py`](https://github.com/sgl-project/sglang/blob/main/test/manual/perf/bench_h3_fp8_quality.py).
 
 A 50-step check with one prompt and explicit cuDNN video-VAE attention reduced
-warm decode from 1.761 s (`lossless`) to 1.300 s (`high`), but full-request time
-only from 101.433 s to 100.783 s. This is one warm observation per quality, not
+warm decode from 1.762 s (`lossless`) to 1.301 s (`high`), but full-request time
+only from 101.362 s to 100.844 s. This is one warm observation per quality, not
 a statistically established end-to-end gain. Worst-frame PSNR/SSIM was
 52.73 dB / 0.99824; non-high video remained bit-identical. The unquantized
 50-step baseline's audio roundoff reached 2.38e-7, so this run explicitly used
