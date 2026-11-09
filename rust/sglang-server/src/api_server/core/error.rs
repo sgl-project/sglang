@@ -5,6 +5,7 @@ use http::StatusCode;
 use sglang_api_types::api::v1 as api;
 
 use super::CoreOutput;
+use crate::multi_modality::worker::MediaError;
 
 /// Protocol-independent error category used by transport adapters.
 ///
@@ -78,6 +79,17 @@ pub(crate) enum CoreError {
 
     #[error("{0}")]
     Internal(String),
+}
+
+/// A media failure keeps Python's class and message, whether admission or the
+/// MM processor raised it: `ValueError` is a 400, anything else a 500.
+impl From<MediaError> for CoreError {
+    fn from(error: MediaError) -> Self {
+        match error {
+            MediaError::Client(message) => Self::InvalidArgument(message),
+            MediaError::Server(message) => Self::Internal(message),
+        }
+    }
 }
 
 impl CoreError {

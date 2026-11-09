@@ -139,9 +139,13 @@ class RadixAttention(nn.Module):
             and (breakable_cg or full_cg)
         )
         if use_eager_attention:
-            is_sparse = kwargs.get("idx_q") is not None
+            # `head_cls` identifies DASH: its 2D router inputs return one
+            # tensor, unlike MiniMax-M3's 3D dual-output path.
+            is_sparse = (
+                kwargs.get("idx_q") is not None and kwargs.get("head_cls") is None
+            )
             output, idx_output = allocate_attention_outputs(
-                self, q, v, kwargs.get("idx_q")
+                self, q, v, kwargs.get("idx_q") if is_sparse else None
             )
             return_lse = not is_sparse and bool(
                 kwargs.get("return_lse") or forward_batch.mha_return_lse
@@ -167,7 +171,7 @@ class RadixAttention(nn.Module):
             if return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
-        real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+        real_num_tokens = padded_extend_real_tokens(q.shape[0], forward_batch)
         if real_num_tokens is not None:
             return _attention_on_real_rows(
                 self,

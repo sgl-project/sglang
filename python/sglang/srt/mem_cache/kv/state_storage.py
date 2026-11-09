@@ -13,11 +13,12 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import torch
 
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.kv.router import KVLayerRouter
 
 
 class StateSlotsExhausted(RuntimeError):
@@ -96,16 +97,35 @@ class StateStorage:
 
     # -- slot lifecycle --
 
+    def pending_request_slots(self, table, req: Req) -> int:
+        """Slots acquire will allocate for this request's working/tracking state."""
+        return int(not req.kv.holds_mamba) + (
+            table.mamba_initial_tracking_slots
+            if table.enable_mamba_extra_buffer
+            and req.kv.mamba_ping_pong_track_buffer is None
+            else 0
+        )
+
     def acquire(
-        self, table, reqs: List[Req], rows: List[int], fresh_rows: List[bool]
+        self,
+        table,
+        reqs: List[Req],
+        rows: List[int],
+        fresh_rows: List[bool],
+        *,
+        reset_request_parts: bool = True,
     ) -> None:
         """Gives each request of newly bound ``rows`` its state slot and, with
         the extra buffer, its ping-pong tracking slots, and writes them into
         the table's columns. A request that already holds a slot (a radix hit,
         a continuing chunk) keeps it. ``fresh_rows`` marks rows the requests
         did not hold before: their speculative ReplaySSM cursors restart."""
+        # FIXME: these cursor resets run on the schedule stream when a row is
+        # reused, while the forward of the row's previous request may still be
+        # running and advancing the same cursors (the write-after-read barrier
+        # orders only shared reads). Order the reset after that forward.
         spec_write_pos = self.pool.replayssm_spec_write_pos
-        if spec_write_pos is not None:
+        if spec_write_pos is not None and reset_request_parts:
             fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
             if fresh_indices:
                 fresh = async_h2d(fresh_indices, dtype=torch.int64, device=table.device)
@@ -134,7 +154,9 @@ class StateStorage:
                 # A zero write_pos empties the ReplaySSM ring;
                 # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:
-                    self.pool.replayssm_write_pos[req.kv.mamba_pool_idx] = 0
+                    self.pool.replayssm_write_pos.index_fill_(
+                        0, self.slots.translate(mid).to(torch.int64), 0
+                    )
             mamba_indices.append(req.kv.mamba_pool_idx)
             if table.enable_mamba_extra_buffer:
                 if req.kv.mamba_ping_pong_track_buffer is None:

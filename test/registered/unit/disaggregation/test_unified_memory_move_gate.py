@@ -4,7 +4,7 @@ The source decides when lazy compaction may relocate physical pages. A page is
 exposed to the peer from the moment its address is published until the transfer
 concludes, and for part of that lifetime the request sits in NEITHER end's
 queue. Both cases below are exactly those windows: an earlier version of the
-predicates looked only at `disagg_prefill_inflight_queue` /
+predicates looked only at `disagg_prefill_transfer_queue` /
 `disagg_decode_transfer_queue` (plus `scheduler.chunked_req`) and reported idle
 here, letting compaction move pages under in-flight RDMA -- silent KV
 corruption with no crash.
@@ -18,14 +18,16 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    disagg_transfers_in_flight,
-)
+from sglang.srt.disaggregation.decode import DecodePreallocQueue
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import disagg_transfers_in_flight
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.mem_cache.kv.alloc.band import Band
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.kv.alloc.page_usage import PageUsage
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
@@ -38,14 +40,15 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 class _FakeTransferQueue:
     def __init__(self):
-        self.queue: List[object] = []
+        self.queue = decode_queue(ListKind.PD_RECEIVING)
 
 
-class _FakePreallocQueue:
+class _FakePreallocQueue(DecodePreallocQueue):
     """Mirrors the real queue's published-destination bookkeeping."""
 
-    def __init__(self):
+    def __init__(self, transfer_queue):
         self._num_published_destinations = 0
+        self.transfer_queue = transfer_queue
 
     @property
     def has_published_destinations(self) -> bool:
@@ -64,10 +67,12 @@ class _FakeScheduler:
     def __init__(self, mode: DisaggregationMode):
         self.disaggregation_mode = mode
         self.chunked_req: Optional[object] = None
-        self.disagg_prefill_inflight_queue: List[object] = []
+        self.disagg_prefill_transfer_queue: List[object] = []
         self.disagg_prefill_pending_chunk_rids: Set[str] = set()
         self.disagg_decode_transfer_queue = _FakeTransferQueue()
-        self.disagg_decode_prealloc_queue = _FakePreallocQueue()
+        self.disagg_decode_prealloc_queue = _FakePreallocQueue(
+            self.disagg_decode_transfer_queue
+        )
         self.decode_offload_manager = None
 
 
@@ -89,7 +94,9 @@ class TestDecodeMoveGate(CustomTestCase):
         self.assertTrue(busy())
 
         # Handing the batch to the transfer queue transfers responsibility.
-        scheduler.disagg_decode_transfer_queue.queue.append(object())
+        scheduler.disagg_decode_transfer_queue.queue.join(
+            [SimpleNamespace(req=FakeReq(), host_staged=False)]
+        )
         scheduler.disagg_decode_prealloc_queue.note_destinations_queued(1)
         self.assertTrue(busy(), "transfer queue still holds it")
 
@@ -100,7 +107,7 @@ class TestDecodeMoveGate(CustomTestCase):
 class TestPrefillMoveGate(CustomTestCase):
     def test_closed_after_final_chunk_clears_chunked_req(self):
         """Scheduling the final chunk clears `scheduler.chunked_req`, but the
-        request only reaches `disagg_prefill_inflight_queue` later in the result
+        request only reaches `disagg_prefill_transfer_queue` later in the result
         path. Earlier middle chunks may still be draining in that window, so the
         source must not key off `chunked_req` alone.
         """
@@ -115,15 +122,15 @@ class TestPrefillMoveGate(CustomTestCase):
 
         # Final chunk scheduled: chunked_req cleared, not yet inflight-queued.
         scheduler.chunked_req = None
-        self.assertFalse(scheduler.disagg_prefill_inflight_queue)
+        self.assertFalse(scheduler.disagg_prefill_transfer_queue)
         self.assertTrue(busy())
 
         # Last chunk sent: the request is on the inflight queue, which covers it.
-        scheduler.disagg_prefill_inflight_queue.append(object())
+        scheduler.disagg_prefill_transfer_queue.append(object())
         scheduler.disagg_prefill_pending_chunk_rids.discard("r0")
         self.assertTrue(busy())
 
-        scheduler.disagg_prefill_inflight_queue.clear()
+        scheduler.disagg_prefill_transfer_queue.clear()
         self.assertFalse(busy())
 
     def test_reopens_when_middle_sent_request_is_retired_without_final_chunk(self):
@@ -157,10 +164,12 @@ class TestPinnedPeerHolesAreNotSchedulable(CustomTestCase):
     class _Peer:
         def __init__(self, sources):
             self.lazy_compaction = True
-            self._free_phys_pages = [0, 1, 2, 3]  # only len() is read
-            self._load_pinned_pages = 0
+            self.usage = PageUsage()  # no page fixed
             self.entry_bytes_per_page = 512
             self.pin_sources = sources
+
+        def _reusable_pages(self):
+            return 4  # four holes, nothing pending
 
         def _is_frontier_transparent(self):
             return False
@@ -312,11 +321,15 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 check_pins(False)
 
                 scheduler.disaggregation_mode = DisaggregationMode.DECODE
-                scheduler.disagg_prefill_inflight_queue = None
+                scheduler.disagg_prefill_transfer_queue = None
                 scheduler.disagg_decode_transfer_queue = _FakeTransferQueue()
-                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue()
+                scheduler.disagg_decode_prealloc_queue = _FakePreallocQueue(
+                    scheduler.disagg_decode_transfer_queue
+                )
                 check_pins(False)
-                scheduler.disagg_decode_transfer_queue.queue.append(object())
+                scheduler.disagg_decode_transfer_queue.queue.join(
+                    [SimpleNamespace(req=FakeReq(), host_staged=False)]
+                )
                 check_pins(True)
                 scheduler.disagg_decode_transfer_queue.queue.clear()
                 offload = SimpleNamespace(busy=True)
@@ -329,9 +342,9 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
 
     def test_every_ordering_event_reaches_every_member(self):
         """Every member that can relocate pages must hear each event its moves
-        wait on: a member that misses a HiCache copy's event may move a page the
-        copy still reads or writes. Recurrent state is written by its own
-        kernels, so its member gets no in-flight token ids."""
+        wait on: a member that misses a forward's event may move a page the
+        forward still reads or writes. Recurrent state is written by its own
+        kernels, so its member gets the state slots, not the token ids."""
         for chain in self._CHAINS:
             alloc = self._chain(chain)
             received = {m.sub_pool_name: {} for m in alloc.members}
@@ -339,7 +352,6 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                 for member in alloc.members:
                     got = received[member.sub_pool_name]
                     for name, hook in (
-                        ("set_hicache_transfer_done_event", "hicache"),
                         ("set_latest_forward_done_event", "forward_done"),
                         ("set_inflight_forward", "inflight"),
                     ):
@@ -347,16 +359,15 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
                             mock.patch.object(
                                 member,
                                 name,
-                                side_effect=lambda *args, got=got, hook=hook: (
+                                side_effect=lambda *args, got=got, hook=hook, **_: (
                                     got.__setitem__(hook, args[-1])
                                 ),
                             )
                         )
                 event, ids = object(), torch.tensor([5, 6])
-                alloc.set_hicache_transfer_done_event("load", event)
                 alloc.set_latest_forward_done_event(event)
-                alloc.set_inflight_forward(event, ids)
-            for hook in ("hicache", "forward_done", "inflight"):
+                alloc.set_inflight_forward(event, ids, torch.tensor([3]))
+            for hook in ("forward_done", "inflight"):
                 with self.subTest(chain=chain, hook=hook):
                     self.assertEqual(
                         {name for name, got in received.items() if hook in got},
@@ -366,7 +377,7 @@ class TestUnifiedAllocatorsPublishTheTransferContract(CustomTestCase):
             with self.subTest(chain=chain, hook="inflight ids"):
                 for name, got in received.items():
                     if name == "mamba":
-                        self.assertIsNone(got["inflight"])
+                        self.assertEqual(got["inflight"].tolist(), [3])
                     else:
                         self.assertEqual(got["inflight"].tolist(), [5, 6])
 

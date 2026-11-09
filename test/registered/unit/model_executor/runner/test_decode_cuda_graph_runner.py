@@ -3,9 +3,9 @@
 Two capture-trace modes plus their precedence:
 
   * **Original single-trace** (``SGLANG_ENABLE_CUDA_GRAPH_CAPTURE_TRACE``):
-    ``_init_profile_context_and_memory_record`` builds an *unscheduled* profiler
+    ``create_cuda_capture_profile`` builds an *unscheduled* profiler
     (``record_shapes`` only, no schedule / no ``on_trace_ready``); the combined
-    trace is exported in ``_post_process_after_profile`` via
+    trace is exported in ``finish_cuda_capture_profile`` via
     ``export_cuda_graph_capture_trace``.
   * **Per-batch-size traces** (``SGLANG_GRAPH_BATCH_CAPTURE``): a *scheduled*
     profiler (``wait=2, warmup=0, active=1, repeat=0``) with the trace-export
@@ -35,7 +35,8 @@ from sglang.srt.model_executor.runner import decode_cuda_graph_runner as mod
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
-from sglang.srt.utils import profile_utils as putils
+from sglang.srt.model_executor.runner_backend import capture_profile as profile_mod
+from sglang.srt.observability import profile_utils as putils
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -47,7 +48,7 @@ _BATCH_CAPTURE = "SGLANG_GRAPH_BATCH_CAPTURE"
 
 def _make_fake_self(capture_bs):
     """Stand-in ``self`` with the real precedence helper bound so the env-var
-    gating in ``_init_profile_context_and_memory_record`` applies."""
+    gating in ``create_cuda_capture_profile`` applies."""
     fake_self = SimpleNamespace(capture_bs=list(capture_bs))
     fake_self._graph_batch_capture_active = (
         DecodeCudaGraphRunner._graph_batch_capture_active.__get__(fake_self)
@@ -59,6 +60,9 @@ def _make_fake_self(capture_bs):
     )
     fake_self._profile_runner_name = DecodeCudaGraphRunner._profile_runner_name.__get__(
         fake_self
+    )
+    fake_self._capture_profile_options = (
+        DecodeCudaGraphRunner._capture_profile_options.__get__(fake_self)
     )
     return fake_self
 
@@ -82,9 +86,9 @@ class TestInitProfileBatchMode(CustomTestCase):
         with (
             mock.patch.dict(os.environ, env, clear=False),
             mock.patch.object(
-                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
+                profile_mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
             ),
-            mock.patch.object(mod, "profile") as mock_profile,
+            mock.patch.object(profile_mod, "profile") as mock_profile,
             mock.patch("torch.profiler.schedule") as mock_schedule,
             mock.patch(
                 "torch.cuda.memory._record_memory_history"
@@ -93,8 +97,8 @@ class TestInitProfileBatchMode(CustomTestCase):
             os.environ.pop(_CAPTURE_TRACE, None)  # original flag off
             if profiler_dir is None:
                 os.environ.pop("SGLANG_TORCH_PROFILER_DIR", None)
-            ctx = DecodeCudaGraphRunner._init_profile_context_and_memory_record(
-                fake_self
+            ctx = profile_mod.create_cuda_capture_profile(
+                fake_self._capture_profile_options()
             )
         self.assertIs(ctx, mock_profile.return_value)
         return fake_self, mock_profile, mock_schedule, mock_record_history
@@ -103,11 +107,6 @@ class TestInitProfileBatchMode(CustomTestCase):
         with tempfile.TemporaryDirectory() as tmp:
             self._invoke(capture_bs=[1, 2, 4], profiler_dir=tmp)
             self.assertTrue(os.path.isdir(os.path.join(tmp, "graph_capture_profile")))
-
-    def test_primes_empty_trace_tag(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            fake_self, *_ = self._invoke(capture_bs=[1, 2, 4, 8], profiler_dir=tmp)
-            self.assertIsNone(fake_self._profile_trace_tag)
 
 
 class TestInitProfileOriginalMode(CustomTestCase):
@@ -122,16 +121,18 @@ class TestInitProfileOriginalMode(CustomTestCase):
             with (
                 mock.patch.dict(os.environ, environ, clear=False),
                 mock.patch.object(
-                    mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
+                    profile_mod, "get_parallel", return_value=SimpleNamespace(tp_rank=0)
                 ),
-                mock.patch.object(mod, "profile") as mock_profile,
+                mock.patch.object(profile_mod, "profile") as mock_profile,
                 mock.patch("torch.profiler.schedule") as mock_schedule,
                 mock.patch("torch.cuda.memory._record_memory_history"),
             ):
                 for k in (_CAPTURE_TRACE, _BATCH_CAPTURE):
                     if k not in environ:
                         os.environ.pop(k, None)
-                DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
+                profile_mod.create_cuda_capture_profile(
+                    fake_self._capture_profile_options()
+                )
             kwargs = mock_profile.call_args.kwargs
             # Unscheduled pass: record_shapes only, no schedule / on_trace_ready.
             self.assertTrue(kwargs["record_shapes"])
@@ -164,14 +165,16 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 clear=False,
             ),
             mock.patch.object(
-                mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
+                profile_mod, "get_parallel", return_value=SimpleNamespace(tp_rank=rank)
             ),
-            mock.patch.object(mod, "profile") as mock_profile,
+            mock.patch.object(profile_mod, "profile") as mock_profile,
             mock.patch("torch.profiler.schedule"),
             mock.patch("torch.cuda.memory._record_memory_history"),
         ):
             os.environ.pop(_CAPTURE_TRACE, None)
-            DecodeCudaGraphRunner._init_profile_context_and_memory_record(fake_self)
+            profile_mod.create_cuda_capture_profile(
+                fake_self._capture_profile_options()
+            )
         on_trace_ready = mock_profile.call_args.kwargs["on_trace_ready"]
         return fake_self, on_trace_ready
 
@@ -191,7 +194,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
 
             exported = []
             for bs in (4, 2, 1):
-                fake_self._set_profile_trace_tag(bs, None, None, None)
+                fake_self._set_profile_trace_tag(bs, None, None)
                 self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -215,7 +218,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             exported = []
             for bs in (2, 1):
                 for attention_variant in ("dense", "sparse"):
-                    fake_self._set_profile_trace_tag(bs, None, None, attention_variant)
+                    fake_self._set_profile_trace_tag(bs, None, attention_variant)
                     self._flush(on_trace_ready, exported)
 
             self.assertEqual(
@@ -236,7 +239,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
             )
             exported = []
             for i in range(6):
-                fake_self._set_profile_trace_tag(2, None, None, f"v{i}")
+                fake_self._set_profile_trace_tag(2, None, f"v{i}")
                 self._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 6)
 
@@ -255,7 +258,7 @@ class TestOnTraceReadyNaming(CustomTestCase):
                 capture_bs=[8], rank=3, tmp=tmp
             )
             runner = type(fake_self).__name__
-            fake_self._set_profile_trace_tag(8, None, None, None)
+            fake_self._set_profile_trace_tag(8, None, None)
             prof = mock.Mock()
             on_trace_ready(prof)
             prof.export_chrome_trace.assert_called_once_with(
@@ -270,18 +273,18 @@ class TestProfileTraceTag(CustomTestCase):
 
     def test_bs_only_when_no_variants(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(16, None, None, None)
+        fake_self._set_profile_trace_tag(16, None, None)
         self.assertEqual(fake_self._profile_trace_tag, "bs_16")
 
-    def test_appends_attention_lora_and_stream(self):
+    def test_appends_attention_and_lora(self):
         fake_self = _make_fake_self([1])
-        fake_self._set_profile_trace_tag(8, 1, "nolora", "sparse")
-        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora_stream_1")
+        fake_self._set_profile_trace_tag(8, "nolora", "sparse")
+        self.assertEqual(fake_self._profile_trace_tag, "bs_8_sparse_nolora")
 
     def test_noop_without_scheduled_profiler(self):
         fake_self = _make_fake_self([1])
         fake_self._profiler = None
-        fake_self._set_profile_trace_tag(8, None, None, "sparse")
+        fake_self._set_profile_trace_tag(8, None, "sparse")
         self.assertFalse(hasattr(fake_self, "_profile_trace_tag"))
 
 
@@ -317,7 +320,7 @@ class TestProfileRunnerName(CustomTestCase):
                     )
                 )
                 for bs in (2, 1):
-                    fake_self._set_profile_trace_tag(bs, None, None, None)
+                    fake_self._set_profile_trace_tag(bs, None, None)
                     TestOnTraceReadyNaming._flush(on_trace_ready, exported)
             self.assertEqual(len(exported), 4)
             self.assertEqual(len(set(exported)), len(exported))
@@ -409,12 +412,15 @@ class TestAttentionVariantSizes(CustomTestCase):
                 runner.attention_variant_sizes = sizes
                 captured = {}
 
-                def capture_one_shape(bs, forward, stream_idx, lora, label):
+                def capture_one_shape(bs, forward, lora, label):
                     # the label a capture runs under, and what the model reads
                     seen = (label, get_capture_attention_variant())
                     captured.setdefault(bs, []).append(seen)
 
                 runner.capture_one_shape = capture_one_shape
+                runner.backend = SimpleNamespace(
+                    prepare_capture_forward=lambda *a, **k: contextlib.nullcontext()
+                )
                 with (
                     mock.patch.object(
                         mod,
@@ -422,11 +428,6 @@ class TestAttentionVariantSizes(CustomTestCase):
                         return_value=SimpleNamespace(tp_rank=1, tp_group=None),
                     ),
                     mock.patch.object(mod, "get_available_gpu_memory", return_value=0),
-                    mock.patch.object(
-                        mod.torch_compile_decoration,
-                        "patch_model",
-                        side_effect=lambda *a, **k: contextlib.nullcontext(),
-                    ),
                 ):
                     runner._capture_one_stream()
                 self.assertEqual(captured, captures)
@@ -485,9 +486,9 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner.dllm_uses_input_embeds = False
         runner.dllm_input_preparation = None
         runner.ragged_verify_mode = False
-        runner.enable_pdmux = False
         runner.deepep_adapter = SimpleNamespace(replay=lambda: None)
         runner.bs, runner.captured_req_width, runner.raw_num_token = 2, 2, 4
+        runner.raw_bs, runner.require_mlp_tp_gather = 2, False
         runner.buffers = SimpleNamespace(
             input_ids=torch.zeros(4, dtype=torch.int64),
             positions=torch.zeros(4, dtype=torch.int64),
@@ -503,7 +504,7 @@ class TestPrePlannedReplayRestage(CustomTestCase):
         runner._resolve_lora_variant = lambda _: None
         runner._resolve_attention_variant = lambda *_: None
         runner._make_graph_key = lambda *key: key
-        # SGLANG_Q35MF_MKH_N3B on
+        # SGLANG_OPT_SPEC_VERIFY_REUSE_STAGED_INPUTS on
         runner._restage_skip, runner._staged_inputs = True, None
         return runner
 
@@ -642,12 +643,14 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
     KEY = (2, "TARGET_VERIFY", "TARGET_VERIFY")
 
-    def _replay(self, glue, *, raw_bs=2, bs=2, skip=True, staged=False):
+    def _replay(
+        self, glue, *, raw_bs=2, bs=2, skip=True, staged=False, padded_glue=False
+    ):
         runner = mod.DecodeCudaGraphRunner.__new__(mod.DecodeCudaGraphRunner)
         runner._metadata_glue = glue
         runner._skip_glued_replay_view = skip
+        runner._padded_glue = padded_glue
         runner.enable_two_batch_overlap = False
-        runner.enable_pdmux = False
         runner.model_runner = SimpleNamespace(lora_manager=None)
         runner.capture_forward_mode = mod.ForwardMode.TARGET_VERIFY
         eager = []
@@ -696,6 +699,15 @@ class TestReplayAttnMetadataWiring(CustomTestCase):
 
         glue = _RecordingGlue(captured_keys=[key])
         views, eager = self._replay(glue, raw_bs=1)
+        self.assertEqual((glue.calls, eager), ([], views))
+
+        # A declared DSV4 glue also takes padded replays; IDLE (raw_bs 0) stays eager.
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=1, padded_glue=True)
+        self.assertEqual((glue.calls, views, eager), ([("replay", key)], [], []))
+
+        glue = _RecordingGlue(captured_keys=[key])
+        views, eager = self._replay(glue, raw_bs=0, padded_glue=True)
         self.assertEqual((glue.calls, eager), ([], views))
 
 
