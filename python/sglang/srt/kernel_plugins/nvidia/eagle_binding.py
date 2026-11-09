@@ -36,7 +36,7 @@ from typing import Any, Optional
 import msgspec
 import torch
 
-from sglang.srt.mem_cache.kv.router import STATE_PART
+from sglang.srt.mem_cache.kv.decl import STATE_PART
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel, get_schedule, get_spec
 

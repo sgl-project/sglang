@@ -95,7 +95,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_QWEN4_PLE_FILE_SKIP_DEVICE_CHECK</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the load-time check that the device reads pageable host memory through the host page tables (`cudaDevAttrPageableMemoryAccessUsesHostPageTables`) before using the file-backed PLE table; only for devices that cannot be queried</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the load-time check that the device reads pageable host memory (`cudaDevAttrPageableMemoryAccess`) before using the file-backed PLE table; only for devices that cannot be queried</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>0</code></td>
     </tr>
     <tr>

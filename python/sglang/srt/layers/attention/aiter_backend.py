@@ -4696,16 +4696,12 @@ class AiterAttnBackend(AttentionBackend):
                         .view(v_cache.dtype)
                         .view(-1, layer.tp_v_head_num, layer.v_head_dim)
                     )
-                    fp8_q_descale = (
-                        layer.k_scale if layer.k_scale is not None else self.k_scale
-                    )
+                    q_fp8, q_scale = self._quantize_q_fp8(q)
                     o = flash_attn_varlen_fp8_pertensor_func(
-                        q.contiguous()
-                        .view(-1, layer.tp_q_head_num, layer.qk_head_dim)
-                        .to(fp8_dtype),
+                        q_fp8.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         k_gather,
                         v_gather,
-                        fp8_q_descale.reshape(1),
+                        q_scale.reshape(1),
                         k_descale.reshape(1),
                         v_descale.reshape(1),
                         self.forward_metadata.qo_indptr[:bs0],
