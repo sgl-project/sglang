@@ -9,7 +9,6 @@ from torch.nn.parameter import Parameter
 
 from sglang.kernels.ops.quantization.int8_kernel import per_token_quant_int8
 from sglang.srt.environ import envs
-from sglang.srt.hardware_backend.sail.deep_gemm import entrypoint as sail_entrypoint
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.amx_utils import (
     CPUQuantMethod,
@@ -36,20 +35,17 @@ from sglang.srt.utils import (
     is_sail,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import StandardDispatchOutput
-
-logger = logging.getLogger(__name__)
-ACTIVATION_SCHEMES = ["static", "dynamic"]
 
 _is_cuda = is_cuda()
 _is_sail = is_sail()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_cpu_arm64 = is_host_cpu_arm64()
+logger = logging.getLogger(__name__)
 
 if _is_cuda:
     from sgl_kernel import int8_scaled_mm
@@ -66,27 +62,6 @@ if _is_cuda:
         M = mat_a.shape[-2]
         N = mat_b.shape[-1]
         return mat_a.new_empty((M, N), dtype=out_dtype)
-
-
-def gemm_nt_i8i8bf16_fake(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    return
-
-
-@register_custom_op(mutates_args=["C"], fake_impl=gemm_nt_i8i8bf16_fake)
-def gemm_nt_i8i8bf16(
-    A: torch.Tensor,
-    As: torch.Tensor,
-    B: torch.Tensor,
-    Bs: torch.Tensor,
-    C: torch.Tensor,
-) -> None:
-    sail_entrypoint.gemm_nt_i8i8bf16((A, As), (B, Bs), C)
 
 
 class W8A8Int8Config(QuantizationConfig):
@@ -255,6 +230,10 @@ class W8A8Int8LinearMethod(LinearMethodBase):
             and envs.SGLANG_SAIL_DEEPGEMM_DENSE.get()
             and bias is None
         ):
+            from sglang.srt.hardware_backend.sail.deep_gemm.sail_fused_deepgemm_ops import (
+                gemm_nt_i8i8bf16,
+            )
+
             out = torch.empty(
                 (x_q_2d.shape[0], layer.weight.shape[1]),
                 dtype=torch.bfloat16,
