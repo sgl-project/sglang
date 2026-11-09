@@ -29,7 +29,7 @@ from sglang.srt.managers.io_struct import (
     ContinueGenerationReqInput,
     PauseGenerationReqInput,
 )
-from sglang.srt.managers.req_types import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.deferred_responses import (
@@ -1124,7 +1124,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
     def test_dllm_retract_takes_requests_left_out_of_the_last_round(self):
         """A dLLM request keeps its row between rounds. One the last round left
         out, as a prefill round leaves out the decoding requests, is retracted
-        too, its row released."""
+        too, its row released, and comes back as a prefill of its prompt and
+        output. One the last round finished leaves the dLLM lists, which a
+        paused loop would otherwise keep busy."""
         scheduler = self._new_scheduler()
         dllm_config = DllmConfig(
             algorithm="LowConfidence",
@@ -1135,7 +1137,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         )
         scheduler.dllm_config = dllm_config
         scheduler.dllm_manager = DllmManager(dllm_config=dllm_config, abort=MagicMock())
-        decoding, prefilling = (
+        decoding, prefilling, done = (
             Req(
                 rid=rid,
                 origin_input_text="",
@@ -1143,18 +1145,24 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 sampling_params=SamplingParams(),
                 dllm_config=dllm_config,
             )
-            for rid in ("decoding", "prefilling")
+            for rid in ("decoding", "prefilling", "done")
         )
+        # A prompt shorter than a block, with output past it.
+        decoding.origin_input_ids = array("q", [1, 2])
+        decoding.output_ids = array("q", [3, 4, 5])
         decoding.kv.req_pool_idx = 0
         decoding.dllm_initialized = True
         decoding.dllm_phase = DllmReqPhase.STAGING_DECODE
         prefilling.kv.req_pool_idx = 1
         prefilling.dllm_phase = DllmReqPhase.STAGING_PREFILL
-        scheduler.dllm_manager.waiting_queue.join([decoding, prefilling])
-        scheduler.dllm_manager.add_staging_reqs([prefilling])
+        # Finished and released by the last round's result.
+        done.finished_reason = FINISH_LENGTH(length=0)
+        done.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        scheduler.dllm_manager.waiting_queue.join([decoding, prefilling, done])
+        scheduler.dllm_manager.add_staging_reqs([prefilling, done])
         scheduler.running_batch = self._make_batch(scheduler, [])
         scheduler.last_batch = self._make_batch(
-            scheduler, [prefilling], forward_mode=ForwardMode.DLLM_EXTEND
+            scheduler, [prefilling, done], forward_mode=ForwardMode.DLLM_EXTEND
         )
         requeue_log = self._spy_requeue(scheduler)
 
@@ -1168,6 +1176,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
             [entry["req"] for entry in requeue_log], [prefilling, decoding]
         )
         self.assertEqual(len(scheduler.dllm_manager.waiting_queue), 0)
+        self.assertFalse(scheduler.dllm_manager.any_staging_reqs())
         self.assertFalse(decoding.kv.holds_kv)
         self.assertEqual(decoding.dllm_phase, DllmReqPhase.INCOMING_PREFILL)
 

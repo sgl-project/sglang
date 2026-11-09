@@ -6306,12 +6306,15 @@ class Scheduler(
             ]
 
         if self.dllm_config is not None:
+            # A request the last round finished leaves the dLLM lists only at the
+            # next schedule, which a paused loop never reaches.
+            self.dllm_manager.filter_finished_reqs()
             # A dLLM request keeps its row between rounds, also one left out of
             # the last round.
             retract_reqs += [
                 r
                 for r in self.dllm_manager.waiting_queue
-                if not r.finished() and r.kv.holds_kv and r not in retract_reqs
+                if r.kv.holds_kv and r not in retract_reqs
             ]
 
         if self.disaggregation_mode == DisaggregationMode.DECODE:

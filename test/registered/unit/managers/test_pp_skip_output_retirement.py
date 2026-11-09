@@ -1,5 +1,5 @@
-"""A step's processing retires its forward in the unified pool and releases
-the pages pending on it, so the host must have seen that forward end by then,
+"""A step's processing releases what its forward used (in the unified pool, the
+pages pending on it), so the host must have seen that forward end by then,
 including for the two results that carry no output of their own: a pipeline
 stage's skipped output, whose completion must be ordered after the forward's
 done event (the scheduler's current stream does not follow the local forward),

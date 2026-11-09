@@ -31,7 +31,9 @@ class ReqDllmMixin:
             return None
         if self.dllm_config.requires_separate_context_encoding:
             return DllmReqPhase.INCOMING_PREFILL
-        if len(self.origin_input_ids) < self.dllm_config.block_size:
+        # A retracted request re-encodes its output too.
+        committed_len = len(self.origin_input_ids) + len(self.output_ids)
+        if committed_len < self.dllm_config.block_size:
             return DllmReqPhase.INCOMING_DECODE
         return DllmReqPhase.INCOMING_PREFILL
 

@@ -1378,8 +1378,8 @@ class HiSparseCoordinator:
     def abort_staging_request(self, req: Req) -> None:
         """Remove a request from the staging queue and free its host + device resources.
 
-        Must be called when aborting a request that has been admitted into staging
-        but has not yet completed (i.e. req.hisparse_staging is True).
+        For a request admitted into staging whose host copy has not completed
+        (req.hisparse_staging is True), when it is released or retracted.
         """
         # Remove from staging queue
         self.ack_staging_queue.leave([req])
