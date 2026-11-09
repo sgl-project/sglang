@@ -14,6 +14,10 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import wrap_with_lora_layer
+from sglang.multimodal_gen.runtime.layers.quantization import (
+    QUANTIZATION_METHODS,
+    get_quantization_config,
+)
 from sglang.multimodal_gen.runtime.layers.quantization.configs.convrot_int8_config import (
     ConvRotInt8Config,
 )
@@ -662,63 +666,10 @@ def test_every_no_kernel_branch_raises_instead_of_falling_back():
             config.get_quant_method(LinearBase(256, 4), "gate")
 
 
-@patch(_LOAD_COMFY_KITCHEN)
-@patch(_LOAD_JIT_KERNEL)
-def test_serialized_layers_log_the_backend_split_once_loaded(_jit, _comfy, caplog):
-    """Serialized layers skip online quantization, so the backend split must be
-    reported when their weights are in place instead."""
-    import logging
-
-    markers = {
-        "fc1": {"format": "int8_tensorwise", "convrot": True, "convrot_groupsize": 256},
-        "small": {
-            "format": "int8_tensorwise",
-            "convrot": True,
-            "convrot_groupsize": 16,
-        },
-    }
-    with (
-        patch(_JIT_AVAILABLE, return_value=True),
-        patch(_COMFY_AVAILABLE, return_value=True),
-        caplog.at_level(logging.INFO),
-    ):
-        config = ConvRotInt8Config(layer_markers=markers)
-        fc1 = ReplicatedLinear(256, 16, bias=False, quant_config=config, prefix="fc1")
-        small = ReplicatedLinear(
-            64, 16, bias=False, quant_config=config, prefix="small"
-        )
-        fc1.quant_method.process_weights_after_loading(fc1)
-        assert not [r for r in caplog.records if "serialized INT8" in r.getMessage()]
-        small.quant_method.process_weights_after_loading(small)
-    lines = [
-        r.getMessage() for r in caplog.records if "serialized INT8" in r.getMessage()
-    ]
-    assert lines == [
-        "convrot_int8: loaded 2 serialized INT8 linear layers (jit 1, comfy_kitchen 1)"
-    ]
-
-
-def test_kitchen_int8_is_a_deprecated_alias_of_convrot_int8(caplog):
-    """Existing `--quantization kitchen_int8` commands must keep working under the
-    new name, with one deprecation warning per process."""
-    import logging
-
-    from sglang.multimodal_gen.runtime.layers.quantization import (
-        get_quantization_config,
-        method_names,
-    )
-    from sglang.multimodal_gen.runtime.utils.logging_utils import _print_warning_once
-
-    _print_warning_once.cache_clear()
-    with caplog.at_level(logging.WARNING):
-        assert (
-            method_names.canonical_quantization_method("kitchen_int8") == "convrot_int8"
-        )
-        assert (
-            method_names.canonical_quantization_method("kitchen_int8") == "convrot_int8"
-        )
-        assert method_names.canonical_quantization_method("fp8") == "fp8"
-    warnings = [r for r in caplog.records if "deprecated alias" in r.getMessage()]
-    assert len(warnings) == 1
-    assert get_quantization_config("kitchen_int8") is ConvRotInt8Config
+def test_convrot_int8_name_and_removed_alias():
+    assert "convrot_int8" in QUANTIZATION_METHODS
+    assert "kitchen_int8" not in QUANTIZATION_METHODS
+    with pytest.raises(ValueError, match="Invalid quantization method: kitchen_int8"):
+        get_quantization_config("kitchen_int8")
+    assert get_quantization_config("convrot_int8") is ConvRotInt8Config
     assert ConvRotInt8Config.get_name() == "convrot_int8"

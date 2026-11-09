@@ -145,84 +145,55 @@ def test_npu_graph_cleanup_stops_update_worker(make_backend):
 def test_npu_graph_qwen_qsa_replay_dispatch(
     runner_kind, architecture, qsa, dsa, skip_update
 ):
-    from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_extend_npu_graph_runner import (
-        EAGLEDraftExtendNpuGraphRunner,
-    )
-    from sglang.srt.hardware_backend.npu.graph_runner.eagle_draft_npu_graph_runner import (
-        EAGLEDraftNpuGraphRunner,
-    )
-    from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import (
-        NPUGraphRunner,
-    )
-    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnBackend
+    from sglang.srt.model_executor.runner.decode_cuda_graph_runner import DecodeCudaGraphRunner
+    from sglang.srt.speculative.eagle_draft_cuda_graph_runner import EAGLEDraftCudaGraphRunner
+    from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import EAGLEDraftExtendCudaGraphRunner
 
-    text_config = SimpleNamespace()
-    if qsa:
-        text_config = SimpleNamespace(
-            indexer_n_heads=3,
-            indexer_kv_heads=1,
-            indexer_head_dim=256,
-            indexer_budget=2048,
-            indexer_compress_ratio=4,
-        )
-    config = SimpleNamespace(
-        architectures=[architecture],
-        text_config=text_config,
-        index_topk=2048 if dsa else None,
+    runner_type = {
+        "target_decode": DecodeCudaGraphRunner,
+        "target_verify": DecodeCudaGraphRunner,
+        "draft": EAGLEDraftCudaGraphRunner,
+        "draft_extend": EAGLEDraftExtendCudaGraphRunner,
+    }[runner_kind]
+    runner = object.__new__(runner_type)
+    runner.model_runner = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(
+            architectures=[architecture], index_topk=2048 if dsa else None,
+        )),
+        spec_algorithm=SimpleNamespace(is_dflash=lambda: False, is_dflash_family=lambda: False),
     )
-    output = LogitsProcessorOutput(next_token_logits=torch.zeros(2, 3))
-    backend = SimpleNamespace(
-        replay=Mock(return_value=output),
-        replay_with_input_update=Mock(return_value=output),
-    )
-    runner = SimpleNamespace(
-        model_runner=SimpleNamespace(
-            model_config=SimpleNamespace(hf_config=config),
-            spec_algorithm=SimpleNamespace(is_dflash=lambda: False),
-        ),
-        backend=backend,
-        bs=2,
-        raw_bs=1,
-        raw_num_token=1,
-        captured_req_width=4,
-        speculative_num_steps=3,
-        is_dllm=False,
-        load_batch=Mock(),
-        _make_graph_key=lambda bs: bs,
-        _get_update_attr_name=lambda: "actual_seq_lengths_kv",
-        _get_update_attr_type=lambda: [],
-        _replay_attn_backend=lambda: SimpleNamespace(forward_metadata=None),
-    )
+    # The merged backend uses the attention capability, replacing the deleted
+    # NPU runner subclasses. Use the actual QSA declaration for this model.
+    runner.attn_backend = SimpleNamespace(needs_cpu_seq_lens=(
+        QwenSparseAttnBackend.needs_cpu_seq_lens
+        if architecture.startswith("Qwen4Exp") and qsa else True
+    ))
+    runner.bs, runner.raw_bs = 2, 1
+    runner.captured_req_width = 4
+    runner.speculative_num_steps = 3
+    graph, output = SimpleNamespace(replay=Mock()), object()
+    backend = object.__new__(NPUCudaGraphBackend)
+    backend._decode_runner = runner
+    backend._graphs, backend._outputs = {2: graph}, {2: output}
+    backend.replay_with_input_update = Mock(return_value=output)
+    backend.get_update_attr_name = lambda: "actual_seq_lengths_kv"
     lengths = torch.tensor([7], dtype=torch.int32)
     if skip_update:
-        # Direct replay must not prepare CPU lengths, including for draft steps.
         lengths = Mock()
-        lengths.cpu.side_effect = AssertionError("Unexpected CPU length preparation")
         lengths.tolist.side_effect = AssertionError("Unexpected CPU length preparation")
-    forward_batch = SimpleNamespace(
-        seq_lens=lengths,
-        seq_lens_cpu=lengths,
-        needs_forward_metadata_init=lambda: True,
-        forward_mode=SimpleNamespace(
-            is_target_verify=lambda: runner_kind == "target_verify"
-        ),
+    batch = SimpleNamespace(
+        seq_lens=lengths, seq_lens_cpu=lengths,
+        forward_mode=SimpleNamespace(is_target_verify=lambda: runner_kind == "target_verify"),
     )
-    if runner_kind.startswith("target"):
-        NPUGraphRunner.execute(runner, forward_batch)
-        runner.load_batch.assert_called_once_with(forward_batch, None)
-    elif runner_kind == "draft":
-        EAGLEDraftNpuGraphRunner._replay_graph(runner, 2, forward_batch)
-    else:
-        EAGLEDraftExtendNpuGraphRunner._replay_graph(runner, 2, forward_batch)
-
+    assert backend.replay(2, batch) is output
     if skip_update:
-        backend.replay.assert_called_once_with(2, forward_batch)
+        graph.replay.assert_called_once_with()
         backend.replay_with_input_update.assert_not_called()
     else:
-        backend.replay.assert_not_called()
+        graph.replay.assert_not_called()
         update = backend.replay_with_input_update
         assert update.call_count == 1
-        assert update.call_args.args == (2,)
         if runner_kind == "draft":
             assert update.call_args.kwargs == {
                 "seq_lens": None,
@@ -231,12 +202,15 @@ def test_npu_graph_qwen_qsa_replay_dispatch(
                     {"actual_seq_lengths_kv": [9, 0]},
                 ],
             }
-        else:
-            expected = [11, 0] if runner_kind == "target_verify" else [7, 0]
+        elif runner_kind == "draft_extend":
             assert update.call_args.kwargs == {
-                "seq_lens": expected,
-                "attr_name": "actual_seq_lengths_kv",
-                "attr_type": [],
+                "seq_lens": None,
+                "cpu_update_input": [{"actual_seq_lengths_kv": [7, 0]}],
+            }
+        else:
+            assert update.call_args.kwargs == {
+                "seq_lens": [11, 0] if runner_kind == "target_verify" else [7, 0],
+                "attr_name": "actual_seq_lengths_kv", "attr_type": [],
             }
 
 

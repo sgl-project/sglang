@@ -41,7 +41,6 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
     aiter_has_fp4_rowgroup,
     index_q_rope_pack_flydsl,
     index_q_rope_pack_weights_flydsl,
-    indexer_head_weights,
     logits_rows_per_chunk,
     pack_fp4_query_flydsl,
     prepare_fp4_decode_workspace,
@@ -55,6 +54,7 @@ from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
 from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope_hip import (
     index_k_norm_rope_pack_store_split,
 )
+from sglang.kernels.ops.gemm.dsv4_indexer_head_weights_hip import indexer_head_weights
 from sglang.kernels.ops.gemm.router_gemv_hip import rocm_router_gemv_split_k
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import (

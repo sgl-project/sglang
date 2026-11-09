@@ -27,12 +27,14 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel, get_stream
-from sglang.srt.utils import add_prefix, get_compiler_backend, is_cuda, make_layers
+from sglang.srt.utils import get_compiler_backend, is_cuda
 
 
 @torch.compile(backend=get_compiler_backend())
@@ -248,7 +250,9 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
         self.norm_topk_prob = getattr(config, "norm_topk_prob", True)
 
         if self.expert_selection_fn == "sigmoid":
-            custom_routing_function = cohere2_sigmoid_topk
+            custom_routing_function = (
+                None if self.norm_topk_prob else cohere2_sigmoid_topk
+            )
             scoring_func = "sigmoid"
             routing_method_type = (
                 RoutingMethodType.SigmoidRenorm
@@ -292,6 +296,10 @@ class Cohere2MoeSparseMoeBlock(nn.Module):
             routing_method_type=routing_method_type,
             # The decoder reads this buffer on another stream, so in-place races it.
             inplace=False,
+        )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
         )
 
         num_shared_experts = getattr(config, "num_shared_experts", 0)
