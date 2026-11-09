@@ -35,6 +35,8 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
         native_segment_profile_id,
         native_capture_profile,
         progress_kind,
+        progress_artifact=None,
+        given_acceptance=None,
         model_seed=None,
         database_mode="SILICON",
         native_source_binding=None,
@@ -90,12 +92,23 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
             "HYBRID requires an explicit SDK analytic asset",
         )
         _require(
-            progress_kind == "source_golden351",
-            "native progress policy must be source_golden351",
+            progress_kind in ("empirical", "source_golden351", "given_mean_acceptance"),
+            "native progress policy must be explicit",
         )
         _require(
-            type(model_seed) is int and model_seed >= 0,
-            "progress seed must be explicit and nonnegative",
+            (progress_kind == "empirical") == (progress_artifact is not None),
+            "only empirical progress takes progress_artifact",
+        )
+        _require(
+            (progress_kind == "given_mean_acceptance")
+            == (given_acceptance is not None),
+            "given acceptance must be selected explicitly",
+        )
+        _require(
+            (model_seed is None)
+            if progress_kind == "empirical"
+            else (type(model_seed) is int and model_seed >= 0),
+            "progress seed differs from selected policy",
         )
         _require(
             type(output_token_id) is int
@@ -163,11 +176,38 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 code="unsupported_topology",
             )
             policy = assets.source_policy
-            from sglang_simulator.time_predictor.dspark_golden_progress import (
-                SourceGoldenDSparkProgress,
-            )
+            if progress_kind == "empirical":
+                from sglang_simulator.time_predictor.dspark_progress import (
+                    EmpiricalDSparkProgress,
+                )
 
-            progress = SourceGoldenDSparkProgress(policy, model_seed=model_seed)
+                _require(
+                    config.tp_size == 2 and policy.golden_law is None,
+                    "empirical progress requires the natural TP2 source",
+                )
+                progress_path, _, progress_sha = _asset(
+                    progress_artifact, "progress_artifact"
+                )
+                progress = EmpiricalDSparkProgress(
+                    progress_path,
+                    expected_sha256=progress_sha,
+                    runtime_profile_json=assets.runtime_profile_json,
+                )
+            elif progress_kind == "source_golden351":
+                from sglang_simulator.time_predictor.dspark_golden_progress import (
+                    SourceGoldenDSparkProgress,
+                )
+
+                progress = SourceGoldenDSparkProgress(policy, model_seed=model_seed)
+            else:
+                from sglang_simulator.time_predictor.dspark_given_mean_progress import (
+                    GivenMeanDSparkProgress,
+                )
+
+                _, raw, _ = _asset(given_acceptance, "given_acceptance")
+                progress = GivenMeanDSparkProgress(
+                    policy, model_seed=model_seed, given=json.loads(raw)
+                )
             _require(
                 progress.topology == (config.tp_size, 1, 1),
                 "progress source topology differs",

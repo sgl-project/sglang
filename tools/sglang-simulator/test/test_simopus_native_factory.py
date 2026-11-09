@@ -30,8 +30,8 @@ def inputs(tmp_path):
         systems_root=str(tmp_path),
         native_segment_profile_id="c" * 64,
         native_capture_profile={},
-        progress_kind="source_golden351",
-        model_seed=1,
+        progress_kind="empirical",
+        progress_artifact={},
     )
 
 
@@ -44,7 +44,8 @@ def inputs(tmp_path):
         ({"database_mode": "SOL"}, "provider_initialization_failed"),
         ({"database_mode": "HYBRID"}, "provider_initialization_failed"),
         ({"progress_kind": "implicit"}, "provider_initialization_failed"),
-        ({"model_seed": True}, "provider_initialization_failed"),
+        ({"given_acceptance": {}}, "provider_initialization_failed"),
+        ({"model_seed": 1}, "provider_initialization_failed"),
         ({"output_token_id": True}, "provider_initialization_failed"),
     ],
 )
@@ -62,7 +63,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
     import simopus
     import simopus.sdk as sdk
     from sglang_simulator.time_predictor import (
-        dspark_golden_progress,
+        dspark_progress,
         simopus_dspark,
     )
 
@@ -79,12 +80,17 @@ def test_factory_loads_real_native_assets_and_public_umd(
     raw = json.dumps(options["execution_profile"].to_dict()).encode()
     capture = tmp_path / "capture.json"
     capture.write_bytes(raw)
+    progress = tmp_path / "progress.json"
+    progress.write_text("{}")
     args.update(
         native_capture_profile=dict(
             path=str(capture), sha256=hashlib.sha256(raw).hexdigest()
         ),
         native_segment_profile_id=options["native_segment_profile_id"],
         native_source_binding=options["source_binding"],
+        progress_artifact=dict(
+            path=str(progress), sha256=hashlib.sha256(b"{}").hexdigest()
+        ),
     )
     monkeypatch.setattr(sdk.PerfDatabase, "open_fidb", lambda *a, **k: database)
     monkeypatch.setattr(
@@ -93,16 +99,17 @@ def test_factory_loads_real_native_assets_and_public_umd(
         lambda *a, **k: {"scope": "checkpoint binding independently tested"},
     )
     monkeypatch.setattr(simopus_dspark, "_geometry", lambda *a: None)
-    # This fixture verifies public factory/cost wiring. Golden-law provenance
-    # is tested separately; no natural source is relabeled as golden evidence.
     monkeypatch.setattr(
-        dspark_golden_progress,
-        "SourceGoldenDSparkProgress",
+        dspark_progress,
+        "EmpiricalDSparkProgress",
         lambda *a, **k: NS(
-            topology=(args["config"].tp_size, 1, 1),
-            model_ref="explicit CPU progress double; not source-law admission",
+            topology=(2, 1, 1), model_ref="explicit CPU progress double"
         ),
     )
+    if args["config"].tp_size == 4:
+        with pytest.raises(PredictorError, match="natural TP2"):
+            SimOpusDSparkTimePredictor(**args)
+        return
     result = SimOpusDSparkTimePredictor(**args)
     assert (
         result.dspark_runtime.session.cost_model.assets.execution_profile_id

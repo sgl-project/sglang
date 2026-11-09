@@ -53,15 +53,18 @@ The `predictor` object selects these inputs:
 | `native_source_binding` | Optional SDK-verified `{root, profile, cohort, stack}` originals |
 | `native_analytic_model` | Optional original `{path, sha256}`; required only for `HYBRID` |
 | `native_source_work_policy` | Optional existing versioned SDK policy; does not qualify costs |
-| `progress_kind` | Explicit `source_golden351` |
-| `model_seed` | Explicit nonnegative seed for the source golden policy |
+| `progress_kind` | Explicit `empirical`, `source_golden351` or `given_mean_acceptance` |
+| `progress_artifact` | Original empirical training/heldout `{path, sha256}`; natural TP2 only |
+| `given_acceptance` | Authored given-mean condition `{path, sha256}`; only with its named policy |
+| `model_seed` | Explicit nonnegative seed for golden/given policies; empirical uses its artifact seed |
 | `native_cost_evidence_path` | Optional new exclusive JSONL file for full evaluated SDK documents |
 | `model_config_root`, `output_token_id` | Optional local config root and in-vocabulary synthetic token |
 
 Relative asset paths resolve against the configuration directory. Unknown fields
-are rejected. The selected source must contain verified golden progress material;
-selecting a policy cannot manufacture it. Natural TP2 source material without
-that law is rejected by this core route. Cost lookup does not draw progress. One successful decode event shares its one declared draw
+are rejected. TP4 requires source-verified golden or given progress material;
+selecting a policy cannot manufacture that material. Given mean acceptance is
+an authored condition, not independently predicted acceptance. Cost lookup does
+not draw progress. One successful decode event shares its one declared draw
 across the batch, retaining native tail clipping separately.
 
 Launch through the normal simulator entry point, with explicit CPU device,
