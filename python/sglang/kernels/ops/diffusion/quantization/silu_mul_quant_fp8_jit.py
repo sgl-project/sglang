@@ -11,8 +11,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -87,7 +87,7 @@ def can_use_silu_mul_quant_fp8(x: torch.Tensor) -> bool:
         and x.numel() > 0
         and x.is_contiguous()
         and x.data_ptr() % _ALIGNMENT == 0
-        and is_cuda_sm_at_least(_MIN_SM, x.device)
+        and current_arch().is_sm_at_least(*_MIN_SM)
     )
 
 

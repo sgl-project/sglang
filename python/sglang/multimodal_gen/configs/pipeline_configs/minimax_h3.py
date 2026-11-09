@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 
 import torch
 
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
+from sglang.kernels.arch import current_arch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTConfig
 from sglang.multimodal_gen.configs.models.encoders.minimax_h3_qwen3vl import (
     MiniMaxH3Qwen3VLConfig,
@@ -355,7 +355,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                 "supported: the online FP8 decoder quantizes exactly the 144 ViT "
                 "block linears"
             )
-        if not (current_platform.is_cuda() and is_cuda_sm_at_least((10, 0))):
+        if not (current_platform.is_cuda() and current_arch().is_sm_at_least(10)):
             raise ValueError(
                 "The MiniMax-H3 online FP8 video VAE decoder requires CUDA "
                 "compute capability 10.0 or newer"

@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -227,7 +227,7 @@ def can_use_minimax_h3_vae_rmsnorm_fp8(
         and _row_ok(x)
         and _vector_ok(weight, x)
         and eps > 0
-        and is_cuda_sm_at_least(_MIN_SM, x.device)
+        and current_arch().is_sm_at_least(*_MIN_SM)
     )
 
 
@@ -246,7 +246,7 @@ def can_use_minimax_h3_vae_residual_rmsnorm_fp8(
         and _vector_ok(layer_scale, x)
         and _vector_ok(weight, x)
         and eps > 0
-        and is_cuda_sm_at_least(_MIN_SM, x.device)
+        and current_arch().is_sm_at_least(*_MIN_SM)
     )
 
 
@@ -267,7 +267,7 @@ def can_use_minimax_h3_vae_residual_layernorm(
         and _vector_ok(weight, x)
         and _vector_ok(bias, x)
         and eps > 0
-        and is_cuda_sm_at_least(_MIN_SM, x.device)
+        and current_arch().is_sm_at_least(*_MIN_SM)
     )
 
 

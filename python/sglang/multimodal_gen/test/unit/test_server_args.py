@@ -3179,8 +3179,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
 
     def test_video_vae_fp8_override_requires_resident_fp16_cuda(self):
         sm_gate = (
-            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3."
-            "is_cuda_sm_at_least"
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_arch"
         )
         base = {
             "model_path": "MiniMaxAI/MiniMax-H3",
@@ -3188,12 +3187,14 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
             "ulysses_degree": 4,
             "component_quantizations": {"video_vae": "fp8"},
         }
-        with patch(sm_gate, return_value=False):
+        with patch(sm_gate) as arch:
+            arch.return_value.is_sm_at_least.return_value = False
             with self.assertRaisesRegex(ValueError, "compute capability 10.0"):
                 self._from_dict_with_pipeline_config(
                     MiniMaxH3PipelineConfig(), kwargs=base
                 )
-        with patch(sm_gate, return_value=True):
+        with patch(sm_gate) as arch:
+            arch.return_value.is_sm_at_least.return_value = True
             for field in ("enable_torch_compile", "enable_breakable_cuda_graph"):
                 with (
                     self.subTest(field=field),

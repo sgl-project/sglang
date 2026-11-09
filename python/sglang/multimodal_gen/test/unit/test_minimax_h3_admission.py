@@ -683,8 +683,8 @@ def test_high_fp8_admission_keeps_the_denoise_schedule():
     with (
         patch.object(current_platform, "is_cuda", return_value=True),
         patch(
-            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.is_cuda_sm_at_least",
-            return_value=True,
+            "sglang.multimodal_gen.configs.pipeline_configs.minimax_h3.current_arch",
+            return_value=SimpleNamespace(is_sm_at_least=lambda major: True),
         ),
     ):
         assert stage.forward(batch, args) is batch

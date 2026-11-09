@@ -14,6 +14,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     can_use_minimax_h3_vae_residual_layernorm,
     can_use_minimax_h3_vae_residual_rmsnorm_fp8,
@@ -24,14 +25,13 @@ from sglang.kernels.ops.diffusion import (
     minimax_h3_vae_rmsnorm_fp8,
     silu_mul_quant_fp8,
 )
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.multimodal_gen.test.quality_tier_admission import discrete_flip_rate
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 pytestmark = pytest.mark.skipif(
-    not is_cuda_sm_at_least((10, 0)),
+    not current_arch().is_sm_at_least(10),
     reason="MiniMax-H3 VAE FP8 producers are gated to SM100+",
 )
 
