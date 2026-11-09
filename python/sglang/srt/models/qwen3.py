@@ -109,6 +109,7 @@ if _is_xpu:
     except ImportError:
         fused_inplace_qknorm_rope = None
 
+
 def aiter_fused_qk_norm_rope_set_kv(
     qkv: torch.Tensor,
     q_norm: RMSNorm,
