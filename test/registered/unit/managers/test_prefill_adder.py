@@ -957,7 +957,11 @@ class TestPrefillAdder(CustomTestCase):
         fresh.sampling_params.max_new_tokens = 3
         fresh.prefix_len = 4
         fresh.full_untruncated_fill_ids = list(range(4 + block))
-        SchedulerDllmMixin.process_dllm_staging_reqs(None, adder, [retained, fresh])
+        # The fresh row holds no KV on a tree match, so staging re-matches it.
+        scheduler = SimpleNamespace(tree_cache=adder.tree_cache)
+        SchedulerDllmMixin.process_dllm_staging_reqs(
+            scheduler, adder, [retained, fresh]
+        )
         self.assertTrue(adder.can_run_list)
         for req in adder.can_run_list:
             self.assertEqual(req.extend_end - req.prefix_len, block)

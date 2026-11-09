@@ -1543,6 +1543,15 @@ class PrefillAdder:
         truncated = cand_extend_input_len > _rem_tokens
         new_len = min(cand_extend_input_len, _rem_tokens)
         req.extend_end = req.prefix_len + new_len
+        if not req.kv.holds_kv and req.prefix_len > 0:
+            # The row's prefix lives on the tree, not in a row of its own, so
+            # admission must pin the matched path until the batch writes it
+            # into the row — eviction between here and alloc_for_extend would
+            # free the matched KV under it. Mirrors _commit_prefill_admission;
+            # checkpoint/release moves or drops the lock afterwards. A released
+            # row cannot still hold a lock, so this never overwrites one.
+            assert req.lock is None, f"staged row {req.rid} already holds a tree lock"
+            req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
 
         # Update budget: reserve max_new_tokens only if not truncated. A budget

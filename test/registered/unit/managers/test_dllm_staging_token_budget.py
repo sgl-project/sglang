@@ -215,10 +215,12 @@ class TestDllmStagingTokenBudgetFallbackCap(CustomTestCase):
 class _StubReq:
     """Just enough of Req for `add_dllm_staging_req`."""
 
-    def __init__(self, *, rid, fill_len, incomplete_len, req_pool_idx):
+    def __init__(self, *, rid, fill_len, incomplete_len, req_pool_idx, prefix_len=0):
         self.rid = rid
         self.full_untruncated_fill_ids = list(range(fill_len))
-        self.prefix_len = 0
+        self.prefix_len = prefix_len
+        self.lock = None
+        self.last_node = SimpleNamespace()
         self.dllm_incomplete_ids = list(range(incomplete_len))
         # holds_kv mirrors ReqKvInfo's property (req_pool_idx is not None);
         # holds_mamba is irrelevant here (the plain PrefillBudget has no
@@ -346,8 +348,14 @@ class TestProcessDllmStagingReqsPerRowRefusal(CustomTestCase):
 
     @staticmethod
     def _run(adder, rids):
-        reqs = [SimpleNamespace(rid=rid) for rid in rids]
-        return SchedulerDllmMixin.process_dllm_staging_reqs(None, adder, reqs)
+        # Rows holding their KV: the loop's non-holder re-match (covered by
+        # TestProcessDllmStagingReqsRematch) must leave them alone.
+        reqs = [
+            SimpleNamespace(rid=rid, kv=SimpleNamespace(holds_kv=True), prefix_len=0)
+            for rid in rids
+        ]
+        scheduler = SimpleNamespace(tree_cache=object())
+        return SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, reqs)
 
     def test_refused_head_does_not_starve_rows_behind_it(self):
         adder = _ScriptedAdder(
@@ -695,6 +703,98 @@ class TestDllmStagingStallBreaker(CustomTestCase):
 
         self.assertEqual(retirer.retracted, [victim])
         self.assertEqual(gate(), self.BLOCK_SIZE)
+
+
+class TestProcessDllmStagingReqsRematch(CustomTestCase):
+    """A staged row that holds no KV rides a tree prefix match nothing pins
+    (a capacity-refused admission flipped it to STAGING_*, or a stall
+    retraction's requeue was refused the same way), so the staging loop must
+    re-match it against the tree before every admission attempt, exactly as
+    the incoming path does. Rows that hold their KV keep their prefix in
+    their own row and must not be re-matched mid-generation; rows with no
+    matched prefix have nothing to refresh."""
+
+    @staticmethod
+    def _staged(rid, *, holds_kv, prefix_len):
+        req = SimpleNamespace(
+            rid=rid,
+            kv=SimpleNamespace(holds_kv=holds_kv),
+            prefix_len=prefix_len,
+            rematches=[],
+        )
+        req.init_next_round_input = req.rematches.append
+        return req
+
+    def _run(self, reqs):
+        tree_cache = object()
+        scheduler = SimpleNamespace(tree_cache=tree_cache)
+        adder = _ScriptedAdder({req.rid: AddReqResult.CONTINUE for req in reqs})
+        SchedulerDllmMixin.process_dllm_staging_reqs(scheduler, adder, reqs)
+        return tree_cache, adder
+
+    def test_non_holder_with_a_prefix_is_rematched_before_admission(self):
+        req = self._staged("riding", holds_kv=False, prefix_len=64)
+        tree_cache, adder = self._run([req])
+        self.assertEqual(req.rematches, [tree_cache])
+        self.assertEqual(adder.calls, ["riding"])
+
+    def test_holders_and_prefixless_rows_are_not_rematched(self):
+        retained = self._staged("retained", holds_kv=True, prefix_len=64)
+        fresh = self._staged("fresh", holds_kv=False, prefix_len=0)
+        self._run([retained, fresh])
+        self.assertEqual(retained.rematches, [])
+        self.assertEqual(fresh.rematches, [])
+
+
+class TestDllmStagingAdmissionLock(CustomTestCase):
+    """Admitting a staged row whose prefix lives on the tree (no KV row of
+    its own) must pin the matched path, mirroring _commit_prefill_admission:
+    between admission and alloc_for_extend another row's allocation can evict
+    the unlocked match and free the KV under it. Rows that hold their KV need
+    no pin — their prefix is in their own row."""
+
+    BLOCK_SIZE = 32
+
+    def _adder(self):
+        adder = _arm_admission(
+            _make_adder(
+                rem_dllm_tokens=4096,
+                dllm_block_size=self.BLOCK_SIZE,
+                available_tokens=4096,
+            )
+        )
+        adder.tree_cache.lock = lambda node: ("locked", node)
+        return adder
+
+    def test_admitted_tree_riding_row_takes_the_tree_lock(self):
+        adder = self._adder()
+        req = _StubReq(
+            rid="riding",
+            fill_len=96,
+            incomplete_len=0,
+            req_pool_idx=None,
+            prefix_len=64,
+        )
+        adder.add_dllm_staging_req(req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual(req.lock, ("locked", req.last_node))
+
+    def test_holder_and_prefixless_rows_take_no_lock(self):
+        adder = self._adder()
+        holder = _StubReq(
+            rid="holder",
+            fill_len=96,
+            incomplete_len=0,
+            req_pool_idx=7,
+            prefix_len=64,
+        )
+        fresh = _StubReq(rid="fresh", fill_len=32, incomplete_len=0, req_pool_idx=None)
+        adder.add_dllm_staging_req(holder)
+        adder.add_dllm_staging_req(fresh)
+        self.assertIn(holder, adder.can_run_list)
+        self.assertIn(fresh, adder.can_run_list)
+        self.assertIsNone(holder.lock)
+        self.assertIsNone(fresh.lock)
 
 
 class _InflightStubReq:

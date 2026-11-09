@@ -545,6 +545,19 @@ class SchedulerDllmMixin:
         """
         result = AddReqResult.CONTINUE
         for req in reqs:
+            if not req.kv.holds_kv and req.prefix_len > 0:
+                # A staged row that holds no KV rides a tree prefix match from
+                # an earlier refused attempt (a capacity-refused admission
+                # flipped the phase to STAGING_*, or a stall retraction's
+                # requeue was refused the same way). Nothing pins that match:
+                # the lock comes only with admission, so another row's
+                # allocation may have evicted the matched nodes since, and
+                # walking the stale last_node in prepare_for_extend then dies
+                # on the freed node. Re-match before every attempt, exactly
+                # like the incoming path (`process_dllm_incoming_reqs`) does.
+                # Rows that hold KV keep their prefix in their own row and
+                # must not be re-matched mid-generation.
+                req.init_next_round_input(self.tree_cache)
             res = adder.add_dllm_staging_req(req)
             if res == AddReqResult.NO_TOKEN:
                 result = res
