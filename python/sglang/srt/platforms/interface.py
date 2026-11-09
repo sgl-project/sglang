@@ -25,6 +25,9 @@ if TYPE_CHECKING:
     from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
+    from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+        BaseBreakableGraphBackend,
+    )
 
 # Re-export for convenience
 __all__ = [
@@ -137,6 +140,17 @@ class SRTPlatform(DeviceMixin):
 
     def get_full_graph_backend_cls(self) -> type[Any]:
         """Return the full device-graph backend class for this platform."""
+        return None
+
+    def get_breakable_graph_backend_cls(
+        self, phase: Literal["decode", "prefill"]
+    ) -> type[BaseBreakableGraphBackend] | None:
+        """Return the breakable device-graph backend class for ``phase``.
+
+        ``None`` keeps the built-in ``BreakableCudaGraphBackend``. A returned
+        class must implement ``BaseBreakableGraphBackend`` and accept the same
+        construction arguments as the built-in backend for the selected phase.
+        """
         return None
 
     def get_moe_expert_executor_cls(
