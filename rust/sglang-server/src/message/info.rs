@@ -230,7 +230,10 @@ pub(crate) struct MemoryUsage {
     pub(crate) startup_available: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) token_capacity: Option<u64>,
+    /// The target's own window's token capacity, as before windows were named.
     pub(crate) token_capacity_swa: Option<u64>,
+    /// Each sliding-window pool's token capacity, by the window's name.
+    pub(crate) token_capacity_window: Option<BTreeMap<String, u64>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) graph: Option<BTreeMap<String, f64>>,
 }
