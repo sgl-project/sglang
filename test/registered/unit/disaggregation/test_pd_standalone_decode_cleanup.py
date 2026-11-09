@@ -33,7 +33,6 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
-from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -42,6 +41,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -87,14 +87,7 @@ class TestPdStandaloneDecodeCleanup(CustomTestCase):
             token_to_kv_pool_allocator=tokens,
             output_streamer=output_streamer,
             disaggregation_mode=DisaggregationMode.DECODE,
-            request_retirer=RequestRetirer(
-                tree_cache=cache,
-                beam_coordinator=None,
-                hisparse_coordinator=None,
-                uocr_runtime=None,
-                send_abort_output=Mock(),
-                stream_output=output_streamer.stream_output,
-            ),
+            request_retirer=release_only_retirer(cache),
         )
         processor = SchedulerBatchResultProcessor(**fields)
         queue = DecodeTransferQueue.__new__(DecodeTransferQueue)
