@@ -334,8 +334,11 @@ def handle_deprecated_args(server_args: Any):
 
     # Deprecated MoE A2A backend alias.
     renamed = {}
-    for attr in ("moe_a2a_backend", "speculative_moe_a2a_backend"):
-        if getattr(cfg, attr) == "flashinfer":
+    for attr, value in (
+        ("moe_a2a_backend", cfg.moe_a2a_backend),
+        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
+    ):
+        if value == "flashinfer":
             logger.warning(
                 "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
                 "instead.",
