@@ -235,12 +235,13 @@ def test_quality_switch_restores_modules_outputs_and_live_memory(stub_server_arg
     ids = torch.randn(1, 17, 3, device="cuda")
     rope = prepare_rotary_pos_emb(decoder.pos_embed(ids), dtype=torch.float16, batch=1)
     with set_forward_context(0, None), torch.autocast("cuda", dtype=torch.float16):
-        expected = decoder._run_blocks(value, rope)
+        # The FP16 fused residual path owns and mutates its input activation.
+        expected = decoder._run_blocks(value.clone(), rope)
         live_bytes = torch.cuda.memory_allocated()
         for quality in ("exact", "lossless", "high", "lossless", "high", "exact"):
             with use_fp8_decoder(decoder, quality == "high"):
                 assert decoder.fp8_installed == (quality == "high")
-                actual = decoder._run_blocks(value, rope)
+                actual = decoder._run_blocks(value.clone(), rope)
                 if quality != "high":
                     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
                 else:
@@ -259,7 +260,7 @@ def test_quality_switch_restores_modules_outputs_and_live_memory(stub_server_arg
                     raise error("decode failed")
             assert not decoder.fp8_installed
             torch.testing.assert_close(
-                decoder._run_blocks(value, rope), expected, rtol=0, atol=0
+                decoder._run_blocks(value.clone(), rope), expected, rtol=0, atol=0
             )
 
     # a failed conversion must restore even the modules already swapped
