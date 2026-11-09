@@ -229,7 +229,7 @@ def _trims_to_contiguous_alignment(kernel_type: Enum) -> bool:
     return is_contig_layout(kernel_type.name)
 
 
-def _contiguous_m_alignment() -> int:
+def contiguous_m_alignment() -> int:
     """M alignment of the contiguous grouped layouts.
 
     Builds that only expose the M-side query (the SAIL vendor build has no
@@ -258,7 +258,7 @@ def _compile_deep_gemm_one_type_all(
     saved_context = disable_symmetric_memory_context()
     try:
         if _trims_to_contiguous_alignment(kernel_type):
-            m_alignment = _contiguous_m_alignment()
+            m_alignment = contiguous_m_alignment()
             m_list = sorted(list(set(m for m in m_list if m % m_alignment == 0)))
 
         if not m_list:
