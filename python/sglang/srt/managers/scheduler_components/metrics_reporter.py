@@ -11,10 +11,11 @@ from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
 import msgspec
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import EPLB_BALANCEDNESS_WINDOW_SIZES
 from sglang.srt.managers.schedule_batch import ScheduleBatch
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -340,8 +341,6 @@ class SchedulerMetricsReporter:
             self.forward_pass_device_timer = DeviceTimer(
                 reporter=_wrap_execution_reporter,
             )
-        # PDMux event polling across green-context streams is not validated;
-        # keep its overlap label at `none` without disabling forward timing.
         self.scheduler_stage_metrics = SchedulerStageMetricsRecorder(
             enabled=self.enable_metrics,
             query_forward_active=(
@@ -349,7 +348,6 @@ class SchedulerMetricsReporter:
                 if self.enable_metrics
                 and self.forward_pass_device_timer is not None
                 and self.scheduler.device == "cuda"
-                and not get_disagg().enable_pdmux
                 else None
             ),
         )
@@ -766,7 +764,7 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             msg += f"#bootstrap-req: {len(self.scheduler.disagg_prefill_bootstrap_queue.queue)}, "
             msg += (
-                f"#inflight-req: {len(self.scheduler.disagg_prefill_inflight_queue)}, "
+                f"#inflight-req: {len(self.scheduler.disagg_prefill_transfer_queue)}, "
             )
             num_optimistic = sum(1 for r in batch.reqs if r.pending_bootstrap)
             msg += f"#optimistic-req: {num_optimistic}, "
@@ -858,10 +856,7 @@ class SchedulerMetricsReporter:
                 )
             else:
                 self.stats.num_running_reqs = prefill_stats.num_running_reqs
-            self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
-            )
-            self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+            self._update_queue_stats(priority_enabled)
             self.stats.cache_hit_rate = cache_hit_rate
             # Refresh here too: prefill-heavy stretches can run long between
             # decode-stats ticks, and the gauge must decay rather than hold.
@@ -877,13 +872,6 @@ class SchedulerMetricsReporter:
 
             # PD disaggregation
             if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
-                    priority_enabled,
-                )
-                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
-                )
                 self.stats.kv_transfer_speed_gb_s = self.kv_transfer_speed_gb_s
                 self.stats.kv_transfer_latency_ms = self.kv_transfer_latency_ms
             elif self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
@@ -1076,10 +1064,7 @@ class SchedulerMetricsReporter:
             self.stats.num_running_reqs = QueueCount.from_reqs(
                 batch.reqs, priority_enabled
             )
-            self.stats.num_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.waiting_queue, priority_enabled
-            )
-            self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
+            self._update_queue_stats(priority_enabled)
             self.stats.gen_throughput = self.last_gen_throughput
             # cache_hit_rate is prefill-owned (per-report semantics); decode
             # ticks must not reset it, or the exported gauge reads 0 whenever
@@ -1101,16 +1086,6 @@ class SchedulerMetricsReporter:
             self.stats.num_retracted_reqs = self.num_retracted_reqs
             self.stats.num_paused_reqs = self.num_paused_reqs
             self.num_retracted_reqs = self.num_paused_reqs = 0
-
-            # PD disaggregation
-            if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-                self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_bootstrap_queue.queue,
-                    priority_enabled,
-                )
-                self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                    self.scheduler.disagg_prefill_inflight_queue, priority_enabled
-                )
 
             # Streaming session metrics
             self.stats.num_streaming_sessions = (
@@ -1397,6 +1372,19 @@ class SchedulerMetricsReporter:
             self.scheduler_stage_metrics.start(now_wall_ns)
             return
 
+        # CRIU restore can move monotonic time below the saved baseline.
+        # Skip the unknowable gap, but flush buffered idle and stage totals
+        # before rebasing. drain() also preserves the current stage.
+        clock_reset = now_wall_ns < accounting.last_sample_ns
+        if clock_reset:
+            accounting.last_sample_ns = now_wall_ns
+            if ENABLE_METRICS_DEVICE_TIMER:
+                self._forward_occupancy_log_window.reset(now_wall_ns)
+                # perf_counter() reads the same clock, so restart its window too.
+                self._device_timer_window_batch_count = 0
+            if not self.enable_metrics:
+                accounting.reset(now_wall_ns, 0, is_idle)
+
         # Clamp delayed events to the still-unaccounted wall-time range.
         event_ns = max(accounting.last_sample_ns, min(event_ns, now_wall_ns))
         if ENABLE_METRICS_DEVICE_TIMER and is_idle and not accounting.is_idle:
@@ -1413,11 +1401,17 @@ class SchedulerMetricsReporter:
             self._forward_occupancy_log_window.idle_ns += (
                 accounting.accumulate_idle_ns - idle_ns_before
             )
-        if not self.enable_metrics or not accounting.should_record(now_wall_ns):
+        if not self.enable_metrics or (
+            not clock_reset and not accounting.should_record(now_wall_ns)
+        ):
             return
 
         now_process_cpu_ns = time.process_time_ns()
         elapsed_process_cpu_ns = now_process_cpu_ns - accounting.start_process_cpu_ns
+        if elapsed_process_cpu_ns < 0:
+            # CRIU restore restarts the process CPU clock near zero, so its
+            # reading is the CPU time since restore. Never decrement the counter.
+            elapsed_process_cpu_ns = now_process_cpu_ns
         if accounting.accumulate_idle_ns > 0:
             self.metrics_collector.increment_scheduler_idle_seconds(
                 accounting.accumulate_idle_ns / 1e9
@@ -1440,6 +1434,20 @@ class SchedulerMetricsReporter:
             self.fwd_occupancy = float("nan")
             self.stats.fwd_occupancy = float("nan")
 
+    def _update_queue_stats(self, priority_enabled: bool) -> None:
+        lists = self.scheduler.request_lists()
+        self.stats.num_queue_reqs = QueueCount.from_reqs(
+            lists[ListKind.WAITING], priority_enabled
+        )
+        self.stats.num_grammar_queue_reqs = len(lists[ListKind.GRAMMAR])
+        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
+            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
+                lists[ListKind.PD_BOOTSTRAP], priority_enabled
+            )
+            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
+                lists[ListKind.PD_SENDING], priority_enabled
+            )
+
     def _update_decode_queue_stats(self, priority_enabled: bool) -> None:
         transfer_queue = self.scheduler.disagg_decode_transfer_queue.queue
         self.stats.num_decode_prealloc_queue_reqs = QueueCount.from_reqs(
@@ -1452,24 +1460,36 @@ class SchedulerMetricsReporter:
             self.scheduler.disagg_decode_transfer_queue.num_pending_deferred_releases()
         )
         host_reqs = (
-            [req for req in transfer_queue if req.host_staged]
+            [d.req for d in transfer_queue.items() if d.host_staged]
             if get_disagg().disaggregation_decode_host_receive_threshold < 1
             else []
         )
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
         )
-        full_tokens, swa_tokens = (
-            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts()
-        )
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
+        full_tokens, window_tokens = (
+            self.scheduler.disagg_decode_prealloc_queue.pre_allocated_token_counts(
+                tuple(window.sub_pool for window in pool_stats.windows)
+            )
+        )
         self.stats.prealloc_full_token_usage = (
             full_tokens / pool_stats.full_capacity if pool_stats.full_capacity else 0.0
         )
+        # Each window's pending rows, by that window's own cursor.
+        self.stats.prealloc_window_token_usage = {
+            window.name: (
+                window_tokens[window.sub_pool] / window.capacity
+                if window.capacity
+                else 0.0
+            )
+            for window in pool_stats.windows
+        }
+        target = pool_stats.target_window_stats()
         self.stats.prealloc_swa_token_usage = (
-            swa_tokens / pool_stats.swa_capacity
-            if pool_stats.is_hybrid_swa and pool_stats.swa_capacity
-            else 0.0
+            0.0
+            if target is None
+            else self.stats.prealloc_window_token_usage[target.name]
         )
 
     def _maybe_log_idle_metrics(self):
@@ -1512,20 +1532,11 @@ class SchedulerMetricsReporter:
             self.scheduler.running_batch.reqs, priority_enabled
         )
         self.stats.gen_throughput = 0
-        self.stats.num_queue_reqs = QueueCount.from_reqs(
-            self.scheduler.waiting_queue, priority_enabled
-        )
-        self.stats.num_grammar_queue_reqs = len(self.scheduler.grammar_manager)
-        if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
-            self.stats.num_prefill_bootstrap_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_bootstrap_queue.queue, priority_enabled
-            )
-            self.stats.num_prefill_inflight_queue_reqs = QueueCount.from_reqs(
-                self.scheduler.disagg_prefill_inflight_queue, priority_enabled
-            )
+        self._update_queue_stats(priority_enabled)
         if self.scheduler.disaggregation_mode == DisaggregationMode.DECODE:
             self._update_decode_queue_stats(priority_enabled)
         # Host pools change without a batch (e.g. /flush_cache); refresh before
         # publishing so the gauges do not hold the last batch's values.
         self._log_hicache_stats()
         self.metrics_collector.log_stats(self.stats)
+        self.scheduler.kv_events_publisher.emit_kv_metrics()

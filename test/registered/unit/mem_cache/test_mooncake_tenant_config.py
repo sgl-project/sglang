@@ -458,6 +458,7 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                     self.assertEqual(host.get_storage_dtype(), dtype)
 
     def test_page_envelope_reports_persisted_value_dtype(self):
+        from sglang.srt.mem_cache.kv.layout.page import PageEnvelopeHostLayout
         from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 
         for store_dtype, value_dtype, expected in (
@@ -475,6 +476,21 @@ class TestMooncakeTenantConfig(unittest.TestCase):
                     dtype=value_dtype, store_dtype=store_dtype
                 )
                 self.assertEqual(host_pool.get_storage_dtype(), expected)
+                host_pool.device_pool = PageEnvelopeHostLayout(
+                    buffer=torch.empty(1, 8, dtype=torch.uint8),
+                    page_size=1,
+                    capacity=1,
+                    store_dtype=store_dtype,
+                    value_dtype=value_dtype,
+                )
+                self.assertEqual(host_pool.get_storage_dtype(), expected)
+
+        host_pool.device_pool = PageEnvelopeHostLayout(
+            buffer=torch.empty(1, 8, dtype=torch.uint8),
+            page_size=1,
+            capacity=1,
+        )
+        self.assertEqual(host_pool.get_storage_dtype(), torch.uint8)
 
 
 if __name__ == "__main__":

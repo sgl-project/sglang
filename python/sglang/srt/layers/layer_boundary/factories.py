@@ -18,11 +18,9 @@ from sglang.srt.layers.layer_boundary.adapters.overlap import (
     tbo_exit_rows,
 )
 from sglang.srt.layers.layer_boundary.boundary import _cp_moves
-from sglang.srt.layers.layer_boundary.construction import (
-    BatchVariant,
-    _bind_stage,
-)
+from sglang.srt.layers.layer_boundary.construction import _bind_stage
 from sglang.srt.layers.layer_boundary.contracts import (
+    BatchVariant,
     EdgeContract,
     ExitRows,
     InputContract,
@@ -141,6 +139,7 @@ def _resolve_ffn(
     update=PLAIN_ADD,
     dense_tp_size=None,
     output_complete=False,
+    output_on_cp_shards=False,
     terminal_accepts_update=False,
 ):
     parallel = get_parallel()
@@ -242,8 +241,23 @@ def _resolve_ffn(
         rows = Layout.sharded_over(
             *((TokenAxis.ATTN_CP,) if on_cp_shards else ()), axis_sizes=axes
         )
+    # A complete output of rows gathered over attention CP that the compute
+    # already leaves on this rank's CP rows: the residual's.
+    on_residual_cp_shards = (
+        output_on_cp_shards
+        and complete
+        and variant is BatchVariant.CONTEXT_PARALLEL
+        and not on_rank_rows
+        and not on_attention_rows
+        and TokenAxis.ATTN_CP in attention.sharded
+        and TokenAxis.ATTN_CP not in rows.sharded
+    )
     produced = (
-        OutputContract(rows, update=update, transform=output_transform)
+        OutputContract(
+            attention if on_residual_cp_shards else rows,
+            update=update,
+            transform=output_transform,
+        )
         if complete
         else OutputContract(
             rows,
@@ -303,6 +317,12 @@ class StageDeclaration:
         output_complete: Whether the FFN's compute completes its own output
             sum, so the exit owes none. For an FFN whose output sum is fused
             with a reduction its computation needs anyway.
+        output_on_cp_shards: Whether, on a CP extend whose FFN input is
+            gathered over attention CP, the compute returns only this rank's
+            CP rows, every one valid, with the sum complete (how is its own
+            choice). The output then lands on the residual's rows with no
+            take-back. Requires a complete sparse output; every other path
+            keeps the gathered-rows output.
         sum_impl: Optional implementation of the declared output sum using
             the model's custom collective. Its batch predicate, when supplied,
             preserves eligibility for carrying that sum to the consumer.
@@ -337,11 +357,13 @@ class StageDeclaration:
     reduction: ProducerReduction = ProducerReduction.EXIT_SCOPED
     gathers_attn_tp_input: bool = False
     tp_group: SumGroup = SumGroup.ATTN_TP
+    ordinary_tp_group: Optional[SumGroup] = None
     in_token_order: bool = False
     dense_tp_size: Optional[int] = None
     exit_rows: Optional[ExitRows] = None
     writes_at_handoff: bool = False
     output_complete: bool = False
+    output_on_cp_shards: bool = False
     attn_tp_gather: Optional[Callable] = None
     sum_impl: Optional[SumImplementation] = None
     row_transport: Optional[RowTransport] = None
@@ -357,6 +379,18 @@ class StageDeclaration:
                 raise TypeError("stage sources must be declarations")
         _check_update(self.update)
         _check_read(self.read)
+        if self.output_on_cp_shards and not (
+            self.kind is StageKind.FFN
+            and self.sparse
+            and self.output_complete
+            and self.sum_impl is None
+            and self.row_transport is None
+            and self.output_transform is None
+        ):
+            raise ValueError(
+                "output_on_cp_shards needs a sparse FFN whose compute completes "
+                "its output, with no custom sum, transport or output transform"
+            )
 
 
 # The members every ResidualUpdate and ResidualReadout must set: the binding
@@ -438,6 +472,7 @@ def declare_attn(
     gathers_attn_tp_input=True,
     output_transform=None,
     tp_group=SumGroup.ATTN_TP,
+    ordinary_tp_group=None,
     attn_tp_gather=None,
     in_token_order=False,
     sum_impl=None,
@@ -456,6 +491,8 @@ def declare_attn(
             stage's input runs it, so no fused add + norm takes that input.
             Requires ALWAYS_PARTIAL.
         tp_group: Head partition; ATTN_TP by default, TP for full-TP consumers.
+        ordinary_tp_group: Optional head partition on ordinary (unsharded)
+            batches, e.g. replicated prefill attention dispatched to TP decode.
         attn_tp_gather: Implementation of the gather over attention TP into
             this stage, tried before the boundary's own (see StageDeclaration).
         in_token_order: Compute scans the whole sequence in token order. On a
@@ -482,6 +519,7 @@ def declare_attn(
         reduction=reduction,
         gathers_attn_tp_input=gathers_attn_tp_input,
         tp_group=tp_group,
+        ordinary_tp_group=ordinary_tp_group,
         attn_tp_gather=attn_tp_gather,
         in_token_order=in_token_order,
         sum_impl=sum_impl,
@@ -499,6 +537,7 @@ def declare_ffn(
     dense_tp_size=None,
     exit_rows=None,
     output_complete=False,
+    output_on_cp_shards=False,
     sum_impl=None,
     row_transport=None,
 ):
@@ -517,6 +556,8 @@ def declare_ffn(
             the adjacent FFN kinds and TBO configuration.
         output_complete: Whether the compute completes its own output sum,
             fused with a reduction it needs anyway; the exit then owes none.
+        output_on_cp_shards: Whether the compute returns only this rank's CP
+            rows of a CP extend's gathered input (see StageDeclaration).
         sum_impl: Model-specific implementation and deferral eligibility of
             the output sum. Cannot be combined with output_complete.
 
@@ -533,6 +574,7 @@ def declare_ffn(
         dense_tp_size=dense_tp_size,
         exit_rows=exit_rows or tbo_exit_rows(sparse, next_layer_sparse),
         output_complete=output_complete,
+        output_on_cp_shards=output_on_cp_shards,
         sum_impl=sum_impl,
         row_transport=row_transport,
     )
@@ -672,6 +714,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             update=stage.update,
             dense_tp_size=stage.dense_tp_size,
             output_complete=stage.output_complete,
+            output_on_cp_shards=stage.output_on_cp_shards,
             terminal_accepts_update=stage.terminal
             and takes_pending_update(final_read, stage.update),
         )
@@ -702,7 +745,12 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
     owes = not sp and axes[TokenAxis.ATTN_TP] > 1
     group = SumGroup.ATTN_TP
     compute_rows = attention
-    if stage.tp_group is SumGroup.TP:
+    tp_group = (
+        stage.ordinary_tp_group
+        if variant is BatchVariant.ORDINARY and stage.ordinary_tp_group is not None
+        else stage.tp_group
+    )
+    if tp_group is SumGroup.TP:
         parallel = get_parallel()
         if parallel.attn_dp_size != 1 or sp or scattered:
             raise NotImplementedError(
@@ -717,7 +765,7 @@ def _resolve_stage(stage, variant, arrival, following=None, *, final_read=None):
             if parallel.attn_cp_size == parallel.tp_size and parallel.attn_cp_size > 1
             else SumGroup.TP
         )
-    elif stage.tp_group is not SumGroup.ATTN_TP:
+    elif tp_group is not SumGroup.ATTN_TP:
         raise ValueError("attention heads must be partitioned over ATTN_TP or TP")
     # On a CP extend a token-order stage takes the whole sequence.
     in_token_order = stage.in_token_order and variant is BatchVariant.CONTEXT_PARALLEL
