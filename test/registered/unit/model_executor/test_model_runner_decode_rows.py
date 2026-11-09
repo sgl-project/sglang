@@ -12,6 +12,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 class _FakeModelRunner:
     max_decode_logits_rows = ModelRunner.max_decode_logits_rows
 
+    def decode_graph_gather_requirements(self):
+        return True, False
+
     def __init__(self, *, initial_width: int, cuda_graph_bs: list[int]):
         self.initial_width = initial_width
         self.cuda_graph_bs = cuda_graph_bs
@@ -20,7 +23,8 @@ class _FakeModelRunner:
         return self.initial_width if num_draft_tokens is None else num_draft_tokens
 
 
-def _alignment_8_capture_bs(runner, width):
+def _alignment_8_capture_bs(runner, width, *, gathered_buffer_required):
+    assert gathered_buffer_required
     return ([bs for bs in runner.cuda_graph_bs if bs * width % 8 == 0], [])
 
 

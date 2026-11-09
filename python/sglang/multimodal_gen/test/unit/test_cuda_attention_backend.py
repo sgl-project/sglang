@@ -1,13 +1,21 @@
 import sys
 import types
 import unittest
-from types import ModuleType
+from contextlib import nullcontext
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.layers.attention.backends import flash_attn
+from sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn import (
+    FlashAttentionImpl,
+)
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPAImpl
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     _cached_get_attn_backend,
+    component_attn_backend_context_manager,
+    get_attn_backend,
 )
 from sglang.multimodal_gen.runtime.platforms.cuda import (
     CudaPlatformBase,
@@ -18,6 +26,7 @@ from sglang.multimodal_gen.runtime.platforms.interface import (
     AttentionBackendEnum,
     DeviceCapability,
 )
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 SDPA_BACKEND_CLS_STR = (
     "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
@@ -64,6 +73,7 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
         FakeCudaPlatform.supports_flash_attention = True
         FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
         _cached_get_attn_backend.cache_clear()
+        self.addCleanup(_cached_get_attn_backend.cache_clear)
 
     def resolve(
         self,
@@ -106,6 +116,51 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             self.resolve(AttentionBackendEnum.CUBE_SPARSE_ATTN)
 
         fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_sm120_uses_fa4(self):
+        FakeCudaPlatform.is_sm120_device = True
+        FakeCudaPlatform.device_capability = DeviceCapability(12, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_called_once_with(4)
+
+    def test_hybrid_window_h3_on_ampere_keeps_fa3(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(8, 0)
+        fa_module = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn"
+        fake_flash_attn = ModuleType(fa_module)
+        fake_flash_attn.set_fa_ver = Mock()
+        hybrid_module = "sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_h3"
+        fake_hybrid = ModuleType(hybrid_module)
+        fake_hybrid.HybridWindowAttentionH3Backend = object
+
+        with patch.dict(
+            "sys.modules", {fa_module: fake_flash_attn, hybrid_module: fake_hybrid}
+        ):
+            self.assertEqual(
+                self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3),
+                f"{hybrid_module}.HybridWindowAttentionH3Backend",
+            )
+
+        fake_flash_attn.set_fa_ver.assert_not_called()
+
+    def test_hybrid_window_h3_rejects_unsupported_capability(self):
+        FakeCudaPlatform.device_capability = DeviceCapability(7, 5)
+
+        with self.assertRaisesRegex(ValueError, "12.0"):
+            self.resolve(AttentionBackendEnum.HYBRID_WINDOW_ATTN_H3)
 
     def test_default_backend_uses_torch_sdpa_on_sm120(self):
         FakeCudaPlatform.is_sm120_device = True
@@ -150,9 +205,119 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
                 "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend",
             )
 
+    def test_blackwell_serves_fa4_head_sizes_outside_the_fa3_list(self):
+        FakeCudaPlatform.is_blackwell_device = True
+        fa_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn.FlashAttentionBackend"
+        dynamic_cls_str = "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.DynamicCudnnSDPABackend"
+
+        with patch.object(
+            FakeCudaPlatform,
+            "_prepare_flash_attention_for_blackwell",
+            return_value=True,
+        ):
+            for head_size in (72, 80):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        dynamic_cls_str,
+                    )
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.FA, head_size, torch.bfloat16
+                        ),
+                        fa_cls_str,
+                    )
+            for head_size in (68, 136):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            None, head_size, torch.bfloat16
+                        ),
+                        SDPA_BACKEND_CLS_STR,
+                    )
+
+    def test_pre_blackwell_keeps_torch_sdpa_for_head_size_72(self):
+        for selected_backend in (None, AttentionBackendEnum.FA):
+            with self.subTest(selected_backend=selected_backend):
+                self.assertEqual(
+                    FakeCudaPlatform.get_attn_backend_cls_str(
+                        selected_backend, 72, torch.bfloat16
+                    ),
+                    SDPA_BACKEND_CLS_STR,
+                )
+
     def test_invalid_backend_raises(self):
         with self.assertRaisesRegex(ValueError, "Invalid attention backend"):
             self.resolve(AttentionBackendEnum.AITER_SAGE)
+
+    def test_sage_attention_head_sizes(self):
+        sage_cls_str = (
+            "sglang.multimodal_gen.runtime.layers.attention.backends."
+            "sage_attn.SageAttentionBackend"
+        )
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        with patch.dict(sys.modules, {"sageattention": sageattention}):
+            for head_size in (32, 64, 72, 96, 128):
+                with self.subTest(head_size=head_size):
+                    self.assertEqual(
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        ),
+                        sage_cls_str,
+                    )
+            for head_size in (0, 160, 256):
+                with self.subTest(head_size=head_size):
+                    with self.assertRaisesRegex(ValueError, f"head size {head_size}"):
+                        FakeCudaPlatform.get_attn_backend_cls_str(
+                            AttentionBackendEnum.SAGE_ATTN, head_size, torch.float16
+                        )
+
+    def test_sage_head_size_fallback_respects_component_policy(self):
+        selector = "sglang.multimodal_gen.runtime.layers.attention.selector"
+        server_args = ServerArgs.__new__(ServerArgs)
+        server_args.attention_backend = "sage_attn"
+        server_args._explicit_arg_names = {"attention_backend"}
+        sageattention = types.ModuleType("sageattention")
+        sageattention.sageattn = object()
+        sage = AttentionBackendEnum.SAGE_ATTN
+        sdpa = AttentionBackendEnum.TORCH_SDPA
+        with (
+            patch.dict(sys.modules, {"sageattention": sageattention}),
+            patch(f"{selector}.get_global_server_args", return_value=server_args),
+            patch(f"{selector}.get_global_forced_attn_backend", return_value=None),
+            patch(
+                "sglang.multimodal_gen.runtime.platforms.current_platform",
+                FakeCudaPlatform,
+            ),
+            patch.object(
+                FakeCudaPlatform, "_resolve_default_attn_backend", return_value=sdpa
+            ),
+        ):
+            for component, override, head_size, expected in (
+                ("text_encoder", None, 256, sdpa),
+                ("text_encoder", sage, 256, None),
+                ("transformer", None, 256, None),
+                ("text_encoder", sdpa, 72, sdpa),
+                ("transformer", None, 72, sage),
+            ):
+                with self.subTest(
+                    component=component, override=override, size=head_size
+                ):
+                    with (
+                        self.assertRaisesRegex(ValueError, "head size 256")
+                        if expected is None
+                        else nullcontext(),
+                        component_attn_backend_context_manager(
+                            override,
+                            component_name=component,
+                            allow_global_backend_fallback=component == "text_encoder",
+                        ),
+                    ):
+                        backend = get_attn_backend(head_size, torch.float16)
+                        self.assertEqual(backend.get_enum(), expected)
 
     def test_hopper_sage_attention_without_sm90_fix_falls_back(self):
         FakeCudaPlatform.is_hopper_device = True
@@ -229,6 +394,145 @@ class TestCudaAttentionBackendSelection(unittest.TestCase):
             )
 
         self.assertEqual(backend.get_enum(), AttentionBackendEnum.AITER)
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestTrtllmGenSageMetadata(unittest.TestCase):
+    def test_metadata_builds_inside_cuda_graph_capture(self):
+        """The DiT prepares this metadata inside its forward, which breakable
+        CUDA graphs capture; a host-to-device copy there failed the capture."""
+        from sglang.multimodal_gen.runtime.managers.forward_context import (
+            ForwardContext,
+        )
+
+        context = ForwardContext(current_timestep=0, attn_metadata=None)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            qo, kv, seq_lens = context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )
+        graph.replay()
+        torch.cuda.synchronize()
+        self.assertEqual(qo.tolist(), [0, 3, 6])
+        self.assertEqual(kv.tolist(), [0, 5, 10])
+        self.assertEqual(seq_lens.tolist(), [5, 5])
+        self.assertEqual({t.dtype for t in (qo, kv, seq_lens)}, {torch.int32})
+        self.assertIs(
+            context.get_trtllm_gen_sequence_metadata(
+                torch.cuda.current_device(), 2, 3, 5
+            )[0],
+            qo,
+        )
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10,
+    "Blackwell FA4 required",
+)
+class TestFlashAttentionForwardInto(unittest.TestCase):
+    """``forward_into`` writes through a strided ``out`` exactly what ``forward``
+    returns."""
+
+    def setUp(self):
+        self._fa_ver = flash_attn.fa_ver
+        flash_attn.set_fa_ver(4)
+
+    def tearDown(self):
+        flash_attn.set_fa_ver(self._fa_ver)
+
+    def test_strided_out_matches_forward_bitwise(self):
+        torch.manual_seed(0)
+        impl = FlashAttentionImpl(
+            num_heads=4, head_size=128, causal=False, softmax_scale=128**-0.5
+        )
+        q, k, v = (
+            torch.randn(2, 1000, 4, 128, device="cuda", dtype=torch.bfloat16)
+            for _ in range(3)
+        )
+        self.assertTrue(impl.forward_into(q, k, v, None, None))
+        # one head group inside a token-major buffer of every head
+        full = torch.zeros(2, 1000, 12, 128, device="cuda", dtype=torch.bfloat16)
+        out = full[:, :, 4:8]
+        self.assertTrue(impl.forward_into(q, k, v, out, None))
+        self.assertTrue(torch.equal(out, impl.forward(q, k, v, None)))
+        self.assertFalse(full[:, :, :4].any() or full[:, :, 8:].any())
+
+
+class TestFlashAttentionSingleSequence(unittest.TestCase):
+    """A packed varlen call holding one live sequence runs FA3's batch kernel."""
+
+    HEADS, HEAD_DIM = 4, 8
+
+    def _run(self, bounds, *, padding=True, max_seqlen=None, writes_out=True):
+        total = bounds[-1]
+        q, k, v = (torch.randn(total, self.HEADS, self.HEAD_DIM) for _ in range(3))
+        impl = SimpleNamespace(
+            _request_skip_softmax_threshold=lambda: (False, None),
+            softmax_scale=self.HEAD_DIM**-0.5,
+            causal=False,
+            packed_trailing_padding=padding,
+        )
+        calls = []
+
+        def fake(q, k, v, *, cu_seqlens_q, out=None, **kwargs):
+            calls.append((tuple(q.shape), cu_seqlens_q, kwargs))
+            if out is None or not writes_out:
+                return torch.ones_like(q)
+            return out.fill_(1)
+
+        with (
+            patch.object(flash_attn, "fa_ver", 3),
+            patch.object(flash_attn, "flash_attn_varlen_func", fake),
+        ):
+            output = FlashAttentionImpl.forward_varlen(
+                impl,
+                q,
+                k,
+                v,
+                cu_seqlens=torch.tensor(bounds, dtype=torch.int32),
+                max_seqlen=max_seqlen or bounds[1],
+                cu_seqlens_host=bounds,
+            )
+        return output, calls
+
+    def test_one_sequence_runs_the_batch_kernel(self):
+        output, [(shape, cu, kwargs)] = self._run((0, 12))
+        self.assertEqual(shape, (1, 12, self.HEADS, self.HEAD_DIM))
+        self.assertIsNone(cu)
+        self.assertEqual(kwargs["max_seqlen_q"], 12)
+        self.assertTrue((output == 1).all())
+
+    def test_trailing_padding_runs_live_rows_and_zeroes_the_rest(self):
+        output, [(shape, cu, kwargs)] = self._run((0, 10, 16))
+        self.assertEqual(shape, (1, 10, self.HEADS, self.HEAD_DIM))
+        self.assertIsNone(cu)
+        self.assertTrue((output[:10] == 1).all())
+        self.assertTrue((output[10:] == 0).all())
+
+    def test_fallback_that_ignores_out_still_fills_the_live_rows(self):
+        """A kernel that returns a fresh tensor instead of writing `out` must
+        not leave the live rows uninitialized."""
+        output, _ = self._run((0, 10, 16), writes_out=False)
+        self.assertTrue((output[:10] == 1).all())
+        self.assertTrue((output[10:] == 0).all())
+
+    def test_several_sequences_keep_the_varlen_kernel(self):
+        _, [(shape, cu, _)] = self._run((0, 6, 12), padding=False, max_seqlen=6)
+        self.assertEqual(shape, (12, self.HEADS, self.HEAD_DIM))
+        self.assertEqual(cu.tolist(), [0, 6, 12])
+
+    def test_padding_is_only_dropped_where_the_layout_declares_it(self):
+        _, [(shape, cu, _)] = self._run((0, 10, 16), padding=False)
+        self.assertEqual(shape, (16, self.HEADS, self.HEAD_DIM))
+        self.assertEqual(cu.tolist(), [0, 10, 16])
+
+
+class TestForwardIntoDefault(unittest.TestCase):
+    def test_backends_without_it_decline(self):
+        """A backend without ``forward_into`` declines, writing nothing."""
+        impl = SDPAImpl(num_heads=2, head_size=64, causal=False, softmax_scale=0.125)
+        q = torch.zeros(1, 8, 2, 64)
+        self.assertFalse(impl.forward_into(q, q, q, None, None))
 
 
 if __name__ == "__main__":

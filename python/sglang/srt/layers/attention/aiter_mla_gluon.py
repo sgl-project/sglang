@@ -14,7 +14,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -82,9 +82,12 @@ def mla_gluon_decode(
     min_kv_seq_len: int,
     kv_scale: float = 1.0,
     qlen: int = 1,
-) -> Optional[torch.Tensor]:
+    use_2d_view: bool = False,
+    return_lse: bool = False,
+):
     """Run Gluon MLA decode for fused Q [num_tokens, H, 576] and MLA KV pool.
-    Returns [num_tokens, H, v_head_dim], or None when Gluon is unavailable.
+    Returns [num_tokens, H, v_head_dim] (or ``(out, lse)`` when ``return_lse``),
+    or None when Gluon is unavailable.
     """
     mla_gluon = _gluon_fn()
     if mla_gluon is None:
@@ -105,7 +108,11 @@ def mla_gluon_decode(
     else:
         o = q.new_empty((batch_size, num_head, kv_lora_rank))
 
-    mla_gluon(
+    extra_kwargs = {}
+    if return_lse:
+        extra_kwargs["return_lse"] = True
+
+    result = mla_gluon(
         q_nope,
         q_pe,
         k_buffer.view(-1, layer.qk_head_dim),
@@ -115,9 +122,15 @@ def mla_gluon_decode(
         sm_scale,
         k_pe=None,
         kv_pe_offset=kv_lora_rank,
-        use_2d_view=False,
+        use_2d_view=use_2d_view,
         kv_scale=kv_scale,
         min_kv_seq_len=min_kv_seq_len,
+        **extra_kwargs,
     )
     # Hand back the caller's flat [num_tokens, H, v] layout either way.
-    return o.flatten(0, 1) if qlen > 1 else o
+    out = o.flatten(0, 1) if qlen > 1 else o
+    if not return_lse:
+        return out
+    # mla_gluon writes the output into `o` and returns it alongside the lse.
+    _, lse = result
+    return out, lse

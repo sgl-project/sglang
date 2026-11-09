@@ -101,6 +101,29 @@ deepseek:
     - any-glob-to-any-file:
       - '**/*deepseek*'
 
+# Reflection Beam model (exclude ordinary beam search)
+Beam:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'python/sglang/srt/models/beam.py'
+      - 'python/sglang/srt/configs/beam.py'
+      - 'python/sglang/srt/arg_groups/model_overrides/beam.py'
+      - 'python/sglang/srt/parser/beam.py'
+      - 'python/sglang/srt/function_call/beam_detector.py'
+      - 'python/sglang/srt/entrypoints/openai/responses_tools/beam.py'
+      - 'python/sglang/kernels/jit/csrc/distributed/beam_all_reduce.cuh'
+      - 'python/sglang/kernels/ops/communication/beam_all_reduce.py'
+      - 'python/sglang/kernels/ops/elementwise/beam_fused.py'
+      - 'python/sglang/kernels/ops/layernorm/beam_fused.py'
+      - 'test/registered/kernels/ops/communication/test_beam_all_reduce.py'
+      - 'test/registered/unit/parser/test_beam_*.py'
+      - 'docker/beam/**/*'
+      - 'docs/cookbook/autoregressive/Reflection/Beam-*.mdx'
+      - 'docs/src/snippets/configs/reflection/beam-*.jsx'
+    - all-globs-to-any-file:
+      - 'test/registered/e2e/models/test_beam_*.py'
+      - '!test/registered/e2e/models/test_beam_search*'
+
 memory-pool:
   - changed-files:
     - any-glob-to-any-file:
@@ -114,9 +137,7 @@ unified-radix-cache:
   - changed-files:
     - any-glob-to-any-file:
       - 'python/sglang/srt/mem_cache/unified_cache/**/*'
-      - 'python/sglang/srt/mem_cache/cpp_radix_tree/**/*'
       - 'python/sglang/srt/mem_cache/**/*radix*'
-      - 'python/sglang/srt/mem_cache/chunk_cache.py'
       - 'python/sglang/srt/mem_cache/evict_policy.py'
       - 'python/sglang/srt/mem_cache/base_prefix_cache.py'
       - 'test/registered/radix_cache/**/*'
@@ -125,7 +146,6 @@ hicache:
   - changed-files:
     - any-glob-to-any-file:
       - '**/*hicache*'
-      - '**/*hiradix*'
       - '**/HiCache/**/*'
       - 'benchmark/hicache/**/*'
       - 'test/registered/hicache/**/*'
@@ -137,6 +157,28 @@ hicache:
       - 'python/sglang/srt/mem_cache/**/*host*'
       - 'python/sglang/srt/mem_cache/**/*storage*'
       - 'python/sglang/srt/mem_cache/l2_transfer.py'
+
+# A *mooncake* filename glob also matches benchmark/datasets/mooncake.py.
+mooncake:
+  - changed-files:
+    - any-glob-to-any-file:
+      # PD KV transfer.
+      - 'python/sglang/srt/disaggregation/mooncake/**/*'
+      - 'python/sglang/srt/distributed/device_communicators/mooncake_transfer_engine.py'
+      - 'python/sglang/srt/observability/mooncake_trace.py'
+      - 'test/registered/unit/disaggregation/**/*mooncake*'
+      - 'test/manual/kv_transfer/**/*mooncake*'
+      # HiCache store.
+      - 'python/sglang/srt/mem_cache/storage/mooncake_store/**/*'
+      - 'python/sglang/test/mooncake_utils.py'
+      - 'test/registered/unit/mem_cache/**/*mooncake*'
+      - 'test/registered/hicache/**/*mooncake*'
+      # MoE EP. elastic_ep.py also implements nixl.
+      - 'python/sglang/srt/layers/moe/token_dispatcher/mooncake.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_client.py'
+      - 'python/sglang/srt/elastic_ep/expert_backup_manager.py'
+      - 'test/registered/ep/**/*mooncake*'
+      - 'test/manual/ep/**/*mooncake*'
 
 # Deterministic
 deterministic:
@@ -164,3 +206,8 @@ apple-silicon:
       - '**/*mlx*'
       - '**/mlx/**'
       - '**/*mps*'
+
+rust-processor:
+  - changed-files:
+    - any-glob-to-any-file:
+      - 'rust/sglang-processor/**/*'

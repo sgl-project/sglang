@@ -15,7 +15,8 @@ from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVReceiver,
     MooncakeKVSender,
 )
-from sglang.srt.distributed import get_pp_group
+from sglang.srt.disaggregation.utils import resolve_dcp_dst_entry_indices
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.network import get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -26,7 +27,7 @@ class AscendStateType(str, enum.Enum):
 
     DSV4_C128 = "dsv4_c128"
     # C4 compress-state rows (attention + indexer) addressed within each
-    # req_pool_idx bank on A5 (CYCLE cache_mode).  Separate from StateType.SWA
+    # req_pool_idx bank on Ascend 950 (CYCLE cache_mode).  Separate from StateType.SWA
     # because each peer maps logical positions into its own local ring.
     DSV4_C4_STATE = "dsv4_c4_state"
 
@@ -34,7 +35,84 @@ class AscendStateType(str, enum.Enum):
 _DSV4_KVCACHE_STATE_TYPES = tuple(AscendStateType)
 
 
+def _build_page_interleaved_dcp_plan(
+    src_page_indices: npt.NDArray[np.int32],
+    dst_page_indices: npt.NDArray[np.int32],
+    *,
+    page_size: int,
+    dcp_size: int,
+    dcp_rank: int,
+    src_page_offset: int,
+    decode_prefix_len: int,
+    num_kv_tokens: int,
+) -> Tuple[npt.NDArray[np.int64], ...]:
+    """Map physical prefill pages to local/global decode page slots."""
+    if not 0 <= dcp_rank < dcp_size:
+        raise ValueError(f"Invalid DCP rank {dcp_rank} for size {dcp_size}")
+    virtual_page_size = page_size * dcp_size
+    if decode_prefix_len % virtual_page_size:
+        raise ValueError(
+            "Ascend PD DCP requires decode_prefix_len to align to the virtual "
+            f"page size ({virtual_page_size}), got {decode_prefix_len}"
+        )
+    if src_page_offset < 0 or num_kv_tokens < 0:
+        raise ValueError(
+            "Ascend PD DCP page offset and token count must be nonnegative"
+        )
+
+    src_pages = np.asarray(src_page_indices, dtype=np.int64)
+    dst_pages = np.asarray(dst_page_indices, dtype=np.int64)
+    max_src_pages = (num_kv_tokens + page_size - 1) // page_size
+    if src_pages.size > max_src_pages:
+        raise ValueError(
+            "Ascend PD DCP source page count exceeds the token count: "
+            f"pages={src_pages.size}, tokens={num_kv_tokens}, page_size={page_size}"
+        )
+    if src_pages.size == 0:
+        empty = np.empty((0,), dtype=np.int64)
+        return empty, empty.copy(), empty.copy(), empty.copy()
+
+    # CP may assign this sender only a contiguous subset of the chunk pages;
+    # index_slice.start still carries that subset's suffix-relative offset.
+    relative_pages = src_page_offset + np.arange(src_pages.size, dtype=np.int64)
+    dst_positions = relative_pages // dcp_size
+    if dst_positions[-1] >= dst_pages.size:
+        raise ValueError(
+            "Ascend PD DCP destination does not contain enough virtual pages: "
+            f"required={dst_positions[-1] + 1}, available={dst_pages.size}"
+        )
+    dst_super_pages = dst_pages[dst_positions]
+    owners = (decode_prefix_len // page_size + relative_pages) % dcp_size
+    local = owners == dcp_rank
+
+    return (
+        src_pages[local],
+        dst_super_pages[local],
+        src_pages,
+        dst_super_pages * dcp_size + owners,
+    )
+
+
 class AscendKVManager(MooncakeKVManager):
+    def __init__(
+        self,
+        args,
+        disaggregation_mode,
+        server_args,
+        is_mla_backend: Optional[bool] = False,
+        dcp_remote_decode_layout=None,
+    ):
+        self._dcp_remote_decode_layout = (
+            None if dcp_remote_decode_layout is None else list(dcp_remote_decode_layout)
+        )
+        super().__init__(args, disaggregation_mode, server_args, is_mla_backend)
+
+    def _uses_page_interleaved_dcp(self) -> bool:
+        return (
+            getattr(self.kv_args, "kv_buf_groups", 1) in (2, 3)
+            or self.is_hybrid_mla_backend
+        )
+
     def _requires_exact_state_index_match(self, st: StateType) -> bool:
         return (
             super()._requires_exact_state_index_match(st)
@@ -66,6 +144,60 @@ class AscendKVManager(MooncakeKVManager):
             lens.extend(component_lens)
         if ptrs:
             self.engine.batch_register(ptrs, lens)
+
+    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
+        if self._uses_page_interleaved_dcp() and self.dcp_size != dst_dcp_size:
+            if self.dcp_size == 1 and dst_dcp_size > 1:
+                return True
+            raise RuntimeError(
+                "NPU DSA/MLA PD supports prefill DCP 1 -> decode DCP N only, got "
+                f"prefill={self.dcp_size}, decode={dst_dcp_size}"
+            )
+        return super().requires_dcp_relayout(dst_dcp_size, dst_dcp_rank)
+
+    def _get_dcp_remote_decode_layout(self) -> List[bool]:
+        layout = self._dcp_remote_decode_layout
+        if layout is None or len(layout) != len(self.kv_args.kv_data_ptrs):
+            raise RuntimeError(
+                "Ascend PD DCP layout does not match its source KV entries"
+            )
+        num_draft = self.kv_args.num_draft_entries
+        if num_draft:
+            # Remote decode draft KV uses global slots regardless of the local
+            # prefill pool's worker role.
+            return layout[:-num_draft] + [True] * num_draft
+        return layout
+
+    def prepare_dcp_token_item_lens(
+        self,
+        dst_page_item_lens: List[Optional[int]],
+        dst_dcp_size: int,
+        draft_rows_collapsed: bool = False,
+    ) -> List[int]:
+        if not self._uses_page_interleaved_dcp():
+            return super().prepare_dcp_token_item_lens(
+                dst_page_item_lens,
+                dst_dcp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+            )
+        if not self.is_hybrid_mla_backend or StateType.DSA in self.kv_args.state_types:
+            self._get_dcp_remote_decode_layout()
+        page_size = self.kv_args.page_size
+        token_item_lens = []
+        for entry, item_len in enumerate(self.kv_args.kv_item_lens):
+            token_item_len, remainder = divmod(item_len, page_size)
+            if remainder:
+                raise RuntimeError(
+                    f"Ascend PD DCP source entry {entry} is not page aligned"
+                )
+            token_item_lens.append(token_item_len)
+        return token_item_lens
+
+    def _init_dcp_pack_buffers_once(
+        self, dcp_size: int, *, include_draft: bool = False
+    ) -> None:
+        # Page-interleaved NPU DCP transfers whole pages directly.
+        self._dcp_pack_buffers = []
 
     def get_mla_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int], state_type=None
@@ -103,7 +235,7 @@ class AscendKVManager(MooncakeKVManager):
                     dst.extend(dst_kv_ptrs[offset + c4_start : offset + c4_end])
                 return src_kv_ptrs, dst, len(src_kv_ptrs)
 
-            # On A5 (CYCLE cache_mode), StateType.SWA only contains SWA KV
+            # On Ascend 950 (CYCLE cache_mode), StateType.SWA only contains SWA KV
             # buffers (C4 compress state is registered separately as
             # DSV4_C4_STATE).  The common _mla_slice_ptrs_for_pp assumes
             # SWA + C4 state are bundled (swa_L + 2*c4_full), so intercept
@@ -130,7 +262,7 @@ class AscendKVManager(MooncakeKVManager):
         else:
             sliced_dst_kv_ptrs = []
             start_layer = self.kv_args.prefill_start_layer
-            transfer_draft_kv = get_pp_group().is_last_rank and draft_kv_layers
+            transfer_draft_kv = get_parallel().pp_group.is_last_rank and draft_kv_layers
             if transfer_draft_kv:
                 end_layer = start_layer + src_layers - draft_kv_layers
             else:
@@ -174,6 +306,22 @@ class AscendKVManager(MooncakeKVManager):
         self._validate_envelope_kv_layout(
             dst_kv_ptrs, dst_kv_item_len, dst_attn_tp_size
         )
+        # Hybrid MLA prefill stages expose PP-local entries, while a PP=1
+        # decode peer registers all model layers. Pair only this layout by
+        # global layer id; every other Ascend layout keeps the legacy path.
+        if self.is_hybrid_mla_backend and self.pp_size > 1:
+            return self._send_kvcache_generic(
+                mooncake_session_id=mooncake_session_id,
+                src_data_ptrs=self.kv_args.kv_data_ptrs,
+                dst_data_ptrs=dst_kv_ptrs,
+                item_lens=self.kv_args.kv_item_lens,
+                prefill_data_indices=prefill_kv_indices,
+                dst_data_indices=dst_kv_indices,
+                executor=executor,
+                src_layer_ids=self.kv_args.kv_layer_ids,
+                dst_layer_ids=dst_layer_ids,
+            )
+
         # Group by indices
         prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
             prefill_kv_indices, dst_kv_indices
@@ -272,6 +420,133 @@ class AscendKVManager(MooncakeKVManager):
             return process_layers(layers_params)
 
         return 0
+
+    def send_kvcache_dcp(
+        self,
+        mooncake_session_id: str,
+        prefill_kv_indices: npt.NDArray[np.int32],
+        dst_kv_ptrs: list[int],
+        dst_kv_indices: npt.NDArray[np.int32],
+        *,
+        dcp_token_item_lens: List[int],
+        dst_dcp_size: int,
+        dst_dcp_rank: int,
+        src_page_offset: int,
+        decode_prefix_len: int,
+        num_kv_tokens: int,
+        executor: concurrent.futures.ThreadPoolExecutor,
+        dst_layer_ids: List[int],
+        pack_buffer=None,
+        dst_kv_item_lens: Optional[List[int]] = None,
+        dst_tp_rank: int = 0,
+        dst_attn_tp_size: Optional[int] = None,
+        draft_rows_collapsed: bool = False,
+        dsa_index_k: Optional[Tuple[List[int], List[int], int]] = None,
+    ) -> int:
+        if not self._uses_page_interleaved_dcp():
+            return super().send_kvcache_dcp(
+                mooncake_session_id,
+                prefill_kv_indices,
+                dst_kv_ptrs,
+                dst_kv_indices,
+                dcp_token_item_lens=dcp_token_item_lens,
+                dst_dcp_size=dst_dcp_size,
+                dst_dcp_rank=dst_dcp_rank,
+                src_page_offset=src_page_offset,
+                decode_prefix_len=decode_prefix_len,
+                num_kv_tokens=num_kv_tokens,
+                executor=executor,
+                dst_layer_ids=dst_layer_ids,
+                pack_buffer=pack_buffer,
+                dst_kv_item_lens=dst_kv_item_lens,
+                dst_tp_rank=dst_tp_rank,
+                dst_attn_tp_size=dst_attn_tp_size,
+                draft_rows_collapsed=draft_rows_collapsed,
+                dsa_index_k=dsa_index_k,
+            )
+
+        src_kv_ptrs = self.kv_args.kv_data_ptrs
+        if self.is_hybrid_mla_backend:
+            dst_indices = resolve_dcp_dst_entry_indices(
+                self.kv_args.kv_layer_ids,
+                dst_layer_ids,
+                len(src_kv_ptrs),
+                len(dst_kv_ptrs),
+            )
+            dst_kv_ptrs = [dst_kv_ptrs[j] for j in dst_indices]
+            if dst_kv_item_lens:
+                dst_kv_item_lens = [dst_kv_item_lens[j] for j in dst_indices]
+        else:
+            _, dst_kv_ptrs, _ = self.get_mla_kv_ptrs_with_pp(src_kv_ptrs, dst_kv_ptrs)
+            if dst_kv_item_lens:
+                _, dst_kv_item_lens, _ = self.get_mla_kv_ptrs_with_pp(
+                    self.kv_args.kv_item_lens, dst_kv_item_lens
+                )
+
+        num_entries = len(src_kv_ptrs)
+        num_target = num_entries - self.kv_args.num_draft_entries
+        is_dense_hybrid_mla = (
+            self.is_hybrid_mla_backend and StateType.DSA not in self.kv_args.state_types
+        )
+        layout = None if is_dense_hybrid_mla else self._get_dcp_remote_decode_layout()
+        if (
+            not (
+                len(dst_kv_ptrs)
+                == len(self.kv_args.kv_item_lens)
+                == len(dcp_token_item_lens)
+                == num_entries
+            )
+            or not 0 <= num_target <= num_entries
+        ):
+            raise RuntimeError("Ascend PD DCP KV entry metadata is inconsistent")
+        if dst_kv_item_lens and len(dst_kv_item_lens) != num_entries:
+            raise RuntimeError("Ascend PD DCP destination KV metadata is inconsistent")
+
+        local_src, local_dst, global_src, global_dst = _build_page_interleaved_dcp_plan(
+            prefill_kv_indices,
+            dst_kv_indices,
+            page_size=self.kv_args.page_size,
+            dcp_size=dst_dcp_size,
+            dcp_rank=dst_dcp_rank,
+            src_page_offset=src_page_offset,
+            decode_prefix_len=decode_prefix_len,
+            num_kv_tokens=num_kv_tokens,
+        )
+
+        transfer_blocks: List[Tuple[int, int, int]] = []
+        for entry in range(num_entries):
+            # Dense MLA uses the target/draft boundary directly, as Mooncake does.
+            # DSA keeps its per-buffer index-cache layout.
+            uses_global_slots = entry >= num_target if layout is None else layout[entry]
+            page_bytes = self.kv_args.kv_item_lens[entry]
+            if page_bytes != dcp_token_item_lens[entry] * self.kv_args.page_size:
+                raise RuntimeError(
+                    f"Ascend PD DCP source geometry differs at entry {entry}"
+                )
+            if dst_kv_item_lens:
+                expected_dst_bytes = page_bytes * (
+                    dst_dcp_size if uses_global_slots else 1
+                )
+                if dst_kv_item_lens[entry] != expected_dst_bytes:
+                    raise RuntimeError(
+                        "Ascend PD DCP destination geometry differs at entry "
+                        f"{entry}: expected={expected_dst_bytes}, "
+                        f"actual={dst_kv_item_lens[entry]}"
+                    )
+
+            src_pages = global_src if uses_global_slots else local_src
+            dst_pages = global_dst if uses_global_slots else local_dst
+            src_groups, dst_groups = group_concurrent_contiguous(src_pages, dst_pages)
+            for src_group, dst_group in zip(src_groups, dst_groups):
+                transfer_blocks.append(
+                    (
+                        src_kv_ptrs[entry] + int(src_group[0]) * page_bytes,
+                        dst_kv_ptrs[entry] + int(dst_group[0]) * page_bytes,
+                        len(src_group) * page_bytes,
+                    )
+                )
+
+        return self._transfer_data(mooncake_session_id, transfer_blocks)
 
     def _is_generic_kvcache_state_type(self, st) -> bool:
         # DSV4 per-pool components also use the page-indexed send path.

@@ -10,18 +10,17 @@ import torch
 
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
-from sglang.test.run_eval import run_eval
 from sglang.test.runners import DEFAULT_PROMPTS, SRTRunner, check_close_model_outputs
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    is_in_ci,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=217, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=209, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
 
 
@@ -51,7 +50,7 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             num_examples=256,
             num_threads=32,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         self.assertGreaterEqual(metrics["score"], self.mmlu_lower_bound)
 
     def test_gsm8k(self):
@@ -59,12 +58,11 @@ class TestTransformersFallbackEndpoint(CustomTestCase):
             base_url=self.base_url,
             model=self.model,
             eval_name="gsm8k",
-            api="completion",
             max_tokens=512,
             num_examples=200,
             num_threads=128,
         )
-        metrics = run_eval(args)
+        metrics = run_sgl_eval(args)
         print(f"{metrics=}")
         self.assertGreater(metrics["score"], self.gsm8k_lower_bound)
 
@@ -84,10 +82,6 @@ class ModelCase:
 # Popular models that run on the CI
 CI_MODELS = [
     ModelCase(DEFAULT_MODEL_NAME_FOR_TEST),
-]
-
-ALL_OTHER_MODELS = [
-    ModelCase(DEFAULT_MODEL_NAME_FOR_TEST, tp_size=2),
 ]
 
 
@@ -140,19 +134,6 @@ class TestTransformersFallbackEngine(CustomTestCase):
             prompts = DEFAULT_PROMPTS
             if model_case.skip_long_prompt:
                 prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-            # Assert the logits and output strs are close
-            self.assert_close_logits_and_output_strs(prompts, model_case)
-
-    def test_others(self):
-        if is_in_ci():
-            return
-
-        # Skip long prompts for models that do not have a long context
-        prompts = DEFAULT_PROMPTS
-        for model_case in ALL_OTHER_MODELS:
-            if model_case.skip_long_prompt:
-                prompts = [p for p in DEFAULT_PROMPTS if len(p) < 1000]
-
             # Assert the logits and output strs are close
             self.assert_close_logits_and_output_strs(prompts, model_case)
 

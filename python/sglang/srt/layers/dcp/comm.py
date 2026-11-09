@@ -20,54 +20,31 @@ PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
 """
 
-import warnings
+import logging
 from typing import Optional
 
 import torch
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     CPTritonContext,
+    DcpDirectAllToAll,
     _lse_pack_dim,
     correct_attn_out,
     dcp_lse_combine_triton,
     dcp_pack_a2a_send,
+    dcp_pack_q,
 )
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.runtime_context import get_parallel, get_platform
-from sglang.srt.utils.common import is_mnnvl_fabric_device
+from sglang.srt.utils import is_hip
+from sglang.srt.utils.device import is_fi_a2a_supported
 
+logger = logging.getLogger(__name__)
 
-def _warn_deprecated_dcp_accessor(name: str, replacement: str) -> None:
-    warnings.warn(
-        f"{name} is deprecated; use {replacement} instead.",
-        DeprecationWarning,
-        stacklevel=2,
-    )
-
-
-def dcp_enabled() -> bool:
-    """Deprecated: use ``get_parallel().dcp_enabled``."""
-    _warn_deprecated_dcp_accessor("dcp_enabled()", "get_parallel().dcp_enabled")
-    return get_parallel().dcp_enabled
-
-
-def get_attention_dcp_world_size() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
-    return get_parallel().attn_dcp_size
-
-
-def get_attention_dcp_rank() -> int:
-    """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
-    return get_parallel().attn_dcp_rank
+_is_hip = is_hip()
 
 
 def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tensor:
@@ -151,6 +128,41 @@ def cp_lse_ag_out_rs_mla(
     return out.to(cp_attn_out.dtype)
 
 
+def cp_lse_ag_out_rs_mla_npu(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+) -> torch.Tensor:
+    """Merge NPU DCP partial outputs and return the local head slice."""
+    if cp_group.world_size == 1:
+        return cp_attn_out
+
+    import torch_npu
+
+    batch_size, total_heads, head_dim = cp_attn_out.shape
+    world_size = cp_group.world_size
+    local_heads = total_heads // world_size
+    packed = torch.cat([cp_attn_out.float(), cp_attn_lse.float().unsqueeze(-1)], dim=-1)
+    packed = packed.permute(1, 2, 0).contiguous()
+    gathered = torch.empty_like(packed)
+    cp_group.all_to_all_single(gathered, packed)
+    # all_to_all_single splits the leading head dimension. After the exchange,
+    # the heads are grouped by source rank inside every token. Move that source
+    # rank in front before flattening tokens and local heads for the update op.
+    gathered = gathered.permute(2, 0, 1).contiguous()
+    gathered = (
+        gathered.view(batch_size, world_size, local_heads, head_dim + 1)
+        .permute(1, 0, 2, 3)
+        .contiguous()
+        .view(world_size, batch_size * local_heads, head_dim + 1)
+    )
+    out_flat, lse_flat = torch.split(gathered, [head_dim, 1], dim=-1)
+    merged, _ = torch_npu.npu_attention_update(
+        lse_flat.squeeze(-1).unbind(0), out_flat.unbind(0), 0
+    )
+    return merged.view(batch_size, local_heads, head_dim).to(cp_attn_out.dtype)
+
+
 def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     parallel = get_parallel()
     dcp_world_size = parallel.dcp_size
@@ -166,12 +178,32 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
         )
     else:
         parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
+    # Reorder large byte-packed rows with word loads after the collective,
+    # keeping every rank's wire dtype/count unchanged.
+    reorder_dtype = None
+    if (
+        get_platform().is_sm100
+        and kv_a.dtype == torch.uint8
+        and gathered_kv_a.numel() >= 64 * 1024 * 1024
+        and kv_a.shape[-1] % 4 == 0
+    ):
+        reorder_dtype = torch.int64 if kv_a.shape[-1] % 8 == 0 else torch.int32
+    row_shape = kv_a.shape
+    if reorder_dtype is not None:
+        # The destination is freshly allocated, contiguous and aligned, even
+        # when a rank's input rows are empty or have an unusual storage offset.
+        # Reinterpret only after the collective so all ranks keep its original
+        # dtype/count, including heterogeneous devices that take the byte path.
+        gathered_kv_a = gathered_kv_a.view(reorder_dtype)
+        row_shape = (kv_a.shape[0], *gathered_kv_a.shape[1:])
     gathered_kv_a = (
-        gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
+        gathered_kv_a.reshape((dcp_world_size,) + row_shape)
         .transpose(0, 1)
-        .reshape(-1, *kv_a.shape[1:])
+        .reshape(-1, *row_shape[1:])
     )
-    return gathered_kv_a
+    return (
+        gathered_kv_a.view(kv_a.dtype) if reorder_dtype is not None else gathered_kv_a
+    )
 
 
 def all_gather_kv_cache_for_mha_chunk_extend(
@@ -204,9 +236,9 @@ def all_gather_kv_cache_for_mha_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
-    )
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.layer_router.read(
+        attn_mqa.layer_id
+    ).read_mla(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
@@ -251,12 +283,28 @@ def all_gather_kv_cache_for_mha_extend(
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    dtype: Optional[torch.dtype] = None,
 ):
+    """All-gather the DCP group's query heads; ``dtype`` casts q before the wire."""
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
+    if dtype is None or dtype == q_pe.dtype:
+        with use_symmetric_memory(group):
+            # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
+            combined = torch.cat(
+                [q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1
+            )
+        gathered = group.all_gather(combined, dim=0)
+    else:
+        B, H, d_nope = q_nope_out.shape
+        with use_symmetric_memory(group):
+            combined = torch.empty(
+                (H, B, q_pe.shape[-1] + d_nope), dtype=dtype, device=q_pe.device
+            )
+        dcp_pack_q(q_nope_out, q_pe, combined)
+        # The aiter custom all-gather only takes 16/32-bit floats and pynccl has
+        # no FP8 dtype: pair the bytes into fp16 when the row allows, an exact copy.
+        wire = torch.float16 if combined.shape[-1] % 2 == 0 else torch.uint8
+        gathered = group.all_gather(combined.view(wire), dim=0).view(dtype)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
@@ -276,31 +324,37 @@ def all_gather_kv_cache_for_mla_extend(
     k_nope,
     k_pe,
 ):
-    cache_k_nope, cache_k_rope = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa,
-        dcp_local_prefix_kv_indices,
-    )
-    extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
-    # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
-    gathered_kv = all_gather_kv_cache_for_dcp(
-        cache_k_nope,
-        cache_k_rope,
-        extend_prefix_lens_cpu,
-        prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
-    )
-    dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
+    # On hip, skip the all-gather when there is no cached prefix to avoid crash
+    if not _is_hip or dcp_extend_prefix_lens_sum > 0:
+        cache_k_nope, cache_k_rope = token_to_kv_pool.layer_router.read(
+            attn_mqa.layer_id
+        ).read_mla(
+            attn_mqa,
+            dcp_local_prefix_kv_indices,
+        )
+        extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
+        # all gather kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+        gathered_kv = all_gather_kv_cache_for_dcp(
+            cache_k_nope,
+            cache_k_rope,
+            extend_prefix_lens_cpu,
+            prefix_starts_cpu=torch.zeros_like(extend_prefix_lens_cpu),
+        )
+        dcp_kv_buffer[:dcp_extend_prefix_lens_sum] = gathered_kv
 
-    # copy local kv cache into forward_batch.attn_dcp_metadata.dcp_kv_buffer
+    # Attention TP may append dummy tokens to align an extend batch to its
+    # group width. The DCP buffer tracks only real sequence tokens.
+    extend_num_tokens = dcp_kv_buffer.shape[0] - dcp_extend_prefix_lens_sum
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         :kv_lora_rank,
-    ] = k_nope
+    ] = k_nope[:extend_num_tokens]
     dcp_kv_buffer[
         dcp_extend_prefix_lens_sum:,
         ...,
         kv_lora_rank:,
-    ] = k_pe
+    ] = k_pe[:extend_num_tokens]
 
 
 # all gather kv cache and re-org to query orders
@@ -309,6 +363,8 @@ def all_gather_kv_cache_for_dcp(
     prefix_k_pe: torch.Tensor,
     prefix_kv_lens_cpu: torch.Tensor,
     prefix_starts_cpu: torch.Tensor = None,
+    *,
+    interleave_size: int = 1,
 ):
     """
     prefix_kv_a and prefix_k_pe should have same shape, expect for last dim
@@ -323,16 +379,39 @@ def all_gather_kv_cache_for_dcp(
     if prefix_starts_cpu is None:
         prefix_starts_cpu = torch.zeros_like(prefix_kv_lens_cpu)
 
-    left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
-    left_pads = left_pads.to(torch.int32)
-    right_pads = (
-        prefix_starts_cpu + prefix_kv_lens_cpu - 1
-    ) % dcp_world_size < dcp_rank
-    right_pads = right_pads.to(torch.int32)
-    padded_lens = (
-        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
-    ) // dcp_world_size
-
+    cycle_size = dcp_world_size * interleave_size
+    if interleave_size == 1:
+        # Preserve the original token-interleaved padding path.
+        left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
+        left_pads = left_pads.to(torch.int32)
+        right_pads = (
+            prefix_starts_cpu + prefix_kv_lens_cpu - 1
+        ) % dcp_world_size < dcp_rank
+        right_pads = right_pads.to(torch.int32)
+        padded_lens = (
+            prefix_kv_lens_cpu
+            + (prefix_starts_cpu % dcp_world_size)
+            + dcp_world_size
+            - 1
+        ) // dcp_world_size
+    else:
+        start_offset = prefix_starts_cpu % cycle_size
+        end_offset = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % cycle_size
+        left_pads = (
+            (start_offset - dcp_rank * interleave_size)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        right_pads = (
+            ((dcp_rank + 1) * interleave_size - 1 - end_offset)
+            .clamp(0, interleave_size)
+            .to(torch.int32)
+        )
+        padded_lens = (
+            (prefix_kv_lens_cpu + start_offset + cycle_size - 1)
+            // cycle_size
+            * interleave_size
+        )
     local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
         len(prefix_kv_lens_cpu) + 1,
@@ -353,7 +432,13 @@ def all_gather_kv_cache_for_dcp(
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
 
-    gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    if interleave_size == 1:
+        gatherd_kv_cache = _all_gather_dcp_kv_cache(padded_kv_cache)
+    else:
+        gathered_pages = _all_gather_dcp_kv_cache(
+            padded_kv_cache.reshape(-1, interleave_size, *padded_kv_cache.shape[1:])
+        )
+        gatherd_kv_cache = gathered_pages.flatten(0, 1)
 
     # 2. re-org kv cache to query orders
     padded_lens_cu = torch.zeros(
@@ -366,7 +451,7 @@ def all_gather_kv_cache_for_dcp(
         kv_cache_tuple += (
             gatherd_kv_cache[
                 padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
+                + (prefix_starts_cpu[req_idx] % cycle_size) :
             ][: prefix_kv_lens_cpu[req_idx]],
         )
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
@@ -383,17 +468,6 @@ def all_gather_kv_cache_for_dcp(
 # Per-process singleton: MNNVL workspace + this rank's cp position. Populated
 # once, pre-CUDA-graph-capture, by init_fi_a2a_workspace().
 _FI_A2A_STATE: Optional[dict] = None
-
-
-def is_fi_a2a_supported(
-    *, dcp_size: int, tp_size: int, pp_size: int, nnodes: int
-) -> bool:
-    if not get_platform().is_sm100:
-        return False
-    if is_mnnvl_fabric_device():
-        return True
-    tp_size_per_node = tp_size // max(nnodes // pp_size, 1)
-    return tp_size_per_node % dcp_size == 0
 
 
 def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
@@ -468,7 +542,76 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     _FI_A2A_STATE = {
         "workspace": workspace,
         "cp_rank": cp_rank,
+        "direct": DcpDirectAllToAll(cp_group),
     }
+
+
+_PUSH_COMBINE_COMM = None
+
+
+def init_dcp_push_combine(cp_group: "GroupCoordinator", num_heads: int) -> None:
+    """Allocate the push plane of the one-kernel DCP reduce (see
+    dcp_push_combine_reduce). Call once per process before CUDA-graph capture."""
+    global _PUSH_COMBINE_COMM
+    from sglang.srt.environ import envs
+
+    if _PUSH_COMBINE_COMM is not None or cp_group.world_size == 1:
+        return
+    if not envs.SGLANG_ENABLE_DCP_PUSH_COMBINE.get() or num_heads % cp_group.world_size:
+        return
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
+        CustomAllReduceV2,
+    )
+
+    slot_bytes = (
+        envs.SGLANG_DCP_PUSH_COMBINE_MAX_ROWS.get()
+        * (num_heads // cp_group.world_size)
+        * pc.SLOT_BYTES_PER_ROW
+    )
+    comm = CustomAllReduceV2(
+        cp_group.cpu_group,
+        torch.device("cuda", torch.cuda.current_device()),
+        max_pull_size=0,
+        max_push_size=slot_bytes,
+    )
+    if comm.disabled:
+        logger.warning(
+            "DCP push-combine: CustomAllReduceV2 unavailable, keeping the a2a reduce"
+        )
+        return
+    pc.register_comm(comm.obj)
+    _PUSH_COMBINE_COMM = comm
+
+
+def dcp_push_combine_fits(rows: int) -> bool:
+    """Whether the push plane is set up and takes ``rows`` (batch x this rank's
+    heads) of 128-wide partials."""
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+
+    return (
+        _PUSH_COMBINE_COMM is not None
+        and rows * pc.SLOT_BYTES_PER_ROW <= _PUSH_COMBINE_COMM.max_push_size
+    )
+
+
+def dcp_push_combine_reduce(
+    v: torch.Tensor,
+    lse: torch.Tensor,
+    cp_group: "GroupCoordinator",
+    is_lse_base_on_e: bool = True,
+) -> Optional[torch.Tensor]:
+    """The DCP reduce of 128-wide head partials ``v`` [B, H, 128] as one push +
+    combine kernel; returns this rank's heads [B, H / N * 128], or None when the
+    push plane is not set up or too small for ``B`` rows."""
+    from sglang.kernels.ops.attention import dcp_push_combine as pc
+
+    n = cp_group.world_size
+    if v.shape[-1] != pc.HEAD_DIM or not dcp_push_combine_fits(
+        v.shape[0] * (v.shape[1] // n)
+    ):
+        return None
+    return pc.dcp_push_combine(n, v, lse, is_lse_base_on_e=is_lse_base_on_e)
 
 
 def dcp_a2a_lse_reduce(
@@ -555,6 +698,10 @@ def _dcp_fi_a2a_lse_reduce(
         "fi_a2a workspace not initialized — call init_fi_a2a_workspace(dcp_group) "
         "at model-runner init (before CUDA graph capture)."
     )
+
+    direct = state["direct"](cp_attn_out, cp_attn_lse)
+    if direct is not None:
+        return dcp_lse_combine_triton(*direct, is_lse_base_on_e=is_lse_base_on_e)[0]
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape

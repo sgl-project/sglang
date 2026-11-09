@@ -71,7 +71,37 @@ class SenseNovaU1GenerationStage(PipelineStage):
                 "SenseNova-U1 expects output expansion before generation; "
                 f"got num_outputs_per_prompt={batch.num_outputs_per_prompt}."
             )
-        seed = batch.seed[0] if isinstance(batch.seed, list) else int(batch.seed)
+        prompts = batch.prompt if isinstance(batch.prompt, list) else [batch.prompt]
+        batch_size = len(prompts)
+        if batch_size == 0:
+            raise ValueError(
+                "SenseNova-U1 dynamic batch must contain at least one prompt"
+            )
+        if batch_size > 1 and options.think_mode:
+            raise ValueError(
+                "SenseNova-U1 dynamic batching does not support think_mode"
+            )
+
+        dynamic_seeds = batch.extra.get("dynamic_batch_seeds")
+        if dynamic_seeds is None:
+            dynamic_seeds = batch.seed if isinstance(batch.seed, list) else [batch.seed]
+        elif not isinstance(dynamic_seeds, list):
+            dynamic_seeds = [dynamic_seeds]
+        seeds = []
+        for seed in dynamic_seeds:
+            if isinstance(seed, list):
+                if len(seed) != 1:
+                    raise ValueError(
+                        "SenseNova-U1 dynamic batching requires one seed per request"
+                    )
+                seed = seed[0]
+            seeds.append(int(seed))
+        if len(seeds) != batch_size:
+            raise ValueError(
+                "SenseNova-U1 dynamic batch requires one seed per prompt; "
+                f"got {len(seeds)} seeds for {batch_size} prompts"
+            )
+        seed = seeds[0] if batch_size == 1 else seeds
 
         out = self.model.t2i_generate(
             self.tokenizer,
@@ -83,7 +113,7 @@ class SenseNovaU1GenerationStage(PipelineStage):
             enable_timestep_shift=options.enable_timestep_shift,
             cfg_interval=options.cfg_interval,
             num_steps=int(batch.num_inference_steps),
-            batch_size=1,
+            batch_size=batch_size,
             t_eps=options.t_eps,
             think_mode=options.think_mode,
             seed=seed,

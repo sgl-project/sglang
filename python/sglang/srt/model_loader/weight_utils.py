@@ -6,6 +6,7 @@
 
 import collections
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob
 import hashlib
@@ -17,10 +18,9 @@ import re
 import struct
 import tempfile
 import threading
-from collections import defaultdict
 from pathlib import Path
 from typing import (
-    Any,
+    TYPE_CHECKING,
     Callable,
     Dict,
     Generator,
@@ -37,16 +37,21 @@ import numpy as np
 import safetensors.torch
 import torch
 from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
 
-from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.configs.load_config import (
+    _DEFAULT_LOAD_GROUP,
+    LoadConfig,
+    LoadGroup,
+)
 from sglang.srt.configs.model_config import (
     REQUANTIZATION_METHODS,
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
-from sglang.srt.distributed import get_world_group
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
@@ -60,6 +65,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_download_with_validation_and_retry,
     ci_validate_and_cleanup_local_snapshot,
 )
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
     BAR_FORMAT,
@@ -69,8 +75,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
-from sglang.utils import is_in_ci
+from sglang.srt.utils.device import is_cuda_alike
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -170,57 +175,6 @@ def get_lock(
     # mode 0o666 is required for the filelock to be shared across users
     lock = filelock.FileLock(os.path.join(lock_dir, lock_file_name), mode=0o666)
     return lock
-
-
-def _shared_pointers(tensors):
-    ptrs = defaultdict(list)
-    for k, v in tensors.items():
-        ptrs[v.data_ptr()].append(k)
-    failing = []
-    for _, names in ptrs.items():
-        if len(names) > 1:
-            failing.append(names)
-    return failing
-
-
-def convert_bin_to_safetensor_file(
-    pt_filename: str,
-    sf_filename: str,
-) -> None:
-    loaded = torch.load(pt_filename, map_location="cpu", weights_only=True)
-    if "state_dict" in loaded:
-        loaded = loaded["state_dict"]
-    shared = _shared_pointers(loaded)
-    for shared_weights in shared:
-        for name in shared_weights[1:]:
-            loaded.pop(name)
-
-    # For tensors to be contiguous
-    loaded = {k: v.contiguous() for k, v in loaded.items()}
-
-    dirname = os.path.dirname(sf_filename)
-    os.makedirs(dirname, exist_ok=True)
-
-    from safetensors.torch import save_file
-
-    save_file(loaded, sf_filename, metadata={"format": "pt"})
-
-    # check file size
-    sf_size = os.stat(sf_filename).st_size
-    pt_size = os.stat(pt_filename).st_size
-    if (sf_size - pt_size) / pt_size > 0.01:
-        raise RuntimeError(f"""The file size different is more than 1%:
-         - {sf_filename}: {sf_size}
-         - {pt_filename}: {pt_size}
-         """)
-
-    # check if the tensors are the same
-    reloaded = safetensors.torch.load_file(sf_filename)
-    for k in loaded:
-        pt_tensor = loaded[k]
-        sf_tensor = reloaded[k]
-        if not torch.equal(pt_tensor, sf_tensor):
-            raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
 def replace_prefix(key: str, prefix_mapping: dict[str, str]) -> str:
@@ -574,11 +528,10 @@ def _find_local_hf_snapshot_dir_unlocked(
                 ),
             )
             rev_to_use = revision
-            if not rev_to_use:
-                ref_main = os.path.join(repo_folder, "refs", "main")
-                if os.path.isfile(ref_main):
-                    with open(ref_main) as f:
-                        rev_to_use = f.read().strip()
+            ref_path = os.path.join(repo_folder, "refs", revision or "main")
+            if os.path.isfile(ref_path):
+                with open(ref_path) as f:
+                    rev_to_use = f.read().strip()
             if rev_to_use:
                 rev_dir = os.path.join(repo_folder, "snapshots", rev_to_use)
                 if os.path.isdir(rev_dir):
@@ -643,7 +596,7 @@ def _find_local_hf_snapshot_dir_unlocked(
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
+    if envs.SGLANG_IS_IN_CI.get() and local_weight_files:
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -717,7 +670,18 @@ def download_weights_from_hf(
         if not huggingface_hub.constants.HF_HUB_OFFLINE:
             # Before we download we look at what is available:
             fs = HfFileSystem()
-            file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            try:
+                file_list = fs.ls(model_name_or_path, detail=False, revision=revision)
+            except HfHubHTTPError as e:
+                # Fail open (e.g. a 429 rate limit): pick the format from the local
+                # snapshot; snapshot_download below re-raises errors it cannot recover.
+                logger.warning(
+                    "Listing %s on the Hub failed, using the local snapshot: %s",
+                    model_name_or_path,
+                    e,
+                )
+                local_dir = find_local_repo_dir(model_name_or_path, revision)
+                file_list = os.listdir(local_dir) if local_dir else []
 
             # depending on what is available we download different things
             for pattern in allow_patterns:
@@ -728,7 +692,7 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        if not is_in_ci():
+        if not envs.SGLANG_IS_IN_CI.get():
             # Simple download without validation for non-CI environments
             hf_folder = snapshot_download(
                 model_name_or_path,
@@ -830,7 +794,10 @@ def filter_duplicate_safetensors_files(
             if any(fnmatch.fnmatch(rel_path, pattern) for pattern in allow_patterns):
                 files_to_validate.add(f)
 
-    missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
+    if "://" in hf_folder:
+        missing_files = sorted(files_to_validate.difference(hf_weights_files))
+    else:
+        missing_files = sorted(f for f in files_to_validate if not os.path.isfile(f))
     if missing_files:
         raise RuntimeError(
             f"{index_file} references {len(missing_files)} shard file(s) missing "
@@ -876,7 +843,16 @@ def maybe_add_mtp_safetensors(
 
     # Check if mtp.safetensors exists and is not already in the file list
     mtp_path = os.path.join(hf_folder, "mtp.safetensors")
-    if not os.path.isfile(mtp_path) or mtp_path in hf_weights_files:
+    if mtp_path in hf_weights_files:
+        return hf_weights_files
+
+    from sglang.srt.utils.runai_utils import is_runai_obj_uri, list_safetensors
+
+    if is_runai_obj_uri(hf_folder):
+        mtp_exists = mtp_path in list_safetensors(hf_folder)
+    else:
+        mtp_exists = os.path.isfile(mtp_path)
+    if not mtp_exists:
         return hf_weights_files
 
     # mtp.safetensors exists but not in index - this is a bug
@@ -1048,9 +1024,9 @@ def _prefetch_all_checkpoints(
     # full checkpoint into its own page cache. Global rank would split files
     # across nodes, but page cache is not shared across nodes.
     if torch.distributed.is_initialized():
-        world_group = get_world_group()
+        world_group = get_parallel().world_group
         local_rank = world_group.local_rank
-        local_world_size = world_group.local_size or world_group.world_size
+        local_world_size = world_group.local_size or get_parallel().launch_world_size
     else:
         local_rank = 0
         local_world_size = 1
@@ -1180,8 +1156,9 @@ def safetensors_weights_iterator(
         not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
     )
 
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
 
@@ -1203,6 +1180,138 @@ def safetensors_weights_iterator(
                     yield name, f.get_tensor(name)
         if drop_cache_after_load:
             _drop_file_cache_after_load(st_file)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
+
+
+def get_pp_stage_load_group() -> LoadGroup:
+    """Select a group for stage-local loads, not all-rank cold startup.
+
+    Call before draft contexts override the target's parallel topology.
+    """
+    parallel = get_parallel()
+    return parallel.tp_group if parallel.pp_size > 1 else _DEFAULT_LOAD_GROUP
+
+
+def instanttensor_weights_iterator(
+    hf_weights_files: List[str],
+    extra_config: Optional[dict] = None,
+    load_group: LoadGroup = _DEFAULT_LOAD_GROUP,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """Iterate over Safetensors weights with InstantTensor."""
+    if current_platform.device_type != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {current_platform.device_type!r}."
+        )
+
+    unsupported_files = [f for f in hf_weights_files if not f.endswith(".safetensors")]
+    if unsupported_files:
+        raise ValueError(
+            "InstantTensor only supports .safetensors checkpoints; "
+            f"unsupported files: {unsupported_files}"
+        )
+
+    try:
+        import instanttensor
+    except ImportError as e:
+        raise ImportError(
+            'Please install InstantTensor via `pip install "instanttensor>=0.1.9"`.'
+        ) from e
+
+    kwargs = dict(extra_config or {})
+    backend = kwargs.get("backend")
+    if backend is not None:
+        names = [backend] if isinstance(backend, str) else backend
+        if not isinstance(names, list) or not names:
+            raise ValueError(
+                "InstantTensor backend must be a name or a non-empty list of names"
+            )
+        available = {
+            **instanttensor.Backend.__members__,
+            **instanttensor.BackendPolicy.__members__,
+        }
+        if any(not isinstance(name, str) or name not in available for name in names):
+            raise ValueError(
+                f"Invalid InstantTensor backend {backend!r}; expected names from {sorted(available)}"
+            )
+        kwargs["backend"] = [available[name] for name in names]
+
+    distributed = torch.distributed.is_initialized()
+    if load_group is _DEFAULT_LOAD_GROUP:
+        load_group = get_parallel().world_group if distributed else None
+    process_group = (
+        load_group.device_group
+        if load_group is not None and load_group.world_size > 1
+        else None
+    )
+    # InstantTensor all-gathers over the group's NCCL communicator. Nothing else uses
+    # the world device group's communicator, so the first collective would create it
+    # just for loading, and its buffers (0.5-2 GB per GPU; more with NVLS) would stay
+    # resident and shrink the KV cache. Load over a temporary communicator instead and
+    # destroy it afterwards. new_group must be called by every rank, so only do this
+    # when loading over the world group (the default).
+    load_comm_group = None
+    if process_group is not None and load_group is get_parallel().world_group:
+        load_comm_group = torch.distributed.new_group(backend="nccl")
+        process_group = load_comm_group
+
+    try:
+        yield from _instanttensor_tensors(
+            instanttensor, hf_weights_files, kwargs, process_group, distributed
+        )
+    finally:
+        if load_comm_group is not None:
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.destroy_process_group(load_comm_group)
+
+
+def _instanttensor_tensors(
+    instanttensor, hf_weights_files, kwargs, process_group, distributed
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    device = current_platform.get_device(torch.cuda.current_device())
+    enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    # With copy=True every tensor is cloned, unsharded, out of InstantTensor's ring
+    # buffer. Allocate the clones from a private pool. In the shared allocator cache,
+    # long-lived allocations made while or after loading (e.g. post_load_weights'
+    # w_kc/w_vc) are carved out of the freed clones, pinning segments as large as the
+    # largest tensor (~1.8 GB for GLM-5's embedding) that empty_cache cannot return.
+    pool = (
+        torch.cuda.MemPool()
+        if hasattr(torch.cuda, "use_mem_pool") and torch.cuda.is_available()
+        else None
+    )
+    with instanttensor.safe_open(
+        hf_weights_files,
+        framework="pt",
+        device=device,
+        process_group=process_group,
+        copy=True,
+        **kwargs,
+    ) as f:
+        tensors = iter(
+            tqdm(
+                f.tensors(),
+                total=len(f.keys()),
+                desc="Loading safetensors using InstantTensor",
+                disable=not enable_tqdm,
+                mininterval=1,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+            )
+        )
+        while True:
+            # Route only InstantTensor's allocations to the pool, not the consumer's.
+            with (
+                torch.cuda.use_mem_pool(pool)
+                if pool is not None
+                else contextlib.nullcontext()
+            ):
+                item = next(tensors, None)
+            if item is None:
+                return
+            yield item
+            del item
 
 
 def fastsafetensors_weights_iterator(
@@ -1229,7 +1338,9 @@ def fastsafetensors_weights_iterator(
     except Exception:
         rank = 0
 
-    device = torch.device(f"cuda:{rank}")
+    # The group rank is global; on multi-node TP it exceeds the local GPU count.
+    # ModelRunner has already set this process's device (its gpu_id).
+    device = torch.device("cuda", torch.cuda.current_device())
 
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
@@ -1251,62 +1362,15 @@ def fastsafetensors_weights_iterator(
         loader.add_filenames(rank_file_map)
         try:
             fb = loader.copy_files_to_device()
-            try:
-                keys = list(fb.key_to_rank_lidx.keys())
-                for k in keys:
-                    t = fb.get_tensor(k)
-                    yield k, t
-            finally:
-                pass
+            keys = list(fb.key_to_rank_lidx.keys())
+            for k in keys:
+                t = fb.get_tensor(k)
+                yield k, t
         finally:
             loader.close()
         if drop_cache_after_load:
             for loaded_file in rank_file_map.get(rank, []):
                 _drop_file_cache_after_load(loaded_file)
-
-
-def multi_thread_safetensors_weights_iterator(
-    hf_weights_files: List[str],
-    max_workers: int,
-    disable_mmap: bool = False,
-    drop_cache_after_load: bool = False,
-) -> Generator[Tuple[str, torch.Tensor], None, None]:
-    """Multi-Thread iterate over the weights in the model safetensor files."""
-    enable_tqdm = (
-        not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0
-    )
-
-    def _load_file(st_file: str):
-        if disable_mmap:
-            with open(st_file, "rb") as f:
-                result = safetensors.torch.load(f.read())
-        else:
-            with safetensors.safe_open(st_file, framework="pt", device="cpu") as f:
-                result = {k: f.get_tensor(k) for k in f.keys()}
-
-        return st_file, result
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
-
-        if enable_tqdm:
-            futures_iter = tqdm(
-                concurrent.futures.as_completed(futures),
-                total=len(hf_weights_files),
-                desc="Multi-thread loading shards",
-                disable=not enable_tqdm,
-                bar_format=BAR_FORMAT,
-            )
-        else:
-            futures_iter = concurrent.futures.as_completed(futures)
-
-        for future in futures_iter:
-            st_file, state_dict = future.result()
-            for name, param in state_dict.items():
-                yield name, param
-            del state_dict
-            if drop_cache_after_load:
-                _drop_file_cache_after_load(st_file)
 
 
 def buffered_multi_thread_safetensors_weights_iterator(
@@ -1323,8 +1387,9 @@ def buffered_multi_thread_safetensors_weights_iterator(
     max_workers loading concurrently + 1 prefetched and ready to yield.
     Peak CPU RAM ≈ (max_workers + 2) × shard_file_size.
     """
+    prefetch_handle = None
     if prefetch and not disable_mmap:
-        _prefetch_all_checkpoints(
+        prefetch_handle = _prefetch_all_checkpoints(
             sorted(hf_weights_files), num_threads=prefetch_num_threads
         )
     enable_tqdm = (
@@ -1376,26 +1441,13 @@ def buffered_multi_thread_safetensors_weights_iterator(
                     # but later mmap-backed tensor access may fault pages again.
                     _drop_file_cache_after_load(st_file)
                 pbar.update(1)
+    if prefetch_handle is not None:
+        prefetch_handle.stop()
 
 
 def _load_pt_file(bin_file: str) -> dict:
-    """Load a PyTorch checkpoint file, handling legacy tar format.
-
-    PyTorch 2.6 changed the default of weights_only from False to True.
-    Legacy tar format files cannot be loaded with weights_only=True.
-    This function tries weights_only=True first, then falls back to False
-    for legacy tar format files from trusted sources (HuggingFace Hub).
-    """
-    try:
-        return torch.load(bin_file, map_location="cpu", weights_only=True)
-    except RuntimeError as e:
-        if "legacy .tar format" in str(e):
-            logger.warning(
-                "Loading %s with weights_only=False (legacy tar format)",
-                os.path.basename(bin_file),
-            )
-            return torch.load(bin_file, map_location="cpu", weights_only=False)
-        raise
+    """Load a PyTorch checkpoint file with weights_only=True (no pickle execution)."""
+    return torch.load(bin_file, map_location="cpu", weights_only=True)
 
 
 def pt_weights_iterator(
@@ -1557,55 +1609,35 @@ def gguf_quant_weights_iterator(
             yield name, param
 
 
-def convert_pyslice_to_tensor(x: Any) -> torch.Tensor:
-    """convert PySafeSlice object from safetensors to torch.Tensor
+def supports_quantized_rl_reload(func: Callable) -> Callable:
+    """Allow FlashRL to defer FP8 parameter writes until this method returns.
 
-    PySafeSlice object supports indexing, which is done before loading the
-    actual tensor and can reduce the amount of memory being read into the
-    memory. However, it does not support more advanced functionalities
-    like `.view()` or `.t()`. Therefore, if we need to modify the loaded
-    tensor with these more complicated operators, we need to convert to
-    tensor first.
+    Checkpoint names must use the parameter names or QKV/gate-up aliases supported
+    by QuantizedRLModelLoader. FP8 writes must go through param.weight_loader;
+    the method must not read their values afterward, and source tensors must
+    remain unchanged until return. Non-FP8 parameters are loaded immediately.
     """
-    if not isinstance(x, torch.Tensor):
-        x = x[:]
-    return x
+    func._supports_quantized_rl_reload = func
+    return func
 
 
 def default_weight_loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
     """Default weight loader."""
-    try:
-        if param.numel() == 1 and loaded_weight.numel() == 1:
-            # Sometimes scalar values aren't considered tensors with shapes
-            # so if both param and loaded_weight are a scalar,
-            # "broadcast" instead of copy
-            param.data.fill_(loaded_weight.item())
-        else:
-            assert param.size() == loaded_weight.size(), (
-                f"Attempted to load weight ({loaded_weight.size()}) "
-                f"into parameter ({param.size()})"
-            )
-
-            param.data.copy_(loaded_weight)
-    except Exception:
-        # NOTE: This exception is added for the purpose of setting breakpoint to
-        # debug weight loading issues.
-        raise
+    if param.numel() == 1 and loaded_weight.numel() == 1:
+        # Sometimes scalar values aren't considered tensors with shapes
+        # so if both param and loaded_weight are a scalar,
+        # "broadcast" instead of copy
+        param.data.fill_(loaded_weight.item())
+    else:
+        assert param.size() == loaded_weight.size(), (
+            f"Attempted to load weight ({loaded_weight.size()}) "
+            f"into parameter ({param.size()})"
+        )
+        param.data.copy_(loaded_weight)
 
 
-def row_parallel_weight_loader(
-    param: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """Load weights that are row-parallelized."""
-    tp_rank = get_parallel().tp_rank
-    shard_dim = 0 if param.dim() != 1 else None
-
-    if shard_dim is not None:
-        shard_size = param.data.shape[shard_dim]
-        start_idx = tp_rank * shard_size
-        loaded_weight = loaded_weight.narrow(shard_dim, start_idx, shard_size)
-
-    return default_weight_loader(param, loaded_weight)
+if TYPE_CHECKING:
+    from sglang.srt.layers.linear import LinearParallelGroup
 
 
 LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -1614,24 +1646,37 @@ LoaderFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
 def sharded_weight_loader(
     shard_axis: int,
     tp_rank_getter=None,
+    *,
+    parallel_group: Optional["LinearParallelGroup"] = None,
 ) -> LoaderFunction:
-    """Create a weight loader that shards the weights along the given axis"""
+    """Create a weight loader with placement frozen in its construction scope.
 
-    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
+    Without a group selection, retain the attention rank and legacy CPU padding
+    width. An explicit rank getter is evaluated once when creating the loader.
+    """
+    if parallel_group is not None:
+        if tp_rank_getter is not None:
+            raise ValueError("parallel_group cannot be combined with tp_rank_getter")
+        from sglang.srt.layers.linear import resolve_linear_parallel_group
+
+        tp_rank, tp_size = resolve_linear_parallel_group(parallel_group)
+    else:
         tp_rank = (
             tp_rank_getter()
             if tp_rank_getter is not None
             else get_parallel().attn_tp_rank
         )
+        tp_size = get_parallel().tp_size
 
+    def loader(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
         shard_size = param.data.shape[shard_axis]
         start_idx = tp_rank * shard_size
 
         if (
             is_cpu()
             and (
-                loaded_weight.size(0) % get_parallel().tp_size != 0
-                or loaded_weight.size(0) < get_parallel().tp_size * shard_size
+                loaded_weight.size(0) % tp_size != 0
+                or loaded_weight.size(0) < tp_size * shard_size
             )
             and loaded_weight.dim() == 1
         ):
@@ -1698,6 +1743,8 @@ def runai_safetensors_weights_iterator(
 
         for name, tensor in tensor_iter:
             setattr(tensor, RUNAI_STREAMER_TENSOR_ATTR, True)
+            # Views and detach() share storage but do not inherit tensor attributes.
+            setattr(tensor.untyped_storage(), RUNAI_STREAMER_TENSOR_ATTR, True)
             yield name, tensor
 
 
@@ -1759,8 +1806,14 @@ def initialize_dummy_weights(
     the parameter's number of elements and its data type.
     """
     for name, param in model.state_dict().items():
+        # UE8M0 MXFP8 block scales (uint8): 127 is 2**0. Left at zero, every
+        # MXFP8 weight scales to 2**-127.
+        if name.endswith("weight_scale_inv") and param.dtype == torch.uint8:
+            param.fill_(127)
+            continue
         if torch.is_floating_point(param):
-            if name.endswith("weight_scale_inv"):
+            # Neutral FP4 global scales keep fused gate/up projections compatible.
+            if name.endswith(("weight_scale_inv", "weight_scale_2")):
                 param.fill_(1.0)
                 continue
             generator = torch.Generator(device=param.data.device)
@@ -1795,6 +1848,13 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
+    # ModelSlim: map fa_k.scale to attn_mqa.fa_k_scale; skip unused FA parameters.
+    stem, _, parameter = name.rpartition(".")
+    prefix, _, component = stem.rpartition(".")
+    if parameter in ("scale", "offset") and component in ("fa_q", "fa_k", "fa_v"):
+        remapped_name = f"{prefix}.attn_mqa.{component}_{parameter}"
+        return remapped_name if remapped_name in params_dict else None
+
     if name.endswith(".kv_scale"):
         print_warning_once(
             "DEPRECATED. Found kv_scale in the checkpoint. "

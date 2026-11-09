@@ -1,18 +1,24 @@
+import os
+import tempfile
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
     _handle_dspark,
     _target_checkpoint_bundles_dspark_draft,
+    _target_checkpoint_dspark_subfolder,
 )
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
+_HOOK = "sglang.srt.arg_groups.speculative_hook"
 _BUNDLED_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
 _PLAIN_MODEL_PATH = "deepseek-ai/DeepSeek-V4-Flash"
 
@@ -76,8 +82,36 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         server_args = _make_dspark_server_args(
             model_path=_PLAIN_MODEL_PATH, hf_config=_plain_hf_config()
         )
-        with self.assertRaises(ValueError):
+        with (
+            patch(f"{_HOOK}._target_checkpoint_dspark_subfolder", return_value=None),
+            self.assertRaises(ValueError),
+        ):
             _handle_dspark(server_args)
+
+    def test_local_dspark_subfolder_becomes_the_draft_path(self):
+        with tempfile.TemporaryDirectory() as ckpt:
+            draft_dir = os.path.join(ckpt, "dspark")
+            os.makedirs(draft_dir)
+            with open(os.path.join(draft_dir, "config.json"), "w") as f:
+                f.write("{}")
+            server_args = _make_dspark_server_args(
+                model_path=ckpt, hf_config=_plain_hf_config()
+            )
+            _handle_dspark(server_args)
+            self.assertEqual(
+                resolution_result(server_args, "speculative_draft_model_path"),
+                draft_dir,
+            )
+
+    def test_local_checkpoint_without_dspark_config_raises(self):
+        with tempfile.TemporaryDirectory() as ckpt:
+            # A bare folder is not a draft: the draft needs its own config.json.
+            os.makedirs(os.path.join(ckpt, "dspark"))
+            server_args = _make_dspark_server_args(
+                model_path=ckpt, hf_config=_plain_hf_config()
+            )
+            with self.assertRaises(ValueError):
+                _handle_dspark(server_args)
 
     def test_explicit_draft_path_is_not_overwritten(self):
         server_args = _make_dspark_server_args(
@@ -91,16 +125,58 @@ class TestDsparkDraftPathDefaulting(CustomTestCase):
         )
 
 
+class TestTargetCheckpointDsparkSubfolderOnHub(CustomTestCase):
+    """A Hub repo id resolves to the snapshot's dspark/ folder, fetching only it."""
+
+    def test_repo_with_dspark_subfolder_downloads_only_that_folder(self):
+        with (
+            patch("huggingface_hub.hf_hub_download") as probe,
+            patch(
+                "huggingface_hub.snapshot_download", return_value="/hf/snap/abc"
+            ) as snapshot,
+        ):
+            draft_dir = _target_checkpoint_dspark_subfolder(
+                "org/model", revision="main", cache_dir="/dl"
+            )
+        self.assertEqual(draft_dir, "/hf/snap/abc/dspark")
+        probe.assert_called_once_with(
+            "org/model", "dspark/config.json", revision="main", cache_dir="/dl"
+        )
+        snapshot.assert_called_once_with(
+            "org/model", revision="main", cache_dir="/dl", allow_patterns=["dspark/*"]
+        )
+
+    def test_repo_without_dspark_subfolder_returns_none(self):
+        from huggingface_hub.errors import EntryNotFoundError
+
+        with (
+            patch(
+                "huggingface_hub.hf_hub_download",
+                side_effect=EntryNotFoundError("missing"),
+            ),
+            patch("huggingface_hub.snapshot_download") as snapshot,
+        ):
+            self.assertIsNone(
+                _target_checkpoint_dspark_subfolder(
+                    "org/model", revision=None, cache_dir=None
+                )
+            )
+        snapshot.assert_not_called()
+
+
 class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
     """Gate contract for DSpark + dp attention + MoE a2a backends."""
 
-    def _dp_server_args(self, *, moe_a2a_backend: str) -> ServerArgs:
+    def _dp_server_args(
+        self, *, moe_a2a_backend: str, arch: str = "DeepseekV4ForCausalLM"
+    ) -> ServerArgs:
+        hf_config = _bundled_hf_config()
+        hf_config.architectures = [arch]
         server_args = _make_dspark_server_args(
-            model_path=_BUNDLED_MODEL_PATH, hf_config=_bundled_hf_config()
+            model_path=_BUNDLED_MODEL_PATH, hf_config=hf_config
         )
-        server_args.enable_dp_attention = True
         server_args.enable_dp_lm_head = True
-        server_args.dp_size = 2
+        server_args.attn_dp_size = 2
         server_args.tp_size = 2
         server_args.moe_a2a_backend = moe_a2a_backend
         return server_args
@@ -112,6 +188,18 @@ class TestDsparkDpAttentionMoeA2aGate(CustomTestCase):
             for backend in ("deepep", "pplx"):
                 with self.assertRaisesRegex(ValueError, backend):
                     _handle_dspark(self._dp_server_args(moe_a2a_backend=backend))
+
+    def test_ernie55_admits_deepep_and_rejects_megamoe(self):
+        with envs.SGLANG_RAGGED_VERIFY_MODE.override("static"):
+            _handle_dspark(
+                self._dp_server_args(moe_a2a_backend="deepep", arch=ERNIE5_5_MOE_ARCH)
+            )
+            with self.assertRaisesRegex(ValueError, "megamoe"):
+                _handle_dspark(
+                    self._dp_server_args(
+                        moe_a2a_backend="megamoe", arch=ERNIE5_5_MOE_ARCH
+                    )
+                )
 
     def test_a2a_backend_with_compact_verify_mode_raises(self):
         server_args = self._dp_server_args(moe_a2a_backend="megamoe")

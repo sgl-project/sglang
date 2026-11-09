@@ -8,6 +8,7 @@ from collections import deque
 from types import SimpleNamespace
 
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
 register_mlx_ci(est_time=1, suite="stage-a-unit-test-mlx")
@@ -50,12 +51,18 @@ if _HAS_MLX:
     from sglang.srt.managers.scheduler_components import (
         batch_result_processor as batch_result_processor_module,
     )
+    from sglang.srt.managers.scheduler_components import (
+        request_retirer as request_retirer_module,
+    )
     from sglang.srt.managers.scheduler_components.batch_result_processor import (
         SchedulerBatchResultProcessor,
     )
     from sglang.srt.managers.utils import GenerationBatchResult
     from sglang.srt.mem_cache.base_prefix_cache import InsertParams, InsertResult
+    from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
     from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+    from sglang.test.scheduler_test_utils import release_only_retirer
+    from sglang.test.tree_slots import tree_slots_of
 
 
 def _set_runner_cache_layout(
@@ -969,6 +976,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1009,6 +1017,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1049,6 +1058,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1086,6 +1096,7 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
             SimpleNamespace(enable_mamba_extra_buffer=False),
+            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
         )
         insert_params = InsertParams()
 
@@ -1155,15 +1166,15 @@ class TestMlxOverlapScheduler(unittest.TestCase):
 
         scheduler = SchedulerMlxOverlapMixin.__new__(SchedulerMlxOverlapMixin)
         scheduler.ingest_requests = lambda: []
+        scheduler.increment_scheduler_iterations = lambda: None
         scheduler.gracefully_exit = False
-        scheduler._engine_paused = False
-        scheduler.forward_ct = 0
-        scheduler.profiler_manager = SimpleNamespace(
-            _profile_batch_predicate=lambda batch: None
-        )
+        scheduler.pause_state = PauseState()
+        scheduler._on_step_launch = lambda batch: None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
-        scheduler.future_map = SimpleNamespace()
+        scheduler.future_map = SimpleNamespace(
+            takes_deferred_relay=lambda batch: False, flush_deferred_relay=lambda: None
+        )
         scheduler.cur_batch_for_debug = None
         scheduler.last_batch = None
         scheduler.running_batch = None
@@ -1195,13 +1206,12 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=None,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=None,
             token_to_kv_pool_allocator=None,
             tree_cache=tree_cache,
             hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
             req_to_token_pool=None,
+            kv_weight_version_tracker=None,
             decode_offload_manager=None,
             metrics_collector=None,
             metrics_reporter=None,
@@ -1214,7 +1224,12 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             logprob_result_processor=None,
             output_streamer=None,
             beam_coordinator=None,
+            request_retirer=release_only_retirer(
+                tree_cache=tree_cache,
+                hisparse_coordinator=SimpleNamespace(request_finished=lambda req: None),
+            ),
             abort_request=lambda req: None,
+            still_in_batch=lambda req: True,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is
@@ -1232,11 +1247,16 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             setattr(SchedulerBatchResultProcessor, name, value)
         req = SimpleNamespace(
             rid="r0",
+            exit_via=None,
+            kv=SimpleNamespace(
+                holds_kv=True, holds_mamba=False, retraction_backup=None
+            ),
             finished=lambda: True,
+            finished_reason=None,
             multimodal_inputs=None,
             session=None,
             return_routed_experts=False,
-            mamba_lazy_is_insert=True,
+            mamba_lazy_checkpoint=True,
             time_stats=SimpleNamespace(
                 set_completion_time=lambda: events.append(("completion", "r0"))
             ),
@@ -1246,17 +1266,17 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             mamba_track_mask_next_cpu=None,
             mamba_decode_batch_idx_cpu=None,
         )
-        result = SimpleNamespace()
+        result = GenerationBatchResult()
         i = 0
         logits_output = SimpleNamespace(customized_info=None)
-        original_release = batch_result_processor_module.release_kv_cache
+        original_release = request_retirer_module.release_kv_cache
         original_get_indexer = batch_result_processor_module.get_global_indexer_capturer
 
-        def fake_release_kv_cache(release_req, tree_cache, is_insert=False):
+        def fake_release_kv_cache(release_req, tree_cache, checkpoint=False):
             events.append(("release", release_req.rid))
             self.assertIs(tree_cache, processor.tree_cache)
 
-        batch_result_processor_module.release_kv_cache = fake_release_kv_cache
+        request_retirer_module.release_kv_cache = fake_release_kv_cache
         batch_result_processor_module.get_global_indexer_capturer = lambda: None
         # The lazy predicate reads the published bags; publish the non-lazy
         # strategy instead of stubbing the accessor.
@@ -1274,7 +1294,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             override.restore()
             for name, original in saved.items():
                 setattr(SchedulerBatchResultProcessor, name, original)
-            batch_result_processor_module.release_kv_cache = original_release
+            request_retirer_module.release_kv_cache = original_release
             batch_result_processor_module.get_global_indexer_capturer = (
                 original_get_indexer
             )
@@ -1517,7 +1537,6 @@ if _HAS_MLX:
         def __init__(self):
             self.kv = ReqKvInfo()
             self.mamba_branching_seqlen = None
-            self.inflight_middle_chunks = 0
             self.mamba_branching_seqlen = None
 
     class FakeTpWorker:

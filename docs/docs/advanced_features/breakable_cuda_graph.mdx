@@ -18,11 +18,12 @@ Standard CUDA graphs capture an entire forward pass as a single, opaque graph. T
 
 ### Debug Mode: Run Everything Eagerly
 
-The simplest use case is debugging. The `--debug-cuda-graph` flag wraps the entire decode forward pass in a graph break, so every operation runs eagerly while still going through the full CUDA graph capture/replay code path. This lets you debug CUDA graph issues without changing model code.
+The simplest use case is debugging. The `--debug-cuda-graph` flag wraps the entire decode forward pass in a graph break, so every operation runs eagerly while still going through the full CUDA graph capture/replay code path. This lets you debug CUDA graph issues without changing model code. It requires the breakable backend for decode.
 
 ```bash
 python -m sglang.launch_server \
     --model meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-backend-decode breakable \
     --debug-cuda-graph
 ```
 
@@ -30,16 +31,47 @@ This mode is intended for debugging only — it eliminates the performance benef
 
 ### Selective Graph Breaks in Model Code
 
-For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During CUDA graph capture, these functions run eagerly between captured graph segments. Outside of capture, they behave normally.
+For production use, you can mark specific functions as "non-graphable" using the `@eager_on_graph` decorator. During replay, these functions run eagerly between captured graph segments. Outside a breakable CUDA graph, they run as plain calls.
 
 ```python
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import eager_on_graph
 
-@eager_on_graph(enable=True)
-def my_dynamic_op(x):
+@eager_on_graph
+def my_dynamic_op(x, out):
     # This op is incompatible with CUDA graph capture
-    return some_dynamic_operation(x)
+    out.copy_(some_dynamic_operation(x))
+
+def forward(self, x):
+    out = torch.empty_like(x)
+    my_dynamic_op(x, out)
+    return out
 ```
+
+#### Pool-owned outputs
+
+When you can determine the output layout before a break, supply an
+`output_factory`. It runs during capture, before the segment ends, so output
+storage belongs to the graph pool and can be reused after its consumers:
+
+```python
+import torch
+
+@eager_on_graph(output_factory=torch.empty_like)
+def dynamic_scale(x):
+    return x * 2
+```
+
+The factory receives the function's arguments and returns a tensor, or nested
+tuples/lists of tensors and `None`. Output shapes, dtypes, devices, and structure
+must match on every replay. The wrapper copies the results into those buffers;
+this does not automatically eliminate the computation's temporary outputs.
+
+For a function that can fill buffers directly, set `pass_output=True`, accept an
+optional `out=None` keyword argument, and return the supplied buffers for the
+leaves you filled. Those leaves are not copied. Outside capture, the factory
+and output copies are bypassed, and the function receives its original arguments.
+Use `.run_eager(...)` for an already-decorated operation inside another eager
+break to avoid nested graph segmentation.
 
 You can also insert a bare graph break (no computation) using the `break_graph()` helper:
 
@@ -53,12 +85,12 @@ def forward(self, x):
     return x
 ```
 
-To enable breakable CUDA graph at the environment level (without debug mode), set the environment variable:
+Breakable CUDA graph is selected per phase. Prefill uses it by default on CUDA; to use it for decode (without debug mode), pass `--cuda-graph-backend-decode breakable`:
 
 ```bash
-export SGLANG_USE_BREAKABLE_CUDA_GRAPH=1
 python -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-backend-decode breakable
 ```
 
 ### Server Args
@@ -83,9 +115,14 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable debug/eager mode. Wraps the entire forward pass in a graph break so every op runs eagerly through the capture/replay path.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_BREAKABLE_CUDA_GRAPH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>0</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Environment variable. Enables breakable CUDA graph without debug mode. Required for <code>@eager_on_graph</code> decorators to take effect.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-decode</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>full</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Set to <code>breakable</code> to capture decode with breakable CUDA graph. Required for <code>--debug-cuda-graph</code> and for <code>@eager_on_graph</code> breaks to take effect in decode.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-prefill</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>breakable</code> on CUDA</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prefill capture backend; <code>breakable</code> is the CUDA default.</td>
     </tr>
   </tbody>
 </table>
@@ -103,9 +140,9 @@ Begin capture (segment 1)
   ... graphable ops ...
   @eager_on_graph function encountered:
     1. End current capture segment
-    2. Run the function eagerly (allocates output tensors)
-    3. Record the function for later replay
-    4. Begin new capture segment
+    2. Record the function for later replay without running it; an optional
+       on_capture runs host setup that later segments read
+    3. Begin new capture segment
   ... more graphable ops ...
 End capture (segment N)
 ```
@@ -123,15 +160,11 @@ For each segment i:
 Launch final CUDA graph segment
 ```
 
-The non-graph functions are re-invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
+The non-graph functions are invoked with the same tensor references as capture time. Since these references point to the CUDA graph's static input/output buffers, they see updated values on each replay.
 
-### Output Writeback
+### Outputs
 
-When a non-graph function produces output during replay, the result must be written back into the same tensor buffers that downstream graph segments reference. The mechanism handles:
-
-- **Plain tensors**: In-place `copy_()` into the original buffer.
-- **Structured outputs** (dataclasses, objects with tensor attributes): Tensor fields are copied in-place; non-tensor fields are replaced.
-- **Dicts of tensors**: Tensor values are copied in-place; non-tensor values are replaced.
+A non-graph function writes its results into buffers its caller allocated before the break, so the downstream graph segments read the same addresses at every replay. Host-side results go into a holder object the caller owns. Without an `output_factory`, a function that returns a value fails with an assertion. Every captured shape is warmed up before capture, so lazy setup (JIT compilation, buffers sized by the first run) happens outside capture.
 
 ### Stream Fork/Join Tracking
 
@@ -182,11 +215,7 @@ For typical use cases with a small number of graph breaks, the overhead is negli
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/server_args.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--debug-cuda-graph</code> flag and environment variable handling</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/environ.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>SGLANG_USE_BREAKABLE_CUDA_GRAPH</code> environment variable definition</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--debug-cuda-graph</code> flag handling</td>
     </tr>
   </tbody>
 </table>

@@ -33,29 +33,36 @@ from sglang.srt.disaggregation.encoder.receiver import (
     video_meta_attrs_for,
 )
 from sglang.srt.distributed.parallel_state import (
+    create_custom_parallel_group,
     get_default_distributed_backend,
     get_mooncake_transfer_engine,
-    get_tp_group,
     init_distributed_environment,
     initialize_model_parallel,
 )
 from sglang.srt.environ import envs
-from sglang.srt.layers.dp_attention import initialize_dp_attention
+from sglang.srt.layers.dp_attention import (
+    init_dp_gathered_buffer,
+    initialize_dp_attention_flags,
+)
 from sglang.srt.managers.io_struct import (
     ProfileReq,
     ProfileReqType,
     async_sock_recv,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult, MultiModalStaticCache
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     maybe_precompile_model_kernels_after_loading,
 )
 from sglang.srt.model_loader import get_model as load_model
+from sglang.srt.multimodal.cache.digest import structured_digest
+from sglang.srt.multimodal.cache.identity import build_processor_fingerprint
 from sglang.srt.multimodal.encoder_preprocessing import (
     get_encoder_preprocessed_items,
     resolve_encoder_media_processor_config,
 )
+from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.metrics_collector import EncoderMetricsCollector
 from sglang.srt.runtime_context import (
     assert_published,
@@ -68,7 +75,6 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import configure_media_url_security
 from sglang.srt.utils.network import (
     NetworkAddress,
     config_socket,
@@ -590,8 +596,29 @@ class MMEncoder:
             distributed_init_method=dist_init_method,
             local_rank=rank,
         )
-        initialize_model_parallel(tensor_model_parallel_size=get_parallel().tp_size)
-        initialize_dp_attention(server_args, self.model_config)
+        # The encoder uses a separate WORLD with tensor and attention-CP parallelism.
+        parallel = get_parallel()
+        attn_cp_size = parallel.attn_cp_size
+        attn_tp_size = parallel.tp_size // attn_cp_size
+        attn_cp_rank, attn_tp_rank = divmod(rank, attn_tp_size)
+        parallel.override_permanently(
+            tp_rank=rank,
+            pp_size=1,
+            pp_rank=0,
+            attn_dp_size=1,
+            attn_dp_rank=0,
+            attn_tp_size=attn_tp_size,
+            attn_tp_rank=attn_tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            attn_dcp_size=1,
+            moe_ep_size=1,
+            moe_ep_rank=0,
+            moe_dp_size=1,
+            moe_tp_size=parallel.tp_size,
+        )
+        initialize_model_parallel()
+        initialize_dp_attention_flags(server_args)
+        init_dp_gathered_buffer(self.model_config)
 
         self.model = load_model(
             model_config=self.model_config,
@@ -609,6 +636,11 @@ class MMEncoder:
             model_config=self.model_config,
             model_preprocessor=getattr(self.model, "preprocess_mm_for_encoder", None),
             encoder_media_processor_config=encoder_media_processor_config,
+        )
+        self.cache_namespace = build_processor_fingerprint(
+            self.preprocessor,
+            self.model_config.hf_config,
+            extra={"encoder_model_path": self.model_config.model_path},
         )
 
         self.context = zmq.asyncio.Context(2)
@@ -637,26 +669,7 @@ class MMEncoder:
         ).element_size()
         self._embedding_dims = self._infer_embedding_dims()
 
-        if get_mm().enable_mm_global_cache:
-            from sglang.srt.mem_cache.embedding_cache_controller import (
-                EmbeddingCacheController,
-            )
-            from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
-
-            embedding_store = EmbeddingStoreFactory.create_backend(
-                get_mm().mm_global_cache_backend,
-            )
-            self.mm_global_cache = EmbeddingCacheController(
-                rank,
-                get_parallel().tp_size,
-                embedding_store=embedding_store,
-                hidden_dims=self._embedding_dims,
-                tp_group=get_tp_group().cpu_group,
-                all_rank_get=False,
-                dtype=self._embedding_dtype,
-            )
-        else:
-            self.mm_global_cache = None
+        self._init_global_cache()
 
         if self.rank == 0:
             logger.info(
@@ -702,6 +715,42 @@ class MMEncoder:
                 )
 
         logger.info(f"rank {rank} init finish ")
+
+    def _init_global_cache(self) -> None:
+        self.mm_global_cache_enabled = get_mm().enable_mm_global_cache
+        self.mm_global_cache = None
+        self.global_cache_tp_group = None
+        if not self.mm_global_cache_enabled:
+            return
+
+        parallel = get_parallel()
+        if parallel.tp_size > 1:
+            # Every rank participates in cache hit/fallback decisions, even
+            # though only rank 0 needs the embedding data and host pools.
+            group_ranks = torch.distributed.get_process_group_ranks(
+                parallel.tp_group.cpu_group
+            )
+            self.global_cache_tp_group = create_custom_parallel_group(
+                group_ranks=group_ranks, backend="gloo"
+            )
+
+        if self.rank != 0:
+            return
+
+        from sglang.srt.mem_cache.embedding_cache_controller import (
+            EmbeddingCacheController,
+        )
+        from sglang.srt.mem_cache.embedding_store import EmbeddingStoreFactory
+
+        embedding_store = EmbeddingStoreFactory.create_backend(
+            get_mm().mm_global_cache_backend,
+        )
+        self.mm_global_cache = EmbeddingCacheController(
+            embedding_store=embedding_store,
+            hidden_dims=self._embedding_dims,
+            all_rank_get=False,
+            dtype=self._embedding_dtype,
+        )
 
     def _background_task_done(self, task: asyncio.Task) -> None:
         self.background_tasks.discard(task)
@@ -955,42 +1004,20 @@ class MMEncoder:
         return slices
 
     def _calculate_hashes_from_features(
-        self, mm_feature, grid_thw: List, modality: Modality, mm_inputs=None
-    ) -> List[int]:
-        """CPU Task: Compute hashes based on processed feature patches."""
-        preprocessed_items = (
-            get_encoder_preprocessed_items(mm_inputs) if mm_inputs is not None else None
-        )
-        if preprocessed_items is not None:
-            if len(preprocessed_items) != len(grid_thw):
-                raise ValueError(
-                    "Encoder preprocess item/grid mismatch: "
-                    f"{len(preprocessed_items)} items != {len(grid_thw)} grids"
+        self, mm_feature, preprocess_result: EncoderPreprocessResult, modality: Modality
+    ) -> List[bytes]:
+        """Identify each grid's exact model-facing features and metadata."""
+        return [
+            structured_digest(
+                tuple(
+                    item.cache_key
+                    for item in self._build_model_mm_items(
+                        mm_feature, preprocess_result, [index], modality
+                    )
                 )
-            hashes = []
-            for item in preprocessed_items:
-                item.set_pad_value()
-                hashes.append(item.hash)
-            return hashes
-
-        hashes = []
-        if modality == Modality.AUDIO and isinstance(mm_feature, list):
-            for feature in mm_feature:
-                tmp_item = MultimodalDataItem(modality=modality, feature=feature)
-                tmp_item.set_pad_value()
-                hashes.append(tmp_item.hash)
-            return hashes
-
-        offset = 0
-        logger.info(f"{mm_feature.shape=} with {modality=}")
-        for grid in grid_thw:
-            num_patches = self.preprocessor.get_num_patches(grid, modality)
-            feature_slice = mm_feature[offset : offset + num_patches]
-            tmp_item = MultimodalDataItem(modality=modality, feature=feature_slice)
-            tmp_item.set_pad_value()
-            hashes.append(tmp_item.hash)
-            offset += num_patches
-        return hashes
+            )
+            for index in range(len(preprocess_result.grid_thw))
+        ]
 
     def _encode_missing(
         self,
@@ -1046,6 +1073,8 @@ class MMEncoder:
             selected = [preprocessed_items[index] for index in indices]
             if any(item.modality != modality for item in selected):
                 raise ValueError("Encoder preprocess output contains wrong modality")
+            for item in selected:
+                item.bind_processor_fingerprint(self.cache_namespace)
             return selected
 
         split_kimi_k3_images = (
@@ -1067,7 +1096,11 @@ class MMEncoder:
             for idx in indices:
                 feature_slices.append(mm_feature[offsets[idx] : offsets[idx + 1]])
             if not split_kimi_k3_images:
-                sub_feature = torch.cat(feature_slices, dim=0)
+                sub_feature = (
+                    feature_slices[0]
+                    if len(feature_slices) == 1
+                    else torch.cat(feature_slices, dim=0)
+                )
 
         if split_kimi_k3_images:
             mm_items = [
@@ -1103,6 +1136,8 @@ class MMEncoder:
             else:
                 for mm_item in mm_items:
                     mm_item.set(key, value)
+        for item in mm_items:
+            item.bind_processor_fingerprint(self.cache_namespace)
         return mm_items
 
     async def _prepare_encode_context(
@@ -1181,14 +1216,13 @@ class MMEncoder:
                             f"count {n} for req {req['req_id']}; hashes must be "
                             f"grid-space (1 per encoder grid entry)."
                         )
-                mm_hashes = [h for hashes in per_req_hashes for h in hashes]
             if self.rank == 0:
-                if mm_hashes is None:
-                    mm_hashes = self._calculate_hashes_from_features(
-                        mm_feature, grid_thw, modality, mm_inputs
-                    )
+                # Caller hints cannot replace the actual encoder-input identity.
+                mm_hashes = self._calculate_hashes_from_features(
+                    mm_feature, preprocess_result, modality
+                )
                 # Embedding stores use string cache keys.
-                str_mm_hashes = [str(h) for h in mm_hashes]
+                str_mm_hashes = [h.hex() for h in mm_hashes]
 
         return EncodeContext(
             req_id=requests[0]["req_id"],
@@ -1272,7 +1306,7 @@ class MMEncoder:
         layout_digest: tuple[int, int],
     ) -> List[torch.Tensor]:
         """Raise the same preparation error on every TP rank."""
-        tp_group = get_tp_group()
+        tp_group = get_parallel().tp_group
         error_code = (
             int(
                 local_error.code
@@ -1337,7 +1371,7 @@ class MMEncoder:
             torch.distributed.broadcast(
                 mask_tensor,
                 src=0,
-                group=self.mm_global_cache.prefetch_tp_group,
+                group=self.global_cache_tp_group,
             )
 
     async def _lookup_global_cache(
@@ -1729,10 +1763,10 @@ class MMEncoder:
             if use_mm_cache:
                 for mm_item in mm_items:
                     mm_item.set_pad_value()
-                mm_hashes = [mm_item.hash for mm_item in mm_items]
+                mm_hashes = [mm_item.cache_key for mm_item in mm_items]
                 mm_hash = MultiModalStaticCache.combine_hashes(mm_hashes)
                 async with self.mm_cache_lock:
-                    mm_cache = self.mm_cache.get(mm_hashes)
+                    mm_cache = self.mm_cache.get(mm_hashes, combined_hash=mm_hash)
                     if mm_cache is not None:
                         mm_embedding = mm_cache.embedding
                         cache_hit = True
@@ -2219,7 +2253,7 @@ class MMEncoder:
             is_health_check_request(req["req_id"]) for req in requests
         )
         keep_on_gpu = self.use_mooncake and not is_health_check
-        use_global_cache = self.mm_global_cache is not None and not is_health_check
+        use_global_cache = self.mm_global_cache_enabled and not is_health_check
         try:
             if self.rank == 0:
                 async with encode_state_condition:
@@ -2311,10 +2345,13 @@ class MMEncoder:
         start_time = asyncio.get_running_loop().time()
         timeout = self.send_timeout
         cond = await _get_receive_condition(req_id)
+        failure: Optional[str] = None
+        failure_code = HTTPStatus.BAD_GATEWAY
 
         try:
             while True:
                 if state.release_requested:
+                    # An upstream abort, not a delivery failure.
                     break
 
                 async with rid_lock:
@@ -2343,9 +2380,11 @@ class MMEncoder:
                     break
                 remaining = timeout - (asyncio.get_running_loop().time() - start_time)
                 if remaining <= 0:
-                    logger.error(
-                        f"[{req_id}] Timeout! Sent {len(sent_urls)}/{expected_count}"
+                    failure = (
+                        f"timed out after {timeout}s with "
+                        f"{len(sent_urls)}/{expected_count} destination(s) initiated"
                     )
+                    failure_code = HTTPStatus.GATEWAY_TIMEOUT
                     break
 
                 async with cond:
@@ -2361,13 +2400,25 @@ class MMEncoder:
                 tasks_only = [t[0] for t in all_tasks]
                 results = await asyncio.gather(*tasks_only, return_exceptions=True)
 
-                # Process results and log errors
+                failed = []
                 for i, result in enumerate(results):
                     url = all_tasks[i][1]  # Retrieve URL associated with the task
-                    if isinstance(result, Exception):
-                        logger.error(f"Failed to send to {url}: {result}")
+                    # A cancelled send delivered nothing, and CancelledError
+                    # is not an Exception; outer cancellation re-raises out of
+                    # gather rather than landing here.
+                    if isinstance(result, BaseException):
+                        logger.error(f"Failed to send to {url}: {result!r}")
+                        failed.append(url)
                     else:
                         logger.debug(f"Successfully sent to {url}")
+                if failed and failure is None:
+                    failure = f"delivery failed for {failed}"
+
+            if failure is not None:
+                raise MMError(
+                    f"[{req_id}] embedding delivery failed: {failure}",
+                    code=failure_code,
+                )
 
             logger.info(f"All tasks completed for req_id: {req_id}")
 

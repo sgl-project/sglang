@@ -1,6 +1,6 @@
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -32,7 +32,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         self._tree_draft_mode = tree_draft_width is not None
 
         if self._tree_draft_mode:
-            self.record_nolora_graph = False
             self._capture_spec_input_type = SpecInputType.UNO_DRAFT
             self._lora_state = UnoCudaGraphLoRAState(
                 model_runner.lora_manager,
@@ -52,7 +51,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         if self._tree_mode:
             # Capture exactly one base-model target graph.  The internal UNO
             # adapter is active only in the rejected F-wide draft phase.
-            self.record_nolora_graph = False
             model_runner.lora_manager.reset_lora_batch()
             kwargs.update(
                 attn_backend=model_runner.attn_backend,
@@ -64,7 +62,6 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             return
 
         forward_width = model_runner.decode_num_tokens_per_req()
-        self.record_nolora_graph = forward_width > 1
         self._capture_spec_input_type = SpecInputType.UNO_VERIFY
         self._lora_state = UnoCudaGraphLoRAState(
             model_runner.lora_manager,
@@ -72,11 +69,11 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
             forward_width,
         )
         model_runner.lora_manager.reset_lora_batch()
-        super().__init__(model_runner, **kwargs)
+        super().__init__(model_runner, record_nolora_graph=forward_width > 1, **kwargs)
 
-    def capture_prepare(self, size, stream_idx=None, num_tokens=None):
+    def capture_prepare(self, size, num_tokens=None):
         forward_batch, attn_backend, pp_proxy_tensors = super().capture_prepare(
-            size, stream_idx=stream_idx, num_tokens=num_tokens
+            size, num_tokens=num_tokens
         )
         # UNO owns token-row routing directly. K2's generic graph runner now
         # keys LoRA setup off lora_manager presence, so suppress its synthetic
@@ -126,20 +123,17 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size,
         forward,
-        stream_idx=None,
         variant_label=None,
-        dsa_variant=None,
+        attention_variant=None,
     ):
-        """capture one CUDA graph with/out UNO LoRA."""
         if self._tree_draft_mode:
             self._lora_state.capture_draft(size)
             try:
                 return super().capture_one_shape(
                     size,
                     forward,
-                    stream_idx,
                     None,
-                    dsa_variant,
+                    attention_variant,
                 )
             finally:
                 self._lora_state.reset()
@@ -150,9 +144,8 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
                 return super().capture_one_shape(
                     size,
                     forward,
-                    stream_idx,
                     None,
-                    dsa_variant,
+                    attention_variant,
                 )
             finally:
                 self.model_runner.lora_manager.reset_lora_batch()
@@ -167,13 +160,12 @@ class UnoDecodeCudaGraphRunner(DecodeCudaGraphRunner):
         super().capture_one_shape(
             size,
             forward,
-            stream_idx,
             variant_label,
-            dsa_variant,
+            attention_variant,
         )
         self._lora_state.reset()
 
-    def get_spec_info(self, num_tokens: int):
+    def get_spec_info(self, num_tokens: int, ragged_verify_layout=None):
         if self._tree_draft_mode:
             return UnoForwardInput(
                 spec_input_type=SpecInputType.UNO_DRAFT,

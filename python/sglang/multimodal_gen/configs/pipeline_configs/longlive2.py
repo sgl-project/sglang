@@ -5,11 +5,11 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.longlive2 import LongLive2VideoConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import Wan2_2_TI2V_5B_Config
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -70,3 +70,19 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
         super().__post_init__()
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
+
+
+def register():
+    from sglang.multimodal_gen.configs.sample.longlive2 import (
+        LongLive2SamplingParams,
+    )
+    from sglang.multimodal_gen.registry import register_configs
+
+    register_configs(
+        sampling_param_cls=LongLive2SamplingParams,
+        pipeline_config_cls=LongLive2T2VConfig,
+        hf_model_paths=[
+            "Rabinovich/LongLive-2.0-5B-Diffusers",
+            "Efficient-Large-Model/LongLive-2.0-5B",
+        ],
+    )

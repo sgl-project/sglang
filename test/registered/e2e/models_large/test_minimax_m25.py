@@ -31,8 +31,7 @@ class TestMiniMaxM25(unittest.TestCase):
             "--reasoning-parser=minimax-append-think",
         ]
         dp_attn_args = base_args + [
-            "--enable-dp-attention",
-            "--dp=8",
+            "--attn-dp-size=8",
         ]
 
         variants = [

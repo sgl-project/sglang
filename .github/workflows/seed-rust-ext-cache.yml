@@ -48,5 +48,5 @@ jobs:
       runs_on: ubuntu-22.04-arm
       collect_runs_on: ubuntu-22.04-arm
       artifact_name: rust-ext-aarch64
-      cache_key_prefix: rust-ext-aarch64-cp310-cp312
+      cache_key_prefix: rust-ext-aarch64-cp312
     secrets: inherit

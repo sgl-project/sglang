@@ -6,22 +6,68 @@ import os
 from typing import TYPE_CHECKING, Optional
 
 from sglang.srt.arg_groups.choices import DRAFT_ATTENTION_BACKEND_CHOICES
-from sglang.srt.arg_groups.overrides import (
-    _speculative_moe_runner_default,
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
+    dspark_dp_a2a_backends,
     model_config_of,
-    record_foreign_defaults,
     resolved_view,
     resolving_view,
+)
+from sglang.srt.arg_groups.overrides import (
+    _speculative_moe_runner_default,
+    declare_resolution,
+    record_foreign_defaults,
     run_post_process_pass,
 )
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.dspark_components.dspark_config import (
+        DSparkDraftConfig,
+    )
 
 logger = logging.getLogger(__name__)
+
+
+def _should_auto_enable_hip_rejection_sampling(
+    *,
+    is_hip: bool,
+    use_rejection_sampling: bool,
+    algorithm: Optional[str],
+    token_map: Optional[str],
+    eagle_topk: int,
+    accept_threshold_single: float,
+    accept_threshold_acc: float,
+    enable_deterministic_inference: bool,
+    simulate_acc_len: float = -1.0,
+) -> bool:
+    """Whether HIP may default ``speculative_use_rejection_sampling`` on.
+
+    Rejection sampling still cannot consume a reduced / hot draft vocab
+    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
+    would crash configs that previously ran greedy on HIP, including EAGLE3
+    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
+    EAGLE3 and any EAGLE run that already has a token map.
+
+    Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
+    runs the real EAGLE verify then overwrites accept length, so the Triton
+    chain sampler is paid for and thrown away.
+    """
+    return (
+        is_hip
+        and not use_rejection_sampling
+        and algorithm == "EAGLE"
+        and token_map is None
+        and eagle_topk == 1
+        and accept_threshold_single == 1.0
+        and accept_threshold_acc == 1.0
+        and not enable_deterministic_inference
+        and simulate_acc_len <= 0
+    )
 
 
 def _disable_overlap_schedule_for_cpu(server_args: ServerArgs) -> None:
@@ -49,7 +95,7 @@ def _resolve_speculative_algorithm_alias(
 
     is_gemma4_draft = False
     if speculative_draft_model_path:
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.hf_transformers import get_config
 
         cfg = get_config(
             speculative_draft_model_path, trust_remote_code=trust_remote_code, **kwargs
@@ -103,15 +149,6 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             speculative_algorithm=cfg.speculative_algorithm.upper(),
         )
 
-    # Removal notice for the retired env var; raw os.getenv on purpose -- the
-    # Envs descriptor is gone. Drop this check after one release.
-    if os.getenv("SGLANG_ENABLE_SPEC_V2") is not None:
-        logger.warning(
-            "SGLANG_ENABLE_SPEC_V2 has been removed: speculative decoding "
-            "always runs the V2 worker. Use --disable-overlap-schedule to "
-            "select the non-overlap (synchronous) path."
-        )
-
     kwargs = {}
 
     override_config_file = cfg.decrypted_draft_config_file
@@ -129,8 +166,46 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         ),
     )
 
-    # Validate --speculative-draft-window-size once, regardless of algorithm.
-    # Consumed by DFLASH (compact draft KV cache) and Llama EAGLE-3 (drafter attention SWA).
+    # Check the final algorithm: NEXTN aliases EAGLE, while Gemma4 drafts promote
+    # EAGLE/NEXTN to FROZEN_KV_MTP.
+    if (
+        cfg.disaggregation_mode == "decode"
+        and cfg.disaggregation_decode_enable_radix_cache
+        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+    ):
+        raise ValueError(
+            "--disaggregation-decode-enable-radix-cache is incompatible "
+            "with speculative decoding "
+            f"(--speculative-algorithm {cfg.speculative_algorithm})"
+        )
+
+    if cfg.speculative_use_block_verification:
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+            raise ValueError(
+                "--speculative-use-block-verification only supports EAGLE / EAGLE3 / "
+                "NEXTN / DFLASH / DSPARK."
+            )
+        if cfg.device != "cuda":
+            raise ValueError(
+                "--speculative-use-block-verification only supports CUDA or ROCm."
+            )
+        # Block verification needs sampled proposals and their full distributions.
+        # The DFLASH family's sampled drafts always carry them.
+        if (
+            cfg.speculative_algorithm in ("EAGLE", "EAGLE3")
+            and not cfg.speculative_use_rejection_sampling
+        ):
+            declare_resolution(
+                server_args,
+                "handle_speculative_decoding",
+                speculative_use_rejection_sampling=True,
+            )
+
+    # Validate --speculative-draft-window-size / --speculative-draft-sink-size once,
+    # regardless of algorithm. Consumed by DFLASH (compact draft KV cache), Llama
+    # EAGLE-3 (drafter attention SWA), and the built-in MTP/NEXTN + EAGLE draft-decode
+    # path on the Triton and FlashInfer draft attention backends (StreamingLLM sink +
+    # recent window).
     if cfg.speculative_draft_window_size is not None:
         window_size = int(cfg.speculative_draft_window_size)
         if window_size <= 0:
@@ -142,12 +217,29 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
             "handle_speculative_decoding",
             speculative_draft_window_size=window_size,
         )
-        if cfg.speculative_algorithm not in ("EAGLE3", "DFLASH"):
+        if cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DFLASH"):
             logger.warning(
                 "--speculative-draft-window-size has no effect with "
-                "speculative_algorithm=%s (honored by Llama EAGLE-3 and DFLASH only).",
+                "speculative_algorithm=%s (honored by DFLASH, Llama EAGLE-3, and the "
+                "EAGLE/MTP/NEXTN draft-decode path on the Triton/FlashInfer draft backends).",
                 cfg.speculative_algorithm,
             )
+
+    if cfg.speculative_draft_sink_size is not None:
+        sink_size = int(cfg.speculative_draft_sink_size)
+        if sink_size < 0:
+            raise ValueError(
+                f"--speculative-draft-sink-size must be non-negative, got {sink_size}."
+            )
+        if cfg.speculative_draft_window_size is None:
+            raise ValueError(
+                "--speculative-draft-sink-size requires --speculative-draft-window-size."
+            )
+        declare_resolution(
+            server_args,
+            "handle_speculative_decoding",
+            speculative_draft_sink_size=sink_size,
+        )
 
     algo = None
     if cfg.speculative_algorithm is not None:
@@ -164,11 +256,14 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
                 algo.validate_server_args,
             )
 
-    if cfg.speculative_skip_dp_mlp_sync:
-        assert cfg.speculative_algorithm == "EAGLE", (
-            "--speculative-skip-dp-mlp-sync is only supported with "
-            f"speculative_algorithm == EAGLE, got {cfg.speculative_algorithm}."
-        )
+    if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+        if (
+            cfg.speculative_algorithm not in ("EAGLE", "EAGLE3", "DSPARK")
+            or cfg.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "DP spec/prefill coordination requires single-layer EAGLE, EAGLE3 or DSPARK"
+            )
 
     if cfg.speculative_adaptive:
         _maybe_disable_adaptive(server_args)
@@ -199,17 +294,34 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
 def _handle_dflash(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
-    if not (
-        cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
-    ):
+    algorithm = "DFLASH"
+    if current_platform.is_out_of_tree():
+        is_supported = current_platform.supports_speculative_algorithm(algorithm)
+    else:
+        is_supported = (
+            cfg.device.startswith("cuda") or cfg.device == "npu" or cfg.device == "xpu"
+        )
+    if not is_supported:
         raise ValueError(
-            "DFLASH speculative decoding only supports CUDA, NPU and XPU devices."
+            f"{algorithm} speculative decoding is not supported by "
+            f"{type(current_platform).__name__} on device {cfg.device!r}."
         )
 
-    if resolved_view(server_args).enable_dp_attention:
-        raise ValueError(
-            "Currently DFLASH speculative decoding does not support dp attention."
-        )
+    if attn_dp_enabled_of(cfg) and cfg.device != "npu":
+        if not cfg.device.startswith("cuda"):
+            raise ValueError("DFLASH with dp attention requires CUDA or NPU.")
+        # Both greedy projection and the selector borrow the target head.
+        if not cfg.enable_dp_lm_head:
+            raise ValueError("DFLASH with dp attention requires --enable-dp-lm-head.")
+        if cfg.attn_cp_size != 1:
+            raise ValueError(
+                "DFLASH with dp attention does not support context parallel."
+            )
+        if envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get():
+            raise ValueError(
+                "DFLASH with dp attention requires "
+                "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
+            )
 
     if cfg.pp_size != 1:
         raise ValueError(
@@ -289,7 +401,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         model_override_args = json.loads(cfg.json_model_override_args)
         inferred_block_size = None
         try:
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.hf_transformers import get_config
 
             draft_hf_config = get_config(
                 cfg.speculative_draft_model_path,
@@ -440,8 +552,6 @@ def _handle_uno(server_args: ServerArgs) -> None:
                 f"F={draft_width}, K={candidate_top_k}."
             )
 
-        if cfg.enable_pdmux:
-            raise ValueError("UNO tree mode does not yet support PDMux.")
         if cfg.enable_two_batch_overlap:
             raise ValueError("UNO tree mode does not yet support two-batch overlap.")
         if (
@@ -472,7 +582,7 @@ def _handle_uno(server_args: ServerArgs) -> None:
 
     if (cfg.tp_size, cfg.pp_size) != (1, 1):
         raise ValueError("UNO requires TP=PP=1.")
-    if cfg.enable_dp_attention or cfg.attn_cp_size != 1:
+    if attn_dp_enabled_of(cfg) or cfg.attn_cp_size != 1:
         raise ValueError("UNO does not support DP attention or context parallelism.")
     if cfg.enable_lora or cfg.lora_paths:
         raise ValueError("UNO does not support public Multi-LoRA serving.")
@@ -514,25 +624,74 @@ def _target_checkpoint_bundles_dspark_draft(server_args: ServerArgs) -> bool:
     return checkpoint_bundles_dspark_draft(model_config_of(server_args).hf_config)
 
 
+_DSPARK_DRAFT_SUBFOLDER = "dspark"
+
+
+def _target_checkpoint_dspark_subfolder(
+    model_path: str, revision: Optional[str], cache_dir: Optional[str]
+) -> Optional[str]:
+    """Local path of a DSpark draft shipped as a `dspark/` subfolder of the
+    target checkpoint, with its own config.json and weights; None if absent.
+
+    A Hub repo id fetches only that subfolder here: the draft is loaded by
+    path, and the target loader downloads the rest into the same snapshot.
+    """
+    if os.path.isdir(model_path):
+        draft_dir = os.path.join(model_path, _DSPARK_DRAFT_SUBFOLDER)
+        if os.path.isfile(os.path.join(draft_dir, "config.json")):
+            return draft_dir
+        return None
+
+    from huggingface_hub import hf_hub_download, snapshot_download
+    from huggingface_hub.errors import (
+        EntryNotFoundError,
+        RepositoryNotFoundError,
+        RevisionNotFoundError,
+    )
+
+    try:
+        # EntryNotFoundError also covers an offline cache that lacks the file.
+        hf_hub_download(
+            model_path,
+            f"{_DSPARK_DRAFT_SUBFOLDER}/config.json",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+    except (EntryNotFoundError, RepositoryNotFoundError, RevisionNotFoundError):
+        return None
+    snapshot = snapshot_download(
+        model_path,
+        revision=revision,
+        cache_dir=cache_dir,
+        allow_patterns=[f"{_DSPARK_DRAFT_SUBFOLDER}/*"],
+    )
+    return os.path.join(snapshot, _DSPARK_DRAFT_SUBFOLDER)
+
+
 def _handle_dspark(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     _is_npu = cfg.device.startswith("npu")
-    if not cfg.device.startswith(("cuda", "npu")):
+    if not cfg.device.startswith(("cuda", "npu", "xpu")):
         raise ValueError(
-            "DSpark speculative decoding only supports CUDA or NPU device."
+            "DSpark speculative decoding only supports CUDA, NPU or XPU device."
         )
 
-    # dp_size==1 with dp_attention is a degenerate flag under DSV4 CP; skip DP-only checks.
-    if cfg.enable_dp_attention and cfg.dp_size > 1:
+    if cfg.attn_dp_size > 1:
         if not cfg.enable_dp_lm_head:
             raise ValueError("DSpark with dp attention requires --enable-dp-lm-head.")
-        if not _is_npu and cfg.moe_a2a_backend not in ("none", "megamoe"):
+        allowed_a2a_backends = dspark_dp_a2a_backends(
+            model_config_of(server_args).hf_config.architectures[0]
+        )
+        if not _is_npu and cfg.moe_a2a_backend not in allowed_a2a_backends:
             raise ValueError(
-                "DSpark with dp attention supports moe_a2a_backend 'none' "
-                "(built-in TP MoE) or 'megamoe', got "
+                "DSpark with dp attention supports moe_a2a_backend "
+                f"{', '.join(map(repr, allowed_a2a_backends))} for this model, got "
                 f"{cfg.moe_a2a_backend!r}."
             )
-        if not _is_npu and cfg.moe_a2a_backend != "none":
+        if not _is_npu and (
+            cfg.moe_a2a_backend != "none"
+            or envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
+        ):
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
                 read_ragged_verify_mode,
@@ -540,8 +699,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
 
             if read_ragged_verify_mode() is not RaggedVerifyMode.STATIC:
                 raise ValueError(
-                    "DSpark with dp attention + "
-                    f"moe_a2a_backend={cfg.moe_a2a_backend!r} requires "
+                    "DSpark DP MoE or prefill coordination requires "
                     "SGLANG_RAGGED_VERIFY_MODE=static."
                 )
         if cfg.attn_cp_size > 1:
@@ -561,9 +719,11 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1:
-        raise ValueError(
-            "Currently DSpark speculative decoding only supports pp_size == 1."
-        )
+        if cfg.disaggregation_mode != "prefill":
+            raise ValueError(
+                "DSpark pipeline parallelism requires PD prefill; "
+                "decode and non-disaggregated serving require pp_size == 1."
+            )
 
     if cfg.speculative_draft_model_path is None:
         if _target_checkpoint_bundles_dspark_draft(server_args):
@@ -581,6 +741,20 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 "DSpark draft weights are bundled in the target checkpoint; "
                 "defaulting --speculative-draft-model-path to --model-path (%s).",
                 cfg.model_path,
+            )
+        elif draft_dir := _target_checkpoint_dspark_subfolder(
+            cfg.model_path, cfg.revision, cfg.download_dir
+        ):
+            declare_resolution(
+                server_args,
+                "_handle_dspark",
+                speculative_draft_model_path=draft_dir,
+            )
+            logger.info(
+                "DSpark draft found in the target checkpoint's %s/ subfolder; "
+                "defaulting --speculative-draft-model-path to %s.",
+                _DSPARK_DRAFT_SUBFOLDER,
+                draft_dir,
             )
         else:
             raise ValueError(
@@ -636,6 +810,8 @@ def _handle_dspark(server_args: ServerArgs) -> None:
             "gamma resolution. Error: %s",
             e,
         )
+    if draft_config is not None:
+        _publish_dspark_mla_draft_backend(server_args, draft_config)
 
     gamma: Optional[int] = None
     if cfg.speculative_dspark_block_size is not None:
@@ -717,6 +893,35 @@ def _handle_dspark(server_args: ServerArgs) -> None:
         )
 
 
+def _keep_mla_draft_off_trtllm_mha(
+    draft_backend: Optional[str], *, is_mla: bool
+) -> Optional[str]:
+    # trtllm_mha serves only MHA/GQA layers and implies CUDA.
+    if is_mla and draft_backend == "trtllm_mha":
+        logger.warning("MLA drafts cannot use 'trtllm_mha'; using 'flashinfer'.")
+        return "flashinfer"
+    return draft_backend
+
+
+def _publish_dspark_mla_draft_backend(
+    server_args: ServerArgs, draft_config: DSparkDraftConfig
+) -> None:
+    cfg = resolving_view(server_args)
+    draft_backend = cfg.speculative_draft_attention_backend
+    if draft_backend is None:
+        draft_backend, _ = attention_backends_of(resolved_view(server_args))
+    mla_backend = _keep_mla_draft_off_trtllm_mha(
+        draft_backend, is_mla=draft_config.is_mla
+    )
+    if mla_backend != draft_backend:
+        # Declared at launch so the KV planners see the backend the draft runs.
+        declare_resolution(
+            server_args,
+            "_handle_dspark",
+            speculative_draft_attention_backend=mla_backend,
+        )
+
+
 def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     """Resolve `speculative_draft_attention_backend` to a final, supported value.
 
@@ -726,19 +931,73 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
 
     supported_draft_backends = DRAFT_ATTENTION_BACKEND_CHOICES
-    # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
-    fallback_backend = (
-        "triton" if (get_platform().is_xpu or get_platform().is_hip) else "flashinfer"
-    )
+
+    def is_supported_backend(backend: str) -> bool:
+        if current_platform.is_out_of_tree():
+            return current_platform.supports_speculative_draft_attention_backend(
+                "DFLASH", backend
+            )
+        if backend == "cutedsl_mla":
+            from sglang.srt.hf_transformers import get_config
+            from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
+
+            draft_hf_config = get_config(
+                cfg.speculative_draft_model_path,
+                trust_remote_code=cfg.trust_remote_code,
+                revision=cfg.speculative_draft_model_revision,
+                model_override_args=json.loads(cfg.json_model_override_args),
+            )
+            return parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla
+        return backend in supported_draft_backends
+
+    def get_fallback_backend() -> str:
+        if current_platform.is_out_of_tree():
+            try:
+                fallback_backend = (
+                    current_platform.get_default_speculative_draft_attention_backend(
+                        "DFLASH"
+                    )
+                )
+            except NotImplementedError as error:
+                raise ValueError(
+                    f"{type(current_platform).__name__} must implement "
+                    "get_default_speculative_draft_attention_backend() to use DFLASH."
+                ) from error
+            if not is_supported_backend(fallback_backend):
+                raise ValueError(
+                    f"{type(current_platform).__name__} returned unsupported DFLASH "
+                    f"draft attention backend {fallback_backend!r} from "
+                    "get_default_speculative_draft_attention_backend()."
+                )
+            return fallback_backend
+        # FlashInfer is CUDA-only; fall back to triton on XPU and ROCm.
+        return (
+            "triton"
+            if (get_platform().is_xpu or get_platform().is_hip)
+            else "flashinfer"
+        )
 
     draft_backend = cfg.speculative_draft_attention_backend
     if draft_backend is None:
         draft_backend, _ = attention_backends_of(resolved_view(server_args))
     if draft_backend is None:
+        draft_backend = get_fallback_backend()
+    elif not is_supported_backend(draft_backend):
+        fallback_backend = get_fallback_backend()
+        logger.warning(
+            "DFLASH draft worker does not support attention_backend %r on %s. "
+            "Falling back to '%s'.",
+            draft_backend,
+            type(current_platform).__name__,
+            fallback_backend,
+        )
         draft_backend = fallback_backend
     elif draft_backend == "trtllm_mha":
-        from sglang.srt.speculative.dflash_utils import get_dflash_layer_types
-        from sglang.srt.utils.hf_transformers_utils import get_config
+        from sglang.srt.hf_transformers import get_config
+        from sglang.srt.speculative.dflash_utils import (
+            get_dflash_layer_types,
+            parse_dflash_draft_config,
+        )
 
         draft_hf_config = get_config(
             cfg.speculative_draft_model_path,
@@ -757,7 +1016,15 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
             and set(layer_types) == {"sliding_attention"}
         )
         all_causal = getattr(draft_text_config, "is_causal", False) is True
-        if not (all_sliding or all_causal):
+        draft_backend = _keep_mla_draft_off_trtllm_mha(
+            draft_backend,
+            is_mla=parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla,
+        )
+        if draft_backend == "trtllm_mha" and not (all_sliding or all_causal):
+            fallback_backend = get_fallback_backend()
+            # Preserve the CUDA FA4 path without overriding out-of-tree defaults.
+            if not current_platform.is_out_of_tree() and get_platform().is_sm100:
+                fallback_backend = "fa4"
             logger.warning(
                 "DFLASH only enables 'trtllm_mha' when all layers use sliding "
                 "attention or the draft is explicitly causal; got "
@@ -768,15 +1035,6 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
                 fallback_backend,
             )
             draft_backend = fallback_backend
-    elif draft_backend not in supported_draft_backends:
-        logger.warning(
-            "DFLASH draft worker only supports attention_backend in %s for now, "
-            "but got %r. Falling back to '%s'.",
-            supported_draft_backends,
-            draft_backend,
-            fallback_backend,
-        )
-        draft_backend = fallback_backend
     # FIXME: avoid overriding server args directly; pass the resolved draft
     # backend to the draft worker explicitly instead.
     declare_resolution(
@@ -810,13 +1068,116 @@ def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:
         )
 
 
-def _handle_eagle_family(server_args: ServerArgs) -> None:
+def _handle_iquest_q1_mtp_draft(server_args: ServerArgs) -> bool:
+    from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
+    from sglang.srt.hf_transformers import get_config
 
+    target = model_config_of(server_args).hf_config
+    if target.architectures[0] != "IQuestQ1ForCausalLM":
+        return False
     cfg = resolving_view(server_args)
+    if cfg.speculative_draft_model_path in (None, cfg.model_path):
+        raise ValueError("IQuest Q1 requires an independent draft model path.")
+    draft = get_config(
+        cfg.speculative_draft_model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.speculative_draft_model_revision,
+    )
+    if not isinstance(draft, IQuestQ1MTPConfig):
+        raise ValueError("IQuest Q1 requires an independent MTP draft checkpoint.")
+    if draft.hidden_size != target.hidden_size or draft.vocab_size != target.vocab_size:
+        raise ValueError("MTP draft hidden size and vocabulary must match the target.")
+    if draft.num_target_layers != target.num_hidden_layers:
+        raise ValueError("MTP draft target layer count must match the target.")
+    if cfg.speculative_token_map is not None:
+        raise ValueError("MTP uses its own full-vocabulary embedding and head.")
+    steps = cfg.speculative_num_steps
+    if steps is None:
+        steps = draft.num_draft_slots
+    if steps < 1:
+        raise ValueError("MTP requires positive speculative_num_steps.")
+    if steps > draft.num_draft_slots:
+        logger.warning(
+            "MTP depth %d exceeds the checkpoint's num_draft_slots=%d.",
+            steps,
+            draft.num_draft_slots,
+        )
+    if cfg.speculative_eagle_topk not in (None, 1):
+        raise ValueError("MTP requires --speculative-eagle-topk 1.")
+    if cfg.speculative_num_draft_tokens not in (None, steps + 1):
+        raise ValueError("MTP verification width must equal draft steps + 1.")
+    declare_resolution(
+        server_args,
+        "_handle_iquest_q1_mtp_draft",
+        speculative_num_steps=steps,
+        speculative_eagle_topk=1,
+        speculative_num_draft_tokens=steps + 1,
+    )
+    return True
 
+
+def _check_oot_speculative_algorithm(algorithm: str, device: str) -> None:
+    if current_platform.is_out_of_tree() and not (
+        current_platform.supports_speculative_algorithm(algorithm)
+    ):
+        raise ValueError(
+            f"{algorithm} speculative decoding is not supported by "
+            f"{type(current_platform).__name__} on device {device!r}."
+        )
+
+
+# Head sizes the paged prefill/decode kernels behind intel_xpu accept (sgl-kernel-xpu
+# src/sycl/flash_attention.cpp); any other head size raises on the first draft forward.
+_INTEL_XPU_PAGED_ATTENTION_HEAD_SIZES = (64, 96, 128, 192, 256, 512)
+
+
+def _fall_back_xpu_draft_attention_for_head_size(server_args: ServerArgs) -> None:
+    """Give an EAGLE draft the triton backend when intel_xpu cannot run its head size."""
+    cfg = resolving_view(server_args)
     if (
-        cfg.speculative_algorithm == "STANDALONE"
-        and resolved_view(server_args).enable_dp_attention
+        not get_platform().is_xpu
+        or cfg.speculative_draft_attention_backend is not None
+        or cfg.speculative_draft_model_path is None
+        or attention_backends_of(resolved_view(server_args))[0] != "intel_xpu"
+    ):
+        return
+    from sglang.srt.hf_transformers.common import get_hf_text_config
+    from sglang.srt.hf_transformers.config import get_config
+
+    # Composite configs (e.g. Qwen3_5Config) keep the attention dims in a text sub-config.
+    draft_hf_config = get_hf_text_config(
+        get_config(
+            cfg.speculative_draft_model_path,
+            trust_remote_code=cfg.trust_remote_code,
+            revision=cfg.speculative_draft_model_revision,
+        )
+    )
+    # head_dim is optional in HF configs; without it the head size is hidden / heads.
+    head_dim = getattr(draft_hf_config, "head_dim", None) or (
+        draft_hf_config.hidden_size // draft_hf_config.num_attention_heads
+    )
+    if head_dim in _INTEL_XPU_PAGED_ATTENTION_HEAD_SIZES:
+        return
+    logger.info(
+        "intel_xpu attention does not support the draft model's head size %d; "
+        "using --speculative-draft-attention-backend triton for the draft.",
+        head_dim,
+    )
+    declare_resolution(
+        server_args,
+        "_handle_eagle_family",
+        speculative_draft_attention_backend="triton",
+    )
+
+
+def _handle_eagle_family(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    _check_oot_speculative_algorithm(
+        algorithm=cfg.speculative_algorithm, device=cfg.device
+    )
+
+    if cfg.speculative_algorithm == "STANDALONE" and attn_dp_enabled_of(
+        resolved_view(server_args)
     ):
         # TODO: support dp attention for standalone speculative decoding
         raise ValueError(
@@ -871,6 +1232,7 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
         "MistralLarge3ForCausalLM",
         "PixtralForConditionalGeneration",
         "HYV3ForCausalLM",
+        "Xing4_0ForCausalLM",
         "HYV4ForCausalLM",
         # Qwen4-Exp ships its NEXTN draft layer inside the target checkpoint.
         "Qwen4ExpForConditionalGeneration",
@@ -895,6 +1257,8 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                     "DeepSeek MTP does not require setting speculative_draft_model_path."
                 )
 
+    _handle_iquest_q1_mtp_draft(server_args)
+    _fall_back_xpu_draft_attention_for_head_size(server_args)
     if not cfg.speculative_adaptive and cfg.speculative_num_steps is None:
         assert (
             cfg.speculative_eagle_topk is None
@@ -918,7 +1282,35 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "trtllm_mha backend only supports topk = 1 for speculative decoding."
             )
 
-    if cfg.speculative_use_rejection_sampling:
+    # ROCm/HIP has no CUDA/MUSA sampling-verify kernels, so EAGLE verify would
+    # otherwise fall back to greedy (argmax) and silently ignore temperature and
+    # top_p. Default rejection sampling on -- it routes verify through the Triton
+    # chain sampler -- for configs that support it. See
+    # _should_auto_enable_hip_rejection_sampling for the cases we must not flip.
+    if _should_auto_enable_hip_rejection_sampling(
+        is_hip=get_platform().is_hip,
+        use_rejection_sampling=cfg.speculative_use_rejection_sampling,
+        algorithm=cfg.speculative_algorithm,
+        token_map=cfg.speculative_token_map,
+        eagle_topk=cfg.speculative_eagle_topk,
+        accept_threshold_single=cfg.speculative_accept_threshold_single,
+        accept_threshold_acc=cfg.speculative_accept_threshold_acc,
+        enable_deterministic_inference=cfg.enable_deterministic_inference,
+        simulate_acc_len=float(envs.SGLANG_SIMULATE_ACC_LEN.get()),
+    ):
+        declare_resolution(
+            server_args,
+            "_handle_eagle_family",
+            speculative_use_rejection_sampling=True,
+        )
+        logger.info(
+            "ROCm needs rejection sampling for EAGLE spec-decode to sample at all; "
+            "enabling speculative_use_rejection_sampling by default."
+        )
+
+    # resolved_view, not cfg: the block above may have just decided this field,
+    # and declare_resolution writes to the stash rather than the dataclass.
+    if resolved_view(server_args).speculative_use_rejection_sampling:
         # Resolved alias by now: NEXTN -> EAGLE, Gemma4 draft -> FROZEN_KV_MTP.
         # Only the EAGLE/EAGLE3 draft workers emit a target-vocab proposal that
         # the rejection-sampling kernel consumes; everything else (STANDALONE,
@@ -933,6 +1325,12 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
             raise ValueError(
                 "--speculative-use-rejection-sampling requires --speculative-eagle-topk=1."
             )
+        if cfg.enable_deterministic_inference and not cfg.device.startswith("cuda"):
+            raise ValueError(
+                "Deterministic rejection sampling is currently supported only on "
+                "CUDA-compatible devices because draft proposal sampling uses a "
+                "Triton hash kernel."
+            )
         if (
             cfg.speculative_accept_threshold_single != 1.0
             or cfg.speculative_accept_threshold_acc != 1.0
@@ -943,13 +1341,6 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
                 "--speculative-accept-threshold-acc; rejection sampling ignores "
                 "the accept thresholds."
             )
-        if cfg.enable_deterministic_inference:
-            raise ValueError(
-                "--speculative-use-rejection-sampling is incompatible with "
-                "--enable-deterministic-inference; the sampling kernel draws "
-                "coins from the global RNG and is not batch-invariant."
-            )
-
         if (
             resolved_view(server_args).enable_multi_layer_eagle
             and cfg.speculative_eagle_topk != 1
@@ -996,9 +1387,9 @@ def _handle_eagle_family(server_args: ServerArgs) -> None:
 
 def _handle_ngram(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
-    if cfg.device not in ("cuda", "cpu"):
+    if cfg.device not in ("cuda", "cpu", "xpu"):
         raise ValueError(
-            "Ngram speculative decoding only supports CUDA or CPU devices."
+            "Ngram speculative decoding only supports CUDA, CPU, or XPU devices."
         )
 
     _disable_overlap_schedule_for_cpu(server_args)
@@ -1076,7 +1467,7 @@ def _handle_ngram(server_args: ServerArgs) -> None:
             "and produces incorrect results for paged attention backends. "
             "This combination is only supported for the 'flashinfer' backend."
         )
-    if view.enable_dp_attention:
+    if attn_dp_enabled_of(view):
         # TODO: support dp attention for ngram speculative decoding
         raise ValueError(
             "Currently ngram speculative decoding does not support dp attention."
@@ -1169,5 +1560,8 @@ def _auto_choose_speculative_params(server_args: ServerArgs, model_arch: str) ->
         return (3, 1, 4)
     elif model_arch in ["Grok1ForCausalLM", "Grok1VForCausalLM"]:
         return (5, 4, 8)
+    elif model_arch == ERNIE5_5_MOE_ARCH:
+        # One ECHO step; the cookbook's low-latency recipes pass 2.
+        return (1, 1, 2)
     else:
         return (3, 1, 4)

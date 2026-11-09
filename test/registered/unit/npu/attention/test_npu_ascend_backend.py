@@ -4,15 +4,17 @@ Unit tests for sglang.srt.hardware_backend.npu.attention.ascend_backend.
 
 import sys
 import unittest
-from dataclasses import fields, is_dataclass
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
+# Loaded before the torch_npu mock below: importing transformers runs
+# accelerate's find_spec("torch_npu"), which fails on a mock without __spec__.
+import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=5, suite="base-a-test-1-npu-a2")
+register_npu_ci(est_time=5, suite="base-a-test-npu")
 
 # Mock NPU-only modules before importing the source module.
 for _ in (
@@ -21,6 +23,8 @@ for _ in (
     "sgl_kernel_npu",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
     "sglang.srt.speculative",
     "sglang.srt.speculative.decoupled_spec_io",
     "sglang.srt.speculative.spec_info",
@@ -31,11 +35,11 @@ for _ in (
 from sglang.srt.hardware_backend.npu.attention.ascend_backend import (
     AscendAttnBackend,
     AscendAttnMaskBuilder,
-    AscendAttnMultiStepDraftBackend,
     ForwardMetadata,
     _expand_dsa_sparse_indices,
     _reshape_kv_for_fia_nz,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 
 class TestExpandDsaSparseIndices(unittest.TestCase):
@@ -108,58 +112,6 @@ class TestReshapeKvForFiaNz(unittest.TestCase):
         tensor = torch.arange(total, dtype=torch.float32)
         result = _reshape_kv_for_fia_nz(tensor, num_heads, head_dim, page_size)
         self.assertEqual(result.data_ptr(), tensor.data_ptr())
-
-
-class TestForwardMetadata(unittest.TestCase):
-    def test_is_dataclass(self):
-        self.assertTrue(is_dataclass(ForwardMetadata))
-
-    def test_all_fields_default_none(self):
-        metadata = ForwardMetadata()
-        for f in fields(ForwardMetadata):
-            self.assertIsNone(
-                getattr(metadata, f.name),
-                f"Field '{f.name}' should default to None",
-            )
-
-    def test_create_with_values(self):
-        block_tables = torch.tensor([[1, 2], [3, 4]])
-        seq_lens = torch.tensor([10, 20])
-        metadata = ForwardMetadata(
-            block_tables=block_tables,
-            seq_lens=seq_lens,
-            seq_lens_cpu_list=[10, 20],
-        )
-        self.assertTrue(torch.equal(metadata.block_tables, block_tables))
-        self.assertTrue(torch.equal(metadata.seq_lens, seq_lens))
-        self.assertEqual(metadata.seq_lens_cpu_list, [10, 20])
-
-    def test_partial_assignment(self):
-        metadata = ForwardMetadata(swa_mask=torch.ones(3, 3))
-        self.assertIsNotNone(metadata.swa_mask)
-        self.assertIsNone(metadata.block_tables)
-        self.assertIsNone(metadata.seq_lens)
-
-    def test_field_names(self):
-        names = {f.name for f in fields(ForwardMetadata)}
-        expected = {
-            "block_tables",
-            "block_tables_swa",
-            "swa_out_cache_loc",
-            "extend_seq_lens_cpu_int",
-            "seq_lens_cpu_int",
-            "seq_lens_cpu_list",
-            "seq_lens_list_cumsum",
-            "seq_lens",
-            "actual_seq_lengths_q",
-            "actual_seq_lengths_q_pa",
-            "actual_seq_lengths_q_pa_cpu",
-            "actual_seq_lengths_kv",
-            "swa_mask",
-            "prefix_lens",
-            "flatten_prefix_block_tables",
-        }
-        self.assertEqual(names, expected)
 
 
 class TestGenerateMaskFlag(unittest.TestCase):
@@ -529,78 +481,6 @@ class TestGetSwaMask(unittest.TestCase):
         self.assertEqual(mask.dtype, torch.bool)
 
 
-class TestCanUseTnd(unittest.TestCase):
-    def test_128_128(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=128)
-            )
-        )
-
-    def test_192_192(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=192)
-            )
-        )
-
-    def test_256_256(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=256, v_head_dim=256)
-            )
-        )
-
-    def test_192_128(self):
-        self.assertTrue(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=128)
-            )
-        )
-
-    def test_64_64(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=64, v_head_dim=64)
-            )
-        )
-
-    def test_128_256(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=256)
-            )
-        )
-
-    def test_256_128(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=256, v_head_dim=128)
-            )
-        )
-
-    def test_128_192(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=128, v_head_dim=192)
-            )
-        )
-
-    def test_192_256(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=192, v_head_dim=256)
-            )
-        )
-
-    def test_96_96(self):
-        self.assertFalse(
-            AscendAttnBackend._can_use_tnd(
-                SimpleNamespace(qk_head_dim=96, v_head_dim=96)
-            )
-        )
-
-
 class TestGenerateAlibiBias(unittest.TestCase):
     def setUp(self):
         self.backend = object.__new__(AscendAttnBackend)
@@ -682,84 +562,450 @@ class TestGenerateAlibiBias(unittest.TestCase):
         self.assertEqual(result.dtype, torch.bfloat16)
 
 
-class TestGetCudaGraphSeqLenFillValue(unittest.TestCase):
-    def test_returns_zero(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertEqual(backend.get_cuda_graph_seq_len_fill_value(), 0)
+class TestMlaPrefixCacheDcp(unittest.TestCase):
+    def test_fp8_prefix_dequantized_before_projection_or_dcp_gather(self):
+        from sglang.srt.hardware_backend.npu.attention.mla_cache import (
+            build_mla_prefix_token_indices,
+        )
+
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        page = 4
+        for local_lens in ([5, 3], [4, 4]):
+            counts = [(length + page - 1) // page for length in local_lens]
+            blocks = sum(counts)
+            ids = torch.arange(blocks - 1, -1, -1)
+            latent = (
+                (torch.arange(blocks * page * 32).remainder(97) - 48)
+                .reshape(blocks, page, 1, 32)
+                .to(torch.float8_e4m3fn)
+            )
+            rope = (
+                torch.arange(blocks * page * 32).reshape(blocks, page, 1, 32).bfloat16()
+            )
+            expected_k, expected_pe, offset = [], [], 0
+            for length, count in zip(local_lens, counts):
+                request_ids = ids[offset : offset + count]
+                expected_k.append(latent.float()[request_ids].flatten(0, 1)[:length])
+                expected_pe.append(rope[request_ids].flatten(0, 1)[:length])
+                offset += count
+            expected_k = torch.cat(expected_k)
+            expected_pe = torch.cat(expected_pe)
+            expected_dequantized = (expected_k * 0.25).bfloat16()
+
+            for is_nz in (False, True):
+
+                def encode(data):
+                    if not is_nz:
+                        return data
+                    tile = 32 if data.dtype == torch.float8_e4m3fn else 16
+                    backing = data.view(torch.uint8) if tile == 32 else data
+                    return (
+                        backing.reshape(blocks, page, 32 // tile, tile)
+                        .permute(0, 2, 1, 3)
+                        .contiguous()
+                        .reshape_as(backing)
+                        .view(data.dtype)
+                    )
+
+                for size in (1, 2):
+                    with self.subTest(lengths=local_lens, nz=is_nz, dcp_size=size):
+                        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+                        backend.dcp_size, backend.page_size = size, page
+                        backend.kv_lora_rank = backend.qk_rope_head_dim = 32
+                        global_lens = (
+                            local_lens
+                            if size == 1
+                            else ([9, 3] if local_lens == [5, 3] else [8, 8])
+                        )
+                        backend.forward_metadata = ForwardMetadata(
+                            prefix_lens=torch.tensor(global_lens),
+                            flatten_prefix_block_tables=ids,
+                            prefix_token_indices=(
+                                build_mla_prefix_token_indices(
+                                    local_lens, page, device=torch.device("cpu")
+                                )
+                                if any(length % page for length in local_lens)
+                                else None
+                            ),
+                        )
+                        k_buffer, pe_buffer = encode(latent), encode(rope)
+                        backend.token_to_kv_pool = SimpleNamespace(
+                            get_key_buffer=lambda _: k_buffer,
+                            get_value_buffer=lambda _: pe_buffer,
+                        )
+                        dequantize = MagicMock(
+                            side_effect=lambda value: (
+                                (value.float() * 0.25).bfloat16(),
+                                None,
+                            )
+                        )
+                        full_prefix = torch.randn(sum(global_lens), 1, 64).bfloat16()
+                        with (
+                            patch(f"{module}.is_fia_nz", return_value=is_nz),
+                            patch(
+                                f"{module}.all_gather_kv_cache_for_dcp",
+                                return_value=full_prefix,
+                            ) as gather,
+                        ):
+                            result_k, result_pe = backend._load_mla_prefix_cache(
+                                SimpleNamespace(
+                                    layer_id=0,
+                                    scheme=SimpleNamespace(dequantize_cache=dequantize),
+                                )
+                            )
+                        dequantize.assert_called_once()
+                        encoded = dequantize.call_args.args[0]
+                        self.assertEqual(encoded.dtype, torch.float8_e4m3fn)
+                        torch.testing.assert_close(
+                            encoded.float(), expected_k, atol=0, rtol=0
+                        )
+                        if size == 1:
+                            gather.assert_not_called()
+                            torch.testing.assert_close(
+                                result_k, expected_dequantized, atol=0, rtol=0
+                            )
+                            torch.testing.assert_close(
+                                result_pe, expected_pe, atol=0, rtol=0
+                            )
+                        else:
+                            gather.assert_called_once()
+                            torch.testing.assert_close(
+                                gather.call_args.args[0],
+                                expected_dequantized,
+                                atol=0,
+                                rtol=0,
+                            )
+                            torch.testing.assert_close(
+                                gather.call_args.args[1], expected_pe, atol=0, rtol=0
+                            )
+                            self.assertIs(
+                                gather.call_args.args[2],
+                                backend.forward_metadata.prefix_lens,
+                            )
+                            self.assertEqual(
+                                gather.call_args.kwargs, {"interleave_size": page}
+                            )
+                            torch.testing.assert_close(
+                                torch.cat((result_k, result_pe), -1),
+                                full_prefix,
+                                atol=0,
+                                rtol=0,
+                            )
+
+    def _check_prefix_cache(self, lengths, page_size, size, rank, is_nz, mode):
+        module = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        queries = torch.tensor([3, 1, 1], dtype=torch.int32)
+        prefix_lens = torch.tensor(lengths, dtype=torch.int32)
+        seq_lens = prefix_lens + queries
+        stride = page_size * size
+        cycles = (int(seq_lens.max()) + stride - 1) // stride
+        mapping = torch.arange(3 * cycles * stride).reshape(3, -1)
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.device = torch.device("cpu")
+        backend.use_mla = True
+        backend.use_dsa = False
+        backend.dcp_size, backend.dcp_rank = size, rank
+        backend.use_flash_mla = backend.use_paged_mtp = False
+        backend.dense_mla_dcp_target = size > 1
+        backend.dsa_dcp_target = False
+        backend.is_hybrid_swa = False
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.kv_lora_rank, backend.qk_rope_head_dim = 32, 16
+        backend.req_to_token = mapping
+        backend.req_to_token_pool = SimpleNamespace(req_to_token=mapping)
+        batch = SimpleNamespace(
+            forward_mode=mode,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            extend_seq_lens=queries,
+            extend_seq_lens_cpu=queries.tolist(),
+            extend_prefix_lens=prefix_lens,
+            extend_prefix_lens_cpu=lengths,
+            req_pool_indices=torch.tensor([2, 0, 1]),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+        parallel = SimpleNamespace(attn_dcp_size=size, attn_dcp_rank=rank)
+        with (
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(
+                f"{module}.build_mla_prefix_token_indices",
+                wraps=sys.modules[module].build_mla_prefix_token_indices,
+            ) as build_indices,
+        ):
+            backend.init_forward_metadata(batch)
+        metadata = backend.forward_metadata
+        self.assertEqual(metadata.prefix_lens.tolist(), lengths)
+
+        full, local = [], []
+        for request, length in enumerate(lengths):
+            values = torch.arange(length * 48, dtype=torch.float32).reshape(
+                length, 1, 48
+            )
+            values = values + request * 10000
+            full.append(values)
+            positions = torch.arange(length)
+            local.append(values[(positions // page_size) % size == rank])
+        expected_local = torch.cat(local)
+        expected_full = torch.cat(full)
+        needs_compaction = any(len(values) % page_size for values in local)
+        if needs_compaction:
+            self.assertEqual(
+                metadata.prefix_token_indices.numel(), expected_local.shape[0]
+            )
+        else:
+            self.assertIsNone(metadata.prefix_token_indices)
+        self.assertEqual(build_indices.call_count, int(needs_compaction))
+
+        blocks = metadata.flatten_prefix_block_tables.tolist()
+        pages = torch.full((max(blocks, default=0) + 1, page_size, 1, 48), -999.0)
+        offset = 0
+        for values in local:
+            count = (len(values) + page_size - 1) // page_size
+            if count:
+                request_pages = pages.new_full((count * page_size, 1, 48), -999)
+                request_pages[: len(values)] = values
+                pages[blocks[offset : offset + count]] = request_pages.reshape(
+                    count, page_size, 1, 48
+                )
+            offset += count
+
+        def encode(cache):
+            if not is_nz:
+                return cache
+            return (
+                cache.reshape(cache.shape[0], page_size, -1, 16)
+                .permute(0, 2, 1, 3)
+                .contiguous()
+                .reshape_as(cache)
+            )
+
+        latent, rope = encode(pages[..., :32]), encode(pages[..., 32:])
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: latent,
+            get_value_buffer=lambda _: rope,
+        )
+
+        def gather(kv, pe, global_lens, *, interleave_size):
+            torch.testing.assert_close(kv, expected_local[..., :32], atol=0, rtol=0)
+            torch.testing.assert_close(pe, expected_local[..., 32:], atol=0, rtol=0)
+            self.assertEqual(global_lens.tolist(), lengths)
+            self.assertEqual(interleave_size, page_size)
+            return expected_full
+
+        with (
+            patch(f"{module}.is_fia_nz", return_value=is_nz),
+            patch(
+                f"{module}.all_gather_kv_cache_for_dcp", side_effect=gather
+            ) as collective,
+        ):
+            actual_kv, actual_pe = backend._load_mla_prefix_cache(
+                SimpleNamespace(layer_id=0)
+            )
+        torch.testing.assert_close(actual_kv, expected_full[..., :32], atol=0, rtol=0)
+        torch.testing.assert_close(actual_pe, expected_full[..., 32:], atol=0, rtol=0)
+        self.assertEqual(collective.call_count, int(size > 1))
+
+    def test_rank_local_compaction_and_global_prefix_contract(self):
+        for lengths, page in (
+            ([5, 3, 0], 4),
+            ([0, 9, 2], 4),
+            ([128, 255, 129], 128),
+            ([4, 8, 0], 4),
+            ([128, 256, 0], 128),
+        ):
+            for size in (1, 2, 4):
+                for rank in range(size):
+                    for is_nz in (False, True):
+                        for mode in (ForwardMode.EXTEND, ForwardMode.MIXED):
+                            with self.subTest(
+                                lengths=lengths,
+                                size=size,
+                                rank=rank,
+                                nz=is_nz,
+                                mode=mode,
+                            ):
+                                self._check_prefix_cache(
+                                    lengths, page, size, rank, is_nz, mode
+                                )
 
 
-class TestGetVerifyBuffers(unittest.TestCase):
-    def test_no_verify_mask(self):
-        backend = object.__new__(AscendAttnBackend)
-        self.assertIsNone(backend.verify_mask)
-
-    def test_update_is_noop(self):
-        backend = object.__new__(AscendAttnBackend)
-        backend.update_verify_buffers_to_fill_after_draft(None, None)
-        backend.update_verify_buffers_to_fill_after_draft(MagicMock(), 4)
-        backend.update_verify_buffers_to_fill_after_draft(None, 16)
-
-
-class TestCommonTemplate(unittest.TestCase):
+class TestMlaPrefixFia(unittest.TestCase):
     @staticmethod
-    def _make_draft_backend(speculative_num_steps):
-        backend = object.__new__(AscendAttnMultiStepDraftBackend)
-        backend.speculative_num_steps = speculative_num_steps
-        return backend
+    def _fia_reference(**kwargs):
+        q, k, v = (kwargs[name] for name in ("query", "key", "value"))
+        for name in ("query", "key", "value", "query_rope", "key_rope"):
+            assert kwargs[name].is_contiguous(), name
+        assert kwargs["input_layout"] == "TND"
+        assert kwargs["return_softmax_lse"]
+        assert kwargs["num_query_heads"] == q.shape[1]
+        assert kwargs["num_key_value_heads"] == k.shape[1]
+        q = torch.cat((q, kwargs["query_rope"]), dim=-1).float()
+        k = torch.cat((k, kwargs["key_rope"]), dim=-1).float()
+        output = v.new_empty(q.shape[0], q.shape[1], v.shape[-1])
+        lse = q.new_empty(q.shape[0], q.shape[1], 1)
+        q_start = kv_start = 0
+        for q_end, kv_end in zip(kwargs["actual_seq_qlen"], kwargs["actual_seq_kvlen"]):
+            if kv_start == kv_end:
+                output[q_start:q_end] = float("nan")
+                lse[q_start:q_end] = float("inf")
+            else:
+                scores = (
+                    torch.einsum("thd,shd->hts", q[q_start:q_end], k[kv_start:kv_end])
+                    * kwargs["softmax_scale"]
+                )
+                if kwargs["sparse_mode"] == 3:
+                    assert kwargs["next_tokens"] == 0
+                    assert kwargs["atten_mask"].dtype == torch.bool
+                    mask = torch.ones_like(scores, dtype=torch.bool).triu(1)
+                    scores.masked_fill_(mask, -float("inf"))
+                else:
+                    assert kwargs["sparse_mode"] == 0
+                    assert kwargs.get("atten_mask") is None
+                output[q_start:q_end] = torch.einsum(
+                    "hts,shd->thd", scores.softmax(-1), v[kv_start:kv_end].float()
+                ).to(v.dtype)
+                lse[q_start:q_end] = scores.logsumexp(-1).T.unsqueeze(-1)
+            q_start, kv_start = q_end, kv_end
+        assert q_start == q.shape[0]
+        assert kv_start == k.shape[0]
+        return output, lse
 
-    def test_calls_fn_for_each_step(self):
-        """call_fn is invoked for steps 0..speculative_num_steps-2."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        self.assertEqual(call_fn.call_count, 3)
-        for i in range(3):
-            call_fn.assert_any_call(i, forward_batch)
+    @staticmethod
+    def _update_reference(lse, outputs, update_type):
+        assert update_type == 0
+        assert all(x.ndim == 1 and x.dtype == torch.float32 for x in lse)
+        assert all(x.ndim == 2 and x.dtype == torch.float32 for x in outputs)
+        assert all(x.is_contiguous() for x in (*lse, *outputs))
+        weights = torch.stack(lse).softmax(0).unsqueeze(-1)
+        return (torch.stack(outputs) * weights).sum(0), None
 
-    def test_zero_steps(self):
-        """speculative_num_steps=1 -> no calls (range(0))."""
-        backend = self._make_draft_backend(speculative_num_steps=1)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_not_called()
+    def _check_prefix(
+        self, query_lens, prefix_lens, dtype, padding, heads, magnitude=1, use_fia=False
+    ):
+        torch.manual_seed(47)
+        tokens, prefix_tokens = sum(query_lens), sum(prefix_lens)
+        q = torch.randn(tokens + padding, heads, 208, dtype=dtype)[..., :192]
+        k = torch.randn(tokens + padding, heads, 208, dtype=dtype)[..., :192]
+        v = torch.randn(tokens + padding, heads, 144, dtype=dtype)[..., :128]
+        q.mul_(magnitude)
+        k.mul_(magnitude)
+        cached = torch.randn(prefix_tokens + 3, 1, 1, 32, dtype=dtype)
+        cached_rope = torch.randn(prefix_tokens + 3, 1, 1, 64, dtype=dtype)
+        indices = torch.randperm(prefix_tokens + 3)[:prefix_tokens]
+        weight = torch.randn(32, heads * 256, dtype=dtype) / 32**0.5
 
-    def test_two_steps(self):
-        """speculative_num_steps=2 -> exactly one call with index 0."""
-        backend = self._make_draft_backend(speculative_num_steps=2)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        call_fn.assert_called_once_with(0, forward_batch)
+        def project(x):
+            return x @ weight, None
 
-    def test_call_indices(self):
-        backend = self._make_draft_backend(speculative_num_steps=5)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        indices = []
-        backend.common_template(forward_batch, lambda i, fb: indices.append(i))
-        self.assertEqual(indices, [0, 1, 2, 3])
+        backend = AscendAttnBackend.__new__(AscendAttnBackend)
+        backend.dcp_size = 1
+        backend.use_mla = True
+        backend.use_fia = use_fia
+        backend.is_dllm_model = False
+        backend.qk_nope_head_dim = 128
+        backend.qk_rope_head_dim = 64
+        backend.fia_mask = torch.ones(2048, 2048, dtype=torch.bool).triu(1)
+        backend.forward_metadata = ForwardMetadata(
+            extend_seq_lens_cpu_int=torch.tensor(query_lens, dtype=torch.int32),
+            prefix_lens=torch.tensor(prefix_lens, dtype=torch.int32),
+            flatten_prefix_block_tables=indices,
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_key_buffer=lambda _: cached,
+            get_value_buffer=lambda _: cached_rope,
+        )
+        layer = SimpleNamespace(
+            layer_id=0,
+            tp_q_head_num=heads,
+            tp_k_head_num=heads,
+            qk_head_dim=192,
+            v_head_dim=128,
+            kv_b_proj=project,
+            scaling=192**-0.5,
+        )
+        batch = SimpleNamespace(
+            global_num_token_non_padded_cpu=tokens,
+            extend_prefix_lens_cpu=prefix_lens,
+            forward_mode=SimpleNamespace(
+                is_target_verify=lambda: False,
+                is_draft_extend_v2=lambda: False,
+            ),
+        )
+        module_name = "sglang.srt.hardware_backend.npu.attention.ascend_backend"
+        with (
+            patch(f"{module_name}.is_mla_preprocess_enabled", return_value=False),
+            patch(
+                f"{module_name}.torch_npu.npu_fused_infer_attention_score_v2",
+                side_effect=self._fia_reference,
+            ) as fia,
+            patch(
+                f"{module_name}.torch_npu.npu_attention_update",
+                side_effect=self._update_reference,
+            ) as update,
+            patch(f"{module_name}.torch_npu.atb", None),
+        ):
+            actual = backend.forward_extend(q, k, v, layer, batch, save_kv_cache=False)
+        self.assertEqual(fia.call_count, 2)
+        self.assertEqual(update.call_count, 1)
 
-    def test_assert_spec_info_not_none(self):
-        """Raises AssertionError when forward_batch.spec_info is None."""
-        backend = self._make_draft_backend(speculative_num_steps=4)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = None
-        with self.assertRaises(AssertionError):
-            backend.common_template(forward_batch, MagicMock())
+        prefix_k, prefix_v = (
+            project(cached[indices])[0]
+            .view(prefix_tokens, heads, 256)
+            .split(128, dim=-1)
+        )
+        prefix_k = torch.cat(
+            (prefix_k, cached_rope[indices].flatten(0, 1).expand(-1, heads, -1)),
+            dim=-1,
+        )
+        expected = torch.zeros(tokens + padding, heads, 128, dtype=dtype)
+        q_start = prefix_start = 0
+        for q_len, prefix_len in zip(query_lens, prefix_lens):
+            q_end, prefix_end = q_start + q_len, prefix_start + prefix_len
+            full_k = torch.cat((prefix_k[prefix_start:prefix_end], k[q_start:q_end]))
+            full_v = torch.cat((prefix_v[prefix_start:prefix_end], v[q_start:q_end]))
+            allowed = torch.arange(prefix_len + q_len)[None, :] <= (
+                prefix_len + torch.arange(q_len)[:, None]
+            )
+            expected[q_start:q_end] = (
+                torch.nn.functional.scaled_dot_product_attention(
+                    q[q_start:q_end].float().transpose(0, 1),
+                    full_k.float().transpose(0, 1),
+                    full_v.float().transpose(0, 1),
+                    attn_mask=allowed,
+                    scale=layer.scaling,
+                )
+                .transpose(0, 1)
+                .to(dtype)
+            )
+            q_start, prefix_start = q_end, prefix_end
+        self.assertEqual(actual.dtype, dtype)
+        self.assertTrue(torch.isfinite(actual).all())
+        torch.testing.assert_close(actual, expected, atol=0.02, rtol=0.02)
+        self.assertEqual(torch.count_nonzero(actual[tokens:]).item(), 0)
 
-    def test_passes_same_forward_batch(self):
-        backend = self._make_draft_backend(speculative_num_steps=3)
-        forward_batch = MagicMock()
-        forward_batch.spec_info = MagicMock()
-        call_fn = MagicMock()
-        backend.common_template(forward_batch, call_fn)
-        for call in call_fn.call_args_list:
-            self.assertIs(call.args[1], forward_batch)
+    def test_prefix_matches_dense_attention(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for queries, prefixes, padding, heads in (
+                ([3, 1, 2], [0, 5, 2], 3, 4),
+                ([2, 4, 1], [5, 0, 0], 0, 2),
+                ([1, 1], [2, 3], 2, 4),
+                ([4], [7], 0, 2),
+            ):
+                with self.subTest(dtype=dtype, queries=queries, prefixes=prefixes):
+                    self._check_prefix(queries, prefixes, dtype, padding, heads)
+
+    def test_large_logits_merge_stably(self):
+        self._check_prefix([3, 2], [4, 7], torch.bfloat16, 1, 4, magnitude=8)
+
+    def test_prefix_ignores_fia_flag(self):
+        for dtype in (torch.float16, torch.bfloat16):
+            for use_fia in (False, True):
+                with self.subTest(dtype=dtype, use_fia=use_fia):
+                    self._check_prefix(
+                        [3, 1, 2], [0, 5, 2], dtype, 3, 4, use_fia=use_fia
+                    )
 
 
 if __name__ == "__main__":

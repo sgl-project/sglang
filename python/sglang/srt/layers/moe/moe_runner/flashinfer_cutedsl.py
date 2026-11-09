@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import (
     cutedsl_moe_max_num_tokens,
     get_parallel,
 )
-from sglang.srt.utils.common import log_info_on_rank0, print_warning_once
+from sglang.srt.utils.log_utils import log_info_on_rank0, print_warning_once
 
 if TYPE_CHECKING:
     from sglang.srt.batch_overlap.single_batch_overlap import DownGemmOverlapArgs
@@ -228,13 +228,14 @@ def resolve_cutedsl_standard_scales(
 
 
 def _cutedsl_wrapper_activation_type(activation: str, activation_type_cls: Any) -> Any:
-    if activation == "silu":
+    # FlashInfer selects SiTU as the gated Swiglu path plus situ_beta.
+    if activation in ("silu", "situ"):
         return activation_type_cls.Swiglu
     if activation == "relu2":
         return activation_type_cls.Relu2
     raise ValueError(
-        f"CuteDSL MoE wrapper supports 'silu' (gated) or 'relu2' (non-gated) "
-        f"activation, got {activation!r}."
+        f"CuteDSL MoE wrapper supports 'silu'/'situ' (gated) or 'relu2' "
+        f"(non-gated) activation, got {activation!r}."
     )
 
 
@@ -340,15 +341,22 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
         # A2A path: bounded by the dispatcher's own workspace limit.
         max_num_tokens = dispatcher.max_num_tokens * getattr(dispatcher, "ep_size", 1)
     else:
-        # Standard allgather path: the MoE sees up to dp_size local forwards
-        # gathered together, so scale the per-rank forward bound by dp_size.
-        max_num_tokens = get_parallel().dp_size * cutedsl_moe_max_num_tokens()
+        # Standard allgather path: the MoE sees up to num_dp_ranks local forwards
+        # gathered together, so scale the per-rank forward bound by num_dp_ranks.
+        max_num_tokens = get_parallel().num_dp_ranks * cutedsl_moe_max_num_tokens()
     top_k = layer.top_k if layer.top_k is not None else layer.moe_runner_config.top_k
     # inference_mode(False) ensures the wrapper's pre-allocated CUDA-graph
     # buffers are normal tensors.  This call typically happens inside
     # _dummy_run which runs under inference_mode(); inference tensors cannot
     # be inplace-updated during later CUDA graph capture (which runs outside
     # inference_mode), so we must opt out here.
+    situ_kwargs = {}
+    if layer.moe_runner_config.activation == "situ":
+        # SiTU's beta / linear beta, applied in the GEMM1 epilogue.
+        situ_kwargs = dict(
+            situ_beta=layer.moe_runner_config.gemm1_alpha,
+            situ_linear_beta=layer.moe_runner_config.gemm1_clamp_limit,
+        )
     with torch.inference_mode(False):
         layer._cutedsl_wrapper = CuteDslMoEWrapper(
             num_experts=layer.num_experts,
@@ -366,6 +374,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            **situ_kwargs,
         )
 
         w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
@@ -447,9 +456,10 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
 
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
@@ -527,18 +537,23 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     from sglang.srt.layers.moe.token_dispatcher.flashinfer import (
         FlashinferCombineInput,
     )
-    from sglang.srt.layers.moe.token_dispatcher.standard import (
-        StandardCombineInput,
-        StandardDispatchOutput,
-    )
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
     from sglang.srt.layers.moe.topk import TopKOutputChecker
     from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
+    # Eager prefill uses all-gather, including idle ranks in a prefill batch.
+    # Preserve the standard combine format so the dispatcher reduce-scatters it.
+    if isinstance(dispatch_output, StandardDispatchOutput):
+        return fused_experts_none_to_flashinfer_cutedsl_fp4(
+            dispatch_output, quant_info, runner_config
+        )
+
     assert runner_config.activation in (
         "silu",
+        "situ",
         "relu2",
     ), (
-        f"CuteDSL MoE supports 'silu' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
+        f"CuteDSL MoE supports 'silu'/'situ' (gated) or 'relu2' (non-gated), got {runner_config.activation!r}."
     )
     assert quant_info.wrapper is not None, "CuteDSL v2 path requires CuteDslMoEWrapper."
 
@@ -608,9 +623,6 @@ def fused_experts_flashinfer_to_flashinfer_cutedsl_fp4(
     )
 
     # Note: output contains routed expert results; shared_expert is handled separately
-
-    if isinstance(dispatch_output, StandardDispatchOutput):
-        return StandardCombineInput(hidden_states=output)
 
     # Write into pre-allocated workspace buffer if available
     if dispatch_output.moe_output is not None:

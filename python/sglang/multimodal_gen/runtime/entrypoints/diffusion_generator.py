@@ -15,10 +15,8 @@ import time
 from contextlib import ExitStack
 from typing import Any, List, Optional, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -28,19 +26,29 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
-    expand_request_outputs,
     format_lora_message,
+    map_request_outputs,
     prepare_request,
     save_outputs,
 )
-from sglang.multimodal_gen.runtime.launch_server import launch_server
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    select_output_rollout_trajectory,
+)
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
     should_run_explicit_client_warmup,
+)
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    DiffusionRuntimeError,
+    is_unrecoverable_device_error,
 )
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     GREEN,
@@ -56,15 +64,6 @@ from sglang.multimodal_gen.runtime.utils.trace_wrapper import (
 )
 
 logger = init_logger(__name__)
-
-try:
-    # Set the start method to 'spawn' to avoid CUDA errors in forked processes.
-    # This must be done at the top level of the module, before any CUDA context
-    # or other processes are initialized.
-    mp.set_start_method("spawn", force=True)
-except RuntimeError:
-    # The start method can only be set once per program execution.
-    pass
 
 
 def _replace_sampling_params_for_prompt(
@@ -119,11 +118,11 @@ class DiffGenerator:
             server_args: The inference arguments
         """
         self.server_args = server_args
-        self.port_args = PortArgs.from_server_args(server_args)
 
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None
         self.owns_scheduler_client: bool = False
+        self._runtime_error: str | None = None
 
     @classmethod
     def from_pretrained(
@@ -136,6 +135,10 @@ class DiffGenerator:
 
         Priority level: Default pipeline config < User's pipeline config < User's kwargs
         """
+        # Not shared with from_server_args: the ServerArgs built below runs
+        # Platform.apply_server_args_defaults, which hooks must precede.
+        apply_plugin_hooks()
+
         # If users also provide some kwargs, it will override the ServerArgs and PipelineConfig.
 
         if (server_args := kwargs.get("server_args", None)) is not None:
@@ -146,7 +149,7 @@ class DiffGenerator:
         else:
             server_args = ServerArgs.from_kwargs(**kwargs)
 
-        return cls.from_server_args(server_args, local_mode=local_mode)
+        return cls._create(server_args, local_mode=local_mode)
 
     @classmethod
     def from_server_args(
@@ -160,6 +163,16 @@ class DiffGenerator:
 
         Returns:
             The created DiffGenerator
+        """
+        apply_plugin_hooks()
+        return cls._create(server_args, local_mode=local_mode)
+
+    @classmethod
+    def _create(cls, server_args: ServerArgs, *, local_mode: bool) -> "DiffGenerator":
+        """Build and connect a generator, assuming hooks are already applied.
+
+        Each public constructor owns that step itself, so this shared body must
+        not repeat it.
         """
         globally_suppress_loggers()
         instance = cls(
@@ -183,6 +196,9 @@ class DiffGenerator:
         self,
     ) -> list[mp.Process]:
         """Check if a local server is running; if not, start it and return the process handles."""
+        # Not module scope: launch_server pulls in the whole worker graph.
+        from sglang.multimodal_gen.runtime.launch_server import launch_server
+
         # First, we need a client to test the server. Initialize it temporarily.
         sync_scheduler_client.initialize(self.server_args)
 
@@ -194,7 +210,9 @@ class DiffGenerator:
         if not should_run_explicit_client_warmup(self.server_args):
             return
 
-        run_sync_client_warmup(self.server_args, sync_scheduler_client.forward)
+        run_sync_client_warmup(
+            self.server_args, self._send_to_scheduler_and_wait_for_response
+        )
 
     def _check_remote_scheduler(self):
         """Check if the remote scheduler is accessible."""
@@ -234,9 +252,13 @@ class DiffGenerator:
     ) -> GenerationResult | list[GenerationResult] | None:
         """Generate image(s)/video(s) based on the given prompt(s).
 
-        Returns a single GenerationResult for a single prompt, a list for
-        multiple prompts, or None when every request failed.
+        Returns one GenerationResult per final sample, including each layer
+        of a layered image. Returns a single result without a list wrapper,
+        or None when every request failed with a recoverable error. Raises
+        DiffusionRuntimeError when a device failure or a dead local worker
+        requires recreating the generator.
         """
+        self._raise_if_unavailable()
         # 1. prepare requests
         prompts = self._resolve_prompts(
             sampling_params_kwargs.get("prompt"),
@@ -306,8 +328,10 @@ class DiffGenerator:
         total_start_time = time.perf_counter()
         global_output_index = 0
 
-        for requests in request_groups:
+        for group_index, requests in enumerate(request_groups):
+            output_requests = []
             try:
+                output_requests = map_request_outputs(requests)
                 timer_prompt = [req.prompt for req in requests]
                 logger.info("Processing %d grouped request(s)", len(requests))
                 with ExitStack() as stack:
@@ -332,10 +356,11 @@ class DiffGenerator:
                     if requests[0].save_output and requests[0].return_file_paths_only:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
-                            len(output_file_paths), len(requests)
+                            len(output_file_paths), len(output_requests)
                         )
                         for idx, path in enumerate(output_file_paths):
-                            req = requests[idx]
+                            output_request = output_requests[idx]
+                            req = output_request.request
                             if req.data_type == DataType.VIDEO:
                                 req.sampling_params.validate_video_final_outputs(
                                     [path], req
@@ -343,7 +368,10 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=path,
@@ -352,14 +380,18 @@ class DiffGenerator:
                     elif requests[0].data_type == DataType.MESH:
                         output_file_paths = output_batch.output_file_paths or []
                         self._validate_output_count(
-                            len(output_file_paths), len(requests)
+                            len(output_file_paths), len(output_requests)
                         )
                         for idx, sample in enumerate(output_file_paths):
-                            req = requests[idx]
+                            output_request = output_requests[idx]
+                            req = output_request.request
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     prompt_index=global_output_index + idx,
                                     output_file_path=sample,
@@ -367,7 +399,7 @@ class DiffGenerator:
                             )
                     else:
                         self._validate_output_count(
-                            len(output_batch.output), len(requests)
+                            len(output_batch.output), len(output_requests)
                         )
                         samples_out: list[Any] = []
                         audios_out: list[Any] = []
@@ -375,15 +407,20 @@ class DiffGenerator:
                         save_outputs(
                             output_batch.output,
                             requests[0].data_type,
-                            requests[0].fps,
+                            (
+                                output_batch.fps
+                                if output_batch.fps is not None
+                                else requests[0].fps
+                            ),
                             requests[0].save_output,
-                            lambda idx: requests[idx].output_file_path(1, 0),
+                            lambda idx: output_requests[idx].output_file_path(),
                             audio=output_batch.audio,
                             audio_sample_rate=output_batch.audio_sample_rate,
                             samples_out=samples_out,
                             audios_out=audios_out,
                             frames_out=frames_out,
                             output_compression=requests[0].output_compression,
+                            x264_preset=requests[0].x264_preset,
                             enable_frame_interpolation=requests[
                                 0
                             ].enable_frame_interpolation,
@@ -400,8 +437,9 @@ class DiffGenerator:
                         )
 
                         for idx in range(len(samples_out)):
-                            req = requests[idx]
-                            output_file_path = req.output_file_path(1, 0)
+                            output_request = output_requests[idx]
+                            req = output_request.request
+                            output_file_path = output_request.output_file_path()
                             if req.data_type == DataType.VIDEO and req.save_output:
                                 req.sampling_params.validate_video_final_outputs(
                                     [output_file_path], req
@@ -409,7 +447,10 @@ class DiffGenerator:
                             results.append(
                                 GenerationResult(
                                     **self._result_common(
-                                        req, output_batch, timer.duration, idx
+                                        req,
+                                        output_batch,
+                                        timer.duration,
+                                        output_request.request_index,
                                     ),
                                     samples=samples_out[idx],
                                     frames=frames_out[idx],
@@ -418,21 +459,19 @@ class DiffGenerator:
                                     output_file_path=output_file_path,
                                 )
                             )
+            except DiffusionRuntimeError:
+                self._cleanup_video_request_groups(request_groups[group_index + 1 :])
+                raise
             except Exception as e:
+                if is_unrecoverable_device_error(e):
+                    self._cleanup_video_request_groups(
+                        request_groups[group_index + 1 :]
+                    )
+                    self._fail_runtime(e)
                 logger.error("Generation failed: %s", e, exc_info=True)
             finally:
-                if requests and requests[0].data_type == DataType.VIDEO:
-                    try:
-                        # Pre-queue resources are shared by the shallow
-                        # per-output Req copies, so one idempotent cleanup is
-                        # sufficient for the whole parent request.
-                        requests[0].sampling_params.cleanup_video_request(requests[0])
-                    except Exception:
-                        logger.warning(
-                            "Failed to clean up model-owned video request resources",
-                            exc_info=True,
-                        )
-                global_output_index += len(requests)
+                self._cleanup_video_request_groups([requests])
+                global_output_index += len(output_requests)
 
         total_gen_time = time.perf_counter() - total_start_time
         if self.server_args.batching_max_size > 1:
@@ -446,6 +485,19 @@ class DiffGenerator:
         if not results:
             return None
         return results[0] if len(results) == 1 else results
+
+    @staticmethod
+    def _cleanup_video_request_groups(request_groups: list[list[Req]]) -> None:
+        for requests in request_groups:
+            if requests and requests[0].data_type == DataType.VIDEO:
+                try:
+                    # Expanded outputs share the parent's pre-queue resources.
+                    requests[0].sampling_params.cleanup_video_request(requests[0])
+                except Exception:
+                    logger.warning(
+                        "Failed to clean up model-owned video request resources",
+                        exc_info=True,
+                    )
 
     def generate_action(
         self,
@@ -503,10 +555,17 @@ class DiffGenerator:
             return
         if self.server_args.warmup_mode != "off":
             total_duration_ms = results[0].metrics.get("total_duration_ms", 0)
-            logger.info(
-                f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
-                total_duration_ms / 1000.0,
-            )
+            if results[0].metrics.get("warmup_failed"):
+                logger.warning(
+                    "Warmup failed, so this request ran cold: %.2f seconds "
+                    "includes first-use cost and is not a warmed-up timing",
+                    total_duration_ms / 1000.0,
+                )
+            else:
+                logger.info(
+                    f"Warmed-up request processed in {GREEN}%.2f{RESET} seconds (with warmup excluded)",
+                    total_duration_ms / 1000.0,
+                )
 
         peak_memories = [r.peak_memory_mb for r in results if r.peak_memory_mb]
         if peak_memories:
@@ -540,9 +599,12 @@ class DiffGenerator:
             peak_memory_mb=output_batch.peak_memory_mb,
             metrics=metrics.to_dict() if metrics else {},
             action=output_batch.action_pred,
+            lidar=output_batch.lidar,
             trajectory_latents=output_batch.trajectory_latents,
             trajectory_timesteps=output_batch.trajectory_timesteps,
-            rollout_trajectory_data=output_batch.rollout_trajectory_data,
+            rollout_trajectory_data=select_output_rollout_trajectory(
+                output_batch.rollout_trajectory_data, output_index
+            ),
             trajectory_decoded=output_batch.trajectory_decoded,
         )
 
@@ -553,15 +615,59 @@ class DiffGenerator:
                 f"Expected {request_count} outputs, got {output_count} from scheduler"
             )
 
-    def _send_to_scheduler_and_wait_for_response(self, batch: list[Req]) -> OutputBatch:
-        """
-        Sends a request to the scheduler and waits for a response.
-        """
-        return sync_scheduler_client.forward(batch)
+    def _send_to_scheduler_and_wait_for_response(
+        self, batch: Any, *, replica: int | None = None
+    ) -> OutputBatch:
+        """Send a request without reusing a failed inference runtime."""
+        self._raise_if_unavailable()
+        forward_kwargs = {"replica": replica} if replica is not None else {}
+        try:
+            if self.local_scheduler_process:
+                self._check_worker_health()
+                output_batch = sync_scheduler_client.forward(
+                    batch,
+                    check_worker_health=self._check_worker_health,
+                    **forward_kwargs,
+                )
+            else:
+                output_batch = sync_scheduler_client.forward(batch, **forward_kwargs)
+            if output_batch.error and is_unrecoverable_device_error(output_batch.error):
+                raise DiffusionRuntimeError(output_batch.error)
+            return output_batch
+        except Exception as error:
+            if isinstance(
+                error, DiffusionRuntimeError
+            ) or is_unrecoverable_device_error(error):
+                self._fail_runtime(error)
+            raise
+
+    def _raise_if_unavailable(self) -> None:
+        error = getattr(self, "_runtime_error", None)
+        if error is not None:
+            raise DiffusionRuntimeError(error)
+
+    def _check_worker_health(self) -> None:
+        for process in self.local_scheduler_process or ():
+            if not process.is_alive():
+                raise DiffusionRuntimeError(
+                    f"Local diffusion worker {process.name} (pid={process.pid}) "
+                    f"exited with code {process.exitcode}; recreate the generator."
+                )
+
+    def _fail_runtime(self, error: BaseException) -> None:
+        self._runtime_error = str(error)
+        logger.error("Inference runtime failed; recreate the generator: %s", error)
+        try:
+            # Do not send ShutdownReq to a worker that cannot answer. This also
+            # only terminates processes owned by a local-mode generator.
+            self._force_shutdown_local_processes()
+        except Exception:
+            logger.exception("Failed to clean up the failed inference runtime")
+        raise DiffusionRuntimeError(self._runtime_error) from error
 
     # LoRA
     def _send_lora_request(self, req: Any, success_msg: str, failure_msg: str):
-        response = sync_scheduler_client.forward(req)
+        response = self._send_to_scheduler_and_wait_for_response(req)
         if response.error is None:
             logger.info(success_msg)
             return response
@@ -651,55 +757,6 @@ class DiffGenerator:
         )
         # _send_lora_request already raises on error, so output.error is always None here
         return output.output or {}
-
-    def _ensure_lora_state(
-        self,
-        lora_path: str | None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-    ) -> None:
-        """
-        Ensure the LoRA state matches the desired configuration.
-
-        Note: This method does not cache client-side state. The server handles
-        idempotent operations, so redundant calls are safe but may have minor overhead.
-        """
-        if lora_path is None:
-            # Unmerge all LoRA weights when no lora_path is provided
-            self.unmerge_lora_weights()
-            return
-
-        lora_nickname = lora_nickname or self.server_args.lora_nickname
-
-        # Set the LoRA adapter (server handles idempotent logic)
-        self.set_lora(lora_nickname, lora_path)
-
-        # Merge or unmerge based on the merge_lora flag
-        if merge_lora:
-            self.merge_lora_weights()
-        else:
-            self.unmerge_lora_weights()
-
-    def generate_with_lora(
-        self,
-        prompt: str | list[str] | None = None,
-        sampling_params: SamplingParams | None = None,
-        *,
-        lora_path: str | None = None,
-        lora_nickname: str | None = None,
-        merge_lora: bool = True,
-        **kwargs,
-    ):
-        self._ensure_lora_state(
-            lora_path=lora_path, lora_nickname=lora_nickname, merge_lora=merge_lora
-        )
-        return self.generate(
-            sampling_params_kwargs=dict(
-                prompt=prompt,
-                sampling_params=sampling_params,
-                **kwargs,
-            )
-        )
 
     def shutdown(self):
         """

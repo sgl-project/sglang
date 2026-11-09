@@ -22,7 +22,7 @@ from sglang.test.test_utils import (
     try_cached_model,
 )
 
-register_cuda_ci(est_time=624, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=472, stage="extra-b", runner_config="4-gpu-b200")
 
 MODEL = "deepseek-ai/DeepSeek-V4-Flash-0731"
 MTP_MODEL = "deepseek-ai/DeepSeek-V4-Flash"
@@ -32,50 +32,6 @@ DEEPEP_CONFIG = '{"normal_dispatch":{"num_sms":96},"normal_combine":{"num_sms":9
 _DEEPEP_ENV = {
     "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "1024",
 }
-
-
-class TestDSV4FlashFP4B200MTP(
-    SpecDecodingMixin,
-    BasicDecodeCorrectnessMixin,
-    GSM8KMixin,
-    CustomTestCase,
-):
-    """LowLatency recipe: TP=4, FP4 (mxfp4), EAGLE spec decoding."""
-
-    gsm8k_accuracy_thres = 0.93
-    accept_length_thres = 2.8
-    bs_1_speed_thres = 220
-
-    @classmethod
-    def setUpClass(cls):
-        cls.model = try_cached_model(MTP_MODEL)
-        cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.process = popen_launch_server(
-            cls.model,
-            cls.base_url,
-            timeout=SERVER_LAUNCH_TIMEOUT,
-            other_args=[
-                "--trust-remote-code",
-                "--tp",
-                "4",
-                "--speculative-algorithm",
-                "EAGLE",
-                "--speculative-num-steps",
-                "3",
-                "--speculative-eagle-topk",
-                "1",
-                "--speculative-num-draft-tokens",
-                "4",
-                "--chunked-prefill-size",
-                "4096",
-                "--disable-flashinfer-autotune",
-            ],
-        )
-
-    @classmethod
-    def tearDownClass(cls):
-        if hasattr(cls, "process") and cls.process:
-            kill_process_tree(cls.process.pid)
 
 
 class TestDSV4FlashFP4B200DSpark(
@@ -133,9 +89,8 @@ class TestDSV4FlashFP4NonSpecB200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--moe-a2a-backend",
                 "deepep",
                 "--deepep-config",
@@ -180,9 +135,8 @@ class TestDSV4FlashFP4BreakableCudaGraphB200(
                 "--trust-remote-code",
                 "--tp",
                 "4",
-                "--dp",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--enable-mixed-chunk",
                 "--cuda-graph-backend-prefill",
                 "breakable",

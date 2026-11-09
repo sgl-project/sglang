@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
-from sglang.kernels.ops.minicpm_sala import get_block_table
+from sglang.kernels.ops.attention.minicpm_sala import get_block_table
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     CompressionLevelMetadata,
     MiniCPMSparseMetadata,
@@ -639,7 +639,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
@@ -658,6 +658,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 logical_batch_size=forward_batch.batch_size,
                 kv_head_num=layer.tp_k_head_num,
                 is_prefill=True,
+                ver=self.flash_attn_backend.fa_impl_ver,
             )
         )
         page_table = metadata.base.page_table
@@ -772,7 +773,7 @@ class MiniCPMSparseBackend(AttentionBackend):
         if k is not None:
             assert v is not None
             if save_kv_cache:
-                self.token_to_kv_pool.set_kv_buffer(
+                self.kv_layers.layer(layer.layer_id).store(
                     layer,
                     forward_batch.out_cache_loc,
                     k,
@@ -791,6 +792,7 @@ class MiniCPMSparseBackend(AttentionBackend):
                 logical_batch_size=bs,
                 kv_head_num=layer.tp_k_head_num,
                 is_prefill=False,
+                ver=self.flash_attn_backend.fa_impl_ver,
             )
         )
         key_cache, value_cache = self.flash_attn_backend.get_paged_mha_kv_cache(

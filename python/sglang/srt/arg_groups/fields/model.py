@@ -1,11 +1,4 @@
-"""Config fields of the ``model`` namespace.
-
-One class per namespace. The class *is* the namespace: a field declared here
-lands in the ``model`` bag, which is what ``get_model()`` returns, so a reader
-spells it exactly as before. ``ServerArgs`` composes these classes, so the
-record stays one flat object -- the split moves where declarations live, not
-how config is shaped at runtime.
-"""
+"""Config fields of the ``model`` namespace."""
 
 from __future__ import annotations
 
@@ -23,16 +16,14 @@ from sglang.srt.arg_groups.arg_utils import (
     A,
     Arg,
     Derived,
+    json_list_type,
+    nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
-from sglang.srt.utils.common import (
-    human_readable_int,
-    json_list_type,
-    nullable_str,
-)
+from sglang.srt.utils.common import human_readable_int
 
 
 class Model(msgspec.Struct):
@@ -44,6 +35,12 @@ class Model(msgspec.Struct):
     is_startup_weight_load_overlap = Derived(
         fn="sglang.srt.arg_groups.model_override_base.startup_weight_load_overlap_of",
         doc="Whether weight loading overlaps startup.",
+    )
+
+    # Runtime-only binding: loaders/runners scope the immutable model-owned value.
+    shared_experts = Derived(
+        fn="sglang.srt.configs.shared_experts.default_shared_experts_config",
+        doc="Shared-expert layout of the model being constructed or executed.",
     )
 
     # -------------------------------------------------------------------------
@@ -65,6 +62,8 @@ class Model(msgspec.Struct):
             "is not available. "
             '"pt" will load the weights in the pytorch bin format. '
             '"safetensors" will load the weights in the safetensors format. '
+            '"instanttensor" will load Safetensors weights using '
+            "InstantTensor's high-performance distributed loader. "
             '"npcache" will load the weights in pytorch format and store '
             "a numpy cache to speed up the loading. "
             '"dummy" will initialize the weights with random values, '
@@ -214,9 +213,19 @@ class Model(msgspec.Struct):
                 "bfloat16",
                 "nvfp4",
                 "fp4_mx_block16",
-                "fp4_e2m1",
             ],
             resolvable=True,
+        ),
+    ] = "auto"
+    qsa_indexer_dtype: A[
+        str,
+        Arg(
+            help=(
+                "Storage dtype of the compressed QSA indexer cache and index query "
+                '(Qwen4-Exp). "fp8_e4m3" stores them as plain e4m3 and scores blocks '
+                "with fp8 GEMMs (CUDA SM90+). The main KV cache is unaffected."
+            ),
+            choices=["auto", "bfloat16", "fp8_e4m3"],
         ),
     ] = "auto"
     modelopt_quant: A[

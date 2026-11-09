@@ -1,7 +1,4 @@
-"""Config-time override declarations for glm4_moe.
-
-Architectures: Glm4MoeForCausalLM.
-"""
+"""Config-time override declarations for glm4_moe."""
 
 import logging
 from typing import Any, Dict

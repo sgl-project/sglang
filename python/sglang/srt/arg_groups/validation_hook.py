@@ -6,23 +6,274 @@ from __future__ import annotations
 import json
 import logging
 import os
-from typing import Any, Dict, List, Optional
+from typing import Any, Collection, Dict, List, Optional
 
+from sglang.srt.arg_groups.arg_utils import (
+    _field_default,
+    _field_to_cli_name,
+    record_fields,
+)
+from sglang.srt.arg_groups.choices import BUILT_IN_SAMPLING_BACKENDS
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.arg_groups.overrides import (
     _hisparse_validation,
-    resolved_view,
-    resolving_view,
+    declare_resolution,
     run_post_process_pass,
 )
+from sglang.srt.configs.unlimited_ocr_v2 import UocrDocumentConfig
 from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import torch_release
+from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.sampling.watermarking.config import (
+    MAX_WATERMARK_CONTEXT_WINDOW,
+    parse_watermark_key,
+)
 from sglang.srt.utils.runai_utils import is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
+
+
+def check_watermark_server_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is not None and not cfg.enable_watermark:
+        raise ValueError("--watermark-config requires --enable-watermark")
+
+    if not cfg.enable_watermark:
+        return
+
+    if cfg.device != "cuda":
+        raise ValueError(
+            f"--enable-watermark requires --device cuda, got {cfg.device!r}"
+        )
+    if cfg.watermark_key is not None:
+        parse_watermark_key(cfg.watermark_key)
+    if cfg.watermark_key_b is not None:
+        parse_watermark_key(cfg.watermark_key_b)
+    if (
+        isinstance(cfg.watermark_context_window, bool)
+        or not isinstance(cfg.watermark_context_window, int)
+        or not 1 <= cfg.watermark_context_window <= MAX_WATERMARK_CONTEXT_WINDOW
+    ):
+        raise ValueError("watermark context_window must be an integer from 1 to 64")
+    if cfg.watermark_key_b is not None and cfg.watermark_key is None:
+        raise ValueError("watermark key_b requires a server key")
+    if not 0 < cfg.watermark_mixing_probability < 1:
+        raise ValueError(
+            "watermark mixing_probability must be strictly between 0 and 1"
+        )
+    if cfg.watermark_key_b is None and cfg.watermark_mixing_probability != 0.5:
+        raise ValueError("watermark mixing_probability requires key_b")
+    if not 0 < cfg.watermark_max_probability <= 1:
+        raise ValueError(
+            "watermark max_probability must be greater than 0 and at most 1"
+        )
+    if (
+        cfg.watermark_default_enabled or cfg.watermark_enforce_all
+    ) and cfg.watermark_key is None:
+        raise ValueError(
+            "watermark default_enabled and enforce_all require a server key"
+        )
+    if cfg.enable_custom_logit_processor:
+        raise ValueError(
+            "--enable-watermark is incompatible with --enable-custom-logit-processor"
+        )
+    if (
+        cfg.sampling_backend is not None
+        and cfg.sampling_backend not in BUILT_IN_SAMPLING_BACKENDS
+    ):
+        raise ValueError(
+            "--enable-watermark does not support custom sampling backends; "
+            f"got --sampling-backend {cfg.sampling_backend!r}"
+        )
+    if cfg.dllm_algorithm is not None:
+        raise ValueError("--enable-watermark is not supported with diffusion LLM")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("--enable-watermark is not supported with PD disaggregation")
+    if cfg.speculative_algorithm not in {None, "NGRAM", "EAGLE", "EAGLE3", "DSPARK"}:
+        raise ValueError(
+            "--enable-watermark supports speculative algorithms NGRAM, EAGLE, "
+            f"EAGLE3, and DSPARK, got {cfg.speculative_algorithm!r}"
+        )
+    if cfg.pp_size > 1 and cfg.speculative_algorithm is not None:
+        raise ValueError(
+            "--enable-watermark is not supported with pipeline-parallel "
+            "speculative decoding"
+        )
+    if cfg.speculative_use_rejection_sampling:
+        raise ValueError(
+            "--enable-watermark is incompatible with "
+            "--speculative-use-rejection-sampling"
+        )
+    if envs.SGLANG_RUST_SERVER.get():
+        raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
+
+
+# Server arguments Rust-server mode (SGLANG_RUST_SERVER=1) does not honor, or
+# honors only in part: the Rust server reads only what
+# `rust_server/config.py::_build_server_args` passes, and these act in the
+# Python frontend (with `--enable-trace`, its request spans; the scheduler's
+# own spans alone would be an incomplete trace).
+RUST_SERVER_UNSUPPORTED_ARGS = (
+    "ssl_keyfile",
+    "ssl_certfile",
+    "ssl_ca_certs",
+    "ssl_keyfile_password",
+    "enable_ssl_refresh",
+    "allowed_media_domains",
+    # The Rust media fetcher caps a download at this field's default, 64 MiB.
+    "media_url_max_file_size_mb",
+    "enable_trace",
+    "warmups",
+    "completion_template",
+    "hf_chat_template_name",
+    "enable_custom_logit_processor",
+    "enable_return_routed_experts",
+    "enable_lora",
+    "lora_paths",
+    "tokenizer_mode",
+    "tokenizer_backend",
+    # Python warns on long GCs only when this is positive.
+    "gc_warning_threshold_secs",
+    "tokenizer_metrics_allowed_custom_labels",
+    # The Rust listener speaks HTTP/1 only.
+    "enable_http2",
+    # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
+    # Python's changes the pad values of the items it serves. A model package
+    # whose Rust server caches honors it (`rust_server_unsupported_args`).
+    "mm_preprocess_cache_size_mb",
+    # The Rust server has no encoder dispatch.
+    "language_only",
+    # The Rust listener reports ready without waiting for weight updates.
+    "checkpoint_engine_wait_weights_before_ready",
+    "delete_ckpt_after_loading",
+    # Chat responses would lack the server-default sglext token ids.
+    "return_input_ids",
+    "return_output_ids",
+)
+
+
+def rust_server_unsupported_args(
+    server_args: Any, honored: Collection[str] = ()
+) -> List[str]:
+    """The CLI names of the ``RUST_SERVER_UNSUPPORTED_ARGS`` that are set,
+    except those a model package's Rust server ``honored`` itself.
+
+    An argument counts as set when it differs from its default; where the
+    default is off (``None``, ``False`` or empty), any falsy value is off too.
+    A threshold Python disables when not positive is set only when positive.
+    """
+    cfg = resolving_view(server_args)
+    defaults = {
+        field.name: _field_default(field) for field in record_fields(type(server_args))
+    }
+    offending = []
+    for name in RUST_SERVER_UNSUPPORTED_ARGS:
+        if name in honored:
+            continue
+        value, default = getattr(cfg, name), defaults[name]
+        if name == "gc_warning_threshold_secs":
+            is_set = value > 0
+        elif default is None or default is False or default == []:
+            is_set = bool(value)
+        else:
+            is_set = value != default
+        if is_set:
+            offending.append(_field_to_cli_name(name))
+    # The Rust chat route applies only each tool's own `strict`.
+    if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
+        offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    return offending
+
+
+def rust_server_refusal(offending: List[str], separator: str = ", ") -> ValueError:
+    """The startup error refusing the ``offending`` settings in Rust-server
+    mode."""
+    many = len(offending) > 1
+    return ValueError(
+        "Rust-server mode (SGLANG_RUST_SERVER=1) does not support "
+        f"{separator.join(offending)}: the Rust server would silently ignore "
+        f"{'these settings' if many else 'this setting'}. "
+        f"Remove {'them' if many else 'it'} or unset SGLANG_RUST_SERVER."
+    )
+
+
+def validate_rust_server_unsupported_args(server_args: Any) -> None:
+    """Refuse, in Rust-server mode, every argument the Rust server would ignore
+    (``rust_server_unsupported_args``)."""
+    if not envs.SGLANG_RUST_SERVER.get():
+        return
+    offending = rust_server_unsupported_args(server_args)
+    if offending:
+        raise rust_server_refusal(offending)
+
+
+def validate_response_store(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.enable_response_store and cfg.disaggregation_mode != "null":
+        raise ValueError(
+            "--enable-response-store is not supported with "
+            "--disaggregation-mode=prefill or decode; response storage must "
+            "remain disabled in PD mode."
+        )
+
+
+def validate_uocr_document_config(server_args: Any) -> None:
+    UocrDocumentConfig.from_args(resolving_view(server_args))
+
+
+def check_pipeline_parallel_compat(cfg: Any) -> None:
+    """Validate features used with pipeline parallelism."""
+    assert cfg.disable_overlap_schedule, (
+        "Pipeline parallelism is not compatible with overlap schedule"
+    )
+    if cfg.speculative_algorithm == "DSPARK":
+        assert cfg.disaggregation_mode == "prefill", (
+            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+        )
+        assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
+            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+        )
+    elif cfg.speculative_algorithm is not None:
+        assert (
+            cfg.speculative_algorithm.upper() == "EAGLE"
+            and not cfg.enable_multi_layer_eagle
+        ), (
+            "Pipeline parallelism currently only supports EAGLE "
+            "(non-multi-layer) speculative decoding"
+        )
+        if envs.SGLANG_ENABLE_PP_SPEC.get():
+            # The aggregate relay carries an EAGLE-shaped tree and only
+            # EAGLEWorkerV2 tail-drafts. PD prefill relays topk_p /
+            # topk_index / hidden states through RelayPayload; the gated
+            # flow replaces that relay with its own and does not carry
+            # those fields.
+            assert cfg.disaggregation_mode == "null", (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --disaggregation-mode"
+            )
+            # The PP relay slices spec results with the configured
+            # num_draft_tokens; adaptive spec changes it at runtime.
+            assert not cfg.speculative_adaptive, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with --speculative-adaptive"
+            )
+            # Every stage rebuilds the same verify input from the relayed
+            # per-request state, so all stages must see the same batch.
+            # DP attention partitions it per DP rank.
+            assert not attn_dp_enabled_of(cfg), (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
+                "(--attn-dp-size)"
+            )
+        else:
+            assert cfg.disaggregation_mode == "prefill", (
+                "PP + speculative decoding (MTP) is only supported on prefill nodes "
+                "(disaggregation-mode=prefill)"
+            )
+    assert cfg.min_free_slots_delay is None, (
+        "--min-free-slots-delay is not supported with pipeline "
+        "parallelism: allocatable slots per microbatch are bounded by "
+        "pp-max-micro-batch-size, so the threshold may never be reached"
+    )
 
 
 def check_server_args(server_args: Any):
@@ -50,37 +301,28 @@ def check_server_args(server_args: Any):
     )
 
     if cfg.pp_size > 1:
-        if get_platform().is_npu:
-            # NPU: allow PP + EAGLE speculative decoding
-            assert cfg.disable_overlap_schedule, (
-                "Pipeline parallelism is not compatible with overlap schedule"
-            )
-            if cfg.speculative_algorithm is not None:
-                assert (
-                    cfg.speculative_algorithm.upper() == "EAGLE"
-                    and not cfg.enable_multi_layer_eagle
-                ), (
-                    "Pipeline parallelism currently only supports EAGLE "
-                    "(non-multi-layer) speculative decoding"
-                )
-                assert cfg.disaggregation_mode == "prefill", (
-                    "NPU PP + speculative decoding (MTP) is only supported "
-                    "on prefill nodes (disaggregation-mode=prefill)"
-                )
-        else:
-            # Non-NPU: PP + speculative decoding is not supported
-            assert cfg.disable_overlap_schedule and cfg.speculative_algorithm is None, (
-                "Pipeline parallelism is not compatible with overlap schedule, speculative decoding"
-            )
-        assert cfg.min_free_slots_delay is None, (
-            "--min-free-slots-delay is not supported with pipeline "
-            "parallelism: allocatable slots per microbatch are bounded by "
-            "pp-max-micro-batch-size, so the threshold may never be reached"
-        )
+        check_pipeline_parallel_compat(cfg)
 
-    assert not (cfg.dp_size > 1 and cfg.nnodes != 1 and not cfg.enable_dp_attention), (
-        "multi-node data parallel is not supported unless dp attention!"
+    assert not (cfg.dp_size > 1 and cfg.nnodes != 1), (
+        "multi-node data-parallel replicas are not supported; use attention DP "
+        "(--attn-dp-size) across nodes"
     )
+
+    # Rust-mode prefill registers per-listener bootstrap rows only under attention DP;
+    # plain DP replicas all register with the --port listener.
+    if (
+        envs.SGLANG_RUST_SERVER.get()
+        and cfg.disaggregation_mode == "prefill"
+        and cfg.dp_size > 1
+        and not attn_dp_enabled_of(cfg)
+    ):
+        raise ValueError(
+            f"SGLANG_RUST_SERVER prefill does not support --dp-size {cfg.dp_size} "
+            "replicas: every replica registers its KV bootstrap rows with the "
+            "--port listener, so the other replicas' listeners advertise "
+            "registries that never become ready. Launch one prefill server per "
+            "replica, or unset SGLANG_RUST_SERVER."
+        )
 
     assert cfg.base_gpu_id >= 0, "base_gpu_id must be non-negative"
     assert cfg.gpu_id_step >= 1, "gpu_id_step must be positive"
@@ -125,31 +367,6 @@ def check_server_args(server_args: Any):
         assert cfg.chunked_prefill_size % cfg.page_size == 0, (
             "chunked_prefill_size must be divisible by page_size"
         )
-
-    # Check pdmux
-    if cfg.enable_pdmux:
-        assert cfg.pp_size == 1, (
-            "PD-Multiplexing is only supported with pipeline parallelism disabled (pp_size=1)."
-        )
-        assert cfg.chunked_prefill_size == -1, (
-            "PD-Multiplexing is not compatible with chunked prefill."
-        )
-        assert cfg.disaggregation_mode == "null", (
-            "PD-Multiplexing is not compatible with disaggregation mode."
-        )
-        assert cfg.disable_overlap_schedule, (
-            "PD-Multiplexing is not compatible with overlap schedule."
-        )
-
-        # NOTE: CUDA Green Context may encounter potential issues with CudaGraph on torch 2.7.x – 2.8.x, leading to performance degradation.
-        import torch
-
-        if torch_release >= (2, 7):
-            logger.warning(
-                "WARNING: PD-Multiplexing may experience performance degradation with torch versions > 2.6.x.\n"
-                f"  Current torch version is {torch.__version__}.\n"
-                "  Please manually install torch 2.6.x."
-            )
 
     assert cfg.tokenizer_worker_num > 0, "Tokenizer worker num must >= 1"
     assert cfg.detokenizer_worker_num > 0, "Detokenizer worker num must >= 1"
@@ -201,6 +418,26 @@ def check_server_args(server_args: Any):
             "MindSpore model impl is only supported on Ascend npu."
         )
 
+    # ROCm also uses PyTorch's "cuda" device type.
+    if cfg.load_format == "instanttensor" and cfg.device != "cuda":
+        raise ValueError(
+            "InstantTensor requires a CUDA-compatible device (including CUDA and ROCm); "
+            f"got {cfg.device!r}."
+        )
+
+    # Mooncake's custom memory pools (NVLINK, BAREX, INTRA_NODE_NVLINK) use CUDA
+    # allocators, which XPU lacks; MUSA and Ascend NPU have their own paths.
+    if cfg.device == "xpu":
+        from sglang.srt.disaggregation.mooncake.utils import (
+            check_mooncake_custom_mem_pool_enabled,
+        )
+
+        if check_mooncake_custom_mem_pool_enabled()[0]:
+            raise ValueError(
+                "SGLANG_MOONCAKE_CUSTOM_MEM_POOL is not supported on --device xpu; "
+                "unset it."
+            )
+
     # Check metrics labels
     if (
         not cfg.tokenizer_metrics_custom_labels_header
@@ -226,6 +463,8 @@ def check_server_args(server_args: Any):
     if cfg.enable_quant_communications and cfg.device != "npu":
         raise ValueError("Communications quantization is only supported for NPU device")
 
+    validate_device_sampling_backend(cfg.sampling_backend, cfg.device)
+
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
     if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
@@ -247,6 +486,8 @@ def check_server_args(server_args: Any):
         raise ValueError(
             "--kv-canary-sweep-interval requires --kv-canary in {log, raise}"
         )
+
+    check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
 
@@ -337,11 +578,23 @@ def check_load_publish_args(server_args: Any):
     _, reason = resolve_load_pub_range(
         kv_endpoint=cfg.endpoint,
         replay_endpoint=cfg.replay_endpoint,
-        dp_size=server_cfg.dp_size,
+        dp_size=num_dp_ranks_of(server_cfg),
         load_publish_endpoint=mode,
     )
     if reason:
         raise ValueError(reason)
+
+
+def validate_device_sampling_backend(
+    sampling_backend: Optional[str], device: str
+) -> None:
+    # sampler.py binds the intel_xpu kernels only under is_xpu(), so on another
+    # device the backend either aliases to flashinfer's names or NameErrors on
+    # the first non-greedy decode.
+    if sampling_backend == "intel_xpu" and device != "xpu":
+        raise ValueError(
+            f"--sampling-backend intel_xpu requires --device xpu, got --device {device}"
+        )
 
 
 def validate_ib_devices(device_str: Optional[str]) -> Optional[str]:
@@ -433,10 +686,104 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+def validate_mps_model_config(
+    model_config: Any,
+    *,
+    lora_enabled: bool = False,
+) -> None:
+    """Validate checkpoint-derived MPS constraints."""
+    quantization = getattr(model_config, "quantization", None)
+    if quantization not in (None, "unquant"):
+        raise ValueError(
+            "Torch MPS currently supports only unquantized model weights; "
+            "the resolved model configuration detected "
+            f"quantization={quantization!r}"
+        )
+    if bool(getattr(model_config, "is_multimodal", False)):
+        raise ValueError(
+            "Torch MPS multimodal serving does not yet have a model-specific "
+            "end-to-end contract; use a text-only model until its encoder, "
+            "processor, and decoder paths are validated on MPS"
+        )
+    if lora_enabled:
+        for config in (
+            getattr(model_config, "hf_text_config", None),
+            getattr(model_config, "hf_config", None),
+        ):
+            if config is None:
+                continue
+            for field_name in (
+                "num_experts",
+                "num_local_experts",
+                "n_routed_experts",
+            ):
+                value = getattr(config, field_name, None)
+                if value is not None and int(value) > 0:
+                    raise ValueError(
+                        "Torch MPS LoRA currently supports dense models only; "
+                        f"the model config declares {field_name}={value!r}"
+                    )
+
+
+def validate_standard_mps_server_args(server_args: Any):
+    """Validate execution modes supported by the Torch MPS path."""
+
+    cfg = resolving_view(server_args)
+    supported_attention_backends = {None, "torch_native"}
+    for field in (
+        "attention_backend",
+        "prefill_attention_backend",
+        "decode_attention_backend",
+    ):
+        value = getattr(cfg, field, None)
+        normalized = getattr(value, "value", value)
+        normalized = None if normalized is None else str(normalized).lower()
+        if normalized not in supported_attention_backends:
+            raise ValueError(
+                "The standard Torch MPS path currently supports only the "
+                f"torch_native attention backend; got {field}={value!r}"
+            )
+
+    sampling_backend = getattr(cfg, "sampling_backend", None)
+    normalized_sampling = getattr(sampling_backend, "value", sampling_backend)
+    normalized_sampling = (
+        None if normalized_sampling is None else str(normalized_sampling).lower()
+    )
+    if normalized_sampling not in {None, "pytorch"}:
+        raise ValueError(
+            "The standard Torch MPS path currently supports only the "
+            f"pytorch sampling backend; got sampling_backend={sampling_backend!r}"
+        )
+
+    if (
+        getattr(cfg, "tp_size", 1) != 1
+        or getattr(cfg, "pp_size", 1) != 1
+        or getattr(cfg, "dp_size", 1) != 1
+    ):
+        raise ValueError(
+            "The standard Torch MPS path requires tp_size=1, pp_size=1, and dp_size=1"
+        )
+
+
 def validate_prefill_decode_interval(server_args: Any):
     cfg = resolving_view(server_args)
-    if cfg.prefill_decode_interval < 0:
+    if cfg.prefill_decode_interval is not None and cfg.prefill_decode_interval < 0:
         raise ValueError("--prefill-decode-interval must be non-negative.")
+    if cfg.prefill_decode_interval_min_bs < 0:
+        raise ValueError("--prefill-decode-interval-min-bs must be non-negative.")
+
+
+def default_unset_prefill_decode_interval(server_args: Any):
+    """Leave Qwen3-VL Hopper free to pick 22; everyone else stays disabled."""
+    from sglang.srt.arg_groups.overrides import declare_resolution
+
+    cfg = resolving_view(server_args)
+    if cfg.prefill_decode_interval is None:
+        declare_resolution(
+            server_args,
+            "prefill_decode_interval_default",
+            prefill_decode_interval=0,
+        )
 
 
 def validate_sampling_mask_max_tokens(server_args: Any):
@@ -455,6 +802,68 @@ def validate_sampling_mask_max_tokens(server_args: Any):
         )
 
 
+_AUX_HIDDEN_STATE_CAPTURE_METHODS = ("EAGLE3", "DFLASH", "DSPARK")
+
+
+def handle_aux_hidden_state_capture(server_args: Any):
+    """--enable-return-aux-hidden-states: aux capture on a target without a draft.
+
+    Must run before anything reads speculative_algorithm: with the flag, that
+    argument only names the capture convention and is reset to None here, so
+    the speculative stack stays off.
+    """
+    cfg = resolving_view(server_args)
+    if not cfg.enable_return_aux_hidden_states:
+        if cfg.return_aux_hidden_state_layer_ids is not None:
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids requires "
+                "--enable-return-aux-hidden-states."
+            )
+        return
+    method = (cfg.speculative_algorithm or "").upper()
+    if method not in _AUX_HIDDEN_STATE_CAPTURE_METHODS:
+        raise ValueError(
+            "--enable-return-aux-hidden-states needs --speculative-algorithm "
+            "EAGLE3, DFLASH or DSPARK to name the capture convention, got "
+            f"{cfg.speculative_algorithm!r}."
+        )
+    if cfg.speculative_draft_model_path is not None:
+        raise ValueError(
+            "--enable-return-aux-hidden-states captures without a draft; drop "
+            "--speculative-draft-model-path."
+        )
+    if cfg.pp_size != 1:
+        raise ValueError(
+            "--enable-return-aux-hidden-states only supports pp_size == 1: the "
+            "capture hooks only see the layers on the last pipeline rank."
+        )
+    layer_ids = cfg.return_aux_hidden_state_layer_ids
+    if method != "EAGLE3" and not layer_ids:
+        raise ValueError(
+            f"--enable-return-aux-hidden-states with {method} requires "
+            "--return-aux-hidden-state-layer-ids."
+        )
+    if layer_ids is not None:
+        if len(layer_ids) == 0:
+            raise ValueError("--return-aux-hidden-state-layer-ids must not be empty.")
+        if any(layer_id < 0 for layer_id in layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must be non-negative, got "
+                f"{list(layer_ids)}."
+            )
+        if len(set(layer_ids)) != len(layer_ids):
+            raise ValueError(
+                "--return-aux-hidden-state-layer-ids must not repeat a layer, got "
+                f"{list(layer_ids)}."
+            )
+    declare_resolution(
+        server_args,
+        "_handle_aux_hidden_state_capture",
+        speculative_algorithm=None,
+        aux_hidden_state_capture=method.lower(),
+    )
+
+
 def check_two_batch_overlap(server_args: Any):
     # With no EP a2a backend, two-batch-overlap is only valid on the non-EP
     # DP TP-MoE path (overlapping the DP all_gatherv / reduce_scatterv with
@@ -465,10 +874,10 @@ def check_two_batch_overlap(server_args: Any):
     if (
         cfg.enable_two_batch_overlap
         and cfg.moe_a2a_backend == "none"
-        and not cfg.enable_dp_attention
+        and not attn_dp_enabled_of(cfg)
     ):
         raise ValueError(
             "When enabling two batch overlap without an EP a2a backend "
-            "(moe_a2a_backend='none'), --enable-dp-attention is required "
+            "(moe_a2a_backend='none'), attention DP (--attn-dp-size) is required "
             "(DeepSeek-V4 non-EP DP TBO path)."
         )

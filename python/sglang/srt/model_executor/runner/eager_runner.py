@@ -15,13 +15,15 @@
 
 from __future__ import annotations
 
-import contextlib
 import logging
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any, Tuple, Union
 
 import torch
 
+from sglang.kernels.ops.attention.kv_indices import (
+    create_chunked_prefix_cache_kv_indices,
+)
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.utils import (
@@ -31,30 +33,21 @@ from sglang.srt.layers.cp.utils import (
     is_cp_active,
     prepare_cp_forward,
 )
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size, require_mlp_sync
 from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import (
-    ForwardContext,
     forward_context,
+    get_forward_context,
     get_req_to_token_pool,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
-from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
-    enable_tc_piecewise_cuda_graph,
-    set_tc_piecewise_forward_context,
-)
-from sglang.srt.model_executor.runner_utils import (
+from sglang.srt.model_executor.runner_utils.shared_read_event import (
     maybe_publish_prefill_shared_read_done,
 )
 from sglang.srt.runtime_context import (
@@ -65,11 +58,7 @@ from sglang.srt.runtime_context import (
     max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import is_hip, is_npu
-from sglang.srt.utils.common import (
-    ceil_align,
-    get_eager_max_batch_size,
-    require_mlp_sync,
-)
+from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device_timer import device_timer_ctx
 
 logger = logging.getLogger(__name__)
@@ -82,7 +71,7 @@ if TYPE_CHECKING:
 
 
 class EagerRunner(BaseRunner):
-    def __init__(self, model_runner: ModelRunner) -> None:
+    def __init__(self, model_runner: ModelRunner, *, run_warmup: bool = True) -> None:
         super().__init__(model_runner)
         mr = model_runner
         sa = mr.server_args
@@ -150,10 +139,10 @@ class EagerRunner(BaseRunner):
             encoder_lens_dtype=(
                 torch.int64 if torch.device(mr.device).type == "cpu" else torch.int32
             ),
-            dp_size=get_parallel().dp_size,
         )
         # Eager has no capture step, so warm up here (run-once via mr._kernel_warmed_up).
-        self.warmup()
+        if run_warmup:
+            self.warmup()
 
     def _autotune_buffers(self) -> Tuple[Any, int]:
         """Decode-shaped dummy buffers (bs * num_tokens_per_req) for the warmup
@@ -213,33 +202,21 @@ class EagerRunner(BaseRunner):
     def execute(
         self, forward_batch: ForwardBatch, pp_proxy_tensors=None, **kwargs
     ) -> Any:
-        mode = forward_batch.forward_mode
-        if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
-            # A mixed batch is extend-shaped (decode tails are 1-token
-            # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
-            # kernel; CP keeps it to skip the zigzag split.
-            forward_batch.forward_mode = ForwardMode.EXTEND
-            mode = ForwardMode.EXTEND
-        if mode.is_decode():
-            return self._execute_decode(forward_batch, pp_proxy_tensors)
-        if mode.is_idle():
-            return self._execute_idle(forward_batch, pp_proxy_tensors)
-        if mode.is_extend(include_draft_extend_v2=True):
-            return self._execute_extend(forward_batch, pp_proxy_tensors)
-        raise ValueError(f"Invalid forward mode for eager runner: {mode}")
-
-    def _resolve_decode_pdmux(
-        self,
-    ) -> Tuple[Any, contextlib.AbstractContextManager]:
-        """Resolve the (attn_backend, forward_context) the eager decode forward
-        runs under. PDmux selects a per-stream backend and publishes it via an
-        active ForwardContext; non-pdmux uses attn_backend + the ambient ctx."""
-        model_runner = self.model_runner
-        if self.enable_pdmux:
-            return model_runner.decode_attn_backend, forward_context(
-                ForwardContext(attn_backend=model_runner.decode_attn_backend)
-            )
-        return model_runner.attn_backend, contextlib.nullcontext()
+        with self.model_context():
+            mode = forward_batch.forward_mode
+            if mode.is_mixed() and not is_npu() and get_cp_strategy() is None:
+                # A mixed batch is extend-shaped (decode tails are 1-token
+                # extends); run it as EXTEND. NPU keeps MIXED for its dedicated
+                # kernel; CP keeps it to skip the zigzag split.
+                forward_batch.forward_mode = ForwardMode.EXTEND
+                mode = ForwardMode.EXTEND
+            if mode.is_decode():
+                return self._execute_decode(forward_batch, pp_proxy_tensors)
+            if mode.is_idle():
+                return self._execute_idle(forward_batch, pp_proxy_tensors)
+            if mode.is_extend(include_draft_extend_v2=True):
+                return self._execute_extend(forward_batch, pp_proxy_tensors)
+            raise ValueError(f"Invalid forward mode for eager runner: {mode}")
 
     def _execute_decode(
         self,
@@ -247,22 +224,22 @@ class EagerRunner(BaseRunner):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         model_runner = self.model_runner
-        enable_pdmux = self.enable_pdmux
-        attn_backend, pdmux_ctx = self._resolve_decode_pdmux()
-        if not enable_pdmux:
-            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
         if forward_batch.needs_forward_metadata_init():
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
-            attn_backend.init_forward_metadata(forward_batch)
+            model_runner.attn_backend.init_forward_metadata(forward_batch)
         # FIXME: add pp_proxy_tensors arg to all models
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
 
         ctx = device_timer_ctx(model_runner.device_timer, "decode")
 
-        with ctx, pdmux_ctx:
+        with (
+            ctx,
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,
@@ -278,8 +255,7 @@ class EagerRunner(BaseRunner):
         model_runner = self.model_runner
         kwargs = model_runner._extend_forward_kwargs(forward_batch, pp_proxy_tensors)
 
-        if not self.enable_pdmux:
-            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+        forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
 
         cp_active = is_cp_active(forward_batch)
         if cp_active:
@@ -296,8 +272,12 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+            if (
+                get_parallel().attn_dcp_size > 1
+                and hasattr(
+                    model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+                )
+                and forward_batch.extend_prefix_lens is not None
             ):
                 # prepare kv cache buffer for dcp to gather kv cache
                 forward_batch.attn_dcp_metadata = (
@@ -320,13 +300,14 @@ class EagerRunner(BaseRunner):
                 # e.g. Moss-VL's prefill cross-attention custom mask.
                 model_runner.model.prepare_forward_batch(forward_batch)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
-            model_runner.attn_backend.prepare_prefill_shared_read_snapshot(
-                forward_batch,
-                num_qo_tokens=len(forward_batch.input_ids),
+            shared_read_ends = (
+                model_runner.attn_backend.resolve_prefill_shared_read_ends(
+                    forward_batch
+                )
             )
             maybe_publish_prefill_shared_read_done(
                 model_runner,
-                forward_batch,
+                shared_read_ends,
                 torch.get_device_module(model_runner.device),
             )
 
@@ -338,35 +319,17 @@ class EagerRunner(BaseRunner):
             if forward_batch.forward_mode.is_target_verify()
             else "extend"
         )
-        with device_timer_ctx(model_runner.device_timer, category):
-            pcg_runner = model_runner.prefill_cuda_graph_runner
-            if (
-                _is_hip
-                and pcg_runner is not None
-                and not isinstance(pcg_runner, EagerRunner)
-                and not cp_active
+        with (
+            device_timer_ctx(model_runner.device_timer, category),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
+            if cp_active and (
+                not get_parallel().enable_cp_tp_group_sharing
+                or getattr(model_runner.model, "prepare_cp_inputs", None) is not None
             ):
-                # HIP PCG eager fallback: enter the PCG context so Dynamo guards
-                # and PCG-specific MoE/attention paths stay consistent.
-                with (
-                    enable_tc_piecewise_cuda_graph(),
-                    set_tc_piecewise_forward_context(
-                        forward_batch,
-                        model_runner.attention_layers,
-                        getattr(model_runner.model, "quant_config", None),
-                        model_runner.moe_layers,
-                        model_runner.moe_fusions,
-                        dsa_indexers=model_runner.dsa_indexers,
-                        mha_companion_layers=model_runner.mha_companion_layers,
-                    ),
-                ):
-                    ret = model_runner.model.forward(
-                        forward_batch.input_ids,
-                        forward_batch.positions,
-                        forward_batch,
-                        **kwargs,
-                    )
-            elif cp_active:
+                # GLM and Kimi-K3 delegate their CP boundary to this runner via
+                # prepare_cp_inputs. Other group-sharing models keep owning the
+                # layout in forward().
                 ret = self._execute_extend_cp(forward_batch, kwargs)
             else:
                 ret = model_runner.model.forward(
@@ -385,35 +348,49 @@ class EagerRunner(BaseRunner):
         """
         model = self.model_runner.model
 
-        input_embeds = kwargs.get("input_embeds")
-        if input_embeds is None:
-            input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+        if prepare_inputs := getattr(model, "prepare_cp_inputs", None):
+            input_embeds, positions, model_kwargs = prepare_inputs(
+                forward_batch, **kwargs
+            )
+        else:
+            input_embeds = kwargs.get("input_embeds")
+            if input_embeds is None:
+                input_embeds = model.get_input_embeddings()(forward_batch.input_ids)
+            positions = forward_batch.positions
+            model_kwargs = {}
+            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
+                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
+
         with cp_shard_model_inputs(
             input_embeds,
-            forward_batch.positions,
+            positions,
             forward_batch,
             forward_batch.input_ids,
         ) as (sharded_input_embeds, sharded_positions, model_input_ids):
-            model_kwargs = {"input_embeds": sharded_input_embeds}
-            if (pp_proxy_tensors := kwargs.get("pp_proxy_tensors")) is not None:
-                model_kwargs["pp_proxy_tensors"] = pp_proxy_tensors
-            hidden_states = model.model(
+            model_kwargs["input_embeds"] = sharded_input_embeds
+            body = model.model
+            if hasattr(body, "logits_processor"):
+                # A multimodal wrapper exposes its causal LM as `.model`; run
+                # that LM's text body, as the gather/logits tail below does.
+                body = body.model
+            hidden_states = body(
                 model_input_ids,
                 sharded_positions,
                 forward_batch,
                 **model_kwargs,
             )
-        capture_aux_hidden_states = getattr(model, "capture_aux_hidden_states", False)
-        aux_hidden_states = None
-        if capture_aux_hidden_states:
-            hidden_states, aux_hidden_states = hidden_states
-
         if not model.pp_group.is_last_rank:
-            return (
-                (hidden_states, aux_hidden_states)
-                if capture_aux_hidden_states
-                else hidden_states
-            )
+            # A middle stage may return a PP proxy rather than a tuple.
+            return hidden_states
+
+        # A model with compact output rows must gather with its output layout and
+        # pass matching token indices and lengths to logits/aux-state consumers.
+        if postprocess_cp_output := getattr(model, "postprocess_cp_output", None):
+            return postprocess_cp_output(hidden_states, forward_batch)
+
+        aux_hidden_states = None
+        if getattr(model, "capture_aux_hidden_states", False):
+            hidden_states, aux_hidden_states = hidden_states
 
         stream = torch.cuda.current_stream()
         hidden_states = cp_gather_after_forward(hidden_states, forward_batch, stream)
@@ -452,14 +429,16 @@ class EagerRunner(BaseRunner):
         # Padded idle (DP-attn MLP sync) needs metadata reinit; unpadded must
         # drop stale forward_metadata to avoid an SWA use-after-free on req_pool.
         if forward_batch.batch_size > 0:
-            if not self.enable_pdmux:
-                forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
+            forward_batch = self.load_batch(forward_batch, pp_proxy_tensors)
             model_runner.attn_backend.init_forward_metadata(forward_batch)
         else:
             model_runner.attn_backend.forward_metadata = None
 
         kwargs = model_runner._pp_kwargs(pp_proxy_tensors)
-        with device_timer_ctx(model_runner.device_timer, "idle"):
+        with (
+            device_timer_ctx(model_runner.device_timer, "idle"),
+            forward_context(get_forward_context(), forward_batch=forward_batch),
+        ):
             return model_runner.model.forward(
                 forward_batch.input_ids,
                 forward_batch.positions,

@@ -3,8 +3,9 @@ gate, publish wiring, and the per-arch golden diffs for migrated families."""
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
+import contextlib
 import dataclasses
 import json
 import os
@@ -18,11 +19,12 @@ from unittest.mock import patch
 from sglang.srt.arg_groups import model_override_base as base_module
 from sglang.srt.arg_groups import overrides as overrides_module
 from sglang.srt.arg_groups.arg_utils import A, Arg, resolvable_fields
+from sglang.srt.arg_groups.model_override_base import register_model_override
 from sglang.srt.arg_groups.model_overrides import minicpm as minicpm_module
 from sglang.srt.arg_groups.model_overrides import qwen3_5 as qwen3_5_module
+from sglang.srt.arg_groups.model_overrides import qwen3_vl as qwen3_vl_module
 from sglang.srt.arg_groups.overrides import (
     collect_model_override_declarations,
-    register_model_override,
     resolution_result,
     validate_declarations,
 )
@@ -37,7 +39,19 @@ from sglang.srt.runtime_context import (
     reset_context,
 )
 from sglang.srt.server_args import _declared_default
+from sglang.srt.utils.device import is_confidential_compute
 from sglang.test.test_utils import CustomTestCase
+
+
+@contextlib.contextmanager
+def _confidential_compute(enabled: bool):
+    # is_confidential_compute is lru_cached, so clear it on both edges.
+    is_confidential_compute.cache_clear()
+    try:
+        with envs.SGLANG_FORCE_CONFIDENTIAL_COMPUTE.override(enabled):
+            yield
+    finally:
+        is_confidential_compute.cache_clear()
 
 
 @dataclasses.dataclass
@@ -46,6 +60,104 @@ class _FakeArgs:
     resolved_by_model: A[str, Arg(help="x", resolvable=True)] = "auto"
     also_resolved: A[Optional[int], Arg(help="y", resolvable=True)] = None
     metadata_but_not_overridable: A[bool, Arg(help="z")] = False
+
+
+class TestBoundaryParallelismResolution(CustomTestCase):
+    def config(self, **options):
+        return SimpleNamespace(
+            **dict(
+                dict(
+                    model_path="dummy",
+                    attn_cp_size=1,
+                    enable_prefill_cp=False,
+                    enable_attn_tp_input_scattered=False,
+                    moe_dp_size=1,
+                    cp_strategy=None,
+                    cp_kv_layout=None,
+                    enable_unified_memory=False,
+                    tp_size=4,
+                    dp_size=1,
+                    attn_dp_size=1,
+                    enable_aiter_allreduce_fusion=False,
+                ),
+                **options,
+            )
+        )
+
+    def test_input_scattered_is_resolved_only_for_forwards_without_the_scope(self):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        for model_type in (
+            "nemotron_h",
+            "nemotron_h_puzzle",
+            "longcat_flash",
+            "deepseek_v3",
+        ):
+            with self.subTest(model_type=model_type):
+                cfg = self.config(enable_attn_tp_input_scattered=True)
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy"),
+                ):
+                    handle_context_parallelism(cfg)
+                self.assertTrue(cfg.enable_attn_tp_input_scattered)
+                self.assertEqual(
+                    resolving_view(cfg).enable_attn_tp_input_scattered,
+                    model_type == "deepseek_v3",
+                )
+
+    def test_context_parallel_model_support(self):
+        from sglang.srt.arg_groups.parallel_hook import handle_context_parallelism
+
+        cases = (
+            ("nemotron_h", 2, False, "Nemotron-H.*--attn-cp-size"),
+            ("nemotron_h_puzzle", 2, True, "Nemotron-H.*--attn-cp-size"),
+            ("longcat_flash", 2, True, "LongCat-Flash.*--enable-prefill-cp"),
+            ("nemotron_h", 1, False, None),
+            ("longcat_flash", 1, True, None),
+            ("longcat_flash", 2, False, None),
+            ("deepseek_v3", 2, True, None),
+        )
+        for model_type, cp_size, prefill, error in cases:
+            with self.subTest(model_type=model_type, cp_size=cp_size, prefill=prefill):
+                cfg = self.config(
+                    attn_cp_size=cp_size,
+                    enable_prefill_cp=prefill,
+                    cp_strategy="interleave" if prefill else None,
+                )
+                model = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["TestModel"]),
+                    hf_text_config=SimpleNamespace(model_type=model_type),
+                )
+                with (
+                    patch("sglang.srt.arg_groups.parallel_hook.run_hook"),
+                    patch(
+                        "sglang.srt.arg_groups.parallel_hook.model_config_of",
+                        return_value=model,
+                    ),
+                    patch("sglang.srt.layers.cp.base.init_cp_strategy") as init_cp,
+                ):
+                    if error is not None:
+                        with self.assertRaisesRegex(ValueError, error):
+                            handle_context_parallelism(cfg)
+                        init_cp.assert_not_called()
+                    else:
+                        handle_context_parallelism(cfg)
+                        init_cp.assert_called_once_with(
+                            enable_prefill_cp=prefill,
+                            cp_size=cp_size,
+                            cp_strategy=cfg.cp_strategy,
+                            cp_kv_layout=None,
+                        )
 
 
 class TestModelOverridableWhitelist(CustomTestCase):
@@ -72,10 +184,14 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_hybrid_swa_memory",
                     "sampling_backend",
                     "attention_backend",
+                    "prefill_kv_cache_dequant_dtype",
                     "page_size",
                     "moe_runner_backend",
                     "quantization",
+                    "dp_size",
+                    "attn_dp_size",
                     "enable_dp_attention",
+                    "enable_attn_tp_input_scattered",
                     "enable_dp_lm_head",
                     "enable_tp_lm_head_all_to_all",
                     "moe_a2a_backend",
@@ -84,6 +200,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "attn_cp_size",
                     "dcp_comm_backend",
                     "dcp_replicate_q_proj",
+                    "enable_cp_tp_group_sharing",
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
@@ -97,20 +214,157 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "dsa_prefill_backend",
                     "dsa_decode_backend",
                     "dsv4_attn_backend",
+                    "enable_decoder_swa_bounded_replay",
                     "dsa_topk_backend",
+                    "enable_dsa_fused_indexer",
+                    "enable_fused_qk_norm_rope",
                     "prefill_attention_backend",
                     "decode_attention_backend",
                     "flashinfer_allreduce_fusion_backend",
                     "fp8_gemm_runner_backend",
                     "fp4_gemm_runner_backend",
                     "disable_custom_all_reduce",
+                    "boundary_reduction",
+                    "speculative_boundary_reduction",
                     "enable_aiter_allreduce_fusion",
+                    "disable_aiter_allreduce_fusion_in_prefill",
+                    "disable_aiter_allreduce_fusion_in_decode",
                     "enable_symm_mem",
                     "speculative_attention_mode",
                     "speculative_draft_attention_backend",
+                    "speculative_draft_kv_cache_dtype",
+                    "speculative_draft_model_quantization",
+                    "aux_hidden_state_capture",
+                    "watermark_context_window",
+                    "watermark_default_enabled",
+                    "watermark_enforce_all",
+                    "watermark_key",
+                    "watermark_key_b",
+                    "watermark_max_probability",
+                    "watermark_mixing_probability",
+                    "prefill_decode_interval",
+                    "radix_eviction_policy",
+                    "mm_preprocess_cache_size_mb",
+                    "mm_feature_transport",
+                    "mm_enable_dp_encoder",
                 }
             ),
         )
+
+
+class TestBoundaryReductionDefaults(CustomTestCase):
+    def test_defaults_wrappers_and_explicit_policies_reach_runtime(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.runtime_context import (
+            get_exec,
+            get_spec,
+            publish,
+            reset_context,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        cases = [
+            (SimpleNamespace(architectures=[architecture]), default)
+            for architecture, default in (
+                ("Qwen3ForCausalLM", "ar"),
+                ("Qwen3Model", "ar"),
+                ("KimiK3ForConditionalGeneration", "ar"),
+                ("KimiK3LinearForCausalLM", "ar"),
+                ("MossVLForConditionalGeneration", "ar"),
+                ("Qwen4ExpForConditionalGeneration", "ar"),
+                ("Qwen4ExpForCausalLMMTP", "ar"),
+                ("BailingMoELinearForCausalLM", "rsv"),
+                ("BailingMoeV2_5ForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLM", "rsv"),
+                ("LongcatFlashForCausalLMNextN", "rsv"),
+                ("Step3VLForConditionalGeneration", "rsv"),
+                ("MiMoV2ForCausalLM", "rs+rsv"),
+                ("Qwen3MoeForCausalLM", "rs+rsv"),
+                ("OtherModel", "rs+rsv"),
+            )
+        ]
+        for key in ("text_config", "llm_config"):
+            for backbone, expected in (("qwen3", "ar"), ("qwen3_moe", "rs+rsv")):
+                cases.append(
+                    (
+                        SimpleNamespace(**{key: SimpleNamespace(model_type=backbone)}),
+                        expected,
+                    )
+                )
+        cases.append(
+            (
+                SimpleNamespace(
+                    get_text_config=lambda: SimpleNamespace(model_type="qwen3")
+                ),
+                "ar",
+            )
+        )
+        for config, default in cases:
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                with self.subTest(config=config, requested=requested):
+                    reset_context()
+                    try:
+                        args = ServerArgs(
+                            model_path="local-model", boundary_reduction=requested
+                        )
+                        args._model_config = SimpleNamespace(hf_config=config)
+                        with patch(
+                            "sglang.srt.arg_groups.pipeline.run_resolution_pipeline",
+                            side_effect=lambda record: run_post_process_pass(
+                                record, resolve_boundary_reduction
+                            ),
+                        ):
+                            publish(args, role="test")
+                        expected = default if requested == "auto" else requested
+                        self.assertEqual(get_exec().comm.boundary_reduction, expected)
+                        self.assertEqual(
+                            get_spec().speculative_boundary_reduction, expected
+                        )
+                        self.assertEqual(args.boundary_reduction, requested)
+                    finally:
+                        reset_context()
+
+    def test_independent_draft_and_mtp_resolution(self):
+        from unittest.mock import patch
+
+        from sglang.srt.arg_groups.boundary_reduction import resolve_boundary_reduction
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+        from sglang.srt.arg_groups.overrides import run_post_process_pass
+        from sglang.srt.server_args import ServerArgs
+
+        for same_model in (False, True):
+            for requested in ("auto", "ar", "rs", "rsv", "rs+rsv"):
+                args = ServerArgs(
+                    model_path="target",
+                    boundary_reduction=requested,
+                    speculative_algorithm="EAGLE",
+                    speculative_draft_model_path="target" if same_model else "draft",
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=["MiMoV2ForCausalLM"])
+                )
+                with patch(
+                    "sglang.srt.hf_transformers.get_config",
+                    return_value=SimpleNamespace(model_type="qwen3"),
+                ) as load:
+                    run_post_process_pass(args, resolve_boundary_reduction)
+                resolved = resolving_view(args)
+                self.assertEqual(
+                    resolved.boundary_reduction,
+                    "rs+rsv" if requested == "auto" else requested,
+                )
+                self.assertEqual(
+                    resolved.speculative_boundary_reduction,
+                    ("rs+rsv" if same_model else "ar")
+                    if requested == "auto"
+                    else requested,
+                )
+                self.assertEqual(
+                    load.call_count, int(requested == "auto" and not same_model)
+                )
 
 
 class TestDSparkCheckpointConfig(CustomTestCase):
@@ -207,7 +461,9 @@ class TestModelOverrideRegistry(_IsolatedRegistry):
             collect_model_override_declarations("FakeForCausalLM", None, None)
 
     def test_predicate_keyed_provider(self):
-        from sglang.srt.arg_groups.overrides import register_model_override_predicate
+        from sglang.srt.arg_groups.model_override_base import (
+            register_model_override_predicate,
+        )
 
         @register_model_override("FakeStep9ForCausalLM")
         def _exact(server_args, hf_config):
@@ -232,7 +488,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
     """Pipeline skeleton: read-only view semantics + transition invocation."""
 
     def test_view_forwards_reads_and_rejects_writes(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
 
         live = SimpleNamespace(a=1, method=lambda: "m")
         view = ResolvedView(live)
@@ -244,7 +500,7 @@ class TestResolvedViewAndPasses(CustomTestCase):
             view.a = 3
 
     def test_view_overlay_wins(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
 
         view = ResolvedView(SimpleNamespace(a=1, b=2), overlay={"a": 10})
         self.assertEqual(view.a, 10)
@@ -370,7 +626,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         prefill_attention_backend=None,
         decode_attention_backend=None,
         disaggregation_mode="null",
-        enable_dp_attention=False,
+        attn_dp_size=1,
         enable_hierarchical_cache=False,
     ):
         args = SimpleNamespace(
@@ -378,7 +634,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=prefill_attention_backend,
             decode_attention_backend=decode_attention_backend,
             disaggregation_mode=disaggregation_mode,
-            enable_dp_attention=enable_dp_attention,
+            attn_dp_size=attn_dp_size,
+            ep_join_mode=None,
             enable_hierarchical_cache=enable_hierarchical_cache,
         )
         mixer_types = []
@@ -432,7 +689,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ):
                     self._minicpm_overrides(
                         architecture,
-                        enable_dp_attention=True,
+                        attn_dp_size=2,
                     )
 
     def test_minicpm_rejects_hierarchical_cache_for_hybrid_models(self):
@@ -466,7 +723,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             prefill_attention_backend=None,
             decode_attention_backend=None,
             disaggregation_mode="null",
-            enable_dp_attention=False,
+            attn_dp_size=1,
+            ep_join_mode=None,
             enable_hierarchical_cache=False,
         )
         config = SimpleNamespace(
@@ -586,6 +844,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         set_global_server_args_for_scheduler(server_args)
         return get_server_args()
 
+    def test_explicit_extra_buffer_without_mamba_state_fails_fast(self):
+        with self.assertRaisesRegex(ValueError, "needs mamba state"):
+            self._construct(
+                "LlamaForCausalLM", "llama", mamba_radix_cache_strategy="extra_buffer"
+            )
+
+    def test_explicit_extra_buffer_is_harmless_with_radix_cache_disabled(self):
+        sa = self._construct(
+            "LlamaForCausalLM",
+            "llama",
+            mamba_radix_cache_strategy="extra_buffer",
+            disable_radix_cache=True,
+        )
+        self.assertFalse(self._resolved(sa, "uses_mamba_radix_cache"))
+
+    def test_explicit_extra_buffer_accepts_predicate_registered_mamba_state(self):
+        from transformers import LlamaConfig
+
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        spec = registry.LinearAttnModelSpec(
+            config_class=LlamaConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: getattr(cfg, "linear_attn", False),
+            support_mamba_cache_extra_buffer=True,
+        )
+        with (
+            patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", [spec]),
+            override_platform(is_cuda=True),
+        ):
+            sa = self._construct(
+                "LlamaForCausalLM",
+                "llama",
+                config_extra={"linear_attn": True},
+                mamba_radix_cache_strategy="extra_buffer",
+            )
+        self.assertTrue(self._resolved(sa, "uses_mamba_radix_cache"))
+
     def test_mistral_large3_forces_bfloat16(self):
         sa = self._construct("MistralLarge3ForCausalLM", "mistral")
         self.assertEqual(
@@ -615,16 +911,38 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # value: readers only ever read flags.
         self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "auto")
 
-    def test_qwen4_rejects_pd_and_unified_memory(self):
+    def test_qwen4_pd_support_and_remaining_limits(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
-        for kwargs, message in (
-            ({"disaggregation_mode": "prefill"}, "PD disaggregation"),
-            ({"disaggregation_mode": "decode"}, "PD disaggregation"),
-            ({"enable_unified_memory": True}, "enable-unified-memory"),
-        ):
-            with self.subTest(**kwargs):
-                with self.assertRaisesRegex(ValueError, message):
-                    self._construct(*qwen4, **kwargs)
+        with override_platform(is_cuda=True):
+            for mode in ("prefill", "decode"):
+                with self.subTest(mode=mode):
+                    self._construct(*qwen4, disaggregation_mode=mode)
+
+            with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
+                self._construct(*qwen4, enable_unified_memory=True)
+            with self.assertRaisesRegex(ValueError, "MORI requires --pp-size 1"):
+                self._construct(
+                    *qwen4,
+                    disaggregation_mode="prefill",
+                    disaggregation_transfer_backend="mori",
+                    pp_size=2,
+                )
+
+    def test_qwen4_ple_file_requires_offload(self):
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        with override_platform(is_cuda=True):
+            sa = self._construct(
+                *qwen4,
+                ple_offload_embedding=True,
+                ple_offload_backend="file",
+                ple_offload_dir="/tmp/ple",
+            )
+            self.assertEqual(self._resolved(sa, "ple_offload_backend"), "file")
+            self.assertEqual(self._resolved(sa, "ple_offload_dir"), "/tmp/ple")
+            with self.assertRaisesRegex(ValueError, "requires --ple-offload-embedding"):
+                self._construct(
+                    *qwen4, ple_offload_embedding=False, ple_offload_backend="file"
+                )
 
     def test_qwen4_ple_offload_default(self):
         qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
@@ -649,6 +967,52 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertFalse(
                 self._resolved(self._construct(*qwen4), "ple_offload_embedding")
             )
+
+    def test_qwen4_fp8_indexer_dtype_platform_gate(self):
+        """fp8_e4m3 needs CUDA SM90/SM100 and a compressed QSA indexer. The bf16
+        spellings never consult the platform."""
+        qwen4 = ("Qwen4ExpForConditionalGeneration", "qwen4_exp")
+        compressed = {
+            "indexer_n_heads": 4,
+            "indexer_kv_heads": 1,
+            "indexer_head_dim": 128,
+            "indexer_budget": 2048,
+            "indexer_compress_ratio": 4,
+        }
+        with override_platform(is_cuda=True, is_sm100=True):
+            sa = self._construct(
+                *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+            )
+            self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), "fp8_e4m3")
+            # No compressed indexer fields: no QSA profile, nothing to store in fp8.
+            with self.assertRaisesRegex(ValueError, "compressed QSA indexer"):
+                self._construct(*qwen4, qsa_indexer_dtype="fp8_e4m3")
+        with override_platform(
+            is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+        ):
+            with self.assertRaisesRegex(ValueError, "SM90/SM100"):
+                self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype="fp8_e4m3"
+                )
+            for name in ("auto", "bfloat16"):
+                sa = self._construct(
+                    *qwen4, config_extra=compressed, qsa_indexer_dtype=name
+                )
+                self.assertEqual(self._resolved(sa, "qsa_indexer_dtype"), name)
+
+    def test_nemotron3_embedding_rejects_rocm(self):
+        """The ROCm default attention backend ignores ENCODER_ONLY layers, so
+        Nemotron-3-Embed must fail at startup there, not return causal embeddings."""
+        # The checkpoint is a bare Ministral3Model; ModelConfig renames it.
+        nemotron3 = ("Ministral3Model", "ministral3")
+        embedding_fields = {"is_causal": False, "pooling": "avg"}
+        with override_platform(is_cuda=True):
+            self._construct(*nemotron3, config_extra=embedding_fields)
+        with override_platform(is_cuda=False, is_hip=True):
+            with self.assertRaisesRegex(ValueError, "not supported on ROCm"):
+                self._construct(*nemotron3, config_extra=embedding_fields)
+            # Generative Ministral3 checkpoints are unaffected.
+            self._construct(*nemotron3)
 
     def test_minimax_m2_enables_tf32_matmul(self):
         sa = self._construct("MiniMaxM2ForCausalLM", "llama")
@@ -843,27 +1207,85 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
             self.assertEqual(_mimo_v2_overrides(_args(), None), {})
 
-    def test_mimo_v2_sm100_fp8_pins_flashinfer_trtllm_moe(self):
-        """Blackwell FP8 must not be left on the triton fused-MoE runner."""
+    def test_mimo_v2_sm100_defaults(self):
         from sglang.srt.arg_groups.model_overrides.mimo_v2 import _mimo_v2_overrides
 
         def _args(**kw):
-            defaults = dict(speculative_algorithm=None, moe_runner_backend="auto")
+            defaults = dict(
+                speculative_algorithm=None,
+                moe_runner_backend="auto",
+                moe_a2a_backend="none",
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                _model_config=SimpleNamespace(is_fp4_experts=False),
+            )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
 
         with override_platform(is_sm100=True):
             self.assertEqual(
                 _mimo_v2_overrides(_args(), _hf("fp8")),
-                {"moe_runner_backend": "flashinfer_trtllm"},
+                {"attention_backend": "fa4", "moe_runner_backend": "flashinfer_trtllm"},
+            )
+            # An all-to-all backend chooses its own runner (deepep_v2 accepts
+            # only deep_gemm), so the FP8 pin must not fire.
+            self.assertEqual(
+                _mimo_v2_overrides(_args(moe_a2a_backend="deepep_v2"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # An explicit user choice is never overwritten.
             self.assertEqual(
-                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")), {}
+                _mimo_v2_overrides(_args(moe_runner_backend="triton"), _hf("fp8")),
+                {"attention_backend": "fa4"},
             )
             # FP4 checkpoints run through flashinfer_mxfp4, so they must not be
             # pinned to flashinfer_trtllm.
-            self.assertEqual(_mimo_v2_overrides(_args(), _hf("mxfp4")), {})
+            self.assertEqual(
+                _mimo_v2_overrides(_args(), _hf("mxfp4")),
+                {"attention_backend": "fa4"},
+            )
+            for field in (
+                "attention_backend",
+                "prefill_attention_backend",
+                "decode_attention_backend",
+            ):
+                self.assertEqual(
+                    _mimo_v2_overrides(
+                        _args(moe_runner_backend="triton", **{field: "triton"}),
+                        _hf("fp8"),
+                    ),
+                    {},
+                )
+
+    def test_mimo_v2_sm100_mixed_mxfp4_selects_native_runner(self):
+        for architecture in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
+            for a2a_backend in ("none", "deepep"):
+                for runner in ("auto", "deep_gemm", "flashinfer_mxfp4"):
+                    with (
+                        self.subTest(
+                            architecture=architecture, a2a=a2a_backend, runner=runner
+                        ),
+                        override_platform(is_sm100=True),
+                    ):
+                        args = SimpleNamespace(
+                            speculative_algorithm=None,
+                            moe_runner_backend=runner,
+                            moe_a2a_backend=a2a_backend,
+                            _model_config=SimpleNamespace(is_fp4_experts=True),
+                            attention_backend=None,
+                            prefill_attention_backend=None,
+                            decode_attention_backend=None,
+                        )
+                        expected = {"attention_backend": "fa4"}
+                        if runner == "auto" and a2a_backend == "none":
+                            expected["moe_runner_backend"] = "flashinfer_mxfp4"
+                        self.assertEqual(
+                            collect_model_override_declarations(
+                                architecture, args, _hf("fp8")
+                            ),
+                            [("_mimo_v2_overrides", expected)],
+                        )
 
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
@@ -904,6 +1326,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=model_config,
             ),
             hf_config,
@@ -972,6 +1397,78 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     "attention_backend": "trtllm_mha",
                 },
             )
+
+    def test_nemotron_h_eplb_picks_routed_runner_on_sm100(self):
+        """flashinfer_trtllm cannot take the EPLB remap; with redundant experts it
+        fails its routing shape check at startup."""
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        for quantization in ("modelopt_fp4", "nvfp4_online"):
+            with self.subTest(quantization):
+                server_args, hf_config = self._nemotron_h_args(quantized_layers={})
+                server_args.enable_eplb = True
+                server_args.ep_num_redundant_experts = 32
+                if quantization == "nvfp4_online":
+                    server_args.quantization = quantization
+                    server_args._model_config.quantization = quantization
+
+                with (
+                    override_platform(is_sm100=True),
+                    override_platform(is_blackwell=True),
+                ):
+                    overrides = _nemotron_h_overrides(server_args, hf_config)
+
+                self.assertEqual(
+                    overrides["moe_runner_backend"], "flashinfer_trtllm_routed"
+                )
+
+    def test_nemotron_h_expert_remap_validation(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _validate_expert_remap,
+        )
+
+        def puzzle(*n_routed_experts):
+            return SimpleNamespace(
+                block_configs=[
+                    {"block_type": "moe", "n_routed_experts": n}
+                    for n in n_routed_experts
+                ]
+                + [{"block_type": "mamba"}]
+            )
+
+        def args(moe_runner_backend, moe_a2a_backend="none"):
+            return SimpleNamespace(
+                enable_eplb=True,
+                moe_runner_backend=moe_runner_backend,
+                moe_a2a_backend=moe_a2a_backend,
+            )
+
+        dense = ("NemotronHForCausalLM", SimpleNamespace())
+        rejected = {
+            "flashinfer_trtllm": (args("flashinfer_trtllm"), *dense),
+            "cutedsl_without_a2a": (args("flashinfer_cutedsl"), *dense),
+            "puzzle_mixed_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 128),
+            ),
+        }
+        accepted = {
+            "cutedsl_with_a2a": (args("flashinfer_cutedsl", "flashinfer"), *dense),
+            "puzzle_equal_expert_counts": (
+                args("flashinfer_trtllm_routed"),
+                "NemotronHPuzzleForCausalLM",
+                puzzle(64, 64),
+            ),
+        }
+        for name, (cfg, model_arch, hf_config) in rejected.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                _validate_expert_remap(cfg, hf_config, model_arch)
+        for name, (cfg, model_arch, hf_config) in accepted.items():
+            with self.subTest(name):
+                _validate_expert_remap(cfg, hf_config, model_arch)
 
     def test_nemotron_h_speculation_uses_arch_specific_attention_on_blackwell(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
@@ -1139,6 +1636,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             moe_runner_backend="auto",
             moe_a2a_backend="none",
             attention_backend=None,
+            enable_eplb=False,
+            ep_num_redundant_experts=0,
+            init_expert_location="trivial",
             _model_config=model_config,
         )
 
@@ -1182,7 +1682,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with self.assertRaisesRegex(ValueError, "moe-a2a-backend=none"):
             _nemotron_h_overrides(server_args, hf_config)
 
-    def test_nemotron_h_w4a16_moe_rejects_non_marlin_runner(self):
+    def test_nemotron_h_w4a16_moe_explicit_runner(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
         )
@@ -1195,10 +1695,62 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 }
             }
         )
-        server_args.moe_runner_backend = "flashinfer_trtllm"
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}, None),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}, None),
+            ("marlin", "none", False, {}, None),
+            ("marlin", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", True, {}, None),
+            ("flashinfer_cutedsl", "none", False, None, "moe-runner-backend=marlin"),
+            ("flashinfer_trtllm", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutlass", "none", True, None, "moe-runner-backend=marlin"),
+            ("flashinfer_cutedsl", "deepep", True, None, "moe-a2a-backend=none"),
+            ("flashinfer_cutedsl", "flashinfer", True, None, "moe-a2a-backend=none"),
+        ]
+        for runner, a2a, w4a16_enabled, expected, error in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16_enabled=w4a16_enabled),
+                override_platform(is_sm100=True),
+                override_platform(is_blackwell=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                server_args.moe_runner_backend = runner
+                server_args.moe_a2a_backend = a2a
+                if error is not None:
+                    with self.assertRaisesRegex(ValueError, error):
+                        _nemotron_h_overrides(server_args, hf_config)
+                else:
+                    self.assertEqual(
+                        _nemotron_h_overrides(server_args, hf_config),
+                        {
+                            "quantization": "modelopt_mixed",
+                            "attention_backend": "trtllm_mha",
+                            **expected,
+                        },
+                    )
 
-        with self.assertRaisesRegex(ValueError, "moe-runner-backend=marlin"):
-            _nemotron_h_overrides(server_args, hf_config)
+    def test_nemotron_h_w4a16_cutedsl_rejects_non_sm100(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_h import (
+            _nemotron_h_overrides,
+        )
+
+        server_args, hf_config = self._nemotron_h_args(
+            quantized_layers={
+                "backbone.layers.1.mixer.experts.0.up_proj": {
+                    "quant_algo": "W4A16_NVFP4",
+                    "group_size": 16,
+                }
+            }
+        )
+        server_args.moe_runner_backend = "flashinfer_cutedsl"
+        for is_blackwell in (False, True):
+            with (
+                self.subTest(is_blackwell=is_blackwell),
+                override_platform(is_sm100=False, is_blackwell=is_blackwell),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(True),
+                self.assertRaisesRegex(ValueError, "SM100-family GPUs"),
+            ):
+                _nemotron_h_overrides(server_args, hf_config)
 
     def test_step3p_hierarchical_cache_golden(self):
         # SWA-hybrid arch: the mini config needs layer_types/sliding_window.
@@ -1219,24 +1771,125 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._leaf("swa_full_tokens_ratio"), 1.0)
         self.assertTrue(self._leaf("disable_hybrid_swa_memory"))
 
-    def test_gemma2_disables_hybrid_swa_memory(self):
-        sa = self._construct("Gemma2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertIn(
-            ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
-            sa._resolved_overrides,
+    # The mini config's two layers: one sliding-window layer, one full layer.
+    _SWA_MIX = {
+        "layer_types": ["sliding_attention", "full_attention"],
+        "sliding_window": 64,
+    }
+
+    def test_gemma_keeps_hybrid_swa_memory(self):
+        for architecture, model_type, backend in (
+            ("Gemma2ForCausalLM", "gemma2", "fa3"),
+            ("Gemma3ForCausalLM", "gemma3_text", "triton"),
+            ("Gemma3ForConditionalGeneration", "gemma3", "triton"),
+        ):
+            with self.subTest(architecture=architecture, backend=backend):
+                sa = self._construct(
+                    architecture,
+                    model_type,
+                    config_extra=self._SWA_MIX,
+                    attention_backend=backend,
+                )
+                self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_gemma3_disables_hybrid_swa_memory_on_fa3(self):
+        for architecture, model_type in (
+            ("Gemma3ForCausalLM", "gemma3_text"),
+            ("Gemma3ForConditionalGeneration", "gemma3"),
+        ):
+            for backends in (
+                {"attention_backend": "fa3"},
+                {
+                    "prefill_attention_backend": "triton",
+                    "decode_attention_backend": "fa3",
+                },
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, model_type, config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_gemma2_gemma3_overrides",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_gemma3n_disables_hybrid_swa_memory(self):
+        for architecture in ("Gemma3nForCausalLM", "Gemma3nForConditionalGeneration"):
+            with self.subTest(architecture=architecture):
+                sa = self._construct(architecture, "llama", config_extra=self._SWA_MIX)
+                self.assertIn(
+                    ("_gemma2_gemma3_overrides", {"disable_hybrid_swa_memory": True}),
+                    sa._resolved_overrides,
+                )
+
+    def test_layer_types_hybrid_swa_memory_off_on_backends_without_it(self):
+        for architecture in ("Gemma3ForCausalLM", "Cohere2ForCausalLM"):
+            for backends in (
+                {"attention_backend": "aiter"},
+                {
+                    "prefill_attention_backend": "aiter",
+                    "decode_attention_backend": "triton",
+                },
+                {"attention_backend": "wave"},
+                {"attention_backend": "flex_attention"},
+            ):
+                with self.subTest(architecture=architecture, backends=backends):
+                    sa = self._construct(
+                        architecture, "llama", config_extra=self._SWA_MIX, **backends
+                    )
+                    self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+                    self.assertIn(
+                        (
+                            "_hybrid_swa_memory_backend_disable",
+                            {"disable_hybrid_swa_memory": True},
+                        ),
+                        sa._resolved_overrides,
+                    )
+
+    def test_layer_types_hybrid_swa_memory_off_on_default_aiter(self):
+        # The gate has to see the default backend, which resolves after the
+        # model overrides run.
+        with override_platform(is_cuda=False, is_hip=True):
+            sa = self._construct(
+                "Gemma3ForCausalLM", "llama", config_extra=self._SWA_MIX
+            )
+        self.assertEqual(self._resolved(sa, "attention_backend"), "aiter")
+        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_listed_hybrid_swa_models_keep_their_pool_on_aiter(self):
+        sa = self._construct(
+            "Gemma4ForCausalLM",
+            "llama",
+            config_extra=self._SWA_MIX,
+            attention_backend="aiter",
         )
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
 
-    def test_olmo2_disables_hybrid_swa_memory(self):
-        sa = self._construct("Olmo2ForCausalLM", "llama")
-        self.assertTrue(self._resolved(sa, "disable_hybrid_swa_memory"))  # materialized
-        self.assertTrue((self._publish(sa), self._leaf("disable_hybrid_swa_memory"))[1])
+    def test_olmo3_keeps_hybrid_swa_memory(self):
+        sa = self._construct(
+            "Olmo3ForCausalLM", "olmo3", config_extra={"num_hidden_layers": 4}
+        )
+        model_config = base_module.model_config_of(sa)
+        self.assertEqual(model_config.hf_config.architectures, ["Olmo2ForCausalLM"])
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
 
-    def test_exaone_conditional_on_sliding_window_pattern(self):
-        # With the pattern the branch also asserts an explicit backend.
+    def test_exaone4_keeps_hybrid_swa_memory(self):
         sa = self._construct(
             "Exaone4ForCausalLM",
+            "llama",
+            config_extra={"sliding_window_pattern": "LLLG", **self._SWA_MIX},
+            attention_backend="fa3",
+        )
+        self.assertFalse(self._resolved(sa, "disable_hybrid_swa_memory"))
+
+    def test_exaone_moe_disables_hybrid_swa_memory(self):
+        # With the pattern the branch also asserts an explicit backend.
+        sa = self._construct(
+            "ExaoneMoEForCausalLM",
             "llama",
             config_extra={"sliding_window_pattern": "LLLG"},
             attention_backend="fa3",
@@ -1254,18 +1907,18 @@ class TestGoldenModelOverrides(_IsolatedPublish):
 
     def test_gpt_oss_mxfp4_forces_bfloat16(self):
         from sglang.srt.layers.quantization import QUANTIZATION_METHODS
+        from sglang.srt.layers.quantization.mxfp4 import Mxfp4Config
 
-        if "mxfp4" not in QUANTIZATION_METHODS:
-            # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP);
-            # plain CPU CI runners cannot construct an mxfp4 ModelConfig.
-            self.skipTest("mxfp4 quantization is not registered on this platform")
-        sa = self._construct(
-            "GptOssForCausalLM",
-            "llama",
-            config_extra={"quantization_config": {"quant_method": "mxfp4"}},
-        )
-        self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
-        self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
+        # Registration is platform-gated (CUDA / CPU engine / MXFP-HIP), so a
+        # plain CPU runner would otherwise reject the mxfp4 ModelConfig.
+        with patch.dict(QUANTIZATION_METHODS, {"mxfp4": Mxfp4Config}):
+            sa = self._construct(
+                "GptOssForCausalLM",
+                "llama",
+                config_extra={"quantization_config": {"quant_method": "mxfp4"}},
+            )
+            self.assertEqual(self._resolved(sa, "dtype"), "bfloat16")
+            self.assertEqual((self._publish(sa), self._leaf("dtype"))[1], "bfloat16")
 
     def test_gpt_oss_without_mxfp4_keeps_pristine_dtype(self):
         sa = self._construct("GptOssForCausalLM", "llama")
@@ -1288,7 +1941,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_sampling_backend_default_pass(self):
-        from sglang.srt.utils.common import is_flashinfer_available
+        from sglang.srt.utils.device import is_flashinfer_available
 
         sa = self._construct("LlamaForCausalLM", "llama")
         expected = "flashinfer" if is_flashinfer_available() else "pytorch"
@@ -1336,24 +1989,192 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(self._leaf("attention_backend"), deterministic_fills[0])
 
     def test_deterministic_incompatible_backend_raises(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
 
         view = ResolvedView(
             SimpleNamespace(
-                enable_deterministic_inference=True, attention_backend="flashmla"
+                enable_deterministic_inference=True,
+                attention_backend="flashmla",
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
             )
         )
         with self.assertRaises(ValueError):
             _deterministic_attention_backend(view)
 
-    def test_deterministic_ascend_is_left_alone(self):
+    def test_deterministic_incompatible_phase_backend_raises(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        # A per-phase backend overrides --attention-backend for its phase, so a
+        # non-deterministic one must be refused even when the main backend is fine.
+        for field in ("prefill_attention_backend", "decode_attention_backend"):
+            with (
+                self.subTest(field=field),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=False,
+                ),
+            ):
+                phases = {
+                    "prefill_attention_backend": None,
+                    "decode_attention_backend": None,
+                    field: "aiter",
+                }
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        **phases,
+                    )
+                )
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_decode_only_on_gfx950_without_mla(self):
+        """AITER decode attention is batch-invariant only for non-MLA models on gfx950,
+        and its speculative verify path is not."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        cases = [
+            # (gfx950, MLA model, prefill backend, speculative algorithm, accepted)
+            (True, False, "triton", None, True),
+            (False, False, "triton", None, False),
+            (True, True, "triton", None, False),
+            (True, False, "aiter", None, True),
+            (True, False, "triton", "EAGLE", False),
+        ]
+        for gfx950, mla, prefill, spec, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, prefill=prefill, spec=spec),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend=prefill,
+                        decode_attention_backend="aiter",
+                        speculative_algorithm=spec,
+                        kv_cache_dtype="auto",
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaises(ValueError):
+                        _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_prefill_only_on_gfx950_without_mla(self):
+        """AITER prefill attention is accepted in deterministic mode only on gfx950,
+        for non-MLA models, without speculative decoding and with a bf16 KV cache."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        cases = [
+            # (gfx950, MLA model, speculative algorithm, KV cache dtype, accepted)
+            (True, False, None, "auto", True),
+            (True, False, None, "bf16", True),
+            (False, False, None, "auto", False),
+            (True, True, None, "auto", False),
+            (True, False, "EAGLE", "auto", False),
+            (True, False, None, "fp8_e4m3", False),
+        ]
+        for gfx950, mla, spec, kv_dtype, accepted in cases:
+            with (
+                self.subTest(gfx950=gfx950, mla=mla, spec=spec, kv_dtype=kv_dtype),
+                patch(
+                    "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                    return_value=gfx950,
+                ),
+                patch(
+                    "sglang.srt.arg_groups.overrides.use_mla_backend", return_value=mla
+                ),
+            ):
+                view = ResolvedView(
+                    SimpleNamespace(
+                        enable_deterministic_inference=True,
+                        attention_backend="triton",
+                        prefill_attention_backend="aiter",
+                        decode_attention_backend="triton",
+                        speculative_algorithm=spec,
+                        kv_cache_dtype=kv_dtype,
+                    )
+                )
+                if accepted:
+                    self.assertEqual(_deterministic_attention_backend(view), {})
+                else:
+                    with self.assertRaisesRegex(ValueError, "aiter prefill"):
+                        _deterministic_attention_backend(view)
+
+    def test_deterministic_aiter_prefill_page_size(self):
+        """Deterministic AITER prefill puts prompt splits on its 128-row query tile:
+        page size becomes 128 unless it is already a multiple, and a chunked-prefill
+        size that is not a multiple of 128 is refused."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deterministic_sampling_backend,
+            _deterministic_aiter_prefill_page_size,
         )
+
+        def view(det=True, prefill="aiter", page_size=1, chunk=8192):
+            return ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=det,
+                    prefill_attention_backend=prefill,
+                    page_size=page_size,
+                    chunked_prefill_size=chunk,
+                )
+            )
+
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view()), {"page_size": 128}
+        )
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view(page_size=None)),
+            {"page_size": 128},
+        )
+        for page_size in (128, 256):
+            self.assertEqual(
+                _deterministic_aiter_prefill_page_size(view(page_size=page_size)), {}
+            )
+        for chunk in (None, -1):
+            self.assertEqual(
+                _deterministic_aiter_prefill_page_size(view(chunk=chunk)),
+                {"page_size": 128},
+            )
+        with self.assertRaisesRegex(ValueError, "chunked-prefill-size"):
+            _deterministic_aiter_prefill_page_size(view(chunk=1000))
+        # Unchanged without deterministic mode or with another prefill backend.
+        self.assertEqual(_deterministic_aiter_prefill_page_size(view(det=False)), {})
+        self.assertEqual(
+            _deterministic_aiter_prefill_page_size(view(prefill="triton")), {}
+        )
+
+    def test_deterministic_compatible_phase_backends_are_accepted(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_attention_backend
+
+        view = ResolvedView(
+            SimpleNamespace(
+                enable_deterministic_inference=True,
+                attention_backend="triton",
+                prefill_attention_backend="triton",
+                decode_attention_backend="fa3",
+            )
+        )
+        self.assertEqual(_deterministic_attention_backend(view), {})
+
+    def test_deterministic_ascend_is_left_alone(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_sampling_backend
 
         view = ResolvedView(
             SimpleNamespace(
@@ -1361,6 +2182,36 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
         )
         self.assertEqual(_deterministic_sampling_backend(view), {})
+
+    def test_deterministic_rocm_rccl_check(self):
+        """Deterministic ROCm TP above 2 must not fall back to RCCL; CUDA (which
+        disables the custom all-reduce itself) and TP2 (one summation order) are allowed."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deterministic_rocm_rccl_check
+
+        # (is_hip, deterministic, tp_size, disable_custom_all_reduce, raises)
+        for is_hip, det, tp, disable, raises in [
+            (True, True, 4, True, True),
+            (False, True, 8, True, False),
+            (True, True, 2, True, False),
+            (True, False, 8, True, False),
+            (True, True, 8, False, False),
+        ]:
+            view = ResolvedView(
+                SimpleNamespace(
+                    enable_deterministic_inference=det,
+                    tp_size=tp,
+                    disable_custom_all_reduce=disable,
+                )
+            )
+            with (
+                self.subTest(is_hip=is_hip, det=det, tp=tp, disable=disable),
+                override_platform(is_cuda=not is_hip, is_hip=is_hip),
+            ):
+                if raises:
+                    self.assertRaises(ValueError, _deterministic_rocm_rccl_check, view)
+                else:
+                    self.assertEqual(_deterministic_rocm_rccl_check(view), {})
 
     def test_dllm_forces_flashinfer_with_cuda_graph(self):
         # CUDA path: cuda graph enabled by default -> dllm forces flashinfer.
@@ -1460,8 +2311,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_compatibility_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _attention_backend_default,
             _attention_backend_fa3_fp8_fallback,
             _attention_backend_platform_fallbacks,
@@ -1499,10 +2350,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_attention_backend_platform_fallbacks(view), {})
 
     def test_dllm_platform_paths_at_callable_level(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dllm_attention_backend,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dllm_attention_backend
         from sglang.srt.model_executor.cuda_graph_config import Backend
 
         def _view(**kw):
@@ -1537,7 +2386,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_page_size_default_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _page_size_default
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _page_size_default
 
         # user-set page_size: nothing to declare
         self.assertEqual(
@@ -1557,7 +2407,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_dllm_page_size_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _dllm_page_size
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dllm_page_size
 
         def _view(**kw):
             defaults = dict(
@@ -1584,8 +2435,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_dllm_page_size(_view(dllm_algorithm=None)), {})
 
     def test_overlap_disable_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _dllm_overlap_disable,
             _pipeline_parallel_overlap_disable,
             _sparse_head_overlap_disable,
@@ -1676,6 +2527,14 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "swa_full_tokens_ratio",
             _deepseek_v4_overrides(_args(swa_full_tokens_ratio=0.5), hf),
         )
+        # V4.1 leaves the ratio unset (cap-mode SWA sizing).
+        hf41 = SimpleNamespace(
+            architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
+        )
+        self.assertNotIn(
+            "swa_full_tokens_ratio",
+            _deepseek_v4_overrides(_args(fp8_gemm_runner_backend="triton"), hf41),
+        )
         # An explicit user choice takes precedence over the model default.
         self.assertNotIn(
             "moe_runner_backend",
@@ -1750,6 +2609,74 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             "flashinfer_trtllm_routed",
         )
 
+    def test_bailing_v3_mixed_mxfp4_selects_native_runner(self):
+        """Packed MXFP4 experts must not reach the FP8 Triton runner."""
+
+        def _args(**kw):
+            defaults = dict(
+                device="cuda",
+                moe_a2a_backend="none",
+                moe_runner_backend="auto",
+                _model_config=SimpleNamespace(quantization="fp8", is_fp4_experts=True),
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        with override_platform(
+            is_sm90=False, is_sm100=True, is_sm120=False, is_hip=False
+        ):
+            for architecture in (
+                "BailingMoeV3ForCausalLM",
+                "BailingMoeV3VLForConditionalGeneration",
+            ):
+                with self.subTest(architecture=architecture):
+                    declarations = collect_model_override_declarations(
+                        architecture,
+                        _args(),
+                        SimpleNamespace(architectures=[architecture]),
+                    )
+                    self.assertEqual(
+                        declarations,
+                        [
+                            (
+                                "_bailing_moe_v3_overrides",
+                                {"moe_runner_backend": "flashinfer_mxfp4"},
+                            )
+                        ],
+                    )
+
+            from sglang.srt.arg_groups.model_overrides.bailing_moe_v3 import (
+                _bailing_moe_v3_overrides,
+            )
+
+            hf = SimpleNamespace(
+                architectures=["BailingMoeV3VLForConditionalGeneration"]
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_runner_backend="triton"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(_args(moe_a2a_backend="deepep"), hf),
+                {},
+            )
+            self.assertEqual(
+                _bailing_moe_v3_overrides(
+                    _args(
+                        _model_config=SimpleNamespace(
+                            quantization="fp8", is_fp4_experts=False
+                        )
+                    ),
+                    hf,
+                ),
+                {},
+            )
+
+        with override_platform(
+            is_sm90=False, is_sm100=False, is_sm120=False, is_hip=False
+        ):
+            self.assertEqual(_bailing_moe_v3_overrides(_args(), hf), {})
+
     def test_nemotron_h_overrides_at_callable_level(self):
         from sglang.srt.arg_groups.model_overrides.nemotron_h import (
             _nemotron_h_overrides,
@@ -1778,6 +2705,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 speculative_draft_attention_backend=None,
                 page_size=None,
                 mamba_radix_cache_strategy="auto",
+                enable_eplb=False,
+                ep_num_redundant_experts=0,
+                init_expert_location="trivial",
                 _model_config=mc,
             )
             defaults.update(kw)
@@ -1848,10 +2778,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     )
 
     def test_speculative_moe_runner_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _speculative_moe_runner_default,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _speculative_moe_runner_default
 
         self.assertEqual(
             _speculative_moe_runner_default(
@@ -1862,6 +2790,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {"speculative_moe_runner_backend": "triton"},
+        )
+        self.assertEqual(
+            _speculative_moe_runner_default(
+                ResolvedView(
+                    SimpleNamespace(
+                        speculative_moe_runner_backend=None,
+                        moe_runner_backend="flashinfer_megamoe",
+                    )
+                )
+            ),
+            {"speculative_moe_runner_backend": "flashinfer_trtllm"},
         )
         # user-set draft backend survives
         self.assertEqual(
@@ -1877,10 +2816,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_dsa_split_backend_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_split_backend_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_split_backend_resolution
 
         def _view(arch="DeepseekV32ForCausalLM", learnable_sink=False, **kw):
             hf = SimpleNamespace(architectures=[arch], learnable_sink=learnable_sink)
@@ -1988,8 +2925,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_flashinfer_allreduce_fusion_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _deterministic_allreduce_fusion_disable,
             _enforce_disable_allreduce_fusion,
             _flashinfer_allreduce_fusion_auto_enable,
@@ -2000,7 +2937,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             defaults = dict(
                 flashinfer_allreduce_fusion_backend=None,
                 tp_size=2,
-                enable_dp_attention=False,
+                attn_dp_size=1,
+                ep_join_mode=None,
                 nnodes=1,
                 moe_a2a_backend="none",
                 enforce_disable_flashinfer_allreduce_fusion=False,
@@ -2012,6 +2950,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
         with (
+            _confidential_compute(False),
             override_platform(is_sm90=True),
             override_platform(is_sm100=False),
         ):
@@ -2036,9 +2975,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 _flashinfer_allreduce_fusion_auto_enable(_view(tp_size=1)), {}
             )
             self.assertEqual(
-                _flashinfer_allreduce_fusion_auto_enable(
-                    _view(enable_dp_attention=True)
-                ),
+                _flashinfer_allreduce_fusion_auto_enable(_view(attn_dp_size=2)),
                 {},
             )
             self.assertEqual(
@@ -2058,6 +2995,26 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 ),
                 {},
             )
+
+        # SM100 auto-enables multi-node mnnvl, which needs NVLink multicast, so
+        # Confidential Computing keeps only single-node trtllm.
+        with (
+            override_platform(is_sm90=False),
+            override_platform(is_sm100=True),
+        ):
+            with _confidential_compute(False):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)),
+                    {"flashinfer_allreduce_fusion_backend": "auto"},
+                )
+            with _confidential_compute(True):
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view(nnodes=2)), {}
+                )
+                self.assertEqual(
+                    _flashinfer_allreduce_fusion_auto_enable(_view()),
+                    {"flashinfer_allreduce_fusion_backend": "trtllm"},
+                )
 
         # enforce-disable wins over everything
         self.assertEqual(
@@ -2089,10 +3046,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_cutedsl_prefill_backend_fill_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _cutedsl_prefill_backend_fill,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _cutedsl_prefill_backend_fill
 
         def _view(**kw):
             defaults = dict(
@@ -2159,10 +3114,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moss_vl_overrides(_args(attention_backend="fa3"), None)
 
     def test_dsa_kv_cache_dtype_default_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _dsa_kv_cache_dtype_default,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default
 
         def _view(**kw):
             hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
@@ -2207,10 +3160,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_v4_kv_cache_dtype,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_v4_kv_cache_dtype
 
         def _view(arch="DeepseekV4ForCausalLM", **kw):
             hf = SimpleNamespace(architectures=[arch])
@@ -2239,10 +3190,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
 
     def test_deepseek_spec_moe_resolution_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_spec_moe_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_spec_moe_resolution
         from sglang.srt.environ import envs
 
         def _view(**kw):
@@ -2281,7 +3230,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _deepseek_spec_moe_resolution(
                         _view(
-                            speculative_moe_runner_backend="triton",
+                            speculative_moe_runner_backend="flashinfer_trtllm",
                             speculative_moe_a2a_backend="none",
                         )
                     ),
@@ -2304,8 +3253,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_spec_moe_resolution(_view()), {})
 
     def test_mamba_radix_cache_resolution_pass(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _mamba_radix_cache_resolution,
             supports_mamba_cache_extra_buffer,
         )
@@ -2415,7 +3364,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         # extra-buffer support requires the triton linear-attn backend
         self.assertFalse(
             supports_mamba_cache_extra_buffer(
-                SimpleNamespace(linear_attn_backend="fla"), "Qwen3NextForCausalLM"
+                SimpleNamespace(linear_attn_backend="fla"),
+                SimpleNamespace(architectures=["Qwen3NextForCausalLM"]),
             )
         )
         self.assertTrue(
@@ -2424,9 +3374,114 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                     linear_attn_backend="triton",
                     linear_attn_prefill_backend="flashinfer",
                 ),
-                "Qwen3_5MoeForConditionalGeneration",
+                SimpleNamespace(architectures=["Qwen3_5MoeForConditionalGeneration"]),
             )
         )
+
+    def test_mamba_radix_cache_resolution_reads_registry_specs(self):
+        """A spec registered by config predicate (archs=[]) drives the leaves
+        exactly like an arch-registered one, and the spec's
+        `support_mamba_cache_extra_buffer` gates the extra_buffer strategy."""
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import (
+            _mamba_radix_cache_resolution,
+            supports_mamba_cache_extra_buffer,
+        )
+        from sglang.srt.configs import linear_attn_model_registry as registry
+
+        class _PredicateConfig:
+            def __init__(self, linear_attn):
+                self.architectures = ["PredicateHybridForCausalLM"]
+                self.linear_attn = linear_attn
+
+        class _ArchConfig:
+            architectures = ["ArchHybridForCausalLM"]
+
+        def _view(hf, **kw):
+            defaults = dict(
+                disable_radix_cache=False,
+                mamba_radix_cache_strategy="auto",
+                disable_overlap_schedule=False,
+                page_size=None,
+                linear_attn_backend="triton",
+                linear_attn_prefill_backend=None,
+            )
+            defaults.update(kw)
+            return ResolvedView(
+                SimpleNamespace(_model_config=SimpleNamespace(hf_config=hf), **defaults)
+            )
+
+        by_predicate = registry.LinearAttnModelSpec(
+            config_class=_PredicateConfig,
+            backend_class_name="pkg.mod.Backend",
+            config_predicate=lambda cfg: cfg.linear_attn,
+            support_mamba_cache_extra_buffer=True,
+        )
+        by_arch = registry.LinearAttnModelSpec(
+            config_class=_ArchConfig,
+            backend_class_name="pkg.mod.Backend",
+            arch_names=["ArchHybridForCausalLM"],
+        )
+        with patch.object(registry, "_LINEAR_ATTN_MODEL_REGISTRY", []):
+            registry.register_linear_attn_model(by_predicate)
+            registry.register_linear_attn_model(by_arch)
+
+            # predicate hit: the leaf is declared and the spec opts into
+            # extra_buffer on the triton linear-attn backend only
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(True))),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "extra_buffer",
+                },
+            )
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(_PredicateConfig(True), linear_attn_backend="fla")
+                ),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertTrue(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(True),
+                )
+            )
+            # predicate miss: not a hybrid model at all
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_PredicateConfig(False))), {}
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"),
+                    _PredicateConfig(False),
+                )
+            )
+            # arch-registered spec without the opt-in: unchanged, no_buffer
+            self.assertEqual(
+                _mamba_radix_cache_resolution(_view(_ArchConfig())),
+                {
+                    "uses_mamba_radix_cache": True,
+                    "mamba_radix_cache_strategy": "no_buffer",
+                    "disable_overlap_schedule": True,
+                },
+            )
+            self.assertFalse(
+                supports_mamba_cache_extra_buffer(
+                    SimpleNamespace(linear_attn_backend="triton"), _ArchConfig()
+                )
+            )
+            # hard-coded archs do not need a spec
+            self.assertEqual(
+                _mamba_radix_cache_resolution(
+                    _view(SimpleNamespace(architectures=["Qwen3NextForCausalLM"]))
+                )["mamba_radix_cache_strategy"],
+                "extra_buffer",
+            )
 
     def test_qwen3_5_hybrid_coupled_declaration(self):
         from sglang.srt.arg_groups.model_overrides.qwen3_5 import (
@@ -2511,8 +3566,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
 
     def test_moe_runner_quant_constraint_pass(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _moe_runner_backend_quant_constraints,
         )
 
@@ -2540,6 +3595,24 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             _moe_runner_backend_quant_constraints(_view(quantization="mxfp8")),
             {"moe_runner_backend": "flashinfer_trtllm"},
         )
+        # gfx950 accepts --moe-runner-backend aiter for MXFP8 only with aiter enabled
+        with (
+            override_platform(is_hip=True),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+        ):
+            aiter_view = dict(quantization="mxfp8", moe_runner_backend="aiter")
+            with envs.SGLANG_USE_AITER.override(True):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)), {}
+                )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _moe_runner_backend_quant_constraints(_view(**aiter_view)),
+                    {"moe_runner_backend": "triton"},
+                )
         with override_platform(is_sm120=True):
             self.assertEqual(
                 _moe_runner_backend_quant_constraints(
@@ -2550,10 +3623,11 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         self.assertEqual(_moe_runner_backend_quant_constraints(_view()), {})
 
     def test_gguf_quantization_pass(self):
-        from sglang.srt.arg_groups.overrides import ResolvedView, _gguf_quantization
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _gguf_quantization
 
         with patch(
-            "sglang.srt.utils.hf_transformers_utils.check_gguf_file",
+            "sglang.srt.hf_transformers.check_gguf_file",
             return_value=True,
         ):
             self.assertEqual(
@@ -2652,8 +3726,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["page_size"], 128)
 
     def test_page_constraint_passes_at_callable_level(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _fa4_page_constraint,
             _intel_xpu_page_constraint,
             _mla_backend_page_constraints,
@@ -2668,7 +3742,9 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=1,
                 # `use_mla_backend` reads the model configuration; a non-MLA
                 # one keeps these assertions about the page constraints.
-                _model_config=SimpleNamespace(attention_arch=None),
+                _model_config=SimpleNamespace(
+                    attention_arch=None, hf_config=SimpleNamespace(architectures=[])
+                ),
             )
             defaults.update(kw)
             return ResolvedView(SimpleNamespace(**defaults))
@@ -2732,10 +3808,22 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 {},
             )
 
+        # page_size 1 is accepted: the flat page table runs the non-paged varlen
+        # kernel.
         self.assertEqual(
             _intel_xpu_page_constraint(
                 _view(
                     decode_attention_backend="intel_xpu",
+                )
+            ),
+            {},
+        )
+        # an unsupported page still snaps to 128
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    page_size=32,  # non-MLA accepts only 1, 64, 128
                 )
             ),
             {"page_size": 128},
@@ -2749,6 +3837,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 )
             ),
             {},
+        )
+        # MLA does not inherit MHA's page_size 1: mla_decode has no page_size 1 path.
+        self.assertEqual(
+            _intel_xpu_page_constraint(
+                _view(
+                    decode_attention_backend="intel_xpu",
+                    _model_config=SimpleNamespace(attention_arch=AttentionArch.MLA),
+                    page_size=1,
+                )
+            ),
+            {"page_size": 128},
         )
 
     def test_monolith_attention_families_at_callable_level(self):
@@ -2849,10 +3948,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             )
 
     def test_deepseek_moe_quant_slot_pass(self):
-        from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
-            _deepseek_moe_quant_resolution,
-        )
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
+        from sglang.srt.arg_groups.overrides import _deepseek_moe_quant_resolution
 
         def _view(arch="DeepseekV32ForCausalLM", quant_cfg=None, **kw):
             defaults = dict(
@@ -2889,24 +3986,34 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(_deepseek_moe_quant_resolution(_view()), {})
 
     def test_data_parallelism_and_a2a_passes(self):
+        from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
-            ResolvedView,
             _a2a_ep_size,
             _data_parallelism_defaults,
         )
 
         self.assertEqual(
             _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=1, ep_join_mode=None))
+                ResolvedView(
+                    SimpleNamespace(dp_size=1, attn_dp_size=1, ep_join_mode=None)
+                )
             ),
-            {"enable_dp_attention": False, "enable_dp_lm_head": False},
+            {"enable_dp_lm_head": False},
         )
-        self.assertEqual(
-            _data_parallelism_defaults(
-                ResolvedView(SimpleNamespace(dp_size=2, ep_join_mode=None))
-            ),
-            {},
-        )
+        for dp_size, attn_dp_size in ((2, 1), (1, 2)):
+            with self.subTest(dp_size=dp_size, attn_dp_size=attn_dp_size):
+                self.assertEqual(
+                    _data_parallelism_defaults(
+                        ResolvedView(
+                            SimpleNamespace(
+                                dp_size=dp_size,
+                                attn_dp_size=attn_dp_size,
+                                ep_join_mode=None,
+                            )
+                        )
+                    ),
+                    {},
+                )
 
         self.assertEqual(
             _a2a_ep_size(
@@ -2918,7 +4025,27 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         )
         self.assertEqual(
             _a2a_ep_size(
-                ResolvedView(SimpleNamespace(moe_a2a_backend="none", tp_size=8))
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend=None,
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
+            ),
+            {},
+        )
+        self.assertEqual(
+            _a2a_ep_size(
+                ResolvedView(
+                    SimpleNamespace(
+                        moe_a2a_backend="none",
+                        speculative_moe_a2a_backend="ascend_ops",
+                        ep_size=1,
+                        tp_size=8,
+                    )
+                )
             ),
             {},
         )
@@ -2935,6 +4062,8 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
                 dcp_size=1,
+                attn_cp_size=1,
+                moe_dense_tp_size=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -2989,6 +4118,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                                 cp_strategy="zigzag",
                                 tp_size=8,
                                 dp_size=1,
+                                attn_dp_size=1,
                                 ep_size=1,
                                 moe_a2a_backend="none",
                                 kv_cache_dtype="auto",
@@ -3000,24 +4130,43 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             {
                                 "attention_backend": "dsa",
                                 "page_size": 64,
-                                "enable_dp_attention": True,
+                                "attn_dp_size": 1,
+                                "dp_size": 1,
                                 "moe_dense_tp_size": 1,
                                 "moe_a2a_backend": "deepep",
                                 "ep_size": 8,
                                 "attn_cp_size": 8,
                             },
                         )
-                        # interleave CP with dp>1 must assert
-                        with self.assertRaises(AssertionError):
-                            _deepseek_family_overrides(
+                        # Interleave keeps attention DP and the configured dense TP.
+                        for attn_dp_size, dense_tp_size, cp_size, expected_cp in (
+                            (1, None, 1, 8),
+                            (2, 8, 1, 4),
+                            (2, 1, 1, 4),
+                            # An explicit CP2 leaves two attention-TP ranks
+                            # within each DP group; it must not become CP4.
+                            (2, 8, 2, 2),
+                        ):
+                            result = _deepseek_family_overrides(
                                 _args(
                                     enable_prefill_cp=True,
                                     cp_strategy="interleave",
                                     tp_size=8,
-                                    dp_size=2,
+                                    dp_size=1,
+                                    attn_dp_size=attn_dp_size,
+                                    attn_cp_size=cp_size,
+                                    moe_dense_tp_size=dense_tp_size,
+                                    ep_size=1,
+                                    moe_a2a_backend="none",
+                                    kv_cache_dtype="auto",
                                 ),
                                 None,
                             )
+                            self.assertEqual(result["attn_dp_size"], attn_dp_size)
+                            self.assertEqual(result["attn_cp_size"], expected_cp)
+                            self.assertNotIn("moe_dense_tp_size", result)
+                            self.assertNotIn("ep_size", result)
+                            self.assertNotIn("moe_a2a_backend", result)
 
         # MLA path on sm100: trtllm_mla fill (all three backends unset)
         with patch(
@@ -3061,6 +4210,93 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         with override_platform(is_sm100=False):
             self.assertEqual(_qwen3_moe_family_overrides(None, None), {})
 
+    def test_qwen3_moe_family_mixed_precision_moe_runner(self):
+        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
+            _qwen3_moe_family_overrides,
+        )
+
+        def _mixed(expert_algo):
+            return SimpleNamespace(
+                architectures=["Qwen4ExpForConditionalGeneration"],
+                quantization_config={
+                    "quant_method": "modelopt_mixed",
+                    "quantized_layers": {
+                        "model.language_model.layers.0.mlp.experts": {
+                            "quant_algo": expert_algo
+                        }
+                    },
+                },
+            )
+
+        args = SimpleNamespace(
+            quantization="modelopt_mixed",
+            _quantization_explicitly_unset=False,
+            moe_a2a_backend="none",
+            moe_runner_backend="auto",
+        )
+        with override_platform(is_sm100=True):
+            # W4A4 experts take trtllm-gen like modelopt_fp4; W4A16 has no
+            # trtllm-gen kernel and goes to marlin.
+            self.assertEqual(
+                _qwen3_moe_family_overrides(args, _mixed("NVFP4")),
+                {"moe_runner_backend": "flashinfer_trtllm"},
+            )
+            self.assertEqual(
+                _qwen3_moe_family_overrides(args, _mixed("W4A16_NVFP4")),
+                {"moe_runner_backend": "marlin"},
+            )
+
+    def test_qwen3_moe_family_w4a16_explicit_runner(self):
+        """Keep opted-in CuTe DSL v2 W4A16 accepted and auto routed to Marlin."""
+        from sglang.srt.arg_groups.model_overrides.qwen3_moe import (
+            _qwen3_moe_family_overrides,
+        )
+
+        hf_config = SimpleNamespace(
+            architectures=["Qwen4ExpForConditionalGeneration"],
+            quantization_config={
+                "quant_method": "modelopt_mixed",
+                "quantized_layers": {
+                    "model.language_model.layers.0.mlp.experts": {
+                        "quant_algo": "W4A16_NVFP4"
+                    }
+                },
+            },
+        )
+        cases = [
+            ("auto", "none", False, {"moe_runner_backend": "marlin"}),
+            ("auto", "none", True, {"moe_runner_backend": "marlin"}),
+            ("marlin", "none", False, {}),
+            ("marlin", "none", True, {}),
+            ("flashinfer_cutedsl", "none", True, {}),
+            ("flashinfer_cutedsl", "flashinfer", True, {}),
+            ("flashinfer_cutedsl", "none", False, None),
+            ("flashinfer_cutedsl", "flashinfer", False, None),
+            ("flashinfer_cutedsl", "deepep", True, None),
+            ("flashinfer_cutlass", "none", True, None),
+            ("flashinfer_trtllm", "none", True, None),
+        ]
+        for runner, a2a, w4a16_enabled, expected in cases:
+            with (
+                self.subTest(runner=runner, a2a=a2a, w4a16=w4a16_enabled),
+                override_platform(is_sm100=True),
+                envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.override(w4a16_enabled),
+            ):
+                args = SimpleNamespace(
+                    quantization=None,
+                    _quantization_explicitly_unset=False,
+                    moe_a2a_backend=a2a,
+                    moe_runner_backend=runner,
+                )
+                if expected is None:
+                    with self.assertRaisesRegex(ValueError, "W4A16_NVFP4"):
+                        _qwen3_moe_family_overrides(args, hf_config)
+                else:
+                    self.assertEqual(
+                        _qwen3_moe_family_overrides(args, hf_config),
+                        {"quantization": "modelopt_mixed", **expected},
+                    )
+
     def test_step3p_declarations_at_callable_level(self):
         from sglang.srt.arg_groups.overrides import _step3p_overrides
 
@@ -3099,6 +4335,144 @@ class TestDeclarationValidation(CustomTestCase):
         args = _FakeArgs()
         with self.assertRaises(ValueError):
             validate_declarations(args, [("src", {"nope": 1})])
+
+
+class TestQwen3VLHopperServingOverrides(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(envs.SGLANG_VLM_CACHE_SIZE_MB.clear)
+        self.addCleanup(envs.SGLANG_MM_FEATURE_CACHE_MB.clear)
+        envs.SGLANG_VLM_CACHE_SIZE_MB.clear()
+        envs.SGLANG_MM_FEATURE_CACHE_MB.clear()
+
+    @staticmethod
+    def _args(**overrides):
+        from sglang.srt.server_args import ServerArgs
+
+        values = {
+            "mm_preprocess_cache_size_mb": None,
+            "mm_feature_transport": None,
+            "max_running_requests": 400,
+            "radix_eviction_policy": "lru",
+            "prefill_decode_interval": None,
+            "attention_backend": None,
+            "decode_attention_backend": None,
+        }
+        values.update(overrides)
+        return ServerArgs(model_path="dummy", **values)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_profiled_defaults_are_valid_model_overrides(self, _mock_model_type):
+        server_args = self._args()
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(server_args, None)
+
+        self.assertEqual(
+            updates,
+            {
+                "mm_preprocess_cache_size_mb": 0,
+                "mm_feature_transport": "cuda_ipc",
+                "radix_eviction_policy": "priority",
+                "prefill_decode_interval": 22,
+                "decode_attention_backend": "flashinfer",
+            },
+        )
+        validate_declarations(
+            server_args,
+            [("_qwen3vl_hopper_serving_overrides", updates)],
+        )
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 0)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 3 * 1024)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_multinode_does_not_auto_select_cuda_ipc(self, _mock_model_type):
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(nnodes=2), None
+        )
+
+        self.assertNotIn("mm_feature_transport", updates)
+        self.assertFalse(envs.SGLANG_MM_FEATURE_CACHE_MB.is_set())
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        side_effect=AssertionError("must not load model config without GPU memory"),
+    )
+    def test_decode_graph_expansion_skips_unknown_gpu_memory(self, _mock_model_type):
+        decode_config = SimpleNamespace(max_bs=256)
+
+        qwen3_vl_module.expand_multimodal_decode_graph_to_running_limit(
+            self._args(), decode_config, gpu_mem=None
+        )
+
+        self.assertEqual(decode_config.max_bs, 256)
+
+    @patch.object(
+        qwen3_vl_module,
+        "large_hopper_qwen3_vl_model_type",
+        return_value="qwen3_vl",
+    )
+    def test_explicit_choices_are_not_replaced(self, _mock_model_type):
+        envs.SGLANG_VLM_CACHE_SIZE_MB.set(512)
+        envs.SGLANG_MM_FEATURE_CACHE_MB.set(2048)
+        updates = qwen3_vl_module._qwen3vl_hopper_serving_overrides(
+            self._args(
+                mm_preprocess_cache_size_mb=256,
+                mm_feature_transport="cpu",
+                radix_eviction_policy="lru",
+                _radix_eviction_policy_explicitly_set=True,
+                prefill_decode_interval=0,
+                decode_attention_backend="fa3",
+            ),
+            None,
+        )
+
+        self.assertEqual(updates, {})
+        self.assertEqual(envs.SGLANG_VLM_CACHE_SIZE_MB.get(), 512)
+        self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
+
+
+class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
+    """The deterministic fallback must not hand XPU a CUDA-only backend.
+
+    fa3 asserts on the device's SM version, so an XPU server that only asked
+    for --enable-deterministic-inference dies at launch rather than falling
+    back. The explicit-backend case guards the other direction: the platform
+    branch must not override a backend the user named.
+    """
+
+    @staticmethod
+    def _view(attention_backend):
+        return SimpleNamespace(
+            enable_deterministic_inference=True,
+            attention_backend=attention_backend,
+            model_path="Qwen/Qwen3-4B",
+        )
+
+    def test_xpu_fallback_is_an_xpu_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view(None)
+            )
+        self.assertEqual(updates, {"attention_backend": "intel_xpu"})
+
+    def test_xpu_keeps_explicit_backend(self):
+        with patch.object(
+            overrides_module, "get_platform", return_value=SimpleNamespace(is_xpu=True)
+        ):
+            updates = overrides_module._deterministic_attention_backend(
+                self._view("triton")
+            )
+        self.assertEqual(updates, {})
 
 
 if __name__ == "__main__":

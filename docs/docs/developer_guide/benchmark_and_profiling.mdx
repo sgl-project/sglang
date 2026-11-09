@@ -49,13 +49,13 @@ Use `bench_serving` by default unless there are specific needs.
 **`bench_serving`** is an async HTTP load-testing client that sends requests at controlled rates with configurable concurrency to a running server. It measures realistic online serving metrics including time-to-first-token (TTFT), time-per-output-token (TPOT), inter-token latency (ITL), and throughput. Use `num-prompts >= 5 * max-concurrency` to measure steady-state performance. Launch a server with `sglang.launch_server` first.
 
   ```bash Command
-  python3 -m sglang.bench_serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
+  python3 -m sglang.benchmark.serving --backend sglang --max-concurrency 16 --num-prompts 80 --random-input-len 256 --random-output-len 32 --dataset-name random
   ```
 
 **`bench_one_batch_server`** sends a single batch as one HTTP request to a running server. Due to only having a single batch, the server is never in a steady-state and metrics will be biased. Launch a server with `sglang.launch_server` first.
 
   ```bash Command
-  python3 -m sglang.bench_one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  python3 -m sglang.benchmark.one_batch_server --base-url http://127.0.0.1:30000 --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
   - Pass `--enable-multi-batch` and set `--batch-size` to a multiple of the server's `--max-running-requests` to stabilize throughput measurements. Surplus requests are queued by the scheduler and promoted batch-by-batch, amortizing per-request prefill and first-step transients into steady-state decode. Under this flag, only `overall_throughput` is authoritative; `input_throughput`, `output_throughput`, `last_ttft`, and ITL include cross-batch queueing in their denominators and should be treated as informational.
@@ -65,20 +65,20 @@ Use `bench_serving` by default unless there are specific needs.
 **`bench_offline_throughput`** directly instantiates the `Engine` object in-process (no HTTP server) and submits all requests at once via `engine.generate()`. The engine's scheduler handles batching and execution. This measures maximum achievable throughput without any network overhead.
 
   ```bash Command
-  python3 -m sglang.bench_offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
+  python3 -m sglang.benchmark.offline_throughput --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --num-prompts 10
   ```
 
 **`bench_one_batch`** is the lowest-level tool. It directly instantiates a `ModelRunner` and calls `extend()` / `decode()` on a fixed static batch, bypassing the scheduler entirely. The prefill and decode phases are run separately, making profiling easier but rendering the metrics unrealistic. Because there is no dynamic batching, it may run out of memory for batch sizes that a real server can handle (a real server chunks prefill into smaller batches). This is best suited for profiling individual kernel performance.
 
   ```bash Command
-  python3 -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
+  python3 -m sglang.benchmark.one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch-size 32 --input-len 256 --output-len 32
   ```
 
 ## Profile with PyTorch Profiler
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
-### Profile a server with `sglang.bench_serving`
+### Profile a server with `sglang.benchmark.serving`
 
 ```bash Command
 # set trace path
@@ -88,7 +88,7 @@ export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # send profiling request from client
-python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
 
 For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
@@ -116,14 +116,14 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --d
 python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 
 # send profiling request targeting prefill workers
-python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000
 ```
 
 #### Profile Decode Workers
 
 ```bash Command
 # send profiling request targeting decode workers
-python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001
 ```
 
 #### Important Notes
@@ -132,24 +132,24 @@ python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-
 - Both options support multiple worker URLs for multi-instance setups:
   ```bash Command
   # Profile multiple prefill workers
-  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
+  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000 http://127.0.0.1:30002
 
   # Profile multiple decode workers
-  python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
+  python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --profile --pd-separated --profile-decode-url http://127.0.0.1:30001 http://127.0.0.1:30003
   ```
 - Make sure `SGLANG_TORCH_PROFILER_DIR` is set on all worker nodes before starting the servers
 - For more details on setting up PD disaggregation, see [PD Disaggregation Guide](../advanced_features/pd_disaggregation)
 
-### Profile a server with `sglang.bench_offline_throughput`
+### Profile a server with `sglang.benchmark.offline_throughput`
 ```bash Command
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
 # profile one batch with bench_one_batch.py
 # batch size can be controlled with --batch argument
-python3 -m sglang.bench_one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
+python3 -m sglang.benchmark.one_batch --model-path meta-llama/Llama-3.1-8B-Instruct --batch 32 --input-len 1024 --output-len 10 --profile
 
 # profile multiple batches with bench_offline_throughput.py
-python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+python -m sglang.benchmark.offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
 ```
 
 ### Profile a server with `sglang.profiler`
@@ -289,7 +289,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
   }'
 
 # Terminal 3: Send requests to generate load
-python -m sglang.bench_serving --backend sglang --num-prompts 100
+python -m sglang.benchmark.serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
 curl -X POST http://127.0.0.1:30000/stop_profile
@@ -376,7 +376,7 @@ RuntimeError: !stack.empty() INTERNAL ASSERT FAILED at "/pytorch/torch/csrc/auto
 This is likely a PyTorch Bug reported in [Bug: vLLM Profiler](https://github.com/vllm-project/vllm/issues/18240) and [Bug: torch.profiler.profile](https://github.com/pytorch/pytorch/issues/101632). As a workaround, you may disable `with_stack` with an environment variable such as follows:
 ```bash Command
 export SGLANG_PROFILE_WITH_STACK=False
-python -m sglang.bench_offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
+python -m sglang.benchmark.offline_throughput --model-path meta-llama/Llama-3.1-8B-Instruct --dataset-name random --num-prompts 10 --profile --mem-frac=0.8
 ```
 
 ### View traces
@@ -391,7 +391,7 @@ client can generate a small trace file (&lt;100MB) by controlling number of prom
 For example, when profiling a server,
 
 ```bash Command
-python -m sglang.bench_serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
+python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 2 --sharegpt-output-len 100 --profile
 ```
 
 This command sets the number of prompts to 2 with `--num-prompts` argument and limits the length of output sequences to 100 with `--sharegpt-output-len` argument, which can generate a small trace file for browser to open smoothly.
@@ -420,7 +420,7 @@ Additionally, if you want to locate the SGLang Python source code through the cu
 2. To profile a single batch, use
 
    ```bash Command
-   nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.bench_one_batch --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512
+   nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node python3 -m sglang.benchmark.one_batch --model meta-llama/Meta-Llama-3-8B --batch-size 64 --input-len 512
    ```
 
 3. To profile a server, e.g.
@@ -432,7 +432,7 @@ Additionally, if you want to locate the SGLang Python source code through the cu
    nsys profile --trace-fork-before-exec=true --cuda-graph-trace=node -o sglang.out --delay 60 --duration 70 python3 -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disable-radix-cache
 
    # client
-   python3 -m sglang.bench_serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
+   python3 -m sglang.benchmark.serving --backend sglang --num-prompts 1000 --dataset-name random --random-input 1024 --random-output 512
    ```
 
    In practice, we recommend users to set `--duration` argument to a large value. Whenever user wants the server to stop profiling. Firstly run:
@@ -510,7 +510,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 3: Generate workload
-   python -m sglang.bench_serving --backend sglang --num-prompts 100
+   python -m sglang.benchmark.serving --backend sglang --num-prompts 100
    ```
 
 4. Profiling will automatically stop after 10 steps (due to `num_steps: 10`). If you hadn't specified `num_steps`, you would need to manually stop it:
@@ -538,7 +538,7 @@ python -m sglang.launch_server \
 nsys profile --trace-fork-before-exec=true \
   --cuda-graph-trace=node \
   -o layerwise_profile \
-  python -m sglang.bench_serving --backend sglang --num-prompts 10
+  python -m sglang.benchmark.serving --backend sglang --num-prompts 10
 ```
 
 This approach profiles the entire client execution, including all server interactions. The layerwise NVTX markers will be visible in the Nsight Systems timeline.
@@ -571,7 +571,7 @@ In the Nsight Systems GUI, you'll see:
 2. You can benchmark a model with modified configs (e.g., less layers) by using `--json-model-override-args`. For example, you can benchmark a model with only 2 layers and 2 kv heads using:
 
    ```bash Command
-   python -m sglang.bench_one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32 --load-format dummy --json-model-override-args '{"num_hidden_layers": 1, "num_key_value_heads": 1}'
+   python -m sglang.benchmark.one_batch --model-path meta-llama/Meta-Llama-3.1-8B-Instruct --batch 32 --input-len 256 --output-len 32 --load-format dummy --json-model-override-args '{"num_hidden_layers": 1, "num_key_value_heads": 1}'
    ```
 
 3. You can use `--python-backtrace=cuda` to see python call stack for all CUDA kernels, as in PyTorch Profiler. (Caveat: this can cause inaccurately long kernel runtimes for CUDA event based timing)

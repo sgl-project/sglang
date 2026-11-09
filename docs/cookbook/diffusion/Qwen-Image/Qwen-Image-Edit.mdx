@@ -1,25 +1,32 @@
 ---
 title: Qwen-Image-Edit-2511
+description: "Deploy Qwen-Image-Edit-2511 with SGLang - 20B image editing model with text rendering, character consistency, and geometric reasoning."
 metatags:
     description: "Deploy Qwen-Image-Edit-2511 with SGLang - 20B image editing model with text rendering, character consistency, and geometric reasoning."
 ---
 
 import { DiffusionModelTags } from '/src/snippets/diffusion/model-tags.jsx';
-import { QwenImageEditDeployment } from '/src/snippets/diffusion/qwen-image-edit-deployment.jsx';
 
 <DiffusionModelTags tags={["image editing", "text replacement", "character consistency", "multi-person", "20B"]} />
 
-## 1. Model Introduction
+import { Deployment } from '/src/snippets/_deployment.jsx';
+import { config } from '/src/snippets/configs/Qwen/qwen-image-edit.jsx';
+
+## 1. Quick start
+
+Follow the [SGLang Diffusion installation guide](/docs/sglang-diffusion/installation) for your GPU platform.
+
+<a id="2-sglang-diffusion-installation" />
+
+<Deployment config={config} />
+
+<a id="1-model-introduction" />
+
+## 2. Model capabilities
 
 [Qwen-Image-Edit-2511](https://huggingface.co/Qwen/Qwen-Image-Edit-2511) is the 20B editing counterpart to Qwen-Image. It is strongest at changing text, materials, lighting, viewpoint, or composition while reducing drift in regions that were not requested to change.
 
 Choose it for identity-sensitive portrait edits, multi-person composition, typography replacement, and geometry-aware design work. It is substantially heavier than small specialist editors, and consistency is improved rather than guaranteed; evaluate untouched-region drift on the actual editing workload.
-
-## 2. SGLang-diffusion Installation
-
-SGLang-diffusion offers multiple installation methods. You can choose the most suitable installation method based on your hardware platform and requirements.
-
-Please refer to the [official SGLang-diffusion installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for installation instructions.
 
 ## 3. Model Deployment
 
@@ -29,9 +36,7 @@ This section provides deployment configurations optimized for different hardware
 
 Qwen-Image-Edit-2511 is a 20B parameter model optimized for image editing tasks. The recommended launch configurations vary by hardware.
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform.
-
-<QwenImageEditDeployment />
+Use the [command builder](#1-quick-start) above.
 
 ### 3.2 Configuration Tips
 
@@ -43,6 +48,44 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 - `--sp-degree`: Sequence parallelism size (typically should match the number of GPUs)
 - `--ulysses-degree`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree`: The degree of ring attention-style SP in USP
+
+### 3.3 Decompose an image into layers on H200
+
+`Qwen/Qwen-Image-Layered` returns separate RGBA images. For this model,
+`--num-frames 4` requests four output layers. The CLI saves all four PNGs,
+and `DiffGenerator.generate()` returns one result per layer.
+
+On Linux with NVIDIA CUDA and two H200 GPUs, you can run the conditional and
+unconditional branches on separate GPUs:
+
+```bash Command
+CUDA_VISIBLE_DEVICES=0,1 sglang generate \
+  --model-path Qwen/Qwen-Image-Layered \
+  --num-gpus 2 \
+  --cfg-parallel-size 2 \
+  --tp-size 1 \
+  --ulysses-degree 1 \
+  --quality exact \
+  --enable-torch-compile false \
+  --warmup-mode request \
+  --width 640 --height 640 --num-frames 4 \
+  --num-inference-steps 50 --guidance-scale 4.0 --seed 42 \
+  --image-path https://raw.githubusercontent.com/QwenLM/Qwen-Image-Layered/main/assets/test_images/4.png \
+  --prompt "a high quality, cute halloween themed illustration, consistent style and lighting" \
+  --output-path outputs/qwen-layered \
+  --save-output
+```
+
+For a single H200, set `CUDA_VISIBLE_DEVICES=0`, `--num-gpus 1`, and
+`--cfg-parallel-size 1`. Both configurations use eager execution. Layered
+does not currently support breakable CUDA graph; enabling BCG falls back to
+eager execution.
+
+The Layered CFG policy gathers the branch predictions before applying the
+single-GPU arithmetic order, preserving BF16 rounding and alpha values in the
+validated fixed-seed example. Each GPU still holds a full DiT replica, so CFG
+parallelism reduces request latency without reducing the model memory needed
+on each GPU.
 
 ## 4. API Usage
 
@@ -277,3 +320,9 @@ Peak Memory Mean (MB):                   47971.49
 Peak Memory Median (MB):                 47971.29
 ============================================================
 ```
+
+## 6. Run in ComfyUI
+
+import { ComfyUISupport } from '/src/snippets/diffusion/comfyui-support.jsx';
+
+<ComfyUISupport model="qwen-image-edit" />
