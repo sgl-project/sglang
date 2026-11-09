@@ -3,6 +3,9 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Optional, Protocol, runtime_checkable
 
+from sglang.srt.arg_groups.choices import (
+    CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS,
+)
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
     is_deepseek_dsa,
@@ -15,7 +18,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_schedule,
 )
-from sglang.srt.server_args import CHUNKED_PREFIX_CACHE_SUPPORTED_ATTENTION_BACKENDS
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig

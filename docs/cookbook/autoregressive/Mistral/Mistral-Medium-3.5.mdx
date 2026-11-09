@@ -370,7 +370,7 @@ Overall accuracy: 0.586
 #### Latency (Low Concurrency)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 10 \
@@ -399,7 +399,7 @@ Median TPOT (ms):                        14.19
 #### Throughput (High Concurrency)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 1000 \
@@ -431,7 +431,7 @@ Median TPOT (ms):                        42.53
 Same 4× H200 setup, EAGLE configuration from [Section 3.3](#3-3-speculative-decoding-eagle). Single-stream latency benchmark (`--max-concurrency 1`).
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name random \
   --num-prompts 10 \

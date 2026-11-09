@@ -199,35 +199,48 @@ class ParallelTiledVAE(ABC, nn.Module, LayerwiseOffloadableModuleMixin):
 
         return self._decode(z)[:, :, :num_sample_frames]
 
+    @staticmethod
+    def _blend(
+        a: torch.Tensor, b: torch.Tensor, blend_extent: int, dim: int
+    ) -> torch.Tensor:
+        """Cross-fade `a`'s last `blend_extent` slices into `b`'s first along `dim`, in place.
+
+        Bitwise equal to scaling one slice at a time by the Python floats
+        `1 - i / extent` and `i / extent`: those scalars run in the op-math dtype,
+        so the weights are the same doubles rounded to it, and each product is
+        rounded to `b`'s dtype before the add.
+        """
+        blend_extent = min(a.shape[dim], b.shape[dim], blend_extent)
+        if blend_extent <= 0:
+            return b
+        opmath = torch.float64 if b.dtype == torch.float64 else torch.float32
+        shape = [1] * b.dim()
+        shape[dim] = blend_extent
+        take = (
+            torch.arange(blend_extent, device=b.device, dtype=torch.float64)
+            / blend_extent
+        )
+        keep = (1 - take).to(opmath).view(shape)
+        take = take.to(opmath).view(shape)
+        head = b.narrow(dim, 0, blend_extent)
+        tail = a.narrow(dim, a.shape[dim] - blend_extent, blend_extent)
+        head.copy_((tail * keep).to(b.dtype) + (head * take).to(b.dtype))
+        return b
+
     def blend_v(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-2], b.shape[-2], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (
-                1 - y / blend_extent
-            ) + b[:, :, :, y, :] * (y / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-2)
 
     def blend_h(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-1], b.shape[-1], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (
-                1 - x / blend_extent
-            ) + b[:, :, :, :, x] * (x / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-1)
 
     def blend_t(
         self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
     ) -> torch.Tensor:
-        blend_extent = min(a.shape[-3], b.shape[-3], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, x, :, :] = a[:, :, -blend_extent + x, :, :] * (
-                1 - x / blend_extent
-            ) + b[:, :, x, :, :] * (x / blend_extent)
-        return b
+        return self._blend(a, b, blend_extent, dim=-3)
 
     def _spatial_tile_geometry(self) -> tuple[int, int, int, int]:
         return (
