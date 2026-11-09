@@ -62,7 +62,7 @@ from sglang.srt.utils.device import get_compiler_backend
 
 _is_npu = is_npu()
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 logger = logging.getLogger(__name__)
 
 try:

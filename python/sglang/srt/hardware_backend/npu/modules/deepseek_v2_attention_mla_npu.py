@@ -2,7 +2,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 import torch_npu
-from sgl_kernel_npu.norm.fused_split_qk_norm import fused_split_qk_norm
+from sgl_kernel_npu.operators.matmul import batch_matmul_transpose
+from sgl_kernel_npu.operators.norm import fused_split_qk_norm
 
 import sglang.srt.layers.dcp.comm as dcp_comm
 import sglang.srt.layers.dcp.layout as dcp_layout
@@ -361,20 +362,12 @@ def forward_mla_core_npu(
     )
 
     attn_output = attn_output.contiguous()
-    if (
-        attn_output.shape[0] >= 65536
-        or attn_output.shape[-1] * attn_output.shape[-2] >= 65536
-        or m.w_vc.shape[-1] >= 65536
+    # A5 supports the fused transpose matmul beyond the A2/A3 shape guard.
+    if _is_npu_arch35 or (
+        attn_output.shape[0] < 65536
+        and attn_output.shape[-1] * attn_output.shape[-2] < 65536
+        and m.w_vc.shape[-1] < 65536
     ):
-        # npu_transpose_batchmatmul does not support dimensions >= 65536.
-        attn_bmm_output = torch.empty(
-            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
-            dtype=attn_output.dtype,
-            device=attn_output.device,
-        )
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
-    else:
-        # Use the numerically validated torch_npu implementation when supported.
         attn_bmm_output = torch_npu.npu_transpose_batchmatmul(
             attn_output,
             m.w_vc,
@@ -382,6 +375,13 @@ def forward_mla_core_npu(
             perm_x2=(0, 1, 2),
             perm_y=(1, 0, 2),
         )
+    else:
+        attn_bmm_output = torch.empty(
+            (attn_output.shape[0], m.num_local_heads, m.v_head_dim),
+            dtype=attn_output.dtype,
+            device=attn_output.device,
+        )
+        batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
     if gate is not None:
@@ -622,7 +622,7 @@ def forward_dsa_core_npu(
             device=attn_output.device,
         )
         attn_output = attn_output.contiguous()
-        torch.ops.npu.batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
+        batch_matmul_transpose(attn_output, m.w_vc, attn_bmm_output)
 
     attn_bmm_output = attn_bmm_output.reshape(-1, m.num_local_heads * m.v_head_dim)
 

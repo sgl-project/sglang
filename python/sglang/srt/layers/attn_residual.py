@@ -219,9 +219,9 @@ def _mix_fused(
         return prefix_sum
     cw = get_cw(score_proj, score_norm)
     if is_npu():
-        from sgl_kernel_npu.kimi_k3.attn_residual import mix_fused
+        from sgl_kernel_npu.operators.hyper_conn import attn_res_mix_fused
 
-        return mix_fused(
+        return attn_res_mix_fused(
             prefix_sum,
             bank,
             nvb,

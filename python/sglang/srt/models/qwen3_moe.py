@@ -108,7 +108,7 @@ _is_cuda = is_cuda()
 _is_npu = is_npu()
 
 if _is_npu:
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import split_qkv_rmsnorm_rope
+    from sgl_kernel_npu.operators.norm import split_qkv_rmsnorm_rope
 
 
 def compute_yarn_parameters(

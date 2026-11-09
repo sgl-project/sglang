@@ -331,9 +331,7 @@ if _is_npu:
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
         triton_split_qkv_rmsnorm_mrope,
     )
-    from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
-        split_qkvgate_gemma_rmsnorm_rope,
-    )
+    from sgl_kernel_npu.operators.norm import split_qkvgate_gemma_rmsnorm_rope
 
 
 class Qwen3_5GatedDeltaNet(nn.Module):
