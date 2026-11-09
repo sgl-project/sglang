@@ -8,6 +8,7 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.e2e.test_npu_dual_pass import assert_no_regression
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
@@ -15,6 +16,8 @@ register_npu_ci(
     suite="",
     nightly=True,
 )
+
+CASE_ID = "test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa_overlap"
 
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_COMMON_ENVS = {
     "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
@@ -97,19 +100,19 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--attention-backend",
     "dsv4",
     "--watchdog-timeout",
-    9000,
+    18000,
     "--disaggregation-mode",
     "prefill",
     "--disaggregation-transfer-backend",
     "ascend",
     "--mem-fraction-static",
-    0.62,
+    0.60,
     "--prefill-max-requests",
-    256,
+    192,
     "--max-prefill-tokens",
     70000,
     "--max-running-requests",
-    256,
+    192,
     "--chunked-prefill-size",
     131072,
     "--dp-size",
@@ -142,7 +145,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--enable-cache-report",
     "--max-total-tokens",
-    140000,
+    180000,
 ]
 
 # Decode node launch arguments.
@@ -157,15 +160,15 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "--attention-backend",
     "dsv4",
     "--watchdog-timeout",
-    9000,
+    18000,
     "--mem-fraction-static",
-    0.71,
+    0.68,
     "--disaggregation-mode",
     "decode",
     "--disaggregation-transfer-backend",
     "ascend",
     "--max-running-requests",
-    256,
+    192,
     "--dp-size",
     16,
     "--enable-dp-attention",
@@ -173,6 +176,8 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     "deepep",
     "--deepep-mode",
     "low_latency",
+    "--context-length",
+    180000,
     "--quantization",
     "modelslim",
     "--enable-dp-lm-head",
@@ -237,8 +242,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHighOverlap(
     min_hit_rate_pcts = {"host": 0}  # percent: L2 host hit rate must exceed 0%
 
     def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high_overlap(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode without spec decoding."""
+        """Run pass-2 GPQA and assert accuracy within 1% of pass 1."""
         self.run_accuracy()
+        assert_no_regression(self, CASE_ID, self.last_metrics)
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_host_hit_rate_overlap(self):
         """Run the 32k GSP bench; assert_metrics checks the host hit rate"""
