@@ -4354,6 +4354,15 @@ class UnifiedRadixCache(BasePrefixCache):
         """The tail a running request keeps of ``sub_pool`` (`window_lengths`)."""
         return dict(self.window_lengths())[sub_pool]
 
+    def window_checkpoint_interval(self) -> int:
+        """0 unless the cache keeps checkpoints and shares prefixes:
+        `retire_window_rows` applies the checkpoint floor only then."""
+        if not self.is_mamba_enabled or not self.supports_prefix_sharing():
+            return 0
+        from sglang.srt.runtime_context import mamba_track_grid
+
+        return mamba_track_grid(self.page_size)
+
     def window_lengths(self) -> tuple[tuple[str, int], ...]:
         return tuple(
             (name, self.components[slot].sliding_window_size)

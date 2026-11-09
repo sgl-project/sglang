@@ -62,6 +62,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
 
+def branching_checkpoint_depth(
+    full_kv_hit_length: int, mamba_boundary_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """The branch checkpoint depth: the last ``checkpoint_grid`` multiple
+    within the full-KV hit, when past ``mamba_boundary_len``; else None."""
+    aligned = full_kv_hit_length // checkpoint_grid * checkpoint_grid
+    return aligned if aligned > mamba_boundary_len else None
+
+
 class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
     family = TREE_STATE
@@ -189,11 +198,8 @@ class MambaComponent(TreeComponent):
         # that lies beyond the current Mamba boundary. With HiCache, incremental
         # persistence of a new branching state is currently write-through only;
         # write-back eviction may discard the device-only state.
-        aligned_seqlen = (
-            result.full_kv_hit_length // self.mamba_checkpoint_grid
-        ) * self.mamba_checkpoint_grid
-        branching_seqlen = (
-            aligned_seqlen if aligned_seqlen > mamba_boundary_len else None
+        branching_seqlen = branching_checkpoint_depth(
+            result.full_kv_hit_length, mamba_boundary_len, self.mamba_checkpoint_grid
         )
 
         # HiCache: if mamba was evicted from device but has host backup,

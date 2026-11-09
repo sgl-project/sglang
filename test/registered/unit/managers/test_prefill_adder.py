@@ -1255,6 +1255,37 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(req.extend_end)
         self.assertEqual(len(adder.can_run_list), 0)
 
+    def test_a_continuation_below_the_checkpoint_grid_waits(self):
+        """REGRESSION: a continuation whose memory fits less than one
+        checkpoint grid unit waits instead of running an empty chunk."""
+        adder = self.create_adder(
+            self.create_running_batch(), page_size=16, rem_chunk_tokens=64
+        )
+        budget = object.__new__(ChainPrefillBudget)
+        budget.page_size = 16
+        budget.rules = SimpleNamespace(window="joint")
+        budget._fits = lambda full, swa, auxiliary_swa_tokens=0, state_slots=0: (
+            full <= 48
+        )
+        budget.swa_tokens = lambda *args, **kwargs: 0
+        budget.auxiliary_tokens = lambda *args, **kwargs: 0
+        adder.memory_budget = budget
+        adder.mamba_chunk_grid = 64
+        adder.strict_chunk_grid = True
+        # Fitted on the page grid alone, the chunk is 32 tokens.
+        self.assertEqual(
+            budget.fit_chunk(extend_input_len=3072, max_new_tokens=0, chunk_limit=64),
+            32,
+        )
+        req = self.create_mock_req("continuing", priority=0, max_new_tokens=1)
+        req.prefix_len = 1024
+        req.full_untruncated_fill_ids = list(range(4096))
+        req.extend_end = None
+
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertIsNone(req.extend_end)
+        self.assertEqual(adder.can_run_list, [])
+
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
         # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the

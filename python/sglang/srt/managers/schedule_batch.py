@@ -1906,6 +1906,36 @@ def _compute_chunked_req_next_prompt_token(
     return None
 
 
+def prefill_checkpoint_boundary(
+    prefix_len: int, extend_len: int, checkpoint_grid: int
+) -> Optional[int]:
+    """Depth a prefill extend checkpoints at without DCP: the last whole
+    ``checkpoint_grid`` multiple past the prefix; None (no checkpoint, so no
+    window row retires behind one) for an extend shorter than the grid."""
+    if extend_len < checkpoint_grid:
+        return None
+    return prefix_len + extend_len // checkpoint_grid * checkpoint_grid
+
+
+def branch_checkpoint(
+    prefix_len: int,
+    branching_seqlen: Optional[int],
+    track_seqlen: int,
+    cache_chunk_size: int,
+) -> Optional[int]:
+    """The branch depth (`branching_checkpoint_depth`) an extend tracks instead
+    of its own checkpoint, when it lies inside the extend before ``track_seqlen``
+    on the state-chunk grid past the prefix; else None."""
+    if branching_seqlen is None:
+        return None
+    if (
+        prefix_len < branching_seqlen < track_seqlen
+        and (branching_seqlen - prefix_len) % cache_chunk_size == 0
+    ):
+        return branching_seqlen
+    return None
+
+
 @dataclasses.dataclass
 class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     """Store all information of a batch on the scheduler."""
@@ -2640,10 +2670,11 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Chunked prefill can leave an active request off the absolute
             # checkpoint grid. Without DCP, keep tracking snapshots relative to
             # that request prefix so later chunks can continue donating states.
-            mask = req.extend_len >= checkpoint_grid
-            mamba_track_seqlen_aligned = (
-                prefix_len + (req.extend_len // checkpoint_grid) * checkpoint_grid
+            boundary = prefill_checkpoint_boundary(
+                prefix_len, req.extend_len, checkpoint_grid
             )
+            mask = boundary is not None
+            mamba_track_seqlen_aligned = prefix_len if boundary is None else boundary
         track_position = req.kv.mamba_next_track_idx
         mamba_track_seqlen = -1
         if mask:
@@ -2666,22 +2697,19 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
                 mamba_track_seqlen = _force_track_h(mamba_track_seqlen_aligned)
 
-            if req.mamba_branching_seqlen is not None:
-                # track branching point in this forward if the branching point
-                # is within the current extend batch.
-                branching_seqlen_aligned_mask = (
-                    req.mamba_branching_seqlen - req.prefix_len
-                ) % cache_chunk_size == 0
-                if (
-                    req.mamba_branching_seqlen > req.prefix_len
-                    and req.mamba_branching_seqlen < mamba_track_seqlen
-                    and branching_seqlen_aligned_mask
-                ):
-                    # We want to track mamba_track_seqlen_aligned, and it's not the last position,
-                    # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
-                    # See _force_track_h() for more details.
-                    mamba_track_seqlen = _force_track_h(req.mamba_branching_seqlen)
-                    mamba_track_seqlen_aligned = req.mamba_branching_seqlen
+            # Track the branching point instead, if it lies within this extend.
+            branch = branch_checkpoint(
+                req.prefix_len,
+                req.mamba_branching_seqlen,
+                mamba_track_seqlen,
+                cache_chunk_size,
+            )
+            if branch is not None:
+                # We want to track mamba_track_seqlen_aligned, and it's not the last position,
+                # so we need to add 1 to the seqlen to retrieve the correct mamba state from h.
+                # See _force_track_h() for more details.
+                mamba_track_seqlen = _force_track_h(branch)
+                mamba_track_seqlen_aligned = branch
             kv_storage_of(
                 self.req_to_token_pool, self.token_to_kv_pool_allocator
             ).advance(
