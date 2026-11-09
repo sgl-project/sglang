@@ -301,8 +301,6 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                 reqs = [
                     types.SimpleNamespace(
                         seqlen=length + 1,
-                        is_retracted=length == 200,
-                        finished=lambda length=length: length == 300,
                         grammar=None,
                         spec_verify_ct=0,
                         spec_num_correct_drafts=0,
@@ -334,7 +332,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
                     advance_grammar_fsm=settle_grammar,
                 )
                 tokens = SchedulerBatchResultProcessor._resolve_spec_v2_tokens(
-                    processor, result, batch
+                    processor, result, batch, [True, False, False]
                 )
                 self.assertEqual([len(ids) for ids in tokens], [1, 8, 3])
                 self.assertEqual([req.kv.kv_committed_len for req in reqs], [1, 0, 0])
@@ -743,6 +741,8 @@ class TestForwardPassMetrics(unittest.TestCase):
                 self.scheduler._fpm_publisher.metrics.clear()
                 timer, interval = DeviceTimer(), FakeInterval(9)
                 receiver = SchedulerPPMixin()
+                # No unified pool: nothing keeps freed pages on the forward.
+                receiver._on_step_forward_recorded = lambda forward_done: False
                 receiver._pp_spec_relay = speculative
                 receiver.forward_stream_ctx = nullcontext()
                 receiver.forward_stream = Mock()
@@ -1235,6 +1235,139 @@ class TestSchedulerTimeAccounting(CustomTestCase):
             increment_scheduler_stage_seconds=lambda **kwargs: (
                 self.stage_seconds.append(kwargs)
             ),
+        )
+
+    def test_cpu_clock_reset_after_restore_rebases_accounting(self):
+        """CPU clock resets must count CPU time since restore, never decrement."""
+        for is_idle in (False, True):
+            with self.subTest(is_idle=is_idle):
+                registry = prometheus_client.CollectorRegistry()
+                cpu_seconds = prometheus_client.Counter(
+                    "test_scheduler_process_cpu_seconds",
+                    "Scheduler CPU time",
+                    registry=registry,
+                )
+                collector = self.reporter.metrics_collector
+                collector.increment_scheduler_process_cpu_seconds = cpu_seconds.inc
+                with (
+                    patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                        side_effect=[
+                            0,
+                            1_000_000_000,
+                            2_000_000_000,
+                            3_000_000_000,
+                            4_000_000_000,
+                        ],
+                    ),
+                    patch(
+                        "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                        # Each restore starts a new process CPU clock near zero;
+                        # its reading is the CPU time since restore.
+                        side_effect=[
+                            10_000_000_000,
+                            100_000_000,
+                            400_000_000,
+                            10_000_000,
+                            210_000_000,
+                        ],
+                    ),
+                ):
+                    self.reporter.start_scheduler_time_accounting()
+                    for second, expected in enumerate((0.1, 0.4, 0.41, 0.61), start=1):
+                        self.reporter._record_scheduler_time(
+                            is_idle=is_idle, event_ns=second * 1_000_000_000
+                        )
+                        self.assertAlmostEqual(
+                            registry.get_sample_value(
+                                "test_scheduler_process_cpu_seconds_total"
+                            ),
+                            expected,
+                        )
+
+    def test_monotonic_clock_reset_after_restore_rebases_accounting(self):
+        """A backwards monotonic clock must rebase accounting, not stall or go negative."""
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                # Restored on a host with less uptime than the checkpointed one.
+                side_effect=[
+                    10_000_000_000,
+                    11_000_000_000,
+                    1_000_000_000,
+                    2_000_000_000,
+                ],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[1_000_000_000, 1_500_000_000, 50_000_000, 250_000_000],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter._record_scheduler_time(is_idle=True, event_ns=11_000_000_000)
+            # An occupancy window open across the reset would keep measuring
+            # from a pre-restore perf_counter() start.
+            self.reporter._device_timer_window_batch_count = 7
+            for event_ns in (1_000_000_000, 2_000_000_000):
+                self.reporter._record_scheduler_time(is_idle=True, event_ns=event_ns)
+
+        self.assertEqual(self.reporter._device_timer_window_batch_count, 0)
+        self.assertEqual(self.idle_seconds, [1.0, 1.0])
+        self.assertEqual(self.process_cpu_seconds, [0.5, 0.05, 0.2])
+        self.assertTrue(all(kwargs["seconds"] >= 0 for kwargs in self.stage_seconds))
+        self.assertAlmostEqual(
+            sum(kwargs["seconds"] for kwargs in self.stage_seconds), 2.0
+        )
+
+    def test_monotonic_reset_preserves_buffered_idle_and_stage_totals(self):
+        """Restore must publish measured spans even before the reporting deadline."""
+        with (
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.monotonic_ns",
+                side_effect=[
+                    10_000_000_000,
+                    10_200_000_000,
+                    10_300_000_000,
+                    10_500_000_000,
+                    10_600_000_000,
+                    1_000_000_000,
+                    1_100_000_000,
+                    2_000_000_000,
+                ],
+            ),
+            patch(
+                "sglang.srt.managers.scheduler_components.metrics_reporter.time.process_time_ns",
+                side_effect=[1_000_000_000, 50_000_000, 250_000_000],
+            ),
+        ):
+            self.reporter.start_scheduler_time_accounting()
+            self.reporter.record_scheduler_active(event_ns=10_200_000_000)
+            with self.reporter.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_RECV_REQUESTS
+            ):
+                pass
+            with self.reporter.scheduler_stage_metrics.record(
+                SCHEDULER_STAGE_RECV_REQUESTS
+            ):
+                # Restore during a stage must retain its category until it exits.
+                self.reporter._record_scheduler_time(
+                    is_idle=False, event_ns=1_000_000_000
+                )
+            self.reporter._record_scheduler_time(is_idle=True, event_ns=2_000_000_000)
+
+        self.assertEqual(self.idle_seconds, [0.2])
+        self.assertEqual(self.process_cpu_seconds, [0.05, 0.2])
+        self.assertTrue(all(sample["seconds"] >= 0 for sample in self.stage_seconds))
+        self.assertAlmostEqual(
+            sum(sample["seconds"] for sample in self.stage_seconds), 1.6
+        )
+        self.assertAlmostEqual(
+            sum(
+                sample["seconds"]
+                for sample in self.stage_seconds
+                if sample["stage"] == SCHEDULER_STAGE_RECV_REQUESTS
+            ),
+            0.3,
         )
 
     def test_counts_idle_wall_time_and_process_cpu_time(self):
