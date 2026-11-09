@@ -633,6 +633,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         allocate_all_layers: bool = False,
     ) -> int:
         index_head_dim = get_dsa_index_head_dim(kvc.model_config.hf_config)
+        if _is_npu and kvc.server_args.indexer_kv_cache_dtype == "int8":
+            dense_element_size = torch._utils._element_size(kvc.kv_cache_dtype)
+            return sum(
+                index_head_dim + torch._utils._element_size(torch.float16)
+                if layer_id in kvc.npu_int8_indexer_layer_ids
+                else index_head_dim * dense_element_size
+                for layer_id in kvc.npu_indexer_layer_ids
+            )
         indexer_size_per_token = ceil_div(
             DSATokenToKVPool.index_bytes_per_token_for(
                 index_head_dim, get_exec().kernel.enable_fp4_indexer
@@ -643,25 +651,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
-            from sglang.srt.mem_cache.kv_cache_dtype import (
-                QUANT_MODE_TOKEN_INT8,
-                resolve_indexer_quant_mode,
-            )
-
             dtype = kvc.kv_cache_dtype
-            # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
+            # GPU sizing assumes FP8 indexers; NPU also needs dense sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_quant_mode = resolve_indexer_quant_mode(
-                    kvc.server_args.indexer_kv_cache_dtype, dtype
-                )
-                if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
-                    indexer_size_per_token = (
-                        index_head_dim + torch._utils._element_size(torch.float16)
-                    )
-                    element_size = 1
-                else:
-                    indexer_size_per_token = index_head_dim
-                    element_size = torch._utils._element_size(dtype)
+                indexer_size_per_token = index_head_dim
+                element_size = torch._utils._element_size(dtype)
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

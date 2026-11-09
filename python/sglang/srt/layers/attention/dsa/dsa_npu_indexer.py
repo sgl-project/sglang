@@ -232,12 +232,12 @@ class DSANPUIndexerMixin:
                 f"length: {indexer_cache_loc.shape[0]} != {positions.shape[0]}"
             )
         pool = get_token_to_kv_pool()
-        use_quant_indexer = pool.index_k_scale_buffer is not None
-        if use_quant_indexer:
+        index_quant_dtype = pool.get_index_k_quant_dtype(layer_id)
+        if index_quant_dtype is not None:
             k, k_scale = _quantize_npu_indexer_activation(
                 k,
                 pool.indexer_hadamard_128,
-                pool.index_k_store_dtype,
+                index_quant_dtype,
                 pool.index_k_scale_dtype,
             )
             pool.set_index_k_scale_buffer(layer_id, indexer_cache_loc, k_scale)
@@ -296,9 +296,9 @@ class DSANPUIndexerMixin:
             and self.dsa_enable_prefill_cp
             and forward_batch.attn_cp_metadata is not None
         ):
-            if use_quant_indexer:
+            if pool.dsa_kv_cache_store_fp8:
                 raise RuntimeError(
-                    "DSANPUIndexerMixin.do_npu_cp_balance_indexer is not implemented for quantized indexer cache"
+                    "Prefill CP is not implemented for the FP8 indexer cache"
                 )
             topk_indices = self.do_npu_cp_balance_indexer(
                 q.view(-1, self.n_heads, self.head_dim),
@@ -316,15 +316,15 @@ class DSANPUIndexerMixin:
                 else block_table
             )
 
-            if use_quant_indexer:
+            if index_quant_dtype is not None:
                 query, query_scale = _quantize_npu_indexer_activation(
                     q.view(-1, self.n_heads, self.head_dim),
                     pool.indexer_hadamard_128,
-                    pool.index_k_store_dtype,
+                    index_quant_dtype,
                     pool.index_k_scale_dtype,
                 )
 
-                if pool.index_k_store_dtype == torch.int8:
+                if index_quant_dtype == torch.int8:
                     # INT8 keys require FP16 weights
                     op_weights = weights.to(torch.float16)
                     # torch_npu.npu_quant_lightning_indexer is not working

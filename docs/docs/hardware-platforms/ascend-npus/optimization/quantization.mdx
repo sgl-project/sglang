@@ -491,6 +491,33 @@ python3 -m sglang.launch_server \
 > - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
 > - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP4 dispatch. SGLang dynamically quantizes each expert input to MXFP4 immediately before grouped matmul.
 
+## INT8 Lightning Indexer cache for DSA models
+
+DSA models (DeepSeek-V3.2, GLM-5.x) keep a per-layer Lightning Indexer K cache next to the MLA KV cache. `--indexer-kv-cache-dtype int8` stores it as int8 with one fp16 scale per token (130 bytes per token per layer instead of 256 in BF16) and selects top-k tokens with `npu_quant_lightning_indexer`. The main KV cache dtype is unchanged.
+
+Layer selection follows the checkpoint's `quant_model_description.json`:
+
+- Layers with `model.layers.N.self_attn.indexer.quant_type: "INT8_DYNAMIC"` use the INT8 cache; every other indexer layer stays BF16.
+- A description without any per-layer `indexer` key (or a checkpoint that is not ModelSlim) quantizes every allocated indexer layer. A warning is logged unless the top-level `indexer_quant_type` is `"INT8_DYNAMIC"`.
+- `indexer.wq_b.weight` entries only describe weight quantization, so their value never selects a layer. Their presence still marks the description as per-layer, so a checkpoint that lists only those entries marks no layer `INT8_DYNAMIC` and the server refuses to start instead of quantizing everything.
+- Enabling speculative decoding (including MTP) with this flag is rejected at startup. Checkpoints containing unused MTP weights can still be served without speculative decoding.
+
+The top-level `indexer_quant_type` is not a switch. It records what the checkpoint was calibrated for, so a checkpoint carrying `"indexer_quant_type": "INT8_DYNAMIC"` still serves with a BF16 indexer cache unless you set `--indexer-kv-cache-dtype int8`. Weight quantization does not enable the indexer cache option.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path MODEL_PATH \
+    --quantization modelslim \
+    --indexer-kv-cache-dtype int8 \
+    --device npu --attention-backend ascend
+```
+
+> **Implementation Notes:**
+> - K and Q are rotated by a normalized 128x128 Hadamard matrix and quantized per token with `npu_dynamic_quant`. Scales are dynamic, as in vLLM-Ascend, which builds the same matrix from scipy and ignores the `indexer.q_rot` / `indexer.k_rot` tensors it loads.
+> - Not supported together with an FP8 KV cache (including ModelSlim FP8 storage), `--enable-hierarchical-cache`, `--enable-hisparse`, `--disaggregation-decode-enable-offload-kvcache`, `--disaggregation-decode-retraction-backup host_pool`, or `SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD`; the server refuses to start rather than silently dropping the int8 cache.
+> - Prefill context parallelism and pipeline-parallel PD disaggregation are not supported with this flag and are rejected at startup. Other PD deployments must use the same flag value and checkpoint on both peers.
+> - Memory profiling sums the actual indexer storage for the layers allocated on each rank: 130 bytes/token for INT8, 256 for BF16. One INT8 plus one BF16 layer costs 386 bytes/token before DCP replication; existing page padding is unchanged. When the existing compact layout is enabled, shared indexer layers do not allocate cache slots.
+
 ## Diffusion Model Quantization on Ascend NPU
 
 SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2/A3 Series.

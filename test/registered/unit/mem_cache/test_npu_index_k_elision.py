@@ -38,7 +38,7 @@ INDEXER_LAYERS = (0, 3, 6)
 
 
 def _kvc():
-    return types.SimpleNamespace(
+    fields = dict(
         modelslim_cache_layout=None,
         model_config=types.SimpleNamespace(
             hf_config=types.SimpleNamespace(
@@ -54,12 +54,19 @@ def _kvc():
         layer_info=types.SimpleNamespace(
             start_layer=0, end_layer=NUM_LAYERS, num_effective_layers=NUM_LAYERS
         ),
-        server_args=types.SimpleNamespace(enable_hisparse=False),
+        server_args=types.SimpleNamespace(
+            enable_hisparse=False, indexer_kv_cache_dtype=None
+        ),
         mambaish_config=None,
         is_draft_worker=False,
         kv_cache_dtype=torch.bfloat16,
         device="cpu",
     )
+
+    configurator = KVCacheConfigurator.__new__(KVCacheConfigurator)
+    for name, value in fields.items():
+        setattr(configurator, name, value)
+    return configurator
 
 
 class TestNpuIndexKElision(CustomTestCase):
@@ -76,9 +83,9 @@ class TestNpuIndexKElision(CustomTestCase):
         with patch(
             "sglang.srt.hardware_backend.npu.memory_pool_npu.NPUMLATokenToKVPool"
         ) as pool_cls:
-            KVCacheConfigurator._build_ascend_mla_kv_pool(
-                kvc, max_total_num_tokens=1024, is_dsa_model=True
-            )
+            with patch("sglang.srt.mem_cache.kv_cache_configurator._is_npu", True):
+                kvc._resolve_npu_indexer_layers()
+            kvc._build_ascend_mla_kv_pool(max_total_num_tokens=1024, is_dsa_model=True)
         self.assertEqual(pool_cls.call_args.kwargs["indexer_layer_ids"], INDEXER_LAYERS)
 
         cell_size = (

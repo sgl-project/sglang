@@ -395,6 +395,7 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
         pool.index_head_dim = 2
         pool.page_size = 8
         pool.index_page_size = 8
+        pool.indexer_layer_ids = (0,)
         pool.index_k_buffer = [torch.empty(4, 8, 1, 2)]
         pool.index_k_scale_buffer = [torch.empty(4, 8, 1)]
 
@@ -417,6 +418,52 @@ class TestNpuDcpBufferAndLseHelpers(unittest.TestCase):
                 pool.index_k_scale_buffer[0][0].nbytes * pool.dcp_size,
             ],
         )
+
+    def test_mixed_indexer_transfer_keeps_layer_order_and_skips_absent_scales(self):
+        """PD metadata and retraction must pair each K/scale with its model layer,
+        even with a PP offset and compact indexer layers.
+        """
+        pool = object.__new__(NPUMLATokenToKVPool)
+        pool.start_layer = 4
+        pool.layer_num = 4
+        pool.layer_transfer_counter = None
+        pool.dtype = pool.store_dtype = torch.bfloat16
+        pool.dsa_kv_cache_store_fp8 = False
+        pool.is_draft_worker = False
+        pool.dcp_size = 2
+        pool.index_head_dim = 128
+        pool.indexer_layer_ids = (4, 6, 7)
+        pool.indexer_layer_id_to_slot = {4: 0, 6: 1, 7: 2}
+        pool.int8_indexer_layer_ids = frozenset({6})
+        pool.k_buffer = torch.empty(4, 2, 8, 1, 2)
+        pool.v_buffer = torch.empty(4, 2, 8, 1, 1)
+        pool.index_k_buffer = [
+            torch.empty(2, 8, 1, 128, dtype=dtype)
+            for dtype in (torch.bfloat16, torch.int8, torch.bfloat16)
+        ]
+        scale = torch.empty(2, 8, 1, dtype=torch.float16)
+        pool.index_k_scale_buffer = [None, scale, None]
+
+        self.assertIs(pool.get_index_k_buffer(6), pool.index_k_buffer[1])
+        self.assertIs(pool.get_index_k_scale_buffer(6), scale)
+        self.assertEqual(pool.get_index_k_quant_dtype(6), torch.int8)
+        self.assertIsNone(pool.get_index_k_quant_dtype(7))
+        self.assertIsNone(pool.get_index_k_scale_buffer(7))
+        self.assertEqual(pool.get_state_layer_ids(), [4, 6, 7, 6])
+        buffers = pool.index_k_buffer + [scale]
+        ptrs, lens, strides = pool.get_state_buf_infos()
+        self.assertEqual(ptrs, [buf.data_ptr() for buf in buffers])
+        self.assertEqual(lens, [buf.nbytes for buf in buffers])
+        self.assertEqual(strides, [buf[0].nbytes for buf in buffers])
+        self.assertEqual(
+            pool.get_kv_size_bytes(),
+            pool.k_buffer.nbytes + pool.v_buffer.nbytes + sum(lens),
+        )
+        self.assertEqual(len(pool._get_cpu_offload_layer_buffers(1)), 2)
+        self.assertEqual(len(pool._get_cpu_offload_layer_buffers(2)), 4)
+        self.assertEqual(len(pool._get_cpu_offload_layer_buffers(3)), 3)
+        _, _, pd_strides = pool.get_contiguous_buf_infos()
+        self.assertEqual(pd_strides[-4:], [stride * 2 for stride in strides])
 
     def test_lse_merge_world_size_one_is_identity(self):
         group = _FakeGroup(world_size=1)

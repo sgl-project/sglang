@@ -427,6 +427,8 @@ class KVCacheConfigurator:
     draft_owns_its_depth: bool = field(init=False)
     draft_swa_full_capacity: bool = field(init=False)
     modelslim_cache_layout: Optional[Any] = field(init=False, default=None)
+    npu_indexer_layer_ids: tuple[int, ...] = field(init=False, default=())
+    npu_int8_indexer_layer_ids: frozenset[int] = field(init=False, default=frozenset())
     _unified_plan: Any = field(init=False, default=None)
     _unified_sized: Any = field(init=False, default=None)
 
@@ -474,6 +476,8 @@ class KVCacheConfigurator:
                 self.model,
                 use_mla_backend=self.use_mla_backend,
             )
+
+        self._resolve_npu_indexer_layers()
 
     def hybrid_swa_token_capacity(
         self,
@@ -2131,6 +2135,80 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _resolve_npu_indexer_layers(self) -> None:
+        """Resolve the pool's indexer ownership and dtype before memory profiling."""
+        if not _is_npu and self.server_args.indexer_kv_cache_dtype is None:
+            return
+        is_dsa_model = is_deepseek_dsa(self.model_config.hf_config)
+        layer_ids = ()
+        if is_dsa_model:
+            if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):
+                layer_ids = tuple(
+                    layer_id
+                    for layer_id in range(
+                        self.layer_info.start_layer, self.layer_info.end_layer
+                    )
+                    if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
+                )
+            else:
+                layer_ids = tuple(
+                    range(
+                        self.layer_info.start_layer,
+                        self.layer_info.start_layer
+                        + self.layer_info.num_effective_layers,
+                    )
+                )
+        self.npu_indexer_layer_ids = layer_ids
+        self.npu_int8_indexer_layer_ids = frozenset()
+        if self.server_args.indexer_kv_cache_dtype != "int8":
+            return
+
+        from sglang.srt.hardware_backend.npu.dsa_int8_indexer import (
+            resolve_npu_int8_indexer_layer_ids,
+        )
+
+        # The weight loader resolves remote checkpoint metadata too; the
+        # ModelConfig lookup below only knows about local model paths.
+        quant_description = getattr(
+            getattr(self.model, "quant_config", None), "quant_description", None
+        )
+        if quant_description is None:
+            quant_description = self.model_config._find_quant_modelslim_config()
+        cache_dtypes = [self.kv_cache_dtype]
+        if self.modelslim_cache_layout is not None:
+            cache_dtypes += [
+                self.modelslim_cache_layout.key_dtype,
+                self.modelslim_cache_layout.value_dtype,
+            ]
+        memory_config = get_memory()
+        disagg_config = get_disagg()
+        self.npu_int8_indexer_layer_ids = resolve_npu_int8_indexer_layer_ids(
+            is_npu=_is_npu,
+            index_head_dim=self.model_config.index_head_dim if is_dsa_model else None,
+            kv_cache_is_fp8=any(
+                dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+                for dtype in cache_dtypes
+            ),
+            enable_hierarchical_cache=memory_config.enable_hierarchical_cache,
+            enable_decode_kv_offload=(
+                disagg_config.disaggregation_decode_enable_offload_kvcache
+            ),
+            enable_decode_host_backup=(
+                disagg_config.disaggregation_decode_retraction_backup == "host_pool"
+            ),
+            enable_hisparse=memory_config.enable_hisparse,
+            enable_sparse_kv_offload=envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get(),
+            enable_speculative_decoding=(
+                self.is_draft_worker or not self.spec_algorithm.is_none()
+            ),
+            enable_prefill_cp=get_parallel().attn_cp_size > 1,
+            enable_pp_disaggregation=(
+                self.pp_size > 1 and disagg_config.disaggregation_mode != "null"
+            ),
+            candidate_layer_ids=layer_ids,
+            modelslim_quant_description=quant_description,
+        )
+
     def _build_ascend_mla_kv_pool(
         self, *, max_total_num_tokens: int, is_dsa_model: bool
     ) -> KVCache:
@@ -2147,21 +2225,6 @@ class KVCacheConfigurator:
         else:
             index_size = max_total_num_tokens * dcp_size
         is_arch35 = is_npu_arch35()
-        # Shared layers never access the indexer; pool sizing uses the same gate
-        # so the saved indexer memory can be used for additional KV tokens.
-        use_compact_indexer_layout = is_dsa_model and _should_elide_dsa_index_k(
-            is_draft_worker=self.is_draft_worker
-        )
-        indexer_layer_ids = None
-        if use_compact_indexer_layout:
-            indexer_layer_ids = tuple(
-                layer_id
-                for layer_id in range(
-                    self.layer_info.start_layer,
-                    self.layer_info.end_layer,
-                )
-                if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
-            )
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
@@ -2174,7 +2237,8 @@ class KVCacheConfigurator:
             index_head_dim=(self.model_config.index_head_dim if is_dsa_model else None),
             index_size=index_size,
             index_page_size=get_schedule().page_size,
-            indexer_layer_ids=indexer_layer_ids,
+            indexer_layer_ids=self.npu_indexer_layer_ids,
+            int8_indexer_layer_ids=tuple(sorted(self.npu_int8_indexer_layer_ids)),
             kv_cache_dim=(
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
