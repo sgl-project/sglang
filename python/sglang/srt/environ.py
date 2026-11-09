@@ -634,6 +634,9 @@ class Envs:
     # HND KV layout folds (page, head) into one paged index for per-kv-head sparse
     # page tables (DP attn); paged backends like trtllm_mha consume it directly.
     SGLANG_USE_HND_KVCACHE = EnvBool(False)
+    # ROCm only: GB kept free for non-torch allocations (HIP scratch, RCCL) by capping
+    # torch's caching allocator after startup; 0 leaves it uncapped.
+    SGLANG_TORCH_MEM_HEADROOM_GB = EnvFloat(0.0)
     # --enable-kv-cache-sharding: register single-node prefix gather scratch
     # as NCCL symmetric memory and request copy engines on its dedicated
     # communicator. Leave NCCL_CTA_POLICY unset to preserve per-comm policies.

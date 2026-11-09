@@ -409,6 +409,7 @@ from sglang.srt.utils import (
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.device import is_confidential_compute, is_npu
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
+from sglang.srt.utils.torch_allocator_headroom import cap_torch_allocator_for_headroom
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.srt.utils.weight_versions import record_weight_version_events
 
@@ -1332,6 +1333,11 @@ class Scheduler(
                 f"context_len={self.model_config.context_len}, "
                 f"{'available_cpu_mem' if self.device == 'cpu' else 'available_gpu_mem'}="
                 f"{self.startup_available_gpu_memory_gb:.2f} GB"
+            )
+        if _is_hip:
+            cap_torch_allocator_for_headroom(
+                device=get_device().gpu_id,
+                headroom_gb=envs.SGLANG_TORCH_MEM_HEADROOM_GB.get(),
             )
 
     def emit_metrics_constants(self) -> None:
