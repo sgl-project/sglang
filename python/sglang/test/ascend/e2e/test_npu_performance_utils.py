@@ -404,8 +404,8 @@ def run_bench_serving(
       - cache_hit_rate_pct: overall KV hit rate across all tiers
       - device_hit_rate_pct: L1 tier hit rate (device = GPU/NPU memory)
       - host_hit_rate_pct: L2 tier hit rate (host = CPU memory / HiCache)
-      - storage_hit_rate_pct: L3 tier hit rate (storage backend, e.g.
-        npu_memcache)
+      - storage_hit_rate_pct: L3 tier hit rate, i.e. the share of all cached
+        tokens served by the hierarchical-cache storage backend
     Thresholds for these tiers are declared on the test case as the
     min_hit_rate_pcts class attribute and enforced by assert_metrics,
     which requires cache_report=True to have any values to check.
