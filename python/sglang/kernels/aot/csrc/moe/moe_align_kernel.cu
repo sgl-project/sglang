@@ -42,6 +42,47 @@ __global__ void count_and_sort_expert_tokens_kernel(
   }
 }
 
+// Same api as count_and_sort_expert_tokens_kernel, with the histogram privatised
+// in shared memory.
+template <typename scalar_t>
+__global__ void count_and_sort_expert_tokens_lds_kernel(
+    const scalar_t* __restrict__ topk_ids,
+    int32_t* __restrict__ sorted_token_ids,
+    int32_t* __restrict__ cumsum_buffer,
+    size_t numel,
+    bool ignore_invalid_expert,
+    int32_t num_experts) {
+  extern __shared__ int32_t smem[];
+  int32_t* s_count = smem;               // [num_experts] counts, reused as cursors
+  int32_t* s_base = smem + num_experts;  // [num_experts] start of this block's run
+
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x)
+    s_count[e] = 0;
+  __syncthreads();
+
+  const size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t stride = blockDim.x * gridDim.x;
+
+  for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+    atomicAdd(&s_count[topk_ids[i] + 1], 1);
+  }
+  __syncthreads();
+
+  for (int e = threadIdx.x; e < num_experts; e += blockDim.x) {
+    s_base[e] = s_count[e] ? atomicAdd(&cumsum_buffer[e], s_count[e]) : 0;
+    s_count[e] = 0;
+  }
+  __syncthreads();
+
+  for (size_t i = tid; i < numel; i += stride) {
+    if (ignore_invalid_expert && topk_ids[i] < 0) continue;
+    const int32_t expert_id = topk_ids[i] + 1;
+    const int32_t rank_in_block = atomicAdd(&s_count[expert_id], 1);
+    sorted_token_ids[s_base[expert_id] + rank_in_block] = i;
+  }
+}
+
 #ifdef __CUDA_ARCH__
 __device__ __forceinline__ int warp_exclusive_scan(int v, unsigned mask = 0xffffffffu) {
   int original = v;
@@ -386,6 +427,17 @@ void moe_align_block_size(
       const int max_blocks = 65535;
       const int actual_blocks = std::min(num_blocks, max_blocks);
 
+#ifdef USE_ROCM
+      // Avoid serialised atomic add by using LDS.
+      auto sort_kernel = count_and_sort_expert_tokens_lds_kernel<scalar_t>;
+      sort_kernel<<<std::min(actual_blocks, 256), block_threads, 2 * num_experts * sizeof(int32_t), stream>>>(
+          topk_ids.data_ptr<scalar_t>(),
+          sorted_token_ids.data_ptr<int32_t>(),
+          cumsum_buffer.data_ptr<int32_t>(),
+          topk_ids.numel(),
+          ignore_invalid_expert,
+          static_cast<int32_t>(num_experts));
+#else
       auto sort_kernel = count_and_sort_expert_tokens_kernel<scalar_t>;
       sort_kernel<<<actual_blocks, block_threads, 0, stream>>>(
           topk_ids.data_ptr<scalar_t>(),
@@ -393,6 +445,7 @@ void moe_align_block_size(
           cumsum_buffer.data_ptr<int32_t>(),
           topk_ids.numel(),
           ignore_invalid_expert);
+#endif
     }
   });
 }

@@ -3,13 +3,14 @@
 The caller selects active layernorm SP. Decode continues to use the canonical
 TRTLLM parameters. DeepGEMM's ``weight_layout="trtllm"`` reads the same
 final weight and scale storage directly. Both kernels apply Muse's
-per-expert norm before the route-weighted sum, using DeepGEMM.
+per-expert norm before the route-weighted sum, using patched DeepGEMM.
 """
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import inspect
 import logging
 import os
 
@@ -18,6 +19,51 @@ import torch
 logger = logging.getLogger(__name__)
 
 _MEGAMOE_SYMM_BUFFERS: dict = {}
+_REQUIRED_ARGUMENTS = (
+    "post_expert_norm",
+    "post_expert_norm_weight",
+    "post_expert_norm_eps",
+    "post_expert_norm_weight_first",
+    "weight_layout",
+)
+
+
+def require_muse_megamoe_patch() -> None:
+    """Fail closed if either checkpoint dtype would silently omit its norm."""
+    try:
+        import deep_gemm
+    except ImportError as exc:
+        raise RuntimeError("Muse MegaMoE requires the patched DeepGEMM build.") from exc
+
+    for name, required in (
+        ("fp8_fp4_mega_moe", _REQUIRED_ARGUMENTS),
+        ("bf16_mega_moe", _REQUIRED_ARGUMENTS),
+    ):
+        try:
+            params = inspect.signature(getattr(deep_gemm, name)).parameters
+        except (AttributeError, TypeError, ValueError):
+            params = {}
+        missing = [arg for arg in required if arg not in params]
+        if missing:
+            raise RuntimeError(
+                f"Muse MegaMoE requires the DeepGEMM post-expert-norm and "
+                "shared-weight patches; "
+                f"{name} is missing {missing}. Apply docker/muse_spark/deep_gemm.patch "
+                "with docker/muse_spark/apply_deep_gemm_patches.sh and rebuild DeepGEMM."
+            )
+
+    try:
+        wrapper = getattr(deep_gemm, "nvfp4_mega_moe")
+        inspect.signature(wrapper).bind(
+            None, None, None, None, **dict.fromkeys(_REQUIRED_ARGUMENTS)
+        )
+    except (AttributeError, TypeError, ValueError) as exc:
+        raise RuntimeError(
+            "Muse MegaMoE requires a patched nvfp4_mega_moe wrapper accepting "
+            "the norm and weight-layout arguments. Apply the vendored DeepGEMM patch "
+            "and rebuild DeepGEMM."
+        ) from exc
+
 
 # DeepGEMM reads this on every MegaMoE launch; an empty value keeps its heuristic.
 _TILES_ENV = "DG_MEGA_MOE_TILES"
@@ -148,6 +194,7 @@ def build_nvfp4_megamoe_weights(layer) -> None:
     """
     if getattr(layer, "_megamoe_metadata_prepared", False):
         return
+    require_muse_megamoe_patch()
 
     mma_type = "nvfp4xnvfp4"
     _check_canonical_weights(layer, mma_type)
@@ -200,6 +247,7 @@ def build_bf16_megamoe_weights(layer) -> None:
     """Validate canonical BF16 experts before TRT-LLM shuffles them in place."""
     if getattr(layer, "_megamoe_metadata_prepared", False):
         return
+    require_muse_megamoe_patch()
     _check_canonical_weights(layer, "bf16xbf16")
     if (
         layer.gate_up_proj.dtype != torch.bfloat16

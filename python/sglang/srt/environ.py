@@ -1255,6 +1255,19 @@ class Envs:
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
     SGLANG_OPT_SM120_NVFP4_PHASE_LAYOUT = EnvBool(False)
     SGLANG_OPT_SM120_MTP_ROUTER_TOP22 = EnvBool(False)
+    # Select the native reference implementation for Muse Spark's NVFP4
+    # post-expert normalization and weighted-sum finalize.
+    SGLANG_USE_MUSE_SPARK_NVFP4_NATIVE_FINALIZE = EnvBool(False)
+    # Keep Muse Spark's checkpoint-layout NVFP4 experts next to their Marlin
+    # repack so weight updates and the weight checker work; costs one more
+    # copy of the routed experts in GPU memory.
+    SGLANG_ENABLE_MUSE_SPARK_NVFP4_WEIGHT_UPDATE = EnvBool(False)
+    # Run Muse Spark's fp32 router projection as a pair of bf16 GEMMs
+    # (a two-limb split of the weight) instead of one fp32 FFMA GEMM.
+    SGLANG_USE_MUSE_SPARK_SPLIT_BF16_ROUTER = EnvBool(False)
+    # Use the experimental FlyDSL split-K paged GQA kernel for Muse Spark's
+    # short-window decode layers on gfx950.
+    SGLANG_MUSE_FLYDSL_DECODE = EnvBool(False)
     # Master switch for the experimental TRT-LLM LoRA fast path; when OFF (default) every
     # fine-grained opt switch reads False, keeping non-experimental paths byte-identical.
     SGLANG_EXPERIMENTAL_LORA_OPTI = EnvBool(False)
@@ -1292,6 +1305,9 @@ class Envs:
     # ===================================================================
     SGLANG_TRITON_DECODE_ATTN_STATIC_KV_SPLITS = EnvBool(False)
     SGLANG_USE_CUSTOM_TRITON_KERNEL_CACHE = EnvBool(False)
+    SGLANG_USE_CUSTOM_ROUTER_SUM = EnvBoolWithAlias(
+        False, deprecated_name="SGLANG_USE_TRITON_ROUTER_SUM"
+    )
     # A-B kill-switch for Work-Centric (Lean) Attention. When True, forces the
     # standard Triton decode kernel even if --enable-lean-attention or the auto-gate
     # would select Lean. Used to isolate the Lean kernel in benchmarks.

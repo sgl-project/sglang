@@ -3307,6 +3307,8 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             self.lm_head = PPMissingLayer()
         self.logits_processor = LogitsProcessor(config)
 
+        self.init_unified_loader_mappings()
+
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: {
                 layer_id: self.model.layers[layer_id].mlp.get_moe_weights()

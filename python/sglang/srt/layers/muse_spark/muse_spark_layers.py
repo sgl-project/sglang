@@ -93,9 +93,19 @@ class MuseSpark1xRMSNorm(nn.Module):
     @torch.no_grad()
     def precompute_effective_weight(self) -> None:
         if self.weight is not None and self.zero_centered_gamma:
-            object.__setattr__(
-                self, "_frozen_weight", (self.weight + self.gain_center).detach()
-            )
+            value = (self.weight + self.gain_center).detach()
+            frozen = self._frozen_weight
+            if (
+                frozen is not None
+                and frozen.shape == value.shape
+                and frozen.dtype == value.dtype
+                and frozen.device == value.device
+            ):
+                # Refresh in place: fused ops and captured CUDA graphs hold this
+                # tensor's address, and weight syncs call this after every update.
+                frozen.copy_(value)
+            else:
+                object.__setattr__(self, "_frozen_weight", value)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if x.numel() == 0:
@@ -170,10 +180,21 @@ class MuseSpark1xNormPreservingResidualConnection(nn.Module):
             alpha, beta = self._coefficients(
                 self.gate.view(1, -1).float() / self.temperature
             )
-            self._alpha = (
-                alpha if isinstance(alpha, torch.Tensor) else torch.tensor(alpha)
-            )
-            self._beta = beta
+            if not isinstance(alpha, torch.Tensor):
+                alpha = torch.tensor(alpha, device=beta.device)
+            # In place when possible: the fused boundary ops alias these buffers and
+            # weight syncs recompute them after every update.
+            for name, value in (("_alpha", alpha), ("_beta", beta)):
+                current = getattr(self, name)
+                if (
+                    current is not None
+                    and current.shape == value.shape
+                    and current.dtype == value.dtype
+                    and current.device == value.device
+                ):
+                    current.copy_(value)
+                else:
+                    setattr(self, name, value)
 
     def forward(self, stream: torch.Tensor, branch: torch.Tensor) -> torch.Tensor:
         if stream.numel() == 0:
