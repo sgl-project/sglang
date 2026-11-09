@@ -15,7 +15,8 @@ from sglang.multimodal_gen.configs.models.dits.sana_wm import (
     SanaWMArchConfig,
     SanaWMConfig,
 )
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+from sglang.multimodal_gen.runtime.models.dits.sana_wm import SanaWMTransformer3DModel
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _CACHE_TYPE_CONCAT,
     _CACHE_TYPE_STATE,
     _NUM_STREAM_CACHE_SLOTS,
@@ -26,7 +27,6 @@ from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
     _SLOT_SHORTCONV,
     _SLOT_TYPE_FLAG,
     _SLOT_V,
-    SanaWMTransformer3DModel,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming import (
     SanaWMStreamingDenoisingStage as Stage,

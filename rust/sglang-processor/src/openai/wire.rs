@@ -63,22 +63,49 @@ pub(super) fn malformed_output_reply(missing: &str) -> Reply {
     error_reply(&message, "InternalServerError", 500)
 }
 
-/// `HTTPStatus(code).name` for the codes SGLang aborts with.
+/// `HTTPStatus(code).name` for an error status, as Python 3.12 names it.
 pub(super) fn http_status_name(code: u64) -> Option<&'static str> {
     Some(match code {
         400 => "BAD_REQUEST",
         401 => "UNAUTHORIZED",
+        402 => "PAYMENT_REQUIRED",
         403 => "FORBIDDEN",
         404 => "NOT_FOUND",
+        405 => "METHOD_NOT_ALLOWED",
+        406 => "NOT_ACCEPTABLE",
+        407 => "PROXY_AUTHENTICATION_REQUIRED",
         408 => "REQUEST_TIMEOUT",
+        409 => "CONFLICT",
+        410 => "GONE",
+        411 => "LENGTH_REQUIRED",
+        412 => "PRECONDITION_FAILED",
         413 => "REQUEST_ENTITY_TOO_LARGE",
+        414 => "REQUEST_URI_TOO_LONG",
+        415 => "UNSUPPORTED_MEDIA_TYPE",
+        416 => "REQUESTED_RANGE_NOT_SATISFIABLE",
+        417 => "EXPECTATION_FAILED",
+        418 => "IM_A_TEAPOT",
+        421 => "MISDIRECTED_REQUEST",
         422 => "UNPROCESSABLE_ENTITY",
+        423 => "LOCKED",
+        424 => "FAILED_DEPENDENCY",
+        425 => "TOO_EARLY",
+        426 => "UPGRADE_REQUIRED",
+        428 => "PRECONDITION_REQUIRED",
         429 => "TOO_MANY_REQUESTS",
+        431 => "REQUEST_HEADER_FIELDS_TOO_LARGE",
+        451 => "UNAVAILABLE_FOR_LEGAL_REASONS",
         500 => "INTERNAL_SERVER_ERROR",
         501 => "NOT_IMPLEMENTED",
         502 => "BAD_GATEWAY",
         503 => "SERVICE_UNAVAILABLE",
         504 => "GATEWAY_TIMEOUT",
+        505 => "HTTP_VERSION_NOT_SUPPORTED",
+        506 => "VARIANT_ALSO_NEGOTIATES",
+        507 => "INSUFFICIENT_STORAGE",
+        508 => "LOOP_DETECTED",
+        510 => "NOT_EXTENDED",
+        511 => "NETWORK_AUTHENTICATION_REQUIRED",
         _ => return None,
     })
 }
@@ -91,6 +118,8 @@ pub(super) fn usage(prompt: u64, completion: u64, reasoning: u64, cached: Option
         "completion_tokens": completion,
         "prompt_tokens_details": cached.map(|n| json!({"cached_tokens": n})),
         "reasoning_tokens": reasoning,
+        // OpenAI's place for the reasoning count, set only when there is some.
+        "completion_tokens_details": (reasoning > 0).then(|| json!({"reasoning_tokens": reasoning})),
     })
 }
 
@@ -159,12 +188,28 @@ pub(super) struct StreamState {
 impl StreamState {
     /// An engine error replaces the reply until the first chunk has been sent.
     pub(super) fn error(&mut self, error: GenerateStreamError) -> Result<Vec<String>, Reply> {
+        let (message, err_type, code) = engine_error_parts(error);
         if !self.started {
-            return Err(engine_error_reply(error));
+            // Python's `/generate` streams a scheduler abort as a frame and
+            // sends only 400 error frames, so a 500 is a host's own failure:
+            // `handle_request`'s generic `InternalServerError`.
+            if code == 500 {
+                let message = format!("Internal server error: {message}");
+                return Err(error_reply(&message, "InternalServerError", code));
+            }
+            return Err(error_reply(&message, &err_type, code));
         }
         self.failed = true;
-        let (message, err_type, code) = engine_error_parts(error);
-        Ok(vec![stream_error_event(&message, &err_type, code)])
+        // Mid-stream, Python's abort event is typed by the status's name.
+        let event_type = match code {
+            400 => None,
+            _ => http_status_name(code.into()),
+        };
+        Ok(vec![stream_error_event(
+            &message,
+            event_type.unwrap_or(&err_type),
+            code,
+        )])
     }
 
     /// An abort or error just ended the stream; Python stops there, without
@@ -263,6 +308,19 @@ pub(super) fn logprob_slice<T>(items: &[T], prev: usize, total: usize, increment
         let start = prev.min(items.len());
         &items[start..start + total.saturating_sub(prev).min(items.len() - start)]
     }
+}
+
+/// `output_token_logprobs_length`, or, for frames without it, the count the
+/// frame's list implies.
+pub(super) fn logprobs_length(meta: &GenerateMetaInfo, prev: usize, incremental: bool) -> usize {
+    if let Some(length) = meta.output_token_logprobs_length {
+        return length as usize;
+    }
+    let listed = meta
+        .output_token_logprobs
+        .as_ref()
+        .map_or(0, |logprobs| logprobs.entries.len());
+    if incremental { prev + listed } else { listed }
 }
 
 #[cfg(test)]

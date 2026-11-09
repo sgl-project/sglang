@@ -21,7 +21,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.utils import get_device
 from sglang.srt.utils.common import temp_set_env
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
@@ -682,6 +682,84 @@ class TestTritonAttention(CustomTestCase):
             self.assertTrue(cos_sim.item() > 1 - (1e-5))
             self.assertTrue(torch.allclose(o[start:end], o_torch, atol=1e-2))
 
+    def test_extend_attention_int32_kv_indices_above_2g(self):
+        """Regression for int32 KV offset overflow in the extend kernels.
+
+        With int32 kv_indices, slot * stride wraps once slot >= 2**31 / stride.
+        Slots sit just below 2**32 / stride so a wrapped offset lands on the
+        zero rows in front of the buffer and shows up as a mismatch, not a
+        fault. Needs ~8.6 GB.
+        """
+        device = get_device()
+        dtype = torch.bfloat16
+        B, P, E, H_Q, D = 2, 64, 16, 8, 128
+        pad, num_slots = 256, 2**32 // D
+        big = torch.zeros(pad + num_slots, 1, D, dtype=dtype, device=device)
+        kv_buffer = big[pad:]
+
+        q = torch.randn(B * E, H_Q, D, dtype=dtype, device=device)
+        kv = torch.randn(B, P + E, 1, D, dtype=dtype, device=device)
+        k_ext = kv[:, P:].reshape(B * E, 1, D)
+        slots = torch.arange(B * (P + E), dtype=torch.int32, device=device)
+        high_slots = slots + (num_slots - pad)
+        kv_buffer[high_slots.long()] = kv.flatten(0, 1)
+        ref_buffer = kv.flatten(0, 1)
+
+        qo_indptr = torch.arange(0, (B + 1) * E, E, dtype=torch.int32, device=device)
+        prefix_indptr = torch.arange(
+            0, (B + 1) * P, P, dtype=torch.int32, device=device
+        )
+        unified_indptr = torch.arange(
+            0, (B + 1) * (P + E), P + E, dtype=torch.int32, device=device
+        )
+        prefix_lens = torch.full((B,), P, dtype=torch.int32, device=device)
+
+        def run(buf, idx, unified):
+            o = torch.empty_like(q)
+            if unified:
+                extend_attention_fwd_unified(
+                    q,
+                    o,
+                    buf,
+                    buf,
+                    1.0,
+                    1.0,
+                    qo_indptr,
+                    unified_indptr,
+                    idx,
+                    prefix_lens,
+                    max_len_extend=E,
+                )
+            else:
+                prefix_idx = idx.view(B, P + E)[:, :P].flatten()
+                extend_attention_fwd(
+                    q,
+                    k_ext,
+                    k_ext,
+                    o,
+                    buf,
+                    buf,
+                    qo_indptr,
+                    prefix_indptr,
+                    prefix_idx,
+                    None,
+                    True,
+                    None,
+                    E,
+                    1.0,
+                    1.0,
+                )
+            return o
+
+        for unified in (False, True):
+            with self.subTest(unified=unified):
+                torch.testing.assert_close(
+                    run(kv_buffer, high_slots, unified),
+                    run(ref_buffer, slots, unified),
+                    atol=1e-2,
+                    rtol=1e-2,
+                )
+
     def test_context_attention(self):
         head_dim = [128, 96, 80, 13]
 
@@ -900,12 +978,7 @@ class TestTritonAttention(CustomTestCase):
             backend.cuda_graph_uneven_batch = torch.zeros(
                 1, dtype=torch.int32, device=device
             )
-            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (
-                None,
-                None,
-                None,
-                lens,
-            )
+            backend._update_decode_kv_buffers = lambda plan, n, lens, req: (None, lens)
 
             seq_lens = torch.zeros(bs, dtype=torch.int32, device=device)
             kv_indptr = torch.zeros(bs + 1, dtype=torch.int32, device=device)

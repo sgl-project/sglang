@@ -11,8 +11,9 @@ import logging
 from typing import TYPE_CHECKING, Callable, Optional, Tuple
 
 from sglang.srt.disaggregation.common.conn import CommonKVReceiver
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import PdRoleSwitchReqInput, PdRoleSwitchReqOutput
+from sglang.srt.managers.scheduler_components.request_list import ListKind
 from sglang.srt.runtime_context import get_context, get_device, get_disagg
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -73,6 +74,14 @@ def handle_pd_role_switch(
     if not scheduler.is_fully_idle():
         return _fail(
             "instance is not idle; drain all requests before switching",
+            safe_to_restore=True,
+        )
+    # is_fully_idle skips them so a weight update can flush during a retract
+    # pause, but the teardown would drop them unanswered.
+    if scheduler.request_lists().get(ListKind.PD_HELD):
+        return _fail(
+            "a retract pause holds requests; resume generation and drain them "
+            "before switching",
             safe_to_restore=True,
         )
 
@@ -247,7 +256,7 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
             if km is not None:
                 km.teardown()
             scheduler.disagg_prefill_bootstrap_queue = None
-        scheduler.disagg_prefill_inflight_queue = []
+        scheduler.disagg_prefill_transfer_queue.clear()
     elif mode == DisaggregationMode.DECODE:
         q = getattr(scheduler, "disagg_decode_prealloc_queue", None)
         if q is not None:

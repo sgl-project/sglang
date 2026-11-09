@@ -27,7 +27,8 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.muse_spark.muse_spark_fp4_moe import (
     finalize_with_post_expert_norm,
 )
-from sglang.srt.utils.common import next_power_of_2, set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
+from sglang.srt.utils.triton_utils import next_power_of_2
 
 logger = logging.getLogger(__name__)
 

@@ -7,7 +7,9 @@ use dynamo_renderer::{OAIChatLikeRequest, PromptFormatter};
 use serde_json::{Value, json};
 
 use super::glm53::valid_documents;
-use super::pydantic_dump::{engine_message, normalize_tools, pydantic_bool, split_continuation};
+use super::pydantic_dump::{
+    continues_final_message, engine_message, normalize_tools, pydantic_bool, split_continuation,
+};
 use crate::render::RenderError;
 use crate::render::reasoning::{requested_effort, requested_thinking};
 
@@ -66,7 +68,7 @@ pub(crate) fn render(
         .into_iter()
         .map(|message| template_message(message, content_parts))
         .collect::<Result<Vec<_>, _>>()?;
-    let prefix = split_continuation(&mut messages, &request)?;
+    let prefix = split_continuation(&mut messages, continues_final_message(&request)?);
     // The template raises on a later system turn, which Dynamo would demote to a user turn.
     if messages.iter().skip(1).any(|m| m["role"] == "system") {
         return Err("System message must be at the beginning.".into());
@@ -152,7 +154,7 @@ fn template_args(
 
 /// `_process_messages`: the request tools as `Tool.model_dump()` gives them; only
 /// the named tool for a named `tool_choice`, and none for `"none"`.
-fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
+pub(super) fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
     let choice = &request["tool_choice"];
     let Some(tools) = request["tools"]
         .as_array()
@@ -167,8 +169,10 @@ fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
         .into_iter()
         .zip(tools)
         .map(|(mut dump, tool)| {
-            let defer = tool.get("defer_loading").filter(|v| !v.is_null());
-            dump["defer_loading"] = defer.map(pydantic_bool).transpose()?.into();
+            // `Tool._serialize` drops an unset `defer_loading`, null included.
+            if let Some(defer) = tool.get("defer_loading").filter(|v| !v.is_null()) {
+                dump["defer_loading"] = pydantic_bool(defer)?.into();
+            }
             // `Tool.type` is any string, dumped as sent.
             if let Some(kind) = tool.get("type").filter(|kind| kind.is_string()) {
                 dump["type"] = kind.clone();
@@ -278,7 +282,7 @@ fn trims_unlike_python(message: &Value) -> bool {
 /// Whether `value` holds a number Dynamo's serde_json prints unlike Python's
 /// `json.dumps`: floats in exponent notation (`1e-06`, `1e+16`), integers
 /// beyond 64 bits, and negative zero, which serde_json also reads from `-0`.
-fn prints_unlike_python(value: &Value) -> bool {
+pub(super) fn prints_unlike_python(value: &Value) -> bool {
     match value {
         Value::Number(number) => number.as_f64().is_some_and(|f| {
             let positive_zero = f == 0.0 && f.is_sign_positive();
