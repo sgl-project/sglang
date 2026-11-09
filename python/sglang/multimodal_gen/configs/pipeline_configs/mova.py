@@ -13,14 +13,12 @@ from PIL import Image
 from sglang.multimodal_gen.configs.models.dits import MOVAAudioConfig, MOVAVideoConfig
 from sglang.multimodal_gen.configs.models.encoders import T5Config
 from sglang.multimodal_gen.configs.models.vaes import DacVAEConfig, WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.wan import t5_postprocess_text
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

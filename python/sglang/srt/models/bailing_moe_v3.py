@@ -10,6 +10,7 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.router_gate_matvec import (
     ROUTER_GATE_MATVEC_MAX_M,
     router_gate_matvec,
@@ -17,11 +18,10 @@ from sglang.kernels.ops.gemm.router_gate_matvec import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     is_fp8_fnuz,
 )
-from sglang.srt.configs import KimiLinearConfig
 from sglang.srt.configs.bailing_hybrid import is_bailing_multi_gate_enabled
+from sglang.srt.configs.kimi_linear import KimiLinearConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStateList
@@ -66,6 +66,8 @@ from sglang.srt.layers.quantization.int8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -83,6 +85,7 @@ from sglang.srt.models.deepseek_common.utils import (
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.models.kimi_linear import KimiDeltaAttention
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
@@ -90,12 +93,9 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_flashinfer_available,
     log_info_on_rank0,
-    make_pp_layers,
 )
 
 _is_fp8_fnuz = is_fp8_fnuz()
@@ -598,6 +598,10 @@ class BailingMoE(nn.Module):
                 and getattr(quant_config, "is_fp4_experts", False)
             ),
         )
+        self.topk.bind_runner_backend(
+            self.experts.runner_backend,
+            routing_method_type=self.experts.routing_method_type,
+        )
 
         # Whether to apply routed_scaling_factor at model layer.
         # For A2A MoE paths (e.g., DeepEP), the runner/post_permute does not apply it,
@@ -831,10 +835,6 @@ class BailingMoE(nn.Module):
                 hidden_states,
                 router_logits,
                 dynamic_expert_bias=dynamic_expert_bias,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         final_hidden_states = self.experts(hidden_states, topk_output)
 
@@ -1626,7 +1626,7 @@ class BailingMoeV3ForCausalLM(nn.Module):
                     ):
                         if (
                             deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
-                            and not deep_gemm_wrapper.DEEPGEMM_BLACKWELL
+                            and current_arch().is_sm(9)
                             and envs.SGLANG_USE_DEEPGEMM_BMM.get()
                         ):
                             block_scale = weight_scale

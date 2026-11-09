@@ -47,6 +47,9 @@ class MoeRunnerConfig:
     params_dtype: Optional[torch.dtype] = None
     routing_method_type: Optional[RoutingMethodType] = None
 
+    # None denotes a direct kernel with standard TopK and local expert IDs.
+    runner_backend: Optional[MoeRunnerBackendLike] = None
+
     # Runner configuration
     activation: str = "silu"
     is_gated: bool = True

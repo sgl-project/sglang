@@ -3,7 +3,7 @@ from __future__ import annotations
 import dataclasses
 import enum
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import numpy as np
 import numpy.typing as npt
@@ -11,7 +11,7 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
-    from sglang.srt.disaggregation.utils import DisaggregationMode
+    from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
 class StateType(str, enum.Enum):
@@ -19,6 +19,7 @@ class StateType(str, enum.Enum):
     QSA_PENDING = "qsa_pending"
     QSA_COMPRESSED = "qsa_compressed"
     SWA = "swa"
+    AUXILIARY_SWA = "auxiliary_swa"
     DSA = "dsa"
     # DSA kpool-compress tail: one per-request ring row. The indices encode
     # only the live subrange of that row for the current open pool.
@@ -89,11 +90,13 @@ class KVArgs:
     # Physical layout of the SWA sub-pool ("nhd", "hnd" or "vectorized_5d");
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
+    dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int
     total_kv_head_num: int
     page_size: int
+    draft_rows_dcp_collapsed: bool = False
     # for system dp
     system_dp_rank: int
     # Local Rust /route registry port; None on scheduler ranks without a listener.

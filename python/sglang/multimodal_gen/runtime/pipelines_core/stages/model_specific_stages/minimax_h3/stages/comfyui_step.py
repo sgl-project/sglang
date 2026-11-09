@@ -552,6 +552,7 @@ def comfyui_payload_to_branch_inputs(
         "orig_video_shape": orig_shape,
         "padded_video_shape": tuple(video.shape),
         "is_ref2va": bool(refs),
+        "native_layout": layout is None,
         "sample_sigmas": sample_sigmas,
         "sigma_v": float(sigma_v),
         "shift_v": shift_v,
@@ -669,6 +670,7 @@ def _step_attn_metadata(
         latent_shape=latent_shape,
         server_args=server_args,
         device=device,
+        native_layout=inputs["native_layout"],
     )
     if build is not None:
         return build

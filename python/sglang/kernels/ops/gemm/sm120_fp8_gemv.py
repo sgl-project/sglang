@@ -28,8 +28,11 @@ _MAX_N = 32768  # very large N is served well by cuBLAS already
 
 def _config(n: int) -> tuple[int, int, int]:
     """(rows_per_warp, k_unroll, num_warps); tuned DRAM-cold on RTX PRO 6000."""
-    if n >= 8192:
+    if n > 8192:
         return (4, 1, 8)
+    if n == 8192:
+        # Four rows measured slower than two at (8192, 5120) DRAM-cold.
+        return (2, 1, 8)
     return (1, 1, 8)
 
 
@@ -47,9 +50,8 @@ def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
 
 
 def use_sm120_fp8_gemv(m: int, n: int, k: int) -> bool:
-    # kUnroll == 1 streams 16B per lane-step with an in-loop k < K guard, so
-    # K only needs 16B alignment; keep 128 for conservative vector alignment
-    # (covers the K=5376 shared-expert down_proj).
+    # kUnroll==1 guards k < K in-loop, so K needs only 16B alignment;
+    # 128 keeps margin and still admits K=5376.
     return (
         m == 1
         and k % 128 == 0
