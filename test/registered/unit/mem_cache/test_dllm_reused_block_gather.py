@@ -27,6 +27,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+import sglang.srt.mem_cache.allocation as allocation
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation import (
     _alloc_extend_loc_with_kv_reuse,
@@ -183,6 +184,26 @@ class TestAllocExtendLocWithKvReuseBatching(CustomTestCase):
             ],
         )
         # fmt: on
+
+    def test_threshold_is_inclusive_and_negative_disables(self):
+        # Two gate boundaries the equality cases cannot see (both sides agree
+        # either way): a batch with exactly min_rows reuse rows batches
+        # (min_rows is a minimum, not a strict bound), and -1 disables
+        # outright (len(reuse_rows) >= -1 would otherwise always hold).
+        kwargs = dict(
+            reuse_kv=[True, False, True],
+            prefix_lens=[0, 0, 8],
+            extend_lens=[4, 3, 4],
+        )
+        with mock.patch.object(
+            allocation, "_gather_reused_block_locs", wraps=_gather_reused_block_locs
+        ) as spy:
+            self._run(min_rows=2, **kwargs)
+            self.assertEqual(spy.call_count, 1)
+            self._run(min_rows=3, **kwargs)
+            self.assertEqual(spy.call_count, 1)
+            self._run(min_rows=-1, **kwargs)
+            self.assertEqual(spy.call_count, 1)
 
     def test_reuse_rows_of_unequal_length_fall_back_per_row(self):
         # Rows of different block_len cannot share one flat index, so the
