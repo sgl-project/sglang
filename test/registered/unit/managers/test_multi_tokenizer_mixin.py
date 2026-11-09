@@ -15,6 +15,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.beam_search.types import BeamSearchSequence
 from sglang.srt.entrypoints import http_server
 from sglang.srt.environ import envs
 from sglang.srt.managers import multi_tokenizer_mixin
@@ -114,10 +115,9 @@ def _make_batch_str_output() -> BatchStrOutput:
         input_top_logprobs_flat_null_prefix=[0, None],
         beam_search_output=[
             BeamSearchOutput(
-                tokens=[[11]],
-                cum_logprobs=[-1.0],
-                beam_scores=[-1.0],
-                finish_reasons=[{"type": "length", "length": 1}],
+                sequences=[
+                    BeamSearchSequence(tokens=[11], cum_logprob=-1.0),
+                ]
             ),
             None,
         ],
@@ -312,7 +312,7 @@ class TestMultiTokenizerMixin(CustomTestCase):
         self.assertEqual(grouped.input_top_logprobs_flat_null_prefix, [None, 0])
         self.assertIsNone(grouped.beam_search_output[0])
         self.assertEqual(
-            grouped.beam_search_output[1].tokens[0],
+            grouped.beam_search_output[1].sequences[0].tokens,
             [11],
         )
         np.testing.assert_array_equal(
