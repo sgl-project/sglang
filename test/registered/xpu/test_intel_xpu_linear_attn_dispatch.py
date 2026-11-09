@@ -227,6 +227,9 @@ class TestIntelXpuGDNDispatch(CustomTestCase):
             needs_track_state=True,
         )
         torch.testing.assert_close(h[:, 0], prefix_h[:, 0])
+        # h[:, 1] is the state after 64 tokens, the checkpoint prefix caching needs.
+        self.assertGreater(h[:, 1].abs().max().item(), 0)
+        torch.testing.assert_close(h[:, 1].float(), prefix_states, atol=2e-2, rtol=2e-2)
 
     def test_plain_prefill_keeps_sycl_kernel(self):
         kernel = XpuGDNKernel()
