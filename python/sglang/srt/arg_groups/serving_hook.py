@@ -10,23 +10,34 @@ import random
 import socket
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    configure_media_url_security,
+from sglang.srt.sampling.watermarking.config import load_watermark_config
+from sglang.srt.utils.device import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def handle_watermark_config(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is None:
+        return
+    config = load_watermark_config(cfg.watermark_config)
+    resolved = {
+        f"watermark_{field}": getattr(config, field)
+        for field in config.__struct_fields__
+        if getattr(config, field) is not None
+    }
+    if resolved:
+        declare_resolution(server_args, "handle_watermark_config", **resolved)
 
 
 def handle_ssl_validation(server_args: Any):
@@ -69,6 +80,13 @@ def handle_ssl_validation(server_args: Any):
         raise ValueError(
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
             "to be specified."
+        )
+    if cfg.enable_http_worker_reuseport and (
+        cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+    ):
+        raise ValueError(
+            "--enable-http-worker-reuseport requires --tokenizer-worker-num > 1 "
+            "and has no effect with --enable-http2."
         )
 
     if cfg.enable_http2:
@@ -224,7 +242,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
@@ -278,7 +296,8 @@ def handle_deprecated_args(server_args: Any):
         "_handle_deprecated_args",
         enable_flashinfer_allreduce_fusion=False,
     )
-    # Deprecated attention-backend alias: "compressed" -> "dsv4".
+    # Deprecated attention-backend aliases.
+    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -286,12 +305,30 @@ def handle_deprecated_args(server_args: Any):
         "prefill_attention_backend",
         "speculative_draft_attention_backend",
     ):
-        if getattr(server_args, attr, None) == "compressed":
+        old = getattr(server_args, attr, None)
+        if old in aliases:
             logger.warning(
-                "--%s=compressed is deprecated; use 'dsv4' instead.",
+                "--%s=%s is deprecated; use '%s' instead.",
                 attr.replace("_", "-"),
+                old,
+                aliases[old],
             )
-            renamed[attr] = "dsv4"
+            renamed[attr] = aliases[old]
+    if renamed.get("prefill_attention_backend") == "cutedsl_mla":
+        # cutedsl_mla is decode-only.
+        renamed["prefill_attention_backend"] = "trtllm_mla"
+    if "tokenspeed_mla" in (cfg.attention_backend, cfg.decode_attention_backend):
+        # Keep what tokenspeed_mla implied: FP8 KV, verify on the decode kernel.
+        if cfg.kv_cache_dtype != "fp8_e4m3":
+            logger.warning(
+                "tokenspeed_mla required FP8 KV; setting --kv-cache-dtype=fp8_e4m3."
+            )
+            renamed["kv_cache_dtype"] = "fp8_e4m3"
+        if (
+            cfg.speculative_algorithm is not None
+            and cfg.speculative_attention_mode == "prefill"
+        ):
+            renamed["speculative_attention_mode"] = "decode"
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
@@ -368,11 +405,6 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
-                "Rust-server mode does not run the Python sidecar lifecycle."
-            )
     if native_grpc:
         if cfg.use_ray:
             raise ValueError(
@@ -420,7 +452,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
@@ -431,6 +462,10 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
+        )
+    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+        raise ValueError(
+            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0
@@ -570,19 +605,25 @@ def handle_other_validations(server_args: Any):
                     )
 
     # Validate preferred_sampling_params
-    if cfg.preferred_sampling_params:
-        if isinstance(cfg.preferred_sampling_params, str):
+    preferred_sampling_params = cfg.preferred_sampling_params
+    if preferred_sampling_params:
+        if isinstance(preferred_sampling_params, str):
+            preferred_sampling_params = json.loads(preferred_sampling_params)
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
-                preferred_sampling_params=json.loads(cfg.preferred_sampling_params),
+                preferred_sampling_params=preferred_sampling_params,
+            )
+        if "watermark" in preferred_sampling_params:
+            raise ValueError(
+                "watermark is not supported in --preferred-sampling-params"
             )
 
         # Validate preferred_sampling_params doesn't use tokenizer-dependent features
         if cfg.skip_tokenizer_init:
             from sglang.srt.sampling.sampling_params import SamplingParams
 
-            test_params = SamplingParams(**cfg.preferred_sampling_params)
+            test_params = SamplingParams(**preferred_sampling_params)
             # raises if tokenizer-dependent features used
             test_params.normalize(None)
 
@@ -674,7 +715,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

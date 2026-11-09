@@ -17,7 +17,7 @@
 
 import logging
 from contextlib import nullcontext
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any, Dict, Iterable, Optional, Set, Tuple, Union
 
 import torch
@@ -29,7 +29,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
-from sglang.srt.eplb.expert_location_dispatch import ExpertLocationDispatchInfo
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
     AuxHiddenStateList,
@@ -61,6 +61,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -87,9 +89,8 @@ from sglang.srt.runtime_context import (
 # Importing from the wrong module causes this file to fail import, which prevents the
 # native MiniMaxM2ForCausalLM from registering in ModelRegistry. The fallback to the
 # transformers wrapper then crashes on config.rope_parameters (transformers v5 issue).
-# Other files (custom_all_reduce.py, hf_transformers_utils.py) also use sglang.srt.utils.
+# Other files (custom_all_reduce.py, hf_transformers/) also use sglang.srt.utils.
 from sglang.srt.utils import (
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     get_compiler_backend,
@@ -97,11 +98,8 @@ from sglang.srt.utils import (
     is_cuda,
     is_npu,
     is_xpu,
-    make_pp_layers,
 )
-from sglang.srt.utils.common import is_building_neighbour_layer
 from sglang.srt.utils.custom_op import register_custom_op
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cpu = is_cpu()
@@ -409,12 +407,7 @@ class MiniMaxM2QKRMSNorm:
         use_fused_norm = get_bool_env_var("SGLANG_USE_FUSED_PARALLEL_QKNORM")
 
         self._forward_impl = self._forward_naive
-        if (
-            self._world_size > 1
-            and _is_cuda
-            and use_fused_norm
-            and not is_building_neighbour_layer()
-        ):
+        if self._world_size > 1 and _is_cuda and use_fused_norm:
             occupancy = get_fused_parallel_qknorm_max_occupancy(
                 q_norm.weight.dtype,
                 self._world_size,
@@ -558,6 +551,7 @@ class MiniMaxM2MoE(nn.Module):
             correction_bias=self.e_score_correction_bias,
             routed_scaling_factor=1.0,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         self.gate = ReplicatedLinear(
             config.hidden_size,
@@ -619,10 +613,6 @@ class MiniMaxM2MoE(nn.Module):
             topk_output = self.topk(
                 hidden_states,
                 router_logits,
-                num_token_non_padded=forward_batch.moe_num_token_non_padded(),
-                expert_location_dispatch_info=ExpertLocationDispatchInfo.init_new(
-                    layer_id=self.layer_id,
-                ),
             )
         else:
             topk_output = self.topk.empty_topk_output(device=hidden_states.device)
@@ -846,8 +836,8 @@ class MiniMaxM2DecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.layer_id = layer_id
 
-        # TBO support: All MiniMax layers are sparse (MoE)
-        self.is_layer_sparse = True
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         self.self_attn = MiniMaxM2Attention(
             config=config,
@@ -870,17 +860,20 @@ class MiniMaxM2DecoderLayer(nn.Module):
             config.hidden_size, eps=getattr(config, "rms_norm_eps", 1e-6)
         )
 
-        is_next_layer_sparse = True
-
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
-            ),
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: PretrainedConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, in order: the model's
+        shared declaration function, which the layer declares with too (see
+        make_layers)."""
+        # TBO support: All MiniMax layers are sparse (MoE)
+        return (
+            declare_attn(),
+            declare_ffn(sparse=True, next_layer_sparse=True),
         )
 
     def forward(
@@ -951,6 +944,7 @@ class MiniMaxM2Model(nn.Module):
             config.num_hidden_layers,
             layer_fn,
             prefix=add_prefix("layers", prefix),
+            stage_facts=partial(MiniMaxM2DecoderLayer.stage_facts, config),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

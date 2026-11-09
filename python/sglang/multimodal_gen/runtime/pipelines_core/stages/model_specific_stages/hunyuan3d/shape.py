@@ -252,9 +252,6 @@ class Hunyuan3DShapeBeforeDenoisingStage(PipelineStage):
 class Hunyuan3DShapeDenoisingStage(DenoisingStage):
     """Denoising stage for Hunyuan3D shape generation."""
 
-    def __init__(self, transformer: Any, scheduler: Any, **kwargs) -> None:
-        super().__init__(transformer=transformer, scheduler=scheduler, **kwargs)
-
     def _component_name_for_stage_module(self, module, default_name: str) -> str:
         if module is self.transformer:
             return "hy3dshape_model"
@@ -539,7 +536,8 @@ class Hunyuan3DShapeSaveStage(PipelineStage):
         output_dir = os.path.dirname(obj_path)
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
-        mesh.export(obj_path)
+        if not (self.config.paint_enable and self.config.paint_save_glb):
+            mesh.export(obj_path)
 
         batch.extra["shape_obj_path"] = obj_path
         batch.extra["shape_return_path"] = return_path

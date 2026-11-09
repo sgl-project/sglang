@@ -4,12 +4,12 @@ from typing import Dict, List, TypedDict
 
 import torch
 
+from sglang.srt.hf_transformers import get_config
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import get_config_dtype_str
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe_triton_config import (
     get_config_file_name,
 )
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.hf_transformers_utils import get_config
 
 
 class BenchmarkConfig(TypedDict):
@@ -78,6 +78,7 @@ def get_model_config(
         topk = config.num_experts_per_tok
         intermediate_size = config.intermediate_size
     elif architecture in [
+        "BeamForCausalLM",
         "Qwen2MoeForCausalLM",
         "Qwen3MoeForCausalLM",
         "Qwen3NextForCausalLM",

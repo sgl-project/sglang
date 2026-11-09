@@ -3,12 +3,25 @@ Generator for SGLang Diffusion ComfyUI integration.
 """
 
 import atexit
+import contextlib
+import json
 import logging
 import os
+import sys
+
+import torch
 
 from ..executors.flux import FluxExecutor
-from ..executors.minimax_h3 import MiniMaxH3Executor
+from ..executors.minimax_h3 import (
+    FastH3Executor,
+    MiniMaxH3Executor,
+    VDNH3Executor,
+    load_fasth3_release,
+)
+from ..executors.qwen_image21 import QwenImage21Executor
 from ..executors.zimage import ZImageExecutor
+from ..options import ATTENTION_DISPLAY, INT8_GEMM_DISPLAY, PLUGIN_KEYS
+from .preflight import check_model_options, check_sgld_options
 
 logger = logging.getLogger(__name__)
 
@@ -30,6 +43,59 @@ class _HeaderTensor:
     nelement = numel
 
 
+@contextlib.contextmanager
+def _spawn_without_launcher_main():
+    """spawn re-runs ``__main__`` in every child; ComfyUI's main.py then resolves
+    ``import utils`` to comfy/utils.py and the worker dies before reporting ready."""
+    main_dict = vars(sys.modules["__main__"])
+    saved = {
+        key: main_dict[key] for key in ("__file__", "__spec__") if key in main_dict
+    }
+    main_dict.pop("__file__", None)
+    main_dict["__spec__"] = None
+    try:
+        yield
+    finally:
+        main_dict.pop("__spec__", None)
+        main_dict.update(saved)
+
+
+def _check_h3_single_file(path: str, sgld_options: dict) -> None:
+    """Reject options the ComfyUI H3 checkpoint loader would silently ignore."""
+    if sgld_options.get("minimax_h3_adaln_online") or sgld_options.get(
+        "minimax_h3_adaln_cache_path"
+    ):
+        raise ValueError(
+            "ComfyUI H3 checkpoint loading does not support the native AdaLN "
+            "online/sidecar caches"
+        )
+    if not path.endswith(".safetensors"):
+        return
+    if sgld_options.get("quantization"):
+        raise ValueError(
+            "ComfyUI H3 files cannot be quantized at load time; load a pre-quantized "
+            "file (e.g. *_int8_convrot), whose per-layer metadata selects the "
+            "format, and leave quantization empty"
+        )
+    from safetensors import safe_open
+
+    with safe_open(path, framework="pt") as f:
+        if any(".to_gate_compress." in key for key in f.keys()):
+            raise ValueError(
+                "This is a FastH3 checkpoint (VSA gate weights), which the base "
+                "MiniMax H3 model cannot load; load the native FastH3 directory "
+                "with SGLDNativeModelLoader"
+            )
+
+
+# Renamed local files and directories miss the registry's path detectors and
+# model-id keyed defaults (e.g. BCG support); these ids always match.
+_H3_MODEL_IDS = {
+    "MiniMaxH3Pipeline": "MiniMax-H3",
+    "VDNH3Pipeline": "vdn-minimax-h3",
+}
+
+
 def _looks_like_gguf(path: str) -> bool:
     if not path:
         return False
@@ -38,54 +104,80 @@ def _looks_like_gguf(path: str) -> bool:
     )
 
 
-def _h3_detect_companion(gguf_ref: str) -> str:
-    """ComfyUI detect needs H3 safetensors keys; GGUF only overrides the DiT."""
-    name = os.path.basename(gguf_ref).lower()
-    prefer = []
-    if "ref2va" in name:
-        prefer.append("minimax_h3_ref2va_bf16.safetensors")
-    prefer.extend(
-        [
-            "minimax_h3_fl2va_bf16.safetensors",
-            "minimax_h3_ref2va_bf16.safetensors",
-        ]
-    )
-    folders = (
-        [os.path.dirname(os.path.abspath(gguf_ref))]
-        if os.path.dirname(gguf_ref)
-        else []
-    )
-    try:
-        import folder_paths
+_NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
+NATIVE_MODEL_TYPES = tuple(_NATIVE_MODEL_TYPES.values())
 
-        folders.extend(folder_paths.get_folder_paths("diffusion_models"))
-    except Exception:
-        pass
-    seen: set[str] = set()
-    for folder in folders:
-        if not folder:
-            continue
-        for candidate in prefer:
-            path = os.path.join(folder, candidate)
-            if path in seen:
-                continue
-            seen.add(path)
-            if os.path.isfile(path):
-                return path
-    raise ValueError(
-        "GGUF transformer needs a MiniMax-H3 BF16 safetensors in "
-        "models/diffusion_models for ComfyUI architecture detect "
-        f"(looked for {prefer}). Keep --model-path / unet_name on the "
-        "BF16 file and pass the GGUF via transformer_weights_path."
-    )
+
+def _apply_cache_mode(executor, plugin: dict) -> None:
+    """Per-request cache switches; they never restart the worker."""
+    mode = plugin.get("cache_mode")
+    # None (no cache_mode given) keeps the worker's environment default.
+    executor.enable_cache_dit = None if mode is None else mode == "cache_dit"
+    executor.cache_dit_params = plugin.get("cache_dit_params")
+    executor.enable_spectrum = mode == "spectrum"
+
+
+@contextlib.contextmanager
+def _worker_env(values: dict):
+    """Set env vars the spawned worker inherits, then restore this process's."""
+    saved = {key: os.environ.get(key) for key in values}
+    os.environ.update(values)
+    try:
+        yield
+    finally:
+        for key, value in saved.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def native_model_type(model_dir: str) -> str:
+    with open(os.path.join(model_dir, "model_index.json")) as f:
+        class_name = json.load(f).get("_class_name")
+    if class_name not in _NATIVE_MODEL_TYPES:
+        raise ValueError(
+            f"{model_dir}: native model {class_name!r} is not supported by "
+            f"SGLDNativeModelLoader; supported: {sorted(_NATIVE_MODEL_TYPES)}"
+        )
+    return _NATIVE_MODEL_TYPES[class_name]
+
+
+def _h3_unet_config_from_native(model_dir: str) -> dict:
+    """ComfyUI MiniMaxH3 unet_config built from a native transformer/config.json."""
+    with open(os.path.join(model_dir, "transformer", "config.json")) as f:
+        c = json.load(f)
+    return {
+        "image_model": "minimax_h3",
+        "num_layers": c["num_layers"],
+        "token_refiner_num_layers": c["num_refiner_layers"],
+        "hidden_size": c["hidden_size"],
+        "latents_dim": c["in_channels"],
+        "audio_latents_dim": c["audio_in_channels"],
+        "attention_head_dim": c["attention_head_dim"],
+        "num_attention_heads": c["num_attention_heads"],
+        "ffn_hidden_size": c["ffn_dim"],
+        "text_dim": c["text_dim"],
+        "timestep_input_dim": c["freq_dim"],
+        "time_embed_hidden_size": c["time_embed_hidden_dim"],
+        "time_embed_dim": c["time_embed_dim"],
+        "rope_inv_freq_len": c["rope_freq_dim"],
+        "gate_compress": False,
+    }
 
 
 def _load_state_dict_for_detection(model_path: str):
     if _looks_like_gguf(model_path):
-        raise ValueError(
-            f"Cannot detect architecture from GGUF {model_path!r}. "
-            "Use a MiniMax-H3 BF16 safetensors for detect."
+        # Same header-only trick as safetensors: tensor names and logical
+        # (unpacked) shapes are all detect_unet_config looks at.
+        from sglang.multimodal_gen.runtime.loader.gguf_weights import (
+            read_gguf_tensor_meta,
         )
+
+        return {
+            name: _HeaderTensor(meta.logical_shape)
+            for name, meta in read_gguf_tensor_meta(model_path).items()
+        }
     if model_path.endswith(".safetensors"):
         from safetensors import safe_open
 
@@ -101,15 +193,28 @@ def _load_state_dict_for_detection(model_path: str):
 
 try:
     from sglang.multimodal_gen import DiffGenerator
-except ImportError:
+except ImportError as exc:
+    # Keep the nodes importable so ComfyUI shows this; fail clearly on first use.
+    _RUNTIME_IMPORT_ERROR: ImportError | None = exc
     logger.error(
-        "Error: sglang.multimodal_gen is not installed. Please install it using 'pip install sglang[diffusion]'"
+        "Failed to import the SGLang diffusion runtime: %r. Install the diffusion "
+        "extras with 'pip install sglang[diffusion]'.",
+        exc,
     )
+else:
+    _RUNTIME_IMPORT_ERROR = None
 
 
 def _load_executor_classes():
     """Qwen adapters import ComfyUI. Keep them optional so CI can load the rest."""
-    classes = [FluxExecutor, ZImageExecutor, MiniMaxH3Executor]
+    classes = [
+        FluxExecutor,
+        ZImageExecutor,
+        MiniMaxH3Executor,
+        FastH3Executor,
+        VDNH3Executor,
+        QwenImage21Executor,
+    ]
     try:
         from ..executors.qwen_image import QwenImageEditExecutor, QwenImageExecutor
     except ModuleNotFoundError as exc:
@@ -129,6 +234,57 @@ _SHARED = None
 _ATEXIT_REGISTERED = False
 
 
+def _loader_settings(*, args, sgld_options: dict, int8_kernel: str, model_type) -> dict:
+    """The worker's loader-time settings, as SGLDOptions widget names and values.
+
+    Values come from ServerArgs, so they are what the worker runs; fields that do
+    not apply to the chosen mode are left out, as SGLDOptions ignores them too.
+    """
+    settings = {
+        "model_type": model_type,
+        "num_gpus": args.num_gpus,
+        # create_options only passes tp_size when parallel_mode is manual.
+        "parallel_mode": "manual" if "tp_size" in sgld_options else "auto",
+        "tp_size": args.tp_size,
+        "ulysses_degree": args.ulysses_degree,
+        "ring_degree": args.ring_degree,
+        "attention_backend": ATTENTION_DISPLAY.get(
+            args.attention_backend, args.attention_backend or "auto"
+        ),
+    }
+    if sgld_options.get("attention_backend_config"):
+        settings["attention_backend_config"] = sgld_options["attention_backend_config"]
+    settings["quantization"] = args.quantization or "none"
+    # A pre-quantized H3 file reports quantization=none, but an explicit
+    # ConvRot backend still affects the worker through its environment.
+    if int8_kernel != "auto":
+        settings["int8_gemm"] = INT8_GEMM_DISPLAY.get(int8_kernel, int8_kernel)
+    if args.enable_torch_compile:
+        settings["execution_mode"] = "torch_compile"
+        settings["regional_compile"] = args.regional_compile
+    elif args.enable_breakable_cuda_graph:
+        settings["execution_mode"] = "cuda_graph"
+    else:
+        settings["execution_mode"] = "eager"
+    if args.dit_layerwise_offload:
+        settings["memory_mode"] = "layerwise_offload"
+        settings["resident_layers"] = args.dit_layerwise_resident_layers
+        settings["prefetch_layers"] = args.dit_offload_prefetch_size
+    else:
+        settings["memory_mode"] = "resident"
+    return settings
+
+
+def _cache_mode(executor) -> str:
+    """The cache_mode the next request will use, as set by SGLDOptions."""
+    if getattr(executor, "enable_spectrum", False):
+        return "spectrum"
+    cache_dit = getattr(executor, "enable_cache_dit", None)
+    if cache_dit is None:
+        return "worker default"
+    return "cache_dit" if cache_dit else "off"
+
+
 class SGLDiffusionGenerator:
     """Process-wide owner of the one live SGLD worker.
 
@@ -143,6 +299,10 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        # Executor that sent the last request; differs from self.executor
+        # after a cached executor rebuilt the worker.
+        self._active_executor = None
+        self.model_type = None
         self.last_options = None
         self._patcher = None
 
@@ -180,11 +340,19 @@ class SGLDiffusionGenerator:
             _SHARED.close_generator()
 
     def init_generator(
-        self, model_path: str, pipeline_class_name: str, kwargs: dict = None
+        self,
+        model_path: str,
+        pipeline_class_name: str,
+        kwargs: dict = None,
+        worker_patches=(),
     ):
         """Initialize the diffusion generator."""
         if self.generator is not None:
             return self.generator
+        if _RUNTIME_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "SGLang diffusion runtime failed to import"
+            ) from _RUNTIME_IMPORT_ERROR
         if kwargs is None:
             kwargs = {}
         # Set comfyui_mode for ComfyUI integration
@@ -194,12 +362,34 @@ class SGLDiffusionGenerator:
         # policy otherwise sets dit_cpu_offload=True and every sampler step
         # reloads the DiT from CPU.
         kwargs.setdefault("dit_cpu_offload", False)
+        # ComfyUI sends cond and uncond as separate requests, so worker-side CFG
+        # parallel only recomputes; its auto-enable also needs a model_index.json,
+        # which a non-H3 single file lacks, and fails worker startup on >= 2 GPUs.
+        if not kwargs.get("enable_cfg_parallel"):
+            kwargs.setdefault("cfg_parallel_degree", 1)
+        # Each sampler step is its own request carrying ComfyUI tensors; a
+        # synthetic or request-based warmup has no such inputs to run with.
+        kwargs["warmup_mode"] = "off"
+        if pipeline_class_name in _H3_MODEL_IDS:
+            kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
-        self.generator = DiffGenerator.from_pretrained(
-            model_path=model_path,
-            pipeline_class_name=pipeline_class_name,
-            **kwargs,
-        )
+        try:
+            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+                scheduler_profiles,
+            )
+
+            with scheduler_profiles(worker_patches), _spawn_without_launcher_main():
+                self.generator = DiffGenerator.from_pretrained(
+                    model_path=model_path,
+                    pipeline_class_name=pipeline_class_name,
+                    **kwargs,
+                )
+        except EOFError as error:
+            # A worker that raises while loading closes its pipe without a message.
+            raise RuntimeError(
+                "The SGLD worker exited while loading the model; its traceback is in "
+                "the ComfyUI console output above this error"
+            ) from error
         return self.generator
 
     @staticmethod
@@ -224,6 +414,56 @@ class SGLDiffusionGenerator:
         if gen is None:
             return []
         return list(getattr(gen, "local_scheduler_process", None) or [])
+
+    def status_text(self) -> str:
+        """Worker summary from ServerArgs and the worker's RequestMetrics."""
+        if self.generator is None:
+            return "SGLD worker: not started (run the workflow once to load a model)"
+        import torch
+
+        import sglang
+
+        args = self.generator.server_args
+        executor = self._active_executor or self.executor
+        pids = [proc.pid for proc in self._worker_processes()]
+        loader = _loader_settings(
+            args=args,
+            sgld_options=self.last_options["sgld_options"],
+            int8_kernel=self.last_options["int8_kernel"],
+            model_type=self.model_type,
+        )
+        lines = [
+            f"model: {args.model_path} pipeline={args.pipeline_class_name}",
+            f"worker: {'live' if self._is_live() else 'NOT live'} pids={pids}",
+            "loader settings (fixed until the worker restarts): "
+            + " ".join(f"{k}={v}" for k, v in loader.items()),
+        ]
+        if executor is None:
+            lines.append("per-run settings: no executor")
+        else:
+            params = getattr(executor, "cache_dit_params", None)
+            lines.append(
+                f"per-run settings (apply to the next request): "
+                f"cache_mode={_cache_mode(executor)}"
+                + (f" cache_dit_params={params}" if params else "")
+            )
+        metrics = getattr(executor, "last_metrics", None)
+        if metrics is None:
+            lines.append("last DiT call: none yet")
+        else:
+            lines.append(
+                f"last DiT call (one sampler step, or half of a CFG step): "
+                f"{metrics.total_duration_ms:.1f} ms"
+            )
+            snapshot = metrics.memory_snapshots.get("after_forward")
+            if snapshot is not None:
+                lines.append(
+                    f"vram during that call: peak allocated "
+                    f"{snapshot.peak_allocated_mb:.0f} MiB, peak reserved "
+                    f"{snapshot.peak_reserved_mb:.0f} MiB"
+                )
+        lines.append(f"sglang={sglang.__version__} torch={torch.__version__}")
+        return "\n".join(lines)
 
     def _is_live(self) -> bool:
         """True when this owner still has a usable worker + scheduler client."""
@@ -263,9 +503,10 @@ class SGLDiffusionGenerator:
 
     def ensure_executor(self, executor) -> None:
         """Rebuild the worker if this cached executor no longer owns it."""
+        self._active_executor = executor
         if self._owns_live(executor):
             return
-        reload = getattr(executor, "_sgld_reload", None)
+        reload = executor._sgld_reload
         if not reload:
             raise RuntimeError(
                 "SGLD worker is down and this executor has no reload spec"
@@ -276,9 +517,12 @@ class SGLDiffusionGenerator:
         )
         self.load_model(**reload)
         executor.generator = self.generator
-        lora = getattr(executor, "_lora_input", None)
+        lora = executor._lora_input
         if lora and lora.get("lora_nickname"):
             executor.set_lora(**lora)
+        # The new worker's session cache starts empty, so conditioning the
+        # old worker already had cannot be restored; resend it.
+        executor.begin_sampler_run()
 
     def kill_generator(self):
         """Force-stop workers this owner started. Do not scan the process table."""
@@ -311,6 +555,8 @@ class SGLDiffusionGenerator:
         self.model_path = None
         self.generator = None
         self.executor = None
+        self._active_executor = None
+        self.model_type = None
         self._patcher = None
 
     def get_comfyui_model(self, model_path: str, model_options: dict = None):
@@ -326,6 +572,14 @@ class SGLDiffusionGenerator:
             state_dict_prefix_replace,
             unet_to_diffusers,
         )
+
+        if os.path.isdir(model_path):
+            model_config = model_detection.model_config_from_unet_config(
+                _h3_unet_config_from_native(model_path)
+            )
+            model_config.set_inference_dtype(torch.bfloat16, None)
+            model_config.unet_config["disable_unet_model_creation"] = True
+            return model_config.get_model({}), model_config, "minimax_h3"
 
         sd = _load_state_dict_for_detection(model_path)
         diffusion_model_prefix = model_detection.unet_prefix_from_state_dict(sd)
@@ -351,11 +605,11 @@ class SGLDiffusionGenerator:
             if new_sd is not None:  # diffusers mmdit
                 model_config = model_detection.model_config_from_unet(new_sd, "")
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
             else:  # diffusers unet
                 model_config = model_detection.model_config_from_diffusers_unet(sd)
                 if model_config is None:
-                    return None
+                    raise ValueError(f"No ComfyUI model config for {model_path!r}")
 
                 diffusers_keys = unet_to_diffusers(model_config.unet_config)
                 new_sd = {}
@@ -391,10 +645,34 @@ class SGLDiffusionGenerator:
         }
         sgld_options = dict(raw_sgld_options)
         model_options = dict(reload_kwargs["model_options"])
-        plugin_flags = {}
-        if "enable_cache_dit" in sgld_options:
-            plugin_flags["enable_cache_dit"] = sgld_options.pop("enable_cache_dit")
-        set_model_type = sgld_options.pop("model_type", None)
+        if model_options.get("dtype") is not None:
+            # Only the ComfyUI architecture companion would get this dtype; the
+            # worker loads its own weights, so the choice would be silently lost.
+            raise ValueError(
+                "SGLDUNETLoader weight_dtype must be 'default': the SGLD worker "
+                "does not use it; select quantization in SGLDOptions instead"
+            )
+        check_sgld_options(sgld_options)
+        plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
+        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            canonical_profiles,
+            validate_options,
+        )
+
+        patches = canonical_profiles(plugin.get("worker_patches"))
+        reload_kwargs["sgld_options"]["worker_patches"] = patches
+        set_model_type = plugin.get("model_type")
+        if set_model_type in NATIVE_MODEL_TYPES:
+            raise ValueError(
+                f"{set_model_type} loads from its native model directory; use "
+                "SGLDNativeModelLoader instead of model_type"
+            )
+        native_dir = os.path.isdir(model_path)
+        runtime_model_path = None
+        if native_dir:
+            # SGLDNativeModelLoader: the directory is both skeleton and weights.
+            set_model_type = native_model_type(model_path)
+            runtime_model_path = model_path
         override = (sgld_options.get("transformer_weights_path") or "").strip()
         if override:
             sgld_options["transformer_weights_path"] = override
@@ -403,21 +681,22 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
-        if _looks_like_gguf(model_path):
-            detect_path = _h3_detect_companion(sgld_options["transformer_weights_path"])
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
             "sgld_options": sgld_options,
             "set_model_type": set_model_type,
+            "runtime_model_path": runtime_model_path,
+            "int8_kernel": plugin.get("int8_kernel", "auto"),
+            "worker_patch_identity": patches,
         }
         if self._can_reuse(gather_options):
-            self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+            validate_options(patches, self.model_type, {**sgld_options, **plugin})
+            check_model_options(
+                self.model_type, {**sgld_options, **plugin}, native_dir=native_dir
+            )
+            _apply_cache_mode(self.executor, plugin)
             return self._patcher
-
-        self.close_generator()
-        self.last_options = gather_options
-        self.model_path = detect_path
 
         comfyui_model, model_config, model_type = self.get_comfyui_model(
             detect_path, model_options
@@ -427,16 +706,43 @@ class SGLDiffusionGenerator:
         if set_model_type is not None and set_model_type in self.pipeline_class_dict:
             model_type = set_model_type
 
-        pipeline_class_name = self.pipeline_class_dict[model_type]
-        self.generator = self.init_generator(
-            detect_path, pipeline_class_name, sgld_options
+        check_model_options(
+            model_type, {**sgld_options, **plugin}, native_dir=native_dir
         )
+        validate_options(patches, model_type, {**sgld_options, **plugin})
+        if model_type == "fast_h3":
+            load_fasth3_release(runtime_model_path)
+        if model_type == "minimax_h3":
+            _check_h3_single_file(detect_path, sgld_options)
+
+        # Checks above run first so a rejected config keeps the current worker.
+        self.close_generator()
+        self.last_options = gather_options
+        self.model_path = detect_path
+
+        pipeline_class_name = self.pipeline_class_dict[model_type]
+        worker_model_path = runtime_model_path or detect_path
+        int8_kernel = gather_options["int8_kernel"]
+        # auto keeps whatever the ComfyUI process environment already selects.
+        worker_env = (
+            {}
+            if int8_kernel == "auto"
+            else {"SGLANG_DIFFUSION_CONVROT_INT8_BACKEND": int8_kernel}
+        )
+        with _worker_env(worker_env):
+            self.generator = self.init_generator(
+                worker_model_path,
+                pipeline_class_name,
+                sgld_options,
+                worker_patches=patches,
+            )
+        self.model_type = model_type
 
         executor_class = self.executor_class_dict[model_type]
         self.executor = executor_class(
-            self.generator, detect_path, comfyui_model, model_config
+            self.generator, worker_model_path, comfyui_model, model_config
         )
-        self.executor.enable_cache_dit = plugin_flags.get("enable_cache_dit")
+        _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
         comfyui_model.diffusion_model = self.executor

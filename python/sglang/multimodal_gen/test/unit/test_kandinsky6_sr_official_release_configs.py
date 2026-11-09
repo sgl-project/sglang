@@ -284,10 +284,12 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
         loader_cls=None,
         component_attn_backend=None,
         component_attn_name=None,
+        component_backend_by_role=None,
     ):
         assert component_type == component_name
         assert loader_cls is None and component_attn_backend is None
         assert component_attn_name == component_name
+        assert component_backend_by_role == {}
         requested[component_name] = (transformers_or_diffusers, component_architecture)
         return SimpleNamespace(name=component_name), 0.0
 
@@ -302,6 +304,7 @@ def test_real_model_index_is_accepted_by_the_module_loading_path(
         component_direct_gpu_weight_loading={},
         pipeline_config=Kandinsky6SRPipelineConfig(),
         resolve_component_attention_backend=lambda *names: (None, None),
+        resolve_component_backend_by_role=lambda *names: {},
     )
     # the state ``ComposedPipelineBase.__init__`` sets up before it calls load_modules
     pipeline = object.__new__(Kandinsky6SRPipeline)

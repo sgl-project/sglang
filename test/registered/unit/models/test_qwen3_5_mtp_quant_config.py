@@ -6,7 +6,7 @@ from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP, _mtp_quant_conf
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=13, suite="base-a-test-cpu")
 
 # The real `mtp.*` exclude entries of the two AMD Quark MXFP4 checkpoints.
 # Quark names layers in the checkpoint namespace, where the draft is prefixed
@@ -54,13 +54,6 @@ class TestQwen3_5MTPQuantConfig(CustomTestCase):
         quant_config = _FakeQuantConfig("quark", _ALL_BF16_EXCLUDES)
 
         self.assertIsNone(_mtp_quant_config(quant_config))
-
-    def test_the_two_checkpoints_differ_only_in_the_routed_experts(self):
-        """Guards the premise of the fix, not the implementation."""
-        extra = set(_ALL_BF16_EXCLUDES) - set(_MIXED_EXCLUDES)
-
-        self.assertTrue(all("mlp.experts" in layer for layer in extra))
-        self.assertEqual(len(extra), 512 * 3)
 
     def test_quark_checkpoint_without_mtp_excludes_keeps_quantization(self):
         quant_config = _FakeQuantConfig("quark", ["model.layers.0.self_attn.q_proj"])

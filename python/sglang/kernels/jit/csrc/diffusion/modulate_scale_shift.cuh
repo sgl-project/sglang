@@ -99,7 +99,7 @@ struct ModulateScaleShiftKernel {
     auto L = SymbolicSize{"sequence_length"};
     auto D = SymbolicSize{"hidden_size"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({B, L, D}).with_dtype<T>().with_device(device).verify(out).verify(x);
     TensorMatcher({B, D}).with_dtype<T>().with_device(device).verify(scale).verify(shift);

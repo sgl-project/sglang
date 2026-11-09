@@ -19,9 +19,18 @@ def _domino_gru_cell(
     )
 
 
-# Throughput policy for the logical full-vocabulary tensor. TP>1 uses the
-# compact candidate pool when this gathered representation would be large.
+# A full-vocab gather is one collective; the candidate pool takes four
+# all-gathers and an all-reduce. Eager stays launch bound until the gathered
+# logits are large, while a captured graph pays only GPU time.
 _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES = 96 * 1024 * 1024
+
+
+def _domino_prefers_tp_candidate_pool(
+    *, batch_size: int, full_base_logits_bytes: int, in_cuda_graph: bool
+) -> bool:
+    if in_cuda_graph:
+        return batch_size > 1
+    return full_base_logits_bytes > _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES
 
 
 def _domino_tp_first_ids(
@@ -315,7 +324,7 @@ def domino_greedy_rollout(
     lm_head_org_vocab_start: int = 0,
     lm_head_num_org: int | None = None,
     lm_head_num_org_padded: int | None = None,
-    prefer_tp_candidate_pool: bool | None = None,
+    in_cuda_graph: bool,
 ) -> torch.Tensor:
     """Generate a Domino chain using one block-shared base-logit candidate pool."""
     if draft_hidden.ndim != 3:
@@ -377,17 +386,17 @@ def domino_greedy_rollout(
     local_logits = F.linear(logits_input, weight).view(
         num_proposals, batch_size, local_vocab_size
     )
-    if prefer_tp_candidate_pool is None:
-        full_base_logits_bytes = (
-            num_proposals * batch_size * int(vocab_size) * local_logits.element_size()
-        )
-        prefer_tp_candidate_pool = (
-            full_base_logits_bytes > _DOMINO_TP_FULL_BASE_LOGITS_MAX_BYTES
-        )
     use_tp_candidate_pool = (
         tp_size > 1
-        and prefer_tp_candidate_pool
         and 0 < candidate_pool_size < int(vocab_size)
+        and _domino_prefers_tp_candidate_pool(
+            batch_size=batch_size,
+            full_base_logits_bytes=num_proposals
+            * batch_size
+            * int(vocab_size)
+            * local_logits.element_size(),
+            in_cuda_graph=in_cuda_graph,
+        )
     )
     first_ids = None
     candidate_ids = None
