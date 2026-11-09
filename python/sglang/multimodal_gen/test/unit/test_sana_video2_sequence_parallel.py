@@ -44,11 +44,20 @@ def test_attention_ignores_tail_padding(attention_cls):
     torch.testing.assert_close(actual[:, :3], expected, atol=2e-6, rtol=2e-5)
 
 
-def test_ring_degree_is_rejected():
+def test_unsupported_parallel_layouts_are_rejected():
     config = SanaVideo2PipelineConfig()
-    config.validate_server_args(SimpleNamespace(ring_degree=1))
+    config.validate_server_args(SimpleNamespace(ring_degree=1, sp_degree=2))
     with pytest.raises(ValueError, match="ring"):
-        config.validate_server_args(SimpleNamespace(ring_degree=2))
+        config.validate_server_args(SimpleNamespace(ring_degree=2, sp_degree=2))
+    # the softmax layers have 10 heads to spread over the ranks
+    with pytest.raises(ValueError, match="10 softmax attention heads"):
+        config.validate_server_args(SimpleNamespace(ring_degree=1, sp_degree=4))
+
+
+def test_extra_gpus_go_to_sequence_parallelism():
+    deployment = SanaVideo2PipelineConfig().get_model_deployment_config()
+    assert not deployment.auto_enable_cfg_parallel
+    assert not deployment.supports_cfg_parallel
 
 
 def test_frame_count_is_not_aligned_to_gpus():

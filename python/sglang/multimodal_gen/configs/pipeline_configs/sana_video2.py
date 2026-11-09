@@ -5,6 +5,9 @@ from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.dits.sana_video2 import SanaVideo2Config
 from sglang.multimodal_gen.configs.models.vaes.ltx_video import LTXVideoVAEConfig
+from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
+    ModelDeploymentConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.sana_video import (
     SanaVideoPipelineConfig,
 )
@@ -35,11 +38,26 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
+    def get_model_deployment_config(self) -> ModelDeploymentConfig:
+        # the denoising stage batches both guidance branches on every rank
+        return ModelDeploymentConfig(
+            auto_enable_cfg_parallel=False, supports_cfg_parallel=False
+        )
+
     def validate_server_args(self, server_args):
         if int(server_args.ring_degree or 1) > 1:
             raise ValueError(
                 "SANA-Video 2.0 does not support --ring-degree > 1; use Ulysses "
                 "sequence parallelism."
+            )
+        arch = self.dit_config.arch_config
+        softmax_heads = arch.hidden_size // arch.softmax_head_dim
+        sp_degree = int(server_args.sp_degree or 1)
+        if softmax_heads % sp_degree:
+            raise ValueError(
+                f"SANA-Video 2.0 spreads its {softmax_heads} softmax attention heads "
+                f"over the sequence-parallel ranks; --sp-degree {sp_degree} does not "
+                "divide them."
             )
         super().validate_server_args(server_args)
 
