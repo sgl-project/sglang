@@ -2838,6 +2838,7 @@ class Scheduler(
             tree_cache=self.tree_cache,
             server_args=self.server_args,
             is_generation=self.is_generation,
+            is_dllm=self.dllm_config is not None,
             spec_algorithm=self.spec_algorithm,
             disaggregation_mode=self.disaggregation_mode,
             skip_tokenizer_init=self.skip_tokenizer_init,

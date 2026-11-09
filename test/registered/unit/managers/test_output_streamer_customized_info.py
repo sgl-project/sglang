@@ -137,12 +137,14 @@ class _FakeReq(FakeReq):
 
 
 def _accumulator(
+    is_dllm=False,
     current_weight_version="default",
     return_sampling_mask=False,
     request_level_keys=frozenset(),
     output_sink=OutputSink.DETOKENIZER,
 ):
     return _GenerationStreamAccumulator(
+        is_dllm=is_dllm,
         return_logprob=False,
         return_hidden_states=False,
         return_routed_experts=False,
@@ -1273,6 +1275,39 @@ class TestOutputStreamerPrefillWeightVersions(unittest.TestCase):
 
         self.assertIsNone(payload.prefill_weight_versions)
         self.assertIsNotNone(payload.weight_versions)
+
+
+class TestForwardCountTransport(unittest.TestCase):
+    # Use the same runtime context fixture as the existing streamer tests.
+    setUp = TestOutputStreamerCustomizedInfo.setUp
+
+    def test_stop_trimmed_completion_and_cumulative_work_snapshot(self):
+        accumulator = _accumulator(is_dllm=True)
+        req = _FakeReq("diffusion", [10, 11, 12, 13], finished=True)
+        req.output_ids_through_stop = [10, 11]
+        req.dllm_forward_count = 5
+        req.dllm_prompt_forward_count = 1
+        req.dllm_generation_forward_count = 3
+        req.dllm_recompute_forward_count = 1
+        accumulator.accept(req=req)
+        # Capture at accept(), not by reading mutable requests in to_payload().
+        req.dllm_forward_count = 9
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertEqual(payload.dllm_forward_counts, [5])
+        self.assertEqual(payload.dllm_prompt_forward_counts, [1])
+        self.assertEqual(payload.dllm_generation_forward_counts, [3])
+        self.assertEqual(payload.dllm_recompute_forward_counts, [1])
+        self.assertEqual(payload.completion_tokens, [2])
+        self.assertEqual(list(row_output_ids(payload, 0)), [10, 11])
+
+    def test_ar_payload_has_no_dllm_counts(self):
+        accumulator = _accumulator()
+        accumulator.accept(req=_FakeReq("autoregressive", [20], finished=True))
+        payload = accumulator.to_payload(dp_rank=0, is_idle_batch=False)
+        self.assertIsNone(payload.dllm_forward_counts)
+        self.assertIsNone(payload.dllm_prompt_forward_counts)
+        self.assertIsNone(payload.dllm_generation_forward_counts)
+        self.assertIsNone(payload.dllm_recompute_forward_counts)
 
 
 if __name__ == "__main__":

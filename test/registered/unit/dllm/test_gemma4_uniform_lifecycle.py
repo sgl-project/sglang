@@ -8,6 +8,7 @@ from unittest.mock import MagicMock, Mock, patch
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
@@ -29,6 +30,7 @@ class _Req(FakeReq):
             "q", [0] * block_size
         )
         self.prefix_len = context_len
+        Req.init_diffusion_llm(self, None)
         self.dllm_block_offset = context_len
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
@@ -50,6 +52,7 @@ class _Req(FakeReq):
         return len(self.origin_input_ids) + len(self.output_ids)
 
     extend_len = Req.extend_len
+    get_dllm_forward_phase = Req.get_dllm_forward_phase
     finish_outside_step = Req.finish_outside_step
 
     def is_dllm_prefill(self):
@@ -66,6 +69,9 @@ class _Req(FakeReq):
 class _Batch:
     def __init__(self, reqs):
         self.reqs = reqs
+        self.dllm_forward_metadata = tuple(
+            (req.get_dllm_forward_phase(), req.extend_end) for req in reqs
+        )
         self.forward_mode = (
             ForwardMode.EXTEND
             if all(req.is_dllm_prefill() for req in reqs)
@@ -107,6 +113,7 @@ class _Scheduler(SchedulerDllmMixin):
 def _result(next_token_ids, *, accept_lengths=None, algo_states=None):
     return SimpleNamespace(
         copy_done=None,
+        dllm_forward_count=1,
         next_token_ids=next_token_ids,
         accept_length_per_req_cpu=accept_lengths,
         dllm_algo_state=algo_states,
@@ -154,6 +161,135 @@ class TestGemma4ContextLifecycle(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator.free_group_begin.assert_not_called()
         scheduler.output_streamer.stream_output.assert_not_called()
         scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+        self.assertEqual(req.dllm_forward_count, 1)
+        self.assertEqual(list(req.output_ids), [])
+
+    def test_scheduler_counts_rounds_without_output(self):
+        for fdfo in (False, True):
+            with self.subTest(fdfo=fdfo):
+                scheduler = _Scheduler(fdfo=fdfo)
+                scheduler.dllm_config.requires_separate_context_encoding = False
+                req = _Req(prefill=not fdfo)
+                result = (
+                    _result([[1, 2, 3, 4]], accept_lengths=[0], algo_states=[{}])
+                    if fdfo
+                    else _result([])
+                )
+                for expected in (1, 2):
+                    scheduler.process_batch_result_dllm(_Batch([req]), result)
+                    self.assertEqual(req.dllm_forward_count, expected)
+                    self.assertEqual(list(req.output_ids), [])
+
+    def test_phase_and_extent_are_snapshotted_before_next_schedule(self):
+        scheduler = _Scheduler(fdfo=True)
+        req = _Req(prefill=True)
+        req.prefix_len, req.extend_end = 0, 8
+        batch = _Batch([req])
+        # Overlap can prepare the next decode round before this result arrives.
+        req.dllm_phase_prefill = False
+        req.extend_end = 12
+        scheduler.process_batch_result_dllm(batch, _result(None))
+        self.assertEqual(req.dllm_forward_count, 1)
+        self.assertEqual(req.dllm_prompt_forward_count, 1)
+        self.assertEqual(req.dllm_generation_forward_count, 0)
+        self.assertEqual(req.dllm_computed_end, 8)
+
+    def test_invalid_forward_metadata_leaves_all_request_counts_unchanged(self):
+        for metadata in (None, (("prompt", 8),), (("prompt", 8),) * 3):
+            with self.subTest(metadata=metadata):
+                scheduler = _Scheduler(fdfo=True)
+                reqs = [_Req(prefill=True), _Req(prefill=True)]
+                batch = _Batch(reqs)
+                batch.dllm_forward_metadata = metadata
+                before = [vars(req).copy() for req in reqs]
+                with self.assertRaisesRegex(ValueError, "one snapshot per request"):
+                    scheduler.process_batch_result_dllm(batch, _result(None))
+                self.assertEqual([vars(req) for req in reqs], before)
+
+    def test_empty_forward_metadata_is_valid_for_empty_batch(self):
+        scheduler = _Scheduler(fdfo=True)
+        scheduler.process_batch_result_dllm(_Batch([]), _result(None))
+        scheduler.metrics_reporter.report_prefill_stats.assert_called_once()
+
+    def test_context_forward_classification_and_zero_work(self):
+        scheduler = _Scheduler(fdfo=True)
+        req = _Req(prefill=True)
+        # Initial prompt, later block context, replay, then resumed context.
+        for prefix, end, replay_until, calls, expected, computed_end in (
+            (0, 8, 0, 1, (1, 0, 0), 8),
+            (8, 12, 0, 1, (1, 1, 0), 12),
+            (0, 8, 12, 1, (1, 1, 1), 12),
+            (12, 16, 12, 1, (1, 2, 1), 16),
+            (16, 20, 12, 0, (1, 2, 1), 16),
+        ):
+            with self.subTest(prefix=prefix, end=end, replay_until=replay_until):
+                req.prefix_len, req.extend_end = prefix, end
+                req.dllm_recompute_until = replay_until
+                result = _result(None)
+                result.dllm_forward_count = calls
+                scheduler.process_batch_result_dllm(_Batch([req]), result)
+                self.assertEqual(
+                    (
+                        req.dllm_prompt_forward_count,
+                        req.dllm_generation_forward_count,
+                        req.dllm_recompute_forward_count,
+                    ),
+                    expected,
+                )
+                self.assertEqual(req.dllm_forward_count, sum(expected))
+                self.assertEqual(req.dllm_computed_end, computed_end)
+
+    def test_repeated_retraction_retains_work_and_replay_boundary(self):
+        req = Req(
+            "replay",
+            "",
+            array("q", range(8)),
+            SamplingParams(),
+            dllm_config=_Scheduler(fdfo=True).dllm_config,
+        )
+        req.output_ids.extend([9, 10, 11, 12])
+        req.dllm_forward_count = 7
+        req.dllm_prompt_forward_count = 2
+        req.dllm_generation_forward_count = 4
+        req.dllm_recompute_forward_count = 1
+        # The computed canvas can extend beyond committed output.
+        req.dllm_computed_end = 16
+        req.reset_for_retract()
+        self.assertEqual(req.dllm_recompute_until, 12)
+        req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        req.prefix_len, req.extend_end = 0, 8
+        self.assertEqual(req.get_dllm_forward_phase(), "recompute")
+        # Retract again before replay reaches its previous high-water mark.
+        req.reset_for_retract()
+        self.assertEqual(req.dllm_recompute_until, 12)
+        self.assertEqual(
+            (
+                req.dllm_forward_count,
+                req.dllm_prompt_forward_count,
+                req.dllm_generation_forward_count,
+                req.dllm_recompute_forward_count,
+            ),
+            (7, 2, 4, 1),
+        )
+        req.prefix_len, req.extend_end = 12, 16
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
+        req.dllm_phase = DllmReqPhase.STAGING_DECODE
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
+
+        # Embedding-input retraction discards output and restarts generation.
+        # Its old generated positions must not classify new context as replay.
+        req.input_embeds = [[0.0]] * len(req.origin_input_ids)
+        req.reset_for_retract()
+        self.assertEqual(len(req.output_ids), 0)
+        self.assertEqual(req.dllm_recompute_until, 8)
+        req.dllm_phase = DllmReqPhase.STAGING_PREFILL
+        req.prefix_len, req.extend_end = 0, 8
+        self.assertEqual(req.get_dllm_forward_phase(), "recompute")
+        req.output_ids.extend([13, 14, 15, 16])
+        req.prefix_len, req.extend_end = 8, 12
+        self.assertEqual(req.get_dllm_forward_phase(), "generation")
+        fresh = Req(req.rid, "", req.origin_input_ids, SamplingParams())
+        self.assertEqual(fresh.dllm_forward_count, 0)
 
     def test_context_admission_obeys_live_swa_budget(self):
         allocator = SimpleNamespace(

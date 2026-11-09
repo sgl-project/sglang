@@ -1796,6 +1796,12 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Cumulative forwards per request, present only for dLLM services.
+    dllm_forward_counts: Optional[List[int]] = None
+    dllm_prompt_forward_counts: Optional[List[int]] = None
+    dllm_generation_forward_counts: Optional[List[int]] = None
+    dllm_recompute_forward_counts: Optional[List[int]] = None
+
 
 class DetokenizeReleaseReq(BaseReq, kw_only=True):
     """Drops the detokenizer's state of a request that ended outside the output
@@ -1880,6 +1886,12 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # See BatchTokenIDOutput.dllm_forward_counts.
+    dllm_forward_counts: Optional[List[int]] = None
+    dllm_prompt_forward_counts: Optional[List[int]] = None
+    dllm_generation_forward_counts: Optional[List[int]] = None
+    dllm_recompute_forward_counts: Optional[List[int]] = None
 
 
 def row_output_ids(output: Union[BatchTokenIDOutput, BatchStrOutput], i: int) -> array:

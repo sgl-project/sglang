@@ -606,6 +606,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu,
             dllm_algo_state,
             can_run_cuda_graph,
+            dllm_forward_count,
         ) = self.dllm_algorithm.run(self.model_runner, forward_batch, algo_states)
 
         return GenerationBatchResult(
@@ -614,6 +615,7 @@ class TpModelWorker(BaseTpWorker):
             accept_length_per_req_cpu=accept_length_per_req_cpu,
             dllm_algo_state=dllm_algo_state,
             can_run_cuda_graph=can_run_cuda_graph,
+            dllm_forward_count=dllm_forward_count,
         )
 
     def _maybe_finalize_elastic_cuda_graph_scale(self) -> None:

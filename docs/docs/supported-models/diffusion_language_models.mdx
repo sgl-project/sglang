@@ -114,6 +114,70 @@ curl -X POST "http://127.0.0.1:30000/generate" \
     }'
 ```
 
+## Forward-count metrics
+
+The Python `/generate` API and `Engine.generate` return request-level work in
+`meta_info.dllm_metrics`:
+
+```json
+{
+  "forward_count": 48,
+  "prompt_forward_count": 6,
+  "generation_forward_count": 40,
+  "recompute_forward_count": 2,
+  "completion_tokens": 128,
+  "tokens_per_forward": 3.2
+}
+```
+
+`forward_count` counts model forwards that the request actually participates in,
+including uncached prefill, denoising, final KV updates, and recomputation after
+retraction. It excludes initialization and CUDA graph capture. In synchronous
+batches, a completed row still counts forwards while it waits for other rows.
+FDFO counts only rounds that contain the request. These are per-request counts;
+summing them across requests does not give the number of GPU batch forwards.
+
+The total is the sum of three counters:
+
+- `prompt_forward_count`: prompt-only encoding outside previously computed regions.
+- `generation_forward_count`: denoising and final KV updates, including a block
+  that contains both a prompt tail and newly generated tokens. For DiffusionGemma,
+  context encoding after generated blocks also belongs to generation.
+- `recompute_forward_count`: committed-token prefill that replays previously
+  computed positions after retraction. A context call spanning both replayed and
+  new positions counts wholly as recomputation; a denoising call counts wholly
+  as generation. This is a classification of calls, not a token-weighted split.
+
+`recompute_forward_count` records replay work; it does not enable retraction.
+In the validated single-GPU SDAR setup without overlap or prefill/decode
+disaggregation, native decode-memory-pressure retraction does not select dLLM
+requests, and retracting pauses have queue-lifecycle limitations. Recompute
+accounting was tested with controlled synchronous replay using real KV release,
+reset, and requeue.
+
+`completion_tokens` matches the outer completion-token count after stop/length
+truncation. `tokens_per_forward` divides it by `generation_forward_count`, or
+returns `0.0` when `generation_forward_count` is zero. Prompt encoding and retraction
+prefill therefore do not enter its denominator. This ratio measures generated
+tokens per generation forward, not latency, throughput, or output quality.
+
+All scalar metrics are cumulative in non-streaming, normal streaming, and
+`--incremental-streaming-output` responses. Only token/text payloads are
+incremental. Chunks can contain forwards without new tokens. Use the last
+metrics snapshot for a request; do not sum snapshots or average their ratios.
+Clients needing increments can subtract consecutive cumulative counters.
+
+These fields are available in native Python `/generate` JSON responses and
+`Engine.generate` dictionaries. A streamed batch output with an abort finish
+reason can include them; a separate abort notification has no metrics snapshot.
+Coalescing uses the last chunk's scalar metadata, so a final notification without
+metrics does not inherit an earlier snapshot. The Rust frontend and generated
+`GenerateMetaInfo` schema do not expose these fields.
+
+For custom algorithm callers, `DllmAlgorithm.run()` now returns `DllmRunOutput`
+with an added `forward_count` field. Use named fields or unpack six values instead
+of five.
+
 ## Supported Models
 
 Below the supported models are summarized in a table.

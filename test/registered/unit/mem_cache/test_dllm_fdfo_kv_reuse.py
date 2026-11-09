@@ -400,7 +400,7 @@ class TestDllmCommittedTokens(unittest.TestCase):
                     )
                     states = None
                     for _ in range(32):
-                        _, output, accepted, states, _ = algorithm.run(
+                        _, output, accepted, states, _, _ = algorithm.run(
                             Runner(), batch, states
                         )
                         self.assertEqual(batch.input_ids[:2].tolist(), [15, 2])

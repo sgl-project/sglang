@@ -425,7 +425,7 @@ class TestGemma4Renoise(unittest.TestCase):
         self.assertEqual(state["step"], 0)
         torch.testing.assert_close(state["current"], final)
 
-    def test_encoder_returns_five_tuple_and_skips_denoising(self):
+    def test_encoder_returns_forward_metrics_and_skips_denoising(self):
         marker = object()
         runner = SimpleNamespace(
             calls=0,
@@ -437,10 +437,10 @@ class TestGemma4Renoise(unittest.TestCase):
         batch = _batch(["request"], 3, encoder=True)
 
         output = algorithm.run(runner, batch)
-        self.assertEqual(output, (marker, [], None, None, True))
+        self.assertEqual(output, (marker, [], None, None, True, 1))
 
         empty = _batch(["request"], 3, encoder=True, empty=True)
-        self.assertEqual(algorithm.run(runner, empty), (None, [], None, None, False))
+        self.assertEqual(algorithm.run(runner, empty), (None, [], None, None, False, 0))
 
     def test_fdfo_mixes_fresh_and_carried_state(self):
         algorithm = Gemma4Renoise(

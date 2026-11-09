@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 
@@ -17,13 +17,14 @@ if TYPE_CHECKING:
 
 _is_npu = is_npu()
 
-DllmRunOutput = Tuple[
-    Union[LogitsProcessorOutput, torch.Tensor],
-    List,
-    Optional[List[int]],
-    Optional[List[Any]],
-    bool,
-]
+
+class DllmRunOutput(NamedTuple):
+    logits_output: Optional[Union[LogitsProcessorOutput, torch.Tensor]]
+    next_token_ids: List
+    accept_length_per_req_cpu: Optional[List[int]]
+    dllm_algo_state: Optional[List[Any]]
+    can_run_cuda_graph: bool
+    forward_count: int
 
 
 class DllmAlgorithm:
@@ -42,6 +43,7 @@ class DllmAlgorithm:
         self.block_size = config.block_size
         self.mask_id = config.mask_id
         self.fdfo = config.first_done_first_out_mode
+        self._forward_count = 0
 
     @staticmethod
     def from_server_args(server_args: ServerArgs):
@@ -93,9 +95,15 @@ class DllmAlgorithm:
         forward_batch: ForwardBatch,
         algo_states: Optional[List[Any]] = None,
     ) -> DllmRunOutput:
+        self._forward_count = 0
         if self.fdfo:
             return self._run_fdfo(model_runner, forward_batch, algo_states)
         return self._run_sync(model_runner, forward_batch)
+
+    def _forward(self, model_runner: ModelRunner, forward_batch: ForwardBatch):
+        """Count actual model invocations, including extra calls within a round."""
+        self._forward_count += 1
+        return model_runner.forward(forward_batch, pp_proxy_tensors=None)
 
     def _block_start_list(self, forward_batch: ForwardBatch) -> List[int]:
         return self._prompt_mask(forward_batch).sum(dim=1).tolist()
@@ -116,11 +124,18 @@ class DllmAlgorithm:
         states = self.init_step_state(forward_batch)
         self.prepare_inputs(model_runner, forward_batch, states)
 
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = self._forward(model_runner, forward_batch)
         # No mask to denoise: return empty so process_batch_result_dllm skips the
         # stream branch (matches the pre-refactor behavior).
         if all(start == self.block_size for start in start_list):
-            return out.logits_output, [], None, None, out.can_run_graph
+            return DllmRunOutput(
+                out.logits_output,
+                [],
+                None,
+                None,
+                out.can_run_graph,
+                self._forward_count,
+            )
 
         # The first forward has planned the fixed canvas's attention metadata.
         if _is_npu or (self.reuse_forward_metadata and out.can_run_graph):
@@ -130,13 +145,20 @@ class DllmAlgorithm:
             if all(done):
                 break
             self.prepare_inputs(model_runner, forward_batch, states)
-            out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+            out = self._forward(model_runner, forward_batch)
 
         next_token_ids = forward_batch.input_ids.view(batch_size, self.block_size)
         next_token_ids_list = [
             next_token_ids[i, start_list[i] :] for i in range(batch_size)
         ]
-        return out.logits_output, next_token_ids_list, None, None, out.can_run_graph
+        return DllmRunOutput(
+            out.logits_output,
+            next_token_ids_list,
+            None,
+            None,
+            out.can_run_graph,
+            self._forward_count,
+        )
 
     def _run_fdfo(
         self,
@@ -159,7 +181,7 @@ class DllmAlgorithm:
                 states.append(carried)
 
         self.prepare_inputs(model_runner, forward_batch, states)
-        out = model_runner.forward(forward_batch, pp_proxy_tensors=None)
+        out = self._forward(model_runner, forward_batch)
         done = self.step(forward_batch, out.logits_output.full_logits, states)
 
         accept_length_per_req_cpu = [self.block_size if d else 0 for d in done]
@@ -168,10 +190,11 @@ class DllmAlgorithm:
         ).tolist()
         states_out = [None if done[i] else states[i] for i in range(batch_size)]
 
-        return (
+        return DllmRunOutput(
             out.logits_output,
             next_token_ids_list,
             accept_length_per_req_cpu,
             states_out,
             out.can_run_graph,
+            self._forward_count,
         )

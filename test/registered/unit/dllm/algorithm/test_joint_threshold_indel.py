@@ -115,7 +115,7 @@ class TestJointThresholdInDelInitialization(CustomTestCase):
                 )
                 states = None
                 for _ in range(32):
-                    _, output, accepted, states, _ = algorithm.run(
+                    _, output, accepted, states, _, _ = algorithm.run(
                         runner, batch, states
                     )
                     self.assertEqual(batch.input_ids[:2].tolist(), [MASK, 3])
@@ -608,7 +608,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         ]
 
         batch = make_batch([[3, 4, 5], [3, MASK, 4]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+        _, next_token_ids, accept_lengths, algo_states, _, _ = algorithm.run(
             model_runner, batch
         )
 
@@ -621,7 +621,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         self.assertTrue(surviving_state["finished"])
 
         batch = make_batch([next_token_ids[1]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+        _, next_token_ids, accept_lengths, algo_states, _, _ = algorithm.run(
             model_runner, batch, [surviving_state]
         )
 
@@ -642,7 +642,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         ]
 
         batch = make_batch([[3, MASK, 4]])
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+        _, next_token_ids, accept_lengths, algo_states, _, _ = algorithm.run(
             model_runner, batch
         )
 
@@ -653,7 +653,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         self.assertFalse(state["finished"])
 
         batch = make_batch(next_token_ids)
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+        _, next_token_ids, accept_lengths, algo_states, _, _ = algorithm.run(
             model_runner, batch, algo_states
         )
 
@@ -664,7 +664,7 @@ class TestJointThresholdInDelFdfo(CustomTestCase):
         self.assertTrue(state["finished"])
 
         batch = make_batch(next_token_ids)
-        _, next_token_ids, accept_lengths, algo_states, _ = algorithm.run(
+        _, next_token_ids, accept_lengths, algo_states, _, _ = algorithm.run(
             model_runner, batch, algo_states
         )
 

@@ -1498,6 +1498,13 @@ class Req(ReqDllmMixin):
         # since we are tracking the total number of retractions for each request.
         self.retraction_count += 1
 
+        if self.is_dllm():
+            self.dllm_recompute_until = min(
+                self.dllm_computed_end,
+                len(self.origin_input_ids)
+                + (len(self.output_ids) if self.input_embeds is None else 0),
+            )
+
         self.prefix_len = 0
         self.routed_experts = None
         self.indexer_topk = None
@@ -2078,6 +2085,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
 
     # Diffusion LLM
     dllm_config: Optional[DllmConfig] = None
+    # Immutable phase and context boundary for each request at forward launch.
+    dllm_forward_metadata: Optional[Tuple[Tuple[str, int], ...]] = None
 
     # === Host metadata crossing to ForwardBatch (CPU lists / mirrors) ===
     seq_lens_cpu: torch.Tensor = None  # shape: [b], int64
@@ -3317,6 +3326,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # Filter out all requests. Stale tensors are left as-is: is_empty()
             # keys off reqs, so callers drop the batch before a forward reads them.
             self.reqs = []
+            if self.dllm_forward_metadata is not None:
+                self.dllm_forward_metadata = ()
             self.return_hidden_states = False
             self.return_hidden_states_mode = CaptureHiddenMode.NULL
             return
@@ -3336,6 +3347,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.encoder_lens_cpu = [self.encoder_lens_cpu[i] for i in keep_indices]
 
         self.reqs = [self.reqs[i] for i in keep_indices]
+        if self.dllm_forward_metadata is not None:
+            self.dllm_forward_metadata = tuple(
+                self.dllm_forward_metadata[i] for i in keep_indices
+            )
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = [self.multimodal_inputs[i] for i in keep_indices]
         self.req_pool_indices = self.req_pool_indices[keep_indices_device]
@@ -3439,6 +3454,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         elif other.return_logprob:
             self.top_logprobs_nums = [0] * len(self.reqs) + other.top_logprobs_nums
             self.token_ids_logprobs = [None] * len(self.reqs) + other.token_ids_logprobs
+        if (
+            self.dllm_forward_metadata is not None
+            or other.dllm_forward_metadata is not None
+        ):
+            assert self.dllm_forward_metadata is not None or not self.reqs
+            assert other.dllm_forward_metadata is not None or not other.reqs
+            self.dllm_forward_metadata = (self.dllm_forward_metadata or ()) + (
+                other.dllm_forward_metadata or ()
+            )
         self.reqs = self.reqs + other.reqs
         if self.multimodal_inputs is not None:
             self.multimodal_inputs = self.multimodal_inputs + other.multimodal_inputs
@@ -3462,6 +3486,8 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         # original.
         return ScheduleBatch(
             reqs=self.reqs[:],
+            dllm_config=self.dllm_config,
+            dllm_forward_metadata=self.dllm_forward_metadata,
             launched_reqs=self.launched_reqs,
             chunked_req=self.chunked_req,
             extend_lens=self.extend_lens,
