@@ -16,6 +16,8 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MiniMaxH3DiTArchConfig,
     MiniMaxH3DiTConfig,
+)
+from sglang.multimodal_gen.configs.models.dits.minimax_h3_vdn import (
     VDNHybridAttentionArchConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (

@@ -5,7 +5,7 @@ import torch
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
-from sglang.srt.utils import is_cpu, is_hip, is_npu, is_xpu
+from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu, is_xpu
 
 _is_hip = is_hip()
 if _is_hip:
@@ -31,6 +31,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
     # non-packed Triton decode() path (fused_sigmoid_gating_delta_rule_update),
     # the same fallback CPU/NPU use. Batched decode is handled via query_start_loc.
     supports_packed_decode: bool = not is_cpu() and not is_npu() and not is_xpu()
+    supports_packed_decode_safe_gate: bool = is_cuda()
     supports_fused_chain_verify: bool = not is_cpu() and not is_npu()
     supports_track_state_snapshot: bool = True
 
@@ -184,6 +185,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_rawk: Optional[torch.Tensor] = None,
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
+        ring_indices: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
@@ -218,6 +220,7 @@ class TritonKDAKernel(LinearAttnKernelBase):
             replayssm_rawk=replayssm_rawk,
             replayssm_g=replayssm_g,
             replayssm_beta=replayssm_beta,
+            ring_indices=ring_indices,
         )
 
     def extend(

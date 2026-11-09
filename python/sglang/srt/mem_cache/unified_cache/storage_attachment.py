@@ -19,7 +19,7 @@ from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -147,9 +147,9 @@ class StorageAttachment:
                 validate_buffer_only_stack(
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
-                    swa_component=cache.components.get(ComponentType.SWA),
-                    auxiliary_swa_component=cache.components.get(
-                        ComponentType.AUXILIARY_SWA
+                    swa_component=cache.component_of(TREE_WINDOW),
+                    further_window_components=tuple(
+                        cache.components[ct] for ct in cache.window_slots()[1:]
                     ),
                     storage_prefetch_threshold=prefetch_threshold,
                 )
@@ -398,7 +398,7 @@ class StorageAttachment:
         and `ongoing_backup` are already empty, so this normally finds nothing. It
         earns its keep on the atexit path, which has no such guard.
 
-        Two deliberate departures from `release_aborted_request`, which does the
+        Two deliberate departures from `_abandon_attempt`, which does the
         same bookkeeping while the storage threads are still running:
 
         * no cross-rank barrier -- at process exit the other ranks may already be
