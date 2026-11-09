@@ -65,6 +65,7 @@ from sglang.srt.utils import (
     is_gfx95_supported,
     is_hip,
     is_npu,
+    is_xpu,
 )
 
 Qwen3Config = None
@@ -73,6 +74,7 @@ logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
+_is_xpu = is_xpu()
 _is_gfx95 = is_gfx95_supported()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
@@ -101,6 +103,11 @@ if _is_npu:
 
     from sglang.srt.hardware_backend.npu.cmo import get_cmo_stream, wait_cmo_stream
 
+if _is_xpu:
+    try:
+        from sgl_kernel import fused_inplace_qknorm_rope
+    except ImportError:
+        fused_inplace_qknorm_rope = None
 
 def aiter_fused_qk_norm_rope_set_kv(
     qkv: torch.Tensor,
@@ -322,6 +329,16 @@ class Qwen3Attention(nn.Module):
             and self.rotary_emb.rotary_dim == self.head_dim
             and self.q_norm.variance_epsilon == self.k_norm.variance_epsilon
         )
+        self.use_xpu_fused_qk_norm_rope = (
+            _is_xpu
+            and fused_inplace_qknorm_rope is not None
+            and get_exec().kernel.enable_fused_qk_norm_rope
+            and not get_exec().deterministic.enable_deterministic_inference
+            and get_exec().deterministic.rl_on_policy_target is None
+            and type(self.rotary_emb) in (RotaryEmbedding, MRotaryEmbedding)
+            and self.rotary_emb.rotary_dim == self.head_dim
+            and self.head_dim in (64, 128, 256)
+        )
 
         self.use_fused_qk_norm_mrope = (
             _has_fused_qk_norm_mrope
@@ -407,6 +424,26 @@ class Qwen3Attention(nn.Module):
                 positions=positions,
                 head_dim=self.head_dim,
                 eps=self.q_norm.variance_epsilon,
+            )
+        elif (
+            self.use_xpu_fused_qk_norm_rope
+            and positions.ndim == 1
+            and qkv.dtype == torch.bfloat16
+            and self.q_norm.weight.dtype == qkv.dtype
+            and self.k_norm.weight.dtype == qkv.dtype
+            and self.rotary_emb.cos_sin_cache.dtype == torch.float32
+        ):
+            fused_inplace_qknorm_rope(
+                q=q.view(-1, self.num_heads, self.head_dim),
+                k=k.view(-1, self.num_kv_heads, self.head_dim),
+                q_weight=self.q_norm.weight,
+                k_weight=self.k_norm.weight,
+                cos_sin_cache=self.rotary_emb.cos_sin_cache,
+                positions=positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                eps=self.q_norm.variance_epsilon,
+                head_dim=self.head_dim,
+                rope_dim=self.rotary_emb.rotary_dim,
             )
         else:
             q, k = apply_qk_norm(
