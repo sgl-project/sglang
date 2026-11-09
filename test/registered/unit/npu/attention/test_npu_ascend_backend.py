@@ -1106,11 +1106,10 @@ class _DeviceTensorGuard:
 class TestInitForwardMetadataSeqLensSource(unittest.TestCase):
     """DLLM_EXTEND must take seq_lens_max from the host mirror.
 
-    A rebase once re-introduced a trailing ``else: seq_lens_max =
-    forward_batch.seq_lens.max()`` after the dLLM assignment, turning the host
-    read into a dead store and silently restoring the per-step D2H sync. These
-    tests pin the source: dLLM never touches the device reduction, decode
-    still does.
+    A trailing ``else: seq_lens_max = forward_batch.seq_lens.max()`` after the
+    dLLM assignment turns the host read into a dead store and silently
+    restores the per-step D2H sync. These tests pin the source: dLLM never
+    touches the device reduction, decode still does.
     """
 
     PAGE_SIZE = 2
