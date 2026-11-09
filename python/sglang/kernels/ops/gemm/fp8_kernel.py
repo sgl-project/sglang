@@ -478,7 +478,7 @@ def get_w8a8_channelwise_fp8_config(N: int, K: int, M: int) -> Optional[Dict[str
     N / K are the weight's output / contraction dims and M the token count. None
     means no tuned config applies -- the caller keeps its existing kernel choice
     -- either because this device / shape was never tuned, or the nearest tuned
-    M is a point where CUTLASS won. The caller gates on the feature flag.
+    M is a point where CUTLASS won.
     """
     configs = get_w8a8_channelwise_fp8_configs(N, K)
     if not configs:
