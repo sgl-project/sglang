@@ -55,8 +55,20 @@ class OllamaServing:
                 "seed": "seed",
             }
             for ollama_param, sglang_param in param_mapping.items():
-                if ollama_param in options:
+                if ollama_param in options and options[ollama_param] is not None:
                     sampling_params[sglang_param] = options[ollama_param]
+
+            # Ollama uses negative num_predict (-1 = infinite, -2 = fill context)
+            # and top_k = 0 to disable top-k sampling, whereas SGLang's
+            # SamplingParams.verify() requires max_new_tokens >= 0 and top_k == -1
+            # (or >= 1).
+            if (
+                "max_new_tokens" in sampling_params
+                and sampling_params["max_new_tokens"] < 0
+            ):
+                del sampling_params["max_new_tokens"]
+            if "top_k" in sampling_params and sampling_params["top_k"] <= 0:
+                sampling_params["top_k"] = -1
 
         # Set a reasonable default for max_new_tokens if not specified
         # Ollama users typically expect longer responses than SGLang's default (128)
@@ -64,6 +76,18 @@ class OllamaServing:
             sampling_params["max_new_tokens"] = 2048
 
         return sampling_params
+
+    @staticmethod
+    def _get_done_reason(meta_info: dict = None) -> str:
+        """Map SGLang finish_reason metadata to Ollama done_reason."""
+        if not isinstance(meta_info, dict):
+            return "stop"
+        finish_reason = meta_info.get("finish_reason")
+        if isinstance(finish_reason, dict):
+            finish_type = finish_reason.get("type")
+        else:
+            finish_type = finish_reason
+        return "length" if finish_type == "length" else "stop"
 
     async def handle_chat(
         self, request: OllamaChatRequest, raw_request: Request
@@ -123,7 +147,7 @@ class OllamaServing:
             created_at=self._get_timestamp(),
             message=OllamaMessage(role="assistant", content=output_text),
             done=True,
-            done_reason="stop",
+            done_reason=self._get_done_reason(response.get("meta_info")),
             total_duration=total_duration,
             prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
             eval_count=response.get("meta_info", {}).get("completion_tokens", None),
@@ -153,7 +177,7 @@ class OllamaServing:
                         created_at=self._get_timestamp(),
                         message=OllamaMessage(role="assistant", content=""),
                         done=True,
-                        done_reason="stop",
+                        done_reason=self._get_done_reason(chunk.get("meta_info")),
                     )
                 else:
                     response = OllamaChatStreamResponse(
@@ -240,7 +264,7 @@ class OllamaServing:
             created_at=self._get_timestamp(),
             response=output_text,
             done=True,
-            done_reason="stop",
+            done_reason=self._get_done_reason(response.get("meta_info")),
             total_duration=total_duration,
             prompt_eval_count=response.get("meta_info", {}).get("prompt_tokens", None),
             eval_count=response.get("meta_info", {}).get("completion_tokens", None),
@@ -269,7 +293,7 @@ class OllamaServing:
                         created_at=self._get_timestamp(),
                         response="",
                         done=True,
-                        done_reason="stop",
+                        done_reason=self._get_done_reason(chunk.get("meta_info")),
                     )
                 else:
                     response = OllamaGenerateStreamResponse(
