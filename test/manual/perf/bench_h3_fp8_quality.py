@@ -98,7 +98,7 @@ def main():
                 frames = np.stack(result.frames)
                 assert frames.dtype == np.uint8 and result.audio is not None
                 audio_hash = hashlib.sha256(
-                    np.asarray(result.audio).tobytes()
+                    result.audio.cpu().numpy().tobytes()
                 ).hexdigest()
                 reference_path = args.output / f"reference-{index}-{quality}.npz"
                 if not args.fp8 and not reference_path.exists():
@@ -113,6 +113,7 @@ def main():
                     "peak_memory_mb": result.peak_memory_mb,
                     "metrics": result.metrics,
                 }
+                del result
                 if quality == "high":
                     reference_path = args.output / f"reference-{index}-lossless.npz"
                 with np.load(reference_path) as reference:
