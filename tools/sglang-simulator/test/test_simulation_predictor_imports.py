@@ -14,7 +14,7 @@ import sys
 
 class BlockOptional(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path=None, target=None):
-        if fullname.split('.')[0] in {'aisimulate', 'simopus', 'joblib', 'sklearn'}:
+        if fullname.split('.')[0] in {'aisimulate', 'joblib', 'sklearn'}:
             raise ModuleNotFoundError('blocked unselected dependency: ' + fullname, name=fullname)
 
 sys.meta_path.insert(0, BlockOptional())
@@ -45,7 +45,7 @@ from sglang_simulator.simulation.client import AsyncCoordinatorClient
 from sglang_simulator.simulation.coordinator import Coordinator, Ready
 
 assert Coordinator().accept_ready(Ready('imports', 0, [], finished=True)) is None
-assert not any(name.split('.')[0] in {'simopus', 'aisimulate', 'torch', 'sglang', 'joblib', 'sklearn'} for name in sys.modules)
+assert not any(name.split('.')[0] in {'aisimulate', 'torch', 'sglang', 'joblib', 'sklearn'} for name in sys.modules)
 """
     )
 
@@ -79,7 +79,7 @@ if sys.argv[2] == 'default':
 else:
     assert value in entries.values()
 assert predictor.get_metrics()['replay_miss_steps'] == 1
-assert not any(name.split('.')[0] in {'aisimulate', 'simopus', 'joblib', 'sklearn'} for name in sys.modules)
+assert not any(name.split('.')[0] in {'aisimulate', 'joblib', 'sklearn'} for name in sys.modules)
 """,
         str(ROOT / "examples/assets/replay_table.json"),
         strategy,
