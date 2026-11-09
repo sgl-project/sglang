@@ -6188,5 +6188,71 @@ class TestRequestChatTemplateTrustGate(CustomTestCase):
                 )
 
 
+class _FakeTokenizer:
+    """Just the surface the logprob-bytes builder reads: id -> vocab piece."""
+
+    def __init__(self, pieces, is_byte_level):
+        self.pieces = pieces
+        self.is_byte_level = is_byte_level
+
+    def convert_ids_to_tokens(self, token_id):
+        return self.pieces[token_id]
+
+
+# Module-level so neither is collected: the byte-level verdict is cached by
+# id(tokenizer), and a recycled id would leak one fake's verdict to the other.
+_SENTENCEPIECE_TOKENIZER = _FakeTokenizer(
+    ["<0xE0>", "<0xB8>", "<0x83>", "\u2581\u00e9"], is_byte_level=False
+)
+_BYTE_LEVEL_TOKENIZER = _FakeTokenizer(["<0xE0>"], is_byte_level=True)
+
+
+class TestChatLogprobBytes(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.tm = _MockTokenizerManager()
+        self.chat = OpenAIServingChat(self.tm, _MockTemplateManager())
+
+    def _logprobs(self, tokenizer, triples):
+        self.tm.tokenizer = tokenizer
+        ret_item = {
+            "meta_info": {
+                "output_token_logprobs": triples,
+                "output_top_logprobs": [[t] for t in triples],
+            }
+        }
+        return self.chat._process_response_logprobs(ret_item).content
+
+    def test_sentencepiece_byte_fallback_pieces_report_their_byte(self):
+        """A non-ASCII byte-fallback piece decodes alone to U+FFFD;
+        its token and top_logprobs bytes must be its raw byte, not [239, 191, 189]."""
+        content = self._logprobs(
+            _SENTENCEPIECE_TOKENIZER,
+            [
+                (-0.1, 0, "\ufffd"),
+                (-0.2, 1, "\ufffd"),
+                (-0.3, 2, "\ufffd"),
+                (-0.4, 3, " \u00e9"),
+            ],
+        )
+        expected = [[0xE0], [0xB8], [0x83], [32, 195, 169]]
+        self.assertEqual([t.bytes for t in content], expected)
+        self.assertEqual([t.top_logprobs[0].bytes for t in content], expected)
+        self.assertEqual(
+            b"".join(bytes(t.bytes) for t in content).decode("utf-8"),
+            "\u0e03 \u00e9",
+        )
+
+    def test_byte_level_literal_hex_piece_keeps_its_text_bytes(self):
+        """In a byte-level BPE vocab, "<0xE0>" is six ASCII characters;
+        it is not a byte-fallback piece and must keep reporting those six bytes."""
+        content = self._logprobs(_BYTE_LEVEL_TOKENIZER, [(-0.1, 0, "<0xE0>")])
+        self.assertEqual(content[0].bytes, list(b"<0xE0>"))
+        self.assertEqual(content[0].top_logprobs[0].bytes, list(b"<0xE0>"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
