@@ -28,11 +28,17 @@ register_amd_ci(est_time=30, stage="jit-kernel-unit", runner_config="amd")
 if not torch.cuda.is_available():
     pytest.skip("GPU required", allow_module_level=True)
 
-FP8 = torch.float8_e4m3fn
+# aiter's e4m3 alias is float8_e4m3fn on gfx950 and float8_e4m3fnuz on gfx942,
+# and its fused KV-cache kernels assert on whichever one the device does not use.
+try:
+    from aiter.ops.triton.utils.types import e4m3_dtype as FP8
+except ImportError:
+    FP8 = torch.float8_e4m3fn
+
 H, KV_LORA_RANK, ROPE_DIM, TOPK, DCP = 64, 512, 64, 2048, 4
 # The RoPE rounds its own way before the fp8 cast: one e4m3 step (3 mantissa
 # bits), absolute below the smallest normal.
-FP8_RTOL, FP8_ATOL = 2**-3, torch.finfo(torch.float8_e4m3fn).smallest_normal
+FP8_RTOL, FP8_ATOL = 2**-3, torch.finfo(FP8).smallest_normal
 
 
 def _rel_err(a: torch.Tensor, b: torch.Tensor) -> float:
