@@ -334,6 +334,63 @@ def test_strided_bias_falls_back(config: str) -> None:
     _assert_matches(w, i, _reference(scores, bias, **kwargs), kwargs["topk"])
 
 
+@pytest.mark.parametrize("config", ["deepseek_v3", "qwen3_moe"])
+@pytest.mark.parametrize("layout", ["column_stride", "base_offset", "row_pitch"])
+def test_strided_scores_fall_back(config: str, layout: str) -> None:
+    scores, bias = _inputs(config, 64, seed=12)
+    m, n = scores.shape
+    if layout == "column_stride":
+        storage = torch.empty((m, n * 2), dtype=scores.dtype, device=DEVICE)
+        view = storage[:, ::2]
+    elif layout == "base_offset":
+        storage = torch.empty(m * n + 1, dtype=scores.dtype, device=DEVICE)
+        view = storage[1:].view(m, n)
+    else:
+        storage = torch.empty((m, n + 1), dtype=scores.dtype, device=DEVICE)
+        view = storage[:, :n]
+    view.copy_(scores)
+    kwargs = _kwargs(config)
+
+    with patch.object(
+        route_warp_module,
+        "moe_route_warp",
+        side_effect=AssertionError("invalid fast-path layout"),
+    ) as fast_path:
+        w, i = moe_fused_gate(view, bias, **kwargs)
+        fast_path.assert_not_called()
+    _assert_matches(w, i, _reference(view, bias, **kwargs), kwargs["topk"])
+
+
+@pytest.mark.parametrize("num_tokens,row_padding", [(1, 1), (64, 8)])
+def test_aligned_padded_scores_keep_fast_path(
+    num_tokens: int, row_padding: int
+) -> None:
+    scores, bias = _inputs("deepseek_v3", num_tokens, seed=12)
+    storage = torch.empty((num_tokens, scores.shape[1] + row_padding), device=DEVICE)
+    view = storage[:, : scores.shape[1]]
+    view.copy_(scores)
+    with patch.object(
+        route_warp_module, "moe_route_warp", return_value=(None, None)
+    ) as fast_path:
+        moe_fused_gate(view, bias, **_kwargs("deepseek_v3"))
+        fast_path.assert_called_once()
+
+
+@pytest.mark.parametrize("layout", ["column_stride", "row_pitch"])
+def test_empty_strided_scores_fall_back(layout: str) -> None:
+    storage = torch.empty((0, 512 if layout == "column_stride" else 257), device=DEVICE)
+    scores = storage[:, ::2] if layout == "column_stride" else storage[:, :256]
+    bias = torch.zeros(256, device=DEVICE)
+    with patch.object(
+        route_warp_module,
+        "moe_route_warp",
+        side_effect=AssertionError("invalid fast-path layout"),
+    ) as fast_path:
+        weights, indices = moe_fused_gate(scores, bias, **_kwargs("deepseek_v3"))
+        fast_path.assert_not_called()
+    assert weights.shape == indices.shape == (0, 8)
+
+
 def test_softmax_bias_grouped_falls_back() -> None:
     # Grouped softmax stays on the Triton router, bias included.
     scores, _ = _inputs("qwen3_moe", 64, seed=6)

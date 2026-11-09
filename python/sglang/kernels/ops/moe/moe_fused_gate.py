@@ -488,6 +488,7 @@ def moe_fused_gate(
             num_expert_group,
             topk_group,
         )
+        and moe_route_warp.scores_layout_ok(scores)
         and moe_route_warp.bias_layout_ok(bias, bias_alt)
     ):
         return moe_route_warp.moe_route_warp(

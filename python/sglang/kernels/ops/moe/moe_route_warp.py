@@ -127,6 +127,23 @@ def bias_layout_ok(*biases: Optional[torch.Tensor]) -> bool:
     )
 
 
+def scores_layout_ok(scores: torch.Tensor) -> bool:
+    """Whether every logits row meets the native kernel's vector-load alignment."""
+    if scores.size(0) > 0 and scores.is_contiguous() and scores.data_ptr() % 32 == 0:
+        return True
+    lanes = scores.shape[1] // 32  # covered() guarantees a positive multiple of 32
+    max_bytes = 32 if current_arch().is_sm_at_least(10) else 16
+    vector_bytes = min((lanes & -lanes) * scores.element_size(), max_bytes)
+    return (
+        scores.stride(1) == 1
+        and scores.data_ptr() % vector_bytes == 0
+        and (
+            scores.size(0) == 1
+            or (scores.stride(0) * scores.element_size()) % vector_bytes == 0
+        )
+    )
+
+
 def moe_route_warp(
     scores: torch.Tensor,
     bias: Optional[torch.Tensor],
@@ -151,7 +168,7 @@ def moe_route_warp(
     device scalar. ``packed_out`` ([T, topk] int32) also receives ``id << 16 |
     bf16_bits(weight)``. Rows whose ``input_ids`` equal ``bias_alt_token_id``
     rank with ``bias_alt`` instead of ``bias``. Caller must have checked
-    :func:`covered` and :func:`bias_layout_ok`."""
+    :func:`covered`, :func:`scores_layout_ok`, and :func:`bias_layout_ok`."""
     num_tokens, num_experts = scores.shape
     if routed_scaling_factor is None:
         routed_scaling_factor = 1.0

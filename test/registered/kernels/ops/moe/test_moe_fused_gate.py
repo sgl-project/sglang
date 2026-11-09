@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sys
 from typing import Tuple
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -558,6 +559,49 @@ def test_grouped_tied_group_max_through_biased_grouped_topk_gpu(
     torch.testing.assert_close(
         _scatter_by_expert(w, i, num_experts),
         _scatter_by_expert(ref_w, ref_i, num_experts),
+        rtol=1e-5,
+        atol=1e-6,
+    )
+
+
+@pytest.mark.parametrize("layout", ["column_stride", "row_pitch"])
+def test_grouped_strided_scores_fall_back(layout: str) -> None:
+    from sglang.kernels.ops.moe import moe_route_warp
+    from sglang.srt.environ import envs
+    from sglang.srt.layers.moe import topk as topk_module
+
+    m, n, topk = 16, 256, 8
+    storage = torch.randn(
+        m, n * 2 if layout == "column_stride" else n + 1, device=DEVICE
+    )
+    gating = storage[:, ::2] if layout == "column_stride" else storage[:, :n]
+    bias = torch.randn(n, device=DEVICE)
+    hidden = torch.empty(m, 16, device=DEVICE)
+    kwargs = dict(num_expert_group=8, topk_group=4)
+    with (
+        envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.override(False),
+        patch.object(
+            moe_route_warp,
+            "moe_route_warp",
+            side_effect=AssertionError("invalid warp layout"),
+        ) as warp,
+        patch.object(
+            topk_module,
+            "fused_topk_deepseek",
+            side_effect=AssertionError("invalid flashinfer layout"),
+        ) as flashinfer,
+    ):
+        w, i = topk_module.biased_grouped_topk_gpu(
+            hidden, gating, bias, topk, True, **kwargs
+        )
+        warp.assert_not_called()
+        flashinfer.assert_not_called()
+    ref_w, ref_i = topk_module.biased_grouped_topk_impl(
+        hidden, gating, bias, topk, True, **kwargs
+    )
+    torch.testing.assert_close(
+        _scatter_by_expert(w, i, n),
+        _scatter_by_expert(ref_w, ref_i, n),
         rtol=1e-5,
         atol=1e-6,
     )

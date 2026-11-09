@@ -2114,15 +2114,19 @@ def biased_grouped_topk_gpu(
         # fused_shared_expert_weight like the branch below.
         from sglang.kernels.ops.moe import moe_route_warp
 
-        if moe_route_warp.covered(
-            gating_output.dtype,
-            gating_output.shape[1],
-            topk,
-            "sigmoid",
-            num_fused_shared_experts,
-            num_expert_group,
-            topk_group,
-        ) and moe_route_warp.bias_layout_ok(correction_bias):
+        if (
+            moe_route_warp.covered(
+                gating_output.dtype,
+                gating_output.shape[1],
+                topk,
+                "sigmoid",
+                num_fused_shared_experts,
+                num_expert_group,
+                topk_group,
+            )
+            and moe_route_warp.scores_layout_ok(gating_output)
+            and moe_route_warp.bias_layout_ok(correction_bias)
+        ):
             return moe_route_warp.moe_route_warp(
                 gating_output,
                 correction_bias,
@@ -2140,6 +2144,7 @@ def biased_grouped_topk_gpu(
     if (
         _is_cuda
         and fused_topk_deepseek is not None
+        and gating_output.is_contiguous()
         # flashinfer always renormalizes the selected weights
         and renormalize
         and is_power_of_two(num_experts)
