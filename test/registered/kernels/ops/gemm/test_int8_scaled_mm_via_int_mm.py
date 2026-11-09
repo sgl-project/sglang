@@ -2,7 +2,7 @@
 
 Checks against an exact integer reference, including the epilogue's masked M/N tails and
 bias in a dtype other than the output's. Zero rows go through the layer test
-(unit/layers/quantization/test_compressed_tensors_w8a8_int8_xpu.py).
+(xpu/test_w8a8_int8_linear_xpu.py).
 """
 
 import itertools
