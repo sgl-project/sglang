@@ -91,11 +91,11 @@ class TestNpuPauseContinue(CustomTestCase):
         thread.start()
         return thread
 
-    def _stream_async(self, events, errors):
+    def _stream_async(self, events, errors, max_new_tokens=128):
         def _run():
             try:
                 for event in stream_generate(
-                    self.base_url, SHORT_PROMPT, max_new_tokens=128
+                    self.base_url, SHORT_PROMPT, max_new_tokens=max_new_tokens
                 ):
                     events.append(event)
             except Exception as exc:  # pragma: no cover
@@ -126,18 +126,32 @@ class TestNpuPauseContinue(CustomTestCase):
         self.assertTrue(generate(self.base_url, SHORT_PROMPT, max_new_tokens=4))
 
     def test_pause_retract_recomputes_kv(self):
-        results = {}
-        thread = self._decode_async(64, results)
+        events, errors = [], []
+        thread = self._stream_async(events, errors, max_new_tokens=64)
 
-        time.sleep(0.2)
+        # Wait for at least one decoded token and make sure the request is still
+        # running; pausing after completion would not exercise retraction.
+        deadline = time.time() + 30
+        while thread.is_alive() and not events and time.time() < deadline:
+            time.sleep(0.02)
+        self.assertTrue(events, "no token was emitted before pause(retract)")
+        self.assertTrue(thread.is_alive(), "request finished before pause(retract)")
+
         pause_generation(self.base_url, mode="retract")
         time.sleep(0.2)
         continue_generation(self.base_url)
         thread.join(timeout=60)
 
-        self.assertNotIn("error", results)
+        self.assertFalse(errors, f"stream failed: {errors}")
+        # Native /generate streaming returns the cumulative output_ids per chunk.
+        output_ids = list(events[-1].get("output_ids", []))
         self.assertEqual(
-            tuple(results["response"]["output_ids"][: len(self.baseline[0])]),
+            len(output_ids),
+            64,
+            "retract/continue did not complete the full decode",
+        )
+        self.assertEqual(
+            tuple(output_ids[: len(self.baseline[0])]),
             self.baseline[0],
             "retract/continue changed a greedy rollout",
         )
