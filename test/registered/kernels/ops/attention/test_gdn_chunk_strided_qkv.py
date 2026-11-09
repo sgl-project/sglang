@@ -150,6 +150,52 @@ class TestGDNChunkStridedQKV(CustomTestCase):
                         self.assertTrue(_same_bits(o, ref_o), "output differs")
                         self.assertTrue(_same_bits(state, ref_state), "state differs")
 
+    def test_split_views_write_mapped_output(self):
+        """Strided q / k / v with a mapped out / output_indices write the same
+        bits into the caller's buffer as contiguous copies, and leave its
+        unmapped rows alone."""
+        lens, num_heads, num_v_heads = [300, 77], 4, 8
+        q, k, v, *rest = self._inputs(
+            lens, num_heads, num_v_heads, 1024, torch.float32, 5
+        )
+        num_tokens = sum(lens)
+        gen = torch.Generator(device="cuda").manual_seed(9)
+        output_indices = torch.randperm(num_tokens + 7, generator=gen, device="cuda")[
+            :num_tokens
+        ]
+        sentinel = torch.full(
+            (1, num_tokens + 7, num_v_heads, 128), 3.0, dtype=v.dtype, device="cuda"
+        )
+        ref_out = sentinel.clone()
+        _, ref_state = self._run(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            *rest,
+            out=ref_out,
+            output_indices=ref_out.new_tensor(output_indices, dtype=torch.int64),
+        )
+        out = sentinel.clone()
+        with patch.object(
+            fla_chunk,
+            "_chunk_gated_delta_rule_strided_qkv",
+            wraps=fla_chunk._chunk_gated_delta_rule_strided_qkv,
+        ) as strided:
+            _, state = self._run(
+                q,
+                k,
+                v,
+                *rest,
+                out=out,
+                output_indices=out.new_tensor(output_indices, dtype=torch.int64),
+            )
+        strided.assert_called_once()
+        self.assertTrue(_same_bits(out, ref_out), "mapped output differs")
+        self.assertTrue(_same_bits(state, ref_state), "state differs")
+        unmapped = torch.ones(num_tokens + 7, dtype=torch.bool, device="cuda")
+        unmapped[output_indices] = False
+        self.assertTrue((out[0, unmapped] == 3.0).all())
+
     def test_padding_rows_stay_zero(self):
         lens, num_padding = [100, 37], 40
         q, k, v, g, beta, pool, indices, cu_seqlens = self._inputs(
