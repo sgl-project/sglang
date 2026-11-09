@@ -35,6 +35,14 @@ class SanaVideo2PipelineConfig(SanaVideoPipelineConfig):
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
 
+    def validate_server_args(self, server_args):
+        if int(server_args.ring_degree or 1) > 1:
+            raise ValueError(
+                "SANA-Video 2.0 does not support --ring-degree > 1; use Ulysses "
+                "sequence parallelism."
+            )
+        super().validate_server_args(server_args)
+
     def supports_sequential_multi_output_inference(self):
         return True
 
