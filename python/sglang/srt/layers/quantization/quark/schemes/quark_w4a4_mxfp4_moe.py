@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.dequantization import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8MoEMethod
 from sglang.srt.layers.quantization.mxfp4 import (
+    _aiter_situ_uses_a4w4,
     _aiter_situ_uses_gu_interleaved_weights,
 )
 from sglang.srt.layers.quantization.online_quantization import CopyNumelCounter
@@ -929,18 +930,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         layer.w2_weight = torch.nn.Parameter(qw2_weight, requires_grad=False)
 
-    def _shuffle_gu_interleaved(self, layer: torch.nn.Module) -> None:
-        """Preshuffle into the GU-interleaved layout the a16w4/a8w4 kernels read.
+    def _shuffle_a16w4(self, layer: torch.nn.Module, gate_up: bool) -> None:
+        """Preshuffle for the A16W4 / A8W4 kernels: w13 gate/up-interleaved
+        when ``gate_up`` (A8W4), separated otherwise (A16W4).
 
         Scales stay 2-D; opus_moe rejects the 3-D form the a4w4 path keeps.
         """
         num_experts = layer.w13_weight_scale.shape[0]
 
-        layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, True)
+        layer.w13_weight.data = shuffle_weight_a16w4(layer.w13_weight, 16, gate_up)
         w13_weight_scale = shuffle_scale_a16w4(
             layer.w13_weight_scale.view(-1, layer.w13_weight_scale.shape[-1]),
             num_experts,
-            True,
+            gate_up,
         )
         layer.w2_weight.data = shuffle_weight_a16w4(layer.w2_weight, 16, False)
         w2_weight_scale = shuffle_scale_a16w4(
@@ -987,16 +989,19 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             assert layer.w13_weight_scale.dtype == torch.uint8
             assert layer.w2_weight_scale.dtype == torch.uint8
 
-        # AITER picks the SiTUv2 activation dtype at runtime: A8W4 and the
-        # A16W4 default read the preshuffled GU-interleaved layout, only A4W4
-        # reads the separated layout below. The mxfp4 MoE method agrees.
+        # AITER picks the SiTUv2 activation dtype at runtime. A8W4 reads the
+        # GU-interleaved layout and the A16W4 default the separated one, both
+        # with 2-D scales from _shuffle_a16w4. A4W4 takes the generic path
+        # below. The mxfp4 MoE method agrees.
         if (
             _is_shuffle_moe_mxfp4
             and not _is_gfx1250
             and layer.moe_runner_config.activation == "situ"
-            and _aiter_situ_uses_gu_interleaved_weights()
+            and not _aiter_situ_uses_a4w4()
         ):
-            self._shuffle_gu_interleaved(layer)
+            self._shuffle_a16w4(
+                layer, gate_up=_aiter_situ_uses_gu_interleaved_weights()
+            )
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
                     build_dispatcher_quant_config(
