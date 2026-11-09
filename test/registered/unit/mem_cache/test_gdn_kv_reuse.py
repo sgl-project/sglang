@@ -12,12 +12,14 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import gdn_kv_reuse as reuse
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-class TestGdnKVReuse(unittest.TestCase):
+class TestGdnKVReuse(CustomTestCase):
     def setUp(self):
+        super().setUp()
         self.context = ExitStack()
         self.addCleanup(self.context.close)
         values = {
