@@ -35,8 +35,8 @@ from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.utils import (
     ceil_align,
     is_cuda,
-    is_gfx1250_supported,
     is_gfx95_supported,
+    is_gfx1250_supported,
     is_hip,
     is_npu,
 )
