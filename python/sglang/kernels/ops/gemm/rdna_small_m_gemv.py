@@ -132,10 +132,12 @@ def rdna_splitk_gemv(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x[1, K] @ weight[N, K].T`` for bf16 weights, returning bf16 ``[1, N]``."""
     n, k = weight.shape
     split_k = k // _BLOCK_K
-    # The kernel has no tail mask: it reads one contiguous K-row per weight row and
-    # writes whole n-tiles.
+    # The kernel has no tail mask: it reads the contiguous K-slice of each weight row,
+    # at the row stride passed in, and writes whole n-tiles. A row stride wider than K
+    # is fine (the gfx115x weight pad is such a view); only K itself must be dense.
     assert (
-        weight.is_contiguous()
+        weight.dim() == 2
+        and weight.stride(1) == 1
         and x.numel() == k
         and n % _BLOCK_N == 0
         and k % _BLOCK_K == 0
