@@ -105,7 +105,7 @@ The steps below show how to build and use an image.
 
    ```bash Command
    drun sglang_image \
-       python3 -m sglang.bench_serving \
+       python3 -m sglang.benchmark.serving \
        --backend sglang \
        --dataset-name random \
        --num-prompts 4000 \
