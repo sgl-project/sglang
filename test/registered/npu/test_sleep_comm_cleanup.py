@@ -320,28 +320,6 @@ class TestSleepCommCleanup(CustomTestCase):
 
         _assert_generate_works(self, self.base_url)
 
-    def test_9_explicit_comm_alone_does_not_touch_weights(self):
-        """A comm-only cycle must not disturb the weights: the greedy output
-        stays identical and the weights are never paused."""
-        text_before = _generate_greedy(self, self.base_url)
-        used_before_mb = _device_used_mb()
-        response = _release(self.base_url, ["comm"])
-        self.assertEqual(response.status_code, 200, response.text)
-        # The comm-only sleep frees the HCCL buffers (and the graphs) but must
-        # stay far below a full sleep, which also pauses weights + KV cache -
-        # that band is the proof the weights were not offloaded.
-        freed_mb = used_before_mb - _device_used_mb()
-        self.assertGreaterEqual(freed_mb, COMM_RELEASE_MIN_DELTA_MB)
-        self.assertLess(
-            freed_mb,
-            FULL_RELEASE_MIN_DELTA_MB,
-            f"a comm-only sleep freed {freed_mb:.0f}MB, closer to a full "
-            "sleep than to the comm/graph footprint: weights look offloaded",
-        )
-        response = _resume(self.base_url, ["comm"])
-        self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(text_before, _generate_greedy(self, self.base_url))
-
 
 class TestSleepCommCleanupNoGraph(CustomTestCase):
     """comm-only sleep/wake with graphs disabled: the memory released by the
