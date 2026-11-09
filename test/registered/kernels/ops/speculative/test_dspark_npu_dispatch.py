@@ -7,11 +7,11 @@ import torch
 import torch_npu  # noqa: F401
 from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
     AcceptGreedy,
     SoftmaxTemp,
-    _row_argmax,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_draft_model import MarkovGreedyStep
 from sglang.kernels.ops.speculative.dspark.dspark_verify_window import (
@@ -93,7 +93,7 @@ class TestDSparkNpuDispatch(CustomTestCase):
         logits = torch.randn(rows * block, vocab, device="npu")
         logits[0, 5] = float("nan")
         expected_top1 = logits.cpu().argmax(-1)
-        self.assertTrue(torch.equal(_row_argmax(logits).cpu(), expected_top1))
+        self.assertTrue(torch.equal(sampling_argmax(logits).cpu(), expected_top1))
         predict = expected_top1.reshape(rows, block)
         candidates = predict.clone()
         candidates[:, 1:] = predict[:, :-1]
