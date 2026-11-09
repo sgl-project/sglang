@@ -340,3 +340,13 @@ error. This changes import timing without replacing the quantizer.
 The CPU pool plumbing translates an explicit logical token capacity to the
 native pool byte budget. Its bounded search rejects unreachable layouts rather
 than spinning indefinitely, preserving native sizing and rounding.
+
+### Packed KV metadata on CPU
+
+The CPU simulator preserves the native packed-KV geometry and allocation state.
+Unused model-value buffers are allocated on `meta`; integer allocators, logical
+capacity, request/window state and the pool's CPU device remain native. Packed
+factories see their original dimensions, including nested initializations, and
+exceptions restore the enclosing geometry/device context. Ordinary pools retain
+their existing compact payload behavior. The optimization is guarded by the
+explicit CPU simulator flags and does not patch a real GPU model's KV payload.
