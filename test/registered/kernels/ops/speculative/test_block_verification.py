@@ -13,11 +13,13 @@ from sglang.srt.speculative.dspark_components.dspark_draft import DraftBlockResu
 from sglang.srt.speculative.dspark_components.dspark_verify import (
     accept_draft_tokens,
 )
-from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.srt.utils import get_device
+from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
 
 register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_xpu_ci(est_time=40, suite="stage-b-test-1-gpu-xpu")
 
-DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else "cuda"
+DEVICE = "cpu" if os.environ.get("TRITON_INTERPRET") == "1" else get_device()
 
 
 def _verify(target, draft, candidates, coins, final_coins, *, block=True):

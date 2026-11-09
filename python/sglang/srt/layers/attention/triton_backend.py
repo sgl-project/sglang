@@ -1022,13 +1022,20 @@ class TritonAttnBackend(AttentionBackend):
         elif forward_batch.forward_mode.is_target_verify():
             bs = len(forward_batch.req_pool_indices)
             num_tokens_per_req = self._target_verify_num_tokens_per_req(spec_info)
-            qo_indptr = torch.arange(
-                0,
-                (1 + bs) * num_tokens_per_req,
-                step=num_tokens_per_req,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            ragged_layout = forward_batch.ragged_verify_layout
+            if ragged_layout is not None:
+                # DSpark compact verify packs per-request verify lengths.
+                verify_lens = ragged_layout.verify_lens
+                qo_indptr = ragged_layout.qo_indptr_device.to(torch.int32)
+            else:
+                verify_lens = num_tokens_per_req
+                qo_indptr = torch.arange(
+                    0,
+                    (1 + bs) * num_tokens_per_req,
+                    step=num_tokens_per_req,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             # gpu_only: seq_lens_sum may be None; over-allocate is safe (ragged write).
             seq_lens_sum = forward_batch.seq_lens_sum
             if seq_lens_sum is None:
@@ -1066,13 +1073,18 @@ class TritonAttnBackend(AttentionBackend):
                 )
 
             custom_mask = spec_info.custom_mask
-            seq_mask_len = num_tokens_per_req * (
-                forward_batch.seq_lens + num_tokens_per_req
-            )
+            seq_mask_len = verify_lens * (forward_batch.seq_lens + verify_lens)
             mask_indptr = self.mask_indptr
             mask_indptr[1 : bs + 1] = torch.cumsum(seq_mask_len[:bs], dim=0)
             mask_indptr = mask_indptr[: bs + 1]
-            max_extend_len = num_tokens_per_req
+            # Device-only layouts carry no host lens; the verify window is a
+            # valid upper bound for the extend grid.
+            max_extend_len = (
+                max(ragged_layout.verify_lens_cpu)
+                if ragged_layout is not None
+                and ragged_layout.verify_lens_cpu is not None
+                else num_tokens_per_req
+            )
             num_kv_splits = None
             attn_logits = None
             attn_lse = None

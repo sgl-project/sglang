@@ -24,7 +24,7 @@ from sglang.srt.model_executor.step_span_utils import set_detailed_annotations_e
 from sglang.srt.observability.profile_utils import ProfileManager
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
-from sglang.srt.utils import is_mps, is_npu
+from sglang.srt.utils import is_mps, is_npu, is_xpu
 from sglang.srt.utils.profile_merger import ProfileMerger
 from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
@@ -185,7 +185,13 @@ class SchedulerProfilerManager:
 
         activity_map = {
             "CPU": torch.profiler.ProfilerActivity.CPU,
-            "GPU": torch.profiler.ProfilerActivity.CUDA,
+            # "GPU" names the local accelerator; ProfilerActivity.CUDA records
+            # nothing on XPU.
+            "GPU": (
+                torch.profiler.ProfilerActivity.XPU
+                if is_xpu()
+                else torch.profiler.ProfilerActivity.CUDA
+            ),
         }
 
         if current_platform.is_out_of_tree():

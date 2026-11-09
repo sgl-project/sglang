@@ -11,6 +11,7 @@ from sglang.srt.layers.attention.triton_backend import (
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -84,7 +85,7 @@ def _make_backend(batch_size, capture_width=7):
     return backend
 
 
-def _make_forward_batch(batch_size, spec_info):
+def _make_forward_batch(batch_size, spec_info, ragged_verify_layout=None):
     seq_lens = torch.arange(32, 32 + batch_size, dtype=torch.int64)
     return SimpleNamespace(
         batch_size=batch_size,
@@ -99,6 +100,7 @@ def _make_forward_batch(batch_size, spec_info):
         out_cache_loc=torch.zeros(batch_size * 7, dtype=torch.int64),
         # A static pool's reads never touch the plan.
         iteration_ids=None,
+        ragged_verify_layout=ragged_verify_layout,
     )
 
 
@@ -123,6 +125,34 @@ def test_eager_target_verify_uses_bonus_token_width():
     assert torch.equal(
         backend.forward_metadata.mask_indptr,
         torch.tensor([0, 273, 553], dtype=torch.int64),
+    )
+
+
+def test_eager_target_verify_follows_ragged_layout():
+    """A compact (ragged) DSpark verify packs only each request's verify_len
+    queries; uniform-width metadata would misalign every request after the first."""
+    batch_size = 2
+    backend = _make_backend(batch_size, capture_width=9)
+    verify_lens = [3, 7]
+    layout = RaggedVerifyLayout(
+        verify_lens=torch.tensor(verify_lens, dtype=torch.int32),
+        graph_num_tokens=sum(verify_lens),
+        extend_start_loc=torch.tensor([0, 3], dtype=torch.int32),
+        qo_indptr_device=torch.tensor([0, 3, 10], dtype=torch.int32),
+        verify_lens_cpu=verify_lens,
+        total_verify_tokens=sum(verify_lens),
+    )
+
+    backend.init_forward_metadata(
+        _make_forward_batch(batch_size, _BonusTokenVerifyInput(), layout)
+    )
+
+    metadata = backend.forward_metadata
+    assert torch.equal(metadata.qo_indptr, torch.tensor([0, 3, 10], dtype=torch.int32))
+    assert metadata.max_extend_len == 7
+    # seq_lens [32, 33]: mask rows are verify_len * (seq_len + verify_len).
+    assert torch.equal(
+        metadata.mask_indptr, torch.tensor([0, 105, 385], dtype=torch.int64)
     )
 
 
