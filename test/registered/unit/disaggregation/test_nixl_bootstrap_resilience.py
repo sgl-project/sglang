@@ -74,6 +74,7 @@ class TestNixlBootstrapResilience(CustomTestCase):
             state_layer_ids=[],
             gpu_id=0,
             engine_rank=0,
+            draft_rows_dcp_collapsed=False,
         )
         return manager
 
@@ -226,7 +227,9 @@ class TestNixlBootstrapResilience(CustomTestCase):
         self.receive(manager, [self.transfer(destinations=2, prefix=4)])
         self.assertEqual(manager.request_status[11], KVPoll.Bootstrapping)
         self.assertNotIn(11, manager.req_to_decode_prefix_len)
-        self.receive(manager, [self.transfer(agent="decode-b", destinations=2, prefix=4)])
+        self.receive(
+            manager, [self.transfer(agent="decode-b", destinations=2, prefix=4)]
+        )
         self.assertEqual(set(manager.transfer_infos[11]), {"decode-a", "decode-b"})
         self.assertEqual(manager.req_to_decode_prefix_len[11], 4)
         self.assertEqual(self.assert_transfer(manager).dst_state_indices, [[5, 9]])
@@ -250,7 +253,10 @@ class TestNixlBootstrapResilience(CustomTestCase):
             with self.assertRaises(ValueError) as caught:
                 self.receive(
                     manager,
-                    [self.producer().build_receiver_registration_message(), self.transfer()],
+                    [
+                        self.producer().build_receiver_registration_message(),
+                        self.transfer(),
+                    ],
                 )
         self.assertIs(caught.exception, error)
         fatal.assert_called_once()
@@ -303,7 +309,8 @@ class TestNixlBootstrapResilience(CustomTestCase):
                     patch.object(nixl_conn, "handle_staging_rsp") as staging,
                 ):
                     self.receive(
-                        manager, [watermark, response, AbortNotification(room=11).to_zmq()]
+                        manager,
+                        [watermark, response, AbortNotification(room=11).to_zmq()],
                     )
                 if enabled:
                     water.assert_called_once_with(manager._staging_ctx, watermark)
