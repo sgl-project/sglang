@@ -99,6 +99,7 @@ def _load_autotune_module(monkeypatch):
 
 
 def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
+    import enum
     from dataclasses import dataclass
 
     module = _load_autotune_module(monkeypatch)
@@ -126,11 +127,16 @@ def _profile_fixture(monkeypatch, world_size=1, num_tokens=3):
         def num_tokens(self):
             return self.hidden_states.shape[0]
 
+    class FinalizeMode(enum.Enum):
+        AUTO = "auto"
+
     @dataclass
     class Config:
         knobs: str | None = None
         kernel_name: str = "test_backend"
         input_norm_const: float = 1.0
+        # flashinfer's MegaMoE config carries enum fields such as finalize_mode.
+        finalize_mode: FinalizeMode = FinalizeMode.AUTO
 
     @dataclass
     class Fleet:
@@ -228,7 +234,7 @@ def test_megamoe_profiles_reuse_cached_winner(monkeypatch, new_process):
     from unittest.mock import Mock
 
     module, first, tensors, _, _ = _profile_fixture(monkeypatch, num_tokens=1)
-    payload = {"version": 1, "entries": [{"knobs": {"native_tactic": 7}}]}
+    payload = {"version": 2, "entries": [{"knobs": {"native_tactic": 7}}]}
     events = []
     staged = []
     native_paths = []
