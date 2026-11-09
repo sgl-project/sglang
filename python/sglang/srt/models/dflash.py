@@ -854,8 +854,13 @@ class DFlashDraftModel(nn.Module):
 
     decoder_layer_cls = DFlashDecoderLayer
     supports_fused_context_kv = True
-    # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
+    # A quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    # Checkpoint shards of the fused layers, so quantization configs match their exclusions.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__()
@@ -916,11 +921,8 @@ class DFlashDraftModel(nn.Module):
                     attention_conv=grouped_conv(),
                     mlp_conv=grouped_conv(),
                     quant_config=quant_config,
-                    prefix=(
-                        (f"{prefix}.layers.{i}" if prefix else f"layers.{i}")
-                        if self.quantizable
-                        else ""
-                    ),
+                    # Checkpoint names, so a quantization config's exclusions match.
+                    prefix=f"{prefix}.layers.{i}" if prefix else f"layers.{i}",
                 )
                 for i in range(num_layers)
             ]

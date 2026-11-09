@@ -33,6 +33,7 @@ from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import QKVParallelLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import rename_excluded_modules
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -71,7 +72,7 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             self.self_attn.total_num_kv_heads,
             bias=False,
             quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
+            prefix=add_prefix("self_attn.qkv_proj", prefix),
         )
 
         if config.model_type == "llama4_text":
@@ -80,7 +81,11 @@ class LlamaDecoderLayer(LlamaDecoderLayer):
             inter_size = config.intermediate_size
 
         self.mlp = LlamaMLP(
-            config.hidden_size, inter_size, config.hidden_act, quant_config, prefix
+            config.hidden_size,
+            inter_size,
+            config.hidden_act,
+            quant_config,
+            add_prefix("mlp", prefix),
         )
 
         self.hidden_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -198,7 +203,9 @@ class LlamaModel(nn.Module):
         with layer_stack():
             self.layers = nn.ModuleList(
                 [
-                    LlamaDecoderLayer(config, i, quant_config, prefix)
+                    LlamaDecoderLayer(
+                        config, i, quant_config, add_prefix(f"layers.{i}", prefix)
+                    )
                     for i in range(config.num_hidden_layers)
                 ]
             )
@@ -271,6 +278,11 @@ class LlamaModel(nn.Module):
 
 class LlamaForCausalLMEagle3(LlamaForCausalLM):
     draft_parallel_spec = DraftParallelSpec(tp_execution=DraftTPExecution.SINGLE_GROUP)
+    # Checkpoint shards of the fused layers, so quantization configs match their exclusions.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
 
     def __init__(
         self,
@@ -280,6 +292,11 @@ class LlamaForCausalLMEagle3(LlamaForCausalLM):
     ) -> None:
         nn.Module.__init__(self)
         self.config = config
+        # Checkpoints that name the draft layer `midlayer` name it so in their
+        # exclusions too: rename them as load_weights renames the weights.
+        quant_config = rename_excluded_modules(
+            quant_config, lambda n: n.replace("midlayer", "layers.0")
+        )
         self.quant_config = quant_config
         self.pp_group = get_parallel().pp_group
 
