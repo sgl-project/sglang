@@ -43,9 +43,10 @@ BASE_ARGS = (
     "--attention-backend",
     "ascend",
     "--disable-cuda-graph",
+    "--disable-overlap-schedule",
     "--disable-radix-cache",
     "--mem-fraction-static",
-    "0.5",
+    "0.45",
     "--context-length",
     "512",
     "--max-running-requests",
@@ -69,9 +70,15 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             cls.reference = generation_signature(base_url, PROMPTS)
         cls.manifest = checkpoint_manifest(MODEL)
         cls.tensor_index = checkpoint_tensor_index(MODEL)
+        # Keep one lane server for the class: the trainer creates NPU tensors
+        # in this process, and launching another server afterwards resets the
+        # device on some CANN/driver combinations.
+        cls._lane_ctx = npu_server(MODEL, extra_args=LANE_ARGS, env=SERVER_ENV)
+        cls.lane_url = cls._lane_ctx.__enter__()
 
-    def _lane(self):
-        return npu_server(MODEL, extra_args=LANE_ARGS, env=SERVER_ENV)
+    @classmethod
+    def tearDownClass(cls):
+        cls._lane_ctx.__exit__(None, None, None)
 
     def _create_group(self, base_url, group_name):
         port = find_available_port(25000)
@@ -153,24 +160,24 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
 
     def test_01_hccl_refit_matches_startup_load(self):
         group_name = "npu_rl_hccl_refit"
-        with self._lane() as base_url:
-            pg = self._create_group(base_url, group_name)
-            try:
-                begin_weight_update(base_url)
-                thread, result = self._post_update_async(base_url, group_name)
-                self._broadcast_all(pg)
-                thread.join(timeout=1800)
-                end_weight_update(base_url)
+        base_url = self.lane_url
+        pg = self._create_group(base_url, group_name)
+        try:
+            begin_weight_update(base_url)
+            thread, result = self._post_update_async(base_url, group_name)
+            self._broadcast_all(pg)
+            thread.join(timeout=1800)
+            end_weight_update(base_url)
 
-                self.assertNotIn("error", result, f"update thread failed: {result}")
-                self.assertEqual(result.get("status"), 200, result.get("text"))
-                self.assertEqual(
-                    generation_signature(base_url, PROMPTS),
-                    self.reference,
-                    "HCCL refit did not reproduce startup loading",
-                )
-            finally:
-                self._destroy_group(base_url, group_name, pg)
+            self.assertNotIn("error", result, f"update thread failed: {result}")
+            self.assertEqual(result.get("status"), 200, result.get("text"))
+            self.assertEqual(
+                generation_signature(base_url, PROMPTS),
+                self.reference,
+                "HCCL refit did not reproduce startup loading",
+            )
+        finally:
+            self._destroy_group(base_url, group_name, pg)
 
     def test_02_init_group_defaults_to_nccl(self):
         request = InitWeightsUpdateGroupReqInput(
@@ -186,50 +193,48 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         )
 
     def test_03_update_error_propagates(self):
-        with self._lane() as base_url:
-            begin_weight_update(base_url)
-            response = requests.post(
-                base_url + "/update_weights_from_distributed",
-                json={
-                    "names": [NORM_WEIGHT],
-                    "dtypes": ["bfloat16"],
-                    "shapes": [[1024]],
-                    "group_name": "missing_group",
-                    "flush_cache": True,
-                },
-                timeout=300,
-            )
-            try:
-                end_weight_update(base_url)
-            except Exception:
-                pass
+        base_url = self.lane_url
+        begin_weight_update(base_url)
+        response = requests.post(
+            base_url + "/update_weights_from_distributed",
+            json={
+                "names": [NORM_WEIGHT],
+                "dtypes": ["bfloat16"],
+                "shapes": [[1024]],
+                "group_name": "missing_group",
+                "flush_cache": True,
+            },
+            timeout=300,
+        )
+        try:
+            end_weight_update(base_url)
+        except Exception:
+            pass
 
-            self.assertNotEqual(
-                response.status_code, 200, "a missing group was accepted"
-            )
-            self.assertTrue(health(base_url))
+        self.assertNotEqual(response.status_code, 200, "a missing group was accepted")
+        self.assertTrue(health(base_url))
 
     def test_04_destroy_group_twice_is_safe(self):
         group_name = "npu_rl_hccl_destroy_twice"
-        with self._lane() as base_url:
-            pg = self._create_group(base_url, group_name)
-            first = requests.post(
-                base_url + "/destroy_weights_update_group",
-                json={"group_name": group_name},
-                timeout=120,
-            )
-            self.assertEqual(first.status_code, 200, first.text)
-            torch.distributed.destroy_process_group(pg)
+        base_url = self.lane_url
+        pg = self._create_group(base_url, group_name)
+        first = requests.post(
+            base_url + "/destroy_weights_update_group",
+            json={"group_name": group_name},
+            timeout=120,
+        )
+        self.assertEqual(first.status_code, 200, first.text)
+        torch.distributed.destroy_process_group(pg)
 
-            second = requests.post(
-                base_url + "/destroy_weights_update_group",
-                json={"group_name": group_name},
-                timeout=120,
-            )
-            self.assertNotEqual(
-                second.status_code, 500, "destroying twice crashed the server"
-            )
-            self.assertTrue(health(base_url))
+        second = requests.post(
+            base_url + "/destroy_weights_update_group",
+            json={"group_name": group_name},
+            timeout=120,
+        )
+        self.assertNotEqual(
+            second.status_code, 500, "destroying twice crashed the server"
+        )
+        self.assertTrue(health(base_url))
 
 
 if __name__ == "__main__":
