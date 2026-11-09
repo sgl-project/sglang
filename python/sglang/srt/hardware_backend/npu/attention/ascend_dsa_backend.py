@@ -30,15 +30,25 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     """Attention/read inputs and shared extend or speculative write plans."""
 
     # ── Core attention ──
-    page_size: int = 0
-    cache_lens_int32: Optional[torch.Tensor] = None
-    real_page_table: Optional[torch.Tensor] = None
+    page_size: int = 0  # physical page size
+    cache_lens_int32: Optional[torch.Tensor] = (
+        None  # [B], int32, kv cache length (include history)
+    )
+    real_page_table: Optional[torch.Tensor] = None  # [B, Pkv], int32
 
     # Inputs for pooled_key_indexer (batch-level)
-    pool_query_ends: Optional[torch.Tensor] = None
-    pool_key_lens: Optional[torch.Tensor] = None
-    pool_tail_lens: Optional[torch.Tensor] = None
-    pool_page_table: Optional[torch.Tensor] = None
+    pool_query_ends: Optional[torch.Tensor] = (
+        None  # [B], int64, cumsum of query token lengths
+    )
+    pool_key_lens: Optional[torch.Tensor] = (
+        None  # [B], int64, number of compressed keys, cache_lens // r
+    )
+    pool_tail_lens: Optional[torch.Tensor] = (
+        None  # [B], int64, number of tail tokens, cache_lens % r
+    )
+    pool_page_table: Optional[torch.Tensor] = (
+        None  # [B, Pi], int32, pooled key page table, real_page_table[:, ::r] // r
+    )
 
     # Inputs for compress_write_npu
     kpool_extend_plan: Optional[KPoolExtendPlan] = None
@@ -117,23 +127,26 @@ class AscendDSAAttnBackend(AscendAttnBackend):
     def _query_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
         """Return per-request query lengths without a device-host round trip."""
         mode = forward_batch.forward_mode
+        batch_size = forward_batch.batch_size
         # Target verify and draft extend v2 both use a fixed batch_size * N query layout.
         if mode.is_target_verify() or mode.is_draft_extend_v2():
-            return torch.full(
-                (forward_batch.batch_size,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=forward_batch.seq_lens.device,
-            )
-        if mode.is_extend():
-            return forward_batch.extend_seq_lens[: forward_batch.batch_size].to(
-                torch.int32
-            )
-        return torch.ones(
-            (forward_batch.batch_size,),
+            query_len = self.speculative_num_draft_tokens
+        elif mode.is_extend():
+            return forward_batch.extend_seq_lens[:batch_size].to(torch.int32)
+        else:
+            query_len = 1
+        query_lens = torch.full(
+            (batch_size,),
+            query_len,
             dtype=torch.int32,
             device=forward_batch.seq_lens.device,
         )
+        # Replay mode: only part of the batch is non-empty
+        real_batch = batch_size - getattr(forward_batch, "num_padding", 0)
+        if getattr(forward_batch, "actual_forward_mode", mode).is_idle():
+            real_batch = 0
+        query_lens[real_batch:] = 0
+        return query_lens
 
     def _cache_lens_device(self, forward_batch: ForwardBatch) -> torch.Tensor:
         cache_seqlens = forward_batch.seq_lens[: forward_batch.batch_size].to(
@@ -174,7 +187,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
         # prepare page table
         token_table = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[:batch], :max_kv_len
+            forward_batch.req_pool_indices[:batch], : max(1, max_kv_len)
         ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32
@@ -246,7 +259,7 @@ class AscendDSAAttnBackend(AscendAttnBackend):
 
         # prepare page table
         token_table = self.req_to_token_pool.req_to_token[
-            forward_batch.req_pool_indices[:batch], :max_kv_len
+            forward_batch.req_pool_indices[:batch], : max(1, max_kv_len)
         ]
         page_table = (token_table[:, :: self.page_size] // self.page_size).to(
             torch.int32

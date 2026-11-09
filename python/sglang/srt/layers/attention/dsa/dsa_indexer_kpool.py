@@ -1899,9 +1899,6 @@ class IndexerKPool(MultiPlatformOp):
     ) -> Optional[torch.Tensor]:
         """BF16 compression and request-level pooled-key selection on A3/A5."""
 
-        if not return_indices:
-            return None
-
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         if metadata is None:
             return None
@@ -1942,6 +1939,9 @@ class IndexerKPool(MultiPlatformOp):
         else:
             raise NotImplementedError(f"NPU KPool does not support {mode}")
 
+        if not return_indices:
+            return None
+
         # --- Read Phase ---
         return self._get_topk_npu(
             layer_id,
@@ -1949,7 +1949,6 @@ class IndexerKPool(MultiPlatformOp):
             x,
             positions,
             metadata,
-            forward_batch.out_cache_loc != 0,
         )  # [T, index_topk + index_kpool - 1]
 
     def _get_topk_npu(
@@ -1959,11 +1958,11 @@ class IndexerKPool(MultiPlatformOp):
         x,
         positions,
         metadata: BaseIndexerMetadata,
-        valid_mask,
     ):
         from sgl_kernel_npu.operators.indexer import (
             pack_pool_key_indexer_indices,
             pool_key_indexer,
+            prepare_pool_key_indexer_inputs,
         )
 
         # 1. get model weights
@@ -1977,32 +1976,34 @@ class IndexerKPool(MultiPlatformOp):
             raise RuntimeError(
                 "NPU KPool requires request-level pooled-indexer metadata"
             )
-        query_ends = metadata.pool_query_ends
-        pool_lens = metadata.pool_key_lens
-        tail_lens = metadata.pool_tail_lens
-        page_table = metadata.pool_page_table
-        # Append a zero-pool request at the end
-        query_ends_padded = torch.cat(
-            (query_ends, query_ends.new_full((1,), query.shape[0]))
-        )
-        pool_lens_padded = torch.cat((pool_lens, pool_lens.new_zeros((1,))))
-        tail_lens_padded = torch.cat((tail_lens, tail_lens.new_zeros((1,))))
-        page_table_padded = torch.cat(
-            (page_table, page_table.new_zeros((1, page_table.shape[1])))
+        # Append one sentinel for pool_key_indexer
+        (
+            query_safe,
+            weights_safe,
+            query_ends_safe,
+            pool_lens_safe,
+            tail_lens_safe,
+            page_table_safe,
+        ) = prepare_pool_key_indexer_inputs(
+            query,
+            weights,
+            metadata.pool_query_ends,
+            metadata.pool_key_lens,
+            metadata.pool_tail_lens,
+            metadata.pool_page_table,
         )
 
-        query = query.contiguous()
         pool = get_token_to_kv_pool()
         kv = pool.layer_router.read(layer_id)
         pool, layer_id = kv.view, kv.view_layer_id
         indices = pool_key_indexer(
-            query=query,
+            query=query_safe,
             pool_key=pool.get_index_k_buffer(layer_id),
-            weights=weights,
-            pool_tail_k=tail_lens_padded,
-            actual_seq_q=query_ends_padded,
-            actual_seq_k=pool_lens_padded,
-            block_table=page_table_padded,
+            weights=weights_safe,
+            pool_tail_k=tail_lens_safe,
+            actual_seq_q=query_ends_safe,
+            actual_seq_k=pool_lens_safe,
+            block_table=page_table_safe,
             layout_q="TND",
             layout_k="PA_BBND",
             topk=self.index_topk,
@@ -2010,11 +2011,11 @@ class IndexerKPool(MultiPlatformOp):
             mask_mode=3,
             quant_mode=-1,
             return_value=False,
-        )  # selected kv token [T, index_topk + index_kpool - 1]
+        )  # selected kv token [T+1, index_topk + index_kpool - 1]
         return pack_pool_key_indexer_indices(
-            indices=indices,
+            indices=indices[: query.shape[0]],
             positions=positions,
-            valid_mask=valid_mask,
+            query_ends=metadata.pool_query_ends,
             topk=self.index_topk,
             pool_size=self.index_kpool,
         )
