@@ -1233,7 +1233,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             out.append(layer_chunks)
         return out
 
-    # KV cache: token rows, localized under DCP except on the draft worker.
+    # KV cache: [layer_num, num_pages, page_size, 1, kv_lora_rank]
     def _get_kv_cache_layer_buffers(self, local_layer_id):
         # flatten(page, slot) also works for the zero-width packed V placeholder.
         buffers = [
@@ -1272,7 +1272,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert cpu.shape[0] == len(rows)
                     buffer[rows] = cpu.to(buffer.device, non_blocking=True)
 
-    # Index cache: pooled rows retaining allocator-global addresses.
+    # Index cache: [layer_num, num_index_pages, index_page_size, 1, index_head_dim]
     def _get_index_cache_layer_buffers(self, local_layer_id):
         slot = self.indexer_layer_id_to_slot.get(local_layer_id + self.start_layer)
         if slot is None:
@@ -1288,6 +1288,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return buffers
 
     def _get_index_cache_cpu_copy(self, indices):
+        # only 1/index_kpool of indices are used
         index_rows = torch.unique_consecutive(indices // self.index_kpool)
         chunk_size = self.cpu_offloading_chunk_size
         index_cpu = []
@@ -1317,7 +1318,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     assert saved.shape[0] == len(rows)
                     buf[rows] = saved.to(buf.device)
 
-    # Tail: per-request state, independent of token and pooled-row addresses.
+    # Tail: list[Tensor[tail_slots, index_head_dim]]
     def _kpool_tail_rows(self, req_pool_index):
         return [
             buf[req_pool_index] if buf.shape[0] else None

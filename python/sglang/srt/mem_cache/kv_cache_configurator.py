@@ -2479,9 +2479,7 @@ class KVCacheConfigurator:
                     ),
                     skip_topk_layers=(
                         None
-                        if not _should_elide_dsa_index_k(
-                            is_draft_worker=self.is_draft_worker
-                        )
+                        if self.is_draft_worker
                         else [
                             dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
                             for layer_id in full_attention_layer_ids
@@ -2554,6 +2552,14 @@ class KVCacheConfigurator:
     def _hybrid_full_attention_pool_class(
         self, *, mha_pool_class: type, mla_pool_class: type, dsa_pool_class: type
     ) -> type:
+        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
+            if _is_npu:
+                from sglang.srt.hardware_backend.npu.memory_pool_npu import (
+                    NPUMLATokenToKVPool,
+                )
+
+                return NPUMLATokenToKVPool
+            return dsa_pool_class
         if _is_npu:
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
@@ -2569,8 +2575,6 @@ class KVCacheConfigurator:
             )
 
             return NPUMHATokenToKVPool
-        if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
-            return dsa_pool_class
         if self.use_mla_backend:
             return mla_pool_class
         # MXFP8 KV cache needs the block-scaled pool (data + UE8M0 scale
