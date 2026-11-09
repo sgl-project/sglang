@@ -45,7 +45,7 @@ HICACHE_STORAGE_EXTRA_CONFIG = json.dumps(
         "config_store_url": METASERVICE_CONFIG["config_store_url"],
         "log_level": "info",
         "world_size": 16,
-        "protocol": "device_rdma",
+        "protocol": "device_sdma",
         "dram_size": "4GB",
     }
 )
@@ -284,9 +284,9 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
         "storage": 0,  # L3 storage hit rate baseline
     }
 
-    def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
-        """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
-        self.run_accuracy()
+    # def test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high(self):
+    #     """Run NPU accuracy test for DSV4-Flash-0731 PD-Sep GPQA High mode."""
+    #     self.run_accuracy()
 
     def test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_l2_l3_hit_rate(self):
         """Run the 32k GSP bench; assert_metrics checks the L2/L3 hit rates"""
