@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import logging
+import re
 from copy import copy, deepcopy
 from fnmatch import fnmatchcase
-from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
@@ -158,9 +158,9 @@ class ModelSlimConfig(QuantizationConfig):
     _HARDCODED_PACKED_MODULES = {
         "fused_qkv_a_proj_with_mqa": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
-    # Hardcoded vision aliases: runtime name suffix -> checkpoint name suffix.
-    # These require the path and fusion guards in the vision resolver below.
-    _HARDCODED_VISION_ALIASES = {
+    # Legacy vision aliases: runtime path fragment -> checkpoint path fragment.
+    # Apply only within the matching vision scope and when the description exists.
+    _LEGACY_VISION_ALIASES = {
         "vision_model": {"proj": "out_proj"},
         "visual": {"qkv_proj": "qkv"},
         "vision_tower": {"attn.qkv_proj": "wqkv", "attn.proj": "wo"},
@@ -309,83 +309,149 @@ class ModelSlimConfig(QuantizationConfig):
         return scheme_class(resolved_prefix, self.requested_kv_cache_dtype)
 
     @staticmethod
-    def _iter_mapped_quant_descriptions(descriptions, mapper):
-        """Map parameter keys; keep description values.
+    def _is_quant_entry(name: Any, value: Any) -> bool:
+        """Check whether a key-value pair has the format of a quantization entry.
 
-        Example: attn.qkv.weight -> attn.qkv_proj.weight.
-        Try a full-key suffix ('.qkv.weight') first. If none matches,
-        remove the field, try a layer suffix ('.qkv'), then add the field back.
+        Args:
+            name: A key from quant_description, e.g. "attn.qkv.weight".
+            value: Its value, e.g. "W8A8" or a packed_modules_mapping dict.
+
+        Returns:
+            True for a string key containing a dot and a string value.
+            ("attn.qkv.weight", "W8A8") -> True.
+            ("quant_method", "modelslim") -> False.
+            ("packed_modules_mapping", {"qkv_proj": ["q_proj", "k_proj", "v_proj"]})
+                -> False.
+            This checks entry format, not scheme support.
         """
-        # Revisit this split if WeightsMapper adds new rule types.
-        prefix_substr_mapper = copy(mapper)
-        prefix_substr_mapper.orig_to_new_suffix = {}
+        return isinstance(name, str) and "." in name and isinstance(value, str)
+
+    @staticmethod
+    def _map_quant_entries(entries, mapper) -> List[Tuple[str, str]]:
+        """Rename entry keys without changing their values.
+
+        Apply substring/prefix rules, then try suffix rules on the full key.
+        If no full-key suffix matches, try the layer name and add the field back.
+
+        Args:
+            entries: Entry dict, e.g. {"attn.qkv.weight": "W8A8"}.
+            mapper: The model's checkpoint-to-runtime name rules.
+                Example: suffix ".qkv" -> ".qkv_proj".
+
+        Returns:
+            A list of pairs, e.g. [("attn.qkv_proj.weight", "W8A8")].
+            None rules omit entries from this result; unmatched names stay.
+            Duplicate names stay in the list so the caller can check conflicts.
+        """
+        non_suffix_mapper = copy(mapper)
+        non_suffix_mapper.orig_to_new_suffix = {}
         suffix_mapper = copy(mapper)
         suffix_mapper.orig_to_new_prefix = {}
         suffix_mapper.orig_to_new_substr = {}
 
-        for original, value in descriptions.items():
-            # Apply substring and prefix rules before checking suffixes.
-            mapped = prefix_substr_mapper.apply_list([original])
+        mapped_entries = []
+        for name, value in entries.items():
+            mapped = non_suffix_mapper.apply_list([name])
+            # An empty result means a rule explicitly skips this name.
+            # If no rule matches, apply_list returns the original name.
             if not mapped:
                 continue
             name = mapped[0]
-            field = None
+
             matches_suffix = any(
                 name.endswith(suffix) for suffix in mapper.orig_to_new_suffix
             )
-            # No full-key match: split attn.qkv.weight into attn.qkv + weight.
-            if not matches_suffix:
-                module, separator, parameter = name.rpartition(".")
-                if separator:
-                    name, field = module, parameter
-            mapped = suffix_mapper.apply_list([name])
-            if mapped:
-                # If split above, add the field back: attn.qkv_proj + .weight.
-                name = mapped[0] if field is None else f"{mapped[0]}.{field}"
-                yield name, value
+            if matches_suffix:
+                mapped = suffix_mapper.apply_list([name])
+                if not mapped:
+                    continue
+                mapped_name = mapped[0]
+            elif "." in name:
+                layer_name, field = name.rsplit(".", 1)
+                mapped = suffix_mapper.apply_list([layer_name])
+                if not mapped:
+                    continue
+                mapped_name = f"{mapped[0]}.{field}"
+            else:
+                mapped_name = name
+
+            mapped_entries.append((mapped_name, value))
+
+        return mapped_entries
 
     def apply_weight_name_mapper(self, hf_to_sglang_mapper):
         """Add renamed keys to quant_description; keep the original keys.
 
         Example: keep attn.qkv.weight and add attn.qkv_proj.weight with the same value.
+        Always map from the first-call snapshot to avoid repeated renaming.
+
+        Args:
+            hf_to_sglang_mapper: The model's checkpoint-to-runtime name rules.
+                None rules add no alias; they do not delete original entries.
+
+        Returns:
+            None. Replaces quant_description after all conflict checks pass.
+
+        Raises:
+            ValueError: An existing or newly mapped key has a different value.
         """
         # Reuse original keys on each call: avoid qkv -> qkv_proj -> qkv_proj_proj.
         if not hasattr(self, "_unmapped_quant_description"):
             self._unmapped_quant_description = dict(self.quant_description)
-        # Map parameter entries such as attn.qkv.weight; skip settings like version.
-        descriptions = {
+
+        # Select quantization entries; leave settings like quant_method alone.
+        quant_entries = {
             name: value
             for name, value in self._unmapped_quant_description.items()
-            if isinstance(name, str) and "." in name and isinstance(value, str)
+            if self._is_quant_entry(name, value)
         }
-        aliases = dict(self.quant_description)
-        for name, value in self._iter_mapped_quant_descriptions(
-            descriptions, hf_to_sglang_mapper
-        ):
-            if name in aliases and aliases[name] != value:
+        mapped_entries = self._map_quant_entries(quant_entries, hf_to_sglang_mapper)
+
+        # Keep existing entries; reject different values for the same name.
+        updated_description = dict(self.quant_description)
+        for name, value in mapped_entries:
+            if name in updated_description and updated_description[name] != value:
                 raise ValueError(f"Conflicting ModelSlim descriptions for {name}")
-            aliases[name] = value
-        self.quant_description = aliases
+            updated_description[name] = value
+        # Save only after all checks pass.
+        self.quant_description = updated_description
 
     def update_packed_modules_mapping(
         self, mapping: Dict[str, List[str] | Dict[str, List[str]]]
     ) -> None:
+        """Update fusion rules without changing the caller's tables or lists.
+
+        Args:
+            mapping: Rules to add or replace, e.g.
+                {"gate_up_proj": ["gate_proj", "up_proj"]}.
+                Also accepts Kimi's {"model": {...}} table.
+                Same-name rules are replaced, including whole nested tables.
+
+        Returns:
+            None. Stores a deep-copied, updated packed_modules_mapping.
+        """
         # Preserve dict.update semantics without modifying shared tables or lists.
         updated = deepcopy(self.packed_modules_mapping)
         updated.update(deepcopy(mapping))
         self.packed_modules_mapping = updated
 
     def _quant_prefix_candidates(self, prefix: str) -> List[str]:
-        """Return candidate layer prefixes (without '.weight').
+        """List possible layer names without looking them up in the description.
 
-        Example: model.mlp.proj -> [
-            "model.mlp.proj",
-            "model.block_sparse_moe.proj",
-            "model.language_model.mlp.proj",
-            "language_model.model.mlp.proj",
-            "model.language_model.block_sparse_moe.proj",
-            "language_model.model.block_sparse_moe.proj",
-        ]
+        Args:
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: model.layers.0.mlp.gate_proj.
+
+        Returns:
+            Candidate paths with duplicates removed; the input comes first.
+            Example: model.layers.0.mlp.gate_proj -> [
+                "model.layers.0.mlp.gate_proj",
+                "model.layers.0.block_sparse_moe.gate_proj",
+                "model.language_model.layers.0.mlp.gate_proj",
+                "language_model.model.layers.0.mlp.gate_proj",
+                "model.language_model.layers.0.block_sparse_moe.gate_proj",
+                "language_model.model.layers.0.block_sparse_moe.gate_proj",
+            ]
         """
         candidates = [prefix]
         for candidate in list(candidates):
@@ -417,9 +483,16 @@ class ModelSlimConfig(QuantizationConfig):
         return list(dict.fromkeys(candidates))
 
     def _resolve_quant_prefix(self, prefix: str) -> str:
-        """Return a matching layer prefix (without '.weight'), or the input.
+        """Find a layer name whose .weight entry exists in quant_description.
 
-        Example: visual.attn.qkv -> model.visual.attn.qkv.
+        Args:
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: visual.blocks.0.attn.qkv.
+
+        Returns:
+            A layer path without .weight or other parameter suffixes.
+            Example: model.visual.blocks.0.attn.qkv.
+            Returns the input unchanged if no candidate matches.
         """
         for candidate in self._quant_prefix_candidates(prefix):
             if candidate + ".weight" in self.quant_description:
@@ -451,84 +524,142 @@ class ModelSlimConfig(QuantizationConfig):
         return cls(config)
 
     def _get_packed_components(self, name: str) -> List[str]:
-        """Find this layer's components; model rules override defaults.
+        """Find fusion components using model rules before defaults.
 
-        Example: gate_up_proj -> [gate_proj, up_proj].
+        Args:
+            name: The last part of a layer name, e.g. gate_up_proj.
+
+        Returns:
+            A copied list, e.g. ["gate_proj", "up_proj"].
+            Returns [] for an explicit empty rule or when no rule exists.
+
+        Raises:
+            ValueError: A nested mapping group other than "model" is present.
         """
         from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
 
         mapping = self.packed_modules_mapping
+
+        # KimiK3LinearForCausalLM uses {"model": {...}} instead of a flat table.
+        # Reject other groups: ignoring {"visual": {...}} could select wrong defaults.
         for group, parts in mapping.items():
             if isinstance(parts, Mapping) and group != "model":
                 raise ValueError(
-                    f"Unsupported ModelSlim packed mapping group: {group!r}"
+                    "ModelSlim supports flat packed mappings and the Kimi-K3 "
+                    f"'model' group only; found group {group!r}"
                 )
-
-        # KimiK3LinearForCausalLM passes {"model": {...}}; read that inner table.
         model_mapping = mapping.get("model", {})
         if isinstance(model_mapping, Mapping) and name in model_mapping:
             return list(model_mapping[name])
-        if name in mapping and not isinstance(mapping[name], Mapping):
-            return list(mapping[name])
-        if name in _FALLBACK_FUSED_SHARDS:
-            return list(_FALLBACK_FUSED_SHARDS[name])
-        return list(self._HARDCODED_PACKED_MODULES.get(name, []))
 
-    def _resolve_legacy_vision_quant_prefix(
-        self, prefix: str, shards: List[str]
-    ) -> Optional[str]:
-        """Find a matching vision prefix (without '.weight'), or return None.
-
-        Example: visual.attn.qkv_proj -> visual.attn.qkv.
-        """
-        from sglang.srt.layers.quantization.utils import _FALLBACK_FUSED_SHARDS
-
-        parent, _, name = prefix.rpartition(".")
-
-        # Keep custom fusion rules, e.g. qkv_proj -> [custom_qkv].
-        standard_shards = _FALLBACK_FUSED_SHARDS.get(name, [])
-        if shards and shards != standard_shards:
-            return None
-
-        # Match path segments and full suffixes; attn.proj must not match self_attn.proj.
-        for scope, aliases in self._HARDCODED_VISION_ALIASES.items():
-            if scope not in parent.split("."):
+        for candidates in (
+            mapping,
+            _FALLBACK_FUSED_SHARDS,
+            self._HARDCODED_PACKED_MODULES,
+        ):
+            if name not in candidates:
                 continue
-            for runtime_name, checkpoint_name in aliases.items():
-                if prefix.endswith("." + runtime_name):
-                    candidate = prefix[: -len(runtime_name)] + checkpoint_name
-                    quant_prefix = self._resolve_quant_prefix(candidate)
-                    if quant_prefix + ".weight" in self.quant_description:
-                        return quant_prefix
-            # Use only the first matching scope, e.g. vision_model before visual.
-            break
+            parts = candidates[name]
+            if isinstance(parts, Mapping):
+                continue
+            return list(parts)
+        return []
+
+    @staticmethod
+    def _replace_path_fragment(prefix: str, old: str, new: str) -> str:
+        """Replace whole path segments, including at the start or end.
+
+        Args:
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: vision_tower.blocks.0.attn.proj.
+            old: Path fragment to replace, e.g. attn.proj.
+            new: Replacement fragment, e.g. wo.
+
+        Returns:
+            The renamed path, e.g. vision_tower.blocks.0.wo.
+            Keeps self_attn.proj and attn.projection unchanged.
+        """
+        # Match attn.proj, but not self_attn.proj or attn.projection.
+        # Keep the shared dot: proj.proj -> out_proj.out_proj, not out_proj.proj.
+        padded = "." + prefix + "."
+        pattern = r"(?<=\.)" + re.escape(old) + r"(?=\.)"
+        renamed = re.sub(pattern, lambda match: new, padded)
+        return renamed[1:-1]
+
+    def _resolve_legacy_vision_quant_prefix(self, prefix: str) -> Optional[str]:
+        """Look up an old vision name missing from the model's mapper.
+
+        Args:
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: model.visual.blocks.0.attn.qkv_proj.
+
+        Returns:
+            A layer path without .weight or other parameter suffixes.
+            Example: model.visual.blocks.0.attn.qkv.
+            Returns None if the alias does not apply or its .weight entry is absent.
+        """
+        path_parts = prefix.split(".")
+        aliases = {}
+
+        # Pick one table: vision_model before visual if both appear in the path.
+        for scope, scope_aliases in self._LEGACY_VISION_ALIASES.items():
+            if scope in path_parts:
+                aliases = scope_aliases
+                break
+
+        # Rename whole path segments, then check for a .weight description.
+        for runtime_name, checkpoint_name in aliases.items():
+            candidate = self._replace_path_fragment(
+                prefix, runtime_name, checkpoint_name
+            )
+            if candidate == prefix:
+                continue
+            quant_prefix = self._resolve_quant_prefix(candidate)
+            if quant_prefix + ".weight" in self.quant_description:
+                return quant_prefix
         return None
 
-    def _linear_quant_prefixes(
+    def _resolve_linear_quant_prefixes(
         self,
         prefix: str,
-        fused_mapping: Optional[Mapping[str, List[str]]] = None,
         output_sizes: Optional[List[int]] = None,
     ) -> List[str]:
-        """Find whole or split layer prefixes (without '.weight').
+        """Find .weight descriptions through three supported paths:
 
-        Whole: attn.qkv_proj -> [attn.qkv_proj].
-        Split: attn.qkv_proj -> [attn.q_proj, attn.k_proj, attn.v_proj].
+        - Original name: attn.qkv_proj.
+        - Legacy vision name: visual.attn.qkv_proj -> visual.attn.qkv.
+        - Split original name: qkv_proj -> q_proj, k_proj, v_proj.
+
+        Do not split legacy names. Check split entries even if a whole entry exists.
+
+        Args:
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: model.layers.0.self_attn.qkv_proj.
+            output_sizes: Optional sizes in component order, e.g. [8, 4, 0].
+                Skip zero-size parts only when the number of sizes matches the parts.
+
+        Returns:
+            Layer paths without .weight or other parameter suffixes.
+            One whole-layer path or a list of component paths.
+            If no description matches, returns [prefix] for the caller to handle.
+
+        Raises:
+            ValueError: Some components are missing, their schemes differ,
+                whole and split layouts both exist, or a mapping group is invalid.
         """
-        # Possibility 1: whole layer, e.g. qkv_proj (mapper aliases or name variants).
+        # Original name: look for attn.qkv_proj.weight, including mapper aliases.
         direct = self._resolve_quant_prefix(prefix)
         whole_quant_prefix = (
             direct if direct + ".weight" in self.quant_description else None
         )
+        # If absent, try a legacy vision name: visual.attn.qkv_proj -> visual.attn.qkv.
+        if whole_quant_prefix is None:
+            whole_quant_prefix = self._resolve_legacy_vision_quant_prefix(prefix)
 
-        # Possibility 2: split components, e.g. q_proj, k_proj, v_proj.
-        # Check both layouts to detect ambiguity.
+        # Split the original name: qkv_proj -> q_proj, k_proj, v_proj.
+        # Use the runtime name to look up packed rules, not the legacy name.
         parent, separator, name = prefix.rpartition(".")
-        shards = (
-            self._get_packed_components(name)
-            if fused_mapping is None
-            else fused_mapping.get(name, [])
-        )
+        shards = self._get_packed_components(name)
         # Skip zero-size parts, e.g. [Q, K, V] with sizes [8, 4, 0] uses Q and K.
         # Sizes must have one entry per part.
         if output_sizes is not None and len(output_sizes) == len(shards):
@@ -558,11 +689,6 @@ class ModelSlimConfig(QuantizationConfig):
                     f"to use the same quantization scheme. Found: {entries}"
                 )
 
-        # Compatibility: try a vision alias missing from the model's mapper.
-        # This is another whole-layer name, e.g. qkv_proj -> qkv.
-        if whole_quant_prefix is None:
-            whole_quant_prefix = self._resolve_legacy_vision_quant_prefix(prefix, shards)
-
         # Reject whole + split descriptions: qkv_proj and separate q/k/v.
         # A single part equal to the whole name is the same entry, not a conflict.
         if any(present):
@@ -576,7 +702,7 @@ class ModelSlimConfig(QuantizationConfig):
         if whole_quant_prefix is not None:
             return [whole_quant_prefix]
         # No description found; let the caller handle the missing .weight key.
-        return [self._resolve_quant_prefix(prefix)]
+        return [direct]
 
     def get_quant_method(
         self,
@@ -589,7 +715,8 @@ class ModelSlimConfig(QuantizationConfig):
 
         Args:
             layer: The layer being built, e.g. QKVParallelLinear.
-            prefix: The layer name, e.g. attn.qkv_proj (no .weight).
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: model.layers.0.self_attn.qkv_proj.
 
         Returns:
             A method object, e.g. W8A8 -> ModelSlimLinearMethod.
@@ -622,15 +749,21 @@ class ModelSlimConfig(QuantizationConfig):
         """Find the description and create this linear layer's scheme.
 
         Args:
-            layer: The layer being built; supplies sizes of fused components.
-            prefix: Its runtime name, e.g. attn.qkv_proj (no .weight).
+            layer: The layer being built, e.g. QKVParallelLinear.
+                Its output_sizes supplies the sizes of fused components when available.
+            prefix: Layer path without .weight or other parameter suffixes.
+                Example: model.layers.0.self_attn.qkv_proj.
 
         Returns:
             A scheme, e.g. ModelSlimW8A8Int8; None for FLOAT or no description.
+
+        Raises:
+            ValueError: Fusion descriptions conflict or are incomplete,
+                a mapping group is invalid, or the declared scheme is unsupported.
         """
 
         # Mapper aliases are already in quant_description. Check whole and split names.
-        quant_prefixes = self._linear_quant_prefixes(
+        quant_prefixes = self._resolve_linear_quant_prefixes(
             prefix, output_sizes=getattr(layer, "output_sizes", None)
         )
         prefix = quant_prefixes[0]  # All components were checked to use the same scheme.
@@ -774,12 +907,6 @@ class ModelSlimConfig(QuantizationConfig):
         logger.info_once(f"Using {type(w2_scheme).__name__} for W2")
 
         return w13_scheme, w2_scheme
-
-    def is_layer_skipped(
-        self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
-    ):
-        resolved = self._linear_quant_prefixes(prefix, fused_mapping)[0]
-        return self.quant_description.get(resolved + ".weight") == "FLOAT"
 
     def get_scaled_act_names(self) -> List[str]:
         return []

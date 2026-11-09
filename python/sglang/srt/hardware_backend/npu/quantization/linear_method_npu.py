@@ -94,7 +94,7 @@ class NPUW8A8Int8LinearMethod(_NPULinearMethodBase):
             output_dtype=original_dtype,
         )
         if x.ndim > 2:
-            out = out.reshape(*original_shape[:-1], -1)
+            out = out.reshape(*original_shape[:-1], out.shape[-1])
         return out
 
 
@@ -138,7 +138,7 @@ class NPUW8A8Int8DynamicLinearMethod(_NPULinearMethodBase):
             output_dtype=original_dtype,
         )
         if x.ndim > 2:
-            out = out.reshape(*original_shape[:-1], -1)
+            out = out.reshape(*original_shape[:-1], out.shape[-1])
         return out
 
 
