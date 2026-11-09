@@ -1370,6 +1370,9 @@ class Envs:
     # Store DeepSeek-V4 SWA KV directly in FlashInfer's 64-token SM120 page
     # layout. The scheduler continues to allocate 256-token logical pages.
     SGLANG_OPT_SM120_DIRECT_SWA_KV = EnvBool(False)
+    # SM12x FA4 calls outside the architecture decode policy (extends, including
+    # sliding-window layers) use the generic SplitKV heuristic; False pins one split.
+    SGLANG_OPT_SM120_FA4_GENERIC_SPLITKV = EnvBool(True)
     SGLANG_FLASHINFER_PREFILL_SPLIT_TILE_SIZE = EnvInt(4096)
     SGLANG_FLASHINFER_DECODE_SPLIT_TILE_SIZE = EnvInt(2048)
     SGLANG_FLASHINFER_AUTOTUNE_CACHE = EnvBool(True)

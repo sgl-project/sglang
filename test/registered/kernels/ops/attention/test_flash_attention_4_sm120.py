@@ -19,6 +19,7 @@ from sglang.kernels.ops.attention.flash_attention_v4_sm120 import (
     flash_attn_with_kvcache,
     get_flash_attention_v4_sm120_runtime_policy,
 )
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(
@@ -39,9 +40,17 @@ def test_sm120_runtime_policy_delegates_decode_shapes():
         device_capability=(12, 0),
         deterministic=False,
     )
-    assert policy.num_splits == 1
+    assert policy.num_splits == 0
     assert policy.decode_num_splits == 0
     assert policy.decode_uses_static_max_seqlen_k
+
+    with envs.SGLANG_OPT_SM120_FA4_GENERIC_SPLITKV.override(False):
+        pinned_policy = get_flash_attention_v4_sm120_runtime_policy(
+            device_capability=(12, 0),
+            deterministic=False,
+        )
+    assert pinned_policy.num_splits == 1
+    assert pinned_policy.decode_num_splits == 0
 
     deterministic_policy = get_flash_attention_v4_sm120_runtime_policy(
         device_capability=(12, 0),
@@ -1937,6 +1946,91 @@ def test_sm120_paged_decode_ragged_splits_are_cache_order_independent(
     error = (ragged_first.float() - reference).abs()
     assert error.max().item() < 1e-2
     assert error.mean().item() < 5e-4
+
+
+@pytest.mark.parametrize("window_left", [None, 512])
+def test_sm120_short_extend_over_cached_prefix_splits_kv(monkeypatch, window_left):
+    """A short extend over a long cached prefix splits its KV under the default policy on
+    a full layer and keeps one split on a sliding-window layer; both match the unsplit
+    launch and the reference."""
+    sm120_forward_host.clear_launch_plans()
+    plan_splits = []
+    original_resolve_plan = Sm120ForwardHost.resolve_plan
+
+    def record_plan(**kwargs):
+        plan = original_resolve_plan(**kwargs)
+        plan_splits.append(plan.num_splits)
+        return plan
+
+    monkeypatch.setattr(Sm120ForwardHost, "resolve_plan", staticmethod(record_plan))
+    torch.manual_seed(20261028)
+    num_q_heads, head_dim, page_size = 6, 256, 64
+    q_lengths = (44, 9)
+    k_lengths = (9216 + 44, 4096 + 9)
+    pages_per_sequence = math.ceil(max(k_lengths) / page_size)
+    batch_size = len(q_lengths)
+    q = torch.randn(
+        sum(q_lengths), num_q_heads, head_dim, device="cuda", dtype=torch.bfloat16
+    )
+    k_cache = torch.randn(
+        batch_size * pages_per_sequence,
+        page_size,
+        1,
+        head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    v_cache = torch.randn_like(k_cache)
+    page_table = (
+        torch.randperm(batch_size * pages_per_sequence, device="cuda")
+        .to(torch.int32)
+        .view(batch_size, pages_per_sequence)
+    )
+    cu_seqlens_q = torch.tensor(
+        [0, q_lengths[0], sum(q_lengths)], device="cuda", dtype=torch.int32
+    )
+    sinks = torch.randn(num_q_heads, device="cuda", dtype=torch.bfloat16)
+    policy = get_flash_attention_v4_sm120_runtime_policy(
+        device_capability=torch.cuda.get_device_capability(),
+        deterministic=False,
+    )
+
+    def run(num_splits):
+        return flash_attn_with_kvcache(
+            q=q,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            page_table=page_table,
+            cache_seqlens=torch.tensor(k_lengths, device="cuda", dtype=torch.int32),
+            cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_q=max(q_lengths),
+            causal=True,
+            window_size=(-1, -1) if window_left is None else (window_left, 0),
+            num_splits=num_splits,
+            sinks=sinks,
+        )
+
+    output = run(policy.num_splits)
+    assert (max(plan_splits) > 1) == (window_left is None)
+    unsplit_output = run(1)
+    torch.testing.assert_close(output, unsplit_output, atol=4e-3, rtol=0.0)
+
+    q_offsets = cu_seqlens_q.tolist()
+    for batch_idx, k_len in enumerate(k_lengths):
+        pages = page_table[batch_idx]
+        k = k_cache.index_select(0, pages).flatten(0, 1)[:k_len]
+        v = v_cache.index_select(0, pages).flatten(0, 1)[:k_len]
+        reference, _ = _attention_reference(
+            q[q_offsets[batch_idx] : q_offsets[batch_idx + 1]],
+            k,
+            v,
+            causal=True,
+            window_size=(window_left, 0 if window_left is not None else None),
+            sinks=sinks,
+        )
+        _assert_attention_close(
+            output[q_offsets[batch_idx] : q_offsets[batch_idx + 1]], reference
+        )
 
 
 def test_sm120_paged_decode_graph_splits_follow_replay_lengths(monkeypatch):
