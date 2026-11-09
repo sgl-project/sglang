@@ -38,6 +38,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
     from sglang.srt.mem_cache.pool_host import HostKVCache
 
+from sglang.srt.arg_groups.kv_shard_hook import check_kv_shard_storage
 from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
@@ -49,6 +50,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
@@ -67,6 +69,42 @@ def storage_model_name(
     if tag is None:
         return model_name
     return f"{model_name}-{tag}" if model_name else tag
+
+
+def _shard_storage_io(
+    *, pool: PageInterleaveHostPool, page_get: Callable, page_set: Callable
+) -> tuple[Callable, Callable]:
+    """Logical-page KV sharding: each rank reads and writes only its own
+    pages of a storage batch, as local host rows. Keys carry no owner rank."""
+
+    def get_owned(operation, hash_values, host_indices, extra_info=None) -> int:
+        positions, rows = pool.owned_storage_pages(host_indices)
+        if not positions:
+            return len(hash_values)
+        try:
+            hits = page_get(
+                operation, [hash_values[i] for i in positions], rows, extra_info
+            )
+        except Exception:
+            # Keep the prefix before this rank's first owned page.
+            logger.exception(
+                "Sharded storage read failed for request %s.", operation.request_id
+            )
+            hits = 0
+        # This rank's logical prefix; the MIN over ranks is the landed prefix.
+        return positions[hits] if hits < len(positions) else len(hash_values)
+
+    def set_owned(hash_values, host_indices, extra_info=None) -> bool:
+        positions, rows = pool.owned_storage_pages(host_indices)
+        if not positions:
+            return True
+        try:
+            return page_set([hash_values[i] for i in positions], rows, extra_info)
+        except Exception:
+            logger.exception("Sharded storage write failed.")
+            return False
+
+    return get_owned, set_owned
 
 
 class LayerLoadingEvent:
@@ -256,6 +294,9 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # Logical-page KV sharding: rotation base of the chain a prefetch
+        # extends; its host bounce is drawn in that chain's owner phase.
+        self.kv_rotation_base: Optional[int] = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -647,6 +688,25 @@ class HiCacheController:
                 "Cannot attach storage backend: previous detach did not stop storage threads cleanly."
             ) from e
 
+        kv_sharded = isinstance(self.storage_host_pool, PageInterleaveHostPool)
+        if kv_sharded:
+            check_kv_shard_storage(
+                storage_backend=storage_backend,
+                host_memory_mode=self.host_memory_mode,
+                extra_config=storage_backend_extra_config or {},
+            )
+            if self.mem_pool_host is not self.storage_host_pool:
+                other_pools = [
+                    entry.name.value
+                    for entry in self.mem_pool_host.entries
+                    if entry.host_pool is not self.storage_host_pool
+                ]
+                if other_pools:
+                    raise ValueError(
+                        "HiCache storage with KV sharding supports only the KV "
+                        f"host pool, not {other_pools}."
+                    )
+
         # Rollback-safe init: if creation fails, keep controller state consistent
         # for future attach attempts.
         self.storage_backend_type = storage_backend
@@ -680,7 +740,7 @@ class HiCacheController:
                 )
             else:
                 # Leave half the pool for write-back. Prefetch occupancy counts
-                # logical tokens, not physical rows on each DCP rank.
+                # logical tokens, including widened KV-sharded host pools.
                 self.prefetch_capacity_limit = int(
                     0.5 * self.mem_pool_host.logical_size
                 )
@@ -716,6 +776,12 @@ class HiCacheController:
             ):
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
+            if kv_sharded:
+                self.page_get_func, self.page_set_func = _shard_storage_io(
+                    pool=self.storage_host_pool,
+                    page_get=self.page_get_func,
+                    page_set=self.page_set_func,
+                )
 
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
@@ -866,6 +932,13 @@ class HiCacheController:
                 for layer_range in unified_plan.layer_ranges
                 for head_group in range(unified_plan.head_group_num)
             ]
+        key_tp_rank = key_tp_size = None
+        if isinstance(self.storage_host_pool, PageInterleaveHostPool):
+            # A page's owner depends on its chain's rotation, so keys name only
+            # the head shard; the tag keeps writers of other page bytes apart.
+            key_tp_rank, key_tp_size = parallel.attn_tp_rank, parallel.attn_tp_size
+            tag = f"atp{key_tp_size}"
+            model_name = f"{model_name}-{tag}" if model_name else tag
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -888,6 +961,8 @@ class HiCacheController:
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
+            key_tp_rank=key_tp_rank,
+            key_tp_size=key_tp_size,
         )
 
     def _build_unified_plan(
@@ -1432,7 +1507,14 @@ class HiCacheController:
         self, operation: StorageOperation, need_size: int
     ) -> Optional[torch.Tensor]:
         """Allocate the host bounce for a storage hit."""
-        return self.mem_pool_host.alloc(need_size)
+        if operation.kv_rotation_base is None:
+            return self.mem_pool_host.alloc(need_size)
+        # KV sharding: the bounce lands on the owners of the chain's pages.
+        return self.mem_pool_host.alloc(
+            need_size,
+            start_owner=operation.kv_rotation_base
+            + operation.storage_start // self.page_size,
+        )
 
     def can_fit_prefetch_host_buffers(
         self, operation: StorageOperation, need_size: int
@@ -1584,7 +1666,14 @@ class HiCacheController:
 
             if prefix_keys is not None:
                 prefix_keys = prefix_keys + batch_hashes
-            operation.completed_tokens += self.page_size * len(batch_hashes)
+            written_pages = len(batch_hashes)
+            if isinstance(self.storage_host_pool, PageInterleaveHostPool):
+                # Shard ranks count their own pages; the group sums to the span.
+                positions, _ = self.storage_host_pool.owned_storage_pages(
+                    batch_host_indices
+                )
+                written_pages = len(positions)
+            operation.completed_tokens += self.page_size * written_pages
 
     def _page_backup_or_log(self, operation):
         try:

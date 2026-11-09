@@ -219,7 +219,9 @@ def build_kv_host_pool(
         **kwargs,
     )
     if isinstance(kv_pool, PageInterleaveKVPoolMixin):
-        return PageInterleaveHostPool(host_pool, kv_pool.placement)
+        return PageInterleaveHostPool(
+            host_pool, kv_pool.placement, kv_dtype=kv_pool.dtype
+        )
     return host_pool
 
 

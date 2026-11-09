@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
-from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -74,13 +73,6 @@ class StorageAttachment:
                 False,
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
-            )
-        if page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1:
-            # Runtime attach bypasses kv_shard_hook.py's startup validation.
-            return (
-                False,
-                "--enable-kv-cache-sharding does not support a HiCache storage "
-                "backend yet.",
             )
 
         # Write-back can retain auxiliary host rows without FULL, or backed
@@ -286,7 +278,9 @@ class StorageAttachment:
                 )
 
         cache.enable_storage = enable_storage
-        cache.prefetch_threshold = prefetch_threshold
+        # The controller's floor: keys and hits are whole pages,
+        # and a KV-sharded host pool cannot allocate a zero-page bounce.
+        cache.prefetch_threshold = max(prefetch_threshold, cache.page_size)
         cache.prefetch_timeout_base = prefetch_timeout_base
         cache.prefetch_timeout_per_page = (
             cache.page_size / 1024 * prefetch_timeout_per_ki_token

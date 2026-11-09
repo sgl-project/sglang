@@ -4791,17 +4791,82 @@ class TestKvCacheShardingCompatibility(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "does not support --enable-hisparse"):
             handle_kv_cache_sharding(args)
 
-    def test_hicache_host_offload_is_accepted_but_not_storage(self):
+    def test_hicache_storage_allowlist(self):
+        # File eviction may also come from these env vars; a CI host may set them.
+        enter_scope(self, envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.override("0"))
+        enter_scope(self, envs.SGLANG_HICACHE_FILE_BACKEND_MIN_FREE_SPACE.override("0"))
+        for backend in (None, "file", "mooncake"):
+            with self.subTest(backend=backend):
+                args = self._rounding_args(
+                    raw_mem_fraction=0.8, resolved_mem_fraction=0.8
+                )
+                args.enable_hierarchical_cache = True
+                args.hicache_storage_backend = backend
+                with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+                    handle_kv_cache_sharding(args, 80 * 1024)
+
+        # Launch cannot read an @file config; attach checks it with its contents.
         args = self._rounding_args(raw_mem_fraction=0.8, resolved_mem_fraction=0.8)
         args.enable_hierarchical_cache = True
-        with envs.SGLANG_DISAGG_STAGING_BUFFER.override(False):
+        args.hicache_storage_backend = "file"
+        args.hicache_storage_backend_extra_config = "@/nonexistent/extra.json"
+        with (
+            envs.SGLANG_DISAGG_STAGING_BUFFER.override(False),
+            envs.SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE.override("1G"),
+        ):
             handle_kv_cache_sharding(args, 80 * 1024)
 
-        args = self._args(
-            enable_hierarchical_cache=True, hicache_storage_backend="file"
+        dsa_model_config = SimpleNamespace(
+            is_encoder_decoder=False,
+            attention_chunk_size=None,
+            attention_arch=AttentionArch.MLA,
+            hf_config=SimpleNamespace(
+                architectures=["GlmMoeDsaForCausalLM"], index_topk=2048
+            ),
         )
-        with self.assertRaisesRegex(ValueError, "not --hicache-storage-backend"):
-            handle_kv_cache_sharding(args)
+        for overrides, error in (
+            ({"hicache_storage_backend": "hf3fs"}, "mooncake and file"),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_host_memory_mode": "buffer_only",
+                },
+                "host-memory-mode cache",
+            ),
+            # Rejected at launch, before the model loads.
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "model_config": dsa_model_config,
+                },
+                "for DSA models",
+            ),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": '{"tp_lcm_size": 8}',
+                },
+                "tp_lcm_size",
+            ),
+            (
+                {
+                    "hicache_storage_backend": "file",
+                    "hicache_storage_backend_extra_config": '{"max_size": "1G"}',
+                },
+                "HiCacheFile eviction",
+            ),
+            (
+                {
+                    "hicache_storage_backend": "mooncake",
+                    "hicache_storage_backend_extra_config": "[8]",
+                },
+                "must be a JSON object",
+            ),
+        ):
+            with self.subTest(overrides=overrides):
+                args = self._args(enable_hierarchical_cache=True, **overrides)
+                with self.assertRaisesRegex(ValueError, error):
+                    handle_kv_cache_sharding(args)
 
     def test_incompatible_cache_tree_modes_are_rejected(self):
         cases = (
