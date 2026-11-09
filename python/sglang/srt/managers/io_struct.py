@@ -2526,6 +2526,7 @@ class ProfileReq(BaseReq, kw_only=True):
 class ProfileReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str
+    is_conflict: bool = False
 
 
 class FreezeGCReq(BaseReq, kw_only=True):

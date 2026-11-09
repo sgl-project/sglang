@@ -122,6 +122,7 @@ class SchedulerProfilerManager:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is already in progress. Call /stop_profile first.",
+                is_conflict=True,
             )
 
         self.profile_by_stage = profile_by_stage
@@ -326,6 +327,7 @@ class SchedulerProfilerManager:
             return ProfileReqOutput(
                 success=False,
                 message="Profiling is not in progress. Call /start_profile first.",
+                is_conflict=True,
             )
 
         self.torch_profiler_output_dir.mkdir(parents=True, exist_ok=True)
