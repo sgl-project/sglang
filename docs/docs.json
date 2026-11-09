@@ -1295,7 +1295,7 @@
                     ]
                   },
                   {
-                    "group": "GLM",
+                    "group": "GLM (ZAI)",
                     "pages": [
                       "cookbook/autoregressive/GLM/GLM-5.3",
                       "cookbook/autoregressive/GLM/GLM-5.3-Flash",
