@@ -566,10 +566,9 @@ def alloc_for_extend(
 _NPU_MIN_ROWS_FOR_BATCHED_GATHER = 8
 
 
+# lru_cache: decide -- and log -- once per process. Returns None to never batch.
 @lru_cache(maxsize=1)
 def _auto_min_rows_for_batched_gather() -> Optional[int]:
-    """Row count above which to batch the retained-block gather, or None to never
-    batch it. Cached so the decision -- and its log line -- happen once."""
     if not _is_npu:
         return None
     logger.info(
@@ -589,9 +588,7 @@ def _gather_reused_block_locs(
     device: torch.device,
     out_dtype: torch.dtype,
 ) -> torch.Tensor:
-    """Re-read the retained KV block of every reuse row from ``req_to_token``
-    in one flat index op (rows share ``block_len``).
-    """
+    # Every row shares block_len; the caller falls back per-row otherwise.
     width = req_to_token.shape[1]
     flat_cpu = torch.tensor(
         [row * width + start for row, start in zip(req_pool_indices, prefix_lens)],

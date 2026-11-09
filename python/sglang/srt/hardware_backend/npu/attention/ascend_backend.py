@@ -660,9 +660,8 @@ class AscendAttnBackend(AttentionBackend):
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
         )
-        # dLLM has no overlap schedule, so these two D2H syncs are exposed as
-        # device idle. Take them from the host mirrors instead. Gated on dLLM so
-        # the decode/prefill path stays byte-identical.
+        # dLLM reads the host mirrors below; the gate keeps every other mode
+        # byte-identical.
         is_dllm = forward_batch.forward_mode.is_dllm_extend()
         # MLA DCP prepares its local KV metadata below.
         # Data-driven branch: take the CPU-mirror path whenever the mirror is
