@@ -8,7 +8,10 @@ from typing import Optional, Sequence
 import numpy as np
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MambaStateBufferInfo
+from sglang.srt.mem_cache import write_back_order
+from sglang.srt.mem_cache.pool_host import slot_state_copy
 from sglang.srt.mem_cache.pool_host.base import (
     HostKVCache,
     host_memory_budget_bytes,
@@ -39,6 +42,7 @@ if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
+        warm_up_mamba_split_kernels,
     )
 if _is_npu:
     from sgl_kernel_npu.kvcacheio import TransferDirection
@@ -215,8 +219,21 @@ class MambaPoolHost(HostKVCache):
         self.kv_buffer = self.init_kv_buffer()
         self._configure_npu_mamba_io()
         self._init_write_back_staging_buffers()
+        self._warm_up_split_copies()
         self.lock = threading.RLock()
         self.clear()
+
+    def _warm_up_split_copies(self) -> None:
+        if not _is_cuda or self.layout != "page_first":
+            return
+        load_quota, backup_quota = warm_up_mamba_split_kernels()
+        if load_quota is not None or backup_quota is not None:
+            logger.info(
+                "HiCache Mamba split kernels built: load quota=%s, backup quota=%s "
+                "(None: stock kernel)",
+                load_quota,
+                backup_quota,
+            )
 
     def _configure_npu_mamba_io(self) -> None:
         mode = _npu_hicache_mamba_io_mode()
@@ -325,6 +342,7 @@ class MambaPoolHost(HostKVCache):
             )
             for state in self.slot_state_device_tensors
         ]
+        slot_state_copy.warm(self.slot_state_device_tensors, self.slot_state_buffers)
         # destroy() unregisters via kv_buffer; without this list the pinned
         # registrations leak past the buffers' mmap. 0-element buffers
         # (conv-only models' temporal state) were never registered.
@@ -845,6 +863,36 @@ class MambaPoolHost(HostKVCache):
         correctness of the ordering against the completion event matters more
         than the microseconds."""
         if not self.slot_state_device_tensors:
+            return
+        if to_device:
+            # The CPU reads below see a device-ordered write-back's rows only once it lands.
+            write_back_order.wait_landed()
+        if (
+            to_device
+            and envs.SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT.get()
+            and slot_state_copy.applies(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+            and slot_state_copy.load_rows(
+                self.slot_state_device_tensors,
+                self.slot_state_buffers,
+                device_indices=device_indices,
+                host_indices=host_indices,
+            )
+        ):
+            return
+        if (
+            not to_device
+            and slot_state_copy.applies(
+                self.slot_state_device_tensors, self.slot_state_buffers
+            )
+            and slot_state_copy.backup_rows(
+                self.slot_state_device_tensors,
+                self.slot_state_buffers,
+                device_indices=device_indices,
+                host_indices=host_indices,
+            )
+        ):
             return
         for state, host_buf in zip(
             self.slot_state_device_tensors, self.slot_state_buffers

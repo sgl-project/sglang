@@ -344,6 +344,22 @@ def _pack_qsa_prefill_kv(
 def pack_qsa_prefill_kv(
     *, k, v, req_to_token, req_indices, cu_k, total_k, max_k, output_dtype=None
 ):
+    from sglang.srt.layers.attention.qsa import prefill_pack
+
+    if prefill_pack.ENABLED:
+        # Bitwise equal; None when the pool layout is not covered.
+        packed = prefill_pack.pack_rows(
+            k=k,
+            v=v,
+            req_to_token=req_to_token,
+            req_indices=req_indices,
+            cu_k=cu_k,
+            total_k=total_k,
+            max_k=max_k,
+            output_dtype=output_dtype,
+        )
+        if packed is not None:
+            return packed
     heads, dim = k.shape[1:]
     packed_k = torch.empty(
         (total_k, heads, dim), dtype=output_dtype or k.dtype, device=k.device

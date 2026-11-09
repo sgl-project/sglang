@@ -15,6 +15,7 @@ import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
+from sglang.kernels.ops.attention import fused_qk_rmsnorm_rope_gate_rows as _qk_rows
 from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
 
 
@@ -201,6 +202,37 @@ def fused_qk_gemma_rmsnorm_rope_gate(
         if has_gate
         else q_out
     )
+
+    if _qk_rows.ENABLED and _qk_rows.applies(
+        q_gate, k, positions, T, head_dim, rotary_dim, has_gate
+    ):
+        # Prefill-sized calls: the same outputs from row-tiled programs.
+        def run_rows():
+            _qk_rows.launch(
+                q_gate=q_gate,
+                k=k,
+                q_out=q_out,
+                k_out=k_out,
+                gate_out=gate_out,
+                q_weight=q_weight,
+                k_weight=k_weight,
+                cos_sin_cache=cos_sin_cache,
+                positions=positions,
+                mrope_axis_map=mrope_axis_map,
+                eps=eps,
+                num_q_heads=num_q_heads,
+                num_kv_heads=num_kv_heads,
+            )
+            return q_out, k_out, gate_out
+
+        def run_stock():
+            return fused_qk_gemma_rmsnorm_rope_gate(
+                q_gate, k, q_weight, k_weight, cos_sin_cache, positions, eps,
+                num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                has_gate=has_gate, mrope_axis_map=mrope_axis_map,
+            )
+
+        return _qk_rows.checked(run_rows, run_stock, T)
 
     half_rotary = rotary_dim // 2
     head_block = triton.next_power_of_2(head_dim)

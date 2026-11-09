@@ -1291,6 +1291,109 @@ if HAS_TILELANG:
 
         return kernel
 
+    # The grouped4 chain kernel with its key tiles software-pipelined: a CTA's next
+    # tiles are in flight (cp.async, num_stages buffers) while the current one is
+    # scored, instead of one tile load per round trip. Every score is the chain
+    # kernel's GEMM (same shapes, threads and warp policy), ReLU, head sum and scale
+    # on the same tile and rows, and sub-pages past the length re-read the tile's
+    # last page (never stored), so the logits are bit-identical; only when the key
+    # loads are issued moves.
+    @tilelang.jit(
+        pass_configs={
+            tilelang.PassConfigKey.TL_ENABLE_FAST_MATH: True,
+            tilelang.PassConfigKey.TL_DISABLE_TMA_LOWER: True,
+            tilelang.PassConfigKey.TL_DISABLE_WARP_SPECIALIZED: True,
+        }
+    )
+    def _tilelang_qsa_mqa_decode_grouped4_pipe_kernel(
+        heads: int,
+        head_dim: int,
+        page_size: int = 64,
+        ctas_per_row: int = 1,
+        min_scored_len: int = 0,
+        num_stages: int = 2,
+        threads: int = 128,
+        dtype: str = "bfloat16",
+    ):
+        GROUP = 64
+        group_rows = 4
+        score_heads = 4
+        assert heads == 8
+        assert GROUP % page_size == 0
+        assert num_stages >= 1
+        sub_pages = GROUP // page_size
+        C = ctas_per_row
+        batch = T.dynamic("batch")
+        pages = T.dynamic("pages")
+        max_pages = T.dynamic("max_pages")
+        max_model_len = T.dynamic("max_model_len")
+
+        @T.prim_func
+        def kernel(
+            Q: T.Tensor([batch, 1, heads, head_dim], dtype),  # type: ignore
+            KCache: T.Tensor([pages, page_size, 1, head_dim], dtype),  # type: ignore
+            PageTable: T.Tensor([batch, max_pages], T.int32),  # type: ignore
+            ContextLens: T.Tensor([batch], T.int32),  # type: ignore
+            Logits: T.Tensor([batch, max_model_len], T.float32),  # type: ignore
+            Scale: T.float32,
+        ):
+            with T.Kernel(T.ceildiv(batch, group_rows), C, threads=threads) as (request, cta):
+                row_base = request * group_rows
+                q_shared = T.alloc_shared([group_rows, score_heads, head_dim], dtype)
+                q_gemm = T.reshape(q_shared, (group_rows * score_heads, head_dim))
+                k_shared = T.alloc_shared([GROUP, head_dim], dtype)
+                scores = T.alloc_fragment([GROUP, group_rows * score_heads], T.float32)
+                scores_3d = T.reshape(scores, (GROUP, group_rows, score_heads))
+                reduced = T.alloc_fragment([GROUP, group_rows], T.float32)
+                context_len = T.alloc_var(T.int32)
+                table_row = T.alloc_var(T.int32)
+                # Graph verify rows share page prefixes and have increasing lengths.
+                table_row = T.min(row_base + group_rows - 1, batch - 1)
+                context_len = ContextLens[table_row]
+                num_groups = T.ceildiv(context_len, GROUP)
+                last_page = T.max(context_len - 1, 0) // page_size
+                if context_len > min_scored_len and cta < num_groups:
+                    T.copy(Q[row_base : row_base + group_rows, 0, 0:score_heads, 0:head_dim], q_shared)
+                    for step in T.Pipelined(T.ceildiv(num_groups - cta, C), num_stages=num_stages):
+                        group = step * C + cta
+                        # Unrolled in Python: the pipeliner takes no dynamic loop around
+                        # shared-memory copies.
+                        for sp in range(sub_pages):
+                            T.copy(
+                                KCache[
+                                    PageTable[table_row, T.min(group * sub_pages + sp, last_page)],
+                                    :,
+                                    0,
+                                    :,
+                                ],
+                                k_shared[sp * page_size : (sp + 1) * page_size, :],
+                            )
+                        T.gemm(
+                            k_shared,
+                            q_gemm,
+                            scores,
+                            transpose_B=True,
+                            clear_accum=True,
+                            policy=T.GemmWarpPolicy.FullCol,
+                        )
+                        for token, qi, head in T.Parallel(GROUP, group_rows, score_heads):
+                            scores_3d[token, qi, head] = T.max(
+                                scores_3d[token, qi, head], 0.0
+                            )
+                        T.reduce_sum(scores_3d, reduced, dim=2, clear=True)
+                        for token, qi in T.Parallel(GROUP, group_rows):
+                            position = group * GROUP + token
+                            if row_base + qi < batch:
+                                if (
+                                    ContextLens[row_base + qi] > min_scored_len
+                                    and position < ContextLens[row_base + qi]
+                                ):
+                                    Logits[row_base + qi, position] = (
+                                        reduced[token, qi] / Scale
+                                    )
+
+        return kernel
+
 
 def tilelang_qsa_mqa_prefill(
     q: torch.Tensor,
@@ -1516,6 +1619,14 @@ _QSA_GROUPED4_VERIFY_CHAIN = envs.SGLANG_ENABLE_QSA_GROUPED4_VERIFY_CHAIN.get()
 _QSA_GROUPED4_VERIFY_CHAIN_CTAS = _positive_env_int(
     envs.SGLANG_QSA_GROUPED4_VERIFY_CHAIN_CTAS
 )
+_QSA_GROUPED4_VERIFY_PIPELINE_STAGES = (
+    envs.SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES.get()
+)
+if _QSA_GROUPED4_VERIFY_PIPELINE_STAGES < 0:
+    raise ValueError(
+        "SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES must be 0 (off) or a positive "
+        f"stage count, got {_QSA_GROUPED4_VERIFY_PIPELINE_STAGES}"
+    )
 # Validated bit-identical up to 576 rows (144 requests); larger batches keep the
 # stock path.
 _QSA_GROUPED4_VERIFY_MAX_ROWS = 576
@@ -1637,6 +1748,23 @@ def _log_grouped4_once(kernel: str, rows: int, ctas_per_group: int) -> None:
     )
 
 
+_logged_grouped4_pipe = False
+
+
+def _log_grouped4_pipe_once(rows: int, ctas_per_group: int, stages: int) -> None:
+    # Once per process at INFO, the engagement line: the chain kernel's DEBUG line stays as is.
+    global _logged_grouped4_pipe
+    if not _logged_grouped4_pipe:
+        _logged_grouped4_pipe = True
+        logger.info(
+            "QSA decode scorer: grouped4_pipe rows=%d ctas_per_group=%d stages=%d "
+            "(SGLANG_QSA_GROUPED4_VERIFY_PIPELINE_STAGES)",
+            rows,
+            ctas_per_group,
+            stages,
+        )
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1727,7 +1855,20 @@ def tilelang_qsa_mqa_decode(
     if grouped4_only and not grouped4:
         rows_per_group = 1
     v2 = None if grouped4 else _v2_config(rows, rows_per_group, q.device)
-    if grouped4 and _QSA_GROUPED4_VERIFY_CHAIN:
+    if grouped4 and _QSA_GROUPED4_VERIFY_CHAIN and _QSA_GROUPED4_VERIFY_PIPELINE_STAGES:
+        _log_grouped4_pipe_once(
+            rows, _QSA_GROUPED4_VERIFY_CHAIN_CTAS, _QSA_GROUPED4_VERIFY_PIPELINE_STAGES
+        )
+        kernel = _tilelang_qsa_mqa_decode_grouped4_pipe_kernel(
+            heads=kernel_heads,
+            head_dim=head_dim,
+            page_size=page_size,
+            ctas_per_row=_QSA_GROUPED4_VERIFY_CHAIN_CTAS,
+            min_scored_len=min_scored_len,
+            num_stages=_QSA_GROUPED4_VERIFY_PIPELINE_STAGES,
+            dtype=_TILELANG_DTYPES[scoring_dtype],
+        )
+    elif grouped4 and _QSA_GROUPED4_VERIFY_CHAIN:
         _log_grouped4_once("grouped4_chain", rows, _QSA_GROUPED4_VERIFY_CHAIN_CTAS)
         kernel = _tilelang_qsa_mqa_decode_grouped4_chain_kernel(
             heads=kernel_heads,

@@ -19,6 +19,9 @@ import torch.nn.functional as F
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.qsa import tma_prefill as qsa_tma_prefill
+from sglang.srt.layers.attention.qsa import union_prefill as qsa_union_prefill
+from sglang.srt.layers.attention.qsa import pool_decode as qsa_pool_decode
 from sglang.srt.layers.attention.qsa.config import (
     is_qwen_qsa,
     parse_qsa_profile,
@@ -67,6 +70,28 @@ _TRTLLM_SPARSE_PAGE_SIZE = 64
 _Q38_ATTN_CORE_V1 = os.environ.get("Q38_ATTN_CORE_V1", "0") == "1"
 _Q38C_ATTN_CORE_TP4 = os.environ.get("SGLANG_Q38C_ATTN_CORE_TP4", "0") == "1"
 _Q38C_GLUE_MERGE = os.environ.get("SGLANG_Q38C_GLUE_MERGE", "0") == "1"
+# SGLANG_QSA_UNION_PREFILL_OUT_ALIAS (default off): the union prefill kernel stores its result
+# straight into forward_batch._attn_output, the buffer the prefill graph's eager attention break
+# hands the backend (radix_attention._eager_attention), so that break's [rows, heads * 256] D2D copy
+# of the result is skipped (its data_ptr check). Same kernel, same values: bitwise.
+_QSA_UNION_PREFILL_OUT_ALIAS = os.environ.get(
+    "SGLANG_QSA_UNION_PREFILL_OUT_ALIAS", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+_QSA_UNION_OUT_ALIAS_LOGGED = [False]
+# Opt-in, read once. MTP draft decode: the native deferred lookup (SGLANG_Q38C_LOOKUP_NATIVE)
+# at any batch, not only one request; _qsa_fused_kv_prepare already resolves it per row.
+_QSA_MTP_LOOKUP_BATCHED = os.environ.get("SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED", "0") == "1"
+# MTP draft-extend: the seed capture as one kernel at any batch (the image's is one request).
+_QSA_MTP_CAPTURE_BATCHED = os.environ.get("SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED", "0") == "1"
+# Verify pool decode: the attention output gate rides the split-K merge (bit-identical).
+_QSA_POOL_MERGE_GATE = os.environ.get("SGLANG_ENABLE_QSA_POOL_MERGE_GATE", "0") == "1"
+_QSA_MTP_BATCHED_LOGGED = set()
+
+
+def _log_qsa_mtp_batched_once(what: str, rows: int) -> None:
+    if what not in _QSA_MTP_BATCHED_LOGGED:
+        _QSA_MTP_BATCHED_LOGGED.add(what)
+        logger.info("QSA %s: fused path engaged (first rows=%d)", what, rows)
 
 
 def _stream_capturing() -> bool:
@@ -101,6 +126,23 @@ def _last_rows_of_runs(*, extend_lens, pool_ids, num_rows: int) -> list:
 
 # Measured at 4-32 verify rows; larger batches keep fused_kv_prepare + trtllm.
 _QSA_POOL_DECODE_MAX_ROWS = 64
+# Opt-in FP8 pool-read verify attention (qsa/pool_union_decode.py); off by default, read once.
+_QSA_FP8_POOL_VERIFY = os.environ.get("SGLANG_QSA_FP8_POOL_VERIFY", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# Its attention kernel warp-specialized (qsa/pool_union_ws.py); off by default, read once.
+_QSA_FP8_POOL_VERIFY_WS = os.environ.get("SGLANG_QSA_FP8_POOL_VERIFY_WS", "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+# The MTP draft extend on the verify's pool-union path (qsa/draft_extend_union.py); read once.
+_QSA_DRAFT_EXTEND_UNION = envs.SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION.get()
+_DRAFT_EXTEND_UNION_LOGGED: set = set()
 
 
 @lru_cache(maxsize=1)
@@ -1459,6 +1501,28 @@ class QwenSparseAttnBackend(AttentionBackend):
                                 topk_indices.shape[0], topk_indices.shape[1])
                     self._q38c_glue_merge_logged = True
                 return
+        if _QSA_MTP_CAPTURE_BATCHED:
+            from sglang.kernels.ops.speculative.mtp_capture_metadata import (
+                try_capture_metadata_batched,
+            )
+
+            slot = state.layer_slots[int(layer_id)]
+            num_accept = getattr(forward_batch.spec_info, "num_accept_tokens", None)
+            has_accept = num_accept is not None and num_accept.numel() >= bs
+            if try_capture_metadata_batched(
+                topk_indices,
+                self._capture_extend_seq_lens(forward_batch)[:bs],
+                num_accept[:bs] if has_accept else None,
+                int(forward_batch.spec_info.num_front_tokens) if has_accept else 0,
+                forward_batch.req_pool_indices[:bs],
+                metadata.sequence_lengths,
+                metadata.get_token_to_batch_idx(),
+                state.indices[slot],
+                state.captured_len[slot],
+                state.trash_row,
+            ):
+                _log_qsa_mtp_batched_once("MTP capture batched", bs)
+                return
         request_extend_lens = self._capture_extend_seq_lens(forward_batch)[:bs].long()
         block_ends = request_extend_lens.cumsum(0) - 1
         spec_info = forward_batch.spec_info
@@ -1492,12 +1556,21 @@ class QwenSparseAttnBackend(AttentionBackend):
         logical_positions = metadata.decode_logical_positions
         if logical_positions is None:
             logical_positions = metadata.get_seqlens_expanded() - 1
+        num_requests = forward_batch.req_pool_indices.numel()
         if (
             self._q38c_lookup_native
             and forward_batch.forward_mode.is_decode()
-            and forward_batch.req_pool_indices.numel() == 1
-            and logical_positions.numel() == 1
+            and (
+                (num_requests == 1 and logical_positions.numel() == 1)
+                or (
+                    _QSA_MTP_LOOKUP_BATCHED
+                    and num_requests > 1
+                    and logical_positions.numel() == num_requests
+                )
+            )
         ):
+            if num_requests > 1:
+                _log_qsa_mtp_batched_once("MTP lookup batched", num_requests)
             state = self._mtp_shared_sparse_indices
             slot = state.layer_slots[int(layer_id)]
             return DeferredMtpSparseIndices(
@@ -1629,8 +1702,14 @@ class QwenSparseAttnBackend(AttentionBackend):
             indices, metadata.sequence_lengths, counts, pk[:stride], pv[:stride],
         )
 
-    def _fused_kv_prefix(self, q, k, v, layer, forward_batch, indices):
-        """Native v1 pool/shape gate shared with the pre-join store."""
+    def _fused_kv_prefix(self, q, k, v, layer, forward_batch, indices, defer_fp8_cast=False):
+        """Native v1 pool/shape gate shared with the pre-join store.
+
+        defer_fp8_cast (SGLANG_QSA_FUSED_FP8_KV_WRITE, target verify only): BF16 k/v bound for an
+        FP8 (E4M3) pool are returned uncast when their [rows, heads, 256] views already have the
+        strides the gate below requires, which their stock casts would have as well; the caller
+        then casts them in the pool write, or with the stock .to() before any other consumer.
+        """
         if not self._fused_kv_pool_eligible or not q.is_cuda or k is None or v is None:
             return None
         mode = forward_batch.forward_mode
@@ -1673,8 +1752,17 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.dtype != torch.bfloat16
         ):
             return None
-        k = k.reshape(rows, kc.shape[1], 256).to(kc.dtype)
-        v = v.reshape(rows, kc.shape[1], 256).to(vc.dtype)
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        if not (
+            defer_fp8_cast
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+            and qsa_pool_decode.write_new_kv_e4m3_ok(kc, vc)
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         if (
             k.stride(1) != 256
             or v.stride(1) != 256
@@ -1779,7 +1867,11 @@ class QwenSparseAttnBackend(AttentionBackend):
         return True
 
     def _try_fused_kv_attention(self, q, k, v, layer, forward_batch, indices, output_gate=None, kv_prestored=False):
-        prefix = self._fused_kv_prefix(q, k, v, layer, forward_batch, indices)
+        prefix = self._fused_kv_prefix(
+            q, k, v, layer, forward_batch, indices,
+            defer_fp8_cast=qsa_pool_decode.FUSED_FP8_KV_WRITE
+            and forward_batch.forward_mode.is_target_verify(),
+        )
         if prefix is None:
             return None
         width, rows, loc, kc, vc, k, v, metadata = prefix
@@ -1887,7 +1979,18 @@ class QwenSparseAttnBackend(AttentionBackend):
             row_requests = metadata.row_req_pool_indices
             if row_requests is None:
                 row_requests = forward_batch.req_pool_indices
-            return qsa_pool_sparse_decode(
+            merge_gate = None
+            if (
+                _QSA_POOL_MERGE_GATE
+                and output_gate is not None
+                and output_gate.dtype == torch.bfloat16
+                and output_gate.shape[0] == rows
+                and output_gate.stride(-1) == 1
+                and output_gate.numel() == rows * layer.tp_q_head_num * layer.head_dim
+            ):
+                # The model's CUDA gate is [rows, heads * dim]; the merge reads [rows, heads, dim].
+                merge_gate = output_gate.view(rows, layer.tp_q_head_num, layer.head_dim)
+            output = qsa_pool_sparse_decode(
                 q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
                 kc,
                 vc,
@@ -1903,7 +2006,33 @@ class QwenSparseAttnBackend(AttentionBackend):
                 layer.scaling,
                 ratio=self.compress_ratio,
                 write_new_kv=not kv_prestored,
+                gate=merge_gate,
             )
+            if merge_gate is not None:
+                _log_qsa_mtp_batched_once("pool merge gate", rows)
+                return output, True
+            return output
+        if (
+            _QSA_FP8_POOL_VERIFY
+            and mode.is_target_verify()
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and int(getattr(forward_batch.spec_info, "topk", 1) or 1) == 1
+            and _qsa_pool_decode_enabled()
+            and self._uses_block_indices(indices)
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+        ):
+            from sglang.srt.layers.attention.qsa import pool_union_decode as union
+
+            if union.admits(rows, kc.dtype, q.dtype):
+                return self._qsa_fp8_pool_verify(
+                    union, q, k, v, kc, vc, loc, layer, forward_batch, metadata,
+                    indices, width, kv_prestored,
+                )
+        if k.dtype != kc.dtype:  # SGLANG_QSA_FUSED_FP8_KV_WRITE deferred them: the stock casts
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
         return self._forward_trtllm_sparse(
             q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
             kc,
@@ -1918,6 +2047,43 @@ class QwenSparseAttnBackend(AttentionBackend):
             ),
             trtllm_decode,
             new_kv=(k, v, loc, width),
+        )
+
+    def _qsa_fp8_pool_verify(
+        self, union, q, k, v, kc, vc, loc, layer, forward_batch, metadata, indices, width,
+        kv_prestored,
+    ):
+        """SGLANG_QSA_FP8_POOL_VERIFY: a topk-1 verify's sparse attention read from an FP8
+        pool, each request's union of rows once. k/v are already cast to the pool dtype; E4M3
+        widens to BF16 exactly with no k/v scale, as trtllm reads the packed rows
+        (bmm1_scale = layer.scaling, bmm2_scale = 1.0)."""
+        rows = indices.shape[0]
+        row_requests = metadata.row_req_pool_indices
+        if row_requests is None:
+            row_requests = forward_batch.req_pool_indices
+        union.log_engaged(rows, width, kc.shape[1], q.device)
+        verify = union.qsa_pool_union_decode
+        if _QSA_FP8_POOL_VERIFY_WS:
+            from sglang.srt.layers.attention.qsa import pool_union_ws
+
+            verify = pool_union_ws.qsa_pool_union_decode_ws
+        return verify(
+            q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            kc,
+            vc,
+            k,
+            v,
+            loc,
+            self.req_to_token_pool.req_to_token,
+            row_requests,
+            indices.to(torch.int32).contiguous(),
+            metadata.sequence_lengths,
+            metadata.indexer_metadata.decode_logical_positions,
+            width,
+            layer.scaling,
+            ratio=self.compress_ratio,
+            write_new_kv=not kv_prestored,
+            **union.LAUNCH,
         )
 
     def forward_extend(
@@ -1947,6 +2113,10 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
+            if _QSA_DRAFT_EXTEND_UNION and not kwargs.get("q38_kv_prestored", False):
+                union_output = self._qsa_draft_extend_union(q, k, v, layer, forward_batch, topk_indices)
+                if union_output is not None:
+                    return union_output
             self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
@@ -1989,7 +2159,27 @@ class QwenSparseAttnBackend(AttentionBackend):
             forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32).cumsum(0),
             (1, 0),
         ).contiguous()
+        union_out = (
+            self._union_prefill_out(q, forward_batch, num_output_rows)
+            if qsa_union_prefill.ENABLED and _QSA_UNION_PREFILL_OUT_ALIAS
+            else None
+        )
         if not any(prefix_lens):
+            if qsa_union_prefill.ENABLED:
+                output = self._qsa_union_cold_prefill(
+                    q=q.contiguous(),
+                    out=union_out,
+                    k=k[:num_valid_rows].contiguous(),
+                    v=v[:num_valid_rows].contiguous(),
+                    layer=layer,
+                    forward_batch=forward_batch,
+                    topk_indices=topk_indices,
+                    cu_seqlens_q=cu_seqlens_q,
+                    extend_lens=extend_lens,
+                    sequence_lens=sequence_lens,
+                )
+                if output is not None:
+                    return self._pad_extend_output(output, num_output_rows)
             output = sparse_gqa_fwd_interface_triton(
                 q.contiguous(),
                 k[:num_valid_rows].contiguous(),
@@ -2017,6 +2207,36 @@ class QwenSparseAttnBackend(AttentionBackend):
                 sequence_lens, dtype=torch.int32, device=q.device
             )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
+        if qsa_union_prefill.ENABLED:
+            output = self._qsa_union_chunk_prefill(
+                q=q.contiguous(),
+                out=union_out,
+                layer=layer,
+                forward_batch=forward_batch,
+                topk_indices=topk_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                extend_lens=extend_lens,
+                sequence_lens=sequence_lens,
+                sequence_lens_tensor=sequence_lens_tensor,
+                max_q=max_q,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
+        if qsa_tma_prefill.ENABLED:
+            output = self._qsa_tma_chunk_prefill(
+                q=q.contiguous(),
+                layer=layer,
+                forward_batch=forward_batch,
+                topk_indices=topk_indices,
+                cu_seqlens_q=cu_seqlens_q,
+                cu_seqlens_k=cu_seqlens_k,
+                sequence_lens=sequence_lens,
+                sequence_lens_tensor=sequence_lens_tensor,
+                max_q=max_q,
+            )
+            if output is not None:
+                return self._pad_extend_output(output, num_output_rows)
         packed_k, packed_v = pack_qsa_prefill_kv(
             k=pool.layer_router.read(layer.layer_id).key(),
             v=pool.layer_router.read(layer.layer_id).value(),
@@ -2039,6 +2259,282 @@ class QwenSparseAttnBackend(AttentionBackend):
             max_q=max_q,
         )
         return self._pad_extend_output(output, num_output_rows)
+
+    def _qsa_draft_extend_union(self, q, k, v, layer, forward_batch, indices):
+        """SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION: a CUDA-graph spec-v2 draft extend (four rows per request in
+        position order) stores its new K/V and attends on the verify's FP8 pool-union path
+        (qsa/draft_extend_union.py), in place of store + _forward_paged_attention; None keeps the stock path."""
+        from sglang.srt.layers.attention.qsa import draft_extend_union
+
+        ratio = self.compress_ratio
+        profile = self.qsa_profile
+        if not (
+            forward_batch.forward_mode.is_draft_extend_v2()
+            and self._fused_kv_pool_eligible
+            and q.is_cuda
+            and k is not None
+            and v is not None
+            and get_parallel().tp_size == 1
+            and is_sm100_supported()
+            and isinstance(indices, torch.Tensor)
+            and profile is not None
+            and profile.budget == profile.block_topk * ratio
+            and indices.dim() == 2
+            and indices.shape[1] == profile.budget + ratio - 1
+        ):
+            return None
+        rows = indices.shape[0]
+        metadata = self._resolve_metadata(forward_batch)
+        indexer = metadata.indexer_metadata
+        loc = forward_batch.out_cache_loc
+        if not (
+            metadata.is_cuda_graph
+            and q.shape[0] == rows
+            and rows == forward_batch.req_pool_indices.numel() * draft_extend_union.WIDTH
+            and indexer is not None
+            and indexer.decode_logical_positions is not None
+            and metadata.row_req_pool_indices is not None
+            and metadata.row_req_pool_indices.numel() == rows
+            and metadata.sequence_lengths.numel() == rows
+            and isinstance(loc, torch.Tensor)
+            and loc.ndim == 1
+            and loc.numel() == rows
+            and loc.is_contiguous()
+        ):
+            return None
+        kc = self.token_to_kv_pool.layer_router.read(layer.layer_id).key()
+        vc = self.token_to_kv_pool.layer_router.read(layer.layer_id).value()
+        if not (
+            kc.ndim == 3
+            and vc.shape == kc.shape
+            and kc.is_contiguous()
+            and vc.is_contiguous()
+            and kc.shape[-1] == 256
+            and vc.dtype == kc.dtype
+            and draft_extend_union.admits(rows, kc.dtype, q.dtype)
+        ):
+            return None
+        k = k.reshape(rows, kc.shape[1], 256)
+        v = v.reshape(rows, kc.shape[1], 256)
+        if not (
+            qsa_pool_decode.FUSED_FP8_KV_WRITE
+            and k.dtype == v.dtype == torch.bfloat16
+            and k.stride(1) == v.stride(1) == 256
+            and k.stride(2) == v.stride(2) == 1
+            and qsa_pool_decode.write_new_kv_e4m3_ok(kc, vc)
+        ):
+            k = k.to(kc.dtype)
+            v = v.to(vc.dtype)
+        if k.stride(1) != 256 or v.stride(1) != 256 or k.stride(2) != 1 or v.stride(2) != 1:
+            return None
+        if rows not in _DRAFT_EXTEND_UNION_LOGGED:  # once per row count, at graph capture
+            _DRAFT_EXTEND_UNION_LOGGED.add(rows)
+            logger.info(
+                "SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION engaged rows=%d requests=%d kv_heads=%d kv_write=%s",
+                rows, rows // draft_extend_union.WIDTH, kc.shape[1],
+                "e4m3_fused" if k.dtype != kc.dtype else "cast",
+            )
+        return draft_extend_union.attend(
+            q=q.reshape(rows, layer.tp_q_head_num, layer.head_dim),
+            k_new=k,
+            v_new=v,
+            k_cache=kc,
+            v_cache=vc,
+            loc=loc,
+            req_to_token=self.req_to_token_pool.req_to_token,
+            row_requests=metadata.row_req_pool_indices,
+            token_indices=indices,
+            sequence_lens=metadata.sequence_lengths,
+            query_positions=indexer.decode_logical_positions,
+            scale=layer.scaling,
+            ratio=ratio,
+            block_topk=profile.block_topk,
+        )
+
+    def _qsa_union_chunk_prefill(
+        self,
+        *,
+        q,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        extend_lens,
+        sequence_lens,
+        sequence_lens_tensor,
+        max_q,
+        out=None,
+    ):
+        """SGLANG_ENABLE_QSA_UNION_PREFILL: the stock pack, then row-group union attention on
+        tcgen05 (qsa/union_prefill.py; not bitwise). None keeps the code below."""
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        layer_kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        kv_max = max(sequence_lens, default=1)
+        total_k = sum(sequence_lens)
+        if not qsa_union_prefill.applies(
+            q,
+            topk_indices,
+            kv_heads=layer_kv.key().shape[1],
+            kv_dtype=q.dtype,
+            extend_lens=extend_lens,
+            kv_max=kv_max,
+            total_k=total_k,
+        ):
+            return None
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=layer_kv.key(),
+            v=layer_kv.value(),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=total_k,
+            max_k=kv_max,
+            output_dtype=q.dtype,
+        )
+        kernel_args = (
+            q,
+            packed_k,
+            packed_v,
+            topk_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
+        if not qsa_union_prefill.kv_ok(packed_k, packed_v):
+            return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
+        qsa_union_prefill.log_once(q, packed_k, topk_indices)
+
+        def run_ref():
+            if max_q is not None and qsa_tma_prefill.applies(
+                q, packed_k, packed_v, topk_indices
+            ):
+                return qsa_tma_prefill.chunk_prefill(*kernel_args, max_q=max_q)
+            return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
+
+        return qsa_union_prefill.checked(
+            lambda: qsa_union_prefill.union_prefill(
+                *kernel_args, extend_lens=extend_lens, kv_max=kv_max, out=out
+            ),
+            run_ref,
+            q.shape[0],
+            kv_max,
+            "replaced",
+        )
+
+    def _qsa_union_cold_prefill(
+        self,
+        *,
+        q,
+        k,
+        v,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        extend_lens,
+        sequence_lens,
+        out=None,
+    ):
+        """SGLANG_ENABLE_QSA_UNION_PREFILL on a pass without cached prefixes: the chunk's own K/V
+        are the context. None keeps the stock kernel."""
+        if torch.cuda.is_current_stream_capturing():
+            return None
+        kv_max = max(extend_lens, default=1)
+        if not qsa_union_prefill.applies(
+            q,
+            topk_indices,
+            kv_heads=k.shape[1],
+            kv_dtype=k.dtype,
+            extend_lens=extend_lens,
+            kv_max=kv_max,
+            total_k=k.shape[0],
+        ):
+            return None
+        if k.ndim != 3 or v.dtype != k.dtype or not qsa_union_prefill.kv_ok(k, v):
+            return None
+        qsa_union_prefill.log_once(q, k, topk_indices)
+        kv_lens = forward_batch.extend_seq_lens.to(q.device, dtype=torch.int32)
+        return qsa_union_prefill.checked(
+            lambda: qsa_union_prefill.union_prefill(
+                q,
+                k,
+                v,
+                topk_indices,
+                cu_seqlens_q,
+                cu_seqlens_q,
+                kv_lens,
+                layer.scaling,
+                extend_lens=extend_lens,
+                kv_max=kv_max,
+                out=out,
+            ),
+            lambda: sparse_gqa_fwd_interface_triton(
+                q,
+                k,
+                v,
+                max(sequence_lens, default=1),
+                topk_indices,
+                cu_seqlens_q,
+                layer.scaling,
+            ),
+            q.shape[0],
+            kv_max,
+            "stock",
+        )
+
+    def _qsa_tma_chunk_prefill(
+        self,
+        *,
+        q,
+        layer,
+        forward_batch,
+        topk_indices,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        sequence_lens,
+        sequence_lens_tensor,
+        max_q,
+    ):
+        """SGLANG_ENABLE_QSA_TMA_PREFILL: the stock pack, then the stock kernel's
+        arithmetic with TMA-gathered K/V (qsa/tma_prefill.py; bitwise equal).
+        None keeps the stock code below."""
+        # The grid needs a host max_q; only the prefill host path supplies one.
+        if max_q is None or torch.cuda.is_current_stream_capturing():
+            return None
+        layer_kv = self.token_to_kv_pool.layer_router.read(layer.layer_id)
+        kv_max = max(sequence_lens, default=1)
+        packed_k, packed_v = pack_qsa_prefill_kv(
+            k=layer_kv.key(),
+            v=layer_kv.value(),
+            req_to_token=self.req_to_token_pool.req_to_token,
+            req_indices=forward_batch.req_pool_indices,
+            cu_k=cu_seqlens_k,
+            total_k=sum(sequence_lens),
+            max_k=kv_max,
+            output_dtype=q.dtype,
+        )
+        kernel_args = (
+            q,
+            packed_k,
+            packed_v,
+            topk_indices,
+            cu_seqlens_q,
+            cu_seqlens_k,
+            sequence_lens_tensor,
+            layer.scaling,
+        )
+        if not qsa_tma_prefill.applies(q, packed_k, packed_v, topk_indices):
+            return sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q)
+        qsa_tma_prefill.log_once(q, packed_k, topk_indices)
+        return qsa_tma_prefill.checked(
+            lambda: qsa_tma_prefill.chunk_prefill(*kernel_args, max_q=max_q),
+            lambda: sparse_gqa_fwd_interface_triton_ck(*kernel_args, max_q=max_q),
+            q.shape[0],
+            kv_max,
+        )
 
     def prefetch_cp_kv(self, layer, k: torch.Tensor, v: torch.Tensor, forward_batch):
         """Run ``layer``'s prefill-CP K/V gather on a side stream; the layer's
@@ -2175,6 +2671,32 @@ class QwenSparseAttnBackend(AttentionBackend):
             # release there (unmap, cudaFreeAsync) after this stream's reads.
             get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
         return self._pad_extend_output(output, num_output_rows)
+
+    @staticmethod
+    def _union_prefill_out(q, forward_batch, num_output_rows):
+        """SGLANG_QSA_UNION_PREFILL_OUT_ALIAS: forward_batch._attn_output as the union
+        kernel's [rows, heads, 256] output, when it is exactly q's rows (no DP padding)
+        in q's dtype and contiguous; else None (a new tensor, then the stock copy)."""
+        out = forward_batch._attn_output
+        if (
+            out is None
+            or q.shape[0] != num_output_rows
+            or out.shape[0] != q.shape[0]
+            or out.numel() != q.numel()
+            or out.dtype != q.dtype
+            or out.device != q.device
+            or not out.is_contiguous()
+        ):
+            return None
+        if not _QSA_UNION_OUT_ALIAS_LOGGED[0]:
+            _QSA_UNION_OUT_ALIAS_LOGGED[0] = True
+            logger.info(
+                "QSA union prefill writes the attention output buffer in place "
+                "(SGLANG_QSA_UNION_PREFILL_OUT_ALIAS; rows=%d heads=%d)",
+                q.shape[0],
+                q.shape[1],
+            )
+        return out.view(q.shape)
 
     @staticmethod
     def _pad_extend_output(output: torch.Tensor, num_rows: int) -> torch.Tensor:

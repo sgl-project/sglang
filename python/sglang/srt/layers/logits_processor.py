@@ -94,6 +94,11 @@ _UNQUANTIZED_LM_HEAD_METHODS = {
 # under DP attention with a tight mem_fraction_static.
 _autotune_run_lm_head: Optional[bool] = None
 _Q38_LM_HEAD_ARTIFACTS = os.environ.get("SGLANG_Q38C_LM_HEAD_ARTIFACTS", "")
+_BF16_GEMM_PINS = bool(envs.SGLANG_BF16_GEMM_PIN_FILE.get())
+
+
+def _lm_head_matmul(hidden_states: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    return torch.matmul(hidden_states.to(weight.dtype), weight.T)
 
 
 class SamplingMaskStatus(IntEnum):
@@ -1264,9 +1269,15 @@ class LogitsProcessor(nn.Module):
                     )
                     if logits is not None:
                         return logits
-                logits = torch.matmul(
-                    hidden_states.to(lm_head.weight.dtype), lm_head.weight.T
-                )
+                if _BF16_GEMM_PINS:
+                    from sglang.srt.layers import bf16_gemm_pins
+
+                    logits = bf16_gemm_pins.gemm(
+                        hidden_states, lm_head.weight, _lm_head_matmul
+                    )
+                    if logits is not None:
+                        return logits
+                logits = _lm_head_matmul(hidden_states, lm_head.weight)
         else:
             # GGUF models
             # TODO: use weight_packed_linear for GGUF models

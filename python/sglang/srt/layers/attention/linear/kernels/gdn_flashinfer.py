@@ -121,6 +121,20 @@ def maybe_build_flashinfer_checkpoint_plan(
     forward_metadata.state_checkpoint_every_n_tokens = checkpoint_every_n_tokens
 
 
+def _install_gdn_prefill_tmem_dealloc_fix() -> None:
+    """FlashInfer #8854 on FlashInfer 0.7.2's Blackwell (SM10x) GDN prefill kernels: TMEM is freed only after every
+    reading warp's last tcgen05.ld (sglang/kernels/ops/mamba/gdn_prefill_tmem_dealloc.py). Bitwise. With another
+    FlashInfer than 0.7.2 nothing changes and the kernels run as shipped, with a warning."""
+    if torch.cuda.get_device_capability()[0] != 10:
+        return
+    try:
+        from sglang.kernels.ops.mamba.gdn_prefill_tmem_dealloc import install
+
+        install()
+    except Exception as e:
+        logger.warning(f"GDN prefill TMEM dealloc fix (FlashInfer #8854) not applied: {e}")
+
+
 def _get_flashinfer_gdn_kernels():
     """Lazy import for FlashInfer GDN prefill, decode and verify (MTP) kernels.
 
@@ -154,6 +168,7 @@ def _get_flashinfer_gdn_kernels():
             )
             if _flashinfer_gdn_available:
                 logger.info("FlashInfer GDN kernels loaded successfully")
+                _install_gdn_prefill_tmem_dealloc_fix()
         except (ImportError, RuntimeError) as e:
             logger.warning(f"FlashInfer GDN kernels not available: {e}")
             _flashinfer_gdn_available = False
@@ -532,8 +547,34 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
                 raise ValueError("FlashInfer GDN prefill output must be contiguous")
 
         # g (alpha) and beta: [1, seq, HV] -> [seq, HV], float32 for FlashInfer
-        alpha_fi = torch.exp(g[0].to(torch.float32))
+        # g_is_alpha: the gating kernel already wrote exp(g) (SGLANG_GDN_PREFILL_ALPHA_FUSED).
+        alpha_fi = (
+            g[0] if kwargs.get("g_is_alpha") else torch.exp(g[0].to(torch.float32))
+        )
         beta_fi = beta[0].to(torch.float32)
+
+        state_copy = kwargs.get("state_copy")
+        if (
+            state_copy is not None
+            and self.use_state_pool
+            and not self._prefill_needs_fp32_state
+        ):
+            fused = self._extend_fused_state_copy(
+                q_fi=q_fi,
+                k_fi=k_fi,
+                v_fi=v_fi,
+                alpha_fi=alpha_fi,
+                beta_fi=beta_fi,
+                output_fi=output_fi,
+                ssm_states=ssm_states,
+                state_copy=state_copy,
+                state_checkpoint_cu_starts=state_checkpoint_cu_starts,
+                num_state_checkpoints=num_state_checkpoints,
+                state_checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+                out_shape=(1, total_seq_len, num_v_heads, head_v_dim),
+            )
+            if fused is not None:
+                return fused[0], None, fused[1]
 
         if self.use_state_pool:
             # Negative indices (e.g. -1) are padding markers for slots not yet
@@ -597,6 +638,61 @@ class FlashInferGDNKernel(LinearAttnKernelBase):
         # Match Triton's [1, checkpoints, H, V, K] intermediate-state layout.
         h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
         return core_attn_out, None, h
+
+    def _extend_fused_state_copy(
+        self,
+        *,
+        q_fi: torch.Tensor,
+        k_fi: torch.Tensor,
+        v_fi: torch.Tensor,
+        alpha_fi: torch.Tensor,
+        beta_fi: torch.Tensor,
+        output_fi: Optional[torch.Tensor],
+        ssm_states: torch.Tensor,
+        state_copy: tuple[torch.Tensor, torch.Tensor],
+        state_checkpoint_cu_starts: Optional[torch.Tensor],
+        num_state_checkpoints: int,
+        state_checkpoint_every_n_tokens: int,
+        out_shape: tuple,
+    ) -> Optional[tuple]:
+        """extend's stock FlashInfer call with its pool-row gather and index_copy_ back as one copy
+        launch each (SGLANG_ENABLE_GDN_PREFILL_FUSED_STATE_COPY); state_copy: the per-forward int64
+        (clamped slots, cu_seqlens) the stock path derives per layer. None: pool rows not dense."""
+        from sglang.kernels.ops.mamba.gdn_prefill_state_glue import (
+            gdn_gather_state_rows,
+            gdn_scatter_state_rows,
+        )
+
+        slots, cu_seqlens = state_copy
+        initial_state_fi = gdn_gather_state_rows(ssm_states, slots)
+        if initial_state_fi is None:
+            return None
+        output_state_fi = torch.empty_like(initial_state_fi)
+        state_checkpoints = (
+            initial_state_fi.new_empty((num_state_checkpoints, *initial_state_fi.shape[1:]))
+            if num_state_checkpoints > 0
+            else None
+        )
+        output_fi, output_state_fi = self._prefill_fn(
+            q=q_fi,
+            k=k_fi,
+            v=v_fi,
+            g=alpha_fi,
+            beta=beta_fi,
+            scale=None,
+            initial_state=initial_state_fi,
+            output_final_state=True,
+            cu_seqlens=cu_seqlens,
+            use_qk_l2norm_in_kernel=False,
+            output=output_fi,
+            output_state=output_state_fi,
+            state_checkpoints=state_checkpoints,
+            checkpoint_cu_starts=state_checkpoint_cu_starts,
+            checkpoint_every_n_tokens=state_checkpoint_every_n_tokens,
+        )
+        gdn_scatter_state_rows(ssm_states, slots, output_state_fi.to(ssm_states.dtype))
+        h = state_checkpoints.unsqueeze(0) if state_checkpoints is not None else None
+        return output_fi.view(*out_shape), h
 
     def extend_in_graph(
         self,

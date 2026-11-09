@@ -116,6 +116,15 @@ class StateStorage:
                 spec_write_pos.index_fill_(0, fresh, 0)
                 self.pool.replayssm_cache_base.index_fill_(0, fresh, 0)
                 self.pool.replayssm_is_flush.index_fill_(0, fresh, 0)
+        gdn_ucache = self.pool.gdn_ucache
+        ucache_by_row = gdn_ucache is not None and gdn_ucache.by_request_row
+        if ucache_by_row:
+            # The row-indexed u-cache window restarts with its request (a PD decode row runs
+            # no target extend before its first verify; agg's extend reset repeats it).
+            fresh_indices = [idx for idx, fresh in zip(rows, fresh_rows) if fresh]
+            if fresh_indices:
+                fresh = async_h2d(fresh_indices, dtype=torch.int64, device=table.device)
+                gdn_ucache.hist_len.index_fill_(0, fresh, 0)
 
         mamba_indices: list[torch.Tensor] = []
         mamba_ping_pong_track_buffers: list[torch.Tensor] = []
@@ -135,6 +144,10 @@ class StateStorage:
                 req.kv.mamba_pool_idx = mid[0]
                 given_state.append(req)
                 req.kv.mamba_needs_clear = True
+                # An empty u-cache window: a PD decode slot runs no target extend
+                # (whose reset_gdn_ucache_cursors covers agg) before its first verify.
+                if self.pool.gdn_ucache is not None and not ucache_by_row:
+                    self.pool.gdn_ucache.hist_len.index_fill_(0, mid, 0)
                 # A zero write_pos empties the ReplaySSM ring;
                 # decode then reads only the checkpoint written by prefill.
                 if self.pool.replayssm_write_pos is not None:

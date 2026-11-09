@@ -303,6 +303,7 @@ def _kernel_module():
             # Verbatim from the vendored epilog_warp (has_bias=False): TMEM -> RMEM, then the rank-ordered reduce.
             cute.arch.mbarrier_arrive(bar_tmem_alloc)
             cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+            epi._tcgen05_fence(before=False)
 
             acc_view = cute.make_tensor(
                 cute.arch.retrieve_tmem_ptr(self.acc_dtype, 16, tmem_base_ptr),
@@ -332,8 +333,10 @@ def _kernel_module():
             thr_t2r = tiled_copy_t2r.get_slice(epi_tid)
 
             cute.arch.mbarrier_wait(bar_mma_epilog, 0)
+            epi._tcgen05_fence(before=False)
             cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
             cute.arch.fence_view_async_tmem_load()
+            epi._tcgen05_fence(before=True)
             cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
             if cutlass.const_expr(self.split_k > 1):
@@ -360,7 +363,7 @@ def _kernel_module():
                         cute.arch.mbarrier_arrive_and_expect_tx(
                             bar_reduce, self.expected_transaction_bytes
                         )
-                    cute.arch.mbarrier_wait(bar_reduce, 0)
+                    epi._mbarrier_wait_acquire_cluster(bar_reduce, Int32(0))
                     for peer in cutlass.range_constexpr(self.split_k - 1):
                         for value_idx in cutlass.range_constexpr(values_per_thread):
                             rAcc[value_idx] = (

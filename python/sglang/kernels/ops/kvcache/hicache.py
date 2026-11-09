@@ -94,6 +94,14 @@ TMA_STORE_WARPS = 4
 TMA_BLOCK_QUOTA = 4
 
 
+def hicache_block_quota_from_env(env) -> int | None:
+    """A HiCache copy CTA quota from its env field; None (unset) keeps the stock quota."""
+    quota = env.get()
+    if quota is not None and quota <= 0:
+        raise ValueError(f"{env.name} must be a positive CTA count, got {quota}")
+    return quota
+
+
 @cache_once
 def _jit_hicache_tma_module(*, block_quota: int) -> Module:
     args = make_cpp_args(TMA_STAGE_BYTES, TMA_NUM_STAGES, TMA_STORE_WARPS, block_quota)

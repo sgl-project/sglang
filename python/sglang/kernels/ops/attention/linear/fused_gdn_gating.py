@@ -6,6 +6,7 @@ from typing import Tuple
 import torch
 import triton
 import triton.language as tl
+from triton.language.extra.cuda import libdevice
 
 
 # g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)
@@ -49,6 +50,11 @@ def fused_gdn_gating_kernel(
 # tokens x all heads per program with the same per-element math (bit-identical).
 # Kill switch: SGLANG_X_GDN_FRONT_DISABLE=1 or SGLANG_X_GDN_FRONT_GATING_DISABLE=1.
 _GDN_FRONT_GATING = _Q38C_EXTEND_PATH
+# SGLANG_GDN_PREFILL_ALPHA_FUSED (default off): the FlashInfer prefill takes exp(g) from the
+# gating kernel instead of a torch.exp launch per GDN layer; needs the 2D kernel above.
+ALPHA_FUSED = _Q38C_EXTEND_PATH and os.environ.get(
+    "SGLANG_GDN_PREFILL_ALPHA_FUSED", "0"
+).strip().lower() in ("1", "true", "yes", "on")
 GATING_BIG_BATCH = 512
 GATING_BIG_CFG = (16, 2)  # (BT, num_warps)
 
@@ -69,6 +75,7 @@ def fused_gdn_gating_2d_kernel(
     threshold: tl.constexpr,
     BT: tl.constexpr,
     BH: tl.constexpr,
+    EXP_G: tl.constexpr = False,
 ):
     rows = tl.program_id(0) * BT + tl.arange(0, BT)
     heads = tl.arange(0, BH)
@@ -85,6 +92,9 @@ def fused_gdn_gating_2d_kernel(
     )
     blk_g = -tl.exp(blk_A_log.to(tl.float32))[None, :] * softplus_x
     off = rows64 * NUM_HEADS + heads[None, :]
+    if EXP_G:
+        # The FlashInfer prefill's torch.exp(g): libdevice expf on the stored fp32 g.
+        blk_g = libdevice.exp(blk_g.to(g.dtype.element_ty).to(tl.float32))
     tl.store(g + off, blk_g.to(g.dtype.element_ty), mask=mask)
     blk_beta_output = tl.sigmoid(blk_b.to(tl.float32))
     tl.store(beta_output + off, blk_beta_output.to(b.dtype.element_ty), mask=mask)
@@ -100,7 +110,9 @@ if _Q38C_EXTEND_PATH:
         beta: float = 1.0,
         threshold: float = 20.0,
         launch_cfg=None,
+        exp_g: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """exp_g: return (exp(g), beta) for the FlashInfer prefill (SGLANG_GDN_PREFILL_ALPHA_FUSED)."""
         batch, num_heads = a.shape
         seq_len = 1
         stride_a = a.stride(0)
@@ -108,7 +120,8 @@ if _Q38C_EXTEND_PATH:
         grid = (batch, seq_len, triton.cdiv(num_heads, 8))
         g = torch.empty(1, batch, num_heads, dtype=torch.float32, device=a.device)
         beta_output = torch.empty(1, batch, num_heads, dtype=torch.float32, device=b.device)
-        if (_GDN_FRONT_GATING and batch >= GATING_BIG_BATCH) or launch_cfg is not None:
+        if exp_g or (_GDN_FRONT_GATING and batch >= GATING_BIG_BATCH) or launch_cfg is not None:
+            # Both launches compute each element alike; exp_g takes the 2D one at any size.
             bt, n_warps = launch_cfg if launch_cfg is not None else GATING_BIG_CFG
             fused_gdn_gating_2d_kernel[(triton.cdiv(batch, bt),)](
                 g,
@@ -126,6 +139,7 @@ if _Q38C_EXTEND_PATH:
                 BT=bt,
                 BH=triton.next_power_of_2(num_heads),
                 num_warps=n_warps,
+                **({"EXP_G": True} if exp_g else {}),
             )
             return g, beta_output
         fused_gdn_gating_kernel[grid](

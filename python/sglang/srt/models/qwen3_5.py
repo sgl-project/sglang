@@ -26,7 +26,12 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    GDN_VERIFY_NORM_CFG,
+    _layer_norm_fwd,
+    gdn_verify_norm_retile_applies,
+    gdn_verify_norm_retiled,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -193,6 +198,7 @@ def _gdn_in_proj_pin_configured() -> bool:
 
 
 _GDN_IN_PROJ_PIN = _gdn_in_proj_pin_configured()
+_GDN_UCACHE_FUSED_NORM = envs.SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM.get()
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
@@ -1221,6 +1227,31 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         self.attn_tp_rank, self.layer_id, self.norm.weight.dtype, hidden_states.dtype,
                     )
                 return self.out_proj(attn_result[0].reshape(32, -1))[0]
+        elif (
+            _GDN_UCACHE_FUSED_NORM
+            and use_strided_prefill_z
+            and forward_batch.forward_mode.is_target_verify()
+            and not use_fused_proj_conv
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and self.norm.norm_before_gate
+            and self.norm.activation == "sigmoid"
+        ):
+            from sglang.srt.model_executor.forward_context import get_attn_backend
+
+            # SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM: the u-cache flush may apply self.norm itself;
+            # it then returns (normalized output, True)
+            attn_result = get_attn_backend().forward(
+                layer=self.attn,
+                forward_batch=forward_batch,
+                mixed_qkv=mixed_qkv,
+                a=a,
+                b=b,
+                gdn_ucache_norm=(z, self.norm.weight, self.norm.eps),
+            )
+            if isinstance(attn_result, tuple):
+                normalized = attn_result[0]  # [tokens, HV, V] rows, gated and normalized
+                return self.out_proj(normalized.reshape(hidden_states.shape[0], -1))[0]
         else:
             attn_result = self.attn(
                 forward_batch,
@@ -1267,7 +1298,25 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             )
             return self.out_proj(fp8)[0]
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            GDN_VERIFY_NORM_CFG is not None
+            and use_strided_prefill_z
+            and forward_batch.forward_mode.is_target_verify()
+            and self.norm.group_size is None
+            and self.norm.bias is None
+            and core_attn_out.stride(-1) == 1
+            and gdn_verify_norm_retile_applies(core_attn_out)
+        ):
+            core_attn_out = gdn_verify_norm_retiled(
+                x=core_attn_out,
+                weight=self.norm.weight,
+                z=z,
+                eps=self.norm.eps,
+                norm_before_gate=self.norm.norm_before_gate,
+                activation=self.norm.activation,
+            )
+        else:
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(
             *core_attn_out.shape[:-2],

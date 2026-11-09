@@ -26,6 +26,8 @@ Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
 
 from __future__ import annotations
 
+import functools
+import logging
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -36,7 +38,9 @@ import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
+from cutlass._mlir.dialects import llvm
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
+from cutlass.cutlass_dsl import dsl_user_op
 
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import (
@@ -84,6 +88,30 @@ _TGV_CUTE_EXT_TACTIC_CONFIGS: List[Tuple[int, int, int, bool]] = [
     (128, 64, 5, True),  # 27
     (128, 128, 4, True),  # 28
 ]
+
+
+@dsl_user_op
+def _tcgen05_fence(*, before: bool, loc=None, ip=None) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns; as FlashInfer #7443)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@functools.lru_cache(maxsize=None)
+def _log_tmem_fix_once() -> None:
+    logging.getLogger(__name__).info(
+        "TMEM release fix: %s (the MMA warp's TMEM release waits for the allocation phase; "
+        "tcgen05 fences order the TMEM hand-offs)", __file__)
 
 
 class WorkTileInfo(NamedTuple):
@@ -703,6 +731,7 @@ class TgvGemmCuteExtKernel:
         # 2-CTA: alloc/relinquish/dealloc are cluster-coherent (is_two_cta=True).
         num_tmem_cols = 256
         cute.arch.alloc_tmem(num_tmem_cols, tmem_base_ptr, is_two_cta=self.use_2cta)
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 0: 32 of 160
         cute.arch.relinquish_tmem_alloc_permit(is_two_cta=self.use_2cta)
 
@@ -728,6 +757,7 @@ class TgvGemmCuteExtKernel:
             for k_tile in cutlass.range(k_tile_count, unroll=1):
                 stage = k_tile % DMA_Stage
                 cute.arch.mbarrier_wait(bar_full + stage, full_phase)
+                _tcgen05_fence(before=False)
 
                 # Inner-K loop: NumMma_K straight-line tcgen05.mma instructions.
                 # cute_ext.dot expects rank-3 operands in the MMA fragment
@@ -772,8 +802,14 @@ class TgvGemmCuteExtKernel:
         # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
         # cross-CTA handshake) because each CTA owns its own physical TMEM
         # half; the cluster-shared accumulator is just a logical view.
+        # The release arrival must land in phase 1. Made while phase 0 is still open (an
+        # epilogue warp has not arrived yet; in 2-CTA mode the peer CTA's MMA warp makes both
+        # arrivals back to back), it counts toward phase 0, and the parity-1 wait then passes
+        # at once and frees TMEM before the epilogue has read it (FlashInfer #6786 / #7443).
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
@@ -798,6 +834,7 @@ class TgvGemmCuteExtKernel:
         # before the wait clears.
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
+        _tcgen05_fence(before=False)
 
         # Bind acc_layout to the TMEM ptr written by alloc_tmem.
         # acc_layout shape: ((Mma_M, Mma_N), NumMma_M, NumMma_N, AccStage)
@@ -916,6 +953,7 @@ class TgvGemmCuteExtKernel:
             rBiasAcc.store(rBias.load().to(self.acc_dtype))
 
         cute.arch.mbarrier_wait(bar_mma_epilog, 0)  # accumulator ready
+        _tcgen05_fence(before=False)
 
         # TMEM → RMEM (one tcgen05.ld for the 64×8 tile).
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
@@ -924,6 +962,7 @@ class TgvGemmCuteExtKernel:
         # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
         # on bar_tmem_alloc phase 1.
         cute.arch.fence_view_async_tmem_load()
+        _tcgen05_fence(before=True)
 
         # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
@@ -1131,6 +1170,7 @@ def _get_compiled_cute_ext_kernel(
     cached = _TGV_CUTE_EXT_COMPILE_CACHE.get(key)
     if cached is not None:
         return cached
+    _log_tmem_fix_once()
 
     if dtype not in _TORCH_TO_CUTLASS_DTYPE:
         raise ValueError(

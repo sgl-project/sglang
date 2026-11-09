@@ -1164,6 +1164,11 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     Lazy: gather the positions planned by mamba_lazy_spec_prepare. Runs
     inside forward isolation, so it must not mutate req/pool state.
     """
+    if get_exec().mamba.enable_gdn_replayssm_ucache:
+        # The u-cache checkpoint lags its ring window: no decode-time state may
+        # reach the tree, only the extend-time track slots.
+        batch.mamba_track_indices = batch.mamba_track_mask = None
+        return
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
     track_positions = None
@@ -1496,7 +1501,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if (
+        get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and not get_exec().mamba.enable_gdn_replayssm_ucache
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),

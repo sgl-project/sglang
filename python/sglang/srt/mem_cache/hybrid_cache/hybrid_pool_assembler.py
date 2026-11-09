@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
+from sglang.srt.mem_cache import hicache_fp4_host
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -143,8 +144,30 @@ def _resolve_deepseek_v4_layer_mappings(
     )
 
 
-def _mha_host_inputs(pool, drafts=()):
+def _mha_host_inputs(pool, drafts=(), fp4_host=False):
     info = pool.get_device_pool_infos()[0].buffer_info
+    if fp4_host:
+        # SGLANG_HICACHE_FP4_HOST_KV: the host keeps an NVFP4 copy of the FP8 device rows.
+        from sglang.srt.mem_cache.pool_host.mha_fp8_nvfp4 import (
+            MHATokenToKVPoolFP8NVFP4Host,
+        )
+
+        return (
+            MHATokenToKVPoolFP8NVFP4Host,
+            info,
+            dict(
+                device_capacity_tokens=(
+                    pool.size
+                    if pool.host_capacity_tokens is None
+                    else pool.host_capacity_tokens
+                ),
+                start_layer=pool.start_layer,
+                end_layer=pool.end_layer,
+                draft_buffer_infos=tuple(
+                    draft.get_device_pool_infos()[0].buffer_info for draft in drafts
+                ),
+            ),
+        )
     return (
         get_mha_host_pool_cls(info),
         info,
@@ -173,6 +196,7 @@ def build_kv_host_pool(
     host_size: Optional[float] = None,
     mtp_draft_device_pools: tuple[Any, ...] = (),
     pool_label: str = "kv",
+    fp4_host: bool = False,
 ):
     if use_mla is None:
         use_mla = is_mla_pool(kv_pool)
@@ -182,7 +206,7 @@ def build_kv_host_pool(
         mha_kwargs = {}
     else:
         kv_host_pool_cls, host_input, mha_kwargs = _mha_host_inputs(
-            kv_pool, mtp_draft_device_pools
+            kv_pool, mtp_draft_device_pools, fp4_host=fp4_host
         )
     if use_mla and override_kv_cache_dim is None:
         # An fp8 DSA store is wider than kv_lora_rank + qk_rope_head_dim. The
@@ -265,6 +289,21 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _pinned_mamba_host_gb(hicache_size: float) -> Optional[float]:
+    """SGLANG_HICACHE_MAMBA_SIZE_GB (sglang#47867's --hicache-mamba-size-gb), validated."""
+    from sglang.srt.environ import envs
+
+    pinned = envs.SGLANG_HICACHE_MAMBA_SIZE_GB.get()
+    if pinned is None:
+        return None
+    if not 0 < pinned < hicache_size:
+        raise ValueError(
+            f"SGLANG_HICACHE_MAMBA_SIZE_GB={pinned} must lie in (0, --hicache-size "
+            f"{hicache_size})"
+        )
+    return float(pinned)
 
 
 def build_pool_entry(
@@ -1314,10 +1353,17 @@ def build_hybrid_mamba_stack(
     root = config.pools[0]
     kv_pool = root.decl.device_pool
     kv_host_size, mamba_host_size = None, 0
+    pinned_mamba_gb = None
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        pinned_mamba_gb = _pinned_mamba_host_gb(get_memory().hicache_size)
+        if pinned_mamba_gb is not None:
+            kv_host_size = get_memory().hicache_size - pinned_mamba_gb
+            mamba_host_size = pinned_mamba_gb
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
+    kv_share = kv_host_size
     if qsa_pool is not None and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
         index_bytes = sum(
@@ -1326,12 +1372,28 @@ def build_hybrid_mamba_stack(
             for b in pool.qsa_compressed_k_buffer_pool
         )
         kv_host_size *= kv_bytes / (kv_bytes + index_bytes)
+    fp4_host = hicache_fp4_host.fp8_device_kv_info(kv_pool) is not None and not use_mla
+    if fp4_host and kv_share is not None:
+        # The whole tier stays within hicache-size at NVFP4 host bytes per token.
+        index_pools = (qsa_pool, *qsa_draft_pools) if qsa_pool is not None else ()
+        kv_host_size, mamba_host_size = hicache_fp4_host.size_host_tier(
+            kv_pool=kv_pool,
+            kv_share_gb=kv_share,
+            mamba_share_gb=mamba_host_size,
+            index_bytes_per_token=sum(
+                b.nbytes for p in index_pools for b in p.qsa_compressed_k_buffer_pool
+            )
+            / kv_pool.size,
+            draft_pools=root.packed_draft_device_pools,
+            mamba_pinned=pinned_mamba_gb is not None,
+        )
     kv_host_pool = build_kv_host_pool(
         kv_pool=kv_pool,
         page_size=params.page_size,
         use_mla=use_mla,
         host_size=kv_host_size,
         mtp_draft_device_pools=root.packed_draft_device_pools,
+        fp4_host=fp4_host,
     )
     mamba_host_pool = build_mamba_host_pool(
         mamba_pool,
@@ -1377,6 +1439,11 @@ def build_hybrid_mamba_stack(
                 transfer_layer_id_max=root.transfer_layer_id_max,
                 packed_draft_device_pools=qsa_draft_pools,
             )
+        )
+    if fp4_host and kv_share is not None:
+        hicache_fp4_host.check_host_tier(
+            pools=[(entry.name.value, entry.host_pool) for entry in entries],
+            hicache_size_gb=get_memory().hicache_size,
         )
     host_pool_group = HostPoolGroup(entries)
     cache_controller = HybridCacheController(
