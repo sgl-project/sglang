@@ -12,6 +12,13 @@ from typing import Any, Callable, Optional
 
 import torch
 import torch.nn.functional as F
+from torch import nn
+
+from sglang.kernels.ops.diffusion import (
+    BitExactFusionGate,
+    fused_rope_rotate_half_bitexact,
+    tensors_equal,
+)
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
     HiDreamO1ImageArchConfig,
     HiDreamO1ImageDitConfig,
@@ -39,6 +46,10 @@ from sglang.srt.configs.qwen3_vl import Qwen3VLVisionConfig
 from sglang.srt.layers.rotary_embedding import apply_rotary_pos_emb
 from sglang.srt.models.qwen3_vl import Qwen3VLMoeVisionModel
 from torch import nn
+from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+logger = init_logger(__name__)
+_HIDREAM_ROPE = BitExactFusionGate("HiDream fused RoPE")
 
 # Checkpoint prefixes that carry no parameter of this model.
 UNUSED_CHECKPOINT_PREFIXES = ("lm_head.",)
@@ -215,7 +226,25 @@ class HiDreamO1Attention(nn.Module):
         v = v.reshape(batch_size, seq_len, self.num_kv_heads, self.head_dim)
 
         # cos/sin are [B, S, D]; broadcast over the head axis of [B, S, H, D].
-        q, k = qwen3_apply_rotary_pos_emb(q, k, cos.unsqueeze(2), sin.unsqueeze(2))
+        cos, sin = cos.unsqueeze(2), sin.unsqueeze(2)
+        if (
+            q.is_cuda
+            and q.dtype is torch.bfloat16
+            and q.is_contiguous()
+            and k.is_contiguous()
+        ):
+            # Keep the BF16 rounding after each product in the eager RoPE.
+            q, k = _HIDREAM_ROPE.run(
+                lambda: (
+                    fused_rope_rotate_half_bitexact(q, cos, sin),
+                    fused_rope_rotate_half_bitexact(k, cos, sin),
+                ),
+                lambda: qwen3_apply_rotary_pos_emb(q, k, cos, sin),
+                equal=tensors_equal,
+                logger=logger,
+            )
+        else:
+            q, k = qwen3_apply_rotary_pos_emb(q, k, cos, sin)
 
         attn_output = self.attn(q, k, v, attn_mask=attention_mask)
         output, _ = self.o_proj(attn_output.reshape(batch_size, seq_len, -1))

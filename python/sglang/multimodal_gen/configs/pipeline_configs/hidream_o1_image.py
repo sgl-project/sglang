@@ -9,11 +9,9 @@ from sglang.multimodal_gen.configs.models.dits.base import DiTConfig
 from sglang.multimodal_gen.configs.models.dits.hidream_o1_image import (
     HiDreamO1ImageDitConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
 from sglang.multimodal_gen.configs.sample.hidream_o1_image import _resolve_variant
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Key under which the before-denoising stage stashes the per-branch backbone
 # inputs, since HiDream-O1 conditions on token ids rather than text embeddings.
@@ -60,6 +58,18 @@ class HiDreamO1ImagePipelineConfig(ImagePipelineConfig):
             self.dit_precision = "fp32"
 
     def validate_server_args(self, server_args: Any) -> None:
+        # The pipeline builds its scheduler with the reference flow shift, so
+        # these would otherwise be silently ignored.
+        scheduler_overrides = [
+            f"--{option.replace('_', '-')}"
+            for option in ("flow_shift", "scheduler_class_override")
+            if getattr(self, option) is not None
+        ]
+        if scheduler_overrides:
+            raise ValueError(
+                "HiDream-O1-Image samples with the reference scheduler and flow "
+                f"shift. Drop {', '.join(scheduler_overrides)}."
+            )
         if server_args.sp_degree > 1:
             raise ValueError(
                 "HiDream-O1-Image mixes causal text spans with a bidirectional "

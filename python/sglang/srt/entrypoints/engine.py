@@ -51,7 +51,7 @@ import torch
 import uvloop
 import zmq
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
     resolving_view,
@@ -62,6 +62,11 @@ from sglang.srt.entrypoints.engine_info_bootstrap_server import (
 )
 from sglang.srt.entrypoints.engine_score_mixin import EngineScoreMixin
 from sglang.srt.entrypoints.EngineBase import EngineBase
+from sglang.srt.entrypoints.server_utils import (
+    launch_dummy_health_check_server,
+    set_prometheus_multiproc_dir,
+    start_follower_grpc_server,
+)
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
 from sglang.srt.environ import envs
 from sglang.srt.managers.data_parallel_controller import (
@@ -88,7 +93,6 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
-    ReturnHiddenStatesMode,
     RpcReqInput,
     RpcReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -102,13 +106,16 @@ from sglang.srt.managers.io_struct import (
 from sglang.srt.managers.multi_tokenizer_mixin import (
     MultiTokenizerRouter,
     get_main_process_id,
-    get_tokenizer_worker_class,
     read_from_shared_memory,
     run_multi_detokenizer_router_process,
     write_data_for_multi_tokenizer,
 )
+from sglang.srt.managers.req_types import ReturnHiddenStatesMode
 from sglang.srt.managers.scheduler import run_scheduler_process
-from sglang.srt.managers.tokenizer_manager import TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    TokenizerManager,
+    get_tokenizer_worker_class,
+)
 from sglang.srt.mem_cache.hicache_storage import merge_scheduler_info_layouts
 from sglang.srt.observability import metrics_collector
 from sglang.srt.observability.metrics_collector import (
@@ -116,6 +123,7 @@ from sglang.srt.observability.metrics_collector import (
     resolve_collector_class,
     tokenizer_metric_labels,
 )
+from sglang.srt.observability.request_dump import CrashDumpGrace
 from sglang.srt.observability.startup_time import build_engine_startup_time
 from sglang.srt.observability.trace import process_tracing_init, trace_set_thread_info
 from sglang.srt.parser.template_detection import resolve_auto_parsers
@@ -135,7 +143,7 @@ from sglang.srt.runtime_context import (
     snapshot_context,
 )
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.server_args import PortArgs, ServerArgs
+from sglang.srt.server_args import PortArgs, ServerArgs, redact_server_args_secrets
 from sglang.srt.utils import (
     MultiprocessingSerializer,
     SerializedTensorPayload,
@@ -145,13 +153,10 @@ from sglang.srt.utils import (
     is_cuda,
     is_mnnvl_fabric_device,
     kill_process_tree,
-    launch_dummy_health_check_server,
     maybe_reindex_device_id,
     normalize_serialized_named_tensor_payloads,
     numa_utils,
-    set_prometheus_multiproc_dir,
     set_ulimit,
-    start_follower_grpc_server,
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.network import (
@@ -177,7 +182,7 @@ _is_cuda = is_cuda()
 
 
 def _server_args_for_logging(server_args: ServerArgs) -> Dict[str, Any]:
-    return redact_watermark_secrets(server_args.resolved_dict())
+    return redact_server_args_secrets(server_args.resolved_dict())
 
 
 @dataclasses.dataclass
@@ -281,7 +286,7 @@ class Engine(EngineScoreMixin, EngineBase):
     # Backend-specific launch handle: the Ray engine schedules its actors onto a
     # placement group. Not config — a live cluster object.
     _placement_group = None
-    # Set by attach_tokenizer_worker(): this instance only owns a TokenizerWorker,
+    # Set by attach_tokenizer_worker(): this instance only owns a tokenizer worker,
     # the engine subprocesses belong to the parent Engine.
     _attached = False
     tokenizer_router: Optional[MultiTokenizerRouter] = None
@@ -315,7 +320,7 @@ class Engine(EngineScoreMixin, EngineBase):
                 "_launch_command",
                 "Engine("
                 + ", ".join(
-                    f"{k}={v!r}" for k, v in redact_watermark_secrets(kwargs).items()
+                    f"{k}={v!r}" for k, v in redact_server_args_secrets(kwargs).items()
                 )
                 + ")",
             )
@@ -364,7 +369,7 @@ class Engine(EngineScoreMixin, EngineBase):
         self.port_args = port_args
 
         if isinstance(tokenizer_manager, MultiTokenizerRouter):
-            # --tokenizer-worker-num > 1: the router only bridges TokenizerWorkers to
+            # --tokenizer-worker-num > 1: the router only bridges tokenizer workers to
             # the scheduler and has no generate_request. Publish the launch data the
             # workers need (same shared-memory contract as `sglang serve`) and give
             # this process its own worker so Engine.generate() keeps working here;
@@ -572,12 +577,9 @@ class Engine(EngineScoreMixin, EngineBase):
         image_data: Optional[MultimodalDataInputFormat] = None,
         audio_data: Optional[MultimodalDataInputFormat] = None,
         video_data: Optional[MultimodalDataInputFormat] = None,
-        # Optional per-image hashes the caller has already computed (hex strings,
-        # one per image in `image_data`). When supplied, each MultimodalDataItem's
-        # `hash` is initialised from this list and `set_pad_value` skips the
-        # internal `hash_feature()` recompute. Intended for external KV routers
-        # that compute their own per-image hash for routing decisions and need
-        # sglang's prefix-cache key to align. See GenerateReqInput.mm_hashes.
+        # Optional per-image routing hints (hex strings). These never replace
+        # the server-computed full content/configuration identity and cannot
+        # force cache sharing. See GenerateReqInput.mm_hashes.
         mm_hashes: Optional[Union[List[str], List[List[str]]]] = None,
         mm_content_hashes: Optional[
             Union[List[Optional[str]], List[List[Optional[str]]]]
@@ -1062,6 +1064,39 @@ class Engine(EngineScoreMixin, EngineBase):
             scheduler_procs,
         )
 
+    @staticmethod
+    def _wait_for_rust_crash_dumps_on_sigquit(
+        server_args: ServerArgs,
+        scheduler_init_result: SchedulerInitResult,
+        subprocess_watchdog: SubprocessWatchdog,
+    ) -> None:
+        """With ``--crash-dump-folder`` set, give the schedulers that embed the
+        Rust server time to write their crash dumps before a child's
+        ``SIGQUIT`` kills the process tree (see ``CrashDumpGrace``), which
+        the launch-phase handler then does as before."""
+        folder = get_observability().crash_dump_folder
+        if (
+            not folder
+            or resolving_view(server_args).custom_sigquit_handler is not None
+            or threading.current_thread() is not threading.main_thread()
+        ):
+            return
+        previous = signal.getsignal(signal.SIGQUIT)
+        if not callable(previous):
+            previous = lambda signum, frame: kill_process_tree(os.getpid())  # noqa: E731
+        grace = CrashDumpGrace(
+            folder,
+            # Absent in DP-controller layouts, which then are not waited for.
+            writer_pids=[
+                info["rust_server_pid"]
+                for info in scheduler_init_result.scheduler_infos
+                if "rust_server_pid" in info
+            ],
+            previous=previous,
+            before_wait=subprocess_watchdog.stop,
+        )
+        signal.signal(signal.SIGQUIT, grace.handle_sigquit)
+
     @classmethod
     def _launch_detokenizer_subprocesses(
         cls,
@@ -1351,6 +1386,9 @@ class Engine(EngineScoreMixin, EngineBase):
                 processes=processes, process_names=names
             )
             subprocess_watchdog.start()
+            cls._wait_for_rust_crash_dumps_on_sigquit(
+                server_args, scheduler_init_result, subprocess_watchdog
+            )
 
             return (
                 None,
@@ -1423,7 +1461,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def _init_tokenizer_worker(
         server_args: ServerArgs, port_args: PortArgs, scheduler_info: Dict[str, Any]
     ) -> Tuple[TokenizerManager, TemplateManager]:
-        # TokenizerWorker.__init__ registers with the router over a zmq.asyncio
+        # TokenizerManager.__init__ registers with the router over a zmq.asyncio
         # socket, which needs the loop the Engine will later run to be current.
         Engine._ensure_event_loop()
         port_args = copy.copy(port_args)
@@ -1458,7 +1496,7 @@ class Engine(EngineScoreMixin, EngineBase):
         process on the same host.
 
         The returned Engine has no subprocesses of its own: it holds a
-        ``TokenizerWorker`` registered with the parent's ``MultiTokenizerRouter``, so
+        tokenizer worker registered with the parent's ``MultiTokenizerRouter``, so
         ``generate``/``async_generate`` run on this process while prefill and decode
         stay on the parent's schedulers. Use it to spread the per-request Python
         work of one engine over several processes (what ``sglang serve`` does with
@@ -1613,7 +1651,9 @@ class Engine(EngineScoreMixin, EngineBase):
         return msgspec_to_builtins(
             redact_watermark_secrets(
                 {
-                    **self.tokenizer_manager.server_args.resolved_dict(),
+                    **redact_server_args_secrets(
+                        self.tokenizer_manager.server_args.resolved_dict()
+                    ),
                     "launch_command": self.tokenizer_manager.server_args.launch_command,
                     **self._scheduler_init_result.scheduler_infos[0],
                     "startup_time": self.tokenizer_manager.startup_time,
@@ -1993,7 +2033,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         ):
             assert_pkg_version(
                 "flashinfer_python",
-                "0.7.2",
+                "0.7.3",
                 "Please uninstall the old version and "
                 "reinstall the latest version by following the instructions "
                 "at https://docs.flashinfer.ai/installation.html.",
@@ -2141,8 +2181,11 @@ def _block_until_follower_schedulers_exit(
     backstop. Rust listeners on this node (one per attention DP group whose
     first rank is here) still drain as node 0's do: SIGTERM is relayed to them
     (``RustServerSigtermDrain``), so their health answers 503 and their
-    in-flight requests finish before they close; their schedulers then exit on
-    rank 0's ShutdownReq. Without a local listener, the caller has already
+    in-flight requests finish before they close; rank 0's drain waits for them
+    (the MLP-sync gather carries every DP listener's drain state, and a drain
+    on any listener begins on all of them), and their schedulers then exit on
+    rank 0's ShutdownReq. Without a SIGTERM here, the first scheduler exiting
+    0 bounds the others. Without a local listener, the caller has already
     routed SIGTERM to ``Engine._handle_follower_sigterm``.
     """
     on_main_thread = threading.current_thread() is threading.main_thread()
@@ -2191,13 +2234,6 @@ def _rust_server_startup_time_sink() -> Callable[[Dict[str, Any]], None]:
 
 def node_hosts_rust_server() -> bool:
     """Whether this node contains a Rust listener rank, assuming Rust mode."""
-    parallel = get_parallel()
-    pp_rank_range, tp_rank_range, _, _ = _calculate_rank_ranges(parallel.node_rank)
-    if 0 not in pp_rank_range:
-        return False
+    from sglang.srt.rust_server.server import node_listener_ports
 
-    if get_exec().moe.is_ep_scale_joiner:
-        # Scale joiners launch the full local TP group, including its first rank.
-        return True
-
-    return any(_rank_hosts_rust_listener(0, tp_rank) for tp_rank in tp_rank_range)
+    return bool(node_listener_ports())

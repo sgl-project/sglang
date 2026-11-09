@@ -866,7 +866,9 @@ class DocReuse:
         )
 
     def on_req_dropped(self, req: Req) -> None:
-        """Release reuse state for a request dropped before it ever ran a batch."""
+        """Release reuse state of a dropped or aborted request, before its row is
+        freed. For one that ran a batch, `_free_pending` finds its slots in that
+        row, and the source and pins go as on the finished-window path."""
         # Its queued copies write slots freed below and read the source window.
         self._cancel(req.rid)
         self._free_pending(req)
@@ -1073,7 +1075,7 @@ class DocReuse:
         return retained
 
     def _retain_finished(self, req) -> bool:
-        from sglang.srt.managers.schedule_batch import (
+        from sglang.srt.managers.req_types import (
             FINISH_MATCHED_STR,
             FINISH_MATCHED_TOKEN,
         )

@@ -48,6 +48,7 @@ class RoutedKVCache(KVCache):
         head_num: int,
         head_dim: int,
         bs1_floor_terms: Sequence[Tuple[str, int]] = (),
+        roles: Optional[Dict[str, str]] = None,
     ):
         # KVCache.__init__ allocates buffers; these views alias the arena,
         # which owns the memory.
@@ -56,6 +57,7 @@ class RoutedKVCache(KVCache):
         # capture; a draft over the target's arena leaves it to the target.
         self._bs1_floor_terms = tuple(bs1_floor_terms)
         self._owner = owner
+        self._roles = dict(roles or {})
         self._layer_maps = tuple(layer_maps)
         views = {name: view for name, view, _ in self._layer_maps}
         self._owner_view = views.get(owner, self._layer_maps[0][1])
@@ -69,7 +71,9 @@ class RoutedKVCache(KVCache):
         self.device = arena.device
         self.dtype = self._owner_view.dtype
         self.store_dtype = self._owner_view.store_dtype
-        for name, view in views.items():
+        for name, view, indices in self._layer_maps:
+            if not indices:
+                continue
             assert (view.dtype, view.store_dtype) == (self.dtype, self.store_dtype), (
                 f"sub-pool {name!r} stores {view.store_dtype} for {view.dtype}; the "
                 f"owner stores {self.store_dtype} for {self.dtype}"
@@ -80,7 +84,12 @@ class RoutedKVCache(KVCache):
         self.mem_usage = 0.0  # the arena logs the real size
 
     def _build_layer_router(self) -> KVLayerRouter:
-        return KVLayerRouter.from_layer_maps(self, self._layer_maps, owner=self._owner)
+        return KVLayerRouter.from_layer_maps(
+            self,
+            self._layer_maps,
+            owner=self._owner,
+            roles=self._roles,
+        )
 
     def id_spaces(self):
         raise NotImplementedError(
@@ -89,6 +98,10 @@ class RoutedKVCache(KVCache):
         )
 
     # -- the arena --
+
+    @property
+    def backing_owner(self):
+        return self._arena
 
     @property
     def post_capture_active(self) -> bool:
@@ -179,6 +192,13 @@ class RoutedKVCache(KVCache):
     ):
         self.layer_router.layer(layer.layer_id).store_mla(
             layer, loc_info, cache_k_nope, cache_k_rope
+        )
+
+    def set_mla_kv_buffer_prefix_valid(
+        self, layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
+    ):
+        self.layer_router.layer(layer.layer_id).store_mla_prefix(
+            layer, loc_info, commit_lens, cache_k_nope, cache_k_rope
         )
 
     def get_mla_kv_buffer(

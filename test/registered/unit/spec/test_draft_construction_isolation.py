@@ -11,7 +11,7 @@ from sglang.srt.layers.moe.utils import (
     get_num_fused_shared_experts,
     resolve_shared_experts_config,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci

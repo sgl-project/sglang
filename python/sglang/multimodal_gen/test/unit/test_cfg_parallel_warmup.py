@@ -21,7 +21,6 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     Flux3ImageSamplingParams,
 )
@@ -45,6 +44,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     normalize_quality,
 )
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     SetLoraReq,
     UnmergeLoraWeightsReq,

@@ -52,6 +52,9 @@ class HiCacheStorageConfig:
     # order. The key grid is layer-major, whereas page bytes are head-major.
     unified_chunk_spans: Optional[List[tuple[int, int]]] = None
 
+    # Whole-page replication can differ from the target's attention layout.
+    rank_replicated: Optional[bool] = None
+
     def __post_init__(self):
         if self.dcp_size < 1 or not 0 <= self.dcp_rank < self.dcp_size:
             raise ValueError("Invalid DCP size or rank for HiCache storage.")
@@ -73,6 +76,12 @@ class HiCacheStorageConfig:
             raise ValueError("DCP storage requires a DCP-aligned logical page size.")
 
     @property
+    def is_rank_replicated(self) -> bool:
+        return (
+            self.is_mla_model if self.rank_replicated is None else self.rank_replicated
+        )
+
+    @property
     def is_storage_writer(self) -> bool:
         """Select one writer for each shared storage object.
 
@@ -83,7 +92,7 @@ class HiCacheStorageConfig:
         """
         if self.unified_suffixes is not None and self.attn_cp_rank != 0:
             return False
-        return not self.is_mla_model or self.tp_rank == self.dcp_rank
+        return not self.is_rank_replicated or self.tp_rank == self.dcp_rank
 
 
 @dataclass
@@ -123,6 +132,9 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+    # Full-context MLA layers: latent KV and DSA index keys.
+    ERNIE5_5_MLA = "ernie55_mla"
+    ERNIE5_5_MLA_INDEXER = "ernie55_mla_indexer"
 
     # Draft KV pool
     DRAFT = "draft"
@@ -236,6 +248,14 @@ class PoolTransferResult:
         start, so count the leading run of successes
         """
         self.extra_pool_hit_pages.update(results)
+
+
+def l3_page_span(host_pool: Any) -> int:
+    """Logical slots one L3 key covers for this host pool. Under DCP a key is a
+    widened (logical) page backed by one physical page on each rank; pools
+    without DCP (or with a page of 1, like KDA state) are unchanged."""
+    page_size = getattr(host_pool, "page_size", 1) or 1
+    return page_size * (getattr(host_pool, "dcp_size", 1) or 1)
 
 
 def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
@@ -835,7 +855,7 @@ class HiCacheFile(HiCacheStorage):
         )
         self.config_suffix = (
             f"_{model_name}{shard_suffix}"
-            if storage_config.is_mla_model
+            if storage_config.is_rank_replicated
             else self.tp_config_suffix
         )
         # TODO: Include KV dtype and stored layout in keys for both DCP and
@@ -904,7 +924,7 @@ class HiCacheFile(HiCacheStorage):
             # Each rank owns its TP-sharded state; selected DCP writers
             # also own their shared MLA shard files.
             owned_suffixes = (self.tp_config_suffix,)
-            if storage_config.is_mla_model and storage_config.is_storage_writer:
+            if storage_config.is_rank_replicated and storage_config.is_storage_writer:
                 owned_suffixes += (self.config_suffix,)
         self._evictor = LRUFileEvictor(
             self.file_path,
@@ -1256,7 +1276,7 @@ class HiCacheFile(HiCacheStorage):
         for transfer in transfers:
             host_pool = self.registered_pools[transfer.name]
             keys = transfer.keys or []
-            page_size = getattr(host_pool, "page_size", 1) or 1
+            page_size = l3_page_span(host_pool)
             expected = len(keys) * page_size
             host_indices = transfer.host_indices
 
