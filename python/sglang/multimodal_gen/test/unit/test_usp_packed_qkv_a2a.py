@@ -81,6 +81,33 @@ class TestA2AStagingBuffer(CustomTestCase):
         self.assertEqual(large.untyped_storage().data_ptr(), small.data_ptr())
         self.assertEqual(small.shape, (2, 7))
 
+    def test_input_exchange_result_survives_next_exchange(self):
+        """K/V exchanged one after the other with one head per rank (GQA at the
+        full Ulysses degree): V's exchange must not overwrite the K result.
+        """
+        world, s_local, d = 8, 16, 64
+
+        def staging_a2a(x, role=None):
+            # The NCCL path receives into the role's staging buffer.
+            out = usp_mod._a2a_staging_buffer(role, x.shape, x.dtype, x.device)
+            return out.copy_(x)
+
+        for head_dim in (1, 2):
+            shape = (1, world, s_local, d) if head_dim == 1 else (1, s_local, world, d)
+            k, v = (
+                torch.randn(shape, dtype=torch.bfloat16, device=self.device)
+                for _ in range(2)
+            )
+            with (
+                torch.no_grad(),
+                patch(f"{_USP}._usp_all_to_all_single", staging_a2a),
+                patch(f"{_USP}.get_ulysses_parallel_world_size", return_value=world),
+            ):
+                k_out = usp_mod._usp_input_all_to_all(k, head_dim=head_dim)
+                k_before = k_out.clone()
+                usp_mod._usp_input_all_to_all(v, head_dim=head_dim)
+            self.assertTrue(torch.equal(k_out, k_before), f"head_dim={head_dim}")
+
     def test_role_and_dtype_are_separate_cache_keys(self):
         device = self.device
 

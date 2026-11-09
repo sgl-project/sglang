@@ -155,7 +155,7 @@ jobs:
           rm -f python/pyproject.toml
           mv python/pyproject_npu.toml python/pyproject.toml
           # Versions mirror npu_ci_install_dependency.sh's defaults; keep them in sync.
-          # triton: sglang.srt.utils.common imports it unconditionally and the CPU
+          # triton: sglang.srt.utils.triton_utils imports it unconditionally and the CPU
           # wheel does not pull it in (the NPU image uses triton-ascend instead).
           # unsafe-best-match: --index-url is the lowest-priority index, so the
           # default strategy would resolve PyPI's CUDA torch, not the +cpu build.
@@ -681,7 +681,6 @@ jobs:
 
   # ==================== Recommend Tests from Coverage ==================== #
   # Recommends PR-affected test cases from the pre-built coverage baseline.
-  # continue-on-error so it never blocks the PR gate.
   recommend-tests-from-coverage:
     name: Recommend tests from coverage
     needs: [check-changes, pr-gate]
@@ -719,11 +718,6 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
-      # Every step carries step-level continue-on-error so the job conclusion
-      # is ALWAYS 'success' — the fast-fail health check in other jobs filters
-      # by job conclusion, and job-level continue-on-error still reports
-      # 'failure' via the API. Failed steps stay visible (red ✗ + annotation)
-      # but never cascade to test jobs.
       - name: Checkout sglang scripts
         continue-on-error: true
         uses: actions/checkout@v4
@@ -773,23 +767,30 @@ jobs:
 
       - name: Recommend tests for current PR
         continue-on-error: true
+        uses: lb-actions/precision-test@v1.0.9
+        with:
+          repo: sglang
+          github-pr: ${{ github.repository }}#${{ github.event.pull_request.number }}
+          source-dir: ${{ github.workspace }}/outputs/covstub
+          map-file: ${{ github.workspace }}/test_case_map.json
+
+      - name: Export changed-file list for bucketing
+        continue-on-error: true
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
-          if ! python3 -c "import regex" >/dev/null 2>&1; then
-            echo "regex not found for $(python3 -V); bootstrapping pip and installing regex"
-            curl -fsSL https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-            python3 get-pip.py --break-system-packages
-            python3 -m pip install --break-system-packages regex
+          if test -f recommended_pytest_paths.txt; then
+            # Paginated files API instead of `gh pr diff --name-only`: the
+            # diff endpoint may truncate large PRs, which would silently
+            # drop a changed pipeline-config path from the full-run gate.
+            gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+              --paginate --jq '.[].filename' > "$PWD/pr_changed_files.txt"
+            test -s "$PWD/pr_changed_files.txt"
+            echo "Changed files: $(wc -l < "$PWD/pr_changed_files.txt")"
+          else
+            echo "::warning::Precision selector produced no recommendation; dropping the changed-file list so all suites run in full."
+            rm -f pr_changed_files.txt
           fi
-          python3 -c "import regex; print('regex ok:', regex.__file__)"
-          PR_SPEC="${{ github.repository }}#${{ github.event.pull_request.number }}"
-          echo "Selecting tests for PR: ${PR_SPEC}"
-          # test_selector.py resolves relative paths against the script's own dir,
-          # so pass absolute paths for files downloaded to the workspace root.
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --github-pr "${PR_SPEC}" \
-            --source-dir "$PWD/outputs/covstub" \
-            --map-file "$PWD/test_case_map.json"
 
       # Bucket the recommended tests per suite. Downstream jobs consume two
       # outputs per suite: should_run_<suite> ('false' -> skip the job, e.g.
@@ -807,8 +808,8 @@ jobs:
         run: |
           set -euo pipefail
           python3 scripts/ci/npu/precise-test/bucket_recommended_tests.py \
-            --recommended scripts/ci/npu/precise-test/recommended_pytest_paths.txt \
-            --changed-files scripts/ci/npu/precise-test/pr_changed_files.txt \
+            --recommended recommended_pytest_paths.txt \
+            --changed-files pr_changed_files.txt \
             --suites "base-b-test-1-npu-a3,base-b-test-2-npu-a3,base-b-test-4-npu-a3,base-b-test-8-npu-a3,base-b-test-16-npu-a3,base-c-test-acc-2-npu-a3,base-c-test-acc-16-npu-a3,base-c-test-perf-2-npu-a3,base-c-test-perf-16-npu-a3" \
             --diffusion-suites "multimodal-gen-test-1-npu-a3:1-npu,multimodal-gen-test-4-npu-a3:2-npu" \
             --case-map "$PWD/test_case_map.json" \
@@ -829,7 +830,7 @@ jobs:
           retention-days: 7
 
   # ==================== Coverage Assembly & Publish ==================== #
-  # Assembles coverage data and publishes the baseline to the shared disk.
+  # Assembles coverage data and publishes the baseline to OBS.
   # !failure() && !cancelled() (not success()): skipped upstream poisons success().
   setup-covstub:
     needs:
@@ -919,7 +920,8 @@ jobs:
           # coverage html from failing on a missing recorded source file.
           echo '__version__ = "0.0.0"' > "${COVSTUB}/sglang/_version.py"
 
-      - name: Build test case map
+      - name: Prepare build-map inputs
+        id: prepare-build-map
         shell: bash
         run: |
           set -euo pipefail
@@ -934,6 +936,8 @@ jobs:
           else
             COV_DATE_TAG="$(date +%Y%m%d)"
           fi
+          # Shared with later steps that derive the same paths.
+          echo "COV_DATE_TAG=${COV_DATE_TAG}" >> "$GITHUB_ENV"
           COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
           COVSTUB="${RUN_DIR}/outputs/covstub"
           # Standalone top-level deliverable, never packed inside outputs/.
@@ -942,34 +946,31 @@ jobs:
           echo "Coverage dir: ${COV_ROOT}"
           echo "Source dir: ${COVSTUB}"
 
-          # Coverage data may be absent when no test targets were enumerated
-          # (run_tests_with_coverage.sh never ran). Skip map building then.
           if [ ! -d "${COV_ROOT}" ]; then
-            echo "::warning::Coverage dir not found: ${COV_ROOT}, skip building test case map"
-            exit 0
+            echo "::error::Coverage dir not found: ${COV_ROOT}; cannot build the test case map"
+            exit 1
           fi
-
           COVERAGE_FILE_COUNT=$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)
           echo "Found ${COVERAGE_FILE_COUNT} coverage files"
           if [ "${COVERAGE_FILE_COUNT}" -eq 0 ]; then
-            echo "::warning::No coverage files found under ${COV_ROOT}, skip building test case map"
-            exit 0
+            echo "::error::No coverage files found under ${COV_ROOT}; cannot build the test case map"
+            exit 1
           fi
 
-          if ! python3 -c "import regex" 2>/dev/null; then
-            python3 -m pip install regex \
-              -i https://repo.huaweicloud.com/repository/pypi/simple \
-              --retries 3 --timeout 60 \
-              || python3 -m pip install regex -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-          fi
+          echo "cov-root=${COV_ROOT}"          >> "$GITHUB_OUTPUT"
+          echo "covstub=${COVSTUB}"            >> "$GITHUB_OUTPUT"
+          echo "map-file=${MAP_FILE}"           >> "$GITHUB_OUTPUT"
 
-          python3 scripts/ci/npu/precise-test/test_selector.py \
-            --build-map \
-            --coverage-dir "${COV_ROOT}" \
-            --source-dir "${COVSTUB}" \
-            --map-file "${MAP_FILE}"
-          test -s "${MAP_FILE}"
-          du -h "${MAP_FILE}"
+      - name: Build test case map
+        uses: lb-actions/precision-test@v1.0.9
+        with:
+          repo: sglang
+          build-map: true
+          # Absolute paths: the action forwards them unchanged to the CLI,
+          # which otherwise resolves relative paths against its own package dir.
+          coverage-dir: ${{ steps.prepare-build-map.outputs.cov-root }}
+          source-dir:   ${{ steps.prepare-build-map.outputs.covstub }}
+          map-file:     ${{ steps.prepare-build-map.outputs.map-file }}
 
       - name: Generate HTML coverage report
         # Best-effort add-on: continue-on-error keeps the job green and later
@@ -980,24 +981,14 @@ jobs:
           set -euo pipefail
 
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          # Date tag derivation must match run_tests_with_coverage.sh.
-          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
-            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
-            COV_DATE_TAG="${COV_DATE_TAG//-/}"
-          else
-            COV_DATE_TAG="$(date +%Y%m%d)"
-          fi
+          # COV_DATE_TAG comes from the "Prepare build-map inputs" step.
           COV_ROOT="${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}"
           COVSTUB="${RUN_DIR}/outputs/covstub"
-          # Standalone top-level dir, packaged into htmlcov.tar.gz at publish.
+          # Standalone top-level dir, uploaded as the coverage-html-report artifact.
           REPORT_DIR="${RUN_DIR}/htmlcov"
 
-          # Same skip conditions as map building: no data -> nothing to report.
-          if [ ! -d "${COV_ROOT}" ] \
-            || [ "$(find "${COV_ROOT}" -name 'coverage.*' -type f | wc -l)" -eq 0 ]; then
-            echo "::warning::No coverage data found, skip HTML report"
-            exit 0
-          fi
+          # Coverage data is guaranteed: "Prepare build-map inputs" fails the
+          # job when it is absent, so there is no skip path here.
 
           # Failures below exit non-zero (errexit) — red ✗, job stays green.
           # Do NOT convert failures to exit 0 behind an `if ! ( set -e; ... )`
@@ -1096,7 +1087,7 @@ jobs:
           echo "NPU-only HTML coverage report: ${REPORT_DIR}-npu"
 
       - name: Upload HTML coverage report
-        # Report upload must never block the baseline publish pipeline.
+        # Report upload must never block the baseline pipeline.
         continue-on-error: true
         uses: actions/upload-artifact@v4
         with:
@@ -1109,51 +1100,20 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Archive outputs
+      - name: Package baseline and coverage data
+        shell: bash
         run: |
+          set -euo pipefail
+
           RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
           # Source-only baseline: recommend mode needs covstub only, and it
           # shrinks the package from ~300MB to a few MB.
           tar -czf "${RUN_DIR}/outputs.tar.gz" -C "${RUN_DIR}" outputs/covstub
           # Raw coverage data for manual map rebuilds: extract both archives
-          # under one root to reconstruct outputs/. Absent when no data.
-          # Date tag derivation must match run_tests_with_coverage.sh.
-          if [ -n "${GITHUB_RUN_STARTED_AT:-}" ]; then
-            COV_DATE_TAG="${GITHUB_RUN_STARTED_AT:0:10}"
-            COV_DATE_TAG="${COV_DATE_TAG//-/}"
-          else
-            COV_DATE_TAG="$(date +%Y%m%d)"
-          fi
-          if [ -d "${RUN_DIR}/outputs/sglang@${COV_DATE_TAG}" ]; then
-            tar -czf "${RUN_DIR}/coverage-data.tar.gz" -C "${RUN_DIR}" "outputs/sglang@${COV_DATE_TAG}"
-          fi
-
-      - name: Upload outputs and test case map
-        # Never blocks the publish pipeline; must run before publish mv's
-        # the files to the fixed PUBLISH_DIR (races with concurrent runs).
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: precise-test-outputs
-          # Two paths -> artifact root becomes RUN_DIR, so the archive
-          # holds outputs.tar.gz and test_case_map.json side by side.
-          path: |
-            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/outputs.tar.gz
-            /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/test_case_map.json
-          if-no-files-found: ignore
-          retention-days: 14
-
-      - name: Upload raw coverage data
-        # Separate artifact keeps the ~300MB bulk out of the baseline package;
-        # must run before publish mv's the file to the fixed PUBLISH_DIR.
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: precise-test-coverage-data
-          path: /root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}/coverage-data.tar.gz
-          # Absent when all test jobs were skipped (no coverage data).
-          if-no-files-found: ignore
-          retention-days: 14
+          # under one root to reconstruct outputs/. Unguarded on purpose —
+          # "Prepare build-map inputs" guarantees the coverage dir exists.
+          # COV_DATE_TAG comes from the "Prepare build-map inputs" step.
+          tar -czf "${RUN_DIR}/coverage-data.tar.gz" -C "${RUN_DIR}" "outputs/sglang@${COV_DATE_TAG}"
 
       - name: Upload baseline to OBS
         shell: bash
@@ -1170,18 +1130,20 @@ jobs:
           # TEMP: debug prefix, revert to "coverage" once verified.
           OBS_PREFIX="${OBS_PREFIX:-coverage/pr}"
 
-          # Same skip rule as publish: no map -> incomplete baseline, never
-          # overwrite the good one in OBS.
-          if [ ! -s "${RUN_DIR}/test_case_map.json" ] || [ ! -s "${RUN_DIR}/outputs.tar.gz" ]; then
-            echo "::warning::test_case_map.json or outputs.tar.gz missing (no coverage data this run), skip OBS upload"
-            exit 0
-          fi
+          # All three files are the baseline product; a missing or empty file
+          # must fail the run rather than silently keep the previous baseline.
+          for f in outputs.tar.gz test_case_map.json coverage-data.tar.gz; do
+            if [ ! -s "${RUN_DIR}/${f}" ]; then
+              echo "::error::expected baseline file missing or empty: ${RUN_DIR}/${f}"
+              exit 1
+            fi
+          done
 
           # NPU-only coverage gate: only the threshold comparison lives here.
           # The percentage is computed once by the "Generate HTML coverage
           # report" step above (same container). Fail closed when the value is
           # missing, e.g. that step died before writing it.
-          MIN_NPU_COVERAGE=10
+          MIN_NPU_COVERAGE=40
           NPU_PCT_FILE="${RUN_DIR}/npu_coverage.txt"
           if [ ! -s "${NPU_PCT_FILE}" ]; then
             echo "::error::NPU-only coverage value missing (${NPU_PCT_FILE}); refusing to upload the baseline to OBS"
@@ -1190,13 +1152,13 @@ jobs:
           NPU_PCT="$(<"${NPU_PCT_FILE}")"
           echo "NPU-only coverage: ${NPU_PCT}% (threshold: ${MIN_NPU_COVERAGE}%)"
           if ! awk "BEGIN {exit !(${NPU_PCT} >= ${MIN_NPU_COVERAGE})}"; then
-            echo "::error::NPU-only coverage ${NPU_PCT}% is below ${MIN_NPU_COVERAGE}%, skip OBS upload"
+            echo "::error::NPU-only coverage ${NPU_PCT}% is below ${MIN_NPU_COVERAGE}%, refusing to upload the baseline to OBS"
             exit 1
           fi
 
           if [ -z "${OBS_ACCESS_KEY_ID:-}" ] || [ -z "${OBS_SECRET_ACCESS_KEY:-}" ]; then
-            echo "::warning::OBS_ACCESS_KEY_PRECISION/OBS_SECRET_ACCESS_KEY_PRECISION secrets not set, skip OBS upload"
-            exit 0
+            echo "::error::OBS_ACCESS_KEY_PRECISION/OBS_SECRET_ACCESS_KEY_PRECISION secrets not set; refusing to discard the baseline silently"
+            exit 1
           fi
 
           if ! command -v obsutil >/dev/null 2>&1; then
@@ -1223,14 +1185,18 @@ jobs:
           # recommend job fetches these over anonymous HTTPS. Pass ACL in the
           # upload request itself so an interruption cannot leave behind an
           # object that exists but is private.
-          for f in outputs.tar.gz test_case_map.json; do
+          # Raw coverage data for manual map rebuilds; guaranteed to exist now
+          # that "Prepare build-map inputs" fails without coverage data.
+          FILES=(outputs.tar.gz test_case_map.json coverage-data.tar.gz)
+
+          for f in "${FILES[@]}"; do
             obj="obs://${OBS_BUCKET}/${OBS_PREFIX}/${f}"
             obsutil cp "${RUN_DIR}/${f}" "${obj}" -f -acl=public-read
           done
 
           # Anonymous-read check: a stale private ACL here would only surface
           # as a confusing failure in the next run's download steps.
-          for f in outputs.tar.gz test_case_map.json; do
+          for f in "${FILES[@]}"; do
             code="$(curl -s -o /dev/null -w '%{http_code}' -I -L \
               "https://${OBS_BUCKET}.${OBS_ENDPOINT}/${OBS_PREFIX}/${f}")"
             echo "${f}: anonymous HEAD -> HTTP ${code}"
@@ -1241,78 +1207,32 @@ jobs:
           done
 
           echo "Uploaded baseline to obs://${OBS_BUCKET}/${OBS_PREFIX}/"
-          ls -lh "${RUN_DIR}/outputs.tar.gz" "${RUN_DIR}/test_case_map.json"
-
-      - name: Publish outputs and map to shared disk
-        # Runs even if the OBS upload above failed: the shared-disk baseline is
-        # the primary product, the OBS copy is only for the recommend job.
-        if: ${{ !cancelled() }}
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          RUN_DIR="/root/.cache/tests/precise-test/${{ github.run_id }}-attempt-${{ github.run_attempt }}"
-          # Fixed-name copy for manual use; the recommend job's baseline lives
-          # in OBS, refreshed by the "Upload baseline to OBS" step above.
-          # coverage-data.tar.gz has no automatic consumer — no OBS copy, only
-          # this dir and the precise-test-coverage-data artifact.
-          PUBLISH_DIR="/root/.cache/tests/precise-test/coverage"
-
-          # Skip publish when no coverage data this run — never overwrite
-          # the historical baseline with an incomplete one.
-          if [ ! -s "${RUN_DIR}/test_case_map.json" ]; then
-            echo "::warning::test_case_map.json missing (no coverage data this run), skip publish"
-            exit 0
-          fi
-
-          mkdir -p "${PUBLISH_DIR}"
-
-          # Same-filesystem mv is atomic per file, so readers never see a
-          # partial file (files from two concurrent publishes can interleave).
-          mv "${RUN_DIR}/outputs.tar.gz" "${PUBLISH_DIR}/outputs.tar.gz"
-          mv "${RUN_DIR}/test_case_map.json" "${PUBLISH_DIR}/test_case_map.json"
-          # Guarded: absent in the unlikely case this run collected no
-          # coverage data while still producing a map.
-          if [ -f "${RUN_DIR}/coverage-data.tar.gz" ]; then
-            mv "${RUN_DIR}/coverage-data.tar.gz" "${PUBLISH_DIR}/coverage-data.tar.gz"
-          fi
-
-          # HTML reports too, fixed names — latest wins, like the baseline.
-          # [ -d ] guards the continue-on-error generation step. A tar failure
-          # aborts red after the baseline mv completed; Cleanup stays skipped,
-          # keeping RUN_DIR for recovery.
-          if [ -d "${RUN_DIR}/htmlcov" ]; then
-            tar -czf "${PUBLISH_DIR}/htmlcov.tar.gz" -C "${RUN_DIR}" htmlcov
-          fi
-          if [ -d "${RUN_DIR}/htmlcov-npu" ]; then
-            tar -czf "${PUBLISH_DIR}/htmlcov-npu.tar.gz" -C "${RUN_DIR}" htmlcov-npu
-          fi
-
-          echo "Published baseline to ${PUBLISH_DIR}"
-          ls -lh "${PUBLISH_DIR}" | tail -n +2
+          for f in "${FILES[@]}"; do
+            ls -lh "${RUN_DIR}/${f}"
+          done
 
       - name: Clean up per-run directory
-        # success() by default: earlier failures keep the run dirs for debugging.
-        # Attempts never overlap and earlier ones are already merged, so drop
-        # all of this run's attempt dirs at once; stale ones from old runs go too.
+        # Only this run's own attempt dirs are removed — earlier attempts are
+        # already merged and published, while dirs belonging to other runs may
+        # still be live or kept for debugging, so they are left untouched.
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           CACHE_ROOT="/root/.cache/tests/precise-test"
           RUN_PREFIX="${CACHE_ROOT}/${{ github.run_id }}-attempt-"
-          # 8h > the 6h per-job execution limit, so a live run can never match.
-          STALE_MINUTES=480
-          rm -rf "${RUN_PREFIX}"*
-          echo "Removed ${RUN_PREFIX}*"
-          # -maxdepth 1 keeps the shared coverage/ dir out of reach.
-          find "${CACHE_ROOT}" -mindepth 1 -maxdepth 1 -type d \
-            -name '*-attempt-*' -mmin +"${STALE_MINUTES}" \
-            -print -exec rm -rf {} +
-          echo "Swept stale run dirs older than ${STALE_MINUTES}min"
+          RUN_DIRS=("${RUN_PREFIX}"*)
+          if [ ${#RUN_DIRS[@]} -gt 0 ]; then
+            rm -rf "${RUN_DIRS[@]}"
+            echo "Removed ${#RUN_DIRS[@]} dir(s) for run ${{ github.run_id }}"
+          else
+            echo "No per-run dirs to remove for run ${{ github.run_id }}"
+          fi
 
   pr-test-npu-finish:
     needs:
       [
+        pr-gate,
         check-changes,
 
         base-a-test-npu,

@@ -8,6 +8,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
@@ -719,7 +720,6 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        fused_argmax: bool = False,
         target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy(
@@ -727,7 +727,6 @@ class AcceptGreedy:
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=fused_argmax,
             target_predict=target_predict,
         )
 
@@ -739,7 +738,6 @@ class AcceptGreedy:
         target_logits: torch.Tensor,
         verify_num_draft_tokens: int,
         cutoff_verify_lens: Optional[torch.Tensor] = None,
-        fused_argmax: bool = False,
         target_predict: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return accept_greedy_triton(
@@ -747,7 +745,6 @@ class AcceptGreedy:
             target_logits=target_logits,
             verify_num_draft_tokens=verify_num_draft_tokens,
             cutoff_verify_lens=cutoff_verify_lens,
-            fused_argmax=fused_argmax,
             target_predict=target_predict,
         )
 
@@ -758,13 +755,12 @@ def accept_greedy(
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-    fused_argmax: bool = False,
     target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     # target_predict: the per-row argmax already resolved (e.g. across vocab shards).
     if target_predict is None:
-        target_predict = _row_argmax(target_logits, fused=fused_argmax)
+        target_predict = sampling_argmax(target_logits)
     target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
@@ -807,40 +803,17 @@ def gather_row_bonus_triton(*, table: torch.Tensor, idx: torch.Tensor) -> torch.
     return out
 
 
-def _row_argmax(logits: torch.Tensor, fused: bool = False) -> torch.Tensor:
-    # torch.argmax uses one block per row; at few rows x wide vocab that is ~7x
-    # off the memory the reduction touches. The fused kernel does not reproduce
-    # torch.argmax's NaN selection, hence the opt-in.
-    if (
-        fused
-        and logits.is_cuda
-        and logits.dim() == 2
-        and logits.dtype == torch.float32
-        and logits.stride(1) == 1
-        and (
-            logits.shape[0] <= 64
-            or (logits.shape[0] <= 384 and logits.shape[1] >= 65536)
-        )
-        and logits.shape[1] >= 4096
-    ):
-        from sglang.kernels.ops.speculative.row_argmax import row_argmax
-
-        return row_argmax(logits)
-    return torch.argmax(logits, dim=-1)
-
-
 def accept_greedy_triton(
     *,
     candidates: torch.Tensor,
     target_logits: torch.Tensor,
     verify_num_draft_tokens: int,
     cutoff_verify_lens: Optional[torch.Tensor] = None,
-    fused_argmax: bool = False,
     target_predict: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     bs = candidates.shape[0]
     if target_predict is None:
-        target_predict = _row_argmax(target_logits, fused=fused_argmax)
+        target_predict = sampling_argmax(target_logits)
     target_predict = target_predict.view(bs, verify_num_draft_tokens)
     correct_len, bonus = compute_dflash_correct_drafts_and_bonus(
         candidates=candidates,
@@ -1001,7 +974,8 @@ def cap_correct_len(
     verify_lens: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     ell_r = (verify_lens.to(device=correct_len.device) - 1).to(correct_len.dtype)
-    capped = torch.minimum(correct_len, ell_r)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = torch.clamp(torch.minimum(correct_len, ell_r), min=0)
     cap_trim_lens = correct_len - capped
     return capped, cap_trim_lens
 
@@ -1021,7 +995,8 @@ def _cap_correct_len_kernel(
     cl = tl.load(correct_len_ptr + offs, mask=mask, other=0).to(tl.int64)
     vl = tl.load(verify_lens_ptr + offs, mask=mask, other=0).to(tl.int64)
     ell = vl - 1
-    capped = tl.minimum(cl, ell)
+    # verify_lens==0 (padded) rows would yield -1, an out-of-bounds index downstream.
+    capped = tl.maximum(tl.minimum(cl, ell), 0)
     trim = cl - capped
     tl.store(capped_ptr + offs, capped, mask=mask)
     tl.store(trim_ptr + offs, trim, mask=mask)

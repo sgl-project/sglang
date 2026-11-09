@@ -7,7 +7,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=1, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=1, suite="base-a-test-npu")
 
 from sglang.srt.hardware_backend.npu import memory_pool_npu
 from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
@@ -200,7 +200,7 @@ class TestNPUScatterPaKVCache(unittest.TestCase):
 
         pool.set_kv_buffer(
             layer,
-            KVWriteLoc(loc, swa_loc),
+            KVWriteLoc(loc, window_locs={SWAKVPool.WINDOW_SUB_POOL: swa_loc}),
             cache_k,
             cache_v,
         )

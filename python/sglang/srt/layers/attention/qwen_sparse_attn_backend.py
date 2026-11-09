@@ -52,7 +52,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
@@ -89,7 +89,7 @@ def _resolve_flash_attn_varlen_func():
 
         return qwen38_qsa_sm121_varlen
     if is_hip():
-        # ROCm ships neither flash_attn (FA2) nor flash-attn-4; aiter provides an
+        # ROCm ships neither flash_attn (FA2) nor the FA4 CuTe kernels; aiter provides an
         # FA2-compatible varlen kernel (CK) with the same call signature. Fall
         # through to the flash_attn probes below if aiter is unavailable.
         try:
@@ -111,7 +111,9 @@ def _resolve_flash_attn_varlen_func():
     except ImportError:
         pass
     try:
-        from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
+        from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+            flash_attn_varlen_func as cute_varlen_func,
+        )
 
         def flash_attn_varlen_func(*args, **kwargs):
             output = cute_varlen_func(*args, **kwargs)
@@ -121,7 +123,7 @@ def _resolve_flash_attn_varlen_func():
         return flash_attn_varlen_func
     except ImportError as exc:
         raise ImportError(
-            "QSA decode requires flash_attn (FA2), flash-attn-4 (FA4 cute), "
+            "QSA decode requires flash_attn (FA2), the vendored FA4 CuTe kernels, "
             "or aiter (ROCm) for its packed varlen fallback."
         ) from exc
 

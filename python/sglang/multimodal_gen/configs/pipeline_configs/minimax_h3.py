@@ -14,13 +14,11 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_audio import (
 from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
     MiniMaxH3VideoVAEConfig,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -342,6 +340,28 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         return safetensors_list
 
 
+def vsa_h3_device_supported() -> bool:
+    """Whether this GPU runs the VSA-H3 kernels FastH3 was distilled with."""
+    if not current_platform.is_cuda():
+        return False
+    from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
+
+    capability = current_platform.get_device_capability()
+    return (
+        capability is not None
+        and (capability.major, capability.minor) in VSA_H3_CAPABILITIES
+    )
+
+
+def vsa_h3_execution_supported(
+    *, enable_torch_compile, enable_breakable_cuda_graph, ring_degree
+) -> bool:
+    """VSA-H3 does not serve torch.compile, the breakable CUDA graph or ring."""
+    return not (
+        enable_torch_compile or enable_breakable_cuda_graph or int(ring_degree or 1) > 1
+    )
+
+
 @dataclass
 class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
     """FastH3 8-Step V2: VSA-distilled MiniMax-H3, t2va only."""
@@ -376,20 +396,12 @@ class FastH3PipelineConfig(MiniMaxH3PipelineConfig):
         # trained compression gate and runs slower.
         if self.resolve_transformer_attention_backend(server_args) is not None:
             return
-        if not current_platform.is_cuda():
+        if not vsa_h3_device_supported():
             return
-        from sglang.multimodal_gen.runtime.platforms.cuda import VSA_H3_CAPABILITIES
-
-        capability = current_platform.get_device_capability()
-        if (
-            capability is None
-            or (capability.major, capability.minor) not in VSA_H3_CAPABILITIES
-        ):
-            return
-        if (
-            server_args.enable_torch_compile
-            or server_args.enable_breakable_cuda_graph
-            or int(server_args.ring_degree or 1) > 1
+        if not vsa_h3_execution_supported(
+            enable_torch_compile=server_args.enable_torch_compile,
+            enable_breakable_cuda_graph=server_args.enable_breakable_cuda_graph,
+            ring_degree=server_args.ring_degree,
         ):
             logger.info(
                 "FastH3 runs dense attention: VSA-H3 does not serve torch.compile, "
@@ -431,10 +443,31 @@ class FastH3OmniPipelineConfig(FastH3PipelineConfig):
         MiniMaxH3PipelineConfig.validate_server_args(self, server_args)
 
 
+@dataclass
+class PikaH3FlexPipelineConfig(MiniMaxH3PipelineConfig):
+    """Pika H3 Flex: base MiniMax-H3 with Pika's six-step LoRA adapters."""
+
+    def validate_server_args(self, server_args) -> None:
+        # A BF16 merge rounds away about a third of the adapters' update (by
+        # norm, under auto's 50% cutoff), so keep them unmerged like the
+        # reference unless a merge mode is chosen explicitly.
+        if not server_args.is_arg_explicitly_set("lora_merge_mode"):
+            server_args.lora_merge_mode = "dynamic"
+        super().validate_server_args(server_args)
+
+    def validate_quality_deployment(self, server_args) -> None:
+        raise ValueError(
+            'quality="high" is audited only for the base MiniMax-H3 50-step '
+            "4xH200 deployment; Pika H3 Flex has no audited high-quality "
+            'deployment. Use quality="exact", or the default "lossless".'
+        )
+
+
 __all__ = [
     "FastH3OmniPipelineConfig",
     "FastH3PipelineConfig",
     "MiniMaxH3PipelineConfig",
+    "PikaH3FlexPipelineConfig",
 ]
 
 
@@ -443,6 +476,7 @@ def register():
         FastH3OmniSamplingParams,
         FastH3SamplingParams,
         MiniMaxH3SamplingParams,
+        PikaH3FlexSamplingParams,
     )
     from sglang.multimodal_gen.registry import register_configs
 
@@ -482,6 +516,18 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "fasth3omni" in model_id.lower().replace("-", "").replace("_", "")
+            )
+        ],
+    )
+    register_configs(
+        sampling_param_cls=PikaH3FlexSamplingParams,
+        pipeline_config_cls=PikaH3FlexPipelineConfig,
+        hf_model_paths=[
+            "Pika-Labs/Pika-H3-Flex",
+        ],
+        model_detectors=[
+            lambda model_id: (
+                "pikah3flex" in model_id.lower().replace("-", "").replace("_", "")
             )
         ],
     )
