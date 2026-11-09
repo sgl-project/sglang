@@ -1378,6 +1378,7 @@ class TestSizing(CustomTestCase):
             hybrid_kda_config=None,
             extra_mamba_cache_bytes_per_req=0,
             attn_dp_size=1,
+            _mamba2_spec_replay_enabled=False,
         )
         exec_ = SimpleNamespace(
             mamba=SimpleNamespace(enable_linear_replayssm_spec=False)

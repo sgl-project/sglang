@@ -6,11 +6,37 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CUDA_ONLY, KernelBackend, KernelSpec
+from sglang.kernels.spec import (
+    CUDA_ONLY,
+    CapabilityRequirement,
+    KernelBackend,
+    KernelSpec,
+)
 
 if TYPE_CHECKING:
     import torch
 
+
+register_kernel(
+    KernelSpec(
+        op="mamba.verify_mamba2_replay",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.mamba2_spec_replay:verify_mamba2_replay",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="mamba.materialize_flashinfer_mamba2",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.mamba.flashinfer_replay_materialize:materialize_flashinfer_mamba2",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 0))}
+        ),
+    )
+)
 
 # JIT is the only backend: the AOT kernel it replaced was built for CUDA alone,
 # never by the ROCm / MUSA / Metal extensions. Non-CUDA resolves nothing here --
