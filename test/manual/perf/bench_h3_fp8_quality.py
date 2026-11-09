@@ -39,6 +39,7 @@ def main():
     parser.add_argument("--steps", type=int, default=5)
     parser.add_argument("--short-edge", type=int, default=768)
     parser.add_argument("--prompt-count", type=int, choices=(1, 2, 3), default=3)
+    parser.add_argument("--audio-atol", type=float, default=1e-7)
     parser.add_argument(
         "--vae-attention", choices=("torch_sdpa", "torch_cudnn_sdpa"), default=None
     )
@@ -57,6 +58,7 @@ def main():
         "steps": args.steps,
         "short_edge": args.short_edge,
         "vae_attention": args.vae_attention,
+        "audio_atol": args.audio_atol,
         "model_revision": revision,
         "requests": [],
     }
@@ -134,7 +136,7 @@ def main():
                         np.max(np.abs(audio - reference["audio"]))
                     )
                     row["frames_equal"] = np.array_equal(frames, expected)
-                    if row["audio_max_abs"] > 1e-7 or (
+                    if row["audio_max_abs"] > args.audio_atol or (
                         quality != "high" and not row["frames_equal"]
                     ):
                         np.savez(
@@ -144,7 +146,11 @@ def main():
                         )
                         print(json.dumps(row), flush=True)
                     np.testing.assert_allclose(
-                        audio, reference["audio"], rtol=0, atol=1e-7, equal_nan=False
+                        audio,
+                        reference["audio"],
+                        rtol=0,
+                        atol=args.audio_atol,
+                        equal_nan=False,
                     )
                     if quality != "high":
                         np.testing.assert_array_equal(frames, expected)

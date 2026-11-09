@@ -3,9 +3,9 @@
 Two real ``ViT3DDecoder`` blocks with FP8 linears run once through the eager
 block path and once through ``fused_decoder`` (rmsnorm_fp8 /
 residual_rmsnorm_fp8 / in-place fused Q/K norm+RoPE / silu_mul_quant_fp8 /
-residual_layernorm); the shared ``OnlineFP8Linear`` and the load-time installer
-on the released 36-block topology are checked separately. Weight-update
-rejection is covered by the CPU tests.
+residual_layernorm); the shared ``OnlineFP8Linear`` and request-scoped switching
+on the released 36-block topology are checked separately, including restoration
+after errors and cancellation. Weight-update admission is covered by CPU tests.
 """
 
 import sys
