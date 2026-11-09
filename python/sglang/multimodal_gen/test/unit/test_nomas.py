@@ -1194,6 +1194,7 @@ def checkpoint(tmp_path):
         args = SimpleNamespace(
             pipeline_config=pipeline,
             component_precisions={},
+            component_quantizations={},
             component_weights_paths={},
             model_paths={},
             should_direct_gpu_weight_load_component=lambda _: direct,
