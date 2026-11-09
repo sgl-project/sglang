@@ -97,7 +97,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             for enabled in (False, True):
                 with self.subTest(decode=enabled):
-                    processor.npu_image_decode = enabled
+                    processor.gpu_image_decode = enabled
                     device = processor._fast_image_processor_device(Glm4vProcessor())
                     self.assertEqual(device, "cpu")
 
@@ -128,7 +128,7 @@ class TestFastImageProcessorDevice(CustomTestCase):
                 for processor, expected in ((first, "npu:1"), (second, "npu:3")):
                     for enabled in (False, True):
                         with self.subTest(name=name, device=expected, decode=enabled):
-                            processor.npu_image_decode = enabled
+                            processor.gpu_image_decode = enabled
                             self.assertEqual(
                                 processor._fast_image_processor_device(hf_processor),
                                 expected,

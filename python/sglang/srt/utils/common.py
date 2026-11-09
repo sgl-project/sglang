@@ -2097,9 +2097,14 @@ def is_jpeg_with_cuda(
     return False
 
 
-def is_jpeg_with_npu(image_bytes: bytes = b"", npu_image_decode: bool = True) -> bool:
-    """Check whether NPU JPEG decoding is enabled and the input has JPEG markers."""
-    if not is_npu() or not npu_image_decode:
+def is_jpeg_with_npu(
+    image_bytes: bytes = b"", gpu_image_decode: GPUImageDecodeMode = True
+) -> bool:
+    """Check NPU JPEG eligibility under the shared image decoding policy."""
+    if not is_npu() or not gpu_image_decode:
+        return False
+    # Preserve PIL fidelity until NPU fancy upsampling is implemented.
+    if gpu_image_decode == "nvjpeg_fancy":
         return False
     if image_bytes != b"":
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
@@ -2119,8 +2124,6 @@ def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
     gpu_image_decode: GPUImageDecodeMode = True,
-    *,
-    npu_image_decode: bool = True,
 ) -> Union[torch.Tensor, Image.Image]:
     """
     Try device JPEG decoding and return a torch device tensor,
@@ -2150,7 +2153,7 @@ def _load_image(
                     "Failed to decode JPEG on GPU, falling back to CPU. Error: %s",
                     e,
                 )
-    elif is_jpeg_with_npu(image_bytes, npu_image_decode):
+    elif is_jpeg_with_npu(image_bytes, gpu_image_decode):
         from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
 
         encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
@@ -2177,8 +2180,6 @@ def _fully_load_pil_image(image: Image.Image) -> Image.Image:
 def load_image(
     image_file: Union[Image.Image, str, ImageData, bytes],
     gpu_image_decode: GPUImageDecodeMode = True,
-    *,
-    npu_image_decode: bool = True,
 ) -> tuple[Union[torch.Tensor, Image.Image], Optional[tuple[int, int]]]:
     """
     Load image from multiple input formats, including:
@@ -2196,19 +2197,16 @@ def load_image(
         image = _load_image(
             image_bytes=image_file,
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith(("http://", "https://")):
         image = _load_image(
             image_file=image_file,
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith("file://"):
         image = _load_image(
             image_file=unquote(urlparse(image_file).path),
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.lower().endswith(
         image_extension_names
@@ -2216,13 +2214,11 @@ def load_image(
         image = _load_image(
             image_file=image_file,
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     elif isinstance(image_file, str) and image_file.startswith("data:"):
         image = _load_image(
             image_file=image_file,
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     elif isinstance(
         image_file, str
@@ -2230,7 +2226,6 @@ def load_image(
         image = _load_image(
             image_file=image_file,
             gpu_image_decode=gpu_image_decode,
-            npu_image_decode=npu_image_decode,
         )
     else:
         raise ValueError(f"Invalid image: {image_file}")

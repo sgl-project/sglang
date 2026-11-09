@@ -106,13 +106,12 @@ class TestPILImageDecodePolicy(unittest.TestCase):
         self.assertIs(ordinary, self.decoded)
         self.assertIs(cached, self.decoded)
         self.assertEqual(self.decode.call_count, 2)
-        self.assertTrue(BaseMultimodalProcessor.npu_image_decode)
         self.assertTrue(BaseMultimodalProcessor.gpu_image_decode)
 
     def test_qwen_snapshot_honors_disabled_npu_policy(self):
         data = encoded_image()
         processor = object.__new__(QwenVLImageProcessor)
-        processor.npu_image_decode = False
+        processor.gpu_image_decode = False
         snapshot = MediaSnapshot(data, "test-content", len(data), "test")
         image = processor.decode_media_snapshot(snapshot, Modality.IMAGE)
         self.assertIsInstance(image, Image.Image)
