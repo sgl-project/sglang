@@ -19,6 +19,7 @@ def _make_pool():
     pool.cpu_offloading_chunk_size = 2
     pool.dcp_size = 1
     pool.is_draft_worker = False
+    pool.use_combined_kv_buffer = False
     pool.dsa_kv_cache_store_fp8 = False
     pool.index_head_dim = 2
     pool.indexer_layer_id_to_slot = {0: 0, 1: 1}
@@ -30,6 +31,17 @@ def _make_pool():
 
 
 class TestPDSplitKVPool(unittest.TestCase):
+    def test_native_combined_export_uses_upstream_layout(self):
+        pool = _make_pool()
+        pool.use_combined_kv_buffer = True
+        pool.kv_buffer = torch.zeros(2, 2, 128, 1, 576, dtype=torch.bfloat16)
+
+        ptrs, lengths, page_bytes = pool.get_contiguous_buf_infos()
+
+        self.assertEqual(ptrs, [buffer.data_ptr() for buffer in pool.kv_buffer])
+        self.assertEqual(lengths, [buffer.nbytes for buffer in pool.kv_buffer])
+        self.assertEqual(page_bytes, [147456, 147456])
+
     def test_export_matches_prefill_page_order(self):
         prefill, decode = _make_pool(), _make_pool()
         k, v = list(decode.k_buffer), list(decode.v_buffer)

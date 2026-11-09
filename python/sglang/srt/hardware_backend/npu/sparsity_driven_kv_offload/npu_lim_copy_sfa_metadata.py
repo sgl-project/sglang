@@ -15,23 +15,17 @@ def _lim_copy_sfa_metadata_kernel(
     valid_rows_ptr,
     sparse_rows_ptr,
     request_slots_ptr,
-    next_prefix_ptr,
-    last_prefix_ptr,
     actual_seq_lengths_kv_ptr,
     num_cache_tokens_ptr,
     hbm_block_table_ptr,
     dram_block_table_ptr,
     host_block_table_ptr,
     seq_lens_ptr,
-    B: tl.constexpr,
     K: tl.constexpr,
     Q: tl.constexpr,
     C: tl.constexpr,
-    H: tl.constexpr,
-    R: tl.constexpr,
     HBM_PAGES: tl.constexpr,
     DRAM_PAGES: tl.constexpr,
-    B_PAD: tl.constexpr,
     BLOCK: tl.constexpr,
     PAGED_HOST: tl.constexpr,
     HOST_COLS: tl.constexpr,
@@ -98,28 +92,6 @@ def _lim_copy_sfa_metadata_kernel(
             tl.where(is_valid, logical_length, 0).to(tl.int32),
         )
         tl.store(num_cache_tokens_ptr + row_id, cache_length)
-        tl.store(
-            last_prefix_ptr + request_slot.to(tl.int64),
-            tl.load(next_prefix_ptr + row_id).to(tl.int32),
-            mask=is_valid,
-        )
-
-    # Only one program writes the invalid-request sentinel. This avoids a
-    # cross-program race while preserving its sticky value when all rows valid.
-    if (row_id == 0) & (tile_id == 0):
-        valid_offsets = tl.arange(0, B_PAD).to(tl.int32)
-        valid_values = (
-            tl.load(
-                valid_rows_ptr + valid_offsets,
-                mask=valid_offsets < B,
-                other=1,
-            )
-            != 0
-        )
-        invalid_count = tl.sum(
-            ((valid_offsets < B) & ~valid_values).to(tl.int32), axis=0
-        )
-        tl.store(last_prefix_ptr + R, -1, mask=invalid_count > 0)
 
 
 def _validate_tensor(name: str, tensor: torch.Tensor, *, dtype, device) -> None:
@@ -141,8 +113,6 @@ def fused_lim_copy_sfa_metadata(
     valid_rows: torch.Tensor,
     sparse_rows: torch.Tensor,
     request_slots: torch.Tensor,
-    next_prefix: torch.Tensor,
-    last_prefix: torch.Tensor,
     actual_seq_lengths_kv: torch.Tensor,
     num_cache_tokens: torch.Tensor,
     hbm_block_table: torch.Tensor,
@@ -185,8 +155,6 @@ def fused_lim_copy_sfa_metadata(
         valid_rows,
         sparse_rows,
         request_slots,
-        next_prefix,
-        last_prefix,
         actual_seq_lengths_kv,
         num_cache_tokens,
         hbm_block_table,
@@ -208,14 +176,11 @@ def fused_lim_copy_sfa_metadata(
         valid_rows,
         sparse_rows,
         request_slots,
-        next_prefix,
         actual_seq_lengths_kv,
         num_cache_tokens,
     )
     if any(tensor.ndim != 1 or tensor.shape[0] != batch for tensor in row_tensors):
         raise ValueError("all per-row metadata tensors must have shape [B].")
-    if last_prefix.ndim != 1 or last_prefix.shape[0] != request_rows + 1:
-        raise ValueError("last_prefix must have shape [request_rows + 1].")
     if (
         seq_lens.shape != (batch,)
         or seq_lens.dtype != torch.int32
@@ -248,8 +213,6 @@ def fused_lim_copy_sfa_metadata(
         topk_misses,
         miss_counts,
         request_slots,
-        next_prefix,
-        last_prefix,
         actual_seq_lengths_kv,
         num_cache_tokens,
         hbm_block_table,
@@ -261,8 +224,6 @@ def fused_lim_copy_sfa_metadata(
             "topk_misses",
             "miss_counts",
             "request_slots",
-            "next_prefix",
-            "last_prefix",
             "actual_seq_lengths_kv",
             "num_cache_tokens",
             "hbm_block_table",
@@ -284,23 +245,17 @@ def fused_lim_copy_sfa_metadata(
         valid_rows,
         sparse_rows,
         request_slots,
-        next_prefix,
-        last_prefix,
         actual_seq_lengths_kv,
         num_cache_tokens,
         hbm_block_table,
         dram_block_table,
         host_block_table if host_block_table is not None else dram_block_table,
         seq_lens,
-        batch,
         2048,
         query_width,
         capacity,
-        host_context_len,
-        request_rows,
         hbm_pages,
         dram_pages,
-        triton.next_power_of_2(batch),
         2048,
         host_block_table is not None,
         host_block_table.shape[1] if host_block_table is not None else 0,

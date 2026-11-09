@@ -71,7 +71,7 @@ class LIMDecodeAdapter:
                         1, self.batch_capacity + 1, dtype=spec.dtype, device=device
                     )[None, :]
                 )
-            elif name in ("last_prefix", "_metadata_prefix_scratch"):
+            elif name == "last_prefix":
                 value = spec.allocate(device, fill_value=-1)
             else:
                 value = spec.allocate(device)
@@ -176,8 +176,6 @@ class LIMDecodeAdapter:
             valid_rows=plan.valid_rows,
             sparse_rows=plan.sparse_rows,
             request_slots=plan.request_safe_slots,
-            next_prefix=plan.prefix_lens,
-            last_prefix=self._metadata_prefix_scratch,
             actual_seq_lengths_kv=manager.planner_actual_seq_lengths_kv[:batch],
             num_cache_tokens=manager.planner_num_cache_tokens[:batch],
             hbm_block_table=manager.planner_hbm_block_table[:batch],

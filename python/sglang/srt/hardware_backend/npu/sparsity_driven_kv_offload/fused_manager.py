@@ -402,7 +402,6 @@ class SparseKVCacheManager:
         layer: RadixAttention,
         forward_batch: ForwardBatch,
         stream: torch.npu.Stream,
-        plan=None,
     ):
         """Publish KV to paged host storage and return decode rows for CopySFA."""
         layer_idx = layer.layer_id - self.start_layer

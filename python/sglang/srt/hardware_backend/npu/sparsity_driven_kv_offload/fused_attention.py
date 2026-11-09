@@ -49,9 +49,7 @@ def forward_sparsity_driven_kv_offload(
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
     stream = torch.npu.current_stream(backend.device)
-    current_inputs = manager.offload_v2(
-        k_nope, k_pe, layer, forward_batch, stream, plan=plan
-    )
+    current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch, stream)
     if not is_prefill:
         rows = forward_batch.batch_size * plan.query_width
         result = manager.copy_sfa_attention(

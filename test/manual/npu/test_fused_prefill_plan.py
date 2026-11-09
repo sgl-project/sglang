@@ -217,6 +217,7 @@ class TestWorkspaceLifecycle(unittest.TestCase):
         )
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             m = self.manager_type()
+            m.host_pool = None
             m.budget = SimpleNamespace(prefill_workspace_tokens=8)
             m._prefill_workspace_stream = None
             m.size, m.max_context_len, m.start_layer, m.layer_num = 4, 4, 0, 2

@@ -27,7 +27,6 @@ def test_fused_copy_sfa_metadata_width_and_graph(width, paged_host):
     sparse = torch.tensor([True, False, False], dtype=torch.bool, device=device)
     slots = torch.tensor([1, 2, request_rows], dtype=torch.int32, device=device)
     prefix = torch.tensor([16000, 2000, 0], dtype=torch.int32, device=device)
-    last = torch.full((request_rows + 1,), -1, dtype=torch.int32, device=device)
     kv = torch.empty(batch, dtype=torch.int32, device=device)
     cache = torch.empty_like(kv)
     hbm = torch.empty((batch, capacity // 128), dtype=torch.int32, device=device)
@@ -47,9 +46,7 @@ def test_fused_copy_sfa_metadata_width_and_graph(width, paged_host):
             valid_rows=valid,
             sparse_rows=sparse,
             request_slots=slots,
-            next_prefix=prefix,
             seq_lens=prefix,
-            last_prefix=last,
             actual_seq_lengths_kv=kv,
             num_cache_tokens=cache,
             hbm_block_table=hbm,

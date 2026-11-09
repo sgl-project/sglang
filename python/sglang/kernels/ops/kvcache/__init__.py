@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
+from sglang.kernels.spec import KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -82,14 +82,5 @@ register_kernel(
         target=(
             "sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache:store_fp4_index_k_cache"
         ),
-    )
-)
-
-register_kernel(
-    KernelSpec(
-        op="kvcache.restore_short_kv_history_inplace",
-        backend=KernelBackend.AOT,
-        target="sglang.kernels.ops.kvcache.npu_residency:restore_short_kv_history_inplace",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )
