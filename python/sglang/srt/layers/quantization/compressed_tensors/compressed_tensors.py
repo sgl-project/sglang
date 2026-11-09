@@ -169,6 +169,17 @@ class CompressedTensorsConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
+    def can_fuse_shared_expert(self) -> bool:
+        # A shared expert that the ignore list keeps unquantized cannot share the
+        # routed experts' quantized FusedMoE buffers: fused, its BF16 weights are
+        # loaded into a packed expert slot whose scales no tensor writes. The
+        # shared_expert_gate is a separate linear and does not block fusion.
+        for entry in self.ignore:
+            name = entry[3:] if entry.startswith("re:") else entry
+            if "shared_expert" in name and "shared_expert_gate" not in name:
+                return False
+        return True
+
     def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         self.target_scheme_map = hf_to_sglang_mapper.apply_dict(self.target_scheme_map)
         self.ignore = hf_to_sglang_mapper.apply_list(self.ignore)
