@@ -40,7 +40,7 @@ from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, layer_window_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
@@ -489,10 +489,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
     ) -> None:
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
-        if get_parallel().attn_dcp_size > 1:
-            # The draft pool is not DCP-sharded, but the target MLA layer
-            # would gather across DCP ranks.
-            raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
         sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
@@ -620,7 +616,13 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
                 self.attn_mqa,
-                KVWriteLoc(cache_loc, swa_loc=swa_cache_loc, physical=True),
+                KVWriteLoc(
+                    cache_loc,
+                    window_locs=layer_window_locs(
+                        pool, self.attn_mqa.layer_id, swa_cache_loc
+                    ),
+                    physical=True,
+                ),
                 k_nope,
                 k_pe,
             )
@@ -629,9 +631,13 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
                 self.attn_mqa,
                 KVWriteLoc(
                     cache_loc_2d,
-                    swa_loc=None
-                    if swa_cache_loc is None
-                    else swa_cache_loc.view_as(cache_loc_2d),
+                    window_locs=layer_window_locs(
+                        pool,
+                        self.attn_mqa.layer_id,
+                        None
+                        if swa_cache_loc is None
+                        else swa_cache_loc.view_as(cache_loc_2d),
+                    ),
                     physical=True,
                 ),
                 commit_lens,
@@ -1003,8 +1009,12 @@ class DFlashDraftModel(nn.Module):
                 if conv is not None:
                     conv.block_size = self.block_size
 
+    @staticmethod
+    def sliding_layer_window_size(config) -> Optional[int]:
+        return get_dflash_attention_sliding_window_size(config)
+
     def get_attention_sliding_window_size(self) -> Optional[int]:
-        return get_dflash_attention_sliding_window_size(self.config)
+        return self.sliding_layer_window_size(self.config)
 
     def get_input_embeddings(self) -> Optional[VocabParallelEmbedding]:
         return self.embed_tokens

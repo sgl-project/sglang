@@ -3,7 +3,7 @@
 
 ``TritonKDAKernel.extend`` tries :func:`extend` first on ROCm. It returns None for
 anything the kernel does not cover, and the caller keeps the Triton ``chunk_kda``
-path. On by default on gfx950; ``SGLANG_ROCM_KDA_HIP_PREFILL=0`` turns it off.
+path. Used on gfx950 only.
 
 The kernel is ``attention.kda_prefill_gfx950`` (``KernelBackend.KDA``), implemented
 in ``sglang.kernels.kda_kernels.kda_prefill_gfx950``.
@@ -18,14 +18,11 @@ import torch
 from sglang.kernels.arch import current_arch
 from sglang.kernels.selector import get_kernel
 from sglang.kernels.spec import KernelBackend
-from sglang.srt.environ import envs
 
 
 @lru_cache(maxsize=1)
 def available() -> bool:
     """gfx950 only: the kernel uses the 16x16x32 bf16 MFMA and up to 157 KiB of LDS."""
-    if envs.SGLANG_ROCM_KDA_HIP_PREFILL.get().lower() in ("0", "false"):
-        return False
     if not torch.version.hip or not torch.cuda.is_available():
         return False
     hip = current_arch().hip
