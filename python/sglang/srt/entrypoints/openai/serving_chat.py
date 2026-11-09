@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import time
 import uuid
 from collections import OrderedDict
@@ -104,6 +105,7 @@ from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.function_call.glm47_moe_detector import Glm47MoeDetector
 from sglang.srt.function_call.json_array_parser import JsonArrayParser
+from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.utils import (
     get_json_schema_constraint,
     normalize_json_schema_types,
@@ -152,6 +154,21 @@ logger = logging.getLogger(__name__)
 
 _MEDIA_CONTENT_PART_TYPES = frozenset({"image_url", "video_url", "audio_url"})
 _CHAT_TEMPLATE_CACHE_MAX_SIZE = 128
+
+
+class _ClosingStreamingResponse(StreamingResponse):
+    """Close the body iterator however streaming ends.
+
+    Starlette leaves the iterator suspended when a send fails, and on ASGI
+    spec >= 2.4 it also skips the background task, so nothing would abort the
+    request until the generator is garbage collected.
+    """
+
+    async def stream_response(self, send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self.body_iterator.aclose()
 
 
 def _incomplete_tool_call_indices(parser) -> set[int]:
@@ -264,6 +281,35 @@ def neutralize_kimi_k3_image_placeholder_value(value: Any) -> Any:
             for key, item in value.items()
         }
     return value
+
+
+_KIMI_K3_TOOL_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_-]{0,255}")
+
+
+def _validate_kimi_k3_message_tools(request: ChatCompletionRequest) -> str | None:
+    """Message-level tool rules of the Kimi-K3 encoding, which renders such
+    tools only from a system message without content."""
+    for index in request._message_tools_indices:
+        message = request.messages[index]
+        if message.role not in ("system", "developer"):
+            return (
+                f"messages[{index}]: only a system or developer message can "
+                f"declare tools, got role {message.role!r}."
+            )
+        if message.content:
+            return f"messages[{index}]: a message that declares tools must have no content."
+        for tool in message.tools:
+            # `type` defaults to "function", so a missing one must be caught here.
+            if tool.type != "function" or "type" not in tool.model_fields_set:
+                return f"messages[{index}]: tool 'type' must be 'function'."
+            name = tool.function.name
+            if not _KIMI_K3_TOOL_NAME_RE.fullmatch(name):
+                return (
+                    f"messages[{index}]: invalid tool name {name!r}: it must start "
+                    "with a letter or '_', contain only letters, digits, '_' or "
+                    "'-', and be at most 256 characters."
+                )
+    return None
 
 
 _M3_THINKING_TYPES = ("adaptive", "enabled", "disabled")
@@ -1146,6 +1192,10 @@ class OpenAIServingChat(OpenAIServingBase):
             m3_error = _validate_minimax_m3_request(request)
             if m3_error:
                 return m3_error
+        if self.chat_encoding_spec == "kimi_k3":
+            k3_error = _validate_kimi_k3_message_tools(request)
+            if k3_error:
+                return k3_error
         if request.return_flat_raw_output_top_logprobs and not request.return_meta_info:
             return "return_flat_raw_output_top_logprobs requires return_meta_info=true."
 
@@ -1886,6 +1936,9 @@ class OpenAIServingChat(OpenAIServingBase):
         tools = None
         tool_call_stop = None
         required_parsed_natively = glm_constraint
+        kimi_k3_tool_grammar = (
+            self.chat_encoding_spec == "kimi_k3" and self.tool_call_parser == "kimi_k3"
+        )
         if effective_tools and request.tool_choice != "none":
             request.skip_special_tokens = False
             if not isinstance(request.tool_choice, str):
@@ -1934,10 +1987,7 @@ class OpenAIServingChat(OpenAIServingBase):
             if (
                 tool_call_constraint is None
                 and not required_parsed_natively
-                and not (
-                    self.chat_encoding_spec == "kimi_k3"
-                    and self.tool_call_parser == "kimi_k3"
-                )
+                and not kimi_k3_tool_grammar
                 and (
                     request.tool_choice == "required"
                     or isinstance(request.tool_choice, ToolChoice)
@@ -1949,6 +1999,15 @@ class OpenAIServingChat(OpenAIServingBase):
                     parallel_tool_calls=request.parallel_tool_calls,
                 )
                 tool_call_constraint = ("json_schema", json_schema)
+        elif effective_tools and kimi_k3_tool_grammar:
+            tool_call_constraint = (
+                "structural_tag",
+                KimiK3Detector().get_structural_tag(
+                    effective_tools,
+                    tool_choice="none",
+                    thinking_mode=xgrammar_reasoning,
+                ),
+            )
 
         if tool_call_constraint is None and self._takes_turn_grammar(
             request, output_constrained=output_constrained
@@ -2465,11 +2524,14 @@ class OpenAIServingChat(OpenAIServingBase):
             return self.create_error_response(str(e))
 
         async def prepend_first_chunk():
-            yield first_chunk
-            async for chunk in generator:
-                yield chunk
+            try:
+                yield first_chunk
+                async for chunk in generator:
+                    yield chunk
+            finally:
+                await generator.aclose()
 
-        return StreamingResponse(
+        return _ClosingStreamingResponse(
             prepend_first_chunk(),
             media_type="text/event-stream",
             background=self.tokenizer_manager.create_abort_task(adapted_request),
@@ -2513,6 +2575,7 @@ class OpenAIServingChat(OpenAIServingBase):
 
         stream_started = False
         error_aborted = False
+        stream = self.tokenizer_manager.generate_request(adapted_request, raw_request)
         try:
             include_usage, continuous_usage_stats = should_include_usage(
                 request.stream_options,
@@ -2527,9 +2590,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 and raw_request.headers.get("x-sglext-ids-framed") == "1"
             )
 
-            async for content in self.tokenizer_manager.generate_request(
-                adapted_request, raw_request
-            ):
+            async for content in stream:
                 index = content.get("index", 0)
 
                 prompt_tokens[index] = self._reported_prompt_tokens(
@@ -2838,6 +2899,10 @@ class OpenAIServingChat(OpenAIServingBase):
                 raise
             error = self.create_streaming_error_response(str(e))
             yield f"data: {error}\n\n"
+        finally:
+            # Closing generate_request runs its cleanup, which aborts the
+            # request only while this request still owns its rid.
+            await stream.aclose()
 
         yield "data: [DONE]\n\n"
 
@@ -3399,6 +3464,8 @@ class OpenAIServingChat(OpenAIServingBase):
         if self.reasoning_parser == "apertus2509":
             request.skip_special_tokens = False
         if self.reasoning_parser == "kimi_k3" or self.chat_encoding_spec == "kimi_k3":
+            request.skip_special_tokens = False
+        if self.reasoning_parser == "xing4_0":
             request.skip_special_tokens = False
 
         if (

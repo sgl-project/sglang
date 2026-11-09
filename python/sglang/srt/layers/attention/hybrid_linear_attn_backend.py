@@ -34,7 +34,8 @@ from sglang.srt.layers.attention.mamba.replay_state_indices_validator import (
     validate_replay_state_indices_cpu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayer
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayer
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART, SHORT_CONV_PART
 from sglang.srt.model_executor.cuda_graph_config import (
@@ -51,6 +52,7 @@ from sglang.srt.speculative.spec_info import SpecInput
 from sglang.srt.utils import is_pin_memory_available
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.layers.attention.verify_mask import VerifyMask
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
@@ -1267,6 +1269,10 @@ class Mamba2AttnBackend(MambaAttnBackendBase):
 class HybridLinearAttnBackend(AttentionBackend):
     """Manages a full and linear attention backend"""
 
+    def window_capacity_children(self) -> list:
+        # Window layers attend through the full-attention child only.
+        return [self.full_attn_backend]
+
     def __init__(
         self,
         full_attn_backend: AttentionBackend,
@@ -1350,6 +1356,14 @@ class HybridLinearAttnBackend(AttentionBackend):
     def shared_read_ends(self, fm: ForwardMode) -> SharedReadEnds:
         return SharedReadEnds.max_of(
             b.shared_read_ends(fm) for b in self.attn_backend_list
+        )
+
+    def get_decode_graph_variants(
+        self, capture_forward_mode: ForwardMode, captured_req_width: int
+    ) -> Optional[AttentionGraphVariants]:
+        # Linear layers capture identically under every label.
+        return self.full_attn_backend.get_decode_graph_variants(
+            capture_forward_mode, captured_req_width
         )
 
     def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
@@ -1603,6 +1617,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         req_pool_indices: Optional[torch.Tensor] = None,
     ):
         """Commit accepted Mamba states; PP rows identify the delayed batch."""
+        # FIXME: on the PP stable-rows path this reads the request rows and
+        # translates state indices after the forward's declared shared-read
+        # end. A row or state slot reused on the schedule stream meanwhile is
+        # read with its new owner's values. Declare a later read end, or gather
+        # the indices during metadata preparation.
         request_number = last_correct_step_indices.shape[0]
         src_indices_raw = None
         if pp_spec_stable_rows_enabled() and req_pool_indices is not None:
