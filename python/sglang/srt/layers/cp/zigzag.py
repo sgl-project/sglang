@@ -30,10 +30,11 @@ After all-gather, the blocks are reranged back to their original order:
 
 from __future__ import annotations
 
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass
 from itertools import accumulate
-from typing import Any, List, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 import torch.nn.functional as F
@@ -52,8 +53,14 @@ from sglang.srt.layers.dp_attention import (
     is_allocation_symmetric,
 )
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
-from sglang.srt.model_executor.forward_context import get_kv_layers
-from sglang.srt.runtime_context import get_device, get_parallel
+from sglang.srt.model_executor.forward_context import (
+    get_attn_backend,
+    get_kv_layers,
+    has_forward_context,
+)
+from sglang.srt.runtime_context import attention_backends, get_device, get_parallel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -105,6 +112,7 @@ ContextParallelMetadata = ZigzagContextParallelMetadata
 class ZigzagCPStrategy(ContextParallelStrategy):
     name = "zigzag"
     kind = ContextParallelStrategyKind.ZIGZAG
+    _prefill_backend_supported: Optional[bool] = None
 
     def can_apply(self, num_tokens: int, forward_batch) -> bool:
         if self.cp_size <= 1 or num_tokens < self.cp_size * 2:
@@ -114,9 +122,52 @@ class ZigzagCPStrategy(ContextParallelStrategy):
             return False
 
         extend_lens = getattr(forward_batch, "extend_seq_lens_cpu", None)
-        if extend_lens is None:
+        if extend_lens is not None and not all(
+            int(length) >= self.cp_size * 2 for length in extend_lens
+        ):
+            return False
+        return self._prefill_backend_supports_cp()
+
+    def _prefill_backend_supports_cp(self) -> bool:
+        """Whether the prefill attention backend can run zigzag CP.
+
+        Only FlashInfer's limits are checked here. The answer is fixed for the
+        process, so it is cached once a forward context exposes the backend.
+        """
+        if self._prefill_backend_supported is not None:
+            return self._prefill_backend_supported
+        try:
+            prefill_backend, _ = attention_backends()
+            backend_kind = CPAttentionBackendKind.from_string(prefill_backend)
+        except ValueError:
+            # Unpublished config, or a backend with no CP kind.
             return True
-        return all(int(length) >= self.cp_size * 2 for length in extend_lens)
+        if backend_kind != CPAttentionBackendKind.FLASHINFER:
+            self._prefill_backend_supported = True
+            return True
+        if not has_forward_context():
+            return True
+
+        from sglang.srt.layers.attention.hybrid_attn_backend import (
+            HybridAttnBackend,
+        )
+        from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
+
+        backend = get_attn_backend()
+        while isinstance(backend, (HybridAttnBackend, TboAttnBackend)):
+            backend = (
+                backend.prefill_backend
+                if isinstance(backend, HybridAttnBackend)
+                else backend.primary
+            )
+        reason = backend.prefill_cp_unsupported_reason()
+        if reason is not None:
+            logger.warning(
+                "Prefill context parallelism is disabled for FlashInfer: %s.",
+                reason,
+            )
+        self._prefill_backend_supported = reason is None
+        return self._prefill_backend_supported
 
     def build_metadata(
         self,
@@ -357,6 +408,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         return [
             CPAttentionBackendKind.FLASH_ATTENTION,
             CPAttentionBackendKind.TRTLLM_MHA,
+            CPAttentionBackendKind.FLASHINFER,
         ]
 
     def run_attention(
@@ -364,7 +416,7 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         q: Any,
         forward_batch,
         device: Any,
-        attn_fn,
+        attn_fn: Callable[..., Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
         assert attention_backend in self.get_supported_attention_backend(), (
@@ -372,13 +424,14 @@ class ZigzagCPStrategy(ContextParallelStrategy):
         )
 
         meta = forward_batch.attn_cp_metadata
-        q_prev = q[: meta.total_q_prev_tokens]
         logical_tokens = meta.total_q_prev_tokens + meta.total_q_next_tokens
-        q_next = q[meta.total_q_prev_tokens : logical_tokens]
+        queries = q if isinstance(q, tuple) else (q,)
 
-        prev_kwargs = {}
-        next_kwargs = {}
-        if attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+        if attention_backend == CPAttentionBackendKind.FLASHINFER:
+            assert not isinstance(q, tuple)
+            result = attn_fn(q[:logical_tokens])
+        elif attention_backend == CPAttentionBackendKind.TRTLLM_MHA:
+            assert not isinstance(q, tuple)
             result = attn_fn(
                 q[:logical_tokens],
                 meta.cu_seqlens_q_combined_tensor,
@@ -388,23 +441,29 @@ class ZigzagCPStrategy(ContextParallelStrategy):
                 use_zigzag_page_table=True,
             )
         else:
+            # MLA passes separate query components to avoid concatenating them just
+            # to split the token dimension. Slice every component identically.
+            q_prev = tuple(t[: meta.total_q_prev_tokens] for t in queries)
+            q_next = tuple(
+                t[meta.total_q_prev_tokens : logical_tokens] for t in queries
+            )
+            if not isinstance(q, tuple):
+                q_prev, q_next = q_prev[0], q_next[0]
             result_prev = attn_fn(
                 q_prev,
                 meta.cu_seqlens_q_prev_tensor,
                 meta.kv_len_prev_tensor,
                 meta.max_seqlen_q_prev,
-                **prev_kwargs,
             )
             result_next = attn_fn(
                 q_next,
                 meta.cu_seqlens_q_next_tensor,
                 meta.kv_len_next_tensor,
                 meta.max_seqlen_q_next,
-                **next_kwargs,
             )
             result = torch.cat([result_prev, result_next], dim=0)
 
-        pad_size = q.shape[0] - logical_tokens
+        pad_size = queries[0].shape[0] - logical_tokens
         assert pad_size >= 0
         if pad_size > 0:
             result = torch.cat(
