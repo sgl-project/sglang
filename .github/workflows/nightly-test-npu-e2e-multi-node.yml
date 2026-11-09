@@ -100,6 +100,10 @@ jobs:
 
       - name: Prepare code for testing
         run: |
+          # Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.
+          find /root/.cache/tests -regextype posix-extended -maxdepth 1 -type d \
+            -regex '.*/sglang-[0-9]+$' -mtime +7 -exec rm -rf {} + 2>/dev/null || true
+
           # copy source code to shared-disk
           # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
