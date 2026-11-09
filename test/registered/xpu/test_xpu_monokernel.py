@@ -1,8 +1,8 @@
 """Load test of --enable-xpu-monokernel (sgl-kernel-xpu's Qwen3.5 / Qwen3.6 MoE
 monokernels): a 4-layer Qwen3.6-35B-A3B-FP8 (3 GatedDeltaNet + 1 full-attention
 layer, dummy weights) at TP2 on two Xe2 GPUs with 32 Xe cores. The server must
-start with the monokernels, route its decode (and MTP draft decode) steps to
-them, and give the stock path's greedy tokens and logprobs.
+start with the monokernels, route its decode (and the MTP drafter's draft decode and
+draft extend) steps to them, and give the stock path's greedy tokens and logprobs.
 
 Usage:
 python3 -m unittest test_xpu_monokernel
@@ -156,6 +156,10 @@ class TestXPUMonokernel(CustomTestCase):
             [
                 r"monokernel qwen3_5_moe_35b_a3b_fp8 on xe2 runs target_verify steps",
                 r"monokernel qwen3_5_moe_35b_a3b_fp8_mtp on xe2: widths",
+                # the drafter's decode steps and its draft extend (the verified
+                # positions) run the monokernels, captured or eager
+                r"MTP drafter runs a decode step of \d+ rows",
+                r"MTP drafter runs a draft_extend step of \d+ rows",
             ],
         )
 

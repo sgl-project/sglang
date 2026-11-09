@@ -107,7 +107,7 @@ class Numerics(msgspec.Struct, frozen=True):
 class ShapeKey(msgspec.Struct, frozen=True):
     """The graph key a step is routed by; every rank holds it alike."""
 
-    forward_mode: str  # "decode" or "target_verify"
+    forward_mode: str  # "decode", "target_verify" or "draft_extend"
     batch_size: int  # requests, padded to the graph's batch size
     tokens_per_request: int
 
