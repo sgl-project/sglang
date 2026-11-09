@@ -766,6 +766,16 @@ impl RouterTrait for Router {
             .await
     }
 
+    async fn route_chat_with_custom_params(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::chat::ChatRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        self.route_typed_request(headers, body, "/v1/chat/completions", model_id)
+            .await
+    }
+
     async fn route_completion(
         &self,
         headers: Option<&HeaderMap>,

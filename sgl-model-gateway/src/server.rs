@@ -40,7 +40,6 @@ use crate::{
         otel_trace,
     },
     protocols::{
-        chat::ChatCompletionRequest,
         classify::ClassifyRequest,
         completion::CompletionRequest,
         embedding::EmbeddingRequest,
@@ -53,6 +52,7 @@ use crate::{
         worker_spec::{WorkerConfigRequest, WorkerUpdateRequest},
     },
     routers::{
+        chat::ChatRequest,
         conversations,
         mesh::{
             get_app_config, get_cluster_status, get_global_rate_limit, get_global_rate_limit_stats,
@@ -184,11 +184,11 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ChatRequest>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_custom_params(Some(&headers), &body, Some(&body.model))
         .await
 }
 

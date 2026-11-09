@@ -20,6 +20,7 @@ use crate::protocols::{
     responses::{ResponsesGetParams, ResponsesRequest},
 };
 
+pub mod chat;
 pub mod conversations;
 pub mod error;
 pub mod factory;
@@ -97,6 +98,22 @@ pub trait RouterTrait: Send + Sync + Debug {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response;
+
+    /// Route a chat request including SGLang custom sampling parameters.
+    async fn route_chat_with_custom_params(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &chat::ChatRequest,
+        model_id: Option<&str>,
+    ) -> Response {
+        if body.custom_params.is_some() {
+            return error::bad_request(
+                "unsupported_custom_params",
+                "custom_params requires an SGLang HTTP worker",
+            );
+        }
+        self.route_chat(headers, &body.request, model_id).await
+    }
 
     /// Route a completion request
     async fn route_completion(

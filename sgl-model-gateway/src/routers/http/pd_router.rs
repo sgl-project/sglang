@@ -1701,6 +1701,16 @@ impl RouterTrait for PDRouter {
         body: &ChatCompletionRequest,
         model_id: Option<&str>,
     ) -> Response {
+        self.route_chat_with_custom_params(headers, &body.clone().into(), model_id)
+            .await
+    }
+
+    async fn route_chat_with_custom_params(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &crate::routers::chat::ChatRequest,
+        model_id: Option<&str>,
+    ) -> Response {
         let is_stream = body.stream;
         let return_logprob = body.logprobs;
 
