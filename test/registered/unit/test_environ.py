@@ -223,7 +223,7 @@ class TestKimiK3KdaInprojEnvAliases(CustomTestCase):
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
             value = getattr(envs, name).get()
-        return value, [w for w in caught if w.category is DeprecationWarning]
+        return value, [w for w in caught if w.category is FutureWarning]
 
     def test_deprecated_name_is_read_with_warning(self):
         for new_name, old_name, old_raw, old_value, _, _ in self.ALIASES:
@@ -263,10 +263,12 @@ class TestRenamedEnvAliases(unittest.TestCase):
                 os.environ.pop(new, None)
             with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(False):
                 value = field.get()
-        deprecations = [w for w in caught if issubclass(w.category, DeprecationWarning)]
+        deprecations = [w for w in caught if issubclass(w.category, FutureWarning)]
         return field, value, deprecations
 
-    def test_former_name_applies_with_a_deprecation_warning(self):
+    def test_former_name_applies_with_a_visible_warning(self):
+        """The warning must reach users: a DeprecationWarning raised from library
+        code is filtered out by Python's default warning filters."""
         for new, old in RENAMED_NV_MEGA_RUNTIME_CHILDREN.items():
             with self.subTest(new=new):
                 field, value, deprecations = self._read(new, {old: "1"})

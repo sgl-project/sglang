@@ -43,6 +43,12 @@ class TestErnieImagePostprocessText(unittest.TestCase):
 
 
 class TestErnieImagePrepareCondKwargs(unittest.TestCase):
+    def test_sp_keeps_spatial_latents_for_dit_embedding(self) -> None:
+        latents = torch.randn(2, 128, 8, 12)
+        result, sharded = ErnieImagePipelineConfig().shard_latents_for_sp(None, latents)
+        self.assertIs(result, latents)
+        self.assertFalse(sharded)
+
     def _make_batch(self, prompt_embeds, prompt_seq_lens):
         return SimpleNamespace(
             height=256,
