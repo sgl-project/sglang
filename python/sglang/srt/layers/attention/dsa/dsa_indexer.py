@@ -1843,10 +1843,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             metadata.attn_metadata.topk_v2_plan,
         )
 
-    def _hip_mqa_logits(self, q, index_k, weights, ks, ke) -> torch.Tensor:
+    def _hip_mqa_logits(self, q, index_k, weights, ks, ke, plans=None) -> torch.Tensor:
         if isinstance(index_k, Fp4IndexKeys):
             return fp4_ragged_mqa_logits(
-                q, weights, self.softmax_scale, index_k, ks, ke
+                q, weights, self.softmax_scale, index_k, ks, ke, plans
             )
         from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 
@@ -2061,6 +2061,17 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             )
             dst_base = row_lo
 
+        # every layer of an eager batch scores the same row chunks over the same key
+        # table, so the first keeps the FP4 schedules (and their host read of ks)
+        fp4_plans = None
+        if (
+            _is_hip
+            and isinstance(index_k, Fp4IndexKeys)
+            and not torch.cuda.is_current_stream_capturing()
+            and not is_in_breakable_cuda_graph()
+        ):
+            fp4_plans = getattr(metadata.attn_metadata, "fp4_logits_plans", None)
+
         start = row_lo
         while start < row_hi:
             end = min(start + max_rows, row_hi)
@@ -2073,6 +2084,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                         weights[start:end],
                         ks[start:end],
                         ke[start:end],
+                        fp4_plans,
                     )
                 elif _is_xpu:
                     logits_chunk = sgl_fp8_mqa_logits(

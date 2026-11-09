@@ -370,7 +370,8 @@ class TestFp4IndexKHip(CustomTestCase):
     def test_decode_and_prefill_logits_read_the_stored_fp4_values(self):
         """AITER's decode (row-group) and prefill logits over keys and queries our FP4
         kernels wrote, the prefill keys gathered and staged back into pages, equal torch
-        scores of the same FP4 values: a layout drift on either side breaks them."""
+        scores of the same FP4 values: a layout drift on either side breaks them. Prefill
+        schedules kept for a batch's later layers score those layers' own keys."""
         gen = torch.Generator(device="cuda").manual_seed(0)
         lens = torch.tensor([300, 2500, 1, 1730], dtype=torch.int32)
         batch, next_n = lens.numel(), 5
@@ -466,6 +467,25 @@ class TestFp4IndexKHip(CustomTestCase):
             tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
             torch.testing.assert_close(logits[r, :end], ref, **tol)
             torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
+
+        # a batch's later layers score their own keys on the first layer's schedules
+        prefill_args = (q_prefill, gate_bf16.squeeze(-1), HEAD_DIM**-0.5)
+        other_layer = stage_fp4_index_k_rows(rows.flip(0))
+        ke, plans = ks + ends, {}
+        fp4_ragged_mqa_logits(
+            *prefill_args, stage_fp4_index_k_rows(rows), ks, ke, plans
+        )
+        reused = fp4_ragged_mqa_logits(*prefill_args, other_layer, ks, ke, plans)
+        self.assertEqual(len(plans), 1)
+        fresh = fp4_ragged_mqa_logits(*prefill_args, other_layer, ks, ke)
+        for r in range(batch * next_n):
+            start, end = int(ks[r]), int(ends[r])
+            torch.testing.assert_close(
+                reused[r, start : start + end],
+                fresh[r, start : start + end],
+                rtol=0,
+                atol=0,
+            )
 
 
 if __name__ == "__main__":
