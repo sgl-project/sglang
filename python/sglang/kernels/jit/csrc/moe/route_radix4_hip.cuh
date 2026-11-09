@@ -301,7 +301,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   // No CTA of a launch knows when every tail CTA has seen the final arrival
   // count, so none can reset it. Two counters alternate instead: each launch
   // clears the one the launch before used, and the last arrival flips the parity.
-  int32_t* tail_arrival = nullptr;
+  int tail_parity = 0;
   if constexpr (kFuseSort) {
     // Routing-independent, so issued first to drain during the radix search;
     // pads stay in wave 0, the only wave that releases at the arrival barrier.
@@ -316,9 +316,9 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           token,
           static_cast<int>(gridDim.x));
     if constexpr (kTailSort) {
-      const int parity = __hip_atomic_load(&params.sort_ws[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) & 1;
-      tail_arrival = &params.sort_ws[2 + parity];
-      if (token == 0 && tid == 0) params.sort_ws[2 + (parity ^ 1)] = 0;
+      tail_parity = __hip_atomic_load(&params.sort_ws[1], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT) & 1;
+      if (token == 0 && tid == 0)
+        __hip_atomic_store(&params.sort_ws[2 + (tail_parity ^ 1)], 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
       for (int e = tid; e < EXPERTS; e += BLOCK) {
         sort_before[e] = 0;
         sort_mask[e] = 0u;
@@ -555,6 +555,7 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
   if constexpr (kTailSort) {
     const int M = static_cast<int>(gridDim.x);
     const int first_helper = M - params.tail_ctas;
+    int32_t* tail_arrival = &params.sort_ws[2 + tail_parity];
     // Every store another CTA reads (route row, pad slice) is wave 0's and
     // written through, so retiring them is the release.
     if (wid == 0) __builtin_amdgcn_s_waitcnt(0x0f70);  // vmcnt(0)
@@ -592,7 +593,8 @@ __global__ __launch_bounds__(BLOCK) void route_radix4_kernel(__grid_constant__ c
           M,
           ticket == M - 1);
       // Every CTA read the parity before arriving.
-      if (ticket == M - 1 && tid == 0) params.sort_ws[1] ^= 1;
+      if (ticket == M - 1 && tid == 0)
+        __hip_atomic_store(&params.sort_ws[1], tail_parity ^ 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
     }
     radix4_sort::zero_bf16_row<BLOCK>(params.moe_buf, token, static_cast<int>(params.moe_dim));
   } else if constexpr (kFuseSort) {
