@@ -302,9 +302,9 @@ class MiniMaxM3MLP(nn.Module):
     @staticmethod
     def _swigluoai_fused(x: torch.Tensor, alpha: float, limit: float) -> torch.Tensor:
         """swiglu_oai using fused Triton kernel (sgl_kernel_npu), no quant."""
-        from sgl_kernel_npu.activation.swiglu_oai_quant import swiglu_oai_quant
+        from sgl_kernel_npu.operators.activation import swiglu_oai_quant
 
-        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False)
+        out, _ = swiglu_oai_quant(x, alpha, limit, need_quant=False, impl="auto")
         return out
 
     def __init__(
