@@ -302,6 +302,7 @@ class TestGdnKVReuse(CustomTestCase):
         self._check_allocation_failure("write")
 
     def test_auxiliary_allocation_failure_frees_only_fresh_slots(self):
+        self.batch.enable_overlap = True
         self._check_allocation_failure("aux")
 
     def test_unaligned_chunk_falls_back(self):
@@ -312,9 +313,46 @@ class TestGdnKVReuse(CustomTestCase):
         self.batch.model_config.quantization = "modelopt_fp4"
         self.assert_fallback()
 
-    def test_overlap_falls_back(self):
+    def test_overlap_mixed_batch_retains_pin_while_forward_is_pending(self):
         self.batch.enable_overlap = True
-        self.assert_fallback()
+        fresh = deepcopy(self.req)
+        fresh.extend_end = 4352
+        fresh.skip_radix_cache_insert = True
+        self.batch.reqs = [self.req, fresh]
+        borrowed = reuse.try_borrow_full_kv(self.batch)
+        self.assertIsNotNone(borrowed[0])
+        self.assertIsNone(borrowed[1])
+        self.assertTrue(
+            torch.equal(
+                self.batch.full_kv_fresh_token_indices, torch.arange(4096, 4352)
+            )
+        )
+        # A later scheduling pass cannot borrow again while the earlier forward
+        # still owns the temporary pin, nor release that pin on fallback.
+        self.assertIsNone(reuse._try_borrow_request(self.cache, self.req))
+        self.cache.tree_core.dec_full_pin.assert_not_called()
+        reuse.release_full_kv_pin(self.cache, self.req)
+        self.cache.tree_core.dec_full_pin.assert_called_once_with(17)
+
+    def test_overlap_snapshot_keeps_previous_fresh_indices_alive(self):
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+        from sglang.srt.managers.scheduler import Scheduler
+
+        fresh = torch.arange(256)
+        batch = ScheduleBatch(
+            reqs=[],
+            enable_overlap=True,
+            full_kv_replay=True,
+            full_kv_fresh_token_indices=fresh,
+        )
+        scheduler = NS(
+            batch_record_ct=0, batch_record_buf=[None, None], uocr_runtime=None
+        )
+        Scheduler.record_batch_in_overlap(scheduler, batch)
+        batch.full_kv_replay = False
+        batch.full_kv_fresh_token_indices = None
+        saved = scheduler.batch_record_buf[1][1]
+        self.assertTrue(any(value is fresh for value in saved))
 
     def test_earlier_branch_checkpoint_falls_back(self):
         self.req.mamba_branching_seqlen = 6144

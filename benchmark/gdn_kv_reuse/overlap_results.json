@@ -1,0 +1,380 @@
+{
+  "parent_commit": "d38bebdbd8307ecf9224665476784116271de5e7",
+  "source_sha256": {
+    "python/sglang/srt/mem_cache/gdn_kv_reuse.py": "866805d8ce257ca71bb05c8284e98d93f6505d0451ae9abf7994db2106d57003",
+    "test/registered/unit/mem_cache/test_gdn_kv_reuse.py": "d393bacb92ba2f63ba13d4238144a8c47e27a4904468a9cba03faadc10c76ef4",
+    "benchmark/gdn_kv_reuse/launch_server.sh": "64821df634ee73fe5950c3f3cfd94a7e7b8d766151ebb9e4c04edab1ff50de73"
+  },
+  "protocol": {
+    "models": [
+      "Qwen3.5-4B",
+      "Qwen3.5-9B",
+      "Olmo-Hybrid-7B"
+    ],
+    "concurrency": 8,
+    "chunk_size": 4096,
+    "long_C": 4096,
+    "long_H": 8192,
+    "long_D": 4096,
+    "generated_tokens": 32,
+    "tp": 1,
+    "weights_dtype": "bfloat16",
+    "ssm_dtype": "float32",
+    "max_mamba_cache_size": 64,
+    "max_total_tokens": 98304,
+    "overlap": true,
+    "prefill_graph": false,
+    "decode_graph": false,
+    "backend": "paged FlashInfer",
+    "correctness_mm": "fixed-order Triton MM, unchanged attention/cache/scheduler",
+    "smoke_mm": "ordinary CUDA",
+    "performance_measurement": false
+  },
+  "exact_comparisons": {
+    "Qwen3.5-4B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      }
+    },
+    "Qwen3.5-9B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      }
+    }
+  },
+  "ordinary_cuda_smoke": {
+    "Qwen3.5-4B": {
+      "long": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "all-reuse": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "mixed": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      }
+    },
+    "Qwen3.5-9B": {
+      "long": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "all-reuse": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "mixed": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "long": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "all-reuse": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      },
+      "mixed": {
+        "completed_requests": 8,
+        "tokens_per_request": [
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32,
+          32
+        ],
+        "warm_controls": 8
+      }
+    }
+  },
+  "activation": {
+    "Qwen3.5-4B": {
+      "overlap-correctness": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      },
+      "overlap-cuda-smoke": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      }
+    },
+    "Qwen3.5-9B": {
+      "overlap-correctness": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      },
+      "overlap-cuda-smoke": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "overlap-correctness": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      },
+      "overlap-cuda-smoke": {
+        "overlap": true,
+        "scheduler_max_running_requests": 8,
+        "shared_batch_size": 8,
+        "shared_reused_requests": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4,
+        "mixed_fresh_tokens": 1060,
+        "long_reuse_events": 8,
+        "long_reused_token_rows": 25600
+      }
+    }
+  },
+  "limitations": [
+    "Exact selected logprobs/top-5 are tested under fixed-order MM; ordinary CUDA smoke makes no exact-equivalence claim.",
+    "Olmo uses the explicit external experimental model fixture.",
+    "No task-level accuracy or overlap latency benchmark was requested."
+  ]
+}

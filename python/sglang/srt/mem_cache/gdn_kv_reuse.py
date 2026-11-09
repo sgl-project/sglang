@@ -54,7 +54,6 @@ def try_borrow_full_kv(batch):
         )
         or config.quantization is not None
         or config.dtype != torch.bfloat16
-        or batch.enable_overlap
         or not batch.spec_algorithm.is_none()
         or get_schedule().enable_mixed_chunk
         or get_lora().enable_lora
@@ -88,6 +87,8 @@ def try_borrow_full_kv(batch):
         if indices is None:
             fresh_tokens.extend(range(offset, offset + length))
         offset += length
+    # This per-forward tensor is never mutated in place. The overlap scheduler
+    # retains every ScheduleBatch field until the forward stream is done.
     batch.full_kv_fresh_token_indices = (
         torch.tensor(fresh_tokens, dtype=torch.int64, device=batch.device)
         if fresh_tokens

@@ -22,6 +22,10 @@ export SGLANG_ENABLE_GDN_KV_REUSE="$reuse_flag"
 export SGLANG_FLASHINFER_USE_PAGED=1
 export OMP_NUM_THREADS=8
 export TOKENIZERS_PARALLELISM=false
+overlap_args=()
+if [[ "${ENABLE_OVERLAP:-0}" != 1 ]]; then
+  overlap_args+=(--disable-overlap-schedule)
+fi
 exec "${PYTHON:-python3}" -m sglang.launch_server \
   --model-path "$model_path" --host 127.0.0.1 --port "$port" \
   --dtype bfloat16 --attention-backend flashinfer \
@@ -30,6 +34,6 @@ exec "${PYTHON:-python3}" -m sglang.launch_server \
   --page-size 256 --chunked-prefill-size 4096 --max-prefill-tokens 8192 \
   --max-total-tokens "${MAX_TOTAL_TOKENS:-32768}" --context-length 16384 \
   --max-running-requests "${MAX_RUNNING_REQUESTS:-4}" \
-  --max-mamba-cache-size 32 --mamba-max-states-per-path 1 --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
-  --disable-overlap-schedule --cuda-graph-backend-prefill disabled \
+  --max-mamba-cache-size "${MAX_MAMBA_CACHE_SIZE:-32}" --mamba-max-states-per-path 1 --mem-fraction-static "${MEM_FRACTION_STATIC:-0.8}" \
+  "${overlap_args[@]}" --cuda-graph-backend-prefill disabled \
   --cuda-graph-backend-decode disabled --log-level debug --enable-request-time-stats-logging

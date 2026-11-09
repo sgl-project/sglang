@@ -123,8 +123,38 @@ chunks and ordinary chunks: reused requests borrow and pin their cached Full KV,
 while other requests allocate fresh slots. Q and any attention gate are computed
 for all tokens; K/V are computed and written only for ordinary chunks. The
 single-request restrictions above still apply to each reusable chunk, including
-alignment and the requirement that the entire chunk is cached. Overlap,
-prefill graphs, quantization, and TP/PP greater than one remain unsupported.
+alignment and the requirement that the entire chunk is cached. Both normal
+and overlap scheduling are supported. Prefill graphs, quantization, and TP/PP
+greater than one remain unsupported.
+
+Set `ENABLE_OVERLAP=1` with the launcher to use SGLang's overlap scheduler.
+For eight requests, also set `MAX_MAMBA_CACHE_SIZE=64`: overlap uses five
+Mamba state slots per request in this extra-buffer configuration, so the
+historical 32-slot fixture would cap the scheduler at six requests. For example:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 ENABLE_OVERLAP=1 MAX_MAMBA_CACHE_SIZE=64 \
+  MAX_RUNNING_REQUESTS=8 MAX_TOTAL_TOKENS=98304 \
+  MAMBA_SSM_DTYPE=float32 MEM_FRACTION_STATIC=0.9 \
+  PYTHON=/path/to/venv/bin/python \
+  bash benchmark/gdn_kv_reuse/launch_server.sh /path/to/Qwen3.5-4B 1
+```
+
+The scheduler's existing per-forward field snapshot retains the compact K/V
+index tensor across streams. A request's temporary Full pin remains held until
+checkpoint lock handover or teardown. If the previous replay still holds that
+pin when the request is scheduled again, the new chunk falls back rather than
+replacing the in-flight pin. No additional stream synchronization is introduced.
+
+The finite overlap regression in `overlap_results.json` covers Qwen3.5-4B,
+Qwen3.5-9B, and the external Olmo-Hybrid-7B fixture. Each model runs the long
+`D=4096` case, eight shared-prefix reusable requests, and four reusable plus
+four ordinary requests. Each request generates 32 tokens. With fixed-order MM,
+Base/reuse token sequences, selected logprobs, and top-5 agree exactly, including
+warm controls. Separate ordinary CUDA runs verify completion and actual reuse;
+they do not assert bitwise equality. Server logs confirm real eight-request
+shared/mixed batches. Both prefill and decode graphs are disabled in these
+checks; this is functional validation, not a latency benchmark.
 
 Start a server with enough KV capacity for eight distinct cached continuations:
 
