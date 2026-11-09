@@ -228,6 +228,27 @@ class TestMuseSparkLaunchDefaults(CustomTestCase):
             apply_muse_spark_env_defaults(args)
         return resolving_view(args)
 
+    def test_architecture_probe_uses_decrypted_model_config(self):
+        from sglang.srt.arg_groups.muse_spark_hook import apply_muse_spark_env_defaults
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            model_path = Path(tmpdir) / "checkpoint"
+            model_path.mkdir()
+            config_path = Path(tmpdir) / "decrypted.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "model_type": "qwen3",
+                        "architectures": ["Qwen3ForCausalLM"],
+                    }
+                )
+            )
+            args = ServerArgs(
+                model_path="dummy", decrypted_config_file=str(config_path)
+            )
+            args.model_path = str(model_path)
+            apply_muse_spark_env_defaults(args)
+
     def test_nvfp4_hardware_defaults_and_explicit_overrides(self):
         for platform, runner, fraction in (
             ("blackwell", "flashinfer_trtllm", 0.8),
