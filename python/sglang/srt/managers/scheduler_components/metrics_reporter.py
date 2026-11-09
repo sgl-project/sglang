@@ -1278,15 +1278,11 @@ class SchedulerMetricsReporter:
         if self.scheduler.disaggregation_mode == DisaggregationMode.PREFILL:
             self.stats.utilization = -1
         else:
-            # TODO: max_running_requests_under_SLO has no setter — sglang:utilization stuck at 0 (regressed #22713).
-            max_under_slo = getattr(
-                self.scheduler, "max_running_requests_under_SLO", None
+            # No OSS setter exists for the SLO-based capacity; the running-request cap stands in.
+            self.stats.utilization = max(
+                self.stats.num_running_reqs.total / self.scheduler.max_running_requests,
+                self.stats.token_usage / 0.9,
             )
-            if max_under_slo is not None and max_under_slo > 0:
-                self.stats.utilization = max(
-                    self.stats.num_running_reqs.total / max_under_slo,
-                    self.stats.token_usage / 0.9,
-                )
 
     def forward_occupancy_log_string(self) -> str:
         now_ns = time.monotonic_ns()
