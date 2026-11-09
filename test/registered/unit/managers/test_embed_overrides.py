@@ -134,9 +134,7 @@ class TestCreateTokenizedObjectEmbedOverrideValidation(CustomTestCase):
 
         for request in requests:
             with self.subTest(request_type=type(request).__name__):
-                with self.assertRaisesRegex(
-                    ValueError, "must be a PositionalEmbeds"
-                ):
+                with self.assertRaisesRegex(ValueError, "must be a PositionalEmbeds"):
                     manager._create_tokenized_object(request, "hello", [1, 2])
 
 
