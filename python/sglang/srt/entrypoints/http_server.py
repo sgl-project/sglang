@@ -2349,18 +2349,25 @@ async def _send_disaggregation_warmup_requests(
         )
 
 
-def _wait_for_model_info(server_args: ServerArgs) -> dict:
-    # Polls once a second; after 120 tries, raises with the last failure.
+def _wait_for_model_info(
+    server_args: ServerArgs, *, deadline_s: Optional[float] = None
+) -> dict:
+    # Polls once a second; after 120 tries or deadline_s seconds, raises with the
+    # last failure.
     headers = {}
     if get_serving().api_key:
         headers["Authorization"] = f"Bearer {get_serving().api_key}"
     last_traceback = ""
+    end = None if deadline_s is None else time.monotonic() + deadline_s
     for _ in range(120):
         time.sleep(1)
+        timeout = 5 if end is None else min(5, end - time.monotonic())
+        if timeout <= 0:
+            break
         try:
             res = requests.get(
                 server_args.url() + "/model_info",
-                timeout=5,
+                timeout=timeout,
                 headers=headers,
                 verify=ssl_verify_of(server_args),
             )
@@ -2549,13 +2556,23 @@ def _multi_tokenizer_warmup_kwargs(server_args: ServerArgs, worker_id: int):
     )
 
 
-def _wait_for_server_before_gc_freeze(server_args: ServerArgs):
+# Arbitrary: a server listens within seconds, and one that cannot reach its own
+# URL (a common reason to skip warmup) should not hold /health back for minutes.
+_SKIPPED_WARMUP_WAIT_S = 20
+
+
+def _wait_for_server_before_gc_freeze(server_args: ServerArgs) -> bool:
     # The freeze is a request to this server, and with warmup skipped nothing
     # else waits for it to listen; a refused freeze is only logged, never retried.
     try:
-        _wait_for_model_info(server_args)
+        _wait_for_model_info(server_args, deadline_s=_SKIPPED_WARMUP_WAIT_S)
     except TimeoutError as error:
-        logger.warning(f"No answer from the server before the GC freeze: {error}")
+        logger.warning(
+            f"No answer from the server within {_SKIPPED_WARMUP_WAIT_S} s; "
+            f"skipping the GC freeze: {error}"
+        )
+        return False
+    return True
 
 
 def _freeze_gc_after_server_warmup(server_args: ServerArgs):
@@ -2595,16 +2612,18 @@ def _wait_and_warmup(
         )
 
     skip_warmup = get_serving().skip_server_warmup and not skip_elastic_joiner_warmup
+    server_answered = True
     if skip_elastic_joiner_warmup:
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
     elif skip_warmup:
-        _wait_for_server_before_gc_freeze(server_args)
+        server_answered = _wait_for_server_before_gc_freeze(server_args)
     elif not execute_warmup_func(server_args):
         return
 
     if post_warmup_callback is not None:
         post_warmup_callback()
-    _freeze_gc_after_server_warmup(server_args)
+    if server_answered:
+        _freeze_gc_after_server_warmup(server_args)
     if skip_warmup:
         # Up after the freeze, so no request waits on it walking the startup heap.
         _global_state.tokenizer_manager.server_status = ServerStatus.Up
