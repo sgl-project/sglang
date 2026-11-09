@@ -1176,6 +1176,52 @@ def megakernel_enabled() -> bool:
     return get_exec().kernel.enable_nvidia_megakernel
 
 
+def _kimi_build_widths(
+    max_rows: int, tokens: int, architectures: Any, *, is_draft: bool
+) -> tuple[int, ...]:
+    """Opt-in q6 preparation from requested graphs, before KV pool sizing.
+
+    Request counts are converted to token rows. Keep the single-request width;
+    missing eager widths and any later added graph buckets use stock dispatch.
+    This does not resize pools, alter graphs, or admit wider ordinary decode.
+    """
+    widths = tuple(range(tokens, max_rows + 1, tokens))
+    if is_draft or tuple(architectures or ()) != ("KimiK3ForConditionalGeneration",):
+        return widths
+    enabled = envs.SGLANG_KIMI_K3_MEGAKERNEL_CAPTURE_ONLY.get()
+    error = None
+    if enabled:
+        graph = get_exec().graph.cuda_graph_config
+        config = get_spec()
+        if (
+            tokens != 6
+            or config.speculative_algorithm != "DSPARK"
+            or config.speculative_adaptive
+            or get_parallel().dcp_size != 1
+        ):
+            error = "capture-only preparation requires fixed DSpark q6 with DCP off"
+        elif graph is None or graph.decode.backend != Backend.FULL:
+            error = "capture-only preparation requires full decode graphs"
+        elif not graph.decode.bs or any(
+            type(bs) is not int or bs <= 0 for bs in graph.decode.bs
+        ):
+            error = "capture-only preparation requires positive graph request batches"
+        else:
+            widths = tuple(
+                sorted(
+                    rows
+                    for rows in {tokens, *(bs * tokens for bs in graph.decode.bs)}
+                    if rows <= max_rows
+                )
+            )
+    # Even OFF ranks participate: differing flags or an invalid peer must fail
+    # on every rank before any rank enters plugin preparation collectives.
+    megakernel_agree((enabled, widths, error), what="Kimi preparation policy")
+    if error is not None:
+        raise ValueError(error)
+    return widths
+
+
 def install_megakernel(
     *,
     model: torch.nn.Module,
@@ -1198,7 +1244,9 @@ def install_megakernel(
     tokens = _tokens_per_request()
     binding = _binding_class(hf_config.architectures)(model=model)
     context = BuildContext(
-        widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
+        widths=_kimi_build_widths(
+            spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
+        ),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
