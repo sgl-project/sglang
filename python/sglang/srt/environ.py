@@ -1054,6 +1054,9 @@ class Envs:
     # many MiB in INT8, which is as fast at decode sizes with about 1/16 of INT4's error; 0 runs
     # INT4 at every size.
     SGLANG_ROCM_QUICK_REDUCE_INT8_BELOW_MB = EnvInt(64)
+    # Quick all-reduce goes ahead of the custom all-reduce for all-reduces of at least this many
+    # bytes, below the codec's own minimum size too; 0 keeps the custom all-reduce first.
+    SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES = EnvInt(0)
     # Use reduce_scatter (instead of all_reduce + dp_scatter) for the equal-chunk
     # MAX_LEN DP-MoE combine. Default ON for ROCm/HIP (uses the aiter custom
     # symmetric-memory kernel), OFF elsewhere (would fall back to RCCL); override

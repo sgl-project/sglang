@@ -171,6 +171,80 @@ def test_custom_allreduce_precedes_symmetric_memory_pynccl():
     coordinator.pynccl_comm.all_reduce.assert_not_called()
 
 
+def _quick_all_reduce_tp4_int4(monkeypatch):
+    from sglang.srt.distributed.device_communicators.quick_all_reduce import (
+        MB,
+        QuickAllReduce,
+        QuickReduceRegime,
+    )
+
+    # Builds without quick all-reduce, such as the CPU suite's, define no qr_supports.
+    monkeypatch.setattr(
+        "sglang.srt.distributed.device_communicators.custom_all_reduce_ops.qr_supports",
+        lambda fa, dtype: True,
+        raising=False,
+    )
+    quick_reduce = QuickAllReduce.__new__(QuickAllReduce)
+    quick_reduce.disabled = False
+    # No handle, so close() at garbage collection destroys nothing.
+    quick_reduce._ptr = 0
+    quick_reduce.world_size = 4
+    quick_reduce.qr_quant_level = QuickReduceRegime.INT4
+    quick_reduce.use_fp16_kernels = 1
+    quick_reduce.qr_max_size = 2048 * MB
+    return quick_reduce
+
+
+def _coordinator_with_custom_allreduce(qr_comm):
+    coordinator = parallel_state.GroupCoordinator.__new__(
+        parallel_state.GroupCoordinator
+    )
+    coordinator.pymscclpp_comm = None
+    coordinator.pcie_ipc_comm = None
+    coordinator.torch_symm_mem_comm = None
+    coordinator.qr_comm = qr_comm
+    coordinator.ca_comm = Mock(disabled=False)
+    coordinator.ca_comm.should_custom_ar.return_value = True
+    return coordinator
+
+
+@pytest.mark.parametrize(
+    "first_min_bytes,rows,method",
+    [
+        # Unset (0): the custom all-reduce keeps every size it admits.
+        (0, 192, "ca"),
+        (1 << 20, 64, "ca"),
+        # 192 x 5120 bf16 = 1.875 MiB, below INT4's 2 MiB minimum at TP4.
+        (1 << 20, 192, "qr"),
+    ],
+)
+def test_quick_allreduce_first_min_bytes_precedes_custom_allreduce(
+    monkeypatch, first_min_bytes, rows, method
+):
+    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", str(first_min_bytes))
+    coordinator = _coordinator_with_custom_allreduce(
+        _quick_all_reduce_tp4_int4(monkeypatch)
+    )
+    input_ = torch.empty(rows, 5120, dtype=torch.bfloat16)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == method
+
+
+@pytest.mark.parametrize(
+    "shape,dtype",
+    # A dtype the kernel does not reduce; a size that is not a multiple of 16 bytes.
+    [((192, 5120), torch.float32), ((193, 5121), torch.bfloat16)],
+)
+def test_quick_allreduce_first_min_bytes_keeps_kernel_input_rules(
+    monkeypatch, shape, dtype
+):
+    monkeypatch.setenv("SGLANG_ROCM_QUICK_REDUCE_FIRST_MIN_BYTES", str(1 << 20))
+    coordinator = _coordinator_with_custom_allreduce(
+        _quick_all_reduce_tp4_int4(monkeypatch)
+    )
+    input_ = torch.empty(shape, dtype=dtype)
+    assert coordinator._resolve_outplace_all_reduce_method(input_) == "ca"
+
+
 @pytest.mark.parametrize(
     "tp,cp,dp,pp,shared", [(8, 8, 1, 1, 8), (16, 8, 2, 2, 8), (8, 4, 1, 2, 4)]
 )
