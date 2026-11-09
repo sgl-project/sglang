@@ -21,6 +21,7 @@ beam_shared_context_stream_k.py).
 from __future__ import annotations
 
 import functools
+from typing import Callable
 
 import torch
 import triton
@@ -262,6 +263,41 @@ def _shared_context_attention_kernel(
 @functools.lru_cache(maxsize=None)
 def num_sms(device_index: int) -> int:
     return torch.cuda.get_device_properties(device_index).multi_processor_count
+
+
+def resident_ctas_per_sm(kernel) -> int:
+    """CTAs of a compiled Triton kernel that one SM holds at once, as the driver counts.
+
+    On RTX PRO 6000 the split-KV and stream-K kernels use all 64K registers of an SM,
+    so this is 1 there; GPUs or compilers that need fewer registers per CTA fit more.
+    """
+    from cuda.bindings import driver
+
+    # Loads the module and sets kernel.function, which a first launch would also do.
+    kernel._init_handles()
+    error, count = driver.cuOccupancyMaxActiveBlocksPerMultiprocessor(
+        kernel.function, kernel.metadata.num_warps * 32, kernel.metadata.shared
+    )
+    if error != driver.CUresult.CUDA_SUCCESS or count < 1:
+        raise RuntimeError(f"{kernel.name} fits no CTA on an SM: {error}, {count}")
+    return count
+
+
+_WAVE_CTAS: dict[tuple, int] = {}
+
+
+def wave_ctas(
+    *,
+    key: tuple,  # what changes the compiled code: kernel, device, dtypes, constexprs
+    compile_kernel: Callable,  # compiles without launching (JITFunction.warmup)
+    device_index: int,
+) -> int:
+    """CTAs the whole GPU holds at once for one kernel: SMs times CTAs per SM."""
+    wave = _WAVE_CTAS.get(key)
+    if wave is None:
+        wave = num_sms(device_index) * resident_ctas_per_sm(compile_kernel())
+        _WAVE_CTAS[key] = wave
+    return wave
 
 
 def check_shared_context_inputs(

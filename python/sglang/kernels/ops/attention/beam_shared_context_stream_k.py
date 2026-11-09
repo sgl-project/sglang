@@ -44,15 +44,17 @@ from sglang.kernels.ops.attention.beam_shared_context import (
     check_shared_context_inputs,
     empty_softmax_state,
     num_sms,
+    wave_ctas,
 )
 
-# Measured on RTX PRO 6000 (SM120) at 256 beams, head_dim 128, 1-8 groups.
+# Split-KV's tile, not re-swept here; RTX PRO 6000, 256 beams, head_dim 128.
+# Shared memory: 64 KB at head_dim <= 128; 144 KB up to 256, past SM86/89/120's 99 KB.
 _BLOCK_M = 128
 _BLOCK_N = 64
 _NUM_WARPS = 8
 _NUM_STAGES = 2
-# Measured: one unit per tile start balances best (0-3 tried); starting a
-# segment loads Q and ends in an output store.
+# Measured on RTX PRO 6000: one unit per tile start balances best (0-3 tried);
+# starting a segment loads Q and ends in an output store.
 _SETUP_UNITS = 1
 _MERGE_ROWS = 16
 # Triton computes these offsets in 32 bits.
@@ -459,7 +461,7 @@ def shared_context_attention_stream_k(
     maps each beam to its row of Q and of the output, and `decode_slots` is
     [groups, capacity * beam_width], step-major. Only those rows are written.
     Every group needs a prompt token or a decode step; the output of a group with
-    neither is undefined. `num_ctas` defaults to one CTA per SM.
+    neither is undefined. `num_ctas` defaults to the CTAs the GPU holds at once.
     """
     output = check_shared_context_inputs(
         q,
@@ -485,10 +487,64 @@ def shared_context_attention_stream_k(
     num_groups, beam_width = row_indices.shape
     kv_heads = k_buffer.shape[1]
 
-    if num_ctas is None:
-        # One CTA per SM: 8 warps of this kernel fill an SM's register file.
-        num_ctas = num_sms(q.device.index)
     beam_blocks = triton.cdiv(beam_width, _BLOCK_M)
+    block_d = triton.next_power_of_2(head_dim)
+    constexprs = dict(
+        BEAM_WIDTH=beam_width,
+        Q_PER_KV=q_heads // kv_heads,
+        Q_HEADS=q_heads,
+        BEAM_BLOCKS=beam_blocks,
+        HEAD_DIM=head_dim,
+        BLOCK_M=_BLOCK_M,
+        BLOCK_N=_BLOCK_N,
+        BLOCK_D=block_d,
+        SETUP_UNITS=_SETUP_UNITS,
+        num_warps=_NUM_WARPS,
+        num_stages=_NUM_STAGES,
+    )
+
+    def kernel_args(partial_output, partial_lse, ctas):
+        return (
+            q,
+            k_buffer,
+            v_buffer,
+            row_indices,
+            context_slots,
+            context_cu_seqlens,
+            decode_slots,
+            decode_lens,
+            output,
+            partial_output,
+            partial_lse,
+            softmax_scale,
+            num_groups,
+            ctas,
+            q.stride(0),
+            q.stride(1),
+            row_indices.stride(0),
+            row_indices.stride(1),
+            k_buffer.stride(0),
+            k_buffer.stride(1),
+            v_buffer.stride(0),
+            v_buffer.stride(1),
+            decode_slots.stride(0),
+            output.stride(0),
+            output.stride(1),
+        )
+
+    if num_ctas is None:
+        # Persistent: one full wave. The probe passes the partials' dtype before they
+        # are allocated, since their size depends on the CTA count.
+        num_ctas = wave_ctas(
+            key=("stream_k", q.device.index, q.dtype, k_buffer.dtype)
+            + tuple(sorted(constexprs.items())),
+            compile_kernel=lambda: _shared_context_stream_k_kernel.warmup(
+                *kernel_args(torch.float32, torch.float32, num_sms(q.device.index)),
+                grid=(1,),
+                **constexprs,
+            ),
+            device_index=q.device.index,
+        )
     num_tiles = num_groups * q_heads * beam_blocks
     # Unit counts are bounded by the static slot capacities, which CUDA graphs fix.
     decode_capacity = decode_slots.shape[1] // beam_width
@@ -516,44 +572,9 @@ def shared_context_attention_stream_k(
         device=q.device,
     )
 
-    block_d = triton.next_power_of_2(head_dim)
     _shared_context_stream_k_kernel[(num_ctas,)](
-        q,
-        k_buffer,
-        v_buffer,
-        row_indices,
-        context_slots,
-        context_cu_seqlens,
-        decode_slots,
-        decode_lens,
-        output,
-        partial_output,
-        partial_lse,
-        softmax_scale,
-        num_groups,
-        num_ctas,
-        q.stride(0),
-        q.stride(1),
-        row_indices.stride(0),
-        row_indices.stride(1),
-        k_buffer.stride(0),
-        k_buffer.stride(1),
-        v_buffer.stride(0),
-        v_buffer.stride(1),
-        decode_slots.stride(0),
-        output.stride(0),
-        output.stride(1),
-        BEAM_WIDTH=beam_width,
-        Q_PER_KV=q_heads // kv_heads,
-        Q_HEADS=q_heads,
-        BEAM_BLOCKS=beam_blocks,
-        HEAD_DIM=head_dim,
-        BLOCK_M=_BLOCK_M,
-        BLOCK_N=_BLOCK_N,
-        BLOCK_D=block_d,
-        SETUP_UNITS=_SETUP_UNITS,
-        num_warps=_NUM_WARPS,
-        num_stages=_NUM_STAGES,
+        *kernel_args(partial_output, partial_lse, num_ctas),
+        **constexprs,
     )
     _merge_segments_kernel[(num_tiles, triton.cdiv(_BLOCK_M, _MERGE_ROWS))](
         partial_output,
