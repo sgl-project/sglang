@@ -166,6 +166,15 @@ impl UnifiedLRUList {
         self.add_node_(cell);
     }
 
+    /// Move a member node to the least-recently-used end, the next one the
+    /// list's eviction walk reaches; panics if not a member.
+    pub fn move_to_lru(&mut self, node_id: NodeIdx_) {
+        let cell = Self::cell_of_(node_id);
+        self.remove_node_(cell);
+        let last = self.cell_(TAIL).prev;
+        self.add_node_after_(last, cell);
+    }
+
     /// Re-rank the `should_include` nodes from `node_id` up to its root
     /// (exclusive) as the MRU run, deepest first.
     pub fn reset_node_and_parents_mru<K: ChildKeyType>(

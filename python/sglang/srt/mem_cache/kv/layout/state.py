@@ -157,6 +157,7 @@ class StateView:
     replayssm_spec_write_pos = None
     replayssm_cache_base = None
     replayssm_is_flush = None
+    gdn_ucache = None
 
     def __init__(
         self,

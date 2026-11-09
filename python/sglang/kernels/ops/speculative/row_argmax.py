@@ -7,9 +7,15 @@ vocabulary saturates it instead.
 Ties resolve to the lowest index, matching ``ArgMaxOps``' strict ``>``.
 """
 
+import logging
+import os
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -144,4 +150,72 @@ def row_argmax(x: torch.Tensor) -> torch.Tensor:
         x, pv, pi, n, x.stride(0), SPLITS=_SPLITS, BLOCK=2048, num_warps=8
     )
     _argmax_final_kernel[(rows,)](pv, pi, out, SPLITS=_SPLITS, BLOCK=64, num_warps=2)
+    return out
+
+
+# SGLANG_SPEC_ROW_ARGMAX (default off, read once): the speculative verify's target argmax
+# (eagle_utils._target_argmax) and the draft extend's top-1 (eagle_worker_v2) on the medium
+# split below instead of torch.argmax, whose reduce runs one CTA row-group per output row.
+SPEC_ROW_ARGMAX_ENV = "SGLANG_SPEC_ROW_ARGMAX"
+SPEC_ROW_ARGMAX = os.environ.get(SPEC_ROW_ARGMAX_ENV, "").strip().lower() in (
+    "1",
+    "true",
+    "yes",
+    "on",
+)
+_INT32_MAX = 2**31 - 1
+_noted = set()
+
+
+def argmax_like_torch(x: torch.Tensor) -> Optional[torch.Tensor]:
+    """``torch.argmax(x, dim=-1)`` bit for bit on the medium split, or None where it does not apply.
+
+    ``_argmax_pair`` orders candidates as ATen's ``ArgMaxOps`` (``GreaterOrNan``): a NaN beats any
+    number and the first NaN wins; otherwise the larger value, and a value tie (-0.0 == +0.0
+    included) goes to the lower index. That is a total order on (value, index), so the per-split
+    tree reduction and the final merge pick the index torch picks, whatever the split. The
+    small-batch split of ``row_argmax`` (rows <= 64) does not order NaNs, so every row count takes
+    the medium kernels here. FP32, 2-D, unit column stride, CUDA, int32 offsets.
+    """
+    if not (
+        x.is_cuda and x.dim() == 2 and x.dtype == torch.float32 and x.stride(1) == 1
+    ):
+        return None
+    rows, n = x.shape
+    if rows == 0 or n == 0 or (rows - 1) * x.stride(0) + n >= _INT32_MAX:
+        return None
+    # Measured on VR200 at a 248,320 vocab (H577 sweep): fastest of 2K-32K blocks x 4-16 warps.
+    block, warps = (2048, 4) if rows <= 64 else (8192, 8)
+    splits = triton.cdiv(n, block)
+    values = torch.empty((rows, splits), dtype=torch.float32, device=x.device)
+    indices = torch.empty((rows, splits), dtype=torch.int32, device=x.device)
+    out = torch.empty(rows, dtype=torch.int64, device=x.device)
+    _medium_argmax_partial_kernel[(rows, splits)](
+        x, values, indices, n, x.stride(0), splits, block, num_warps=warps
+    )
+    _medium_argmax_final_kernel[(rows,)](
+        values, indices, out, splits, triton.next_power_of_2(splits), num_warps=1
+    )
+    return out
+
+
+def spec_row_argmax(x: torch.Tensor, site: str) -> torch.Tensor:
+    """``torch.argmax(x, dim=-1)`` under SGLANG_SPEC_ROW_ARGMAX: the medium split where
+    ``argmax_like_torch`` applies, torch.argmax otherwise. One INFO line per site and outcome."""
+    out = argmax_like_torch(x)
+    key = (site, out is not None)
+    if key not in _noted:
+        _noted.add(key)
+        logger.info(
+            "%s: %s argmax %s: rows=%d vocab=%d dtype=%s stride=%s",
+            SPEC_ROW_ARGMAX_ENV,
+            site,
+            "on the row_argmax medium split" if out is not None else "kept torch.argmax",
+            x.shape[0] if x.dim() else 0,
+            x.shape[-1] if x.dim() else 0,
+            x.dtype,
+            tuple(x.stride()),
+        )
+    if out is None:
+        return torch.argmax(x, dim=-1)
     return out

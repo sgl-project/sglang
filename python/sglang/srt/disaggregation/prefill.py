@@ -268,7 +268,11 @@ class PrefillBootstrapQueue:
             if self.scheduler.rust_server is not None
             else None
         )
-        kv_args.kv_cache_dtype_str = (
+        from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+            gdn_ucache_pd_dtype_tag,
+        )
+
+        kv_args.kv_cache_dtype_str = gdn_ucache_pd_dtype_tag(
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)

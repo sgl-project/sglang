@@ -1951,8 +1951,9 @@ class ModelRunner:
     def _maybe_execute_deferred_mamba_cow_and_clear(
         self, forward_batch: ForwardBatch
     ) -> None:
-        """Run deferred clear/COW on the forward stream, before the mamba layers
-        read the pool, so the copies don't race the scheduler copy stream.
+        """Run deferred clear/COW (and the GDN u-cache window reset) on the
+        forward stream, before the mamba layers read the pool, so the copies
+        don't race the scheduler copy stream.
 
         No-op unless this is an extend forward on a mamba model's target worker;
         COW/clear only happen at prefix match on extend.
@@ -1998,6 +1999,28 @@ class ModelRunner:
                     state_ids.ids(forward_batch.mamba_cow_src_indices),
                     state_ids.ids(forward_batch.mamba_cow_dst_indices),
                 )
+        gdn_ucache = self.token_to_kv_pool_allocator.state.pool.gdn_ucache
+        if gdn_ucache is not None and gdn_ucache.by_request_row:
+            from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+                reset_gdn_ucache_request_rows,
+            )
+
+            reset_gdn_ucache_request_rows(
+                buffers=gdn_ucache, request_rows=forward_batch.req_pool_indices
+            )
+        elif gdn_ucache is not None:
+            from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+                reset_gdn_ucache_cursors,
+            )
+
+            # Stays here, not in the GDN backend metadata: this is the one eager,
+            # forward-stream point every target extend passes, graphed or not.
+            reset_gdn_ucache_cursors(
+                buffers=gdn_ucache,
+                slots=self.runner_ids.state_ids(pool.state_sub_pool).ids(
+                    pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ),
+            )
         forward_batch.mamba_clear_indices = None
         forward_batch.mamba_cow_src_indices = None
         forward_batch.mamba_cow_dst_indices = None

@@ -333,11 +333,16 @@ class Envs:
     # TP1: the HC boundary at 33..N rows (N <= 128) takes the side-stream gate and the fused combine and next norm
     # that the gate rows above use, with the same arithmetic. 0 keeps the default path there.
     SGLANG_HC_FUSED_COMBINE_MAX_ROWS = EnvInt(0)
+    # TP1 with the HC macro, hc 4: the HC mix at 33..N rows (N capped by hc_mix_splitk's measured table) runs the
+    # CuTe split-K silu down and a fused Triton up/gate (not bitwise to the torch.compile chain). 0 keeps that chain.
+    SGLANG_HC_MIX_SPLITK_MAX_ROWS = EnvInt(0)
     SGLANG_ENABLE_PLE_STATE_INDEX_MASK = EnvBool(False)
     # Prefill depthwise-convolution output tokens per call; zero keeps stock.
     SGLANG_PLE_PREFILL_CONV_CHUNK_SIZE = EnvInt(0)
     # Keep the frozen cluster path by default; opt in to native rows except M4.
     SGLANG_Q38C_HC_CLUSTER_M4ONLY = EnvBool(False)
+    # Q38C megakernel GDN target verify; its call sites still read it raw as "1".
+    SGLANG_Q38C_MK_GDN = EnvBool(False)
     # Experimental FN target router + input NVFP4 quantization, SM103 TP1/EP1.
     SGLANG_Q38_ROUTER_FRONT = EnvBool(False)
     SGLANG_Q38_ROUTER_HYBRID = EnvBool(False)
@@ -866,11 +871,39 @@ class Envs:
     # HiCache host<->device transfers use the TMA staging kernel when the GPU
     # (sm_90+), row size and page size allow; set to 0 to force the register kernel.
     SGLANG_HICACHE_TMA_TRANSFER = EnvBool(True)
+    # CTA quotas of HiCache copies (CUDA); unset keeps the stock quota and kernel. KV: loads
+    # only. Mamba set: each state item is split over up to that many CTAs.
+    SGLANG_HICACHE_LOAD_BLOCK_QUOTA = EnvInt(None)
+    SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA = EnvInt(None)
+    SGLANG_HICACHE_MAMBA_BACKUP_BLOCK_QUOTA = EnvInt(None)
+    # GB of --hicache-size pinned to the Mamba host pool; the KV host pools split
+    # the rest (sglang#47867's --hicache-mamba-size-gb). Unset: split by device bytes.
+    SGLANG_HICACHE_MAMBA_SIZE_GB = EnvFloat(None)
+    # Load-back issues the Mamba state layers first, so a state copy-on-write
+    # before layer 0 waits for them alone, not for the whole load.
+    SGLANG_ENABLE_HICACHE_STATE_FIRST_LOAD = EnvBool(False)
+    # Pages must be at least this many bytes for the staged write-back to issue one
+    # cudaMemcpyBatchAsync instead of per-page cudaMemcpyAsync. None keeps the
+    # kernel's 128 KiB default; the JIT kernel reads it from the environment once,
+    # at first use (sgl-project/sglang#40910).
+    SGLANG_HICACHE_BATCH_COPY_THRESHOLD = EnvInt(None)
     # Base token count for each MLA/DSA dedup broadcast chunk.
     SGLANG_MLA_DEDUP_CHUNK_TOKENS = EnvInt(2048)
     SGLANG_HICACHE_HF3FS_CONFIG_PATH = EnvStr(None)
     SGLANG_HICACHE_DECODE_OFFLOAD_STRIDE = EnvInt(None)
     SGLANG_HICACHE_SKIP_HOST_DUPLICATE_RECLAIM = EnvBool(False)
+    # Write-back eviction waits once per walk for its victims' copies, not once
+    # per victim; sgl-project/sglang#46930. Needs a TreeCore with its binding.
+    SGLANG_HICACHE_WRITE_BACK_BATCHED_EVICTION = EnvBool(False)
+    # Write-back: copy a device-only Mamba state to host before its device slot
+    # is dropped, also on nodes whose Full KV is already on host (Rust TreeCore).
+    SGLANG_HICACHE_KEEP_BACKED_MAMBA_STATES = EnvBool(False)
+    # When a session's next request arrives, rank its finished sub-agent
+    # sessions' nodes first for host eviction (Rust TreeCore; needs the
+    # frontend's parent_session_id).
+    SGLANG_HICACHE_SUBAGENT_HOST_EVICT_FIRST = EnvBool(False)
+    # Seconds between cumulative residency-counter log lines; 0 disables them.
+    SGLANG_HICACHE_RESIDENCY_LOG_INTERVAL = EnvInt(300)
     SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR = EnvStr(None)
     # File-backend LRU eviction (opt-in; sizes accept SI/IEC suffixes, "0" disables).
     SGLANG_HICACHE_FILE_BACKEND_MAX_SIZE = EnvStr(None)
@@ -1321,6 +1354,19 @@ class Envs:
     # Re-enable PDL for FlashInfer trtllm-gen MoE ops on SM107, where FlashInfer
     # forces it off: off | all | comma list of fp4, fp8_block, fp8_tensor, bf16, mxint4.
     SGLANG_TRTLLM_MOE_SM107_PDL = EnvStr("all")
+    # Qwen3.8 NVFP4 decode MoE (512 experts, top-10, TP1): one kernel computes the routing,
+    # the trtllm-gen routing metadata and the activation quant; FlashInfer's routing kernel is skipped.
+    SGLANG_ENABLE_Q38_FUSED_ROUTING = EnvBool(False)
+    # Row cap of that path, at most 512; 33-512 rows run its thread-block-cluster kernel.
+    SGLANG_Q38_FUSED_ROUTING_MAX_ROWS = EnvInt(32)
+    # Qwen3.8 decode-graph heads, each bit-identical to the torch ops it replaces (read raw at
+    # import by the modules that use them): the MTP draft lookup at any batch (needs
+    # SGLANG_Q38C_LOOKUP_NATIVE), the MTP draft-extend seed capture, the target-verify PLE
+    # layout, and the attention output gate inside the QSA pool-decode merge.
+    SGLANG_ENABLE_QSA_MTP_LOOKUP_BATCHED = EnvBool(False)
+    SGLANG_ENABLE_QSA_MTP_CAPTURE_BATCHED = EnvBool(False)
+    SGLANG_ENABLE_Q38_PLE_VERIFY_PREPARE_BATCHED = EnvBool(False)
+    SGLANG_ENABLE_QSA_POOL_MERGE_GATE = EnvBool(False)
     # Use FlashInfer's fused atomic CUTLASS/CuTe DSL MoE finalize.
     SGLANG_FLASHINFER_MOE_FUSED_FINALIZE = EnvBool(False)
     # Experimental Nemotron small-M NVFP4 path; validated only on SM120.
@@ -1531,9 +1577,18 @@ class Envs:
     # SM107, cutedsl backend with split-K: small-M BF16 GEMMs listed in sm107_bf16_smallm.ROUTES run as one kernel
     # whose output bits equal the stock dispatch's.
     SGLANG_ENABLE_SM107_BF16_SMALLM_ROUTES = EnvBool(False)
+    # With the routes above: also serve sm107_bf16_smallm.NONBITWISE_ROUTES, whose outputs differ from the stock
+    # dispatch's in FP32 summation order only; each key is checked at load against a relative-L2 bound.
+    SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_ROUTES = EnvBool(False)
+    # With the routes above: also serve sm107_bf16_smallm.NONBITWISE_LOWM_ROUTES (out_proj/o_proj at M 4-16), checked
+    # and dropped key by key like NONBITWISE_ROUTES.
+    SGLANG_ENABLE_SM107_BF16_SMALLM_NONBITWISE_LOWM_ROUTES = EnvBool(False)
     # With the routes above: the shared expert's act_and_mul at 1-16 rows runs in its gate_up kernel's epilogue,
     # with the stock JIT act_and_mul's bits.
     SGLANG_ENABLE_SM107_SHARED_EXPERT_FUSED_ACT = EnvBool(False)
+    # JSON file of BF16 GEMM kernels pinned per (M, N, K), each checked bit-equal to the stock dispatch;
+    # see layers/bf16_gemm_pins.py. Unset: off.
+    SGLANG_BF16_GEMM_PIN_FILE = EnvStr(None)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
     # Cap the DeepGEMM masked grouped-GEMM per-expert padded capacity at
@@ -2040,6 +2095,16 @@ class Envs:
     # mamba pool ratio accordingly. Frees one resident slot per running request,
     # raising max_running_requests. Off = original locking + ratio (escape hatch).
     SGLANG_OPT_MAMBA_SKIP_DECODE_LOCK = EnvBool(False)
+    # Opt-in: store radix mamba checkpoints only in the hicache host pool.
+    # Matched prefixes and donated checkpoints then occupy no GPU mamba slot,
+    # so the pool ratio is the live slot plus the ping-pong slots extra-buffer
+    # still writes. Requires --enable-hierarchical-cache. Off keeps the
+    # donated GPU slot and the previous ratio.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # With host-only checkpoints, a request whose anchor is still loading for
+    # another request fetches its state at once when it needs no KV from host;
+    # off, its admission retries (and ends the batch) until that load is acked.
+    SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers
@@ -2557,6 +2622,9 @@ class Envs:
     # Score the MTP draft extend's rows four per request on the grouped4 kernel
     # (TP1, a window of four per request); other shapes keep per-row scoring.
     SGLANG_ENABLE_QSA_GROUPED4_DRAFT_EXTEND = EnvBool(False)
+    # The MTP draft extend's sparse attention on the target verify's FP8 pool-union path and its
+    # top-k on verify_topk (fast_topk's exact output); not bitwise for the draft (union FMHA rounding).
+    SGLANG_ENABLE_QSA_DRAFT_EXTEND_UNION = EnvBool(False)
     # Fold the relative prefill scorer's 1/sqrt(128) into its store instead of a
     # separate divide over the logits (bit-identical on CUDA).
     SGLANG_ENABLE_QSA_PREFILL_SCALE_FOLD = EnvBool(False)
@@ -2571,6 +2639,55 @@ class Envs:
     # Qwen3.5 and GDN
     SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV = EnvBool(True)
     SGLANG_GDN_REPLAYSSM_VERIFY_NUM_STAGES = EnvInt(3)
+    # --enable-gdn-replayssm-ucache under PD: set on both roles; the decode role runs the
+    # u-cache verify, the prefill role keeps the fp16 GDN state its transfers carry.
+    SGLANG_ENABLE_GDN_UCACHE_PD = EnvBool(False)
+    # --enable-gdn-replayssm-ucache: keep the ring's normalized keys in fp16 (SM107 kernel only),
+    # the same k-hat the verify's readout uses, instead of bf16.
+    SGLANG_ENABLE_GDN_UCACHE_FP16_KEY_RING = EnvBool(False)
+    # --enable-gdn-replayssm-ucache, SM107 flush kernel launch options (same results):
+    # read the packed post-conv q / k / v and the projection's b / a views in place,
+    SGLANG_ENABLE_GDN_UCACHE_STRIDED_QKV = EnvBool(False)
+    # launch it as a programmatic dependent of the conv before it,
+    SGLANG_ENABLE_GDN_UCACHE_PDL = EnvBool(False)
+    # and run the rows that fold their window first (one row order per verify).
+    SGLANG_ENABLE_GDN_UCACHE_FLUSH_FIRST = EnvBool(False)
+    # Admit Q38_GDN_FRONT=1 (the verify's fused projection / conv front; Q38_GDN_PDL is inert
+    # there) with the u-cache verify.
+    SGLANG_ENABLE_GDN_UCACHE_FRONT = EnvBool(False)
+    # --enable-gdn-replayssm-ucache: size the k / u / g rings and their cursors by request row
+    # (request-lifetime scratch, max running requests + 1 rows) instead of by Mamba slot, so the
+    # radix tree's cached slots carry no rings (SM107 kernel only; same results).
+    SGLANG_ENABLE_GDN_UCACHE_REQUEST_RINGS = EnvBool(False)
+    # Q38_GDN_FRONT target-verify conv (q38_gdn_front/conv.py) on a [rows, block_n] tile that
+    # loads every x row before its stores and writes a deduplicated window as one row a channel
+    # (same results); the config "block_n,num_warps[,rows[,prefetch]]" overrides the default.
+    SGLANG_ENABLE_GDN_VERIFY_CONV_RETILE = EnvBool(False)
+    SGLANG_GDN_VERIFY_CONV_RETILE_CONFIG = EnvStr(None)
+    # Q38_GDN_FRONT target-verify gated RMSNorm with more rows and warps per program, each row
+    # keeping its 16-lane x 8-element reduction (same results); verifies small enough for the
+    # stock 1-row launch (B1/B2) keep it. Config "rows,num_warps".
+    SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE = EnvBool(False)
+    SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG = EnvStr(None)
+    # --enable-gdn-replayssm-ucache with Q38_GDN_FRONT and the strided / PDL flush (SM107): the
+    # target-verify conv runs inside the u-cache flush kernel, each (key head, row) CTA convolving
+    # its own q / k / v channels before it reads them (same results); launches whose CTAs split a
+    # key head keep the separate conv.
+    SGLANG_ENABLE_GDN_UCACHE_FUSED_CONV = EnvBool(False)
+    # The same flush launch applies the verify's gated RMSNorm to its output before storing it
+    # (16-lane x 8-row partial sums, as the Triton norm reduces a 128-wide row; not shown bitwise).
+    SGLANG_ENABLE_GDN_UCACHE_FUSED_NORM = EnvBool(False)
+    # Verify batches above this keep the separate norm: measured VR200 chain, the fold is faster at
+    # B 32 / 48 and slower from B 60 (the per-head barrier sits on the flush's critical path).
+    SGLANG_GDN_UCACHE_FUSED_NORM_MAX_BATCH = EnvInt(48)
+    # Eager GDN prefill on FlashInfer: the chunked kernel's pool-row gather and index_copy_ back
+    # as one copy launch each, its int64 slots and cu_seqlens once per forward (same results).
+    SGLANG_ENABLE_GDN_PREFILL_FUSED_STATE_COPY = EnvBool(False)
+    # Eager GDN prefill: the prefix-cache track copies (conv window before the conv; checkpoint
+    # and final states after the chunked kernel) as one copy launch each (same results).
+    SGLANG_ENABLE_GDN_PREFILL_FUSED_TRACK = EnvBool(False)
+    # Largest target-verify batch (requests) the SGLANG_GDN_FUSED_VERIFY_GLUE kernel serves.
+    SGLANG_GDN_FUSED_VERIFY_GLUE_MAX_BS = EnvInt(4)
 
     # ===================================================================
     # Plugin system
@@ -2603,6 +2720,10 @@ class Envs:
     # Build a missing Rust extension from source (auto), require a bundled or
     # cached extension (never), or rebuild the local cache entry (force).
     SGLANG_RUST_BUILD_MODE = EnvStr("auto")
+    # A prebuilt TreeCore extension loaded in place of the bundled one, built
+    # from this package's commit; its SHA-256 is required and must match the file.
+    SGLANG_RUST_TREE_CORE_EXTENSION = EnvStr(None)
+    SGLANG_RUST_TREE_CORE_EXTENSION_SHA256 = EnvStr(None)
     # Most batched requests one /generate HTTP call may expand into.
     SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ = EnvInt(4096)
 

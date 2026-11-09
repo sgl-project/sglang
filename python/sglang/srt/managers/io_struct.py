@@ -181,6 +181,8 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
+    # The session that spawned this one (an agent's sub-agent); cache hints only.
+    parent_session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -965,6 +967,7 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
+            parent_session_id=self.parent_session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -1177,6 +1180,8 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # See GenerateReqInput.parent_session_id; a defaulted tail field.
+    parent_session_id: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

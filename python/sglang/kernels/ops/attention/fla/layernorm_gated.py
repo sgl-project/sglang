@@ -8,9 +8,11 @@
 
 from sglang.kernels.ops.extend_fastpath import GDN_NORM_ENABLED as _Q38C_EXTEND_PATH
 
+import logging
 import os
 from contextlib import nullcontext
 from functools import lru_cache
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -34,6 +36,7 @@ from sglang.srt.utils import (
     next_power_of_2,
 )
 
+logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
 
@@ -49,6 +52,44 @@ MAX_ROWS_PER_BLOCK = 4
 _GDN_FRONT_NORM = _Q38C_EXTEND_PATH
 NORM_BIG_ROWS = 32768
 NORM_BIG_CFG = (32, 4)  # (ROWS_PER_BLOCK, num_warps)
+
+
+# Measured on VR200 at verify rows B x 4 x 48, B 4-104; re-tune when the kernel changes.
+GDN_VERIFY_NORM_DEFAULT = (16, 8)  # (ROWS_PER_BLOCK, num_warps)
+
+
+def parse_verify_norm_cfg(*, enabled: bool, raw: Optional[str]) -> Optional[tuple]:
+    """SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG: "rows,num_warps". rows >= 2 * num_warps keeps
+    every 128-wide row on one warp's 16 lanes x 8 elements, the stock reduction order."""
+    if not enabled:
+        return None
+    if raw is None or not raw.strip():
+        return GDN_VERIFY_NORM_DEFAULT
+    rows, warps = (int(v) for v in raw.split(","))
+    if not (rows & (rows - 1) == 0 and warps & (warps - 1) == 0 and 1 <= warps <= 16
+            and 2 * warps <= rows <= 256):
+        raise ValueError(
+            "SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG: rows and num_warps powers of 2 with "
+            f"2 * num_warps <= rows <= 256, got {raw!r}"
+        )
+    return rows, warps
+
+
+def _verify_norm_cfg_from_env() -> Optional[tuple]:
+    from sglang.srt.environ import envs
+
+    cfg = parse_verify_norm_cfg(
+        enabled=envs.SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE.get(),
+        raw=envs.SGLANG_GDN_VERIFY_NORM_RETILE_CONFIG.get(),
+    )
+    if cfg is not None and (_is_npu or not _Q38C_EXTEND_PATH):
+        # only the CUDA extend-fast-path _layer_norm_fwd takes a launch config
+        logger.warning(
+            "SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE needs SGLANG_Q38C_EXTEND_FASTPATH=1 "
+            "(and the GDN front norm on); the verify norm keeps the stock launch"
+        )
+        return None
+    return cfg
 
 
 def rms_norm_ref(
@@ -563,6 +604,56 @@ def rms_norm_gated(
         activation=activation,
     )
     return y.reshape(x_shape_og)
+
+
+GDN_VERIFY_NORM_CFG = _verify_norm_cfg_from_env()
+_verify_norm_logged = False
+_verify_norm_stock_logged = False
+
+
+def gdn_verify_norm_retile_applies(x) -> bool:
+    """Whether GDN_VERIFY_NORM_CFG keeps the stock row reduction for x [rows, N]: only for
+    N == 128 where the stock launch holds >= 2 rows per program (8 elements x 16 lanes a row);
+    at 1 row per program (M <= 2 x SMs, verify B1/B2) a stock row is 4 elements x 32 lanes."""
+    global _verify_norm_stock_logged
+    if GDN_VERIFY_NORM_CFG is None or x.shape[-1] != 128:
+        return False
+    if calc_rows_per_block(x.shape[0], x.device) >= 2:
+        return True
+    if not _verify_norm_stock_logged:
+        _verify_norm_stock_logged = True
+        logger.info(
+            "SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE: stock launch kept at %d rows (1 row per "
+            "program), as at every verify this small",
+            x.shape[0],
+        )
+    return False
+
+
+def gdn_verify_norm_retiled(*, x, weight, z, eps, norm_before_gate, activation):
+    """``rms_norm_gated`` of a Q38_GDN_FRONT verify (x [rows, head_v_dim], z the 3-D strided
+    gate view, no bias, no groups) on GDN_VERIFY_NORM_CFG's launch: the same values per row."""
+    global _verify_norm_logged
+    if not _verify_norm_logged:
+        _verify_norm_logged = True
+        logger.info(
+            "SGLANG_ENABLE_GDN_VERIFY_NORM_RETILE engaged: rows_per_block, num_warps = %s, "
+            "first verify %d rows of %d",
+            GDN_VERIFY_NORM_CFG, x.shape[0], x.shape[1],
+        )
+    y, _, _ = _layer_norm_fwd(
+        x,
+        weight,
+        None,
+        eps,
+        z=z,
+        group_size=None,
+        norm_before_gate=norm_before_gate,
+        is_rms_norm=True,
+        activation=activation,
+        launch_cfg=GDN_VERIFY_NORM_CFG,
+    )
+    return y
 
 
 class LayerNormFn(torch.autograd.Function):

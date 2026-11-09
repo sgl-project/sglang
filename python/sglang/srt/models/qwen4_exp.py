@@ -41,6 +41,7 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.layers.hyperconnection import (
+    _HC_AR_COMBINE_NORM,
     GatedResidual,
     GroupedGemmaRMSNorm,
     HyperConnectionConfig,
@@ -98,6 +99,7 @@ from sglang.srt.models.qwen3_5 import (
     _qwen3_5_is_moe,
 )
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.models import qwen4_exp_ple_fused as _ple_fused
 from sglang.srt.models.qwen4_exp_ple_table import (
     allocate_ple_host_table,
     make_ple_file_prefetcher,
@@ -107,6 +109,7 @@ from sglang.srt.runtime_context import get_parallel, linear_attn_parallel_group
 from sglang.srt.utils import get_bool_env_var, is_hip, logger
 
 from sglang.kernels.ops.pdl_small import ENABLED as _PDL_SMALL
+from sglang.srt.models import qwen4_exp_ple_gather as _ple_gather
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
 
@@ -118,6 +121,18 @@ _Q38_ATTN_GATE_V2 = get_bool_env_var("Q38_ATTN_GATE_V2", "False")
 _Q38_QSA_PDL_INDEX = get_bool_env_var("Q38_QSA_PDL_INDEX", "False")
 _Q38_QSA_KV_PRESTORE = get_bool_env_var("SGLANG_QSA_QPF_KV_PRESTORE", "False")
 _Q38_MK_MTP = get_bool_env_var("SGLANG_Q38C_MK_MTP", "False")
+# SGLANG_QSA_PREFILL_TOPK_BRIDGE_DIRECT: see qsa_indexer.prefill_topk_output (read there too).
+_QSA_TOPK_BRIDGE_DIRECT = get_bool_env_var("SGLANG_QSA_PREFILL_TOPK_BRIDGE_DIRECT", "False")
+_QSA_TOPK_BRIDGE_LOGGED = [False]
+# SGLANG_PLE_PREFILL_FUSED_GATE: the prefill PLE gate after its reduction (scale, signed sqrt,
+# sigmoid, broadcast multiply by value) as one kernel (kernels/ops/elementwise/qwen4_gate.py).
+_PLE_PREFILL_FUSED_GATE = get_bool_env_var("SGLANG_PLE_PREFILL_FUSED_GATE", "False")
+# Opt-in, read once: target-verify PLE layout in one launch at any batch.
+_Q38_PLE_VERIFY_PREPARE_BATCHED = get_bool_env_var(
+    "SGLANG_ENABLE_Q38_PLE_VERIFY_PREPARE_BATCHED", "False"
+)
+# Opt-in, read once: pass the attention output gate to the QSA pool-decode merge.
+_QSA_POOL_MERGE_GATE = get_bool_env_var("SGLANG_ENABLE_QSA_POOL_MERGE_GATE", "False")
 
 
 def _mask_state_indices(
@@ -155,6 +170,36 @@ def _breakable_qsa_indexer(layer, hidden_states, positions, output):
     allocates a new bridge when ``output`` is None."""
     # Read the live batch on every replay of this eager break.
     forward_batch = get_tc_piecewise_forward_context().forward_batch
+    if output is not None and _QSA_TOPK_BRIDGE_DIRECT:
+        from sglang.srt.layers.attention.qsa.qsa_indexer import prefill_topk_output
+
+        # The selection writes the bridge's rows itself; rows past it end zero,
+        # as the stock fill_(0) + copy_ leaves them.
+        with prefill_topk_output(output):
+            topk = layer._compute_qsa_topk_indices_eager(
+                hidden_states=hidden_states,
+                positions=positions,
+                forward_batch=forward_batch,
+            )
+        if (
+            topk.data_ptr() == output.data_ptr()
+            and topk.shape[1] == output.shape[1]
+            and topk.shape[0] <= output.shape[0]
+        ):
+            if not _QSA_TOPK_BRIDGE_LOGGED[0]:
+                _QSA_TOPK_BRIDGE_LOGGED[0] = True
+                logger.info(
+                    "QSA prefill top-k written into the graph bridge "
+                    "(SGLANG_QSA_PREFILL_TOPK_BRIDGE_DIRECT; rows=%d of %d, width=%d)",
+                    topk.shape[0],
+                    output.shape[0],
+                    output.shape[1],
+                )
+            output[topk.shape[0] :].fill_(0)
+            return
+        output.fill_(0)
+        output[: topk.shape[0]].copy_(topk)
+        return
     topk = layer._compute_qsa_topk_indices_eager(
         hidden_states=hidden_states,
         positions=positions,
@@ -317,6 +362,18 @@ def _prepare_ple_batch(
                 ngram_context=mk_layout.ngram_context,
                 ngram_eos_token_id=ngram_eos_token_id,
             )
+    if _Q38_PLE_VERIFY_PREPARE_BATCHED:
+        batched = _try_prepare_ple_verify_batched(
+            tokens,
+            forward_batch,
+            mode,
+            physical_tokens=physical_tokens,
+            processed_tokens=processed_tokens,
+            ngram_size=ngram_size,
+            ngram_eos_token_id=ngram_eos_token_id,
+        )
+        if batched is not None:
+            return batched
     positions = torch.arange(processed_tokens, device=tokens.device, dtype=torch.long)
 
     if mode.is_target_verify():
@@ -446,6 +503,92 @@ def _prepare_ple_batch(
         ngram_context=ngram_context,
         ngram_eos_token_id=ngram_eos_token_id,
     )
+
+
+def _try_prepare_ple_verify_batched(
+    tokens: torch.Tensor,
+    forward_batch: ForwardBatch,
+    mode: ForwardMode,
+    *,
+    physical_tokens: int,
+    processed_tokens: int,
+    ngram_size: Optional[int],
+    ngram_eos_token_id: Optional[int],
+) -> Optional[_PLEBatch]:
+    """The target-verify branch of ``_prepare_ple_batch`` in one launch, bit-identical;
+    None (nothing launched) outside its contract, so the caller runs the torch ops."""
+    from sglang.kernels.ops.embeddings import qwen4_ple_verify_prepare as ple_prepare
+    from sglang.srt.layers.cp.utils import is_cp_active
+    from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
+
+    if not (
+        mode.is_target_verify()
+        and forward_batch.forward_mode.is_target_verify()
+        and not is_in_breakable_cuda_graph()
+        and get_parallel().pp_size == 1
+        and not is_cp_active(forward_batch)
+        and forward_batch.spec_info is not None
+        and ngram_size is not None
+        and ngram_eos_token_id is not None
+    ):
+        return None
+    width = int(forward_batch.spec_info.draft_token_num)
+    if width <= 0 or processed_tokens == 0 or processed_tokens % width:
+        return None
+    count = processed_tokens // width
+    pool = get_req_to_token_pool()
+    router = get_token_to_kv_pool().layer_router
+    view = router.part_view(NGRAM_PART)
+    if type(pool) is not HybridReqToTokenPool or view is None:
+        return None
+    requests = forward_batch.req_pool_indices[:count]
+    lengths = forward_batch.extend_seq_lens
+    if lengths is not None:
+        lengths = lengths[:count]
+    locations = forward_batch.out_cache_loc
+    if locations is not None:
+        locations = locations[:processed_tokens]
+    history = view.context
+    if not ple_prepare.can_prepare(
+        tokens,
+        lengths,
+        requests,
+        locations,
+        pool.req_index_to_mamba_index_mapping,
+        history,
+        width,
+        ngram_size,
+    ):
+        return None
+    # The torch branch waits here, before its history read.
+    router.wait_for_part(NGRAM_PART)
+    layout = ple_prepare.prepare_verify_layout(
+        tokens,
+        lengths,
+        requests,
+        locations,
+        pool.req_index_to_mamba_index_mapping,
+        history,
+        width,
+        ngram_eos_token_id,
+    )
+    batch = _PLEBatch(
+        mode=mode,
+        use_decode_fast_path=False,
+        physical_tokens=physical_tokens,
+        processed_tokens=processed_tokens,
+        lengths=layout.lengths,
+        row_width=width,
+        req_indices=layout.req_indices,
+        token_offsets=layout.token_offsets,
+        valid_tokens=layout.valid_tokens,
+        state_indices=layout.state_indices,
+        ngram_context=layout.ngram_context,
+        ngram_eos_token_id=ngram_eos_token_id,
+    )
+    # compute_ngram_ids' unfold + index for this batch, already written by the kernel.
+    pool.ple_window_cache = (batch, layout.contexts, None)
+    return batch
 
 
 def _commit_ple_batch(batch: Optional[_PLEBatch], forward_batch: ForwardBatch) -> None:
@@ -1065,6 +1208,19 @@ class Qwen4ExpPinnedHostEmbedding(VocabParallelEmbedding):
                     vocab_start=self.shard_indices.org_vocab_start_index,
                     vocab_end=self.shard_indices.org_vocab_end_index,
                 )
+            if _ple_gather.ROWS:
+                _ple_gather.gather_rows(
+                    weight_ptr=self.weight.data_ptr(),
+                    flat_ids=flat_ids,
+                    output=output,
+                    embedding_dim=self.embedding_dim,
+                    tp_vocab_start=self.shard_indices.org_vocab_start_index,
+                    tp_vocab_end=self.shard_indices.org_vocab_end_index,
+                    is_fp8=self.weight.dtype == torch.float8_e4m3fn,
+                    block_d=self._block_d,
+                    pdl_small=_PDL_SMALL,
+                )
+                return output
             _gather_ple_embedding_from_pinned_kernel[(flat_ids.numel(),)](
                 self.weight.data_ptr(),
                 flat_ids,
@@ -1221,6 +1377,34 @@ class Qwen4ExpPLELayer(nn.Module):
                 track_indices, _ = track
                 conv_state[track_indices] = next_state.to(dtype=conv_state.dtype)
             return F.silu(conv_output)
+
+        if _ple_fused.CONV_ENABLED and _ple_fused.conv_engages(
+            x,
+            batch,
+            forward_batch.extend_seq_lens_cpu,
+            weight=(weight := self.conv1d.weight.to(dtype=x.dtype)),
+            conv_state=conv_state,
+            channels=self.conv_channels,
+            state_len=self.short_conv_state_len,
+        ):
+            # SGLANG_PLE_FUSED_EXTEND_CONV: stock's conv bytes from one launch over
+            # the token rows, without the padded [B, C, S + W] input.
+            state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
+            track = _ple_track_targets(forward_batch, batch)
+            offsets = (batch.lengths,) if track is None else (batch.lengths, track[1])
+            conv_tokens, states = _ple_fused.fused_short_conv_extend(
+                x,
+                state,
+                weight,
+                batch,
+                dilation=self.short_conv_dilation,
+                state_offsets=offsets,
+            )
+            del state
+            conv_state[batch.state_indices] = states[0].to(dtype=conv_state.dtype)
+            if track is not None:
+                conv_state[track[0]] = states[1].to(dtype=conv_state.dtype)
+            return F.silu(conv_tokens)
 
         state = conv_state.index_select(0, batch.state_indices).to(dtype=x.dtype)
         padded_seq = x.new_zeros(
@@ -1462,10 +1646,26 @@ class Qwen4ExpPLELayer(nn.Module):
             and batch.mode.is_target_verify()
             and can_fuse_qwen4_gate_reduce(key_normed, query_normed, value)
         )
+        fused_gate_post = False
         if fused_gate_reduce:
             gated_value = fused_qwen4_gate_reduce(key_normed, query_normed, value)
         else:
             gate = (key_normed * query_normed).sum(dim=-1, keepdim=True)
+            if _PLE_PREFILL_FUSED_GATE and not batch.use_decode_fast_path:
+                from sglang.kernels.ops.elementwise.qwen4_gate import (
+                    can_fuse_qwen4_gate_post,
+                    fused_qwen4_gate_post,
+                    qwen4_gate_post_ready,
+                )
+
+                # The reduction above stays torch's; the rest of the chain is one
+                # kernel, bitwise to it (self-tested over every BF16 gate input).
+                fused_gate_post = can_fuse_qwen4_gate_post(
+                    gate, value
+                ) and qwen4_gate_post_ready(gate.device)
+        if fused_gate_post:
+            gated_value = fused_qwen4_gate_post(gate, value)
+        elif not fused_gate_reduce:
             gate = gate / math.sqrt(hidden_size)
             fused_gate_value = False
             if batch.use_decode_fast_path:
@@ -1553,6 +1753,8 @@ class _HCNorms:
     ffn_partials: Optional[torch.Tensor] = None
     output: Optional[torch.Tensor] = None
     output_partials: Optional[torch.Tensor] = None
+    # The next read's module: with the one-launch HC boundary its mix runs inside this layer's FFN write-back.
+    next_mix: Optional[GatedResidual] = None
 
 
 def _has_ple(layer_id, config) -> bool:
@@ -1693,6 +1895,7 @@ class Qwen4ExpLayerExtensionMixin:
                 ffn_combine=self._ffn_combine,
                 # The PLE embedding is computed for every row.
                 attn_reads_every_row=_has_ple(layer_id, config),
+                **self._combines_owing_sum(),
             ).residual_ops(),
             linear_attention=linear_attention,
         )
@@ -1719,13 +1922,14 @@ class Qwen4ExpLayerExtensionMixin:
 
     @contextmanager
     def hc_norms(
-        self, normalized_input, next_norm, partials=None, next_inject_weight=None
+        self, normalized_input, next_norm, partials=None, next_inject_weight=None, next_mix=None
     ):
         norms = _HCNorms(
             attn_input=normalized_input,
             next_norm=next_norm,
             attn_partials=partials if normalized_input is not None else None,
             next_inject_weight=next_inject_weight if next_norm is not None else None,
+            next_mix=next_mix if next_norm is not None else None,
         )
         # A prepared norm can only follow its residual without row movement.
         self._hc_norms = (
@@ -1772,8 +1976,66 @@ class Qwen4ExpLayerExtensionMixin:
             self._hc_norms.ffn_input,
             self._hc_norms.ffn_partials,
         ) = self.attn_hyper_connection.combine_and_normalize(
-            hidden_states, residuals, mlp_hc.hc_norm, mlp_hc.block_inject_weight.weight
+            hidden_states,
+            residuals,
+            mlp_hc.hc_norm,
+            mlp_hc.block_inject_weight.weight,
+            next_mix=mlp_hc,
         )
+        return hidden_states
+
+    def _combines_owing_sum(self) -> dict:
+        """SGLANG_HC_AR_COMBINE_NORM: write-backs that complete their input's
+        TP all-reduce themselves; none otherwise, which keeps the stages stock."""
+        parallel = get_parallel()
+        if not (_HC_AR_COMBINE_NORM and parallel.tp_size > 1):
+            return {}
+        from sglang.kernels.ops.communication import hc_all_reduce_combine_norm
+
+        # The JIT build runs here, before any rank can reach a fused call.
+        hc_all_reduce_combine_norm.warmup_on_all_ranks(
+            group=parallel.tp_group,
+            world_sizes=(parallel.tp_size, parallel.attn_tp_size, parallel.moe_tp_size),
+        )
+        return dict(
+            attn_combine_owing_sum=self._attn_combine_owing_sum,
+            ffn_combine_owing_sum=self._ffn_combine_owing_sum,
+        )
+
+    def _attn_combine_owing_sum(self, hidden_states, residuals, coordinator):
+        """_attn_combine of an output that still owes its sum; None, with
+        nothing launched, where the fused kernel does not apply."""
+        if self._hc_norms is None:
+            return None
+        result = self.attn_hyper_connection.all_reduce_combine_and_normalize(
+            hidden_states,
+            residuals,
+            self.mlp_hyper_connection.hc_norm,
+            coordinator,
+            site=f"attn{self.layer_id}",
+        )
+        if result is None:
+            return None
+        hidden_states, self._hc_norms.ffn_input, self._hc_norms.ffn_partials = result
+        return hidden_states
+
+    def _ffn_combine_owing_sum(self, hidden_states, residuals, coordinator):
+        """_ffn_combine of an output that still owes its sum; None, with
+        nothing launched, where the fused kernel does not apply."""
+        if self._hc_norms is None or (
+            self._shared_out_on and self.mlp._q38_shared_pending is not None
+        ):
+            return None
+        result = self.mlp_hyper_connection.all_reduce_combine_and_normalize(
+            hidden_states,
+            residuals,
+            self._hc_norms.next_norm,
+            coordinator,
+            site=f"ffn{self.layer_id}",
+        )
+        if result is None:
+            return None
+        hidden_states, self._hc_norms.output, self._hc_norms.output_partials = result
         return hidden_states
 
     def _ffn_mix(self, residual):
@@ -1828,6 +2090,7 @@ class Qwen4ExpLayerExtensionMixin:
         ) = self.mlp_hyper_connection.combine_and_normalize(
             hidden_states, residuals, self._hc_norms.next_norm,
             self._hc_norms.next_inject_weight,
+            next_mix=self._hc_norms.next_mix,
         )
         return hidden_states
 
@@ -2305,6 +2568,11 @@ class Qwen4ExpAttentionDecoderLayer(
             and q.is_cuda and q.dtype == torch.bfloat16 and q.shape[0] == 4
             and forward_batch.forward_mode.is_target_verify()):
             attention_kwargs["q38_output_gate"] = gate
+        elif (_QSA_POOL_MERGE_GATE and gate is not None and self.is_qsa
+              and q.is_cuda and q.dtype == torch.bfloat16
+              and forward_batch.forward_mode.is_target_verify()):
+            # Only the pool-decode merge consumes it (and says so); others leave it to us.
+            attention_kwargs["q38_output_gate"] = gate
         attn_output = self.attn(q, k, v, forward_batch, **attention_kwargs)
         gate_applied = False
         if isinstance(attn_output, tuple):
@@ -2464,15 +2732,18 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                         )
             next_norm = None
             next_inject_weight = None
+            next_mix = None
             if i + 1 < self.end_layer:
                 next_layer = self.layers[i + 1]
                 if next_layer.ple is None:
                     next_hc = next_layer.attn_hyper_connection
                     next_norm = next_hc.hc_norm
                     next_inject_weight = next_hc.block_inject_weight.weight
+                    next_mix = next_hc
             elif self.pp_group.is_last_rank:
                 # The terminal mix has no gate, so no partials to prepare.
                 next_norm = self.hyper_connection_mixer.hc_norm
+                next_mix = self.hyper_connection_mixer
             with (
                 get_global_expert_distribution_recorder().with_current_layer(i),
                 layer.hc_norms(
@@ -2480,6 +2751,7 @@ class Qwen4ExpModel(Qwen3_5ForCausalLM):
                     next_norm,
                     partials=gate_partials,
                     next_inject_weight=next_inject_weight,
+                    next_mix=next_mix,
                 ) as norms,
             ):
                 hidden_states = layer(

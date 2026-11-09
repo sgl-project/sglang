@@ -312,7 +312,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_post_process_pass(server_args, resolve_boundary_reduction)
 
     # After the speculative hook so speculative_algorithm is final.
+    from sglang.srt.arg_groups.attention_hook import (
+        handle_gdn_replayssm_ucache_spec_shape,
+    )
     from sglang.srt.arg_groups.layernorm_sp_hook import handle_layernorm_sp
+
+    run_hook(handle_gdn_replayssm_ucache_spec_shape, server_args)
 
     run_hook(handle_layernorm_sp, server_args)
 

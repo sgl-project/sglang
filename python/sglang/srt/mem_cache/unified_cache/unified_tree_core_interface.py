@@ -397,6 +397,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def mark_write_back_queued(
+        self, node_id: NodeId, copied: Sequence[NodeId] = ()
+    ) -> int:
+        """Queue a victim of the running write-back eviction walk for its
+        demote. It keeps its device slots until then, but the walk counts it
+        as demoted. ``copied`` lists the nodes its queued copy covers; their
+        host-duplicate entries update now, as that copy's ack would have.
+        Returns the Full tokens its demote reclaims."""
+        ...
+
+    @abstractmethod
     def demote(self, node_id: NodeId) -> DemoteResult:
         """Demote a backed-up node: drop its device value after a successful backup."""
         ...

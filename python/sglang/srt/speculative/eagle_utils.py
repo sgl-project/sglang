@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.ops.sampling import softmax as sampling_softmax
 from sglang.kernels.ops.sampling.renorm import top_k_renorm_prob, top_p_renorm_prob
 from sglang.kernels.ops.speculative import multi_cta_verify_sampling
+from sglang.kernels.ops.speculative.row_argmax import SPEC_ROW_ARGMAX, spec_row_argmax
 from sglang.kernels.ops.speculative.spec_tree import (
     TreeMaskMode,
     build_tree_kernel_efficient_func,
@@ -585,6 +586,8 @@ def _target_argmax(
     logits: torch.Tensor, vocab_shard: Optional[VocabShard]
 ) -> torch.Tensor:
     if vocab_shard is None:
+        if SPEC_ROW_ARGMAX:
+            return spec_row_argmax(logits, "verify target")
         return torch.argmax(logits, dim=-1)
     from sglang.srt.runtime_context import get_parallel
 

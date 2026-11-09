@@ -15,6 +15,8 @@ from typing import Any, Dict, Optional, Sequence, Tuple
 
 import msgspec
 
+from sglang.srt.environ import envs
+
 # The part every token KV view holds today; derived parts get their own names.
 KV_PART = "kv"
 # A request's recurrent state, one slot per request, in the state sub-pool.
@@ -260,8 +262,26 @@ class KVLayerRouter:
         layer on this stage (a pipeline stage without state layers) waits for
         nothing."""
         layer_ids = self._part_layer_ids[part]
-        if layer_ids:
-            self._wait(layer_ids[-1], part)
+        if not layer_ids:
+            return
+        if part == STATE_PART and self._wait_state_first():
+            return
+        self._wait(layer_ids[-1], part)
+
+    def _wait_state_first(self) -> bool:
+        """Waits for a state-first load-back's state part alone; False to wait for
+        the last layer."""
+        if not (
+            self._parts_load_layer_wise
+            and envs.SGLANG_ENABLE_HICACHE_STATE_FIRST_LOAD.get()
+        ):
+            return False
+        # Only cache_controller.LayerDoneCounter records a state part; the external
+        # linker's LayerWiseLoadCounter does not.
+        wait_for_state = getattr(
+            self._pool.layer_transfer_counter, "wait_for_state", None
+        )
+        return wait_for_state is not None and wait_for_state()
 
     def _wait(self, layer_id: int, part: str) -> None:
         counter = self._pool.layer_transfer_counter

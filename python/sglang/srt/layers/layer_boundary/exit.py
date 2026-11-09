@@ -43,6 +43,7 @@ from sglang.srt.layers.layer_boundary.ops import (
     all_reduce_to_dp_local,
     dp_reduce_scatter,
     dp_reduce_scatterv,
+    keep_output,
     sum_output,
     to_dp_local,
 )
@@ -368,6 +369,25 @@ class ExitPolicy:
         chosen: the sum the output owes, the move back to where the next layer
         reads it, then the write-back into the residual for a layer that does
         it itself."""
+        if (
+            owes_sum
+            and update is not None
+            and update.applied_at_exit
+            and residual is not None
+            and steps.output.sum_impl is None
+            and steps.output.transform is None
+            and not steps.returns_over_dp
+            and dp_step is None
+            and output_move is keep_output
+        ):
+            # A write-back that completes the sum itself (gated HC, decode).
+            update_owing_sum = getattr(update, "update_owing_sum", None)
+            if update_owing_sum is not None:
+                combined = update_owing_sum(
+                    hidden_states, residual, steps.output.group, forward_batch
+                )
+                if combined is not None:
+                    return combined, None
         if owes_sum and steps.output.sum_impl is not None:
             if steps.output_move_completes_sum or dp_step is not None:
                 raise NotImplementedError(

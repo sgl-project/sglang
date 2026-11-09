@@ -488,6 +488,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -529,6 +530,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -603,6 +605,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
@@ -644,6 +647,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )

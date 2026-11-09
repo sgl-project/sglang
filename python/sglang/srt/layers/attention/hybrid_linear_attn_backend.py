@@ -21,6 +21,9 @@ from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     SharedReadEnds,
 )
+from sglang.srt.layers.attention.linear.gdn_replayssm_ucache import (
+    commit_gdn_ucache_cursors,
+)
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.attention.mamba.mamba import MambaMixer2
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
@@ -1617,14 +1620,43 @@ class HybridLinearAttnBackend(AttentionBackend):
             )
             return
 
-        scatter_mamba_states_after_mtp_verify(
-            mamba_caches,
-            state_indices_tensor,
-            last_correct_step_indices,
-            mamba_track_indices,
-            mamba_steps_to_track,
-            src_indices_raw=src_indices_raw,
-        )
+        if mamba_pool.gdn_ucache is not None:
+            # The u-cache ring owns the SSM rollback: no intermediate_ssm to scatter.
+            assert mamba_track_indices is None, "u-cache verify tracks no decode state"
+            commit_gdn_ucache_cursors(
+                buffers=mamba_pool.gdn_ucache,
+                slots=state_indices_tensor,
+                # Linear chain only, so the last accepted step + 1 counts the bonus.
+                num_accept_tokens=last_correct_step_indices + 1,
+                request_rows=(
+                    req_pool_indices[:request_number]
+                    if mamba_pool.gdn_ucache.by_request_row
+                    and req_pool_indices is not None
+                    else None
+                ),
+            )
+            # Per-conv-type scatter (as the ReplaySSM spec commit does): with no
+            # track rows it is cheaper than the single-launch multi-pair kernel.
+            for conv_states, intermediate_conv_window in zip(
+                mamba_caches.conv, mamba_caches.intermediate_conv_window
+            ):
+                if conv_states.numel() > 0:
+                    fused_conv_window_scatter_with_mask(
+                        conv_states,
+                        intermediate_conv_window,
+                        state_indices_tensor,
+                        last_correct_step_indices,
+                        src_indices_raw,
+                    )
+        else:
+            scatter_mamba_states_after_mtp_verify(
+                mamba_caches,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+                src_indices_raw=src_indices_raw,
+            )
 
         self._update_ple_state_after_mtp_verify(
             state_indices_tensor,

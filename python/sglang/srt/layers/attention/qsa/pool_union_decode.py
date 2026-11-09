@@ -42,6 +42,7 @@ from sglang.srt.layers.attention.qsa.pool_decode import (
     _num_sms,
     _qsa_write_new_kv,
 )
+from sglang.srt.layers.attention.qsa.pool_decode import FUSED_FP8_KV_WRITE, write_new_kv_e4m3
 
 logger = logging.getLogger(__name__)
 
@@ -58,11 +59,11 @@ def _env_num(name: str, default, cast):
 # Read once at import, like the backend's other QSA switches; off by default.
 ENABLED = _env_flag("SGLANG_QSA_FP8_POOL_VERIFY")
 # Below 64 rows the union kernel's fixed ~15 us (kernel U) loses to the stock chain
-# (faster than the dense path from ~16 rows upward in a microbenchmark).
+# (cae28c66 microbench on VR200: 1.29x at 16 rows, 0.68x at 64, 0.51x at 160, 0.43x at 416).
 MIN_ROWS = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_MIN_ROWS", 64, int)
 # Arbitrary cap at the grouped verify scorer's 576 rows; nothing in the kernels depends on it.
 MAX_ROWS = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_MAX_ROWS", 576, int)
-# Best of 24 launch configs measured at 43, 86 and 128 requests; waves None
+# Best of 24 launch configs measured at 43, 86 and 128 requests on VR200 (212 SMs); waves None
 # picks the split count per batch (choose_union_splits).
 LAUNCH = dict(
     bn=_env_num("SGLANG_QSA_FP8_POOL_VERIFY_BN", 128, int),
@@ -70,6 +71,9 @@ LAUNCH = dict(
     num_warps=_env_num("SGLANG_QSA_FP8_POOL_VERIFY_WARPS", 8, int),
     num_stages=_env_num("SGLANG_QSA_FP8_POOL_VERIFY_STAGES", 3, int),
 )
+# Warps of kernel U (each request's token union); its output does not depend on them. 16 is
+# 1-3 us per layer faster than 8 at 44-64 requests on VR200 (H452 microbench); 8 is the default.
+UNION_WARPS = _env_num("SGLANG_QSA_FP8_POOL_VERIFY_UNION_WARPS", 8, int)
 _LOGGED_ROWS: set = set()
 
 
@@ -90,7 +94,7 @@ def log_engaged(rows: int, width: int, kv_heads: int, device) -> None:
     _LOGGED_ROWS.add(rows)
     logger.info(
         "SGLANG_QSA_FP8_POOL_VERIFY engaged rows=%d width=%d requests=%d splits=%d "
-        "bn=%d warps=%d stages=%d rows_range=%d-%d",
+        "bn=%d warps=%d stages=%d rows_range=%d-%d union_warps=%d",
         rows,
         width,
         rows // width,
@@ -100,6 +104,7 @@ def log_engaged(rows: int, width: int, kv_heads: int, device) -> None:
         LAUNCH["num_stages"],
         MIN_ROWS,
         MAX_ROWS,
+        UNION_WARPS,
     )
 
 
@@ -365,7 +370,7 @@ def choose_union_splits(requests, kv_heads, sms, waves=None):
     """Splits of a request's token list. With waves, requests * kv_heads * splits ~ waves * SMs.
     Without: two splits once the (request, head) pairs exceed the SMs; below that, the split
     count with the least wave-quantized work per CTA, each split charged 10% for its merge and
-    q load. Picks measured fastest at 43, 64, 86, 104, 128 and 144 requests."""
+    q load. Picks (VR200, 212 SMs) measured fastest at 43, 64, 86, 104, 128 and 144 requests."""
     pairs = max(1, requests * kv_heads)
     if waves is not None:
         return max(1, min(16, round(waves * sms / pairs)))
@@ -423,7 +428,9 @@ def qsa_pool_union_decode(
     assert k_new.stride(-1) == 1 and k_new.shape[-1] * k_new.shape[-2] == kv_heads * dim
     kv_fp8 = k_cache.dtype == torch.float8_e4m3fn
     if kv_fp8:
-        assert k_new.dtype == v_new.dtype == k_cache.dtype == v_cache.dtype
+        assert k_new.dtype == v_new.dtype == k_cache.dtype == v_cache.dtype or (
+            FUSED_FP8_KV_WRITE and k_new.dtype == v_new.dtype == torch.bfloat16 and k_cache.dtype == v_cache.dtype
+        )
         assert q.dtype == torch.bfloat16
     if out is None:
         out = torch.empty(rows, qh * dim, dtype=q.dtype, device=q.device)
@@ -447,9 +454,12 @@ def qsa_pool_union_decode(
     if write_new_kv:
         nk = k_new.reshape(rows, kv_heads * dim) if k_new.dim() == 3 else k_new
         nv = v_new.reshape(rows, kv_heads * dim) if v_new.dim() == 3 else v_new
-        _qsa_write_new_kv[(rows, kv_heads)](
-            k_cache, v_cache, nk, nv, loc, nk.stride(0), nv.stride(0), kv_heads, dim, pdl, num_warps=1, **pdl_kw
-        )
+        if nk.dtype != k_cache.dtype:  # SGLANG_QSA_FUSED_FP8_KV_WRITE: BF16 rows, cast in the write
+            write_new_kv_e4m3(k_cache, v_cache, nk, nv, loc, rows, kv_heads, dim, pdl, pdl_kw)
+        else:
+            _qsa_write_new_kv[(rows, kv_heads)](
+                k_cache, v_cache, nk, nv, loc, nk.stride(0), nv.stride(0), kv_heads, dim, pdl, num_warps=1, **pdl_kw
+            )
     _qsa_union_tokens[(requests,)](
         block_indices,
         block_indices.stride(0),
@@ -471,7 +481,7 @@ def qsa_pool_union_decode(
         nt,
         tb,
         pdl,
-        num_warps=8,
+        num_warps=UNION_WARPS,
         **pdl_kw,
     )
     LAST_KERNEL["union"] = _qsa_pool_union_splitk[(requests, kv_heads, splits)](
