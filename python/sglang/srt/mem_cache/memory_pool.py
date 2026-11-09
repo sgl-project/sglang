@@ -2947,6 +2947,31 @@ class MHATokenToKVPool(KVCache, MHAKVView):
             )
             return
 
+        if (
+            self.kv_cache_layout == "vectorized_5d"
+            and not self.use_hnd
+            and dcp_kv_mask is None
+            and cache_k.dtype != self.dtype
+            and self.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        ):
+            # The 5D writer divides by the scales, saturates and casts as it
+            # writes, in place of the two divisions and two casts below.
+            from sglang.kernels.ops.kvcache.shuffle_5d_cache import (
+                launch_reshape_and_cache_shuffle_5d,
+            )
+
+            layer_idx = layer_id - self.start_layer
+            launch_reshape_and_cache_shuffle_5d(
+                cache_k,
+                cache_v,
+                self.k_buffer[layer_idx].view(self.dtype),
+                self.v_buffer[layer_idx].view(self.dtype),
+                loc,
+                k_scale=k_scale,
+                v_scale=v_scale,
+            )
+            return
+
         if cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
