@@ -793,6 +793,9 @@ class Scheduler(
 
         self.init_rank_consensus_checker()
 
+        # Init SLA dynamic batching
+        self.init_sla_constraint()
+
         self.is_initializing = False
         self.init_startup_timing_summary()
 
@@ -2931,6 +2934,348 @@ class Scheduler(
             record_step_time=RECORD_STEP_TIME,
         )
 
+    # =============================================================================
+    # SLA (Service Level Agreement) Constrained Dynamic Batching
+    # =============================================================================
+    #
+    # Reference:
+    #     Pang, Li, and Wang. "Optimizing LLM Inference Throughput via Memory-aware
+    #     and SLA-constrained Dynamic Batching", arXiv:2503.05248, 2025.
+    #
+    # Theoretical background:
+    #     Throughput Phi(t) is monotonically increasing with batch size b_t
+    #     but with diminishing marginal returns (concave: dPhi/db_t > 0,
+    #     d^2Phi/db_t^2 < 0). Decoding latency D(b_t) grows linearly with b_t.
+    #     Memory consumption M(b_t) scales linearly with both batch size and
+    #     sequence length due to KV cache overheads.
+    #
+    #     The online optimization problem at each scheduling step is:
+    #         max_{b_t}  Phi(t) = E[ T * lambda(t) / (tau_step(b_t) * n(b_t)) ]
+    #         s.t.  P(M(b_t) > M_max) <= epsilon_M     (memory soft constraint)
+    #               D(b_t) - D_SLA <= epsilon_D          (SLA hard constraint)
+    #               b_t in Z+
+    #
+    #     The optimal batch size is:
+    #         b* = min{ b_mem, b_SLA }
+    #     where b_mem is the memory-bounded batch size and
+    #     b_SLA is the latency-bounded batch size.
+    #
+    # Core algorithm:
+    #     Maintains a dynamic search space [b_low, b_high] and uses a binary-search-
+    #     like feedback mechanism with parameters alpha (interval width) and
+    #     delta (corrective step size) to keep decode latency within the target
+    #     SLA range [D_SLA - epsilon_D, D_SLA + epsilon_D].
+    # =============================================================================
+
+    # History tracking constants
+    SLA_LATENCY_HISTORY_MAXLEN = 100
+    SLA_BATCH_HISTORY_MAXLEN = 100
+    SLA_MIN_HISTORY_SAMPLES = 3
+    SLA_COLD_START_MIN_SAMPLES = 1
+
+    # Interval expansion constants
+    SLA_INTERVAL_MIN_MULTIPLIER = 2
+    SLA_INTERVAL_EXPAND_MULTIPLIER = 4
+
+    # Latency adjustment factors
+    SLA_SHRINK_FACTOR = 0.8
+    SLA_AGGRESSIVE_GROWTH_THRESHOLD = 0.5
+    SLA_MAX_GROWTH_FACTOR = 1.5
+    SLA_BASE_GROWTH_FACTOR = 1.0
+    SLA_WEIGHTED_LOW_FACTOR = 0.3
+    SLA_WEIGHTED_HIGH_FACTOR = 0.7
+
+    # Memory safety constants
+    SLA_MEMORY_SAFETY_FACTOR = 0.8
+    SLA_MAX_TOKENS_MULTIPLIER = 2
+    SLA_MIN_TOKENS_PER_REQ = 1
+
+    # Smoothing and tuning constants
+    SLA_DEFAULT_MAX_CHANGE = 30
+    SLA_ALPHA_DIVISOR = 2
+    SLA_BOUNDARY_BUFFER = 1
+    SLA_MIN_BATCH_SIZE = 1
+
+    # Token ratio adjustment constant
+    SLA_TOKEN_RATIO_BOOST = 1.2
+
+    def init_sla_constraint(self):
+        """Initialize SLA-constrained dynamic batching state.
+
+        Loads hyper-parameters from server_args corresponding to the paper's
+        notation:
+            - sla_latency  -> D_SLA (target decode latency)
+            - sla_epsilon  -> epsilon_D (SLA tolerance / absolute error)
+            - sla_alpha    -> alpha (minimum search-interval width)
+            - sla_sigma    -> delta (conservative corrective step size)
+            - batch_size_lower / batch_size_upper -> B_min / B_max
+
+        Initializes the search space [batch_lower_bound, batch_upper_bound],
+        latency history dequeues, and tracking variables for the online
+        SLA-constrained dynamic batching algorithm in the paper.
+
+        Returns immediately if enable_sla_constraint is False.
+        """
+        self.enable_sla_constraint = getattr(
+            self.server_args, "enable_sla_constraint", False
+        )
+        if not self.enable_sla_constraint:
+            return
+
+        # Load SLA parameters from server args
+        self.sla_latency = self.server_args.sla_latency
+        self.sla_epsilon = self.server_args.sla_epsilon
+        self.sla_alpha = self.server_args.sla_alpha
+        self.sla_sigma = self.server_args.sla_sigma
+        self.sla_max_change = self.server_args.sla_max_change_per_step
+
+        # Batch size bounds (with PP-aware limits)
+        self.batch_lower_bound = self.server_args.batch_size_lower
+        pp_max_micro_batch = get_parallel().pp_max_micro_batch_size
+        self.batch_upper_bound = min(
+            self.server_args.batch_size_upper,
+            self.max_running_requests,
+            pp_max_micro_batch if get_parallel().pp_size > 1 else float("inf"),
+        )
+        self.sla_pp_max_limit = pp_max_micro_batch if get_parallel().pp_size > 1 else None
+
+        # Ensure a minimum interval between lower and upper bounds
+        min_interval_size = self.sla_alpha * self.SLA_INTERVAL_MIN_MULTIPLIER
+        if self.batch_upper_bound <= self.batch_lower_bound + min_interval_size:
+            self.batch_upper_bound = self.batch_lower_bound + min_interval_size
+
+        # SLA latency bounds
+        self.sla_low = self.sla_latency - self.sla_epsilon
+        self.sla_high = self.sla_latency + self.sla_epsilon
+
+        # History tracking for statistics
+        self.latency_history = deque(maxlen=self.SLA_LATENCY_HISTORY_MAXLEN)
+        self.batch_history = deque(maxlen=self.SLA_BATCH_HISTORY_MAXLEN)
+
+        # Batch timing tracking
+        self.current_batch_start_time = None
+        self.current_decode_batch_size = 0
+        self._prev_effective_max_running = self.max_running_requests
+
+        # Growth rate and memory parameters
+        self.sla_max_growth_rate = getattr(self.server_args, "sla_max_growth_rate", 1.2)
+        self.sla_avg_tokens_per_req = getattr(
+            self.server_args, "sla_avg_tokens_per_req", 50
+        )
+
+        logger.info(
+            f"SLA constraint enabled: target={self.sla_latency}s, "
+            f"epsilon={self.sla_epsilon}, "
+            f"bounds=[{self.batch_lower_bound}, {self.batch_upper_bound}]"
+        )
+
+    def _get_recent_stats(self) -> Tuple[float, float]:
+        """Calculate recent average decode latency D(b_t) and average batch size.
+
+        Returns the statistics required by the SLA algorithm to
+        determine whether the current latency is above, below, or within
+        the target SLA range [D_SLA - epsilon_D, D_SLA + epsilon_D].
+        """
+        if (
+            len(self.batch_history) < self.SLA_MIN_HISTORY_SAMPLES
+            or len(self.latency_history) < self.SLA_MIN_HISTORY_SAMPLES
+        ):
+            return 0.0, self.batch_lower_bound
+
+        avg_latency = sum(self.latency_history) / len(self.latency_history)
+        avg_batch = sum(self.batch_history) / len(self.batch_history)
+        return avg_latency, avg_batch
+
+    def _update_sla_bounds(self) -> int:
+        """Update batch size bounds based on SLA latency constraints.
+
+        Implements the online SLA-constrained dynamic batching algorithm from the paper:
+        "Optimizing LLM Inference Throughput via Memory-aware and
+        SLA-constrained Dynamic Batching" (Pang et al., 2025).
+
+        The algorithm maintains a dynamic search space [b_low, b_high] and
+        adjusts it based on recent average decode latency D(b_t) relative
+        to the SLA target D_SLA with tolerance epsilon_D:
+            - High latency (D > D_SLA + epsilon_D): shrink upper bound
+              aggressively to restore SLA compliance.
+            - Low latency (D < D_SLA - epsilon_D): expand bounds to improve
+              GPU utilization, with aggressive or conservative growth.
+            - Within SLA range: fine-tune by tightening boundaries around
+              the current average batch size.
+
+        The optimal batch size is b* = min{b_mem, b_SLA}, where b_mem is
+        obtained from _get_memory_limited_batch_size() and b_SLA is the
+        value returned by this method.
+
+        Returns:
+            int: Recommended maximum batch size b_SLA for the next decode step.
+        """
+        if len(self.latency_history) < self.SLA_COLD_START_MIN_SAMPLES:
+            return self.max_running_requests
+
+        avg_latency, avg_batch = self._get_recent_stats()
+        memory_limited_bs = self._get_memory_limited_batch_size()
+        current_decode_bs = self.current_decode_batch_size
+
+        avg_batch = max(avg_batch, self.server_args.batch_size_lower)
+
+        # Adjust bounds based on latency
+        if avg_latency > self.sla_high:
+            # High latency: aggressive shrink to quickly restore SLA
+            self.batch_upper_bound = max(
+                int(avg_batch * self.SLA_SHRINK_FACTOR),
+                self.batch_lower_bound + self.sla_alpha,
+                current_decode_bs,
+            )
+            self.batch_lower_bound = max(
+                self.batch_lower_bound
+                - self.sla_sigma * self.SLA_INTERVAL_MIN_MULTIPLIER,
+                self.server_args.batch_size_lower,
+            )
+        elif avg_latency < self.sla_low:
+            # Low latency: expand batch size to improve GPU utilization
+            gap_ratio = (self.sla_low - avg_latency) / self.sla_latency
+
+            if gap_ratio > self.SLA_AGGRESSIVE_GROWTH_THRESHOLD:
+                # Aggressive growth: latency is well below target, plenty of headroom
+                growth_factor = min(
+                    self.SLA_MAX_GROWTH_FACTOR, self.SLA_BASE_GROWTH_FACTOR + gap_ratio
+                )
+                self.batch_lower_bound = min(
+                    int(avg_batch * growth_factor),
+                    self.batch_upper_bound - self.sla_alpha,
+                )
+                self.batch_upper_bound = min(
+                    int(self.batch_upper_bound * self.sla_max_growth_rate),
+                    memory_limited_bs,
+                )
+            else:
+                # Conservative linear growth
+                target_lower = min(
+                    int(avg_batch), self.batch_upper_bound - self.sla_alpha
+                )
+                self.batch_lower_bound = max(
+                    target_lower, self.server_args.batch_size_lower
+                )
+                self.batch_upper_bound = min(
+                    self.batch_upper_bound + self.sla_sigma, self.max_running_requests
+                )
+
+            # Ensure valid interval
+            if self.batch_upper_bound <= self.batch_lower_bound + self.sla_alpha:
+                self.batch_upper_bound = (
+                    self.batch_lower_bound
+                    + self.sla_alpha * self.SLA_INTERVAL_EXPAND_MULTIPLIER
+                )
+        else:
+            # Within SLA range: fine-tune, tightening boundaries around current average batch size
+            alpha_adj = self.sla_alpha // self.SLA_ALPHA_DIVISOR
+            self.batch_upper_bound = min(
+                int(avg_batch) + alpha_adj, self.max_running_requests
+            )
+            self.batch_lower_bound = max(
+                int(avg_batch) - alpha_adj, self.server_args.batch_size_lower
+            )
+
+        # Apply hard constraints: memory limit, max running requests, min batch size
+        self.batch_upper_bound = min(
+            self.batch_upper_bound, memory_limited_bs, self.max_running_requests
+        )
+        self.batch_lower_bound = max(
+            min(
+                self.batch_lower_bound,
+                self.batch_upper_bound - self.SLA_BOUNDARY_BUFFER,
+            ),
+            self.server_args.batch_size_lower,
+            self.SLA_MIN_BATCH_SIZE,
+        )
+
+        # Weighted average toward upper bound to improve GPU utilization
+        new_batch_size = int(
+            self.batch_lower_bound * self.SLA_WEIGHTED_LOW_FACTOR
+            + self.batch_upper_bound * self.SLA_WEIGHTED_HIGH_FACTOR
+        )
+        new_batch_size = max(new_batch_size, min(current_decode_bs, memory_limited_bs))
+        new_batch_size = min(new_batch_size, memory_limited_bs)
+
+        # Smooth with max change limit to prevent violent oscillation between boundaries
+        prev = getattr(self, "_prev_effective_max_running", new_batch_size)
+        max_change = getattr(self, "sla_max_change", self.SLA_DEFAULT_MAX_CHANGE)
+        new_batch_size = max(prev - max_change, min(new_batch_size, prev + max_change))
+        self._prev_effective_max_running = new_batch_size
+
+        # Debug logging
+        if get_parallel().tp_rank == 0 and self.metrics_reporter.enable_metrics:
+            gap_pct = ((self.sla_latency - avg_latency) / self.sla_latency) * 100
+            logger.info(
+                f"[SLA-Update] latency={avg_latency:.4f}s, target={self.sla_latency}s, "
+                f"gap={gap_pct:.1f}%, "
+                f"bounds=[{self.batch_lower_bound}, {self.batch_upper_bound}], "
+                f"final={new_batch_size}"
+            )
+
+        return new_batch_size
+
+    def _get_memory_limited_batch_size(self) -> int:
+        """Calculate the memory-bounded maximum batch size b_mem.
+
+        Estimates the maximum safe batch size based on available KV cache
+        memory. Corresponds to the memory constraint P(M(b_t) > M_max) <= epsilon_M
+        in the paper, using a conservative safety margin to prevent OOM.
+
+        Returns:
+            int: Maximum batch size b_mem limited by available token pool size.
+        """
+        available_tokens = self.req_to_token_pool.available_size()
+        avg_tokens_per_req = self.sla_avg_tokens_per_req
+
+        # Conservative memory estimation: account for safety margin
+        safe_available = int(available_tokens * self.SLA_MEMORY_SAFETY_FACTOR)
+
+        max_by_memory = int(
+            safe_available / max(avg_tokens_per_req, self.SLA_MIN_TOKENS_PER_REQ)
+        )
+
+        max_by_memory = min(max_by_memory, self.server_args.batch_size_upper)
+
+        return max(
+            self.server_args.batch_size_lower,
+            min(max_by_memory, self.max_running_requests),
+        )
+
+    def get_num_allocatable_reqs_sla(
+        self, running_bs: int, max_running_reqs: int
+    ) -> int:
+        """Calculate the number of allocatable requests considering SLA constraints.
+
+        Together with _get_memory_limited_batch_size(), this forms a "double guardrail"
+        memory safety mechanism, ensuring the optimal batch size b* = min{b_mem, b_SLA}
+        never exceeds either the latency SLA bound or the real-time memory capacity.
+
+        Args:
+            running_bs (int): Current number of running requests (batch size).
+            max_running_reqs (int): Maximum allowed running requests.
+
+        Returns:
+            int: Number of additional requests that can be allocated, clamped to non-negative.
+        """
+        # Base calculation: in PP mode both microbatch and max_running_reqs limits must be satisfied
+        if get_parallel().pp_size > 1:
+            base_limit = get_parallel().pp_max_micro_batch_size
+            effective_limit = min(base_limit, max_running_reqs)
+            res = effective_limit - running_bs
+        else:
+            res = max_running_reqs - running_bs
+
+        # Real-time memory hard constraint: cannot exceed current available token slots
+        available_tokens = self.req_to_token_pool.available_size()
+        min_tokens_per_req = self.sla_avg_tokens_per_req
+        max_new_by_memory = available_tokens // min_tokens_per_req
+
+        res = min(res, max_new_by_memory)
+        # Prevent negative values
+        return max(0, res)
+
     def init_req_max_new_tokens(self, req):
         input_len = len(req.origin_input_ids)
         max_new_tokens = (
@@ -4315,6 +4660,17 @@ class Scheduler(
             # A beam candidate owns beam_width rows once decoding.
             res = min(res, row_budget // beam_width)
 
+        # SLA: keep the architecture's own budgets and additionally respect
+        # the latency/memory bounded batch size.
+        if getattr(self, "enable_sla_constraint", False):
+            res = min(
+                res,
+                self.get_num_allocatable_reqs_sla(
+                    running_bs, self.max_running_requests
+                ),
+            )
+            res = max(0, res)
+
         return res
 
     def get_new_batch_prefill(self, running_batch: ScheduleBatch) -> NextBatchPlan:
@@ -4892,6 +5248,11 @@ class Scheduler(
         """Update the running decoding batch in place; None skips decode this step."""
         initial_bs = batch.batch_size()
 
+        # SLA: clear per-step timing state on every path, including early returns.
+        if getattr(self, "enable_sla_constraint", False):
+            self.current_batch_start_time = None
+            self.current_decode_batch_size = 0
+
         finishing_reqs = self._reqs_finishing_inflight(batch)
         batch.filter_batch(reqs_to_exclude=finishing_reqs)
         if batch.is_empty():
@@ -4975,6 +5336,25 @@ class Scheduler(
 
         if batch.is_empty():
             return batch
+
+        # SLA: adaptive decode batch-size limit and latency sampling. Placed
+        # after main's own resets so the flag is not overwritten.
+        if getattr(self, "enable_sla_constraint", False) and batch.forward_mode.is_decode():
+            sla_max_running_reqs = self._update_sla_bounds()
+            current_bs = batch.batch_size()
+            if current_bs > sla_max_running_reqs:
+                logger.warning(
+                    f"[SLA-Limit] bs={current_bs} > sla_max={sla_max_running_reqs}, marking batch full"
+                )
+                batch.batch_is_full = True
+                self.new_token_ratio_tracker.current = min(
+                    self.new_token_ratio_tracker.current * self.SLA_TOKEN_RATIO_BOOST,
+                    self.new_token_ratio_tracker.init,
+                )
+            else:
+                batch.batch_is_full = False
+            self.current_batch_start_time = time.perf_counter()
+            self.current_decode_batch_size = current_bs
 
         # Update batch tensors
         batch.prepare_for_decode()
@@ -5574,6 +5954,18 @@ class Scheduler(
         result: Union[GenerationBatchResult, EmbeddingBatchResult],
     ):
         self.deferred_responses.stream_released()
+
+        # SLA: record decode latency and batch size for adaptive control.
+        if (
+            getattr(self, "enable_sla_constraint", False)
+            and getattr(self, "current_batch_start_time", None) is not None
+            and batch.forward_mode.is_decode()
+        ):
+            latency = time.perf_counter() - self.current_batch_start_time
+            self.latency_history.append(latency)
+            self.batch_history.append(self.current_decode_batch_size)
+            self.current_batch_start_time = None
+
         # Flush async trace ops here: in overlap mode this CPU work runs while
         # the next batch's GPU forward is in flight, giving free overlap.
         flush_trace_batch(batch.reqs)
