@@ -77,6 +77,9 @@ class CanaryPDFixture(CanaryViolationAssertMixin, PDDisaggregationServerBase):
             prompts=prompts,
             max_new_tokens=max_new_tokens,
             timeout=timeout,
+            # Greedy gemma-4-E2B-it can stop at its first token on these prompts,
+            # leaving D no decode forward to verify the transferred KV on.
+            ignore_eos=self.model_mode == "swa",
         )
         if assert_all_success:
             for result in results:
