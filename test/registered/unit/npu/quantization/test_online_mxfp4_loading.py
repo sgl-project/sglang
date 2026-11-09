@@ -413,7 +413,7 @@ class TestOnlineMXFP4Loading(unittest.TestCase):
                         side_effect=quantize,
                     ) as convert,
                     patch(
-                        "sglang.srt.hardware_backend.npu.quantization.moe_methods.npu_format_cast",
+                        "sglang.srt.hardware_backend.npu.quantization.moe_utils.npu_format_cast",
                         side_effect=lambda x: x,
                     ),
                 ):

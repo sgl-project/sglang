@@ -11,6 +11,7 @@ import sglang.srt.layers.quantization  # noqa: F401
 from sglang.srt.hardware_backend.npu.moe.matmul import GroupedMatmulSwigluQuant
 from sglang.srt.hardware_backend.npu.quantization import (
     moe_methods,
+    moe_utils,
     online_moe_methods,
 )
 from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
@@ -80,7 +81,7 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                 patch.object(
                     online_moe_methods, "get_moe_runner_backend", return_value=backend
                 ),
-                patch.object(online_moe_methods, "MoeRunner") as runner,
+                patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as runner,
             ):
                 method = NPUW4A4MXFP4OnlineMoEMethod()
                 layer = torch.nn.Module()
@@ -115,7 +116,7 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
             patch.object(
                 online_moe_methods, "get_moe_runner_backend", return_value=backend
             ),
-            patch.object(online_moe_methods, "MoeRunner") as runner,
+            patch("sglang.srt.layers.moe.moe_runner.runner.MoeRunner") as runner,
         ):
             method = NPUW4A4MXFP4OnlineMoEMethod()
             layer = torch.nn.Module()
@@ -177,12 +178,12 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                         )
                     with (
                         patch.object(
-                            moe_methods, "npu_format_cast", side_effect=lambda x: x
+                            moe_utils, "npu_format_cast", side_effect=lambda x: x
                         ),
                         patch.object(
                             moe_methods,
                             "prepare_mxfp4_moe_weight",
-                            wraps=moe_methods.prepare_mxfp4_moe_weight,
+                            wraps=moe_utils.prepare_mxfp4_moe_weight,
                         ) as prepare,
                         patch.object(
                             method,
@@ -226,15 +227,15 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                 with (
                     self.subTest(w4a8=w4a8, explicit_format=npu_format is not None),
                     patch.object(
-                        moe_methods, "npu_format_cast", return_value=weight
+                        moe_utils, "npu_format_cast", return_value=weight
                     ) as cast,
                     patch.object(
-                        moe_methods, "_get_float4_e2m1fn_x2_dtype", return_value=296
+                        moe_utils, "_get_float4_e2m1fn_x2_dtype", return_value=296
                     ),
                 ):
                     if w4a8:
                         actual_weight, actual_scale = (
-                            moe_methods.prepare_w4a8_mxfp_weight(
+                            moe_utils.prepare_w4a8_mxfp_weight(
                                 weight, scale, npu_format=npu_format
                             )
                         )
@@ -244,7 +245,7 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
                         }
                     else:
                         actual_weight, actual_scale = (
-                            moe_methods.prepare_mxfp4_moe_weight(
+                            moe_utils.prepare_mxfp4_moe_weight(
                                 weight,
                                 scale,
                                 customize_dtype=None,
@@ -269,13 +270,46 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
         for customize_dtype in (None, torch.float8_e4m3fn):
             with (
                 self.subTest(dtype=customize_dtype),
-                patch.object(moe_methods, "npu_format_cast") as cast,
+                patch.object(moe_utils, "npu_format_cast") as cast,
             ):
                 with self.assertRaisesRegex(ValueError, "divisible by 2"):
-                    moe_methods.prepare_mxfp4_moe_weight(
+                    moe_utils.prepare_mxfp4_moe_weight(
                         weight, scale, customize_dtype=customize_dtype
                     )
                 cast.assert_not_called()
+
+    def test_w4a8_preparation_preserves_checkpoint_normalization(self):
+        weight = torch.arange(256).to(torch.uint8).reshape(1, 2, 128).view(torch.int8)
+        scale = torch.tensor([[[0.25, 0.5, 1.0, 2.0], [4.0, 8.0, 16.0, 32.0]]])
+        with (
+            patch.object(
+                moe_utils, "npu_format_cast", side_effect=lambda x, **kwargs: x
+            ) as cast,
+            patch.object(moe_utils, "_get_float4_e2m1fn_x2_dtype", return_value=296),
+        ):
+            actual_weight, actual_scale = moe_utils.prepare_w4a8_mxfp_weight(
+                weight, scale
+            )
+        cast.assert_called_once()
+        self.assertEqual(cast.call_args.args[0].dtype, torch.uint8)
+        self.assertEqual(cast.call_args.args[0].data_ptr(), weight.data_ptr())
+        torch.testing.assert_close(
+            actual_weight, weight.view(torch.uint8).transpose(1, 2)
+        )
+        expected_scale = torch.arange(125, 133, dtype=torch.uint8).reshape(1, 2, 2, 2)
+        torch.testing.assert_close(actual_scale, expected_scale.transpose(1, 2))
+
+    def test_w4a8_preparation_rejects_missing_fp4_dtype(self):
+        with (
+            patch.object(moe_utils, "_get_float4_e2m1fn_x2_dtype", return_value=None),
+            patch.object(moe_utils, "npu_format_cast") as cast,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "requires float4 support"):
+                moe_utils.prepare_w4a8_mxfp_weight(
+                    torch.zeros(1, 64, 32, dtype=torch.uint8),
+                    torch.zeros(1, 64, 2, dtype=torch.uint8),
+                )
+            cast.assert_not_called()
 
     def test_online_method_stays_on_the_unquant_fused_moe_base(self):
         """FusedMoE picks its w1/w3 shard order from this base class.
@@ -492,7 +526,7 @@ class TestNPUW4A4MXFP4MoE(CustomTestCase):
         layer.w2_weight_scale = torch.nn.Parameter(
             torch.zeros(2, 64, 3, dtype=torch.uint8), requires_grad=False
         )
-        with patch.object(moe_methods, "npu_format_cast") as cast:
+        with patch.object(moe_utils, "npu_format_cast") as cast:
             with self.assertRaisesRegex(ValueError, "divisible by 2"):
                 NPUW4A4MXFP4MoEMethod().process_weights_after_loading(layer, "w2")
             cast.assert_not_called()
