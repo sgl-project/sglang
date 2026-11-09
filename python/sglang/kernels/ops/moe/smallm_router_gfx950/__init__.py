@@ -1,6 +1,6 @@
 """gfx950 one-launch Qwen3.5 MoE router for 1..8 tokens: gate GEMV (routed logits rounded to bf16, as today) +
 softmax top-10 + renormalize + fused shared-expert slot, written as the [M, 11] int32 ids / fp32 weights that
-smallm_moe_gfx950 consumes. SGLANG_ROCM_SMALLM_ROUTER=0 disables it; a build/load failure disables it too."""
+smallm_moe_gfx950 consumes. A build/load failure disables it."""
 
 import ctypes
 import logging
@@ -9,9 +9,8 @@ import subprocess
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils.hipcc import HipKernel, build_gfx950_module
-from sglang.srt.environ import envs
-from sglang.srt.utils import is_gfx95_supported
 
 _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smallm_router.hip")
 MAX_TOK = 8  # MAX_TOK in smallm_router.hip; from 9 tokens the unfused path is faster
@@ -34,10 +33,11 @@ class Args(ctypes.Structure):
 
 
 def smallm_router_supported(x: torch.Tensor) -> bool:
+    hip = current_arch().hip
     return (
         not _disabled
-        and envs.SGLANG_ROCM_SMALLM_ROUTER.get()
-        and is_gfx95_supported()
+        and hip is not None
+        and hip.gcn_arch == "gfx950"
         and 1 <= x.shape[0] <= MAX_TOK
         and x.dtype == torch.bfloat16
         and x.shape[1] == 4096
