@@ -56,7 +56,7 @@ def build_standalone_disagg_draft_input(
     from sglang.srt.managers.overlap_utils import RelayPayload
     from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
     from sglang.srt.speculative.eagle_info import EagleDraftInput
-    from sglang.srt.utils.common import async_h2d_stack
+    from sglang.srt.utils.device import async_h2d_stack
 
     topk = get_spec().speculative_eagle_topk
     topk_p_rows = []

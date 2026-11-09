@@ -78,13 +78,14 @@ class TestPdStandaloneDecodeCleanup(CustomTestCase):
         fields = dict.fromkeys(
             field.name for field in dataclasses.fields(SchedulerBatchResultProcessor)
         )
+        output_streamer = Mock()
         fields.update(
             model_config=SimpleNamespace(
                 vocab_size=11, self_opened_think_start_ids=None
             ),
             tree_cache=cache,
             token_to_kv_pool_allocator=tokens,
-            output_streamer=Mock(),
+            output_streamer=output_streamer,
             disaggregation_mode=DisaggregationMode.DECODE,
             request_retirer=RequestRetirer(
                 tree_cache=cache,
@@ -92,6 +93,7 @@ class TestPdStandaloneDecodeCleanup(CustomTestCase):
                 hisparse_coordinator=None,
                 uocr_runtime=None,
                 send_abort_output=Mock(),
+                stream_output=output_streamer.stream_output,
             ),
         )
         processor = SchedulerBatchResultProcessor(**fields)
@@ -105,6 +107,7 @@ class TestPdStandaloneDecodeCleanup(CustomTestCase):
             kv_checksum_computer=None,
             model_config=fields["model_config"],
             batch_result_processor=processor,
+            request_retirer=fields["request_retirer"],
             output_streamer=fields["output_streamer"],
             enable_decode_hicache=False,
             enable_hisparse=False,
