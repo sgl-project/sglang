@@ -2178,6 +2178,16 @@ class KVCacheConfigurator:
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 
+        # NPU mirror of the GPU DSA cache layer split: under prefill CP, swap
+        # in an owned-layers-only pool with owner-broadcast reads.
+        dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = None, 1
+        if is_dsa_model and not self.is_draft_worker:
+            from sglang.srt.layers.cp.utils import get_glm_dsa_cp_layer_shard_info
+
+            dsa_cp_layer_shard_rank, dsa_cp_layer_shard_size = (
+                get_glm_dsa_cp_layer_shard_info(self)
+            )
+
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
         if self.is_draft_worker:
@@ -2203,7 +2213,17 @@ class KVCacheConfigurator:
         use_dsa_fp8_kv_cache_storage = (
             self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
         )
-        token_to_kv_pool = NPUMLATokenToKVPool(
+        pool_cls = NPUMLATokenToKVPool
+        pool_kwargs = {}
+        if dsa_cp_layer_shard_rank is not None:
+            from sglang.srt.hardware_backend.npu.dsa_cache_layer_split import (
+                LayerSplitNPUMLATokenToKVPool,
+            )
+
+            pool_cls = LayerSplitNPUMLATokenToKVPool
+            pool_kwargs["layer_shard_rank"] = dsa_cp_layer_shard_rank
+            pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
+        token_to_kv_pool = pool_cls(
             max_total_num_tokens,
             page_size=get_schedule().page_size,
             dtype=self.kv_cache_dtype,
@@ -2228,6 +2248,7 @@ class KVCacheConfigurator:
             end_layer=self.layer_info.end_layer,
             use_combined_kv_buffer=self.use_combined_kv_buffer,
             modelslim_cache_layout=self.modelslim_cache_layout,
+            **pool_kwargs,
         )
         return token_to_kv_pool
 

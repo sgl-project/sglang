@@ -882,6 +882,47 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         is_draft: bool = False,
     ):
         assert not self._is_dummy, "backup on a dummy (non-src MLA) host pool"
+        if io_backend == "kernel_ascend":
+            # Layer-sharded NPU D2H mirrors the non-sharded one-shot backup:
+            # the whole owned-layer range is transferred in a single call, so
+            # only the first target layer triggers it and later iterations
+            # return early.  Draft pools are not backed up, matching the
+            # non-sharded kernel_ascend path (target pool only).
+            if is_draft or layer_id != 0:
+                return
+            if self.layout != "page_first_kv_split":
+                raise ValueError(f"Unsupported layout: {self.layout}")
+            native = self._native_infos[0].native_buffers()
+            if _is_npu and ascendc_io_enabled():
+                self._transfer_ascendc_sparse_copy(
+                    native,
+                    host_indices,
+                    device_indices,
+                    TransferDirection.D2H,
+                )
+                return
+            for (
+                native,
+                host_k,
+                host_v,
+                host_index_k,
+                host_index_k_scale,
+            ) in self._npu_transfer_pool_slices():
+                transfer_kv_dim_exchange(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    device_k=native.k,
+                    host_k=host_k,
+                    device_v=native.v,
+                    host_v=host_v,
+                    device_index_k=native.index_k,
+                    host_index_k=host_index_k,
+                    device_index_k_scale=native.index_scales,
+                    host_index_k_scale=host_index_k_scale,
+                    page_size=self.page_size,
+                    direction=TransferDirection.D2H,
+                )
+            return
         if io_backend not in ("kernel", "direct"):
             raise ValueError(
                 f"Layer-sharded HiCache backup does not support IO backend: {io_backend}"

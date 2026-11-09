@@ -333,11 +333,18 @@ class PrefillBootstrapQueue:
             num_hidden_layers=self.scheduler.model_config.num_hidden_layers,
         )
         kv_data_ptrs, kv_data_lens, kv_item_lens = get_kv_transfer_buf_infos(storage)
-        kv_args.prefill_end_layer = (
-            kv_args.prefill_start_layer + len(kv_data_ptrs)
-            if layer_shard_enabled
-            else getattr(self.token_to_kv_pool, "end_layer", None)
-        )
+        if layer_shard_enabled:
+            # NPU MLA pools report one entry per layer per buffer group
+            # (latent k/v, indexer k, fp8 index scale), so the layer span is
+            # the entry count divided by the group count, not the raw count.
+            span = getattr(self.token_to_kv_pool, "get_kv_transfer_layer_span", None)
+            kv_args.prefill_end_layer = kv_args.prefill_start_layer + (
+                span(len(kv_data_ptrs)) if span is not None else len(kv_data_ptrs)
+            )
+        else:
+            kv_args.prefill_end_layer = getattr(
+                self.token_to_kv_pool, "end_layer", None
+            )
 
         draft_kv_pool = (
             self.draft_token_to_kv_pool
