@@ -1183,6 +1183,7 @@ class KVStorage:
         for transfer in transfers:
             if transfer.released:
                 continue
+            transfer.orphaned = True
             pages = {}
             for name, band in self._members():
                 held = band.hold_orphaned_transfer(transfer)

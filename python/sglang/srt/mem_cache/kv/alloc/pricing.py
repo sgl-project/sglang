@@ -83,6 +83,9 @@ class ChainSnapshot(msgspec.Struct, frozen=True, gc=False):
     total_bytes: int
     positions: Dict[str, int]  # band name -> index in `bands`
     held: Tuple[Tuple[int, int], ...] = ()
+    # Byte ranges no layout may use, `feasible`'s included: bytes an orphaned
+    # network transfer may still touch, which nothing may wait for.
+    withheld: Tuple[Tuple[int, int], ...] = ()
 
     def index(self, name: str) -> int:
         return self.positions[name]
@@ -281,6 +284,17 @@ class TakePlan(msgspec.Struct, frozen=True, gc=False, kw_only=True):
 
 def _align_up(x: int, e: int) -> int:
     return -(-x // e) * e
+
+
+def _merged(ranges: Tuple[Tuple[int, int], ...]) -> Tuple[Tuple[int, int], ...]:
+    """``ranges`` sorted, overlapping ones merged."""
+    out: list = []
+    for lo, hi in sorted(ranges):
+        if out and lo <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], hi))
+        else:
+            out.append((lo, hi))
+    return tuple(out)
 
 
 def _held_meeting(
@@ -519,7 +533,7 @@ def plan(
     if any(name not in snapshot.positions or n < 0 for name, n in demands.items()):
         raise ValueError("a demand must name a chain band and be non-negative")
     total = snapshot.total_bytes
-    held = snapshot.held
+    held = _merged(snapshot.held + snapshot.withheld)
     takes: Dict[str, PlanTake] = {}
     targets: Dict[str, Tuple[int, int]] = {}
     movers = []
@@ -597,7 +611,8 @@ def feasible(snapshot: ChainSnapshot, demands: Dict[str, int]) -> bool:
     """Whether some layout reachable from ``snapshot`` serves ``demands``: the
     one capacity question. Pass a snapshot with evictable pages reclaimed
     (`reclaimed_snapshot`) to ask it with eviction. Every byte counts, those
-    held for a network send too: a layout that needs them waits for it."""
+    held for a network send too: a layout that needs them waits for it. Only
+    the bytes ``withheld`` for a transfer whose request is gone never count."""
     if snapshot.held:
         snapshot = msgspec.structs.replace(snapshot, held=())
     return plan(snapshot, demands, RELAYOUT) is not None

@@ -36,13 +36,16 @@ class NetworkTransfer(TransferRelease):
     """One send or receive a network engine runs on a request's rows. It is
     released where the transfer's owner observes its end on every rank; a move
     that cannot wait for that asks the storage's `NetworkWaiter`. ``peer`` is
-    what the waiter judges the transfer by, opaque here."""
+    what the waiter judges the transfer by, opaque here. ``orphaned``: its
+    request gave its rows back before it was released; nothing may then wait
+    for it, since it may never end."""
 
-    __slots__ = ("peer",)
+    __slots__ = ("peer", "orphaned")
 
     def __init__(self, peer=None):
         super().__init__()
         self.peer = peer
+        self.orphaned = False
 
 
 # Blocks on the host, releasing the GIL, until the engine is done with every

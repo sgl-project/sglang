@@ -479,14 +479,23 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         the epoch moves."""
         key = self._snapshot_key_now()
         if key != self._snapshot_key:
-            self._snapshot_memo = snapshot_chain(
-                self.bands,
-                page_size=self.page_size,
-                total_bytes=self.arena.total_bytes,
-                positions=self._band_positions,
-            )
+            self._snapshot_memo = self._fresh_snapshot()
             self._snapshot_key = key
         return self._snapshot_memo
+
+    def _fresh_snapshot(self) -> ChainSnapshot:
+        """The bands' snapshot now, with the bytes no layout may use
+        (`Band.withheld_byte_ranges`)."""
+        snapshot = snapshot_chain(
+            self.bands,
+            page_size=self.page_size,
+            total_bytes=self.arena.total_bytes,
+            positions=self._band_positions,
+        )
+        withheld = tuple(self.bands[0].withheld_byte_ranges()) if self.bands else ()
+        if withheld:
+            snapshot = msgspec.structs.replace(snapshot, withheld=withheld)
+        return snapshot
 
     def network_held_bytes(self) -> Tuple[Tuple[int, int], ...]:
         """Merged byte ranges outside the bands that unreleased network sends
@@ -529,11 +538,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
         capacity field changed without moving the epoch. Empty == healthy."""
         if self._snapshot_key != self._snapshot_key_now():
             return []
-        fresh = snapshot_chain(
-            self.bands,
-            page_size=self.page_size,
-            total_bytes=self.arena.total_bytes,
-        )
+        fresh = self._fresh_snapshot()
         if fresh == self._snapshot_memo:
             return []
         return [f"[chain] stale pricing snapshot: {self._snapshot_memo} != {fresh}"]

@@ -1038,23 +1038,36 @@ class Band:
 
     def _chain_low_frontier_above_bytes(self) -> int:
         """Byte low-frontier of the nearest NON-transparent chain member above
-        this pool; the buffer top if none."""
+        this pool, or of the nearest withheld byte range above it
+        (`withheld_byte_ranges`); the buffer top if none."""
         p = self.high_peer
         while p is not None and p._is_frontier_transparent():
             p = p.high_peer
-        if p is None:
-            return self.arena.total_bytes
-        return p._byte_low_frontier()
+        frontier = self.arena.total_bytes if p is None else p._byte_low_frontier()
+        own = self._byte_high_frontier()
+        for lo, _ in self.withheld_byte_ranges():
+            if own <= lo < frontier:
+                frontier = lo
+        return frontier
 
     def _chain_high_frontier_below_bytes(self) -> int:
         """Byte high-frontier of the nearest NON-transparent chain member below
-        this pool; 0 if none."""
+        this pool, or of the nearest withheld byte range below it; 0 if
+        none."""
         p = self.low_peer
         while p is not None and p._is_frontier_transparent():
             p = p.low_peer
-        if p is None:
-            return 0
-        return p._byte_high_frontier()
+        frontier = 0 if p is None else p._byte_high_frontier()
+        own = self._byte_low_frontier()
+        for _, hi in self.withheld_byte_ranges():
+            if frontier < hi <= own:
+                frontier = hi
+        return frontier
+
+    def withheld_byte_ranges(self) -> List[Tuple[int, int]]:
+        """Byte ranges outside every band an orphaned network transfer may touch (fences
+        of a last-resort move): no band or layout uses them until its release."""
+        return [r for ranges in self.arena.withheld.values() for r in ranges]
 
     def _chain_capacity_epoch(self) -> int:
         """Sum of `_capacity_epoch` over the whole chain (self included). Capacity
@@ -2213,8 +2226,18 @@ class Band:
 
     def hold_orphaned_transfer(self, transfer: NetworkTransfer) -> Set[int]:
         """Hold this band's pages in ``transfer``'s span, its request gone, fixed and
-        off the free list until `end_orphaned_transfer`; beyond the span its fence holds
-        the bytes (`ChainAllocator.network_held_bytes`). Returns the pages held."""
+        off the free list until `end_orphaned_transfer`; beyond the span its fence keeps
+        the bytes out of every layout and frontier (`withheld_byte_ranges`)."""
+        # Its fences beyond every span are no layout's any more; none comes, as its
+        # pages in the span never move again.
+        fences = tuple(
+            (use.lo, use.hi)
+            for use in self.usage.network_fences()
+            if any(t is transfer for t in unreleased_transfers(use.signal))
+        )
+        if fences:
+            self.arena.withheld[(self.sub_pool_name, id(transfer))] = fences
+            self._capacity_epoch += 1
         uses = [use for use in self.usage.transfers() if use.release is transfer]
         if not uses:
             return set()
@@ -2246,6 +2269,7 @@ class Band:
         out of the free list join it at the next drain (their key ended)."""
         self._holes_dirty = True
         self._capacity_epoch += 1
+        self.arena.withheld.pop((self.sub_pool_name, id(transfer)), None)
         if self._orphan_pages.pop(id(transfer), None) is None:
             return
         self._withheld = set().union(
@@ -2317,6 +2341,13 @@ class Band:
             for use in band.usage.network_fences(lo, hi)
             for transfer in unreleased_transfers(use.signal)
         }
+        if any(transfer.orphaned for transfer in transfers.values()):
+            # Every plan keeps out of these bytes (`withheld_byte_ranges`): a block over
+            # them is a planner error, never a wait that may not end.
+            raise RuntimeError(
+                f"[{self.sub_pool_name}] a layout placed pages [{first}, {end}) "
+                "over bytes a transfer whose request is gone may still touch"
+            )
         if transfers:
             self._wait_on_stream(tuple(transfers.values()))
 
