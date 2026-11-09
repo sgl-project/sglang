@@ -185,7 +185,8 @@ class TestWorkflowCacheIdentity(unittest.TestCase):
                         self.assertIn("PIP_INDEX_URL=https://pypi.org/simple", line)
                     else:
                         self.assertIn(
-                            "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/", line
+                            "PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple/",
+                            line,
                         )
                         self.assertIn("PIP_TRUSTED_HOST=mirrors.aliyun.com", line)
 

@@ -108,7 +108,7 @@ jobs:
           container_options: |
             privileged: true
             host_ipc: true
-            host_network: true
+            host_network: false
             shm_size: 8Gi
           timeout_minutes: 110
           cleanup_policy: always
@@ -170,7 +170,7 @@ jobs:
           container_options: |
             privileged: true
             host_ipc: true
-            host_network: true
+            host_network: false
             shm_size: 8Gi
           timeout_minutes: 125
           cleanup_policy: always
@@ -218,7 +218,7 @@ jobs:
           container_options: |
             privileged: true
             host_ipc: true
-            host_network: true
+            host_network: false
             shm_size: 8Gi
           timeout_minutes: 140
           cleanup_policy: always
@@ -265,7 +265,7 @@ jobs:
           container_options: |
             privileged: true
             host_ipc: true
-            host_network: true
+            host_network: false
             shm_size: 8Gi
           timeout_minutes: 170
           cleanup_policy: always
