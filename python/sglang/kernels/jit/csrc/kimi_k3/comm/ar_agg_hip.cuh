@@ -42,7 +42,8 @@
 //
 // Numerics: prefix_out (the AR / add3 row) and the bank snapshot are
 // bit-identical to the unfused path. Scores and the norm use the same fp32
-// formulas with a different reduction order, ||mix||^2 via the Gram form and
+// formulas with a different reduction order, ||mix||^2 via the Gram form (fp64,
+// so nearly cancelling candidate rows keep their small terms) and
 // hardware rsq / exp2 / rcp, so out / E4M3 / stream match attn_res_smallm up
 // to rare 1-ulp bf16 flips (~1e-4 of elements). Every rank sums the 8
 // slices' statistics in rank order: outputs are identical on all ranks.
@@ -83,7 +84,7 @@ constexpr int kThreads = 256;
 constexpr int kMaxT = aiter::kMaxBlocks;  // start-barrier slots
 constexpr int64_t kRegionBytes = 1 << 20;
 constexpr int64_t kDataOff = 0, kDataPar = 256 << 10;         // [T][slice] packs
-constexpr int64_t kStatOff = 512 << 10, kStatPar = 64 << 10;  // [T][64] fp32
+constexpr int64_t kStatOff = 512 << 10, kStatPar = 64 << 10;  // [T][64] fp64
 constexpr int64_t kFlagOff = 768 << 10, kFlagPar = 64 << 10;  // [T * split][8] u32
 constexpr int kStatStride = 64;
 
@@ -146,6 +147,16 @@ __device__ __forceinline__ uint8_t to_e4m3(float x) {
 
 typedef float f2_t __attribute__((ext_vector_type(2)));
 
+// fp64 FMA of an element pair (bf16 products are exact)
+__device__ __forceinline__ double gram(const double (&a)[2], const double (&b)[2], double acc) {
+  return fma(a[1], b[1], fma(a[0], b[0], acc));
+}
+
+__device__ __forceinline__ void widen(f2_t f, double (&d)[2]) {
+  d[0] = f.x;
+  d[1] = f.y;
+}
+
 __device__ __forceinline__ void unpack2(const vec_t& v, f2_t (&f)[kVec / 2]) {
   const uint32_t* u = reinterpret_cast<const uint32_t*>(&v);
 #pragma unroll
@@ -169,9 +180,9 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
   constexpr int kG = kR * (kR + 1) / 2;
   constexpr int kS = kR + kG;  // dot_i, then G_ij (i <= j, row-major)
   static_assert(kS <= kStatStride, "statistics layout");
-  __shared__ float red[kS * 128];
+  __shared__ double red[kS * 128];
   constexpr int kS4 = (kS + 3) / 4;
-  __shared__ __attribute__((aligned(16))) float stat[kS4 * 4];
+  __shared__ __attribute__((aligned(16))) double stat[kS4 * 4];
 
   const int t = blockIdx.x / p.split;
   const int k = blockIdx.x - t * p.split;
@@ -236,10 +247,14 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
       }
     }
     // packed fp32 math (v_pk_fma_f32): element pairs
-    f2_t pp[kS];
+    f2_t pp[kR];    // dots
+    double gp[kG];  // G
 #pragma unroll
-    for (int s = 0; s < kS; ++s)
+    for (int s = 0; s < kR; ++s)
       pp[s] = f2_t{0.f, 0.f};
+#pragma unroll
+    for (int s = 0; s < kG; ++s)
+      gp[s] = 0.0;
     f2_t x[kR][kVec / 2];
     f2_t cwv[kVec / 2];
     if (pact) {
@@ -255,12 +270,16 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
 #pragma unroll
         for (int a = 0; a < kNVB; ++a)
           pp[a] = x[a][e] * cwv[e] + pp[a];
-        int idx = kR;
+        double xd[kNVB][2];
+#pragma unroll
+        for (int a = 0; a < kNVB; ++a)
+          widen(x[a][e], xd[a]);
+        int idx = 0;
 #pragma unroll
         for (int a = 0; a < kR; ++a)
 #pragma unroll
           for (int b = a; b < kR; ++b) {
-            if (b < kNVB) pp[idx] = x[a][e] * x[b][e] + pp[idx];
+            if (b < kNVB) gp[idx] = gram(xd[a], xd[b], gp[idx]);
             ++idx;
           }
       }
@@ -302,19 +321,26 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
 #pragma unroll
       for (int e = 0; e < kVec / 2; ++e) {
         pp[kNVB] = x[kNVB][e] * cwv[e] + pp[kNVB];
-        int idx = kR;
+        double xd[kR][2];
+#pragma unroll
+        for (int a = 0; a < kR; ++a)
+          widen(x[a][e], xd[a]);
+        int idx = 0;
 #pragma unroll
         for (int a = 0; a < kR; ++a) {
           idx += kNVB - a;  // (a, kNVB) is the last pair of row a
-          pp[idx] = x[a][e] * x[kNVB][e] + pp[idx];
+          gp[idx] = gram(xd[a], xd[kNVB], gp[idx]);
           ++idx;
         }
       }
     }
-    float part[kS];
+    double part[kS];
 #pragma unroll
-    for (int s = 0; s < kS; ++s)
+    for (int s = 0; s < kR; ++s)
       part[s] = pp[s].x + pp[s].y;
+#pragma unroll
+    for (int s = 0; s < kG; ++s)
+      part[kR + s] = gp[s];
     // block reduction of the kS partials over the first kRedT threads (the
     // slice has sv <= kRedT vectors): LDS transpose, 4 lanes per value
     constexpr int kRedT = 128, kLanes = 4;
@@ -327,7 +353,7 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
     __syncthreads();
     {
       const int s = threadIdx.x / kLanes, l = threadIdx.x % kLanes;
-      float sum = 0.f;
+      double sum = 0.0;
       if (s < kS) {
 #pragma unroll
         for (int j = 0; j < kRedT / kLanes; ++j)
@@ -335,7 +361,7 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
       }
       sum += __shfl_xor(sum, 1, 64);
       sum += __shfl_xor(sum, 2, 64);
-      if (s < kS && l == 0) reinterpret_cast<float*>(mine + spar)[t * kStatStride + s] = sum;
+      if (s < kS && l == 0) reinterpret_cast<double*>(mine + spar)[t * kStatStride + s] = sum;
     }
     __syncthreads();  // all slice / statistics stores issued and waited for
     if (threadIdx.x < kNG * p.split) {
@@ -366,11 +392,11 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
     rows[kNVB].load(region(p, q) + dpar, static_cast<int64_t>(t) * sv + (v - q * sv));
   }
   if (threadIdx.x < kS) {
-    float sv8[kNG];
+    double sv8[kNG];
 #pragma unroll
     for (int q = 0; q < kNG; ++q)
-      sv8[q] = reinterpret_cast<const float*>(region(p, q) + spar)[t * kStatStride + threadIdx.x];
-    float st = 0.f;
+      sv8[q] = reinterpret_cast<const double*>(region(p, q) + spar)[t * kStatStride + threadIdx.x];
+    double st = 0.0;
 #pragma unroll
     for (int q = 0; q < kNG; ++q)
       st += sv8[q];
@@ -382,13 +408,8 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
   // from registers (one vectorized LDS read of all statistics)
   float sr[kS4 * 4];
 #pragma unroll
-  for (int i = 0; i < kS4; ++i) {
-    const float4 f4 = reinterpret_cast<const float4*>(stat)[i];
-    sr[4 * i] = f4.x;
-    sr[4 * i + 1] = f4.y;
-    sr[4 * i + 2] = f4.z;
-    sr[4 * i + 3] = f4.w;
-  }
+  for (int i = 0; i < kS4 * 4; ++i)
+    sr[i] = static_cast<float>(stat[i]);
   const float inv_h = 1.0f / static_cast<float>(p.hidden);
   float w[kR];
   {
@@ -417,18 +438,19 @@ __global__ void __launch_bounds__(kThreads) ar_agg_kernel(const Params __grid_co
   }
   float scale = 1.f;
   if (p.ow != nullptr) {
-    float asq = 0.f;
+    double asq = 0.0;
     int idx = kR;
 #pragma unroll
     for (int a = 0; a < kR; ++a) {
-      asq += w[a] * w[a] * sr[idx++];
-      float cross = 0.f;
+      const double wa = w[a];
+      asq += wa * wa * stat[idx++];
+      double cross = 0.0;
 #pragma unroll
       for (int b = a + 1; b < kR; ++b)
-        cross += w[b] * sr[idx++];
-      asq += 2.f * w[a] * cross;
+        cross += static_cast<double>(w[b]) * stat[idx++];
+      asq += 2.0 * wa * cross;
     }
-    scale = __builtin_amdgcn_rsqf(fmaxf(asq, 0.f) * inv_h + p.out_eps);
+    scale = __builtin_amdgcn_rsqf(static_cast<float>(fmax(asq, 0.0)) * inv_h + p.out_eps);
   }
   if (!act) return;
 
@@ -566,7 +588,7 @@ struct ArAgg {
     const int64_t chunk = (n_vecs + split - 1) / split;
     RuntimeCheck(sv <= 128 && chunk <= kThreads, "ar_agg: H too large");
     RuntimeCheck(
-        T * sv * 16 <= kDataPar && T * kStatStride * 4 <= kStatPar && T * split * kNG * 4 <= kFlagPar,
+        T * sv * 16 <= kDataPar && T * kStatStride * 8 <= kStatPar && T * split * kNG * 4 <= kFlagPar,
         "ar_agg: region too small");
     RuntimeCheck(kNG * split <= kThreads, "ar_agg: split too large");
     RuntimeCheck(
