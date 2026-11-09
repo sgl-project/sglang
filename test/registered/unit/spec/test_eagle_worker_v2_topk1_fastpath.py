@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.adaptive_runtime_state import SpecRuntimeState
 from sglang.srt.speculative.eagle_info import EagleVerifyInput
@@ -224,7 +224,7 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
                 )
                 worker.target_worker = SimpleNamespace(
                     model_runner=SimpleNamespace(
-                        attn_backend=attn_backend, kv_index_translator=None
+                        attn_backend=attn_backend, runner_ids=None
                     )
                 )
                 draft_input = SimpleNamespace(
@@ -266,7 +266,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            runner_ids=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
@@ -301,7 +303,9 @@ class TestEagleWorkerV2BackendFallback(CustomTestCase):
         worker.draft_runner = SimpleNamespace(
             attn_backend=existing_backend,
             model_config=SimpleNamespace(hf_config=SimpleNamespace()),
-            kv_index_translator=SimpleNamespace(is_translating=False),
+            runner_ids=SimpleNamespace(
+                is_translating=False, needs_read_translate=False
+            ),
         )
         worker.topk = 1
         worker.speculative_num_steps = 2
