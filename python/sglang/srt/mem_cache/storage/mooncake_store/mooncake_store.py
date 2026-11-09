@@ -2,6 +2,7 @@ import ctypes
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from collections.abc import Sequence
@@ -670,6 +671,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self._wholepage_staging_cap_bytes = (
                 envs.SGLANG_HICACHE_MOONCAKE_WHOLEPAGE_STAGING_MB.get() * 1024 * 1024
             )
+            self._wholepage_io_lock = threading.Lock()
             self._wholepage_staging = None
             self._wholepage_retired = []
 
@@ -1236,7 +1238,6 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 all_key_strs, all_ptrs, all_sizes
             )
 
-        results: dict = {}
         for name, key_multiplier, start, end in prepared:
             results[name] = self._batch_postprocess(
                 io_results[start:end],
@@ -1319,6 +1320,17 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return tensor
 
     def _wholepage_io_v2(
+        self,
+        transfers: List[PoolTransfer],
+        is_set: bool,
+        session_id: Optional[str] = None,
+    ) -> dict:
+        # Backup and prefetch run on different threads. Keep staging bytes
+        # stable until the RPC and any host-pool restore have both completed.
+        with self._wholepage_io_lock:
+            return self._wholepage_io_v2_locked(transfers, is_set, session_id)
+
+    def _wholepage_io_v2_locked(
         self,
         transfers: List[PoolTransfer],
         is_set: bool,

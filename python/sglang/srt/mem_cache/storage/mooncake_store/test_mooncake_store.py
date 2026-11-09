@@ -1,6 +1,8 @@
 import ctypes
 import logging
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import torch
@@ -304,6 +306,7 @@ def _make_wholepage_store(fake_client, cap_bytes):
     store._replicate_config_cls = lambda: SimpleNamespace(group_ids=None)
     store._supports_session_ids = True
     store._wholepage_staging_cap_bytes = cap_bytes
+    store._wholepage_io_lock = threading.Lock()
     store._wholepage_staging = None
     store._wholepage_retired = []
     return store
@@ -428,8 +431,129 @@ def test_wholepage_mamba_v2():
     logger.info("✅ Whole-page mamba v2 test passed")
 
 
+def test_mixed_wholepage_and_zero_copy_results():
+    class KVPool:
+        page_size = 1
+
+        def __init__(self):
+            self.buffer = torch.arange(32, dtype=torch.uint8).reshape(8, 4)
+            self.meta_calls = 0
+
+        def get_hybrid_pool_buffer(self):
+            return [self.buffer]
+
+        def get_page_buffer_meta(self, indices):
+            self.meta_calls += 1
+            return [self.buffer[int(i)].data_ptr() for i in indices], [4] * len(indices)
+
+    for order in [(PoolName.KV, PoolName.MAMBA), (PoolName.MAMBA, PoolName.KV)]:
+        client = FakeMooncakeStoreClient()
+        store = _make_wholepage_store(client, cap_bytes=1024)
+        mamba, kv = MockMambaPoolHost(8), KVPool()
+        store.register_mem_host_pool_v2(mamba, PoolName.MAMBA)
+        # The KV anchor is initialized separately from v2 sidecar registration.
+        store.registered_pools[PoolName.KV] = kv
+        store.register_buffer(kv.buffer)
+        expected = [mamba.get_data_page(i).clone() for i in range(2)]
+
+        def transfers(indices):
+            return [
+                PoolTransfer(
+                    name=name,
+                    keys=["mixed0", "mixed1"],
+                    host_indices=torch.tensor(indices),
+                    hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                )
+                for name in order
+            ]
+
+        put = store.batch_set_v2(transfers([0, 1]))
+        assert put == {PoolName.KV: [True, True], PoolName.MAMBA: [True, True]}
+        get = store.batch_get_v2(transfers([4, 5]))
+        assert get == {PoolName.KV: [True, True], PoolName.MAMBA: [True, True]}
+        assert kv.meta_calls == 2, "KV must retain its zero-copy path"
+        assert torch.equal(kv.buffer[:2], kv.buffer[4:6])
+        for i in range(2):
+            assert torch.equal(expected[i], mamba.get_data_page(i + 4))
+
+        # A whole-page failure must also survive merging the zero-copy results.
+        del client.objects["testprefix_mixed0_0_wholepage"]
+        get = store.batch_get_v2(transfers([6, 7]))
+        assert get == {PoolName.KV: [True, True], PoolName.MAMBA: [False, True]}
+
+
+def test_wholepage_backup_prefetch_overlap():
+    writer_entered = threading.Event()
+    reader_reached_staging = threading.Event()
+    release_writer = threading.Event()
+
+    class ObservedLock:
+        def __init__(self):
+            self.lock = threading.Lock()
+            self.attempts = 0
+
+        def __enter__(self):
+            self.attempts += 1
+            if self.attempts == 2:
+                # The reader has reached the critical section while the writer
+                # still owns its staging bytes. No sleep-based scheduling.
+                reader_reached_staging.set()
+            self.lock.acquire()
+
+        def __exit__(self, *args):
+            self.lock.release()
+
+    class BlockingClient(FakeMooncakeStoreClient):
+        def batch_put_from(self, key_strs, buffer_ptrs, buffer_sizes, config=None):
+            writer_entered.set()
+            assert release_writer.wait(10), "writer was not released"
+            return super().batch_put_from(key_strs, buffer_ptrs, buffer_sizes, config)
+
+        def batch_get_into(self, key_strs, buffer_ptrs, buffer_sizes):
+            result = super().batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
+            # Without the lock, this overwrites the pending writer's staging
+            # bytes before allowing its delayed RPC to consume them.
+            reader_reached_staging.set()
+            return result
+
+    client = BlockingClient()
+    store = _make_wholepage_store(client, cap_bytes=1024)
+    store._wholepage_io_lock = ObservedLock()
+    pool = MockMambaPoolHost(4)
+    store.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+    expected_write = bytes(pool.get_data_page(0).tolist())
+    expected_read = bytes(pool.get_data_page(1).tolist())
+    client.objects["testprefix_reader_0_wholepage"] = expected_read
+
+    def transfer(key, index):
+        return [
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=[key],
+                host_indices=torch.tensor([index]),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+        ]
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        writer = executor.submit(store.batch_set_v2, transfer("writer", 0))
+        try:
+            assert writer_entered.wait(10), "writer did not reach its RPC"
+            reader = executor.submit(store.batch_get_v2, transfer("reader", 2))
+            assert reader_reached_staging.wait(10), "reader did not start"
+        finally:
+            release_writer.set()
+        assert writer.result(timeout=10) == {PoolName.MAMBA: [True]}
+        assert reader.result(timeout=10) == {PoolName.MAMBA: [True]}
+
+    assert client.objects["testprefix_writer_0_wholepage"] == expected_write
+    assert bytes(pool.get_data_page(2).tolist()) == expected_read
+
+
 if __name__ == "__main__":
     test_wholepage_mamba_v2()
+    test_mixed_wholepage_and_zero_copy_results()
+    test_wholepage_backup_prefetch_overlap()
     test_single_operation()
     test_batch_operation(
         make_hicache_storage_config(is_mla_model=False, tp_rank=0, tp_size=1)
