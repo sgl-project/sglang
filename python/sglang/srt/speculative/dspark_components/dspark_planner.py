@@ -12,7 +12,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    require_mlp_tp_gather,
+)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -41,7 +44,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,
@@ -69,7 +71,9 @@ class VerifyTierResolution(msgspec.Struct, frozen=True):
     tier_num_reqs: int
     tier_num_tokens: Optional[int]
     graph_num_tokens_floor: int
-    # None when the floor is empty or no ragged capture grid exists.
+    exceeds_captured_grid: bool
+    # None when the floor is empty, no ragged capture grid exists, or the tier
+    # exceeds the captured grid.
     graph_num_tokens: Optional[int]
 
 
@@ -435,12 +439,7 @@ class DSparkVerifyPlanner:
             dp_tier_num_tokens=dp_tier_num_tokens,
             budget=budget,
         )
-        if ragged_layout_exceeds_captured_grid(
-            num_reqs=tier.tier_num_reqs,
-            verify_num_draft_tokens=self.verify_num_draft_tokens,
-            model_runner=self.model_runner,
-            tier_tokens_hint=tier.tier_num_tokens,
-        ):
+        if tier.exceeds_captured_grid:
             return None
         graph_num_tokens_floor = tier.graph_num_tokens_floor
         if tier.graph_num_tokens is not None:
@@ -528,16 +527,25 @@ class DSparkVerifyPlanner:
             model_runner=self.model_runner,
             tier_num_tokens=tier_num_tokens,
         )
+        exceeds_captured_grid = ragged_layout_exceeds_captured_grid(
+            num_reqs=tier_num_reqs,
+            verify_num_draft_tokens=self.verify_num_draft_tokens,
+            model_runner=self.model_runner,
+            tier_tokens_hint=tier_num_tokens,
+        )
         capture_num_tokens = ragged_capture_num_tokens(model_runner=self.model_runner)
         graph_num_tokens = (
             round_up_grid(graph_num_tokens_floor, capture_num_tokens)
-            if graph_num_tokens_floor > 0 and capture_num_tokens is not None
+            if not exceeds_captured_grid
+            and graph_num_tokens_floor > 0
+            and capture_num_tokens is not None
             else None
         )
         return VerifyTierResolution(
             tier_num_reqs=tier_num_reqs,
             tier_num_tokens=tier_num_tokens,
             graph_num_tokens_floor=graph_num_tokens_floor,
+            exceeds_captured_grid=exceeds_captured_grid,
             graph_num_tokens=graph_num_tokens,
         )
 

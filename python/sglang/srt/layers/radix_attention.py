@@ -76,6 +76,7 @@ class RadixAttention(nn.Module):
         use_irope: bool = False,
         prefix: str = "",
         use_prefill_attention_wrapper: bool = True,
+        graph_layer_id: Optional[int] = None,
     ):
         super().__init__()
         self.tp_q_head_num = num_heads
@@ -86,6 +87,7 @@ class RadixAttention(nn.Module):
         self.v_head_dim = v_head_dim if v_head_dim != -1 else head_dim
         self.scaling = scaling
         self.layer_id = layer_id
+        self._graph_layer_id = graph_layer_id
         self.logit_cap = logit_cap
         self.sliding_window_size = sliding_window_size or -1
         self.is_cross_attention = is_cross_attention
@@ -110,6 +112,11 @@ class RadixAttention(nn.Module):
         self.pos_encoding_mode = pos_encoding_mode
         self.logit_capping_method = logit_capping_method
         self.xai_temperature_len = -1
+
+    @property
+    def graph_layer_id(self) -> int:
+        # Shared KV cache does not make two decoder layers the same graph layer.
+        return self.layer_id if self._graph_layer_id is None else self._graph_layer_id
 
     def forward(
         self,
@@ -139,9 +146,13 @@ class RadixAttention(nn.Module):
             and (breakable_cg or full_cg)
         )
         if use_eager_attention:
-            is_sparse = kwargs.get("idx_q") is not None
+            # `head_cls` identifies DASH: its 2D router inputs return one
+            # tensor, unlike MiniMax-M3's 3D dual-output path.
+            is_sparse = (
+                kwargs.get("idx_q") is not None and kwargs.get("head_cls") is None
+            )
             output, idx_output = allocate_attention_outputs(
-                self, q, v, kwargs.get("idx_q")
+                self, q, v, kwargs.get("idx_q") if is_sparse else None
             )
             return_lse = not is_sparse and bool(
                 kwargs.get("return_lse") or forward_batch.mha_return_lse
@@ -167,7 +178,7 @@ class RadixAttention(nn.Module):
             if return_lse:
                 return output.view(-1, self.tp_q_head_num, self.v_head_dim), lse
             return output
-        real_num_tokens = padded_extend_real_tokens(q, forward_batch)
+        real_num_tokens = padded_extend_real_tokens(q.shape[0], forward_batch)
         if real_num_tokens is not None:
             return _attention_on_real_rows(
                 self,

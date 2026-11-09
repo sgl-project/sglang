@@ -9,10 +9,10 @@ import torch
 
 from sglang.kernels.ops.embeddings.ngram_embedding import update_token_table
 from sglang.srt.configs.model_config import ModelConfig
-from sglang.srt.managers.schedule_batch import ForwardMode
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_schedule
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.layers.engram import EngramHasher
