@@ -3,20 +3,20 @@
 A band held where it stands fixes its live pages; freeing some of them leaves
 fixed pages on the free list. No path that shrinks a band past free pages may
 pass one of those: a lazy end's compaction (urgent or not), a float's boundary
-absorption, or a float parking once it holds no live page. Capacity prices a
-band's extent over its fixed pages, so a band that shrank past one would lose
-pages.
+absorption, or a float parking once it holds no live page. The planner prices
+a band's extent over its fixed pages, so a band that shrank past one would
+lose pages or refuse a planned take.
 """
 
 import unittest
-from types import SimpleNamespace
 
 import torch
+from test_unified_chain_realize import _allocator
 
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
-    build_test_unified_pools,
     hold_band,
     release_band,
     setup_allocator_context,
@@ -28,39 +28,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 def _tri():
     """state end + window float + full end, every end compacting lazily."""
     setup_allocator_context()
-    allocator = build_test_unified_pools(
-        device="cpu",
-        kv_cache_dtype=torch.float16,
-        head_num=1,
-        head_dim=8,
-        v_head_dim=8,
-        swa_head_num=1,
-        swa_head_dim=8,
-        swa_v_head_dim=8,
-        page_size=1,
-        start_layer=0,
-        end_layer=2,
-        swa_attention_layer_ids=[1],
-        full_attention_layer_ids=[0],
-        full_max_total_num_tokens=48,
-        swa_max_total_num_tokens=48,
-        enable_memory_saver=False,
-        need_sort=False,
-        mamba_layer_ids=[0],
-        mamba2_cache_params=SimpleNamespace(
-            shape=SimpleNamespace(conv=[(3, 8)], temporal=(1, 4, 8)),
-            dtype=SimpleNamespace(conv=torch.bfloat16, temporal=torch.float32),
-            layers=[0],
-        ),
-        max_mamba_cache_size=8,
-        model_context_len=256,
-        extra_max_context_len=1,
-        max_num_reqs=4,
-        enable_mamba_extra_buffer=False,
-        enable_mamba_extra_buffer_lazy=False,
-        disable_overlap_schedule=True,
-        sliding_window_size=32,
-    ).token_to_kv_pool_allocator
+    allocator = _allocator("cpu", "tri", lazy=True)
     (window,) = allocator._windows
     assert window.grow_direction == "float"
     return allocator, window
@@ -157,6 +125,22 @@ class TestFloatKeepsFixedFreePages(CustomTestCase):
         self.assertTrue(window._is_frontier_transparent())
         self.assertEqual(window._span_pages(), 0)
         self.assertEqual(allocator.verify_byte_accounting(), [])
+
+    def test_what_admission_accepts_the_chain_takes(self):
+        """With the float empty and fixed, every admitted demand realizes,
+        from holes in place up to a relocation of the float's block."""
+        admitted = 0
+        for tokens in range(1, 49):
+            allocator, window = self._held_float()
+            low, high = window._span_range()
+            allocator.free_swa(_virtual_ids(window, range(low, high)))
+            demand = KVDemand(tokens, {window.sub_pool_name: tokens}, 0)
+            if not allocator.admits(demand):
+                continue
+            admitted += 1
+            self.assertIsNotNone(allocator.alloc(tokens), tokens)
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+        self.assertGreater(admitted, 0)
 
 
 if __name__ == "__main__":
