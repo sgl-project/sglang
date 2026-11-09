@@ -12,40 +12,40 @@ slot, and a host page move carries the draft bytes with it.
 """
 
 import unittest
-from types import SimpleNamespace
+from contextlib import nullcontext
+from types import MethodType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 from sglang.srt.mem_cache import memory_pool as mem_pool
+from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView, MHASubPoolSpec, MHAView
+from sglang.srt.mem_cache.kv.layout.mla import MLASubPoolSpec
+from sglang.srt.mem_cache.kv.layout.state import (
+    DraftStateView,
+    MambaSubPoolSpec,
+    StateView,
+)
 from sglang.srt.mem_cache.layout.fused_draft import (
     DenseDraftRegion,
     DraftStateGeometry,
     DraftStateRegion,
     FusedDraftPlacement,
 )
-from sglang.srt.mem_cache.layout.token_major import (
-    ENTRY_ALIGN_BYTES,
-    align_entry_bytes,
-    align_part_offset,
-)
+from sglang.srt.mem_cache.layout.token_major import align_entry_bytes
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.unified_draft_pool import (
-    UnifiedDraftKVPool,
-    UnifiedDraftMambaPool,
-    UnifiedDraftSWAKVPool,
-)
-from sglang.srt.mem_cache.unified_memory_pool import (
-    MambaSubPoolSpec,
-    MHASubPoolSpec,
-    MLASubPoolSpec,
-    UnifiedKVPool,
-    UnifiedMambaPool,
-    UnifiedMHATokenToKVPool,
+    routed_draft_pool,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.unified_allocator_fixtures import (
+    arena_of,
+    plan_stand_in,
+    stand_in_views,
+)
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -104,28 +104,6 @@ def _placement(region, num_runners=1):
     )
 
 
-class TestFusedSpecMath(unittest.TestCase):
-    def test_fused_entry_appends_the_draft_parts(self):
-        f = _host_spec(_draft_region())
-        r = f.draft_region
-        self.assertEqual(r.k_row_bytes(), 48)
-        self.assertEqual(r.v_row_bytes(), 16)
-        self.assertEqual(r.entry_bytes(), 64)
-        self.assertEqual(
-            f.draft_offset_in_entry(), align_part_offset(f.host_entry_bytes())
-        )
-        self.assertEqual(f.draft_offset_in_entry(), 64)
-        self.assertEqual(f.entry_bytes(), align_entry_bytes(64 + 64))
-        self.assertEqual(f.entry_bytes() % ENTRY_ALIGN_BYTES, 0)
-        layout = f.layout()
-        self.assertEqual(
-            [p.name for p in layout.parts], ["k", "v", "draft_k", "draft_v"]
-        )
-        self.assertEqual(layout.part("draft_k").offset_bytes, 64)
-        self.assertEqual(layout.part("draft_v").offset_bytes, 64 + 48)
-        self.assertEqual(layout.part("draft_k").layer_stride_bytes, 64)
-
-
 class TestFusedRegionConfinement(unittest.TestCase):
     """Writes through host/draft views must land in their own part of their
     own slot."""
@@ -144,7 +122,7 @@ class TestFusedRegionConfinement(unittest.TestCase):
             grow_direction="up",
         )
         total = 8 * self.PS * spec.entry_bytes() + 8 * self.PS * swa.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[spec, swa],
             device=_DEV,
@@ -152,14 +130,14 @@ class TestFusedRegionConfinement(unittest.TestCase):
             page_size=self.PS,
             fused_draft=_placement(spec.draft_region),
         )
-        hk, hv = pool.mha_views_for("full")
-        dk, dv = pool.build_dense_draft_views("full")
+        hk, hv = pool.spec("full").views(pool)
+        dk, dv = pool.spec("full").draft_views(pool)
         return spec, pool, (hk, hv), (dk, dv)
 
     def test_host_and_draft_writes_confine_to_their_parts(self):
         spec, pool, (hk, hv), (dk, dv) = self._build()
         layout = spec.layout()
-        raw = pool._raw
+        raw = pool.raw
         entry = spec.entry_bytes()
         families = (
             ("k", hk),
@@ -184,7 +162,43 @@ class TestFusedRegionConfinement(unittest.TestCase):
                     self.assertLessEqual(hi, (page + 1) * self.PS * entry)
 
 
-class TestUnifiedDraftKVPool(unittest.TestCase):
+class TestDraftPartAlignment(unittest.TestCase):
+    def test_mixed_dtype_state_parts_are_aligned_and_move_with_the_entry(self):
+        region = DraftStateRegion(
+            lane_num=3,
+            state=DraftStateGeometry(
+                conv_state_shapes=((1, 3), (1, 1)),
+                conv_dtype=torch.bfloat16,
+                temporal_state_shape=(3,),
+                temporal_dtype=torch.float32,
+            ),
+        )
+        state = _mamba_spec(region)
+        full = _host_spec()
+        arena = arena_of(
+            total_bytes=16384,
+            sub_pool_specs=[state, full],
+            device="cpu",
+            enable_memory_saver=False,
+            page_size=1,
+            fused_draft=FusedDraftPlacement.from_counts(
+                counts={"mamba": [3]}, regions={"mamba": region}
+            ),
+        )
+        arena.raw.zero_()
+        conv, temporal = state.draft_views(arena)
+        for tensor in (*conv, temporal):
+            self.assertEqual(tensor.data_ptr() % tensor.element_size(), 0)
+            tensor[:, 4].fill_(7)
+        arena.move_units("mamba", torch.tensor([6]), torch.tensor([4]))
+        for tensor in (*conv, temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 7))
+        host_conv, host_temporal = state.views(arena)
+        for tensor in (*host_conv, host_temporal):
+            self.assertTrue(torch.all(tensor[:, 6] == 0))
+
+
+class TestDraftMHAView(unittest.TestCase):
     PS = 2
     PAGES = 8
 
@@ -199,7 +213,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             grow_direction="up",
         )
         total = self.PAGES * self.PS * (spec.entry_bytes() + swa.entry_bytes())
-        return UnifiedKVPool(
+        return arena_of(
             total_bytes=total,
             sub_pool_specs=[spec, swa],
             device=_DEV,
@@ -209,28 +223,24 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        sentinel_allocator = object()
-        dp = UnifiedDraftKVPool(
-            unified_buffer=pool,
-            host_sub_pool_name="full",
-            host_allocator=sentinel_allocator,
+        return DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        return dp, sentinel_allocator
 
     def test_probe_surface_and_view_binding(self):
         pool = self._pool()
-        dp, alloc = self._draft_pool(pool)
-        spec = pool.mha_spec("full")
-        self.assertIs(dp.host_allocator, alloc)
+        dp = self._draft_pool(pool)
+        spec = pool.spec("full")
         self.assertTrue(dp.requires_physical_write_loc)
         self.assertEqual(len(dp.k_buffer), 1)
         self.assertEqual(dp.k_buffer[0].shape[1:], (1, 24))
         self.assertEqual(dp.v_buffer[0].shape[1:], (1, 8))
         # Same slot space as the host: one row per physical token, the slot
         # stride being the whole fused entry.
-        n_rows = pool.max_slots("full") // self.PS * self.PS
+        n_rows = pool.num_entries("full") // self.PS * self.PS
         self.assertEqual(dp.k_buffer[0].shape[0], n_rows)
         self.assertEqual(dp.size, n_rows - self.PS)
         self.assertEqual(
@@ -240,20 +250,21 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
     def test_host_page_move_carries_the_draft_bytes(self):
         # Compaction relocates whole page envelopes on the HOST pool: a draft
         # marker written in page A arrives at page B after
-        # host.move_kv_cache(B, A), with no draft-side move.
+        # the arena moves host unit A to B, with no draft-side move.
         pool = self._pool()
-        dp, _ = self._draft_pool(pool)
-        host = UnifiedMHATokenToKVPool(
-            unified_buffer=pool, sub_pool_name="full", page_size=self.PS
+        dp = self._draft_pool(pool)
+        host = MHAView(
+            arena=pool,
+            spec=pool.spec("full"),
+            page_size=self.PS,
+            model_layer_ids=tuple(range(pool.spec("full").layer_num)),
         )
         src_page, dst_page = 3, 5
         src_t, dst_t = src_page * self.PS, dst_page * self.PS
         dp.k_buffer[0][src_t] = 7.0
         self.assertEqual(float(dp.k_buffer[0][dst_t].sum()), 0.0)
 
-        ps = self.PS
-        to_tokens = lambda p: torch.arange(p * ps, (p + 1) * ps, dtype=torch.int64)
-        host.move_kv_cache(to_tokens(dst_page), to_tokens(src_page))
+        pool.move_units("full", torch.tensor([dst_page]), torch.tensor([src_page]))
         self.assertEqual(float(dp.k_buffer[0][dst_t].sum()), 7.0 * 24)
 
     def test_an_fp8_region_holds_fp8(self):
@@ -283,7 +294,7 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             store_dtype=torch.uint8,
             grow_direction="up",
         )
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=self.PAGES * self.PS * (host.entry_bytes() + swa.entry_bytes()),
             sub_pool_specs=[host, swa],
             device=_DEV,
@@ -291,10 +302,9 @@ class TestUnifiedDraftKVPool(unittest.TestCase):
             page_size=self.PS,
             fused_draft=_placement(region),
         )
-        dp = UnifiedDraftKVPool(
-            unified_buffer=pool,
-            host_sub_pool_name="full",
-            host_allocator=object(),
+        dp = DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
@@ -311,32 +321,25 @@ class TestFusedStateHost(unittest.TestCase):
     """A state (mamba) entry carries the draft's state block after the host's
     streams: the same aligned entry for both, byte-disjoint blocks within a
     slot, and the host's whole-entry copy/clear carry the draft block, so a
-    radix checkpoint restores the draft's state with the target's. Unfused,
-    the entry stays its raw size; that identity guards every state deploy."""
+    radix checkpoint restores the draft's state with the target's. Temporal
+    rows remain aligned both within and between entries."""
 
     SLOTS = 8
 
-    def test_unfused_spec_is_byte_identical_to_before(self):
+    def test_unfused_spec_preserves_temporal_row_alignment(self):
         s = _mamba_spec()
-        self.assertEqual(s.host_entry_bytes(), 2 * (3 * 8 * 2 + 2 * 4))
+        layout = s.entry_layout()
+        self.assertEqual(layout.offsets["temporal"], 128)
+        self.assertEqual(layout.layer_strides["temporal"], 64)
+        self.assertEqual(s.host_entry_bytes(), 256)
         self.assertEqual(s.entry_bytes(), s.host_entry_bytes())
-
-    def test_fused_entry_appends_the_state_block(self):
-        f = _mamba_spec(_state_region())
-        host = f.host_entry_bytes()
-        self.assertEqual(f.draft_offset_in_entry(), align_part_offset(host))
-        self.assertEqual(
-            f.entry_bytes(),
-            align_entry_bytes(f.draft_offset_in_entry() + f.draft_region.entry_bytes()),
-        )
-        self.assertEqual(f.draft_region.entry_bytes(), 2 * (2 * 4 * 4) + 2 * 4)
 
     def _pool(self):
         region = _state_region()
         mamba = _mamba_spec(region)
         full = _host_spec()
         total = 4 * full.entry_bytes() + self.SLOTS * mamba.entry_bytes()
-        pool = UnifiedKVPool(
+        pool = arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
@@ -350,9 +353,9 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_host_and_draft_blocks_stay_byte_disjoint_within_a_slot(self):
         spec, pool = self._pool()
-        host_conv, host_temporal = pool.mamba_views_for("mamba")
-        draft_conv, draft_temporal = pool.build_draft_state_views("mamba")
-        raw = pool._raw
+        host_conv, host_temporal = pool.spec("mamba").views(pool)
+        draft_conv, draft_temporal = pool.spec("mamba").draft_views(pool)
+        raw = pool.raw
         entry = spec.entry_bytes()
         slot = 3
         lo = slot * entry
@@ -375,13 +378,12 @@ class TestFusedStateHost(unittest.TestCase):
 
     def test_host_whole_entry_ops_carry_the_draft_block(self):
         _, pool = self._pool()
-        host = UnifiedMambaPool(
-            unified_buffer=pool,
-            sub_pool_name="mamba",
-            spec_state_size=2,
+        host = StateView(
+            arena=pool,
+            spec=pool.spec("mamba"),
             mamba_layer_ids=[0, 1],
         )
-        draft_conv, _ = pool.build_draft_state_views("mamba")
+        draft_conv, _ = pool.spec("mamba").draft_views(pool)
         host.mamba_cache.conv[0][1][3] = 2.0
         draft_conv[1][0][3] = 7.0
         host.copy_from(torch.tensor([3]), torch.tensor([5]))
@@ -390,18 +392,16 @@ class TestFusedStateHost(unittest.TestCase):
         host.clear_slots(torch.tensor([5]))
         self.assertEqual(float(draft_conv[1][0][5].sum()), 0.0)
         self.assertEqual(float(host.mamba_cache.conv[0][1][5].sum()), 0.0)
-        host.move_kv_cache(torch.tensor([6]), torch.tensor([3]))
+        pool.move_units("mamba", torch.tensor([6]), torch.tensor([3]))
         self.assertEqual(float(host.mamba_cache.conv[0][1][6].sum()), 2.0 * 3 * 8)
         self.assertEqual(float(draft_conv[1][0][6].sum()), 7.0 * 2 * 4)
 
     def test_draft_views_alias_the_fused_block(self):
         _, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
-        )
-        draft_conv, _ = pool.build_draft_state_views("mamba")
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
+        draft_conv, _ = pool.spec("mamba").draft_views(pool)
         self.assertEqual(
-            draft.mamba_cache.conv[1].shape, (1, pool.max_slots("mamba"), 2, 4)
+            draft.mamba_cache.conv[1].shape, (1, pool.num_entries("mamba"), 2, 4)
         )
         self.assertEqual(
             draft.mamba2_layer_cache(0).conv[1].data_ptr(),
@@ -419,16 +419,13 @@ class TestFusedStateHost(unittest.TestCase):
         Equally, they must NOT clear the whole entry: the host's own streams
         share it and stay live while the draft's block is recycled."""
         spec, pool = self._pool()
-        draft = UnifiedDraftMambaPool(
-            unified_buffer=pool, sub_pool_name="mamba", layer_lanes={4: 0}
-        )
-        host = UnifiedMambaPool(
-            unified_buffer=pool,
-            sub_pool_name="mamba",
-            spec_state_size=2,
+        draft = DraftStateView(arena=pool, spec=pool.spec("mamba"), layer_lanes={4: 0})
+        host = StateView(
+            arena=pool,
+            spec=pool.spec("mamba"),
             mamba_layer_ids=[0, 1],
         )
-        draft_conv, draft_temporal = pool.build_draft_state_views("mamba")
+        draft_conv, draft_temporal = pool.spec("mamba").draft_views(pool)
         host.mamba_cache.conv[0][1][2] = 5.0  # host state, same slot
         draft_conv[0][0][2] = 9.0
         draft_temporal[0][2] = 7.0
@@ -483,7 +480,7 @@ class TestFusedMLAHost(unittest.TestCase):
     host/draft parts within every slot."""
 
     def setUp(self):
-        # `KVIndexTranslator.__init__` reads `attn_dcp_size`, a derived
+        # `RunnerIds.__init__` reads `attn_dcp_size`, a derived
         # parallel width that only exists once a config is published.
         reset_context()
         self.addCleanup(reset_context)
@@ -509,7 +506,7 @@ class TestFusedMLAHost(unittest.TestCase):
         full = _mla_host_spec(_draft_region())
         mamba = _mamba_filler_spec()
         total = self.PAGES * self.PS * full.entry_bytes() + 4 * mamba.entry_bytes()
-        return UnifiedKVPool(
+        return arena_of(
             total_bytes=total,
             sub_pool_specs=[full, mamba],
             device=_DEV,
@@ -520,10 +517,10 @@ class TestFusedMLAHost(unittest.TestCase):
 
     def test_host_and_draft_writes_stay_byte_disjoint_within_a_slot(self):
         pool = self._pool()
-        full = pool.mla_spec("full")
-        host_views = pool.mla_views_for("full")
-        dk, dv = pool.build_dense_draft_views("full")
-        raw = pool._raw
+        full = pool.spec("full")
+        host_views = pool.spec("full").views(pool)
+        dk, dv = pool.spec("full").draft_views(pool)
+        raw = pool.raw
         entry = full.entry_bytes()
         t = 2 * self.PS + 1  # page 2, slot 1
         slot_lo = t * entry
@@ -547,10 +544,8 @@ class TestFusedMLAHost(unittest.TestCase):
         """A draft runner bound over the MLA host's entries translates through
         the mamba allocator's full-side v2p, as on the SWA host; a passthrough
         here would write raw virtual ids into the views."""
-        from sglang.srt.mem_cache.allocator.unified_mamba import (
-            UnifiedMambaTokenToKVPoolAllocator,
-        )
-        from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+        from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 
         pool = self._pool()
 
@@ -559,44 +554,46 @@ class TestFusedMLAHost(unittest.TestCase):
                 self.allocator = allocator
 
         kvcache = SimpleNamespace(full_kv_pool=_FakeKV(), mamba_pool=_FakeKV())
-        alloc = UnifiedMambaTokenToKVPoolAllocator(
-            unified_buffer=pool,
+        alloc = ChainAllocator(
+            roles=ChainRoles(owner="full", state="mamba"),
+            arena=pool,
             kvcache=kvcache,
+            views=stand_in_views(
+                ChainRoles(owner="full", state="mamba"), kvcache, kvcache.mamba_pool
+            ),
             device=_DEV,
             page_size=self.PS,
             need_sort=False,
             forward_stream=None,
-            lazy_compaction=False,
+            lazy_compaction=True,
         )
-        dp = UnifiedDraftKVPool(
-            unified_buffer=pool,
-            host_sub_pool_name="full",
-            host_allocator=alloc,
+        dp = DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        translator = KVIndexTranslator(
+        runner_ids = RunnerIds(
             req_to_token=torch.zeros((2, 8), dtype=torch.int32),
             token_to_kv_pool_allocator=alloc,
             token_to_kv_pool=dp,
             page_size=self.PS,
             device=_DEV,
         )
-        self.assertTrue(translator.is_translating)
+        self.assertTrue(runner_ids.is_translating)
         self.assertIs(
-            translator.full_v2p_table, alloc.full_attn_allocator.virtual_to_physical
+            runner_ids.full_v2p_table, alloc.full_attn_allocator.ids.virtual_to_physical
         )
 
     def test_draft_pool_binds_over_the_mla_host(self):
         pool = self._pool()
-        dp = UnifiedDraftKVPool(
-            unified_buffer=pool,
-            host_sub_pool_name="full",
-            host_allocator=object(),
+        dp = DraftMHAView(
+            arena=pool,
+            host_spec=pool.spec("full"),
             layer_lanes={0: 0},
             page_size=self.PS,
         )
-        entry = pool.mla_spec("full").entry_bytes()
+        entry = pool.spec("full").entry_bytes()
         self.assertEqual(dp.k_buffer[0].shape[1:], (1, 24))
         self.assertEqual(dp.v_buffer[0].shape[1:], (1, 8))
         self.assertEqual(
@@ -604,17 +601,20 @@ class TestFusedMLAHost(unittest.TestCase):
         )
 
 
-class TestUnifiedDraftSWAKVPool(unittest.TestCase):
-    """A draft with window layers binds one dense side per host sub-pool and
-    routes per layer like the target's composite: a window layer's write
-    needs the swa loc and lands in the swa entry's draft part, never in the
-    full entry."""
+class TestRoutedDraftPool(CustomTestCase):
+    """A draft with window layers binds one dense view per host sub-pool and
+    routes per layer like the target's pool: a window layer's write needs the
+    swa loc and lands in the swa entry's draft part, never in the full entry."""
 
     PS = 2
     PAGES = 8
 
-    def _pool(self):
-        full_region = _draft_region()
+    def _pool(self, *, symmetric=False):
+        full_region = (
+            DenseDraftRegion(lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE)
+            if symmetric
+            else _draft_region()
+        )
         swa_region = DenseDraftRegion(
             lane_num=1, head_num=1, head_dim=8, store_dtype=_DTYPE
         )
@@ -629,7 +629,7 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
             draft_region=swa_region,
         )
         total = self.PAGES * self.PS * (full.entry_bytes() + swa.entry_bytes())
-        return UnifiedKVPool(
+        return arena_of(
             total_bytes=total,
             sub_pool_specs=[full, swa],
             device=_DEV,
@@ -642,38 +642,38 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         )
 
     def _draft_pool(self, pool):
-        return UnifiedDraftSWAKVPool(
-            unified_buffer=pool,
-            host_allocator=object(),
+        return routed_draft_pool(
+            arena=pool,
+            plan=plan_stand_in(pool),
+            owner="full",
             page_size=self.PS,
-            full_layer_lanes={0: 0},
-            swa_layer_lanes={1: 0},
+            lanes_by_host={"full": {0: 0}, "swa": {1: 0}},
         )
 
     def test_routes_each_layer_to_its_side(self):
         pool = self._pool()
         dp = self._draft_pool(pool)
-        self.assertEqual(dp.layers_mapping, {0: (0, False), 1: (0, True)})
-        dk, _ = pool.build_dense_draft_views("swa")
+        self.assertEqual(dp.layer_router.route(0).sub_pool, "full")
+        self.assertEqual(dp.layer_router.route(1).sub_pool, "swa")
+        self.assertEqual(dp.layer_router.route(1).index, 0)
+        dk, _ = pool.spec("swa").draft_views(pool)
         self.assertEqual(dp.get_key_buffer(1).data_ptr(), dk[0].data_ptr())
         self.assertEqual(dp.get_key_buffer(1).shape[1:], (1, 8))
         self.assertEqual(dp.get_key_buffer(0).shape[1:], (1, 24))
-        self.assertEqual(dp.swa_layer_nums, 1)
-        self.assertEqual(dp.full_layer_nums, 1)
 
     def test_a_window_only_draft_answers_its_own_v_width(self):
-        # MiMoV2MTP: no full layer at all; the composite still works.
+        # MiMoV2MTP: no full layer at all; the swa view answers for the pool.
         pool = self._pool()
-        swa_only = UnifiedDraftSWAKVPool(
-            unified_buffer=pool,
-            host_allocator=object(),
+        swa_only = routed_draft_pool(
+            arena=pool,
+            plan=plan_stand_in(pool),
+            owner="full",
             page_size=self.PS,
-            full_layer_lanes={},
-            swa_layer_lanes={0: 0},
+            lanes_by_host={"swa": {0: 0}},
         )
-        self.assertIsNone(swa_only.full_kv_pool)
+        self.assertIsNone(swa_only.layer_router.sub_pool("full"))
         self.assertEqual(swa_only.get_v_head_dim(), 8)
-        self.assertEqual(swa_only.layers_mapping, {0: (0, True)})
+        self.assertEqual(swa_only.layer_router.route(0).sub_pool, "swa")
 
     def test_window_write_needs_the_swa_loc_and_stays_in_the_swa_entry(self):
         pool = self._pool()
@@ -684,7 +684,7 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         loc = torch.tensor([6], dtype=torch.int64)
         with self.assertRaises(AssertionError):
             dp.set_kv_buffer(layer, KVWriteLoc(loc, physical=True), k, v)
-        raw = pool._raw
+        raw = pool.raw
         raw.zero_()
         # `_is_cuda` is a PLATFORM constant, not a per-tensor device check, so
         # on a CUDA box the store dispatches the CUDA-only `sglang::store_cache`
@@ -698,6 +698,252 @@ class TestUnifiedDraftSWAKVPool(unittest.TestCase):
         nz = raw.nonzero()
         self.assertGreater(nz.numel(), 0)
         self.assertTrue(bool((nz >= lo).all() and (nz < 7 * swa_entry).all()))
+
+    def _write_fixture(self, *, symmetric=False):
+        arena = self._pool(symmetric=symmetric)
+        pool = self._draft_pool(arena)
+        full = torch.tensor([[14, 15, 16], [17, 18, 19]], dtype=torch.int64)
+        swa = torch.tensor([[2, 3, 4], [5, 6, 7]], dtype=torch.int64)
+        values = []
+        for layer_id, name in enumerate(("full", "swa")):
+            region = arena.spec(name).draft_region
+            k = (
+                torch.arange(6 * region.head_dim, dtype=_DTYPE).view(
+                    6, 1, region.head_dim
+                )
+                + 1
+                + layer_id * 64
+            )
+            v = (
+                -torch.arange(6 * region.resolved_v_head_dim(), dtype=_DTYPE).view(
+                    6, 1, region.resolved_v_head_dim()
+                )
+                - 1
+                - layer_id * 64
+            )
+            values.append((k, v))
+        return arena, pool, full, swa, values
+
+    def _expected_writes(self, arena, full, swa, values, commit_lens):
+        arena.raw.fill_(0x5A)
+        expected = arena.raw.clone()
+        rows = (
+            range(6)
+            if commit_lens is None
+            else (
+                row * 3 + col
+                for row, length in enumerate(commit_lens.tolist())
+                for col in range(length)
+            )
+        )
+        rows = tuple(rows)
+        for name, loc, (k, v) in zip(("full", "swa"), (full, swa), values):
+            key_views, value_views = arena.spec(name).draft_views(arena)
+            for source, buffer in ((k, key_views[0]), (v, value_views[0])):
+                base = buffer.data_ptr() - arena.raw.data_ptr()
+                stride = buffer.stride(0) * buffer.element_size()
+                for row in rows:
+                    value = source[row].contiguous().view(torch.uint8).flatten()
+                    offset = base + int(loc.flatten()[row]) * stride
+                    expected[offset : offset + value.numel()] = value
+        return expected
+
+    def test_layer_stores_keep_the_full_and_window_id_spaces(self):
+        """Routed draft writes must use each host's physical IDs and leave rejected rows intact."""
+        arena, pool, full, swa, values = self._write_fixture()
+        for lengths in (None, (2, 0), (0, 0)):
+            with self.subTest(commit_lens=lengths):
+                commit_lens = (
+                    torch.tensor(lengths, dtype=torch.int32)
+                    if lengths is not None
+                    else None
+                )
+                expected = self._expected_writes(arena, full, swa, values, commit_lens)
+                loc = KVWriteLoc(
+                    full if commit_lens is not None else full.flatten(),
+                    swa_loc=swa if commit_lens is not None else swa.flatten(),
+                    physical=True,
+                )
+                with patch.multiple(
+                    mem_pool, _is_cuda=False, _is_hip=False, _cpu_has_amx_support=False
+                ):
+                    for layer_id, (k, v) in enumerate(values):
+                        layer = SimpleNamespace(layer_id=layer_id)
+                        access = pool.layer_router.layer(layer_id)
+                        if commit_lens is None:
+                            access.store(layer, loc, k, v)
+                        else:
+                            access.store_prefix(layer, loc, commit_lens, k, v)
+                self.assertTrue(torch.equal(arena.raw, expected))
+
+    def _draft_layers(self, values):
+        return [
+            SimpleNamespace(
+                self_attn=SimpleNamespace(
+                    attn=SimpleNamespace(layer_id=i, k_scale=None, v_scale=None),
+                    num_kv_heads=1,
+                    head_dim=8,
+                    kv_proj_only=lambda hidden, k=k, v=v: (k, v),
+                    apply_k_norm=lambda k: k,
+                    apply_k_rope=lambda positions, k: k,
+                )
+            )
+            for i, (k, v) in enumerate(values)
+        ]
+
+    def test_dflash_context_append_routes_normal_and_prefix_writes(self):
+        """Both DFLASH materializers must retain SWA IDs through accepted-prefix commits."""
+        from sglang.srt.speculative import dflash_worker_v2
+        from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
+
+        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
+        worker = object.__new__(DFlashWorkerV2)
+        worker.model_runner = SimpleNamespace(device=torch.device("cpu"))
+        worker.draft_model_runner = SimpleNamespace(token_to_kv_pool=pool)
+        worker.draft_parallel_layout = None
+        worker.lilicorr = None
+        worker.draft_model = SimpleNamespace(
+            layers=self._draft_layers(values),
+            project_target_hidden=lambda hidden: hidden,
+            prepare_context_hidden_for_kv=lambda layer, hidden: hidden,
+        )
+
+        class Materializer:
+            def materialize(self, *, write_layer_kv, **kwargs):
+                for layer_id, (k, v) in enumerate(values):
+                    write_layer_kv(layer_id, k, v)
+
+        for fused in (False, True):
+            for lengths in (None, (2, 0), (0, 0)):
+                with self.subTest(fused=fused, commit_lens=lengths):
+                    worker._use_fused_kv_materialize = fused
+                    worker._fused_kv_helper = Materializer() if fused else None
+                    commit_lens = (
+                        torch.tensor(lengths, dtype=torch.int32)
+                        if lengths is not None
+                        else None
+                    )
+                    expected = self._expected_writes(
+                        arena, full, swa, values, commit_lens
+                    )
+                    with (
+                        patch.multiple(
+                            mem_pool,
+                            _is_cuda=False,
+                            _is_hip=False,
+                            _cpu_has_amx_support=False,
+                        ),
+                        patch.object(dflash_worker_v2, "_is_npu", False),
+                        patch.object(
+                            dflash_worker_v2,
+                            "draft_tp_context",
+                            return_value=nullcontext(),
+                        ),
+                    ):
+                        worker._append_target_hidden_to_draft_kv_by_loc(
+                            target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                            cache_loc=full.flatten(),
+                            swa_cache_loc=swa.flatten(),
+                            positions=torch.arange(6),
+                            cache_loc_2d=full if commit_lens is not None else None,
+                            commit_lens=commit_lens,
+                        )
+                    self.assertTrue(torch.equal(arena.raw, expected))
+                    self.assertEqual(worker._use_fused_kv_materialize, fused)
+
+    def test_dspark_context_injector_uses_both_plan_id_spaces(self):
+        """DSpark's projected context must commit into both routed hosts without touching rejected rows."""
+        from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+        from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+        from sglang.srt.models.dspark import DSparkDraftMixin
+        from sglang.srt.speculative.dspark_components.dspark_kv_inject import (
+            TargetHiddenKvInjector,
+        )
+
+        arena, pool, full, swa, values = self._write_fixture(symmetric=True)
+        spaces = {
+            kind: IdSpace(key=kind, write=lambda ids, loc=loc: loc.flatten()[ids])
+            for kind, loc in (
+                (IdSpaceKind.FULL, full),
+                (IdSpaceKind.SLIDING_WINDOW, swa),
+            )
+        }
+        runner_ids = SimpleNamespace(space=spaces.get)
+        plan = IterationIds(
+            source=runner_ids,
+            req_pool_indices=torch.tensor([0, 1]),
+            seq_lens=torch.tensor([3, 3]),
+            seq_lens_cpu=torch.tensor([3, 3]),
+            write_virtual=torch.arange(6),
+        )
+        model = SimpleNamespace(
+            layers=self._draft_layers(values),
+            project_target_hidden=lambda hidden: hidden,
+            _fused_kv_write_bundle=lambda pool: None,
+            _stacked_ctx_kv_params=lambda: None,
+        )
+        model.write_target_hidden_kv = MethodType(
+            DSparkDraftMixin.write_target_hidden_kv, model
+        )
+        injector = TargetHiddenKvInjector(
+            draft_model=model,
+            draft_model_runner=SimpleNamespace(
+                token_to_kv_pool=pool, runner_ids=runner_ids
+            ),
+            model_runner=SimpleNamespace(device=torch.device("cpu")),
+            device=torch.device("cpu"),
+            verify_num_draft_tokens=3,
+            block_pos_offsets=torch.arange(3),
+        )
+        for lengths in (None, (2, 0), (0, 0)):
+            with self.subTest(commit_lens=lengths):
+                commit_lens = (
+                    torch.tensor(lengths, dtype=torch.int32)
+                    if lengths is not None
+                    else None
+                )
+                expected = self._expected_writes(arena, full, swa, values, commit_lens)
+                with patch.multiple(
+                    mem_pool, _is_cuda=False, _is_hip=False, _cpu_has_amx_support=False
+                ):
+                    injector.inject_target_hidden(
+                        target_hidden=torch.ones((6, 8), dtype=_DTYPE),
+                        cache_loc=plan.write_ids(runner_ids),
+                        positions=torch.arange(6),
+                        cache_loc_2d=full if commit_lens is not None else None,
+                        commit_lens=commit_lens,
+                        iteration_ids=plan,
+                    )
+                self.assertTrue(torch.equal(arena.raw, expected))
+
+    def test_dspark_single_location_fusion_declines_window_layers(self):
+        """A shared-location kernel cannot address full and SWA hosts with different IDs."""
+        from sglang.srt.models.dspark import DSparkDraftMixin
+
+        arena, pool, _, _, values = self._write_fixture(symmetric=True)
+        layers = self._draft_layers(values)
+        rotary = type("RotaryEmbedding", (), {})()
+        rotary.position_start = 0
+        rotary.rotary_dim = 8
+        rotary.is_neox_style = True
+        rotary.cos_sin_cache = torch.ones((16, 8), dtype=_DTYPE)
+        for layer in layers:
+            layer.self_attn.kv_size = 8
+            layer.self_attn.rotary_emb = rotary
+            layer.self_attn.k_norm = SimpleNamespace(
+                weight=torch.ones(8, dtype=_DTYPE), variance_epsilon=1e-6
+            )
+        model = SimpleNamespace(layers=layers)
+        model._fused_k_norm_weights = MethodType(
+            DSparkDraftMixin._fused_k_norm_weights, model
+        )
+        self.assertIsNone(
+            DSparkDraftMixin._fused_kv_write_layout(model, pool, project=lambda x: x)
+        )
+        model.layers = layers[:1]
+        self.assertIsNotNone(
+            DSparkDraftMixin._fused_kv_write_layout(model, pool, project=lambda x: x)
+        )
 
 
 if __name__ == "__main__":

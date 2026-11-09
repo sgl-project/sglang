@@ -8,11 +8,11 @@ import torch.nn.functional as F
 
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
 from sglang.srt.runtime_context import get_context
-from sglang.srt.utils import is_hip
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=25, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
 
 HIDDEN = 2048
 HEAD_DIM = 512
@@ -123,9 +123,11 @@ def _build(n: int, ratio: int, seed: int):
         k_norm=k_norm,
         rope_head_dim=ROPE_DIM,
         index_head_dim=INDEX_HEAD_DIM,
+        # ROCm never takes the tiny GEMM for wk (_tiny_gemm_max_m returns -1).
+        wk_small_max_m=-1,
     )
-    # The real method, bound to the stand-in: it reads only wk and
-    # index_head_dim, and it is what decides whether the in-tree GEMM serves wk.
+    # The real method, bound to the stand-in: it reads only wk, index_head_dim
+    # and wk_small_max_m, and it is what decides whether the in-tree GEMM serves wk.
     captured = {}
 
     def forward_wk(latent):
@@ -190,7 +192,7 @@ def _reference(t, ratio: int):
     from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
         index_k_rope_pack,
     )
-    from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
+    from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import rope_tail
 
     if ratio == 1:
@@ -254,7 +256,7 @@ def _reference(t, ratio: int):
     )
     index_cache = tuple(torch.zeros_like(buf) for buf in t.index_cache)
     if t.index_k_split:
-        from sglang.kernels.ops.attention.dsv4.fp4_indexer_hip import (
+        from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache_hip import (
             store_fp4_index_k_cache_split,
         )
         from sglang.srt.layers.attention.dsv4.dsv41_sparse import _rope_fq4
@@ -319,7 +321,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
             with self.subTest(ratio=ratio):
                 self._check_step(_build(64, ratio, seed=164 + ratio), ratio)
 
-    @unittest.skipUnless(is_hip(), "HIP fused pair-state writer")
     def test_pair_state_survives_the_next_decode_step(self):
         t = _build(8, 2, seed=3000)
         t.req.copy_(t.req.roll(1))
@@ -343,7 +344,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
         self._check_step(t, 2)
         self.assertTrue(torch.equal(state, expected_state))
 
-    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_padded_rows_publish_nothing(self):
         """A padded graph suffix carries raw_out_loc == 0 and out_loc == 0, which
         both kernels must read off the arrays (the caller passes no mask)."""
@@ -371,7 +371,6 @@ class TestFusedLowRatioCompress(CustomTestCase):
                 else:
                     self.assertFalse(t.index_cache[0][0, : INDEX_HEAD_DIM // 2].any())
 
-    @unittest.skipUnless(is_hip(), "HIP fused compressor regression")
     def test_open_group_rows_publish_nothing(self):
         """A live ratio-2 token at an even position completes no group, so the metadata
         gives it c2_out_loc == -1; an index-K writer taking that -1 straight from

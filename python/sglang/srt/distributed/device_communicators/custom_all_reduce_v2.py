@@ -18,10 +18,13 @@ The CUDA side is split into independent pieces:
 
 All storage is allocated and owned here, in Python.
 
-CUDA-graph inputs are exchanged from Python after capture (cudaIpc handles
-for cudaMalloc-backed pointers, fabric/posix-fd VMM mapping for expandable
-segments) and written into a device-side pointer table (``graph_params``);
-the kernel captured in the graph dereferences its row at replay time.
+On single-node groups, CUDA-graph inputs are exchanged from Python after
+capture (cudaIpc handles for cudaMalloc-backed pointers, FABRIC/POSIX-fd VMM mapping
+for expandable segments) and written into a device-side pointer table
+(``graph_params``); the kernel captured in the graph dereferences its row at
+replay time. Multi-node (MNNVL) groups skip direct graph-input registration
+and use the torch symmetric-memory workspace during capture and replay too.
+Their input tensors therefore do not require a VMM-backed caching allocator.
 """
 
 import logging
@@ -34,6 +37,7 @@ from torch.distributed import ProcessGroup
 
 from sglang.kernels.kernel_api_logging import _KERNEL_API_LOG_LEVEL
 from sglang.kernels.ops.communication.all_reduce import (
+    SUPPORTED_DTYPES,
     AllReduceAlgo,
     Communicator,
     IPCManager,
@@ -47,6 +51,7 @@ from sglang.srt.environ import envs
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.cuda_vmm_utils import (
     VmmGraphInputManager,
     compute_graph_capture_bases,
@@ -65,6 +70,8 @@ from .custom_all_reduce_utils import (
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+
 MB = 1024 * 1024
 
 _ALIGN_BYTES = 1024
@@ -82,7 +89,16 @@ def _ceil_align(nbytes: int, align: int) -> int:
     return (nbytes + align - 1) // align * align
 
 
-def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: ProcessGroup):
+def _allocate_symmetric_memory(
+    nbytes: int, device: torch.device, group: ProcessGroup
+) -> Tuple[object, List[torch.Tensor], int]:
+    """``(owner, per-rank uint8 views, multicast VA or 0)``; keep ``owner`` alive."""
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import HipSymmetricBuffer
+
+        buffer = HipSymmetricBuffer(nbytes, device, group)
+        return buffer, buffer.buffers, 0
+
     from torch._C._distributed_c10d import _SymmetricMemory
 
     if torch.__version__ < "2.11.0":
@@ -97,7 +113,11 @@ def _allocate_symmetric_memory(nbytes: int, device: torch.device, group: Process
         group.group_name,
     )
     symm_mem = _SymmetricMemory.rendezvous(tensor)
-    return tensor, symm_mem
+    slabs = [
+        symm_mem.get_buffer(i, [nbytes], torch.uint8)
+        for i in range(dist.get_world_size(group=group))
+    ]
+    return (tensor, symm_mem), slabs, int(symm_mem.multicast_ptr)
 
 
 class AllReduceConfig(NamedTuple):
@@ -199,9 +219,14 @@ class CustomAllReduceV2:
         # On a multi-node (MNNVL) group the symm-mem workspace plane works
         # across nodes, but graph zero-copy input registration (cudaIpc /
         # node-local VMM remap) does not — force eager pull inside graphs.
+        # On ROCm the 2-shot graph path would store into peers' cached input
+        # buffers, which XGMI does not keep coherent; stage through the
+        # uncached workspace inside graphs instead.
         is_multinode = not all(in_the_same_node_as(group, source_rank=0))
         tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-        self._is_graph_mode_supported = not tms_cudagraph and not is_multinode
+        self._is_graph_mode_supported = (
+            not tms_cudagraph and not is_multinode and not _is_hip
+        )
         # device-side pointer table: one row of world_size pointers per
         # graph-captured all-reduce input
         self.graph_params = torch.zeros(
@@ -210,7 +235,8 @@ class CustomAllReduceV2:
             device=self.device,
         )
         self._init_workspace()
-        self._ipc_manager = IPCManager()
+        # only graph-input registration opens IPC handles
+        self._ipc_manager = IPCManager() if self._is_graph_mode_supported else None
         self._vmm_graph_input_manager = VmmGraphInputManager(
             obj=self,
             group=self.group,
@@ -222,6 +248,18 @@ class CustomAllReduceV2:
         self._graph_mode_allowed = False
         self._capture_started = False
         self.disabled = False
+
+    def supports_push(self, *, nbytes: int, num_blocks: int) -> bool:
+        """Whether the push plane can hold a payload and its synchronization blocks.
+
+        This checks allocated capacity, not algorithm-selection thresholds or
+        tensor eligibility. Disabled communicators have no usable capacity.
+        """
+        return (
+            not self.disabled
+            and 0 < nbytes <= self.max_push_size
+            and 0 < num_blocks <= self._push_counter.numel()
+        )
 
     def reserve_push_capacity(self, nbytes: int) -> None:
         """Grow shared storage without changing AR dispatch or counter capacity.
@@ -267,13 +305,9 @@ class CustomAllReduceV2:
         pull_offset = push_bytes
         sem_offset = push_bytes + pull_bytes
 
-        self._symm_tensor, symm_mem = _allocate_symmetric_memory(
+        self._symm_owner, slabs, multicast_ptr = _allocate_symmetric_memory(
             total_bytes, device=self.device, group=self.group
         )
-        slabs = [
-            symm_mem.get_buffer(i, [total_bytes], torch.uint8)
-            for i in range(self.world_size)
-        ]
         # The push slots (lamport pos-zero markers) and the semaphores must
         # start zeroed; the pull buffer need not, but it rides along in the
         # one-shot memset.
@@ -289,7 +323,6 @@ class CustomAllReduceV2:
             assert offset + nbytes <= total_bytes
             return [slab[offset : offset + nbytes].view(shape) for slab in slabs]
 
-        multicast_ptr = int(symm_mem.multicast_ptr)
         self.has_multicast = multicast_ptr != 0
 
         def mc_at(offset: int) -> Optional[int]:
@@ -389,6 +422,8 @@ class CustomAllReduceV2:
     def should_custom_ar(self, inp: torch.Tensor) -> bool:
         """Check if the input tensor is suitable for custom all-reduce."""
         if self.disabled:
+            return False
+        if inp.dtype not in SUPPORTED_DTYPES:
             return False
         inp_size = inp.numel() * inp.element_size()
         # custom allreduce requires input byte size to be multiples of 16
@@ -551,7 +586,8 @@ class CustomAllReduceV2:
 
     def close(self):
         if not self.disabled and hasattr(self, "obj"):
-            self._ipc_manager.destroy()
+            if self._ipc_manager is not None:
+                self._ipc_manager.destroy()
             dist.barrier(group=self.group)
             del self.obj  # drop the pointer holder before the workspace tensors
         if hasattr(self, "_vmm_graph_input_manager"):
@@ -561,21 +597,30 @@ class CustomAllReduceV2:
         self.close()
 
 
-def _is_vmm_backed_allocator(device: torch.device) -> bool:
-    """Check whether expandable-segments VMM backs the caching allocator."""
-    probe = torch.empty(1, dtype=torch.uint8, device=device)
-    return is_vmm_pointer(probe.data_ptr())
-
-
 def can_use_custom_all_reduce_v2(
     group: ProcessGroup,
     device: torch.device,
 ) -> bool:
+    if _is_hip:
+        from sglang.srt.utils.hip_vmm_utils import (
+            MIN_HIP_VERSION,
+            hip_runtime_version,
+        )
+
+        version = hip_runtime_version()
+        if version[:2] < MIN_HIP_VERSION:
+            logger.warning(
+                "CustomAllReduceV2 is disabled: HIP runtime %s is older than %s, "
+                "the oldest it is validated on.",
+                ".".join(map(str, version)),
+                ".".join(map(str, MIN_HIP_VERSION)),
+            )
+            return False
     supported = get_supported_world_sizes()
     if dist.get_world_size(group=group) not in supported:
         return False
     if not all(in_the_same_node_as(group, source_rank=0)):
-        return is_one_nvlink_clique(group, device) and _is_vmm_backed_allocator(device)
+        return is_one_nvlink_clique(group, device)
     full_nvlink = can_use_custom_all_reduce_with_nvlink(
         group=group,
         device=device,
