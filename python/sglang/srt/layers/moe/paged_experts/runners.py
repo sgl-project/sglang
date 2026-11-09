@@ -150,6 +150,9 @@ class MarlinContract(RunnerContract):
             and entries.is_contiguous()
             and out.is_contiguous()
             and entries.shape[-1] % 8 == 0
+            # moe_topk_sum's grid is (ceil(K / 8 / threads), M) and gridDim.y is capped at
+            # 65,535: a prefill chunk past that stays on the general reduce.
+            and entries.shape[0] <= 65535
         ):
             from sglang.kernels.ops.moe.moe_topk_sum import moe_topk_sum
 

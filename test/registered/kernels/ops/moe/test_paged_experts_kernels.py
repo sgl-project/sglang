@@ -145,6 +145,18 @@ class TestPagedExpertsKernels(CustomTestCase):
                 torch.equal(run_w.cpu(), weights.masked_fill(topk < 0, 0.0))
             )
 
+    def test_sum_top_k_falls_back_past_the_grid_y_limit(self):
+        """``moe_topk_sum`` grids over (..., M) and gridDim.y stops at 65,535, so a prefill chunk
+        that large must keep the general reduce instead of failing to launch."""
+        from sglang.srt.layers.moe.paged_experts.runners import MarlinContract
+
+        entries = torch.randn(65536, 1, 2560, device="cuda", dtype=torch.bfloat16)
+        out = torch.empty(65536, 2560, device="cuda", dtype=torch.bfloat16)
+        MarlinContract()._sum_top_k(entries, out, 1.3)
+        self.assertTrue(
+            torch.equal(out, (entries.float().sum(1) * 1.3).to(torch.bfloat16))
+        )
+
     def test_gather_with_an_empty_plan_touches_nothing(self):
         """Most decode steps page nothing; count = 0 must leave every slot as it was."""
         hosts = [torch.randn(E, 8, dtype=torch.bfloat16).pin_memory()]
