@@ -744,9 +744,22 @@ class CommonKVManager(BaseKVManager):
                     self.request_status[bootstrap_room] = status
                     return status
                 return None
-            if current in (KVPoll.Success, KVPoll.Failed):
-                # Both are terminal. Failed also sorts lowest, so max() would
-                # promote it back; a late Failed must not undo a finished transfer.
+            if current == KVPoll.Failed or (
+                current == KVPoll.Success
+                and (
+                    status != KVPoll.Failed
+                    or (
+                        self.disaggregation_mode == DisaggregationMode.PREFILL
+                        and self._staging_outstanding.get(bootstrap_room, 0) <= 0
+                    )
+                )
+            ):
+                # Failed is terminal, and sorts lowest, so max() would promote it
+                # back. On prefill, Success is terminal once no staging chunk is
+                # outstanding; before that it is provisional (the poll holds
+                # Transferring), and a deferred chunk's failure must still fail
+                # the room. On decode, a prefill Failed after Success reports such
+                # a chunk, so it still replaces Success.
                 return current
             if status == KVPoll.Failed:
                 self.request_status[bootstrap_room] = KVPoll.Failed
@@ -2636,8 +2649,9 @@ class CommonKVSender(BaseKVSender):
             self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Failed)
             == KVPoll.Success
         ):
-            # The transfer concluded first; Success stands and clear() drops
-            # the failure record written above.
+            # The transfer concluded first and nothing is outstanding (else
+            # update_status would have written Failed); Success stands and
+            # clear() drops the failure record written above.
             return
         self.conclude_state = KVPoll.Failed
         # Some abort paths release the request without ever clearing the

@@ -16,6 +16,7 @@ from sglang.srt.disaggregation.common.conn import CommonKVReceiver, PrefillServe
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
 from sglang.srt.disaggregation.decode import DecodePreallocQueue, DecodeRequest
 from sglang.srt.disaggregation.fake.conn import FakeKVSender
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import (
     MooncakeKVManager,
     MooncakeKVReceiver,
@@ -101,6 +102,9 @@ class TestAllocationIntegration(CustomTestCase):
         mgr = MooncakeKVManager.__new__(MooncakeKVManager)
         mgr.customized_info_enabled = False
         mgr.local_ip, mgr.rank_port = ip, port
+        mgr.disaggregation_mode = (
+            DisaggregationMode.PREFILL if ip == "prefill" else DisaggregationMode.DECODE
+        )
         mgr.kv_args = SimpleNamespace(aux_data_ptrs=[], aux_item_lens=[])
         mgr.request_status = {}
         mgr.failure_lock = threading.Lock()
@@ -951,6 +955,66 @@ class TestAllocationIntegration(CustomTestCase):
                 self.assertEqual(mgr.request_status.get(1), KVPoll.Success)
             with self.subTest("sender reports Success"):
                 self.assertEqual(sender.poll(), KVPoll.Success)
+
+    def test_failed_deferred_chunk_replaces_provisional_success(self):
+        mgr = self.manager("prefill", 1)
+        mgr.defer_decode_allocation = False
+        mgr.deferred_bootstrap = None
+        mgr._staging_outstanding = defaultdict(int)
+        decode = self.manager("decode", 2)
+        decode.defer_decode_allocation = False
+        with get_context().override_server_args(
+            disaggregation_decode_allocation_policy="early"
+        ):
+            sender = MooncakeKVSender(mgr, "prefill:8998", 1)
+            # Decode's destinations arrived; the room is now transferring.
+            mgr.update_status(1, KVPoll.WaitingForInput)
+            decode.request_status[1] = KVPoll.WaitingForInput
+            decode.prefill_response_tracker[1] = set()
+            decode.required_prefill_response_num_table[1] = 1
+            # The worker keeps the room's decode endpoints until teardown;
+            # conclude_failure without targets notifies them.
+            mgr.transfer_infos[1] = {
+                "session": SimpleNamespace(
+                    is_dummy=False, endpoint="decode", dst_port=2
+                )
+            }
+            # The worker counts each chunk at dequeue. Chunk A was deferred and
+            # re-enqueued behind the last chunk B, so both are outstanding.
+            mgr._staging_outstanding[1] += 1
+            mgr._staging_outstanding[1] += 1
+            self.conclude_like_worker(mgr)
+            mgr._staging_outstanding[1] -= 1
+            # Chunk A's retry fails (transfer_worker, ret != 0 branch).
+            mgr.conclude_failure(
+                bootstrap_room=1,
+                failure_reason="Failed to send kv chunk of 1 to decode:2",
+            )
+            to_decode = [
+                decode.parse_kv_status_message(msg)
+                for endpoint, msg in self.wire
+                if endpoint == "tcp://decode:2"
+            ]
+            for room, status, rank, reason in to_decode:
+                decode.apply_prefill_status(
+                    bootstrap_room=room,
+                    status=status,
+                    prefill_rank=rank,
+                    failure_reason=reason,
+                )
+            self.wire.clear()
+            with self.subTest("prefill table reads Failed"):
+                self.assertEqual(mgr.request_status.get(1), KVPoll.Failed)
+            mgr._staging_outstanding[1] -= 1
+            with self.subTest("sender reports Failed"):
+                self.assertEqual(sender.poll(), KVPoll.Failed)
+            with self.subTest("a Failed message reaches decode"):
+                self.assertIn(
+                    KVPoll.Failed,
+                    [status for room, status, _, _ in to_decode if room == 1],
+                )
+            with self.subTest("decode room is Failed"):
+                self.assertEqual(decode.request_status.get(1), KVPoll.Failed)
 
 
 if __name__ == "__main__":
