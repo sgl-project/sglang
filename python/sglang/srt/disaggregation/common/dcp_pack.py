@@ -91,6 +91,43 @@ def try_pack_dcp_src(
     return packed_ptrs, np.arange(n, dtype=np.int64)
 
 
+class NPUDSADCPPackBuffer:
+    def __init__(self, size: int, device_id: int):
+        device = torch.device("npu", device_id)
+        torch.get_device_module(device).set_device(device_id)
+        self.buffer = torch.empty(size, dtype=torch.uint8, device=device)
+        self.stream = None
+        self.failed = False
+
+
+def try_pack_npu_dsa_dcp_src(pack_buffer, buffers, src_indices, token_widths):
+    """Gather row-contiguous NPU MLA bytes into a registered per-worker buffer."""
+    count = src_indices.size
+    size = count * sum(token_widths)
+    if pack_buffer.failed or size > pack_buffer.buffer.nbytes:
+        return None
+
+    device = pack_buffer.buffer.device
+    if pack_buffer.stream is None:
+        pack_buffer.stream = torch.get_device_module(device).Stream(device=device)
+    stream = pack_buffer.stream
+    base = pack_buffer.buffer.data_ptr()
+    packed_ptrs = []
+    offset = 0
+    # The transfer worker already waited for the Prefill forward to finish.
+    with device_stream_context(stream):
+        indices = torch.as_tensor(src_indices, device=device, dtype=torch.int64)
+        for buffer, width in zip(buffers, token_widths):
+            src = buffer.view(torch.uint8).view(-1, width)
+            dst = pack_buffer.buffer.narrow(0, offset, count * width).view(count, width)
+            torch.index_select(src, 0, indices, out=dst)
+            packed_ptrs.append(base + offset)
+            offset += count * width
+    # Mooncake reads raw addresses and has no dependency on the NPU stream.
+    stream.synchronize()
+    return packed_ptrs, np.arange(count, dtype=np.int64)
+
+
 def dsa_index_k_item_lens(kv_args) -> List[int]:
     if kv_args.dsa_index_k_token_bytes is None:
         return []

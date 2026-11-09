@@ -239,7 +239,9 @@ class RunnerIds:
                     localize_dcp_indices,
                     dcp_size=parallel.dcp_size,
                     dcp_rank=parallel.dcp_rank,
-                    interleave_size=page_size,
+                    interleave_size=getattr(
+                        token_to_kv_pool, "dcp_interleave_size", page_size
+                    ),
                 )
                 self._call_spaces = self._spaces
                 self._spaces = {

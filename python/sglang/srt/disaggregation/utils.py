@@ -1628,6 +1628,11 @@ def setup_state_kv_args(
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
     if isinstance(owner_view, NPUMLATokenToKVPool):
+        if (
+            owner_view.index_head_dim is not None
+            and envs.SGLANG_NPU_DSA_DCP_TOKEN_INTERLEAVE.get()
+        ):
+            kv_args.npu_dsa_dcp_target_buffers = owner_view.get_pd_dcp_target_buffers()
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
         kv_args.draft_kv_layers = (

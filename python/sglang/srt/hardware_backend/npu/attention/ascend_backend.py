@@ -41,7 +41,11 @@ from sglang.srt.layers.attention.dsa.utils import (
 )
 from sglang.srt.layers.cp.base import CPAttentionBackendKind, get_cp_strategy
 from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
-from sglang.srt.layers.dcp.layout import get_dcp_chain_spec_lens, get_dcp_lens
+from sglang.srt.layers.dcp.layout import (
+    get_dcp_chain_spec_lens,
+    get_dcp_lens,
+    npu_dcp_interleave_size,
+)
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
@@ -344,6 +348,9 @@ class AscendAttnBackend(AttentionBackend):
         # Only DSA models (GLM-5.2, DeepSeek-V3-DSA, ...) consume the per-token DSA
         # CP metadata built by prepare_dsa_cp_metadata; V4 keeps its own variant.
         self.use_dsa = is_deepseek_dsa(model_runner.model_config.hf_config)
+        self.dcp_interleave_size = npu_dcp_interleave_size(
+            self.page_size, use_dsa=self.use_dsa
+        )
         parallel = get_parallel()
         # Draft KV remains replicated even when the target uses DCP.
         self.dcp_size = 1 if self.is_draft_worker else parallel.attn_dcp_size
@@ -543,14 +550,14 @@ class AscendAttnBackend(AttentionBackend):
                 self.speculative_num_draft_tokens,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
+                interleave_size=self.dcp_interleave_size,
             )
         else:
             local_kv_lens = get_dcp_lens(
                 kv_lens_cpu,
                 parallel.attn_dcp_size,
                 parallel.attn_dcp_rank,
-                interleave_size=self.page_size,
+                interleave_size=self.dcp_interleave_size,
             ).int()
         page_stride = self.page_size * parallel.attn_dcp_size
         max_len = int(kv_lens_cpu.max().item()) if kv_lens_cpu.numel() else 0

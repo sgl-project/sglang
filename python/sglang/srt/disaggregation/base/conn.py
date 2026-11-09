@@ -11,6 +11,8 @@ import numpy.typing as npt
 from sglang.srt.server_args import ServerArgs
 
 if TYPE_CHECKING:
+    import torch
+
     from sglang.srt.disaggregation.mode import DisaggregationMode
 
 
@@ -91,6 +93,7 @@ class KVArgs:
     # None when the SWA state is not held in an MHA sub-pool.
     swa_kv_cache_layout: Optional[str]
     dsa_index_k_token_bytes: Optional[Tuple[int, int]] = None
+    npu_dsa_dcp_target_buffers: Optional[dict[int, torch.Tensor]] = None
     ib_device: str
     gpu_id: int
     kv_head_num: int

@@ -4,7 +4,7 @@ import torch
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
-from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.layers.dcp.layout import localize_dcp_indices, npu_dcp_interleave_size
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -724,6 +724,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         parallel = get_parallel()
         self.dcp_size = parallel.attn_dcp_size
         self.dcp_rank = parallel.attn_dcp_rank
+        self.dcp_interleave_size = npu_dcp_interleave_size(
+            page_size, use_dsa=index_head_dim is not None
+        )
         self.use_combined_kv_buffer = use_combined_kv_buffer
         global_page_padding = self.dcp_size if self.dcp_size > 1 else 1
         kv_page_padding = global_page_padding if is_draft_worker else 1
@@ -869,7 +872,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             indices,
             self.dcp_size,
             self.dcp_rank,
-            self.page_size,
+            self.dcp_interleave_size,
         )
         return local_indices[local_indices >= 0]
 
@@ -1009,6 +1012,15 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             uses_global_slots
             for _, uses_global_slots in self._get_disagg_buffer_entries()
         ]
+
+    def get_pd_dcp_target_buffers(self) -> dict[int, torch.Tensor]:
+        if self.use_fia_nz:
+            raise ValueError("NPU DSA token PD requires a row-contiguous KV pool.")
+        return {
+            buffer.data_ptr(): buffer
+            for buffer, uses_global_slots in self._get_disagg_buffer_entries()
+            if not uses_global_slots
+        }
 
     def get_kv_layer_ids(self):
         return (
