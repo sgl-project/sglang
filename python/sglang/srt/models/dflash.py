@@ -17,6 +17,7 @@ from sglang.kernels.ops.speculative.lilicorr import lilicorr_topk_lse
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.configs.laguna import normalize_gating
 from sglang.srt.distributed.communication_op import tensor_model_parallel_all_gather
+from sglang.srt.hf_transformers import get_rope_config
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.layer_boundary import AttentionInputs, get_attn_tp_context
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -37,6 +38,7 @@ from sglang.srt.layers.quantization.unquant import (
 )
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -45,7 +47,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.utils import apply_qk_norm
+from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -55,9 +57,8 @@ from sglang.srt.speculative.dflash_utils import (
     is_nemotron_35_draft_config,
     parse_dflash_draft_config,
 )
-from sglang.srt.utils import BumpAllocator, bind_or_assign, is_npu, set_weight_attrs
-from sglang.srt.utils.common import get_compiler_backend
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils import BumpAllocator, is_npu
+from sglang.srt.utils.device import get_compiler_backend
 
 _is_npu = is_npu()
 if _is_npu:
@@ -488,10 +489,6 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
     ) -> None:
         if quant_config is not None:
             raise ValueError("DFLASH mla drafts require unquantized draft weights.")
-        if get_parallel().attn_dcp_size > 1:
-            # The draft pool is not DCP-sharded, but the target MLA layer
-            # would gather across DCP ranks.
-            raise ValueError("DFLASH mla drafts do not support --dcp-size > 1.")
         sliding_window_size, attn_type = _get_dflash_layer_attention_params(
             config, layer_id
         )
@@ -610,6 +607,7 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         cache_loc: torch.Tensor,
+        swa_cache_loc: Optional[torch.Tensor] = None,
         cache_loc_2d: Optional[torch.Tensor] = None,
         commit_lens: Optional[torch.Tensor] = None,
     ) -> None:
@@ -617,11 +615,24 @@ class DFlashMLAAttention(DeepseekV2AttentionMLA):
         k_nope, k_pe = self.project_context_kv(positions, hidden_states)
         if cache_loc_2d is None:
             pool.set_mla_kv_buffer(
-                self.attn_mqa, KVWriteLoc(cache_loc, physical=True), k_nope, k_pe
+                self.attn_mqa,
+                KVWriteLoc(cache_loc, swa_loc=swa_cache_loc, physical=True),
+                k_nope,
+                k_pe,
             )
         else:
-            pool.set_mla_kv_buffer_prefix_valid(
-                self.attn_mqa, cache_loc_2d, commit_lens, k_nope, k_pe
+            pool.layer_router.layer(self.attn_mqa.layer_id).store_mla_prefix(
+                self.attn_mqa,
+                KVWriteLoc(
+                    cache_loc_2d,
+                    swa_loc=None
+                    if swa_cache_loc is None
+                    else swa_cache_loc.view_as(cache_loc_2d),
+                    physical=True,
+                ),
+                commit_lens,
+                k_nope,
+                k_pe,
             )
 
 

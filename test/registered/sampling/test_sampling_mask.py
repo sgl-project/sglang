@@ -36,7 +36,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=221, stage="extra-a", runner_config="2-gpu-large")
-register_amd_ci(est_time=320, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=320, suite="extra-a-test-1-gpu-small-amd")
 
 _MAX_NEW_TOKENS = 4
 _TOP_P = 0.99
@@ -162,6 +162,34 @@ class TestSamplingMaskCapture(CustomTestCase):
                     output.support_logprobs[0, sampled_index].item(),
                     math.log(expected),
                     places=6,
+                )
+
+    def test_min_p_capture_preserves_original_top_p_nucleus(self):
+        """Token 3 must survive joint filtering: its original preceding mass
+        is 0.80 < 0.82, while its top-k-normalized mass exceeds 0.82."""
+        backends = ("pytorch",) if is_hip() else ("pytorch", "flashinfer")
+        for backend in backends:
+            with self.subTest(backend=backend):
+                probs = torch.tensor(
+                    [[0.35, 0.25, 0.20, 0.05, 0.03, 0.03, 0.03, 0.03, 0.03]],
+                    device="cuda",
+                )
+                sampled, capture = self._sample(
+                    probs, backend, top_k=4, top_p=0.82, min_p=0.1
+                )
+                output = self.sampler._build_sampling_mask_output(
+                    sampled,
+                    capture,
+                    support_capture_indices=torch.tensor([0], device="cuda"),
+                )
+                self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
+                self.assertEqual(output.lengths.tolist(), [4])
+                support = output.token_ids[0, :4].tolist()
+                self.assertEqual(set(support), {0, 1, 2, 3})
+                self.assertIn(sampled.item(), support)
+                expected_probs = probs[0, support] / probs[0, :4].sum()
+                torch.testing.assert_close(
+                    output.support_logprobs[0, :4], expected_probs.log()
                 )
 
     def test_hard_exclusion_replay_in_mixed_batch(self):

@@ -949,7 +949,9 @@ export const Deployment = ({ config, benchmarks, agenticLink }) => {
         // (--dist-init-addr) and NCCL/GLOO traffic are reachable; single-node
         // just maps the serve port.
         hostNetwork ? "  --network host" : `  -p ${servePort}:${servePort}`,
-        ...((multinode || cell.pd) ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
+        // A single-node PD role on the host network moves KV over RDMA too.
+        ...((multinode || cell.pd || (hostNetwork && PD_SERVE_PORTS[sel.pdMode] !== undefined))
+          ? fabricFlagsOf(sel.hw).map((f) => "  " + f) : []),
         // The NPU device block already mounts ~/.cache/.
         ...(vendorOf(sel.hw) === "npu"
           ? [] : ["  -v ~/.cache/huggingface:/root/.cache/huggingface"]),
