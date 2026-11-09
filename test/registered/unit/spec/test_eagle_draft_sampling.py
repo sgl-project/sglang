@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.speculative import eagle_utils
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
@@ -82,15 +83,13 @@ class TestEagleDraftSamplingPosition(CustomTestCase):
         )
 
 
-def _verify_target_probs(logits: torch.Tensor, temperature: float) -> torch.Tensor:
-    """Run the eager verify of one request and return its target distribution."""
-    sampled = {}
-
-    def capture_target_probs(**kwargs):
-        sampled["target_probs"] = kwargs["target_probs"]
-
-    num_draft_tokens = logits.shape[0]
-    tree_arrays = torch.zeros((1, num_draft_tokens), dtype=torch.int32)
+def _verify_target_probs(
+    logits: torch.Tensor, temperatures: torch.Tensor
+) -> torch.Tensor:
+    """Return the target probabilities supplied to the verify kernel."""
+    num_requests = temperatures.shape[0]
+    num_draft_tokens = logits.shape[0] // num_requests
+    tree_arrays = torch.zeros((num_requests, num_draft_tokens), dtype=torch.int32)
     verify_input = SimpleNamespace(
         draft_token_num=num_draft_tokens,
         draft_token=tree_arrays.flatten(),
@@ -103,7 +102,7 @@ def _verify_target_probs(logits: torch.Tensor, temperature: float) -> torch.Tens
     )
     batch = SimpleNamespace(
         device="cpu",
-        seq_lens=torch.tensor([4], dtype=torch.int32),
+        seq_lens=torch.full((num_requests,), 4, dtype=torch.int32),
         forward_mode=SimpleNamespace(is_idle=lambda: False),
         sampling_info=SimpleNamespace(
             acc_additive_penalties=None,
@@ -113,22 +112,18 @@ def _verify_target_probs(logits: torch.Tensor, temperature: float) -> torch.Tens
             need_top_k_sampling=False,
             need_top_p_sampling=False,
             sampling_seed=None,
-            temperatures=torch.tensor([[temperature]]),
+            temperatures=temperatures,
         ),
     )
     with (
         patch.object(eagle_utils, "_is_cpu", False),
-        patch.object(
-            eagle_utils,
-            "tree_speculative_sampling_target_only",
-            side_effect=capture_target_probs,
-        ),
+        patch.object(eagle_utils, "tree_speculative_sampling_target_only") as sample,
         get_parallel().override(tp_group=SimpleNamespace(world_size=1)),
     ):
         eagle_utils.eagle_sample(
-            verify_input, batch, SimpleNamespace(next_token_logits=logits)
+            verify_input, batch, LogitsProcessorOutput(next_token_logits=logits)
         )
-    return sampled["target_probs"].squeeze(0)
+    return sample.call_args.kwargs["target_probs"].reshape_as(logits)
 
 
 class TestSpeculativeSoftmaxRoute(CustomTestCase):
@@ -137,9 +132,9 @@ class TestSpeculativeSoftmaxRoute(CustomTestCase):
         bits in different batches. Deterministic inference must use torch.softmax
         at each speculative softmax, as the sampler does, and other runs keep the
         fast route."""
-        logits = torch.randn(2, 8)
-        temperature = 0.5
-        temperatures = torch.full((2, 1), temperature)
+        logits = torch.randn(4, 8)
+        request_temperatures = torch.tensor([[0.5], [1.5]])
+        temperatures = request_temperatures.repeat_interleave(2, dim=0)
         plain = torch.softmax(logits, dim=-1)
         scaled = torch.softmax(logits / temperatures, dim=-1)
         fast_route = torch.full_like(logits, 0.125)
@@ -157,7 +152,7 @@ class TestSpeculativeSoftmaxRoute(CustomTestCase):
                 scaled,
             ),
             "verify target probs": (
-                lambda: _verify_target_probs(logits, temperature),
+                lambda: _verify_target_probs(logits, request_temperatures),
                 scaled,
             ),
         }

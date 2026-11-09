@@ -211,7 +211,9 @@ def spec_softmax(
     if not get_exec().deterministic.enable_deterministic_inference:
         return sampling_softmax(logits, temperatures, rows_per_request=rows_per_request)
     if temperatures is not None:
-        logits = logits / temperatures.repeat_interleave(rows_per_request, dim=0)
+        if rows_per_request > 1:
+            temperatures = temperatures.repeat_interleave(rows_per_request, dim=0)
+        logits = logits / temperatures
     return torch.softmax(logits, dim=-1)
 
 

@@ -13,7 +13,7 @@ from sglang.kernels.ops.speculative.dflash import (
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dispatch import inputs_on_cuda
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_utils import (
     _get_or_create_chain_verify_buffers,
@@ -277,10 +277,11 @@ except ImportError:
 
 
 def _deterministic_inference() -> bool:
-    try:
-        return bool(get_exec().deterministic.enable_deterministic_inference)
-    except ValueError:
-        return False  # Server args are not published, as in a kernel test.
+    # Standalone kernel calls can run before the server publishes its config.
+    return (
+        get_context().is_config_namespace_published("exec")
+        and get_exec().deterministic.enable_deterministic_inference
+    )
 
 
 # Not sampling.softmax: the FlashInfer and Triton paths are not bitwise torch.softmax(x / t).
