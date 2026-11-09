@@ -907,11 +907,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
         )
 
     def test_pythonic_forced_tool_choice(self):
-        """
-        Test: A named or required tool_choice constrains the output to a JSON array
-        that the pythonic parser does not read, and a non-streaming response still
-        returns it as tool_calls.
-        """
+        """A forced tool choice returns the constrained JSON as tool calls."""
         client = openai.Client(api_key=self.api_key, base_url=self.base_url)
         for tool_choice, allowed_names in (
             (
@@ -933,6 +929,7 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             self.assertTrue(
                 choice.message.tool_calls, f"No tool_calls: {choice.message.content!r}"
             )
+            self.assertFalse(choice.message.content)
             self.assertEqual(choice.finish_reason, "tool_calls")
             for tool_call in choice.message.tool_calls:
                 self.assertIn(tool_call.function.name, allowed_names)

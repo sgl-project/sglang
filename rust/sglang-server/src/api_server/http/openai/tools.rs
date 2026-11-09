@@ -17,14 +17,15 @@
 //! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
 //! wire values.
 
-use sglang_processor::dynamo_parsers::json::{JsonParserConfig, try_tool_call_parse_basic_json};
+use serde::Deserialize;
+use serde_json::value::RawValue;
 use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
 use sglang_processor::dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionType, Role,
 };
-use sglang_processor::{ToolConstraint, parse_tool_calls, tool_constraint};
+use sglang_processor::{ToolConstraint, parse_tool_calls, tool_call_id, tool_constraint};
 
 use crate::api_server::core::CoreOutput;
 use crate::message::sampling::SamplingParams;
@@ -68,6 +69,14 @@ pub(super) fn chat_delta(
     }
 }
 
+/// One item from the array built by `tool_constraint`. Keep the argument JSON verbatim.
+#[derive(Deserialize)]
+struct SchemaToolCall<'a> {
+    name: String,
+    #[serde(borrow)]
+    parameters: &'a RawValue,
+}
+
 /// Parse tool calls out of a completed (unary) generation's content.
 ///
 /// Returns `(content, None)` when no parser is configured or no call parses —
@@ -75,9 +84,7 @@ pub(super) fn chat_delta(
 /// returns the leftover non-tool text and the calls; `parallel_tool_calls`
 /// false truncates the batch to the first call, mirroring Python.
 ///
-/// `uses_tool_call_json_schema` means the output follows the schema of
-/// [`apply_tool_constraint`] and not the parser's format, so the bare JSON is
-/// read first, as Dynamo's streaming jail reads it.
+/// When [`apply_tool_constraint`] selects the JSON schema, read the array first.
 pub(super) async fn parse_chat_tool_calls(
     content: String,
     parser: Option<&str>,
@@ -88,40 +95,44 @@ pub(super) async fn parse_chat_tool_calls(
     let Some(parser) = parser else {
         return (content, None);
     };
-    let bare_json = JsonParserConfig {
-        bare_json_mode: true,
-        ..Default::default()
+    let starts_schema_array = uses_tool_call_json_schema
+        && content
+            .trim_start()
+            .strip_prefix('[')
+            .is_some_and(|items| items.trim_start().starts_with('{'));
+    let schema_calls =
+        starts_schema_array.then(|| serde_json::from_str::<Vec<SchemaToolCall>>(&content));
+    let function_call = |id, name, arguments| ChatCompletionMessageToolCall {
+        id,
+        r#type: FunctionType::Function,
+        function: FunctionCall { name, arguments },
     };
-    let parsed = match uses_tool_call_json_schema
-        .then(|| try_tool_call_parse_basic_json(&content, &bare_json, tools))
-    {
-        Some(Ok(parsed)) if !parsed.0.is_empty() => Ok(parsed),
-        _ => parse_tool_calls(parser, &content, tools).await,
-    };
-    match parsed {
-        Ok((mut calls, normal)) if !calls.is_empty() => {
-            if !parallel_tool_calls {
-                calls.truncate(1);
-            }
-            (
-                normal.unwrap_or_default(),
-                Some(
-                    calls
-                        .into_iter()
-                        .map(|call| ChatCompletionMessageToolCall {
-                            id: call.id,
-                            r#type: FunctionType::Function,
-                            function: FunctionCall {
-                                name: call.function.name,
-                                arguments: call.function.arguments,
-                            },
-                        })
-                        .collect(),
-                ),
-            )
+    let (mut calls, normal): (Vec<_>, _) = match schema_calls {
+        Some(Ok(calls)) => {
+            let calls = calls.into_iter().map(|call| {
+                function_call(tool_call_id(), call.name, call.parameters.get().to_owned())
+            });
+            (calls.collect(), None)
         }
-        _ => (content, None),
+        // A partial array can contain native tool markers inside an argument string.
+        Some(Err(error)) if !error.is_data() => return (content, None),
+        _ => {
+            let Ok((calls, normal)) = parse_tool_calls(parser, &content, tools).await else {
+                return (content, None);
+            };
+            let calls = calls
+                .into_iter()
+                .map(|call| function_call(call.id, call.function.name, call.function.arguments));
+            (calls.collect(), normal)
+        }
+    };
+    if calls.is_empty() {
+        return (content, None);
     }
+    if !parallel_tool_calls {
+        calls.truncate(1);
+    }
+    (normal.unwrap_or_default(), Some(calls))
 }
 
 /// Map the scheduler's finish kind onto the OpenAI wire values. Length and
@@ -403,6 +414,19 @@ mod tests {
         .await;
         assert!(content.is_empty());
         assert_eq!(calls.unwrap()[0].function.name, "get_weather");
+    }
+
+    #[tokio::test]
+    async fn truncated_json_argument_is_never_a_pythonic_tool_call() {
+        for text in [
+            r#"[{"name":"search","parameters":{"q":"[other(x=1)]"#,
+            r#"[ {"name":"search","parameters":{"q":"[other(x=1)]","n":1e"#,
+        ] {
+            let (content, calls) =
+                parse_chat_tool_calls(text.into(), Some("pythonic"), None, true, true).await;
+            assert!(calls.is_none());
+            assert_eq!(content, text);
+        }
     }
 
     #[tokio::test]
