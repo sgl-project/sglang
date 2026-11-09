@@ -3,7 +3,7 @@
 import unittest
 from collections import deque
 from types import SimpleNamespace as NS
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import maybe_stub_sgl_kernel
@@ -46,7 +46,8 @@ class OverlapHarness:
             finished=lambda: self.done,
         )
         self.gracefully_exit = False
-        self._engine_paused = False
+        self.pause_state = NS(paused=False)
+        self.invariant_checker = Mock()
         self.is_generation = True
         self.enable_unified_memory = False
         self.last_batch = None
