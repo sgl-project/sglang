@@ -165,6 +165,8 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                     return self.create_error_response(
                         "Invalid input: 'tokens' must be a list of integers."
                     )
+                if (error := self._out_of_vocab_error(request.tokens)) is not None:
+                    return error
                 tokens_to_decode = [int(t) for t in request.tokens]
                 text = tokenizer.decode(
                     tokens_to_decode, skip_special_tokens=request.skip_special_tokens
@@ -181,6 +183,8 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                         return self.create_error_response(
                             f"Invalid input: Sublist in 'tokens' must contain only integers. Found: {token_list}"
                         )
+                    if (error := self._out_of_vocab_error(token_list)) is not None:
+                        return error
                     decoded_text = tokenizer.decode(
                         [int(t) for t in token_list],
                         skip_special_tokens=request.skip_special_tokens,
@@ -208,3 +212,13 @@ class OpenAIServingDetokenize(OpenAIServingBase):
                 err_type="InternalServerError",
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
+
+    def _out_of_vocab_error(self, token_ids: List[int]) -> Optional[ErrorResponse]:
+        vocab_size = self.tokenizer_manager.model_config.vocab_size
+        for token_id in token_ids:
+            if token_id < 0 or token_id >= vocab_size:
+                return self.create_error_response(
+                    f"Invalid input: token id {token_id} is out of vocabulary; "
+                    f"valid range is [0, {vocab_size})."
+                )
+        return None

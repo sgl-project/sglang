@@ -28,6 +28,16 @@ def _timing_events_supported() -> bool:
         return False
 
 
+@cache
+def _warn_direct_without_metadata_kernels() -> None:
+    logger.warning(
+        "HiCache io backend 'direct' moves KV with copy-engine DMA, which can queue "
+        "ahead of the forward's small metadata host-to-device copies and stall the "
+        "forward; set SGLANG_ENABLE_MLP_SYNC_METADATA_FILL=1 to write that metadata "
+        "with kernels instead."
+    )
+
+
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
@@ -52,11 +62,35 @@ class TransferCompletion(NamedTuple):
     timing_enabled: bool
 
 
+def host_dcp_size(transfer: L2Transfer) -> int:
+    """The decode-context-parallel width of the transfer's host pool: a host
+    pool that shards under DCP hands widened controller ids."""
+    return getattr(transfer.host_pool, "dcp_size", 1)
+
+
+def controller_virtual_ids(
+    transfer: L2Transfer, indices: Optional[torch.Tensor] = None
+) -> torch.Tensor:
+    """The device pool's local virtual ids that a transfer's controller ids
+    name: what ``device_translate`` is applied to. Widened ids collapse by the
+    host pool's DCP width. The copy and any tracking of the rows it touches
+    read the ids through this one rule."""
+    ids = transfer.device_indices if indices is None else indices
+    dcp_size = host_dcp_size(transfer)
+    return ids // dcp_size if dcp_size > 1 else ids
+
+
 class L2TransferEngine:
     """Runs resolved device↔host transfers without owning cache state."""
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
+        if (
+            io_backend == "direct"
+            and device_module is torch.cuda
+            and not envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
+        ):
+            _warn_direct_without_metadata_kernels()
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
         # Index preparation runs here, never queued behind earlier copies: the
@@ -82,8 +116,9 @@ class L2TransferEngine:
     def _resolve_device_indices(transfer: L2Transfer) -> torch.Tensor:
         """Resolve controller IDs into this pool's device-buffer indices.
 
-        Call on the index stream after the producer event. The HiCache pin
-        source keeps the rows in place until the transfer is acknowledged.
+        Call on the index stream after the producer event: a page move made
+        before the submission is ordered before this translation, and one made
+        after it waits for the copy's finish event.
         """
         translate = transfer.device_translate
         if translate is None:
@@ -94,12 +129,15 @@ class L2TransferEngine:
         indices = transfer.device_indices.to(
             getattr(transfer.device_pool, "device", original_device)
         ).contiguous()
-        dcp_size = getattr(transfer.host_pool, "dcp_size", 1)
+        dcp_size = host_dcp_size(transfer)
         if dcp_size > 1:
             # The MLA host pool selects this rank and collapses logical IDs.
             # Translate in local virtual space, then preserve that widened
             # interface (including token order) for the host pool.
-            resolved = translate(indices // dcp_size) * dcp_size + indices % dcp_size
+            resolved = (
+                translate(controller_virtual_ids(transfer, indices)) * dcp_size
+                + indices % dcp_size
+            )
         else:
             resolved = translate(indices)
         return resolved.to(original_device)
@@ -132,6 +170,12 @@ class L2TransferEngine:
         own_stream = stream in (self.host_to_device_stream, self.device_to_host_stream)
         # A caller's stream prepares indices in order with its own copies.
         index_stream = self.index_stream if own_stream else stream
+        # The host layout keeps one finish event per key, and a newer event
+        # covers an older one only on the same stream: a caller's stream keeps
+        # its own entry beside the engine stream's.
+        layout_key = (
+            (id(self), transfer_key) if own_stream else (id(self), transfer_key, stream)
+        )
         try:
             with device_module.stream(index_stream):
                 # Index preparation can read producer-owned device indices. On its
@@ -155,8 +199,7 @@ class L2TransferEngine:
         finally:
             for domain in reversed(domains):
                 domain.release_layout(
-                    ack_finish if finish_recorded else None,
-                    (id(self), transfer_key),
+                    ack_finish if finish_recorded else None, layout_key
                 )
 
     def submit_device_to_host(self, transfers: list[L2Transfer]) -> TransferCompletion:

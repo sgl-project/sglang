@@ -4,7 +4,7 @@
 use sglang_api_types::api::v1 as api;
 
 use crate::message::ids::Rid;
-use crate::message::info::{InternalState, ModelInfo, ServerInfo};
+use crate::message::info::{DpListener, InternalState, ModelInfo, ServerInfo};
 use crate::message::io_struct::{ControlRequest, GetInternalStateReq};
 
 use super::handle::CoreHandle;
@@ -25,6 +25,7 @@ impl CoreHandle {
             reasoning_parser: metadata.reasoning_parser.clone(),
             tool_call_parser: metadata.tool_call_parser.clone(),
             disaggregation_mode: metadata.disaggregation_mode,
+            launch_fields: metadata.launch_model_info.clone(),
         }
     }
 
@@ -51,6 +52,22 @@ impl CoreHandle {
             .iter_mut()
             .find_map(|state| state.rust_server_startup_time.take());
         let metadata = &self.inner.metadata;
+        // The listener serving the deployment's base URL, DP rank 0's,
+        // publishes every rank's listener (`rust_server_endpoints`), by rank.
+        let mut dp_listeners: Vec<DpListener> = if self.inner.dp_rank == 0 {
+            metadata
+                .deployment_info
+                .rust_server_endpoints
+                .iter()
+                .map(|endpoint| DpListener {
+                    dp_rank: endpoint.dp_rank,
+                    url: endpoint.endpoint.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        dp_listeners.sort_by_key(|listener| listener.dp_rank);
         Ok(ServerInfo {
             launch_fields: metadata.launch_server_info.clone(),
             model_path: metadata.model_path.clone(),
@@ -67,33 +84,38 @@ impl CoreHandle {
             incremental_streaming_output: metadata.incremental_streaming_output,
             disaggregation_mode: metadata.disaggregation_mode,
             deployment_info: metadata.deployment_info.clone(),
+            dp_listeners,
         })
     }
 
     /// One `InternalState` per DP rank, in rank order, as Python's
     /// `get_internal_state` returns one per DP rank.
     async fn internal_states(&self) -> Result<Vec<InternalState>, CoreError> {
-        let envelopes = self
-            .control(&|| {
-                ControlRequest::GetInternalStateReq(GetInternalStateReq::new(
-                    Rid::new().to_string(),
-                ))
-            })
-            .await
-            .decode::<InternalStateEnvelope>("internal-state")?;
-        Ok(envelopes
-            .into_iter()
-            .map(|envelope| envelope.internal_state)
-            .collect())
+        self.control(&|| {
+            ControlRequest::GetInternalStateReq(GetInternalStateReq::new(Rid::new().to_string()))
+        })
+        .await
+        .decode_with("internal-state", |envelope: InternalStateEnvelope| {
+            InternalState::from_scheduler(
+                envelope.internal_state,
+                &self.inner.metadata.server_info_state_keys,
+            )
+            .map_err(|error| error.to_string())
+        })
     }
 }
 
 /// Private scheduler response envelope. This MessagePack shape is decoded at
-/// the runtime boundary and deliberately is not part of the core contract.
+/// the runtime boundary and deliberately is not part of the core contract;
+/// the raw state never leaves [`CoreHandle::internal_states`].
 #[derive(serde::Deserialize)]
 struct InternalStateEnvelope {
-    #[serde(default)]
-    internal_state: InternalState,
+    #[serde(default = "empty_state")]
+    internal_state: rmpv::Value,
+}
+
+fn empty_state() -> rmpv::Value {
+    rmpv::Value::Map(Vec::new())
 }
 
 #[cfg(test)]
@@ -115,6 +137,7 @@ mod tests {
                 startup_ready: false,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 peer_endpoints: Vec::new(),
                 metadata: CoreMetadata {
@@ -122,6 +145,8 @@ mod tests {
                     max_context_length: 1_u64 << 32,
                     ..Default::default()
                 },
+                request_log: None,
+                generate_validator: None,
             },
         );
 
@@ -139,11 +164,36 @@ mod tests {
     }
 
     /// `/server_info` lists one internal state per DP rank, in rank order:
-    /// a target with a lower rank than this listener's comes first.
+    /// a target with a lower rank than this listener's comes first. A rank
+    /// whose state breaks the typed contract fails it, named in the error.
     #[tokio::test]
     async fn server_info_lists_internal_states_in_rank_order() {
+        let throughputs: Vec<_> = rank_one_server_info(serde_json::json!(2.5))
+            .await
+            .unwrap()
+            .internal_states
+            .iter()
+            .map(|state| state.last_gen_throughput)
+            .collect();
+        assert_eq!(throughputs, [Some(2.5), Some(1.5)]);
+
+        let error = rank_one_server_info(serde_json::json!("fast"))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("dp rank 0: invalid internal-state response"),
+            "{error}"
+        );
+    }
+
+    /// `server_info` on the listener of DP rank 1, whose state reports a
+    /// throughput of 1.5, while its peer, DP rank 0, reports `peer_throughput`.
+    async fn rank_one_server_info(
+        peer_throughput: serde_json::Value,
+    ) -> Result<ServerInfo, CoreError> {
         use crate::api_server::core::fanout::testing::DummyTarget;
-        let envelope = |throughput: f64| {
+        let envelope = |throughput: serde_json::Value| {
             bytes::Bytes::from(
                 rmp_serde::to_vec_named(&serde_json::json!({
                     "internal_state": {"last_gen_throughput": throughput},
@@ -162,6 +212,7 @@ mod tests {
                 startup_ready: true,
                 is_disaggregation: false,
                 mm_limits: Vec::new(),
+                multimodal: false,
                 metrics: None,
                 metadata: CoreMetadata {
                     deployment_info: crate::message::config::DeploymentInfo {
@@ -170,20 +221,18 @@ mod tests {
                     },
                     ..Default::default()
                 },
-                peer_endpoints: vec![DummyTarget::replying(&[0], move |_| Ok(envelope(2.5)))],
+                peer_endpoints: vec![DummyTarget::replying(&[0], move |_| {
+                    Ok(envelope(peer_throughput.clone()))
+                })],
+                request_log: None,
+                generate_validator: None,
             },
         );
 
         let (info, ()) = tokio::join!(
             handle.server_info(),
-            answer_local_control(&intake_rx, envelope(1.5)),
+            answer_local_control(&intake_rx, envelope(serde_json::json!(1.5))),
         );
-        let throughputs: Vec<_> = info
-            .unwrap()
-            .internal_states
-            .iter()
-            .map(|state| state.last_gen_throughput)
-            .collect();
-        assert_eq!(throughputs, [Some(2.5), Some(1.5)]);
+        info
     }
 }

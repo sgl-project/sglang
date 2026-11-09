@@ -27,7 +27,9 @@ from sglang.srt import runtime_context as rc
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.dcp import all_gather_kv_cache_for_mha_extend
+from sglang.srt.layers.dcp import layout as dcp_layout
 from sglang.srt.layers.dcp.layout import (
+    dsa_index_k_page_tokens,
     filter_dcp_local_chunk_kv_indices,
     get_dcp_lens,
 )
@@ -240,6 +242,21 @@ class TestAllGatherKvCacheForMhaExtend(CustomTestCase):
             msg = f"{prefix_lens=} {extend_lens=} {pad=} {dcp_size=}"
             self.assertTrue(torch.equal(got_kv_a, want_kv_a), msg)
             self.assertTrue(torch.equal(got_k_pe, want_k_pe), msg)
+
+
+class TestDsaIndexKPageTokens(CustomTestCase):
+    def test_sharded_index_k_pages_span_the_dcp_group(self):
+        for dcp_size, shards_index_k, expected in (
+            (8, True, 512),
+            (8, False, 64),
+            (1, True, 64),
+        ):
+            with self.subTest(dcp_size=dcp_size, shards_index_k=shards_index_k):
+                with (
+                    patch.object(dcp_layout, "_dsa_shards_index_k", shards_index_k),
+                    rc.get_parallel().override(attn_dcp_size=dcp_size),
+                ):
+                    self.assertEqual(dsa_index_k_page_tokens(64), expected)
 
 
 class TestGetDcpLens(CustomTestCase):
@@ -569,7 +586,7 @@ class TestGetDcpLens(CustomTestCase):
                         configurator,
                         sizes=sizes,
                         token_to_kv_pool=physical_kv_cache,
-                        is_dsv4_model=False,
+                        is_compressed_kv_model=False,
                         req_to_token_pool=object(),
                         token_to_kv_pool_allocator=None,
                     )

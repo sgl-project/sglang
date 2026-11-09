@@ -29,7 +29,8 @@ from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.utils import get_hash_str, get_storage_hash_str
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import CustomTestCase
+from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
@@ -55,6 +56,7 @@ def _make_mock_req(
     )
     req.prefix_len = prefix_len
     req.owned_kv_len = lambda: req.kv.kv_committed_len
+    req.exit_via = None
     return req
 
 
@@ -98,9 +100,11 @@ def _make_manager(pool_size: int, page_size: int = 1):
     tree_cache.protected_size_ = 0
     tree_cache.req_to_token_pool = req_to_token_pool
     tree_cache.token_to_kv_pool_allocator = allocator
+    tree_cache.logical_page_size = allocator.page_size
     tree_cache.free_kv_row = lambda owner, ranges: BasePrefixCache.free_kv_row(
         tree_cache, owner, ranges
     )
+    tree_cache.claim_kv_row.return_value = False
 
     # Bypass __init__ entirely and set attributes directly
     manager = object.__new__(DecodeKVCacheOffloadManager)
@@ -114,6 +118,7 @@ def _make_manager(pool_size: int, page_size: int = 1):
     manager.ongoing_offload = {}
     manager.ongoing_backup = {}
     manager.offload_inflight = WeakKeyDict()
+    manager.request_retirer = release_only_retirer(tree_cache)
 
     return manager, freed_indices
 
@@ -125,6 +130,11 @@ class _FinishedEvent:
 
 class TestReleaseFinishedReq(unittest.TestCase):
     """Tests for _release_finished_req overallocation cleanup."""
+
+    def setUp(self):
+        super().setUp()
+        # The release reads the published spec and serving config.
+        enter_scope(self, published_topology())
 
     def test_decode_offload_hash_chain_matches_prefill(self):
         """Decode pages must keep the prefill namespace across offload chunks."""
@@ -256,8 +266,31 @@ class TestReleaseFinishedReq(unittest.TestCase):
         self.assertNotIn(req, manager.offloaded_state)
         self.assertNotIn(req, manager.offload_inflight)
 
+    def test_streaming_session_keeps_the_row_of_a_finished_turn(self):
+        """A finished offloaded turn is released through the session hook, so a
+        streaming session keeps its KV row for the next turn."""
+        manager, freed = _make_manager(pool_size=32)
+        req = _make_mock_req(req_pool_idx=0, kv_committed_len=20, kv_allocated_len=20)
+        req.finished.return_value = True
+
+        def keep_row(req):
+            req.kv = ReqKvInfo()  # `req.detach_kv()`: the session's slot keeps the row.
+            return True
+
+        manager.tree_cache.claim_kv_row.side_effect = keep_row
+
+        manager.finalize_release_on_finish(req)
+
+        manager.tree_cache.claim_kv_row.assert_called_once_with(req)
+        self.assertEqual(freed, [])
+        manager.req_to_token_pool.free.assert_not_called()
+
 
 class TestSamplingMaskAbortOffload(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        enter_scope(self, published_topology())
+
     def test_abort_waits_for_existing_offload_before_reusing_slots(self):
         """An abort must not recycle slots while a previous D2H copy reads them."""
         for inflight in (False, True):

@@ -15,6 +15,12 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.schedule_batch import NextBatchPlan
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -32,6 +38,8 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._process_storage_prefetch_retries = self.calls.retry
         s.process_pending_chunked_abort = Mock()
         s.process_prefill_chunk = Mock()
+        s.running_reqs = KeyedReqList(ListKind.DECODING)
+        s.invariant_checker = Mock()
         s.dp_attn_adapter = Mock()
         s.dp_attn_adapter.maybe_prepare_mlp_sync_batch.return_value = None
         self.running_batch = SimpleNamespace(
@@ -69,7 +77,7 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s._abort_on_waiting_timeout = Mock()
         s._abort_on_running_timeout = Mock()
         s.dllm_config = None
-        s.chunked_req = None
+        s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
         s.enable_hisparse = False
         s.require_mlp_sync = False
         s._should_defer_prefill = self.calls.defer
@@ -97,12 +105,14 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
         s = self.scheduler
         s.init_pp_loop_state = Mock()
         s.pp_loop_size = 1
+        s.pause_state = PauseState()
+        s.mbs = [None]
         enter_scope(self, published_topology(pp_size=2))
         s.pp_group = SimpleNamespace(is_last_rank=True)
         s.running_mbs = [self.running_batch]
         s.last_mbs = [None]
         s.ingest_requests = Mock(return_value=[])
-        s.waiting_queue = []
+        s.waiting_queue = IndexedReqList(ListKind.WAITING)
         s.disagg_prefill_bootstrap_queue = SimpleNamespace(pop_bootstrapped=lambda: [])
         s._pp_pd_get_prefill_transferred_ids = Mock(return_value=[])
         s._pp_commit_comm_work = Mock()

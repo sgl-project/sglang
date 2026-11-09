@@ -111,12 +111,11 @@ class DeepseekMHARocmForwardMixin:
                     )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
-                        self.indexer,
+                        self.run_mla_indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
-                        layer_id=self.layer_id,
                     )
             elif _use_aiter_gfx95 and self.q_b_proj.weight.dtype == torch.uint8:
                 # MXFP4: fused RMSNorm + quant
