@@ -278,9 +278,33 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
     matrix_records = []
     _record_lock = threading.Lock()
     COLD_LENGTHS = (
-        1, 2, 17, 127, 128, 129, 255, 256, 257, 511, 512, 513,
-        1023, 1024, 1025, 4095, 4096, 4097, 8191, 8192, 8193, 10000,
-        16383, 16384, 16385, 24577, 32768,
+        1,
+        2,
+        17,
+        127,
+        128,
+        129,
+        255,
+        256,
+        257,
+        511,
+        512,
+        513,
+        1023,
+        1024,
+        1025,
+        4095,
+        4096,
+        4097,
+        8191,
+        8192,
+        8193,
+        10000,
+        16383,
+        16384,
+        16385,
+        24577,
+        32768,
     )
 
     @classmethod
@@ -305,7 +329,9 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
         return random.Random(seed).choices(pool, k=length)
 
     def flush(self, *, prefill=True, decode=True):
-        urls = ([self.prefill_url] if prefill else []) + ([self.decode_url] if decode else [])
+        urls = ([self.prefill_url] if prefill else []) + (
+            [self.decode_url] if decode else []
+        )
         for url in urls:
             deadline = time.monotonic() + 30
             while True:
@@ -336,9 +362,12 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
             timeout=300,
         )
         record = {
-            "label": label, "rid": rid, "input_tokens": len(ids),
+            "label": label,
+            "rid": rid,
+            "input_tokens": len(ids),
             "requested_output_tokens": output_tokens,
-            "expected_corruption": corrupt, "http_status": response.status_code,
+            "expected_corruption": corrupt,
+            "http_status": response.status_code,
             "elapsed_s": round(time.monotonic() - start, 4),
         }
         data = None
@@ -368,7 +397,9 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
         for length in self.COLD_LENGTHS:
             with self.subTest(input_tokens=length):
                 self.flush()
-                data = self.request_ids(self.token_ids(length, length), f"cold-{length}")
+                data = self.request_ids(
+                    self.token_ids(length, length), f"cold-{length}"
+                )
                 self.assertEqual(data["meta_info"].get("cached_tokens", 0), 0)
 
     def test_matrix_chunk_repetition_and_page_reuse(self):
@@ -384,8 +415,12 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
 
     def test_matrix_cached_prefix_boundaries(self):
         for prefix_len, suffix_len in (
-            (128, 1), (129, 129), (256, 257),
-            (257, 8193), (8192, 1), (8193, 129),
+            (128, 1),
+            (129, 129),
+            (256, 257),
+            (257, 8193),
+            (8192, 1),
+            (8193, 129),
         ):
             with self.subTest(prefix_tokens=prefix_len, suffix_tokens=suffix_len):
                 self.flush()
@@ -401,7 +436,9 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
                     f"prefix-probe-{prefix_len}-{suffix_len}",
                 )
                 expected_hit = prefix_len // self.PAGE_SIZE * self.PAGE_SIZE
-                self.assertGreaterEqual(data["meta_info"]["cached_tokens"], expected_hit)
+                self.assertGreaterEqual(
+                    data["meta_info"]["cached_tokens"], expected_hit
+                )
 
     def concurrent_group(self, requests_to_send, min_cached_tokens=0):
         with ThreadPoolExecutor(max_workers=4) as pool:
@@ -422,10 +459,15 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
             ((129, 8193, 16385, 32768), (128, 8192, 8193, 16384))
         ):
             self.flush()
-            self.concurrent_group([
-                (self.token_ids(length, 500000 + repeat * 100 + i), f"mixed-{repeat}-{length}")
-                for i, length in enumerate(lengths)
-            ])
+            self.concurrent_group(
+                [
+                    (
+                        self.token_ids(length, 500000 + repeat * 100 + i),
+                        f"mixed-{repeat}-{length}",
+                    )
+                    for i, length in enumerate(lengths)
+                ]
+            )
 
     def test_matrix_concurrent_shared_prefix(self):
         self.flush()
@@ -434,13 +476,16 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
         for repeat in range(3):
             # Flush only between fully completed concurrent batches.
             self.flush(prefill=False)
-            self.concurrent_group([
-                (
-                    prefix + self.token_ids(length, 610000 + repeat * 100 + i),
-                    f"shared-{repeat}-{length}",
-                )
-                for i, length in enumerate((1, 129, 8193, 16385))
-            ], min_cached_tokens=1024)
+            self.concurrent_group(
+                [
+                    (
+                        prefix + self.token_ids(length, 610000 + repeat * 100 + i),
+                        f"shared-{repeat}-{length}",
+                    )
+                    for i, length in enumerate((1, 129, 8193, 16385))
+                ],
+                min_cached_tokens=1024,
+            )
 
     def test_matrix_output_lengths(self):
         for output_tokens in (1, 32, 128):
@@ -448,7 +493,8 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
                 self.flush()
                 self.request_ids(
                     self.token_ids(1025, 700000 + output_tokens),
-                    f"output-{output_tokens}", output_tokens=output_tokens,
+                    f"output-{output_tokens}",
+                    output_tokens=output_tokens,
                 )
 
     def test_matrix_corruption_and_recovery(self):
@@ -457,7 +503,8 @@ class TestNpuPdKvChecksumMatrix(_NpuPdKvChecksumBase):
                 self.flush()
                 self.request_ids(
                     self.token_ids(length, 800000 + length),
-                    f"corrupt-{length}", corrupt=True,
+                    f"corrupt-{length}",
+                    corrupt=True,
                 )
                 self.request_ids(
                     self.token_ids(129, 900000 + length), f"recovery-{length}"
