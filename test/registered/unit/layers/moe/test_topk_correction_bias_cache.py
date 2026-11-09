@@ -5,7 +5,11 @@ import torch
 
 from sglang.kernels.ops.moe import moe_route_radix4
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.layers.moe.topk import TopKConfig, select_experts
+from sglang.srt.layers.moe.topk import (
+    TopKConfig,
+    refresh_correction_bias_caches,
+    select_experts,
+)
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -98,7 +102,7 @@ class CorrectionBiasCacheTestMixin:
         torch.testing.assert_close(converted_after_reload, reloaded_value.float())
         self.assertNotEqual(converted.data_ptr(), converted_after_reload.data_ptr())
 
-    def test_data_write_refreshes_cache_in_place(self):
+    def test_refresh_after_data_write_keeps_pointer(self):
         correction_bias = torch.zeros(8, dtype=torch.bfloat16, device=self.device)
         config = TopKConfig(top_k=2, correction_bias=correction_bias)
         converted = config.correction_bias_for_dtype(torch.float32)
@@ -106,12 +110,38 @@ class CorrectionBiasCacheTestMixin:
         reloaded_value = torch.arange(8, dtype=torch.float32).to(
             device=self.device, dtype=torch.bfloat16
         )
-        with torch.no_grad():
-            correction_bias.data.copy_(reloaded_value)
-        converted_after_reload = config.correction_bias_for_dtype(torch.float32)
+        correction_bias.data.copy_(reloaded_value)
+        stale = config.correction_bias_for_dtype(torch.float32)
+        torch.testing.assert_close(stale, torch.zeros_like(stale))
 
-        torch.testing.assert_close(converted_after_reload, reloaded_value.float())
-        self.assertEqual(converted.data_ptr(), converted_after_reload.data_ptr())
+        config.refresh_correction_bias_cache()
+        refreshed = config.correction_bias_for_dtype(torch.float32)
+
+        torch.testing.assert_close(refreshed, reloaded_value.float())
+        self.assertEqual(converted.data_ptr(), refreshed.data_ptr())
+
+    def test_refresh_caches_walks_model_modules(self):
+        correction_bias = torch.zeros(8, dtype=torch.bfloat16, device=self.device)
+        module = torch.nn.Module()
+        module.topk_config = TopKConfig(top_k=2, correction_bias=correction_bias)
+        model = torch.nn.Sequential(module)
+        converted = module.topk_config.correction_bias_for_dtype(torch.float32)
+
+        correction_bias.data.fill_(3.0)
+        refresh_correction_bias_caches(model)
+
+        torch.testing.assert_close(converted, torch.full_like(converted, 3.0))
+        self.assertIs(
+            module.topk_config.correction_bias_for_dtype(torch.float32), converted
+        )
+
+    def test_refresh_without_cache_is_noop(self):
+        config = TopKConfig(
+            top_k=2,
+            correction_bias=torch.zeros(8, dtype=torch.bfloat16, device=self.device),
+        )
+        config.refresh_correction_bias_cache()
+        self.assertIsNone(config._correction_bias_dtype_cache)
 
     def test_matching_dtype_returns_original_tensor(self):
         correction_bias = torch.randn(8, dtype=torch.float32, device=self.device)
@@ -120,6 +150,7 @@ class CorrectionBiasCacheTestMixin:
         result = config.correction_bias_for_dtype(torch.float32)
 
         self.assertEqual(result.data_ptr(), correction_bias.data_ptr())
+
     def test_fp32_bias_routes_in_fp32_on_aiter(self):
         """bf16 logits must not drag an fp32 bias down to bf16 before aiter."""
         self.assertEqual(

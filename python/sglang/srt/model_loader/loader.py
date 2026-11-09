@@ -1077,6 +1077,9 @@ class DefaultModelLoader(BaseModelLoader):
 
     @staticmethod
     def postprocess_weights(model, target_device):
+        from sglang.srt.layers.moe.topk import refresh_correction_bias_caches
+
+        refresh_correction_bias_caches(model)
         if QuantizedRLModelLoader.is_reload_scenario(model):
             return
         for module, quant_method in _modules_with_quant_method(model):

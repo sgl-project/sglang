@@ -306,22 +306,52 @@ class TopKConfig:
 
         # Weight loaders update parameters in place. Including the version in
         # the key prevents an early access from retaining pre-load contents.
-        # Writes through `param.data` (RL weight sync, dummy-load warmup) do
-        # not bump `_version`, so a matching key still has to refresh the copy.
-        cache_key = (
+        cache_key = self._correction_bias_key(dtype)
+        if self._correction_bias_cache_key != cache_key:
+            self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
+            self._correction_bias_cache_key = cache_key
+        return self._correction_bias_dtype_cache
+
+    def refresh_correction_bias_cache(self) -> None:
+        """Copy the current correction bias into the cached copy after a load.
+
+        Writes through ``param.data`` (RL weight sync, the real load after a
+        dummy-load warmup) do not bump ``_version``, so the lookup key cannot
+        see them. The copy is in place to keep the address captured by CUDA
+        graphs.
+        """
+        cache = self._correction_bias_dtype_cache
+        correction_bias = self.correction_bias
+        if cache is None or correction_bias is None:
+            return
+        if (
+            cache.shape != correction_bias.shape
+            or cache.device != correction_bias.device
+        ):
+            self._correction_bias_dtype_cache = None
+            self._correction_bias_cache_key = None
+            return
+        with torch.no_grad():
+            cache.copy_(correction_bias)
+        self._correction_bias_cache_key = self._correction_bias_key(cache.dtype)
+
+    def _correction_bias_key(self, dtype: torch.dtype) -> Tuple:
+        correction_bias = self.correction_bias
+        return (
             correction_bias.data_ptr(),
             correction_bias._version,
             correction_bias.device,
             correction_bias.dtype,
             dtype,
         )
-        if self._correction_bias_cache_key != cache_key:
-            self._correction_bias_dtype_cache = correction_bias.to(dtype=dtype)
-            self._correction_bias_cache_key = cache_key
-        else:
-            # In-place refresh keeps the CUDA-graph address of the cached bias.
-            self._correction_bias_dtype_cache.copy_(correction_bias)
-        return self._correction_bias_dtype_cache
+
+
+def refresh_correction_bias_caches(model: torch.nn.Module) -> None:
+    """Refresh every cached TopK correction bias in ``model`` after a load."""
+    for module in model.modules():
+        topk_config = getattr(module, "topk_config", None)
+        if isinstance(topk_config, TopKConfig):
+            topk_config.refresh_correction_bias_cache()
 
 
 # -------------------------------- TopKOutput ---------------------------------------
