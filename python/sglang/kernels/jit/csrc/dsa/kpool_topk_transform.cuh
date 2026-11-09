@@ -3,12 +3,12 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
 
-#include <bit>
 #include <cstddef>
 #include <cstdint>
 #ifndef USE_ROCM
@@ -354,20 +354,6 @@ __global__ __launch_bounds__(kThreadsPerBlock) void kpool_topk_transform_kernel(
   }
 }
 
-template <auto* f, std::size_t kMaxDynamicSMEM>
-void setup_kernel_smem_once(host::DebugInfo where = {}) {
-  [[maybe_unused]]
-  static const auto result = [] {
-    const auto fptr = std::bit_cast<const void*>(f);
-#if defined(__HIP_PLATFORM_AMD__)
-    return ::hipFuncSetAttribute(fptr, ::hipFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-#else
-    return ::cudaFuncSetAttribute(fptr, ::cudaFuncAttributeMaxDynamicSharedMemorySize, kMaxDynamicSMEM);
-#endif
-  }();
-  host::RuntimeDeviceCheck(result, where);
-}
-
 template <typename T>
 const T* optional_data_ptr(const tvm::ffi::Optional<tvm::ffi::TensorView>& opt) {
   if (!opt.has_value()) {
@@ -463,7 +449,7 @@ struct KpoolTopKTransformKernel {
         .input_stride = static_cast<int64_t>(S.unwrap()),
     };
 
-    setup_kernel_smem_once<kernel, kSmem>();
+    runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap().device_id, kSmem);
     LaunchKernel(batch_size, kThreadsPerBlock, device.unwrap(), kSmem)(
         kernel,
         params,

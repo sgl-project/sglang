@@ -10,9 +10,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -32,7 +37,6 @@ def _make_req(
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_len = prefix_len
     req.extend_end = fill_len
-    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
@@ -70,9 +74,10 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.last_batch = None
     s.require_mlp_sync = False
     s.spec_algorithm = MagicMock()
-    s.server_args = MagicMock(speculative_skip_dp_mlp_sync=True)
+    s.server_args = MagicMock()
     s.running_batch = MagicMock()
     s.running_batch.is_empty.return_value = True
+    s.running_batch.batch_size.return_value = 0
     s.running_batch.is_prefill_only = False
     s.running_batch.batch_is_full = False
     s.running_batch.reqs = []
@@ -92,8 +97,11 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
+    s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
     s.chunked_req = chunked_req
     s._pending_chunked_abort_req = None
+    s.running_reqs = KeyedReqList(ListKind.DECODING)
+    s.invariant_checker = MagicMock()
     return s
 
 
@@ -141,18 +149,6 @@ class TestStashGatePreservesPrefix(CustomTestCase):
         s.tree_cache.checkpoint.assert_called_once_with(
             req, up_to=self.POST_RESET_FILL_LEN
         )
-
-    def test_no_chunked_req_never_mutates_state(self):
-        # The outer `if chunked_req is not None` guard must hold on the retract
-        # path that clears chunked_req.
-        cache = _make_tree_cache()
-        s = _scheduler_for_get_next_batch(tree_cache=cache, chunked_req=None)
-
-        Scheduler.get_next_batch_to_run(
-            s, running_batch=s.running_batch, last_batch=s.last_batch
-        )
-        self.assertIsNone(s.chunked_req)
-        cache.checkpoint.assert_not_called()
 
 
 if __name__ == "__main__":

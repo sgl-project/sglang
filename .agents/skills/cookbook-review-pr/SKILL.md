@@ -120,7 +120,7 @@ than restating.
   ∈ `config.accuracyLabels`.
 - A benchmark's quantization must match a variant actually listed — `(BF16)` on a model
   that only released FP8/FP4 is a factual bug.
-- `benchmarkCommands.speed` is `python3 -m sglang.bench_serving` (the workload), separate
+- `benchmarkCommands.speed` is `python3 -m sglang.benchmark.serving` (the workload), separate
   from the `sglang serve` deploy command, and should carry `--flush-cache`: bench_serving's
   `random` prompts are deterministic, so a warm rerun hits the radix cache and inflates
   throughput — speed numbers are measured cache-cold.
@@ -205,7 +205,7 @@ than restating.
   `python/sglang/srt/function_call/function_call_parser.py` (ToolCallParserEnum) —
   prose naming a near-miss id (e.g. the reasoning id where the tool id differs) is a
   factual bug. `--…-parser auto` is acceptable ONLY if the template-detection rules
-  (`python/sglang/srt/managers/template_detection.py`) actually resolve THIS model's
+  (`python/sglang/srt/parser/template_detection.py`) actually resolve THIS model's
   chat template to the right parser — no rule match means auto silently disables the
   parser; when in doubt require explicit ids (the DSv4 page pins explicit ids).
 

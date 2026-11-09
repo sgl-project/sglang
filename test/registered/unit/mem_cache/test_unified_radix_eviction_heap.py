@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.plan import TREE_TOKEN
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -41,6 +42,7 @@ from sglang.srt.mem_cache.unified_cache.components.full import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import _LazyLeafHeap
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 POLICIES = ("lru", "lfu", "fifo", "mru", "filo", "priority", "slru")
 
@@ -61,13 +63,13 @@ class LegacyFullComponent(FullComponent):
         ]
         heapq.heapify(self._evict_device_heap)
 
-    def _evict_device_next_node(self, tracker, device_frees, host_frees):
+    def _evict_device_next_node(self, tracker, device_frees, host_frees, cache_actions):
         ct = self.component_type
         lv = self._evict_device_last_node
         if (
             lv is not None
             and lv.parent is not None
-            and lv.parent in self.tree_core.evictable_device_leaves
+            and self.tree_core._is_device_walk_candidate(lv.parent)
         ):
             heapq.heappush(
                 self._evict_device_heap,
@@ -76,7 +78,7 @@ class LegacyFullComponent(FullComponent):
         self._evict_device_last_node = None
         while tracker[ct] < self._evict_device_request_cnt and self._evict_device_heap:
             _, x = heapq.heappop(self._evict_device_heap)
-            if x not in self.tree_core.evictable_device_leaves:
+            if not self.tree_core._is_device_walk_candidate(x):
                 continue
             self._evict_device_last_node = x
             return x.id
@@ -86,7 +88,9 @@ class LegacyFullComponent(FullComponent):
         self._evict_device_heap = []
         self._evict_device_last_node = None
 
-    def drive_host_eviction(self, num_tokens, tracker, device_frees, host_frees):
+    def drive_host_eviction(
+        self, num_tokens, tracker, device_frees, host_frees, cache_actions
+    ):
         self._ensure_eviction_strategy()
         heap = [
             (self.session_ref_eviction_strategy(n), n)
@@ -98,7 +102,9 @@ class LegacyFullComponent(FullComponent):
             _, x = heapq.heappop(heap)
             if x not in self.tree_core.evictable_host_leaves:
                 continue
-            self.tree_core._evict_host_leaf(x, tracker, device_frees, host_frees)
+            self.tree_core._evict_host_leaf(
+                x, tracker, device_frees, host_frees, cache_actions=cache_actions
+            )
             if (
                 x.parent is not None
                 and x.parent in self.tree_core.evictable_host_leaves
@@ -119,6 +125,7 @@ def make_cache(
     enable_session: bool = False,
     legacy: bool = False,
     page_size: int = 1,
+    policy_config: Optional[dict] = None,
 ) -> UnifiedRadixCache:
     dtype = torch.float16
     kv_pool = MHATokenToKVPool(
@@ -147,10 +154,11 @@ def make_cache(
                 token_to_kv_pool_allocator=allocator,
                 page_size=page_size,
                 eviction_policy=policy,
+                eviction_policy_config=policy_config,
                 enable_session_radix_cache=enable_session,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
                 component_registry_override=(
-                    {ComponentType.FULL: LegacyFullComponent} if legacy else None
+                    {TREE_TOKEN: LegacyFullComponent} if legacy else None
                 ),
             )
         )
@@ -302,7 +310,12 @@ class Replay:
 
 
 def replay_pair(
-    policy: str, seed: int, session: bool, page_size: int = 1, kill_switch=False
+    policy: str,
+    seed: int,
+    session: bool,
+    page_size: int = 1,
+    kill_switch=False,
+    policy_config: Optional[dict] = None,
 ):
     ops = gen_ops(seed, 320, page_size, session)
     reset_time_counter()
@@ -310,19 +323,33 @@ def replay_pair(
     # construction, so an exported kill switch would otherwise flip both sides.
     with envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.override(True):
         new = Replay(
-            make_cache(policy=policy, enable_session=session, page_size=page_size)
+            make_cache(
+                policy=policy,
+                enable_session=session,
+                page_size=page_size,
+                policy_config=policy_config,
+            )
         )
     new.run(ops)
     reset_time_counter()
     if kill_switch:
         with envs.SGLANG_UNIFIED_RADIX_LAZY_EVICTION_HEAP.override(False):
             ref = Replay(
-                make_cache(policy=policy, enable_session=session, page_size=page_size)
+                make_cache(
+                    policy=policy,
+                    enable_session=session,
+                    page_size=page_size,
+                    policy_config=policy_config,
+                )
             )
     else:
         ref = Replay(
             make_cache(
-                policy=policy, enable_session=session, page_size=page_size, legacy=True
+                policy=policy,
+                enable_session=session,
+                page_size=page_size,
+                legacy=True,
+                policy_config=policy_config,
             )
         )
     ref.run(ops)
@@ -412,6 +439,28 @@ class TestLazyLeafHeapUnit(CustomTestCase):
         heap.check_invariants(errors.append, "t")
         self.assertEqual(errors, [])
 
+    def test_admitted_non_member_lives_for_one_walk(self):
+        # write_back: the walk may take a parent whose device children are all
+        # queued although it is not in the leaf set.
+        nodes = [_Node(i, i) for i in range(3)]
+        members, heap = self._heap(nodes)
+        parent = _Node(10, -1)
+        heap.promote(parent)  # not a member, not admitted: ignored
+        heap.begin_walk()
+        self.assertIs(heap.pop_next(), nodes[0])
+        heap.promote(parent, admit=True)
+        heap.forget(parent)  # a leaf-set update must not drop it mid-walk
+        self.assertIs(heap.pop_next(), parent)
+        self.assertIs(heap.pop_next(), nodes[1])
+        other = _Node(11, -2)
+        heap.promote(other, admit=True)  # admitted but never popped
+        heap.end_walk()
+        self.assertEqual(set(heap._live), members)
+        errors = []
+        heap.check_invariants(errors.append, "t")
+        self.assertEqual(errors, [])
+        self.assertEqual(self._drain(heap), nodes)
+
     def test_mid_walk_touch_is_deferred_to_end_walk(self):
         nodes = [_Node(i, i) for i in range(3)]
         members, heap = self._heap(nodes)
@@ -485,6 +534,40 @@ class TestEvictionOrderParity(CustomTestCase):
                         new, ref = replay_pair(policy, seed, session)
                         self._assert_parity(new, ref, label)
 
+    def test_parity_tlru(self):
+        # T-LRU keys read the branch high-water depth, which an insert raises
+        # on ancestors; a nonzero budget makes the TEL-safe band reachable.
+        config = {"threshold": 8, "next_prompt_estimate": 2}
+        for session in (False, True):
+            for seed in range(6):
+                label = f"policy=tlru session={session} seed={seed}"
+                with self.subTest(label):
+                    new, ref = replay_pair("tlru", seed, session, policy_config=config)
+                    self._assert_parity(new, ref, label)
+
+    def test_parity_write_back_queued_parents(self):
+        for policy in ("lru", "mru", "priority"):
+            for seed in range(4):
+                label = f"write_back policy={policy} seed={seed}"
+                with self.subTest(label):
+                    rng = random.Random(seed)
+                    seqs = gen_sequences(rng, 40, 1)
+                    orders = []
+                    for legacy in (False, True):
+                        reset_time_counter()
+                        cache = make_cache(policy=policy, legacy=legacy, kv_size=4096)
+                        for seq in seqs:
+                            _insert(cache, seq)
+                        orders.append(queued_walk_order(cache))
+                        cache.tree_core.is_write_back = False
+                        cache.sanity_check()
+                    new, ref = orders
+                    self.assertEqual(new, ref, label)
+                    # Interior nodes are reached only through queued children.
+                    self.assertGreater(
+                        len(new[0]), len(cache.tree_core.evictable_device_leaves), label
+                    )
+
     def test_parity_page_size_4(self):
         for policy in ("lru", "lfu", "mru"):
             for seed in range(2):
@@ -517,6 +600,36 @@ def _match_len(cache, tokens) -> int:
     return cache.match_prefix(
         MatchPrefixParams(key=RadixKey(array("q", tokens)))
     ).device_prefix_len
+
+
+def queued_walk_order(cache, rounds: int = 2) -> list[list[tuple]]:
+    """Drive Full device walks the way write_back batching does: every yielded
+    victim is only queued (``write_back_queued``), so a parent whose device
+    children are all queued becomes a walk candidate without being a D-leaf."""
+    core = cache.tree_core
+    core.is_write_back = True
+    full = core.components_by_type[ComponentType.FULL]
+    walks = []
+    for _ in range(rounds):
+        order, queued = [], []
+        full.evict_device_start(1 << 30)
+        try:
+            while True:
+                node_id = full.evict_device_next_node(
+                    {ComponentType.FULL: 0}, {}, {}, cache_actions=[]
+                )
+                if node_id is None:
+                    break
+                node = core.node_by_id(node_id)
+                order.append(node_path(core, node))
+                node.write_back_queued = True
+                queued.append(node)
+        finally:
+            full.evict_device_end()
+        for node in queued:
+            node.write_back_queued = False
+        walks.append(order)
+    return walks
 
 
 class TestHeapOnRealCache(CustomTestCase):

@@ -1,57 +1,85 @@
+import ctypes
+import queue
 import sys
+import threading
 import unittest
 from array import array
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import replace
+from itertools import product
+from queue import Queue
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call, patch
 
 import pytest
-import test_unified_radix_cache_unittest as shared_cache_suite
 import torch
-from test_unified_radix_cache_unittest import (
-    CacheConfig,
-    _device_lock_ref,
-    _device_value,
-    _InsertWalkSuite,
-    _node_children,
-    build_fixture,
-)
 
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestHandle,
+    EvictParams,
     InitLoadBackParams,
-    InsertResult,
+    InsertParams,
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheStorageExtraInfo,
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+    DevicePoolEntry,
+    DevicePoolGroup,
+)
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
+    MooncakeDirectLinker,
+)
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.cache_action import (
-    ReplaceWriteThroughOnNodeSplit,
+    UpdatePendingBackupOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
-from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
 from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     ExternalCacheHitMarker,
+    LayerWiseLoadCounter,
+    TransferReady,
     UnifiedCacheLinker,
     UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.runtime_context import get_context, get_disagg
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+from sglang.test.kits.unified_radix_cache import fixtures as shared_cache_suite
+from sglang.test.kits.unified_radix_cache.config import (
+    CacheConfig,
+)
+from sglang.test.kits.unified_radix_cache.fixtures import (
+    build_fixture,
+    node_children,
+    node_device_lock_ref,
+    node_device_value,
+)
+from sglang.test.kits.unified_radix_cache.mixins import UnifiedRadixCacheFixtures
+from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import FAMILY_OF, index_slots
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
-register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeLinker(UnifiedCacheLinker):
@@ -60,10 +88,12 @@ class _FakeLinker(UnifiedCacheLinker):
         self.restorable = []
         self.queued_loads = {}
         self.queued_offloads = []
-        self.completed_loads = []
+        self.offload_sessions = []
+        self.load_landed = True
         self.completed_offloads = []
         self.reset_count = 0
         self.closed = False
+        self.pools = {}
 
     def lookup(self, rid, transfers):
         return list(self.restorable)
@@ -71,6 +101,9 @@ class _FakeLinker(UnifiedCacheLinker):
     def load(self, rid, transfers):
         self.queued_loads[rid] = list(transfers)
         return True
+
+    def prefetch(self, transfers):
+        return None
 
     def start_layer_wise_loading(self):
         return 3
@@ -81,14 +114,12 @@ class _FakeLinker(UnifiedCacheLinker):
         del self.queued_loads[rid]
         return True
 
-    def num_completed_loads(self):
-        return len(self.completed_loads)
+    def finish_layer_wise_loading(self, counter_index):
+        return self.load_landed
 
-    def pop_completed_load(self):
-        return self.completed_loads.pop(0)
-
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         self.queued_offloads.append(list(transfers))
+        self.offload_sessions.append(session_id)
         return True
 
     def num_completed_offloads(self):
@@ -154,6 +185,15 @@ def _cache_for_wrapper(**kwargs):
         "pp_group": None,
     }
     defaults.update(kwargs)
+    # The stand-in's window slots, as a tree with these slots reports them.
+    windows = tuple(
+        dict.fromkeys(
+            ct
+            for ct in (*defaults["tree_components"], *defaults["components"])
+            if FAMILY_OF.get(ct) == TREE_WINDOW
+        )
+    )
+    defaults.setdefault("window_slots", lambda: windows)
     return SimpleNamespace(**defaults)
 
 
@@ -165,6 +205,528 @@ def _swa_allocator(swa_req_ring):
     return allocator
 
 
+class TestMooncakePrefetch(CustomTestCase):
+    def _linker(self, read):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        linker.load_mode = "prefetch"
+        linker.num_layers = 2
+        linker.layer_done_counter = LayerWiseLoadCounter(2)
+        linker.gc_frozen = True
+        linker.pending_loads, linker.broadcast_loads = {}, {}
+        linker.load_queue, linker.offload_queue, linker.offload_results = (
+            Queue() for _ in range(3)
+        )
+        buffers = [torch.zeros((8, 2), dtype=torch.uint8) for _ in range(2)]
+        pool = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=None,
+            components=[buffers],
+            layer_mapping={0: 0, 1: 1},
+            page_size=2,
+            rows_are_pages=False,
+        )
+        linker.pools = {PoolName.KV: pool}
+        linker.pool_group = DevicePoolGroup([pool], 2, page_size=2)
+        # Keep real pointer packing and byte-count validation; fake only transport.
+        linker.storage = MooncakeStore.__new__(MooncakeStore)
+        linker.storage.registered_pools = linker.pools
+        linker.storage.config_prefix = None
+        linker.storage.mla_suffix = "cp0_pp0"
+        linker.storage.store = SimpleNamespace(batch_get_into_multi_buffers=read)
+        linker.load_thread = threading.Thread(target=linker.load_thread_func)
+        linker.load_thread.start()
+
+        def stop():
+            linker.load_queue.put(None)
+            linker.load_thread.join(5)
+            assert not linker.load_thread.is_alive()
+
+        self.addCleanup(stop)
+        return linker, buffers
+
+    def _prefetch(self, linker, synchronize=lambda: None, indices=(4, 5)):
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=["page"], device_indices=torch.tensor(indices)
+        )
+        ready = TransferReady([SimpleNamespace(synchronize=synchronize)])
+        with patch.object(linker, "record_transfer_ready", return_value=ready):
+            return linker.prefetch([transfer])
+
+    def test_all_layers_and_queued_cancellation_quiesce_before_reset(self):
+        """Neither publication nor reset may overtake the final device write."""
+        ready, waiting, last_layer, release = (threading.Event() for _ in range(4))
+
+        def synchronize():
+            waiting.set()
+            assert ready.wait(5)
+
+        def read(keys, pointers, sizes):
+            assert threading.current_thread() is linker.load_thread
+            for layer, (pointer, size) in enumerate(zip(pointers[0], sizes[0])):
+                if layer == 1:
+                    last_layer.set()
+                    assert release.wait(5)
+                ctypes.memset(pointer, layer + 1, size)
+            return [sum(sizes[0])]
+
+        linker, buffers = self._linker(read)
+        self.addCleanup(ready.set)
+        self.addCleanup(release.set)
+        future = self._prefetch(linker, synchronize)
+        assert waiting.wait(5)
+        assert not future.done()
+        assert not any(torch.any(buffer) for buffer in buffers)
+        ready.set()
+        assert last_layer.wait(5)
+        assert not future.done()
+        assert buffers[0][4:6].tolist() == [[1, 1], [1, 1]]
+        assert not torch.any(buffers[1])
+        canceled = self._prefetch(linker, indices=(2, 3))
+        later = self._prefetch(linker, indices=(6, 7))
+        assert canceled.cancel() and not future.cancel()
+        joining = threading.Event()
+        join = linker.load_queue.join
+
+        def wait_for_writer():
+            joining.set()
+            join()
+
+        with (
+            patch.object(linker.load_queue, "join", wait_for_writer),
+            ThreadPoolExecutor(max_workers=1) as executor,
+        ):
+            reset = executor.submit(linker.reset)
+            try:
+                assert joining.wait(5)
+                assert not reset.done()
+            finally:
+                release.set()
+            reset.result(timeout=5)
+        assert future.result(timeout=5) and later.result(timeout=5)
+        assert canceled.cancelled()
+        assert linker.layer_done_counter.producer_index == -1
+        for layer, buffer in enumerate(buffers):
+            assert buffer[4:].tolist() == [[layer + 1] * 2] * 4
+            assert not torch.any(buffer[:4])
+
+    def test_short_read_or_exception_returns_failure(self):
+        for failure in ("short", "exception"):
+            with self.subTest(failure=failure):
+
+                def read(keys, pointers, sizes, failure=failure):
+                    ctypes.memset(pointers[0][0], 1, sizes[0][0])
+                    if failure == "exception":
+                        raise RuntimeError("Store lost the final layer")
+                    return [sizes[0][0]]
+
+                linker, buffers = self._linker(read)
+                assert not self._prefetch(linker).result(timeout=5)
+                assert torch.any(buffers[0])
+                assert not torch.any(buffers[1])
+
+
+class TestLinkerDevicePrefetch(CustomTestCase):
+    def _fixture(self, *, swa=False, mamba=False, policy="wait_complete"):
+        cfg = CacheConfig(
+            page_size=1 if mamba else 2,
+            components=(ComponentType.FULL,)
+            + ((ComponentType.SWA,) if swa else ())
+            + ((ComponentType.MAMBA,) if mamba else ()),
+            sliding_window_size=2 if swa else None,
+            kv_size=32,
+            num_layers=2,
+            full_attention_layer_ids=(0,),
+        )
+        with patch.object(shared_cache_suite, "get_device", return_value="cpu"):
+            cache, allocator, _ = build_fixture(cfg, tree_core_backend="python")
+        backend = _FakeLinker()
+        if swa:
+            backend.pools[PoolName.SWA] = object()
+        backend.load_mode = "prefetch"
+        backend.prefetch_policy = policy
+        backend.prefetch_futures = []
+
+        def submit(transfers):
+            future = Future()
+            backend.prefetch_futures.append(future)
+            return future
+
+        backend.prefetch = MagicMock(side_effect=submit)
+        backend.lookup = MagicMock(wraps=backend.lookup)
+        backend.restorable = list(range(1, 6 // cfg.page_size + 1))
+        with get_context().override_server_args(
+            hicache_storage_prefetch_policy="best_effort",
+            unified_cache_external_linker_config={
+                "load_mode": "prefetch",
+                "prefetch_policy": policy,
+                "prefetch_timeout_base": 1,
+                "prefetch_timeout_per_ki_token": 512,
+            },
+        ):
+            cache.init_cache_linker(backend)
+        self.addCleanup(cache.linker.close)
+        self.addCleanup(
+            lambda: [
+                f.set_result(False) for f in backend.prefetch_futures if not f.done()
+            ]
+        )
+        return cache, backend, self._request(), allocator
+
+    def _request(self, rid="prefetch", start=1, attempt=0):
+        req = Req(
+            rid=rid,
+            origin_input_text=None,
+            origin_input_ids=array("q", range(start, start + 7)),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        req.cache_request_handle = CacheRequestHandle(rid, attempt)
+        return req
+
+    def _match(self, cache, req):
+        return cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(req.origin_input_ids[:-1]))
+        )
+
+    def _assert_balanced(self, cache, allocator):
+        full = getattr(allocator, "full_attn_allocator", allocator)
+        free = full.available_size()
+        assert free + cache.full_evictable_size() + cache.full_protected_size() == 32
+        if ComponentType.SWA in cache.components:
+            free = allocator.swa_attn_allocator.available_size()
+            window = cache.window_sub_pool_of_slot(ComponentType.SWA)
+            assert (
+                free
+                + cache.window_evictable_size(window)
+                + cache.window_protected_size(window)
+                == 32
+            )
+        if ComponentType.MAMBA in cache.components:
+            free = allocator.state_slots.available_size()
+            assert (
+                free + cache.mamba_evictable_size() + cache.mamba_protected_size() == 20
+            )
+
+    def _enqueue(self, cache, req):
+        # Exercise the real scheduler hook without simulating its entire loop.
+        scheduler = SimpleNamespace(
+            enable_unified_cache_external_linker=True,
+            enable_hicache_storage=False,
+            enable_lmcache=False,
+            tree_cache=cache,
+        )
+        Scheduler._prefetch_kvcache(scheduler, req)
+
+    def test_timeout_config_overrides_legacy_including_empty_object(self):
+        cache, backend, _, _ = self._fixture()
+        for config, legacy, expected in (
+            (None, '{"prefetch_timeout_base":2}', (2, 0.25)),
+            ({}, "@missing-legacy-config.json", (1, 0.25)),
+            (
+                {"prefetch_timeout_base": 10, "prefetch_timeout_per_ki_token": 512},
+                "@missing-legacy-config.json",
+                (10, 512),
+            ),
+        ):
+            with (
+                self.subTest(config=config),
+                get_context().override_server_args(
+                    unified_cache_external_linker_config=config,
+                    hicache_storage_backend_extra_config=legacy,
+                ),
+            ):
+                cache.init_cache_linker(backend)
+                assert cache.prefetch_timeout_base == expected[0]
+                assert cache.prefetch_timeout_per_page == expected[1] * 2 / 1024
+
+    def test_publication_owns_swa_and_mamba_slots_and_frees_racing_duplicates(self):
+        for mamba in (False, True):
+            with self.subTest(mamba=mamba):
+                cache, backend, req, allocator = self._fixture(swa=True, mamba=mamba)
+                requests = (req, self._request("duplicate"))
+                for request in requests:
+                    self._enqueue(cache, request)
+                transfers = [
+                    {t.name: t for t in submitted.args[0]}
+                    for submitted in backend.prefetch.call_args_list
+                ]
+                if mamba:
+                    state = allocator.state
+                    storage = cache.kv_storage()
+                    sub_pool = storage.tree_sub_pool(ComponentType.MAMBA.name)
+                    states = state.pool.mamba_cache
+                    # The recycled slot's replay cursor is not stored state.
+                    state.pool.replayssm_write_pos = torch.full((21,), 7)
+                    for i, transfer in enumerate(transfers, 1):
+                        mamba_transfer = transfer[PoolName.MAMBA]
+                        assert mamba_transfer.keys == transfer[PoolName.KV].keys[-1:]
+                        for buffer in [*states.conv, states.temporal]:
+                            buffer[:, mamba_transfer.device_indices] = 11 * i
+                    assert not any(r.kv.holds_mamba for r in requests)
+                    assert cache.mamba_protected_size() == 2
+                loaded = transfers[0][PoolName.KV].device_indices
+                assert not cache.check_prefetch_progress(req.cache_request_handle)
+                assert self._match(cache, req).device_prefix_len == 0
+                assert allocator.full_to_swa_index_mapping[loaded].tolist() == [0] * 6
+                self._assert_balanced(cache, allocator)
+                for future in backend.prefetch_futures:
+                    future.set_result(True)
+                    cache.check_hicache_events()
+                    self._assert_balanced(cache, allocator)
+                assert cache.check_prefetch_progress(req.cache_request_handle)
+                result = cache.match_prefix(
+                    MatchPrefixParams(
+                        key=RadixKey(req.origin_input_ids[:-1]),
+                        req=req,
+                        cow_mamba=mamba,
+                    )
+                )
+                assert result.device_prefix_len == 6
+                assert torch.equal(
+                    cache.path_device_indices(result.last_device_node), loaded
+                )
+                assert torch.equal(
+                    allocator.translate_loc_from_full_to_swa(loaded[-2:]),
+                    transfers[0][PoolName.SWA].device_indices,
+                )
+                if mamba:
+                    source = transfers[0][PoolName.MAMBA].device_indices
+                    assert torch.equal(req.kv.mamba_cow_src_index, source)
+                    assert int(req.kv.mamba_pool_idx) != int(source)
+                    assert not req.kv.mamba_needs_clear
+                    dst = req.kv.mamba_pool_idx.unsqueeze(0)
+                    storage.copy_state(sub_pool, req.kv.mamba_cow_src_index, dst)
+                    assert all(
+                        torch.all(b[:, dst] == 11)
+                        for b in [*states.conv, states.temporal]
+                    )
+                    assert state.pool.replayssm_write_pos[source].item() == 0
+                    storage.release_state(sub_pool, req)
+                    assert allocator.state_slots.available_size() == 19
+                cache.linker.release_request(req.cache_request_handle)
+                assert self._match(cache, req).device_prefix_len == 6
+                assert allocator.full_attn_allocator.available_size() == 26
+                assert allocator.swa_attn_allocator.available_size() == 30
+                assert not backend.queued_loads
+                cache.evict(
+                    EvictParams(
+                        num_tokens=6,
+                        window_num_tokens={
+                            cache.window_sub_pool_of_slot(ComponentType.SWA): 2
+                        },
+                        mamba_num=int(mamba),
+                    )
+                )
+                assert allocator.full_attn_allocator.available_size() == 32
+                assert allocator.swa_attn_allocator.available_size() == 32
+                if mamba:
+                    assert allocator.state_slots.available_size() == 20
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_failure_falls_back_but_pending_peer_keeps_private_slots(self):
+        for outcome, mamba in product(
+            ("local-failure", "peer-failure", "peer-pending"), (False, True)
+        ):
+            with self.subTest(outcome=outcome, mamba=mamba):
+                cache, backend, req, allocator = self._fixture(swa=True, mamba=mamba)
+                self._enqueue(cache, req)
+                backend.prefetch_futures[-1].set_result(outcome != "local-failure")
+
+                def reduce(verdict, op, outcome=outcome):
+                    if outcome == "peer-failure":
+                        verdict[..., 1] = 0
+                    elif outcome == "peer-pending":
+                        verdict[..., 0] = 0
+
+                cache._all_reduce_attn_groups = reduce
+                cache.linker.check_prefetch_events()
+                assert self._match(cache, req).device_prefix_len == 0
+                pending = outcome == "peer-pending"
+                assert (
+                    cache.check_prefetch_progress(req.cache_request_handle) != pending
+                )
+                assert allocator.full_attn_allocator.available_size() == (
+                    26 if pending else 32
+                )
+                assert allocator.swa_attn_allocator.available_size() == (
+                    30 if pending else 32
+                )
+                self._assert_balanced(cache, allocator)
+                if pending:
+                    cache._all_reduce_attn_groups = lambda value, op: None
+                    cache.linker.check_prefetch_events()
+                    assert self._match(cache, req).device_prefix_len == 6
+                else:
+                    assert cache.linker.load_back(req) == (0, req.last_node)
+                cache.sanity_check()
+
+    def test_admission_policy_and_timeout_begin_at_first_blocked_poll(self):
+        """Stopping admission cannot recycle an in-flight writer's private slots."""
+        for (policy, outcome), mamba in product(
+            (
+                ("best_effort", "queued"),
+                ("best_effort", "running"),
+                ("best_effort", "ready"),
+                ("wait_complete", "running"),
+                ("timeout", "local"),
+                ("timeout", "peer"),
+            ),
+            (False, True),
+        ):
+            with self.subTest(policy=policy, outcome=outcome, mamba=mamba):
+                cache, backend, req, allocator = self._fixture(
+                    swa=True, mamba=mamba, policy=policy
+                )
+                self._enqueue(cache, req)
+                handle, future = req.cache_request_handle, backend.prefetch_futures[-1]
+                if outcome != "queued":
+                    assert future.set_running_or_notify_cancel()
+                if outcome == "ready":
+                    future.set_result(True)
+                state = cache.linker.prefetches[handle]
+                assert state.wait_started is None and state.timeout_s == 4
+                clock = SimpleNamespace(now=1000.0, peer=False, verdicts=[])
+
+                def reduce(verdict, op, clock=clock):
+                    if op == torch.distributed.ReduceOp.MAX:
+                        clock.verdicts.append(verdict.item())
+                        if clock.peer:
+                            verdict.fill_(1)
+
+                cache._all_reduce_attn_groups = reduce
+                with patch(
+                    "sglang.srt.mem_cache.unified_cache.unified_cache_linker.time",
+                    SimpleNamespace(perf_counter=lambda clock=clock: clock.now),
+                ):
+                    assert cache.check_prefetch_progress(handle) == (
+                        policy == "best_effort"
+                    )
+                    if policy == "timeout":
+                        assert state.wait_started == 1000.0
+                        clock.now, clock.peer = 1000.1, outcome == "peer"
+                        assert cache.check_prefetch_progress(handle) == clock.peer
+                        if not clock.peer:
+                            clock.now = 1004.1
+                            assert cache.check_prefetch_progress(handle)
+                        assert clock.verdicts[-1] == (outcome == "local")
+                    elif policy == "wait_complete":
+                        clock.now = 10000.0
+                        assert not cache.check_prefetch_progress(handle)
+                assert allocator.available_size() == 26
+                self._assert_balanced(cache, allocator)
+                if not future.done():
+                    future.set_result(True)
+                cache.linker.check_prefetch_events()
+                assert cache.check_prefetch_progress(handle)
+                hit = policy == "wait_complete" or outcome == "ready"
+                assert self._match(cache, req).device_prefix_len == (6 if hit else 0)
+                assert allocator.available_size() == (26 if hit else 32)
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_out_of_order_completions_isolate_rids_and_reused_attempts(self):
+        cache, backend, old, allocator = self._fixture()
+        prefix = allocator.alloc(2)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(old.origin_input_ids[:2]), value=prefix, inserted_len=2
+            )
+        )
+        other, new = self._request("other", start=11), self._request(attempt=1)
+        for req in (old, other, new):
+            self._enqueue(cache, req)
+            assert backend.prefetch_futures[-1].set_running_or_notify_cancel()
+        first, second, third = backend.prefetch_futures
+        new_slots = backend.prefetch.call_args.args[0][0].device_indices.clone()
+        anchor = old.last_node
+        cache.linker.release_request(old.cache_request_handle)
+        cache.linker.check_prefetch_events()
+        self._enqueue(cache, new)
+        assert len(backend.prefetch_futures) == 3
+        assert len(cache.linker.prefetches) == 3 and allocator.available_size() == 16
+        assert cache.check_prefetch_progress(old.cache_request_handle)
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 2
+        self._assert_balanced(cache, allocator)
+        third.set_result(True)
+        cache.linker.check_prefetch_events()
+        result = self._match(cache, new)
+        assert torch.equal(
+            cache.path_device_indices(result.last_device_node),
+            torch.cat([prefix, new_slots]),
+        )
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 1
+        assert not cache.check_prefetch_progress(other.cache_request_handle)
+        first.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert old.cache_request_handle not in cache.prefetch_loaded_tokens_by_reqid
+        assert cache.prefetch_loaded_tokens_by_reqid[new.cache_request_handle] == 4
+        assert node_device_lock_ref(cache, anchor, ComponentType.FULL) == 0
+        self._assert_balanced(cache, allocator)
+        assert torch.equal(
+            cache.path_device_indices(result.last_device_node),
+            torch.cat([prefix, new_slots]),
+        )
+        second.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert not cache.linker.prefetches
+        assert self._match(cache, other).device_prefix_len == 6
+        assert allocator.available_size() == 20
+        cache.evict(EvictParams(num_tokens=12))
+        assert allocator.available_size() == 32
+        cache.sanity_check()
+
+    def test_miss_refusal_or_no_capacity_can_retry_but_active_read_is_deduplicated(
+        self,
+    ):
+        for unavailable in ("miss", "refusal", "capacity"):
+            with self.subTest(unavailable=unavailable):
+                cache, backend, req, allocator = self._fixture()
+                occupied = allocator.alloc(28) if unavailable == "capacity" else None
+                if unavailable == "miss":
+                    backend.restorable = []
+                available = allocator.available_size()
+                with patch.object(backend, "prefetch", return_value=None):
+                    self._enqueue(cache, req)
+                assert cache.check_prefetch_progress(req.cache_request_handle)
+                assert not cache.linker.prefetches
+                assert not backend.prefetch.called
+                assert not backend.queued_loads
+                assert allocator.available_size() == available
+                if occupied is not None:
+                    allocator.free(occupied)
+                backend.restorable = [1, 2, 3]
+                self._enqueue(cache, req)
+                self._enqueue(cache, req)
+                assert backend.lookup.call_count == 2
+                assert len(backend.prefetch_futures) == 1
+                backend.prefetch_futures[-1].set_result(True)
+                cache.check_hicache_events()
+                assert self._match(cache, req).device_prefix_len == 6
+                self._assert_balanced(cache, allocator)
+                cache.sanity_check()
+
+    def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
+        cache, backend, req, allocator = self._fixture()
+        cache.linker.load_mode = backend.load_mode = "layer_wise"
+        req.init_next_round_input(cache)
+        lookup_count = backend.lookup.call_count
+        available = allocator.available_size()
+        self._enqueue(cache, req)
+        assert backend.lookup.call_count == lookup_count
+        assert allocator.available_size() == available
+        assert not cache.linker.prefetches
+        assert cache.check_prefetch_progress(req.cache_request_handle)
+        assert req.host_hit_length == 6
+        assert not backend.queued_loads
+        assert cache.linker.load_back(req)[0] == 6
+        assert not backend.prefetch.called
+        assert len(backend.queued_loads) == 1
+        assert allocator.available_size() == 26
+        assert cache.linker.finish_loads() == []
+        cache.sanity_check()
+
+
 def test_cache_linker_attachment_is_backend_independent():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.tree_core = SimpleNamespace(
@@ -172,9 +734,11 @@ def test_cache_linker_attachment_is_backend_independent():
         write_through_threshold=256,
     )
     cache.tree_components = (ComponentType.FULL,)
+    index_slots(cache, cache.tree_components)
     cache.linker = None
     cache._components_tuple = ()
     cache.components = {}
+    index_slots(cache, cache.components)
     linker = _FakeLinker()
 
     cache.init_cache_linker(linker)
@@ -185,13 +749,34 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
-def test_cache_linker_rejects_unsupported_tree_components(component_type):
+@pytest.mark.parametrize(
+    "component_type,load_mode",
+    [
+        (ComponentType.C128, "layer_wise"),
+        (ComponentType.C128, "prefetch"),
+    ],
+)
+def test_cache_linker_rejects_unsupported_tree_components(component_type, load_mode):
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
+    backend = _FakeLinker()
+    backend.load_mode = load_mode
 
     with pytest.raises(ValueError, match=component_type.name):
-        UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+        UnifiedCacheLinkerWrapper(cache, backend)
 
+    assert not cache.tree_core.enable_external_cache_linker
+
+
+def test_pipeline_parallelism_rejects_only_prefetch_mode():
+    cache = _cache_for_wrapper(pp_size=2)
+    UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    assert cache.tree_core.enable_external_cache_linker
+
+    cache = _cache_for_wrapper(pp_size=2)
+    backend = _FakeLinker()
+    backend.load_mode = "prefetch"
+    with pytest.raises(ValueError, match="prefetch currently requires PP=1"):
+        UnifiedCacheLinkerWrapper(cache, backend)
     assert not cache.tree_core.enable_external_cache_linker
 
 
@@ -200,13 +785,14 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
 
     def __init__(self, stored_keys=None):
         self.layer_done_counter = object()
+        self.pools = dict.fromkeys(PoolName)
         self.stored_keys = defaultdict(set) if stored_keys is None else stored_keys
         self.lookup_calls = []
         self.offload_calls = []
         self.pending_offloads = []
         self.queued_loads = {}
         self.started_loads = []
-        self.completed_loads = []
+        self.load_landed = True
         self.completed_offloads = []
 
     @staticmethod
@@ -263,6 +849,9 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
         self.queued_loads[rid] = self._clone_transfers(transfers)
         return True
 
+    def prefetch(self, transfers):
+        return None
+
     def start_layer_wise_loading(self):
         if not self.queued_loads:
             return -1
@@ -273,19 +862,12 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def cancel_queued_load(self, rid):
         return self.queued_loads.pop(rid, None) is not None
 
-    def num_completed_loads(self):
-        return len(self.completed_loads)
-
-    def pop_completed_load(self):
-        rids = self.completed_loads.pop(0)
-        for rid in rids:
+    def finish_layer_wise_loading(self, counter_index):
+        for rid in self.started_loads[counter_index]:
             self.queued_loads.pop(rid, None)
-        return rids
+        return self.load_landed
 
-    def complete_started_loads(self):
-        self.completed_loads.append(self.started_loads[-1])
-
-    def offload(self, transfers):
+    def offload(self, transfers, session_id=None):
         transfers = self._clone_transfers(transfers)
         self.offload_calls.append(transfers)
         self.pending_offloads.append(transfers)
@@ -307,7 +889,6 @@ class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
     def reset(self):
         self.queued_loads.clear()
         self.pending_offloads.clear()
-        self.completed_loads.clear()
         self.completed_offloads.clear()
 
     def close(self):
@@ -318,19 +899,36 @@ class _TreeCoreBackendTestMixin:
     tree_core_backend = "python"
 
     def setUp(self):
-        previous = shared_cache_suite._TREE_CORE_TEST_BACKEND
+        previous = shared_cache_suite.TREE_CORE_TEST_BACKEND
         self.addCleanup(
             setattr,
             shared_cache_suite,
-            "_TREE_CORE_TEST_BACKEND",
+            "TREE_CORE_TEST_BACKEND",
             previous,
         )
-        shared_cache_suite._TREE_CORE_TEST_BACKEND = self.tree_core_backend
+        shared_cache_suite.TREE_CORE_TEST_BACKEND = self.tree_core_backend
         super().setUp()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
-class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalkSuite):
+class TestUnifiedCacheLinkerPythonBackend(
+    _TreeCoreBackendTestMixin, UnifiedRadixCacheFixtures, CustomTestCase
+):
+    def _bind_loaded_request(self, cache, req_to_token_pool, req, tokens, loaded):
+        """Leave ``req`` as admission does: loaded tail written, owned by ``req``."""
+        req.kv.cache_protected_len = req.prefix_len
+        req.prefix_len += len(loaded)
+        prefix = cache.prefix_device_indices(req)
+        self.assertTrue(torch.equal(prefix[-len(loaded) :], loaded))
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, len(prefix))), prefix)
+        req.origin_input_ids, req.output_ids = array("q", tokens), array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.extend_end = len(tokens)
+        req.kv.kv_committed_len = len(prefix)
+        req.kv.kv_allocated_len = len(prefix)
+        req.extra_key = None
+        req.lock = cache.lock(req.last_node)
+
     def test_full_offload_load_round_trip_and_dedup(self):
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
@@ -352,11 +950,15 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertTrue(
             torch.equal(
                 kv_offload.device_indices,
-                _device_value(producer, inserted.last_device_node, ComponentType.FULL),
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.FULL
+                ),
             )
         )
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             1,
         )
         self.assertFalse(
@@ -373,7 +975,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         producer_linker.complete_next_offload(True)
         producer.check_hicache_events()
         self.assertEqual(
-            _device_lock_ref(producer, inserted.last_device_node, ComponentType.FULL),
+            node_device_lock_ref(
+                producer, inserted.last_device_node, ComponentType.FULL
+            ),
             0,
         )
         self.assertTrue(
@@ -401,21 +1005,30 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             )
         )
         self.assertEqual(loaded_len, len(tokens))
-        self.assertNotEqual(loaded_node, consumer.root_node_handle())
+        loaded = consumer.linker.private_load_indices[req.rid]
+        # The tail is request-private: nothing is published until it lands.
+        self.assertEqual(loaded_node, req.last_node)
         (kv_load,) = consumer_linker.queued_loads[req.rid]
         self.assertEqual(kv_load.name, PoolName.KV)
         self.assertEqual(kv_load.keys, kv_offload.keys)
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 1)
+        self.assertTrue(torch.equal(kv_load.device_indices, loaded))
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
-        consumer_linker.complete_started_loads()
-        consumer.check_hicache_events()
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
+        self._bind_loaded_request(consumer, consumer_req_pool, req, tokens, loaded)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.checkpoint(req, up_to=req.extend_end)
+        consumer.unlock(req.lock)
+        req.lock = None
         final_match = consumer.match_prefix(
             MatchPrefixParams(key=RadixKey(array("q", tokens)))
         )
-        self.assertEqual(final_match.device_prefix_len, len(tokens))
-        self.assertEqual(consumer_linker.offload_calls, [])
+        self.assertTrue(
+            torch.equal(
+                consumer.path_device_indices(final_match.last_device_node), loaded
+            )
+        )
+        consumer_linker.complete_next_offload(True)
+        consumer.check_hicache_events()
         consumer.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
@@ -462,6 +1075,80 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         (kv_lookup,) = transfers
         self.assertEqual(kv_lookup.keys, kv_offload.keys[2:])
 
+    def test_offload_skips_prefix_stored_by_prefill(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+
+        with cache.linker.skip_offload_prefix(4):
+            inserted = self._insert(cache, allocator, req_pool, tokens)
+        self.assertEqual(cache.linker.offload_skip_prefix_len, 0)
+        (kv_offload,) = linker.offload_calls[0]
+        node = inserted.last_device_node
+        self.assertEqual(kv_offload.keys, cache.tree_core.get_hash_values(node)[2:])
+        self.assertTrue(
+            torch.equal(
+                kv_offload.device_indices,
+                node_device_value(cache, node, ComponentType.FULL)[4:],
+            )
+        )
+        linker.complete_next_offload(True)
+        cache.check_hicache_events()
+        self.assertTrue(cache.tree_core.is_external_cache_stored(node))
+
+    def test_node_inside_skip_offload_prefix_is_marked_stored(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+        tokens = list(range(1, 9))
+
+        with cache.linker.skip_offload_prefix(4):
+            prompt = self._insert(cache, allocator, req_pool, tokens[:4])
+        self.assertEqual(linker.offload_calls, [])
+        self.assertTrue(
+            cache.tree_core.is_external_cache_stored(prompt.last_device_node)
+        )
+
+        full = self._insert(cache, allocator, req_pool, tokens)
+        (kv_offload,) = linker.offload_calls[0]
+        self.assertEqual(
+            kv_offload.keys, cache.tree_core.get_hash_values(full.last_device_node)
+        )
+        self.assertEqual(len(kv_offload.keys), 2)
+
+    def test_decode_match_skips_linker_lookup(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        stored_keys = defaultdict(set)
+        producer, producer_allocator, producer_req_pool = build_fixture(cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        tokens = list(range(1, 9))
+        self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+        key = RadixKey(array("q", tokens))
+        with get_disagg().override(disaggregation_mode="decode"):
+            req = self._make_req(consumer_req_pool)
+            match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, 0)
+        self.assertEqual(consumer_linker.lookup_calls, [])
+        self.assertFalse(consumer.linker.has_hit(req.rid))
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(MatchPrefixParams(key=key, req=req))
+        self.assertEqual(match.host_hit_length, len(tokens))
+        consumer.linker.release_request(req.cache_request_handle)
+
     def test_failed_split_offload_retries_and_reset_releases_locks(self):
         cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
@@ -476,8 +1163,8 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         original_keys = linker.offload_calls[0][0].keys
 
         self._insert(cache, allocator, req_to_token_pool, tokens[:2])
-        (parent,) = _node_children(cache, cache.root_node_handle())
-        (child,) = _node_children(cache, parent)
+        (parent,) = node_children(cache, cache.root_node_handle())
+        (child,) = node_children(cache, parent)
         self.assertEqual(child, original_node)
         self.assertEqual(
             cache.linker.pending_offloads[0].publish_node_ids, [parent, child]
@@ -492,7 +1179,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertFalse(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         retry_calls = linker.offload_calls[1:]
@@ -507,7 +1196,9 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         for node_id in (parent, child):
             self.assertIsNone(cache.tree_core.get_write_through_pending_id(node_id))
             self.assertTrue(cache.tree_core.is_external_cache_stored(node_id))
-            self.assertEqual(_device_lock_ref(cache, node_id, ComponentType.FULL), 0)
+            self.assertEqual(
+                node_device_lock_ref(cache, node_id, ComponentType.FULL), 0
+            )
 
         self._insert(cache, allocator, req_to_token_pool, tokens)
         self.assertEqual(len(linker.offload_calls), 3)
@@ -518,17 +1209,27 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(
             cache.tree_core.get_write_through_pending_id(pending_node), pending_node
         )
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 1)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 1
+        )
 
         cache.linker.reset()
         self.assertEqual(cache.linker.pending_offloads, [])
         self.assertIsNone(cache.tree_core.get_write_through_pending_id(pending_node))
-        self.assertEqual(_device_lock_ref(cache, pending_node, ComponentType.FULL), 0)
+        self.assertEqual(
+            node_device_lock_ref(cache, pending_node, ComponentType.FULL), 0
+        )
         cache.sanity_check()
         cache.reset()
         cache.sanity_check()
 
-    def test_swa_partial_hit_loads_only_pages_not_adopted_locally(self):
+    def test_swa_hit_loads_private_tail_and_dedups_on_insert(self):
+        self._run_swa_hit(load_landed=True)
+
+    def test_swa_failed_load_frees_private_slots_unpublished(self):
+        self._run_swa_hit(load_landed=False)
+
+    def _run_swa_hit(self, load_landed):
         cfg = CacheConfig(
             page_size=1,
             components=(ComponentType.FULL, ComponentType.SWA),
@@ -568,7 +1269,12 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         )
         self.assertEqual(match.device_prefix_len, 2)
         self.assertEqual(match.host_hit_length, 2)
-        self.assertEqual(match.swa_host_hit_length, 2)
+        self.assertEqual(
+            match.window_host_hit_lengths.get(
+                consumer.window_sub_pool_of_slot(ComponentType.SWA), 0
+            ),
+            2,
+        )
         self._apply_match_to_req(req, match)
 
         self._insert(consumer, consumer_allocator, consumer_req_pool, tokens[:3])
@@ -578,7 +1284,6 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         raced_full = consumer.path_device_indices(raced_match.last_device_node)[
             -1:
         ].clone()
-        raced_swa = consumer_allocator.translate_loc_from_full_to_swa(raced_full)
 
         loaded_len, loaded_node = consumer.init_load_back(
             InitLoadBackParams(
@@ -588,47 +1293,223 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
             )
         )
         self.assertEqual(loaded_len, 2)
-        loaded = consumer.path_device_indices(loaded_node)[-loaded_len:]
-        self.assertTrue(torch.equal(loaded[:1], raced_full))
+        loaded = consumer.linker.private_load_indices[req.rid]
         load_by_pool = {
             transfer.name: transfer
             for transfer in consumer_linker.queued_loads[req.rid]
         }
         self.assertEqual(set(load_by_pool), {PoolName.KV, PoolName.SWA})
-        expected_key = all_keys[3]
         for transfer in load_by_pool.values():
-            self.assertEqual(transfer.keys, [expected_key])
-            self.assertEqual(transfer.device_indices.numel(), 1)
-
-        translated = consumer_allocator.translate_loc_from_full_to_swa(loaded)
-        self.assertTrue(torch.equal(translated[:1], raced_swa))
-        self.assertTrue(
-            torch.equal(translated[-1:], load_by_pool[PoolName.SWA].device_indices)
+            self.assertEqual(transfer.keys, all_keys[2:4])
+        translated = consumer_allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(
+            loaded
         )
+        self.assertTrue(
+            torch.equal(translated, load_by_pool[PoolName.SWA].device_indices)
+        )
+
+        full_free = consumer_allocator.full_attn_allocator.available_size
+        swa_free = consumer_allocator.swa_attn_allocator.available_size
+        before = (full_free(), swa_free())
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self._bind_loaded_request(consumer, consumer_req_pool, req, tokens[:4], loaded)
+        if load_landed:
+            self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+            consumer.checkpoint(req, up_to=req.extend_end)
+            consumer.unlock(req.lock)
+            req.lock = None
+            final = consumer.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
+            )
+            # The raced page stays; the request's duplicate of it is freed.
+            self.assertTrue(
+                torch.equal(
+                    consumer.path_device_indices(final.last_device_node)[2:3],
+                    raced_full,
+                )
+            )
+            self.assertTrue(
+                torch.equal(
+                    consumer.path_device_indices(final.last_device_node)[3:], loaded[1:]
+                )
+            )
+        else:
+            consumer_linker.load_landed = False
+            self.assertEqual(consumer.finish_external_linker_loads([req]), [req])
+            self.assertEqual(req.discard_output_reason.status_code, 503)
+            self.assertTrue(req.skip_radix_cache_insert)
+            release_kv_cache(req, consumer, checkpoint=False)
+            self.assertFalse(req.kv.holds_kv)
+            self.assertTrue(req.kv.is_kv_released)
+            self.assertIsNone(req.lock)
+            for component in (ComponentType.FULL, ComponentType.SWA):
+                self.assertEqual(
+                    node_device_lock_ref(consumer, loaded_node, component), 0
+                )
+            self.assertEqual((full_free(), swa_free()), (before[0] + 2, before[1] + 2))
+            unpublished = consumer.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
+            )
+            self.assertEqual(unpublished.device_prefix_len, 3)
+        consumer.sanity_check()
+
+    def _mamba_linker_consumer(self, tokens):
+        self.cfg = CacheConfig(
+            page_size=1,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            sliding_window_size=2,
+            kv_size=64,
+            max_context_len=64,
+        )
+        stored_keys = defaultdict(set)
+
+        producer, producer_allocator, producer_req_pool = build_fixture(self.cfg)
+        producer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        producer.init_cache_linker(producer_linker)
+        inserted = self._insert(producer, producer_allocator, producer_req_pool, tokens)
+        # Ancestors of the chain carry no state; only the checkpoint node does.
+        *ancestors, offload = producer_linker.offload_calls
+        for transfers in ancestors:
+            self.assertEqual(
+                {transfer.name for transfer in transfers}, {PoolName.KV, PoolName.SWA}
+            )
+        offloads = {transfer.name: transfer for transfer in offload}
+        self.assertEqual(set(offloads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        mamba_offload = offloads[PoolName.MAMBA]
+        self.assertEqual(mamba_offload.keys, offloads[PoolName.KV].keys[-1:])
+        self.assertEqual(mamba_offload.hit_policy, PoolHitPolicy.TRAILING_PAGES)
+        self.assertTrue(
+            torch.equal(
+                mamba_offload.device_indices,
+                node_device_value(
+                    producer, inserted.last_device_node, ComponentType.MAMBA
+                ),
+            )
+        )
+        for _ in producer_linker.offload_calls:
+            producer_linker.complete_next_offload(True)
+        producer.check_hicache_events()
+
+        consumer, _, consumer_req_pool = build_fixture(self.cfg)
+        consumer_linker = _InMemoryUnifiedCacheLinker(stored_keys)
+        consumer.init_cache_linker(consumer_linker)
+
+        return consumer, consumer_req_pool, consumer_linker
+
+    def test_mamba_state_round_trips_only_at_its_checkpoint(self):
+        tokens = list(range(1, 7))
+        consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
+            tokens
+        )
+
+        # Every KV and SWA page is stored, but only the full prefix has a state.
+        short = consumer.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(array("q", tokens[:5])),
+                req=self._make_req(consumer_req_pool),
+            )
+        )
+        self.assertEqual(short.host_hit_length, 0)
+
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req)
+        )
+        self.assertEqual(match.host_hit_length, len(tokens))
+        self.assertEqual(match.mamba_host_hit_length, 1)
+        self._apply_match_to_req(req, match)
+        loaded, _ = consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        self.assertEqual(loaded, len(tokens))
+        loads = {
+            transfer.name: transfer
+            for transfer in consumer_linker.queued_loads[req.rid]
+        }
+        self.assertEqual(set(loads), {PoolName.KV, PoolName.SWA, PoolName.MAMBA})
+        self.assertEqual(loads[PoolName.MAMBA].keys, loads[PoolName.KV].keys[-1:])
+        loaded_state = loads[PoolName.MAMBA].device_indices
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertFalse(req.kv.mamba_needs_clear)
+
+        loaded_indices = consumer.linker.private_load_indices[req.rid]
+        self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
+        self._bind_loaded_request(
+            consumer, consumer_req_pool, req, tokens, loaded_indices
+        )
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
+        consumer.checkpoint(req, up_to=req.extend_end)
+        consumer.unlock(req.lock)
+        req.lock = None
+        final_match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)))
+        )
+        self.assertEqual(final_match.device_prefix_len, len(tokens))
+        for _ in consumer_linker.offload_calls:
+            consumer_linker.complete_next_offload(True)
+        consumer.check_hicache_events()
+        consumer.sanity_check()
+
+    def test_mamba_load_supersedes_a_shorter_device_cow(self):
+        tokens = list(range(1, 7))
+        consumer, consumer_req_pool, consumer_linker = self._mamba_linker_consumer(
+            tokens
+        )
+        self._insert(
+            consumer,
+            consumer.token_to_kv_pool_allocator,
+            consumer_req_pool,
+            tokens[:3],
+        )
+        req = self._make_req(consumer_req_pool)
+        match = consumer.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", tokens)), req=req, cow_mamba=True)
+        )
+        self.assertEqual(match.device_prefix_len, 3)
+        self.assertEqual(match.host_hit_length, 3)
+        self.assertIsNotNone(req.kv.mamba_cow_src_index)
+        self._apply_match_to_req(req, match)
+        allocator = consumer_req_pool.mamba_allocator
+        before = allocator.available_size()
+
+        consumer.init_load_back(
+            InitLoadBackParams(
+                best_match_node=match.best_match_node,
+                host_hit_length=match.host_hit_length,
+                req=req,
+            )
+        )
+        # The CoW from the shorter checkpoint would overwrite the loaded state.
+        loaded_state = next(
+            transfer.device_indices
+            for transfer in consumer_linker.queued_loads[req.rid]
+            if transfer.name == PoolName.MAMBA
+        )
+        self.assertEqual(int(req.kv.mamba_pool_idx), int(loaded_state))
+        self.assertIsNone(req.kv.mamba_cow_src_index)
+        self.assertEqual(allocator.available_size(), before)
 
         self.assertGreaterEqual(consumer.ready_to_load_host_cache(), 0)
-        consumer_linker.complete_started_loads()
-        consumer.check_hicache_events()
-        final_match = consumer.match_prefix(
-            MatchPrefixParams(key=RadixKey(array("q", tokens[:4])))
-        )
-        self.assertEqual(final_match.device_prefix_len, 4)
-        self.assertEqual(_device_lock_ref(consumer, loaded_node, ComponentType.FULL), 0)
+        self.assertEqual(consumer.finish_external_linker_loads([req]), [])
         consumer.sanity_check()
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "cache fixtures need CUDA")
 class TestUnifiedCacheLinkerTreeCorePythonBackend(
-    _TreeCoreBackendTestMixin, shared_cache_suite._InsertWalkSuite
+    _TreeCoreBackendTestMixin,
+    UnifiedRadixCacheFixtures,
+    CustomTestCase,
 ):
     """TreeCore linker contracts shared by the Python and Rust inspectors."""
 
     def test_builds_opaque_external_offload_transfers(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=2, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -645,7 +1526,7 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(
             torch.equal(
                 transfer.device_indices,
-                shared_cache_suite._device_value(cache, node_id, ComponentType.FULL),
+                node_device_value(cache, node_id, ComponentType.FULL),
             )
         )
 
@@ -662,11 +1543,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(node_id))
 
     def test_external_state_updates_are_atomic_and_path_scoped(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -734,11 +1613,9 @@ class TestUnifiedCacheLinkerTreeCorePythonBackend(
         self.assertTrue(core.is_external_cache_stored(tail))
 
     def test_failed_offload_preserves_independently_confirmed_state(self):
-        cfg = shared_cache_suite.CacheConfig(
-            page_size=1, kv_size=64, max_context_len=64
-        )
+        cfg = CacheConfig(page_size=1, kv_size=64, max_context_len=64)
         self.cfg = cfg
-        cache, allocator, req_to_token_pool = shared_cache_suite.build_fixture(cfg)
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
         core = cache.tree_core
         core.enable_external_cache_linker = True
 
@@ -821,6 +1698,28 @@ def test_async_offload_pins_node_until_completion():
     assert unlocks == [(node_id, lock_params)]
 
 
+def test_offload_carries_the_inserting_session():
+    linker = _FakeLinker()
+    nodes = {
+        node_id: SimpleNamespace(
+            id=node_id, external_cache_stored=False, write_through_pending_id=None
+        )
+        for node_id in (7, 8)
+    }
+    cache = _cache_for_wrapper(
+        tree_core=_FakeExternalTreeCore(nodes),
+        inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: None),
+        insert_session_id="session-a",
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+
+    wrapper.offload_nodes([7])
+    cache.insert_session_id = None
+    wrapper.offload_nodes([8])
+
+    assert linker.offload_sessions == ["session-a", None]
+
+
 def test_offload_skips_node_already_stored_by_tree_core():
     linker = _FakeLinker()
     node = SimpleNamespace(
@@ -839,52 +1738,107 @@ def test_offload_skips_node_already_stored_by_tree_core():
     assert linker.queued_offloads == []
 
 
-def test_async_load_pins_node_until_completion():
-    linker = _FakeLinker()
-    lock_params = object()
-    locks = []
-    unlocks = []
+def test_layer_counter_reports_failure_after_the_forward():
+    ready = []
+    counter = LayerWiseLoadCounter(2, lambda index, layer: ready.append(layer))
+    index = counter.update_producer()
+    counter.set_consumer(index)
+    counter.complete(index, 0)
+    counter.fail(index, RuntimeError("storage read failed"))
 
-    def inc_lock_ref(node):
-        locks.append(node)
-        return SimpleNamespace(to_dec_params=lambda: lock_params)
+    counter.wait_until(0)
+    counter.wait_until(1)  # does not raise into the forward
 
-    node_id = 7
-    cache = _cache_for_wrapper(
-        inc_lock_ref=inc_lock_ref,
-        dec_lock_ref=lambda node, params: unlocks.append((node, params)),
+    assert ready == [0, 1]  # an MLA dedup source still broadcasts layer 1
+    assert counter.finish(index) is False
+
+
+def test_layer_counter_finish_waits_for_layers_still_loading():
+    counter = LayerWiseLoadCounter(1)
+    index = counter.update_producer()
+    loader = threading.Timer(0.05, counter.complete, (index, 0))
+    loader.start()
+
+    assert counter.finish(index) is True  # the forward never waited on layer 0
+    loader.join()
+
+
+def test_finish_loads_adopts_a_peer_rank_failure():
+    reduce = MagicMock(side_effect=lambda value, op: value.fill_(0))
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=reduce), _FakeLinker()
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper.inflight_load_rids = ["a", "b"]
+    wrapper.start_layer_wise_loading()
 
-    wrapper._queue_load("rid", node_id, [object()])
+    assert wrapper.finish_loads() == ["a", "b"]  # this rank landed, a peer did not
+    assert wrapper.finish_loads() == []  # nothing loaded: no collective
+    reduce.assert_called_once()
 
-    assert locks == [node_id]
-    assert not unlocks
 
-    linker.completed_loads.append(["rid"])
-    wrapper.drain_loads(finish_count=1)
+@pytest.mark.parametrize("device_len", [0, 2])
+@pytest.mark.parametrize("tail_len", [0, 4])
+def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len):
+    path = torch.arange(device_len, dtype=torch.int64)
+    tail = torch.arange(10, 10 + tail_len, dtype=torch.int64)
+    cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+    cache.tree_core = SimpleNamespace(
+        root_node_handle=lambda extra_key: 0,
+        collect_full_device_indices=lambda node, root: path,
+    )
+    cache.linker = SimpleNamespace(
+        private_load_indices={"rid": tail} if tail_len else {}
+    )
+    req = SimpleNamespace(
+        rid="rid", extra_key=None, last_node=1, prefix_len=device_len + tail_len
+    )
 
-    assert unlocks == [(node_id, lock_params)]
+    expected = torch.cat([path, tail])
+    assert torch.equal(cache.prefix_device_indices(req), expected)
+    assert torch.equal(cache.prefix_device_indices(req), expected)
+    assert len(path) == device_len
+
+
+@pytest.mark.parametrize("landed", [True, False])
+def test_finish_loads_releases_private_index_references(landed, caplog):
+    backend = _FakeLinker()
+    backend.load_landed = landed
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(_all_reduce_attn_groups=lambda value, op: None), backend
+    )
+    wrapper.inflight_load_rids = ["rid"]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
+    wrapper.start_layer_wise_loading()
+
+    assert wrapper.finish_loads() == ([] if landed else ["rid"])
+    assert wrapper.private_load_indices == {}
+    assert ("External linker load failed" in caplog.text) is (not landed)
+
+
+@pytest.mark.parametrize("operation", ["reset", "close"])
+def test_linker_lifecycle_releases_private_index_references(operation):
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), _FakeLinker())
+    wrapper.private_load_indices["rid"] = torch.arange(4)
+
+    getattr(wrapper, operation)()
+
+    assert wrapper.private_load_indices == {}
 
 
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
-    lock_params = object()
-    unlocks = []
-    cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node, params: unlocks.append((node, params))
-    )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
     wrapper.hit_markers["rid"] = object()
-    wrapper.pending_loads["rid"] = (7, lock_params)
+    wrapper.inflight_load_rids = ["rid"]
     linker.queued_loads["rid"] = [object()]
+    wrapper.private_load_indices["rid"] = torch.arange(4)
 
-    wrapper.release_request("rid")
+    wrapper.release_request(CacheRequestHandle("rid", 0))
 
     assert wrapper.hit_markers == {}
-    assert wrapper.pending_loads == {}
+    assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
-    assert unlocks == [(7, lock_params)]
+    assert wrapper.private_load_indices == {}
 
 
 def test_failed_offload_rolls_back_split_fragments():
@@ -933,7 +1887,13 @@ def test_split_action_retargets_pending_external_offload():
     cache._replace_pending_write_through_node = lambda *args: calls.append(
         ("hicache", *args)
     )
-    action = ReplaceWriteThroughOnNodeSplit(
+    cache.components = {
+        ComponentType.FULL: SimpleNamespace(
+            apply_component_action=lambda action: calls.append(("full", action))
+        )
+    }
+    index_slots(cache, cache.components)
+    action = UpdatePendingBackupOnNodeSplit(
         ack_id=7,
         old_node_id=7,
         new_node_id=8,
@@ -945,6 +1905,7 @@ def test_split_action_retargets_pending_external_offload():
     assert calls == [
         ("hicache", 7, 7, [8, 7]),
         ("linker", 7, 7, [8, 7]),
+        ("full", action),
     ]
 
 
@@ -968,13 +1929,13 @@ def test_reset_quiesces_backend_before_releasing_pending_locks():
         dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id)),
     )
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper._queue_load("rid", node.id, [object()])
+    wrapper.inflight_load_rids = ["rid"]
     wrapper.offload_nodes([node.id])
 
     wrapper.reset()
 
-    assert events == ["backend", ("unlock", node.id), ("unlock", node.id)]
-    assert wrapper.pending_loads == {}
+    assert events == ["backend", ("unlock", node.id)]
+    assert wrapper.inflight_load_rids == []
     assert wrapper.pending_offloads == []
     assert not node.external_cache_stored
     assert node.write_through_pending_id is None
@@ -989,28 +1950,24 @@ def test_close_quiesces_backend_before_releasing_pending_loads():
             super().close()
 
     linker = _ClosingFakeLinker()
-    cache = _cache_for_wrapper(
-        dec_lock_ref=lambda node_id, params: events.append(("unlock", node_id))
-    )
-    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
-    wrapper.pending_loads["rid"] = (7, object())
+    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
+    wrapper.inflight_load_rids = ["rid"]
 
     wrapper.close()
 
-    assert events == ["backend", ("unlock", 7)]
+    assert events == ["backend"]
     assert linker.closed
-    assert wrapper.pending_loads == {}
+    assert wrapper.inflight_load_rids == []
 
 
 def test_check_hicache_events_commits_common_rank_results():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
-        num_completed_loads=lambda: 1,
-        drain_loads=lambda count: committed.append(("load", count)),
         num_completed_offloads=lambda: 3,
         take_completed_offloads=lambda count: [True] * count,
         commit_completed_offloads=committed.append,
+        check_prefetch_events=lambda: None,
     )
 
     reduce_calls = 0
@@ -1020,7 +1977,7 @@ def test_check_hicache_events_commits_common_rank_results():
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
         if reduce_calls == 1:
-            value.copy_(torch.tensor([1, 1]))
+            value.copy_(torch.tensor([1]))
         else:
             value.fill_(0)
 
@@ -1028,60 +1985,7 @@ def test_check_hicache_events_commits_common_rank_results():
 
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
-
-
-def test_component_commit_keeps_only_adopted_pages():
-    mapping = _MappingRecorder()
-    cache = _cache_for_wrapper(
-        page_size=2,
-        token_to_kv_pool_allocator=SimpleNamespace(
-            set_full_to_swa_mapping=mapping.set_full_to_swa_mapping
-        ),
-    )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
-    full_component = FullComponent.__new__(FullComponent)
-    full_component.cache = cache
-    full_component.component_type = ComponentType.FULL
-    swa_component = SWAComponent.__new__(SWAComponent)
-    swa_component.cache = cache
-    swa_component.component_type = ComponentType.SWA
-    full = PoolTransfer(
-        name=PoolName.KV,
-        keys=["a", "b", "c", "d"],
-        device_indices=torch.tensor([100, 101, 102, 103, 104, 105, 106, 107]),
-    )
-    canonical_tail = torch.tensor([10, 11, 102, 103, 14, 15, 106, 107])
-    swa = PoolTransfer(
-        name=PoolName.SWA,
-        keys=["a", "b", "c", "d"],
-        device_indices=torch.tensor([200, 201, 202, 203, 204, 205, 206, 207]),
-    )
-    insert_result = InsertResult(
-        prefix_len=0,
-        adopted_ranges={
-            ComponentType.FULL: [(2, 4), (6, 8)],
-            ComponentType.SWA: [(2, 4), (6, 8)],
-        },
-    )
-
-    filtered = wrapper._update_load(
-        ExternalLinkerLoadPhase.COMMIT,
-        SimpleNamespace(),
-        [(full_component, full), (swa_component, swa)],
-        prefix_len=8,
-        insert_result=insert_result,
-        canonical_full=canonical_tail,
-    )
-
-    assert filtered == [full, swa]
-    assert full.keys == ["b", "d"]
-    assert full.device_indices.tolist() == [102, 103, 106, 107]
-    assert swa.keys == ["b", "d"]
-    assert swa.device_indices.tolist() == [202, 203, 206, 207]
-    mapped_full, mapped_swa = mapping.mapping[0]
-    assert mapped_full.tolist() == [102, 103, 106, 107]
-    assert mapped_swa.tolist() == [202, 203, 206, 207]
+    assert committed == [[False]]
 
 
 @pytest.mark.parametrize(
@@ -1093,16 +1997,19 @@ def test_component_commit_keeps_only_adopted_pages():
 def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     monkeypatch, swa_req_ring, enable_hicache
 ):
-    from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import env_gate
+    from sglang.srt.layers.attention.dsv4 import unified_kv_gate
 
     unified_kv = swa_req_ring is True
-    monkeypatch.setattr(env_gate, "is_unified_kv_triton", lambda: unified_kv)
+    monkeypatch.setattr(unified_kv_gate, "is_unified_kv_triton", lambda: unified_kv)
     component = SWAComponent.__new__(SWAComponent)
     component.sliding_window_size = 128
+    component.gates_prefix_match = not unified_kv
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.token_to_kv_pool_allocator = _swa_allocator(swa_req_ring)
     cache.components = {ComponentType.SWA: component}
+    index_slots(cache, cache.components)
     cache.cache_controller = object() if enable_hicache else None
+    cache.decoder_swa_bounded_replay = False
     cache.tree_core = SimpleNamespace(
         enable_hicache=enable_hicache,
         has_swa_host_pool=enable_hicache and not unified_kv,
@@ -1110,7 +2017,7 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
     component.cache = cache
     component.tree_core = cache.tree_core
     # #32759: request-relative SWA needs tail re-prefill even without HiCache.
-    assert cache.swa_reprefill_tail_tokens() == (128 if unified_kv else 0)
+    assert cache.window_reprefill_tail_tokens() == (128 if unified_kv else 0)
     node = SimpleNamespace(
         component_data={
             ComponentType.SWA: SimpleNamespace(value=None, host_value=None)
@@ -1124,7 +2031,46 @@ def test_swa_reuse_policy_tracks_layout_without_a_tier_condition(
 def test_cache_without_swa_needs_no_reprefill():
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.components = {}
-    assert cache.swa_reprefill_tail_tokens() == 0
+    index_slots(cache, cache.components)
+    assert cache.window_reprefill_tail_tokens() == 0
+
+
+@pytest.mark.parametrize("swa_stored", [True, False])
+def test_skip_swa_when_linker_store_lacks_swa(swa_stored):
+    """A store without SWA pages must tombstone restored tails, not mark them hit."""
+    linker = _FakeLinker()
+    if swa_stored:
+        linker.pools[PoolName.SWA] = object()
+    swa = SimpleNamespace(pool_name=PoolName.SWA)
+    cache = _cache_for_wrapper(
+        components={ComponentType.SWA: swa},
+        _components_tuple=(swa,),
+        tree_components=(ComponentType.FULL, ComponentType.SWA),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert (swa in wrapper._skipped_windows) is (not swa_stored)
+    assert (swa in wrapper._components) is swa_stored
+
+
+def test_linker_keeps_every_window_slot():
+    """A tree with several window slots (a draft window of its own length
+    beside the target's) gets a linker; each window is stored, or tombstoned
+    when the store lacks its pool, on its own."""
+    linker = _FakeLinker()
+    linker.pools["window_127"] = object()
+    target = SimpleNamespace(pool_name="window_127", window_sub_pool="window_127")
+    draft = SimpleNamespace(pool_name="window_128", window_sub_pool="window_128")
+    target_slot, draft_slot = ComponentType.SWA, object()
+    cache = _cache_for_wrapper(
+        components={target_slot: target, draft_slot: draft},
+        _components_tuple=(target, draft),
+        tree_components=(ComponentType.FULL, target_slot),
+        window_slots=lambda: (target_slot, draft_slot),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, linker)
+    assert wrapper._windows == (target, draft)
+    assert wrapper._skipped_windows == (draft,)
+    assert target in wrapper._components and draft not in wrapper._components
 
 
 @pytest.fixture
@@ -1134,9 +2080,11 @@ def full_linker_component():
         return PoolTransfer(
             name=PoolName.KV,
             keys=keys,
-            device_indices=None
-            if phase == LinkerTransferPhase.LOOKUP
-            else torch.arange(len(keys) * 2),
+            device_indices=(
+                None
+                if phase == LinkerTransferPhase.LOOKUP
+                else torch.arange(len(keys) * 2)
+            ),
         )
 
     return SimpleNamespace(
@@ -1148,11 +2096,10 @@ def full_linker_component():
     )
 
 
-def test_linker_filters_request_relative_swa_from_lookup(
-    full_linker_component,
-):
+def test_linker_filters_unstored_swa_from_lookup(full_linker_component):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
+    swa.__dict__["_window_sub_pool"] = "swa"
     swa.build_external_linker_transfer = MagicMock(
         side_effect=AssertionError("excluded SWA reached linker")
     )
@@ -1160,7 +2107,6 @@ def test_linker_filters_request_relative_swa_from_lookup(
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(True),
         tree_core=SimpleNamespace(enable_external_cache_linker=False, is_eagle=False),
         page_size=2,
         _all_reduce_attn_groups=lambda value, op: None,
@@ -1189,12 +2135,12 @@ def test_linker_filters_request_relative_swa_from_lookup(
     swa.build_external_linker_transfer.assert_not_called()
 
 
-@pytest.mark.parametrize("swa_req_ring", [False, True], ids=["paged", "request-ring"])
+@pytest.mark.parametrize("swa_stored", [True, False], ids=["stored", "unstored"])
 @pytest.mark.parametrize(
     "completion", [True, False, None], ids=["success", "failure", "reset"]
 )
 def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
-    swa_req_ring, completion
+    swa_stored, completion
 ):
     node = SimpleNamespace(
         id=7, external_cache_stored=False, write_through_pending_id=None
@@ -1209,7 +2155,6 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
     cache = _cache_for_wrapper(
         components={ComponentType.SWA: swa},
         _components_tuple=(swa,),
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
         tree_core=core,
         inc_lock_ref=MagicMock(
             return_value=SimpleNamespace(to_dec_params=lambda: lock_params)
@@ -1217,10 +2162,12 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
         dec_lock_ref=MagicMock(),
     )
     backend = _FakeLinker()
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
     wrapper = UnifiedCacheLinkerWrapper(cache, backend)
 
     wrapper.offload_nodes([node.id, node.id])
-    expected = transfers[:1] if swa_req_ring else transfers
+    expected = transfers if swa_stored else transfers[:1]
     assert backend.queued_offloads == [expected]
     assert core.offload_transfers == transfers
     assert node.write_through_pending_id == node.id
@@ -1248,27 +2195,29 @@ def test_offload_filters_tree_core_swa_transfers_and_preserves_lifecycle(
 
 
 @pytest.mark.parametrize(
-    "swa_req_ring,previous_boundary,expected_boundary",
+    "swa_stored,previous_boundary,expected_boundary",
     [
-        pytest.param(True, None, 4, id="unified-tombstones"),
-        pytest.param(True, 8, 8, id="preserve-existing-boundary"),
-        pytest.param(False, None, 2, id="paged-prepare-boundary"),
-        pytest.param(None, None, 2, id="other-allocator-prepare-boundary"),
+        pytest.param(False, None, 4, id="unstored-tombstones"),
+        pytest.param(False, 8, 8, id="preserve-existing-boundary"),
+        pytest.param(True, None, 2, id="stored-prepare-boundary"),
     ],
 )
+@pytest.mark.parametrize("load_refused", [False, True], ids=["queued", "refused"])
 def test_linker_load_preserves_swa_boundaries(
-    full_linker_component, swa_req_ring, previous_boundary, expected_boundary
+    full_linker_component,
+    swa_stored,
+    previous_boundary,
+    expected_boundary,
+    load_refused,
 ):
     full = full_linker_component
     swa = SWAComponent.__new__(SWAComponent)
-    participates = not swa_req_ring
+    swa.__dict__["_window_sub_pool"] = "swa"
+    participates = swa_stored
 
     def prepare(phase, req, full_transfer, transfer, prefix_len, **kwargs):
         if phase == ExternalLinkerLoadPhase.PREPARE:
-            req.kv = ReqKvInfo(
-                kv_allocated_len=prefix_len,
-                component_evicted_seqlens={ComponentType.SWA: prefix_len - 2},
-            )
+            req.kv.set_evicted_seqlen("swa", prefix_len - 2)
         return transfer
 
     swa.build_external_linker_transfer = MagicMock(
@@ -1277,40 +2226,27 @@ def test_linker_load_preserves_swa_boundaries(
         )
     )
     swa.update_external_linker_load = MagicMock(side_effect=prepare)
-    full_indices = torch.arange(4, dtype=torch.int64)
-    adopted = {ComponentType.FULL: [(0, 4)]}
-    if participates:
-        adopted[ComponentType.SWA] = [(0, 4)]
     cache = _cache_for_wrapper(
         _components_tuple=(full, swa),
         page_size=2,
         components={ComponentType.FULL: full, ComponentType.SWA: swa},
-        token_to_kv_pool_allocator=_swa_allocator(swa_req_ring),
-        tree_core=SimpleNamespace(
-            collect_full_device_indices=lambda node, ancestor: full_indices,
-            mark_external_cache_stored_path=MagicMock(),
-        ),
-        insert=MagicMock(
-            return_value=InsertResult(
-                prefix_len=4, total_len=4, last_device_node=0, adopted_ranges=adopted
-            )
-        ),
-        resolve_node_handle=lambda node_id: SimpleNamespace(id=0),
-        prefix_device_indices=lambda req: torch.empty(0, dtype=torch.int64),
+        insert=MagicMock(side_effect=AssertionError("the tail must stay private")),
     )
-    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+    backend = _FakeLinker()
+    backend.load = MagicMock(return_value=not load_refused)
+    if swa_stored:
+        backend.pools[PoolName.SWA] = object()
+    wrapper = UnifiedCacheLinkerWrapper(cache, backend)
     wrapper.hit_markers["rid"] = ExternalCacheHitMarker(
-        prefix_key=RadixKey(array("q", [1, 2, 3, 4])),
         tail_hashes=["a", "b"],
         device_hit_len=0,
     )
-    wrapper._queue_load = MagicMock()
     kv = (
-        None
+        ReqKvInfo()
         if previous_boundary is None
         else ReqKvInfo(
             kv_allocated_len=previous_boundary,
-            component_evicted_seqlens={ComponentType.SWA: previous_boundary},
+            window_evicted_seqlens={"swa": previous_boundary},
         )
     )
     req = SimpleNamespace(
@@ -1319,24 +2255,162 @@ def test_linker_load_preserves_swa_boundaries(
         prefix_len=0,
         last_node=0,
         priority=0,
+        swa_branching_seqlen=2,  # inside the loaded tail
     )
     restored_len, last_node = wrapper.load_back(req)
 
-    assert restored_len == len(full_indices)
     assert last_node == 0
-    assert req.kv.get_evicted_seqlen(ComponentType.SWA) == expected_boundary
-    assert req.kv.kv_allocated_len == (previous_boundary or 4)
-    assert (
-        cache.insert.call_args.args[0].get_evicted_seqlen(ComponentType.SWA)
-        == expected_boundary
-    )
-    cache.tree_core.mark_external_cache_stored_path.assert_called_once_with(0, 0)
+    if load_refused:
+        # Refused before PREPARE: allocations undone, request untouched, recompute.
+        assert restored_len == 0 and req.kv is kv
+        assert wrapper.inflight_load_rids == []
+        assert wrapper.private_load_indices == {}
+        phases = [c.args[0] for c in swa.update_external_linker_load.call_args_list]
+        assert phases == ([ExternalLinkerLoadPhase.ABORT] if participates else [])
+        return
+    assert restored_len == 4
+    restored = wrapper.private_load_indices["rid"]
+    assert restored.tolist() == list(range(4))
+    assert wrapper.inflight_load_rids == ["rid"]
+    assert torch.equal(wrapper.private_load_indices["rid"], restored)
+    assert req.swa_branching_seqlen is None
+    assert req.kv.get_evicted_seqlen("swa") == expected_boundary
+    assert req.kv.kv_allocated_len == (previous_boundary or 0)
     assert [c.args[0] for c in full.build_external_linker_transfer.call_args_list] == [
         LinkerTransferPhase.LOAD
     ]
     if not participates:
         swa.build_external_linker_transfer.assert_not_called()
         swa.update_external_linker_load.assert_not_called()
+
+
+class TestTransferReadyEvents(CustomTestCase):
+    def _record(self, forward_stream):
+        device = MagicMock(name="device_module")
+        device.Event.side_effect = lambda: MagicMock(name="event")
+        linker = _FakeLinker()
+        linker.forward_stream = forward_stream
+        with patch(
+            "sglang.srt.mem_cache.unified_cache.unified_cache_linker.device_module",
+            device,
+        ):
+            return linker.record_transfer_ready()
+
+    def test_transfer_waits_on_the_forward_using_the_pages(self):
+        forward_stream = MagicMock(name="forward_stream")
+        indices_ready, forward_done = self._record(forward_stream).events
+        indices_ready.record.assert_called_once_with()
+        forward_done.record.assert_called_once_with(forward_stream)
+        # The transfer thread waits; the forward stream's own order is untouched.
+        self.assertEqual(forward_stream.mock_calls, [])
+
+    def test_transfer_without_a_forward_stream_waits_on_the_current_one(self):
+        (indices_ready,) = self._record(None).events
+        indices_ready.record.assert_called_once_with()
+
+    def test_mooncake_offload_thread_waits_on_every_event(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.storage = order.storage
+        order.storage.batch_set_v2.return_value = {}
+        linker.stats = {"offload": 1}
+        linker.offload_results = queue.Queue()
+        linker.offload_queue = queue.Queue()
+        linker.offload_queue.put(
+            (
+                ["transfer"],
+                1,
+                TransferReady([order.indices_ready, order.forward_done]),
+                "session-a",
+            )
+        )
+        linker.offload_queue.put(None)
+        linker.offload_thread_func()
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.indices_ready.synchronize(),
+                call.forward_done.synchronize(),
+                call.storage.batch_set_v2(
+                    ["transfer"],
+                    HiCacheStorageExtraInfo(extra_info={"session_id": "session-a"}),
+                ),
+            ],
+        )
+        self.assertTrue(linker.offload_results.get_nowait())
+
+    def test_mooncake_load_thread_waits_on_every_event(self):
+        for prefetch in (False, True):
+            with self.subTest(prefetch=prefetch):
+                linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+                order = MagicMock()
+                linker.record_transfer_ready = order.record_transfer_ready
+                order.record_transfer_ready.return_value = TransferReady(
+                    [order.indices_ready, order.forward_done]
+                )
+                linker.load_layer_wise = order.load_layer_wise
+                linker.load_all_layers = order.load_all_layers
+                order.load_all_layers.return_value = True
+                linker.layer_done_counter = MagicMock()
+                linker.layer_done_counter.update_producer.return_value = 3
+                linker.mla_broadcaster = None
+                linker.gc_frozen = True
+                linker.pending_loads = {"rid": ["transfer"]}
+                linker.stats = {"load": 0}
+                linker.load_queue = queue.Queue()
+                if prefetch:
+                    linker.load_mode = "prefetch"
+                    linker.load_thread = MagicMock()
+                    linker.pool_group = SimpleNamespace(
+                        resolve_transfers=lambda *args, **kwargs: ["transfer"]
+                    )
+                    completion = linker.prefetch(["transfer"])
+                else:
+                    self.assertEqual(linker.start_layer_wise_loading(), 3)
+                linker.load_queue.put(None)
+                linker.load_thread_func()
+                self.assertEqual(
+                    order.mock_calls,
+                    [
+                        call.record_transfer_ready(),
+                        call.indices_ready.synchronize(),
+                        call.forward_done.synchronize(),
+                        (
+                            call.load_all_layers(["transfer"])
+                            if prefetch
+                            else call.load_layer_wise(3, [["transfer"]])
+                        ),
+                    ],
+                )
+                if prefetch:
+                    self.assertTrue(completion.result())
+                linker.layer_done_counter.fail.assert_not_called()
+
+    def test_mla_broadcast_waits_on_every_event_before_the_first_layer(self):
+        linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+        order = MagicMock()
+        linker.mla_broadcaster = order.broadcaster
+        linker.num_layers = 2
+        ready = TransferReady([order.indices_ready, order.forward_done])
+        linker.broadcast_loads = {3: (0, "prepared", ready)}
+        device = MagicMock(name="device_module")
+        device.current_stream.return_value = order.stream
+        with patch(
+            "sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker.device_module",
+            device,
+        ):
+            linker._broadcast_loaded_layers(3, 0)
+            linker._broadcast_loaded_layers(3, 1)
+        self.assertEqual(
+            order.mock_calls,
+            [
+                call.stream.wait_event(order.indices_ready),
+                call.stream.wait_event(order.forward_done),
+                call.broadcaster.broadcast_loaded_layer(0, "prepared"),
+                call.broadcaster.broadcast_loaded_layer(1, "prepared"),
+            ],
+        )
+        self.assertEqual(linker.broadcast_loads, {})
 
 
 if __name__ == "__main__":

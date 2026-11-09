@@ -1,4 +1,5 @@
 import logging
+from typing import Dict
 
 import torch
 
@@ -7,9 +8,11 @@ from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.utils import get_num_new_pages
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.common import get_num_new_pages
+from sglang.srt.utils.device import async_h2d
 from sglang.srt.utils.invariants import Bucket, Invariant, IsTrue, expect
 
 logger = logging.getLogger(__name__)
@@ -37,6 +40,10 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     # Per-request SWA ring (BaseSWAKVPool.swa_req_ring_size). Class default so
     # subclasses that bypass this __init__ read False.
     _swa_req_ring = False
+
+    @property
+    def has_window_pool(self) -> bool:
+        return True
 
     def __init__(
         self,
@@ -170,6 +177,11 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             self, tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
 
+    def window_pool_names(self):
+        from sglang.srt.mem_cache.base_swa_memory_pool import BaseSWAKVPool
+
+        return (BaseSWAKVPool.WINDOW_SUB_POOL,)
+
     def reclaim_for_prealloc(
         self, tree_cache, full_tokens: int, swa_tokens: int
     ) -> str | None:
@@ -184,8 +196,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
 
         available = self.swa_available_size()
         if available < swa_tokens:
+            (window,) = self.window_pool_names()
             tree_cache.evict_for_alloc(
-                EvictParams(swa_num_tokens=swa_tokens - available)
+                EvictParams(window_num_tokens={window: swa_tokens - available})
             )
             available = self.swa_available_size()
         if available < swa_tokens:
@@ -208,8 +221,12 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         full_shortfall = max(0, num_tokens - self.full_available_size())
         swa_shortfall = max(0, num_tokens - self.swa_available_size())
         if full_shortfall or swa_shortfall:
+            (window,) = self.window_pool_names()
             tree_cache.evict_for_alloc(
-                EvictParams(num_tokens=full_shortfall, swa_num_tokens=swa_shortfall)
+                EvictParams(
+                    num_tokens=full_shortfall,
+                    window_num_tokens={window: swa_shortfall} if swa_shortfall else {},
+                )
             )
 
     def full_available_size(self):
@@ -222,8 +239,8 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self.swa_attn_allocator.available_size()
 
     # Slot-conservation views for the leak invariant. On the non-shared allocator
-    # the static budget IS physical (conserve == physical); the shared composite
-    # overrides these with the static-cap view.
+    # the static budget IS physical (conserve == physical); the unified chain
+    # allocator keeps a static-cap view instead.
     def _conserve_full_available_size(self):
         return self.full_available_size()
 
@@ -256,6 +273,16 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
     def translate_loc_from_full_to_swa(self, kv_indices: torch.Tensor):
         assert self._kvcache.full_to_swa_index_mapping is not None
         return self._kvcache.translate_loc_from_full_to_swa(kv_indices)
+
+    def id_spaces(self) -> Dict[str, IdSpace]:
+        """Full ids index the full sub-pool as they are; the window maps them."""
+        return {
+            IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, id(self))),
+            IdSpaceKind.SLIDING_WINDOW: IdSpace(
+                key=(IdSpaceKind.SLIDING_WINDOW, id(self)),
+                write=self.translate_loc_from_full_to_swa,
+            ),
+        }
 
     def translate_swa_indices_for_transfer(
         self, kv_indices: torch.Tensor
@@ -398,9 +425,9 @@ class SWATokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         device = self.device
         swa_prefix_lens = torch.zeros((1,), dtype=torch.int64, device=device)
         swa_prefix_lens_cpu = torch.zeros((1,), dtype=torch.int64)
-        swa_seq_lens = torch.tensor([swa_tail_len], dtype=torch.int64, device=device)
+        swa_seq_lens = async_h2d([swa_tail_len], dtype=torch.int64, device=device)
         swa_seq_lens_cpu = torch.tensor([swa_tail_len], dtype=torch.int64)
-        swa_last_loc = torch.tensor([-1], dtype=torch.int64, device=device)
+        swa_last_loc = async_h2d([-1], dtype=torch.int64, device=device)
 
         alloc_swa_indices = self.swa_attn_allocator.alloc_extend(
             swa_prefix_lens,

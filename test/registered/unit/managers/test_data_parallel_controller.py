@@ -3,12 +3,13 @@
 The e2e counterpart, over the real scheduler load-report path, is
 test/registered/disaggregation/test_disaggregation_dp_attention.py.
 
-Fragility: scheduler tests bypass `DataParallelController.__init__` via
-`__new__` and inject only the attrs the schedulers read (`workers`, `status`,
-`_active_workers`, `round_robin_counter`, `dp_budget`). Update `_make_controller`
-if a scheduler starts reading another attr. `maybe_external_dp_rank_routing`
-is exercised as the real method, no mock. The refresh-throttle tests inject
-`load_snapshot_reader` and `_last_refresh_time` on top of those.
+Fragility: scheduler tests bypass `DataParallelController.__init__` via `__new__` and
+inject only the attrs the schedulers read (`workers`, `_active_workers`,
+`round_robin_counter`, `dp_budget`). `status` / `dp_active` / `max_dp_size` are for
+`update_active_ranks`. Update `_make_controller` if a scheduler starts reading another
+attr. `maybe_external_dp_rank_routing` is exercised as the real method, no mock. The
+refresh-throttle tests inject `load_snapshot_reader` and `_last_refresh_time` on top of
+those.
 """
 
 import threading
@@ -25,15 +26,31 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers import io_struct
 from sglang.srt.managers.data_parallel_controller import (
     DataParallelController,
     DPBudget,
     LoadBalanceMethod,
+    WorkerPortHandshake,
 )
+from sglang.srt.managers.io_struct import ActiveRanksOutput
 from sglang.srt.managers.load_snapshot import LoadSnapshot
 from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+
+
+# Dispatch is asserted through worker.send_pyobj on SimpleNamespace reqs, which
+# only the pickle codec sends.
+_pickle_ipc = patch.object(io_struct, "_USE_PICKLE_IPC", True)
+
+
+def setUpModule():
+    _pickle_ipc.start()
+
+
+def tearDownModule():
+    _pickle_ipc.stop()
 
 
 _BASE_LOAD = msgspec.structs.replace(
@@ -47,12 +64,20 @@ def _load(**overrides) -> LoadSnapshot:
     return msgspec.structs.replace(_BASE_LOAD, **overrides)
 
 
-def _make_controller(num_dp_ranks: int) -> DataParallelController:
+def _make_controller(
+    num_dp_ranks: int, max_dp_size: int | None = None
+) -> DataParallelController:
     """Bypass __init__; inject only the attrs dispatch methods read."""
+    if max_dp_size is None:
+        max_dp_size = num_dp_ranks
     ctl = DataParallelController.__new__(DataParallelController)
-    ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(num_dp_ranks)]
-    ctl.status = [True] * num_dp_ranks
+    ctl.workers = [MagicMock(name=f"worker_{i}") for i in range(max_dp_size)]
+    ctl.max_dp_size = max_dp_size
+    ctl.launch_dp_size = num_dp_ranks
+    ctl.dp_active = [True] * num_dp_ranks + [False] * (max_dp_size - num_dp_ranks)
+    ctl.status = list(ctl.dp_active)
     ctl._active_workers = list(range(num_dp_ranks))
+    ctl._active_count_cache = num_dp_ranks
     ctl.load_balance_method = LoadBalanceMethod.ROUND_ROBIN
     ctl.round_robin_counter = 0
     ctl.health_round_robin_counter = 0
@@ -66,15 +91,89 @@ def _req(
     input_ids=None,
     rid="USER",
     time_stats=None,
+    input_embeds=None,
 ):
-    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema."""
+    """Req stand-in; SimpleNamespace avoids pinning to the Req dataclass schema.
+
+    As with a real input_embeds request, passing input_embeds leaves input_ids None.
+    """
     return SimpleNamespace(
         time_stats=time_stats,
         rid=rid,
         routed_dp_rank=routed_dp_rank,
         bootstrap_room=bootstrap_room,
-        input_ids=input_ids or [],
+        input_ids=None if input_embeds is not None else (input_ids or []),
+        input_embeds=input_embeds,
     )
+
+
+class TestJoinerWorkerPortAdmission(CustomTestCase):
+    def _launch_joiner(self, parallel, handshake, launch):
+        controller = DataParallelController.__new__(DataParallelController)
+        controller._receive_ports_as_client = MagicMock(return_value=handshake)
+        controller.launch_tensor_parallel_group = launch
+        execution = SimpleNamespace(moe=SimpleNamespace(is_ep_scale_joiner=True))
+
+        with (
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_parallel",
+                return_value=parallel,
+            ),
+            patch(
+                "sglang.srt.managers.data_parallel_controller.get_exec",
+                return_value=execution,
+            ),
+        ):
+            controller.launch_dp_attention_schedulers(
+                SimpleNamespace(), SimpleNamespace()
+            )
+
+    def test_topology_mismatch_is_rejected_before_scheduler_launch(self):
+        mismatches = [
+            # A wider joiner would map physical offset 4 onto active primary slot 2.
+            ((1, 1), (2, 1), 1),
+            # A narrower joiner would select beyond the primary's reserved slots.
+            ((2, 1), (1, 1), 2),
+        ]
+        for primary, joining, num_dp_ranks in mismatches:
+            with self.subTest(primary=primary, joining=joining):
+                parallel = SimpleNamespace(
+                    dist_init_addr="127.0.0.1:20000",
+                    ep_join_rank_offset=4,
+                    num_dp_ranks=num_dp_ranks,
+                    attn_tp_size=joining[0],
+                    attn_cp_size=joining[1],
+                )
+                handshake = WorkerPortHandshake(
+                    worker_ports=[1000, 1001, 1002, 1003],
+                    attn_tp_size=primary[0],
+                    attn_cp_size=primary[1],
+                )
+                launch = MagicMock()
+
+                with self.assertRaisesRegex(ValueError, "same attention topology"):
+                    self._launch_joiner(parallel, handshake, launch)
+
+                launch.assert_not_called()
+
+    def test_matching_topology_selects_reserved_logical_dp_slot(self):
+        parallel = SimpleNamespace(
+            dist_init_addr="127.0.0.1:20000",
+            ep_join_rank_offset=4,
+            num_dp_ranks=1,
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        handshake = WorkerPortHandshake(
+            worker_ports=[1000, 1001, 1002, 1003],
+            attn_tp_size=2,
+            attn_cp_size=1,
+        )
+        launch = MagicMock()
+
+        self._launch_joiner(parallel, handshake, launch)
+
+        self.assertEqual(launch.call_args.args[-1], [1002])
 
 
 class TestLocalKvEventSources(CustomTestCase):
@@ -99,6 +198,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
         scheduler.page_size = 64
+        scheduler.enable_hierarchical_cache = False
         scheduler.kv_events_publisher = component
         publisher = MagicMock()
         publisher.describe_local_source.return_value = self._source(4, 256)
@@ -121,9 +221,12 @@ class TestLocalKvEventSources(CustomTestCase):
 
         controller = DataParallelController.__new__(DataParallelController)
         controller.env_lock = threading.Lock()
+        controller._scheduler_init_info_lock = threading.Lock()
+        controller._scheduler_init_infos = []
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
         controller.run_scheduler_process_func = MagicMock()
+        controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
         # TP8/DP4 over two nodes: this follower's four schedulers own ranks 2,3.
         readers = [
@@ -224,54 +327,6 @@ class TestDPBudgetUpdateBudget(CustomTestCase):
         self.assertEqual(budget.total_tokens, [100, 50, 300])
 
 
-class TestDPBudgetDispatch(CustomTestCase):
-    """DPBudget.dispatch picks a rank from current state and updates counters."""
-
-    def test_total_requests_dispatch_picks_min_and_increments(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_REQUESTS)
-        self.assertEqual(rank, 1)
-        self.assertEqual(
-            budget.total_requests[1],
-            3,
-            "dispatch should increment chosen worker's request count",
-        )
-
-    def test_total_tokens_dispatch_applies_estimated_tokens(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [100, 50, 200]
-        budget.total_requests = [0, 0, 0]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=30)
-        self.assertEqual(rank, 1, "should pick worker with min total_tokens")
-        self.assertEqual(
-            budget.total_tokens[1],
-            80,
-            "dispatch should add estimated_tokens to chosen worker",
-        )
-        self.assertEqual(
-            budget.total_requests[1],
-            1,
-            "dispatch should also increment request count",
-        )
-
-    def test_total_tokens_tie_breaks_on_total_requests(self):
-        budget = DPBudget(num_dp_ranks=3)
-        budget.total_tokens = [50, 50, 50]
-        budget.total_requests = [4, 2, 7]
-        rank = budget.dispatch(LoadBalanceMethod.TOTAL_TOKENS, estimated_tokens=10)
-        self.assertEqual(
-            rank, 1, "tie on total_tokens should fall back to min total_requests"
-        )
-
-    def test_dispatch_returns_none_for_methods_not_handled(self):
-        """Round-robin and follow_bootstrap_room dispatch elsewhere; DPBudget
-        only handles the load-aware variants."""
-        budget = DPBudget(num_dp_ranks=3)
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.ROUND_ROBIN))
-        self.assertIsNone(budget.dispatch(LoadBalanceMethod.FOLLOW_BOOTSTRAP_ROOM))
-
-
 class TestRoundRobinScheduler(CustomTestCase):
     def test_cycles_through_active_workers_in_order(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -290,8 +345,7 @@ class TestRoundRobinScheduler(CustomTestCase):
 
     def test_skips_inactive_workers(self):
         ctl = _make_controller(num_dp_ranks=4)
-        ctl.status[1] = False
-        ctl.status[3] = False
+        ctl._active_workers = [0, 2]
         for _ in range(6):
             ctl.round_robin_scheduler(_req())
         # Only workers 0 and 2 are active — should split 6 reqs evenly
@@ -299,6 +353,12 @@ class TestRoundRobinScheduler(CustomTestCase):
         ctl.workers[1].send_pyobj.assert_not_called()
         self.assertEqual(ctl.workers[2].send_pyobj.call_count, 3)
         ctl.workers[3].send_pyobj.assert_not_called()
+
+    def test_raises_when_no_active_workers(self):
+        ctl = _make_controller(num_dp_ranks=4)
+        ctl._active_workers = []
+        with self.assertRaisesRegex(RuntimeError, "No active DP workers"):
+            ctl.round_robin_scheduler(_req())
 
     def test_routed_dp_rank_bypasses_counter(self):
         """External dp-rank routing must not advance the counter."""
@@ -450,12 +510,23 @@ class TestTotalRequestsScheduler(CustomTestCase):
         )
 
 
+class TestTotalTokensScheduler(CustomTestCase):
+    def test_input_embeds_request_is_counted_by_embedding_rows(self):
+        # input_embeds requests carry input_ids=None.
+        ctl = _make_controller(num_dp_ranks=2)
+        ctl.dp_budget.total_tokens = [10, 0]
+        ctl.total_tokens_scheduler(_req(input_embeds=[[0.0] * 4] * 3))
+        ctl.workers[1].send_pyobj.assert_called_once()
+        ctl.workers[0].send_pyobj.assert_not_called()
+        self.assertEqual(ctl.dp_budget.total_tokens, [10, 3])
+
+
 class TestStatusAwarenessInconsistency(CustomTestCase):
-    """Document a divergence: ``round_robin_scheduler`` skips workers whose
-    ``status`` is False, but ``total_requests_scheduler`` /
-    ``total_tokens_scheduler`` route purely by DPBudget — they do NOT
-    consult ``self.status``. If a future change unifies this behaviour,
-    this test will fail and force a reviewer to confirm intent."""
+    """Document a divergence: ``round_robin_scheduler`` routes only through
+    ``_active_workers``, but ``total_requests_scheduler`` / ``total_tokens_scheduler``
+    route purely by DPBudget — they do NOT consult ``self.status`` or
+    ``_active_workers``. If a future change unifies this behaviour, this test will fail
+    and force a reviewer to confirm intent."""
 
     def test_total_requests_ignores_status(self):
         ctl = _make_controller(num_dp_ranks=4)
@@ -465,6 +536,36 @@ class TestStatusAwarenessInconsistency(CustomTestCase):
         ctl.total_requests_scheduler(_req())
         # Current behaviour: still dispatches to the inactive worker.
         ctl.workers[2].send_pyobj.assert_called_once()
+
+
+class TestUpdateActiveRanks(CustomTestCase):
+    def test_refreshes_active_workers_and_masks_unprovisioned_slots(self):
+        """Verify that status updates refresh the worker cache and preserve masking of
+        unprovisioned slots."""
+        ctl = _make_controller(num_dp_ranks=2, max_dp_size=4)
+        # Rank 1 dies; trailing True values would leak onto slots 2 and 3
+        # if we copied ranks.status without intersecting dp_active.
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, False, True, True]))
+        self.assertEqual(ctl.status, [True, False, False, False])
+        self.assertEqual(ctl._active_workers, [0])
+        self.assertEqual(ctl._active_count_cache, 1)
+
+        ctl.round_robin_scheduler(_req())
+        ctl.round_robin_scheduler(_req())
+        self.assertEqual(ctl.workers[0].send_pyobj.call_count, 2)
+        for i in (1, 2, 3):
+            ctl.workers[i].send_pyobj.assert_not_called()
+
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, True, False, False]))
+        self.assertEqual(ctl._active_workers, [0, 1])
+
+    def test_length_mismatch_is_ignored(self):
+        ctl = _make_controller(num_dp_ranks=2, max_dp_size=4)
+        before_status = list(ctl.status)
+        before_active = list(ctl._active_workers)
+        ctl.update_active_ranks(ActiveRanksOutput(status=[True, False]))
+        self.assertEqual(ctl.status, before_status)
+        self.assertEqual(ctl._active_workers, before_active)
 
 
 class TestRefreshLoadBudgetThrottle(CustomTestCase):

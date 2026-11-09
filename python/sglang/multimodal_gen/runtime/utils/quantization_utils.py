@@ -657,6 +657,48 @@ def handle_fp8_metadata_format(quant_config_dict):
     return quant_config_dict
 
 
+def _get_serialized_quant_config(
+    file_path: str, quant_config_dict: dict
+) -> Optional[QuantizationConfig]:
+    from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (
+        FP8_FORMAT,
+        build_rowwise_fp8_config_from_metadata,
+    )
+
+    declared_formats = set()
+    layers = quant_config_dict.get("layers", {})
+    if isinstance(layers, dict):
+        for layer_config in layers.values():
+            layer_format = (
+                layer_config.get("format")
+                if isinstance(layer_config, dict)
+                else layer_config
+            )
+            if isinstance(layer_format, str):
+                declared_formats.add(layer_format)
+    quant_configs = quant_config_dict.get("quant_configs", {})
+    if isinstance(quant_configs, dict):
+        declared_formats.update(quant_configs)
+
+    # NVFP4 layer formats stay with the Comfy loaders, which own that layout.
+    format_builders = {
+        FP8_FORMAT: lambda: build_rowwise_fp8_config_from_metadata(
+            quant_config_dict, _read_safetensors_tensor_metadata(file_path)
+        ),
+    }
+    supported_formats = declared_formats.intersection(format_builders)
+    if not supported_formats:
+        return None
+    if len(supported_formats) > 1:
+        raise ValueError(
+            "Serialized quantization metadata declares multiple supported quant "
+            f"formats: {sorted(supported_formats)}. Only one is supported."
+        )
+
+    quant_format = supported_formats.pop()
+    return format_builders[quant_format]()
+
+
 def get_quant_config_from_safetensors_metadata(
     file_path: str,
 ) -> Optional[QuantizationConfig]:
@@ -686,6 +728,11 @@ def get_quant_config_from_safetensors_metadata(
 
     if not quant_config_dict:
         return None
+
+    quant_config = _get_serialized_quant_config(file_path, quant_config_dict)
+    if quant_config is not None:
+        logger.debug(f"Get quantization config from safetensors file: {file_path}")
+        return quant_config
 
     # handle diffusers fp8 safetensors metadata format
     if (

@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """MiniMax-H3 released VAE decode contract."""
 
-import os
 import subprocess
 import sys
 import textwrap
@@ -44,10 +43,15 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.vit_utils im
     create_token_ids,
     prepare_rotary_pos_emb,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 
+# torch.cuda.is_available() is also true on ROCm, where these JIT/Triton
+# kernels do not compile; gate on the platform instead.
 requires_cuda = pytest.mark.skipif(
-    not torch.cuda.is_available(), reason="fused qk-norm+RoPE kernel needs CUDA"
+    not current_platform.is_cuda(), reason="fused VAE kernels need CUDA"
 )
 
 
@@ -306,43 +310,56 @@ def _h3_shaped_decoder():
     return decoder
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-def test_fused_decoder_matches_unfused_forward():
-    from sglang.multimodal_gen.runtime.managers.forward_context import (
-        set_forward_context,
-    )
-
+@requires_cuda
+def test_fused_decoder_runs_only_under_the_fast_path_gate():
+    """The fused residual add + RMSNorm is not bit-exact, so it runs only while
+    the decode-scoped gate is on (quality lossless/high); exact keeps the
+    unfused blocks."""
     decoder = _h3_shaped_decoder()
     latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
-    previous = os.environ.get("MINIMAX_H3_VAE_DECODER_FUSED_NORM")
     from sglang.kernels.ops import diffusion as diffusion_ops
 
-    try:
-        with (
-            torch.no_grad(),
-            torch.autocast("cuda", dtype=torch.float16),
-            set_forward_context(current_timestep=0, attn_metadata=None),
-            mock.patch.object(
-                diffusion_ops,
-                "h3_vae_scale_add_rmsnorm",
-                wraps=diffusion_ops.h3_vae_scale_add_rmsnorm,
-            ) as scale_add,
-            mock.patch.object(
-                diffusion_ops,
-                "h3_vae_qk_rmsnorm_rope",
-                wraps=diffusion_ops.h3_vae_qk_rmsnorm_rope,
-            ) as qk_rope,
-        ):
-            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "0"
-            eager = decoder(latent)
-            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = "1"
-            fused = decoder(latent)
-            assert scale_add.call_count == 3
-            assert qk_rope.call_count == 2
-    finally:
-        if previous is None:
-            os.environ.pop("MINIMAX_H3_VAE_DECODER_FUSED_NORM", None)
-        else:
-            os.environ["MINIMAX_H3_VAE_DECODER_FUSED_NORM"] = previous
+    gate = VaeFastPathGate()
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.float16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        mock.patch.object(
+            diffusion_ops,
+            "h3_vae_scale_add_rmsnorm",
+            wraps=diffusion_ops.h3_vae_scale_add_rmsnorm,
+        ) as scale_add,
+    ):
+        ungated = decoder(latent)
+        decoder._sgl_gate = gate
+        eager = decoder(latent)
+        assert scale_add.call_count == 0
+        gate.enabled = True
+        fused = decoder(latent)
+        assert scale_add.call_count == 3
 
+    assert torch.equal(eager, ungated)
     torch.testing.assert_close(fused, eager, rtol=1e-3, atol=1e-3)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a GPU")
+def test_fused_decoder_is_disabled_off_nvidia():
+    # On ROCm tensor.is_cuda is true, but the fused Triton norms decoded to NaN
+    # on MI300; the decoder must keep the unfused path there.
+    decoder = _h3_shaped_decoder()
+    latent = torch.randn(2, 4, 1, 2, 2, device="cuda", dtype=torch.float16)
+    from sglang.kernels.ops import diffusion as diffusion_ops
+
+    gate = VaeFastPathGate()
+    gate.enabled = True
+    decoder._sgl_gate = gate
+    vae_dir = "sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae"
+    with (
+        torch.no_grad(),
+        torch.autocast("cuda", dtype=torch.float16),
+        set_forward_context(current_timestep=0, attn_metadata=None),
+        mock.patch(f"{vae_dir}.vae_vit.current_platform.is_cuda", return_value=False),
+        mock.patch.object(diffusion_ops, "h3_vae_scale_add_rmsnorm") as scale_add,
+    ):
+        decoder(latent)
+    scale_add.assert_not_called()
