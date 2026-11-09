@@ -24,13 +24,22 @@ from sglang.srt.disaggregation.prefill import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+)
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, HybridReqToTokenPool
+from sglang.srt.mem_cache.memory_pool import (
+    HybridLinearKVPool,
+    HybridReqToTokenPool,
+    ReqToTokenPool,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
@@ -469,19 +478,19 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
 
         scheduler = SimpleNamespace(
             tree_cache=tree,
-            waiting_queue=[],
+            waiting_queue=IndexedReqList(ListKind.WAITING),
             disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
             metrics_reporter=SimpleNamespace(enable_metrics=False),
             processed_tokens_counter=0,
-            _release_aborted_request=lambda req: None,
             clear_pending_chunk_send=lambda req: None,
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
         )
         with patch(
             "sglang.srt.disaggregation.prefill.get_disagg",
             return_value=SimpleNamespace(optimistic_prefill_attempts=3),
         ):
             SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
-                scheduler, req
+                scheduler, req, scheduler.prefill_launched_reqs
             )
 
         self.assertEqual(tree.total_size(), (self.TRACK_SEQLEN, 1))
@@ -500,6 +509,93 @@ class TestOptimisticPrefillMambaRetryRelease(CustomTestCase):
         self.assertEqual(
             req_to_token_pool.mamba_allocator.available_size(), self.MAMBA_SIZE - 1
         )
+
+
+class TestOptimisticPrefillWriteThroughRetryPublish(CustomTestCase):
+    """With a write-through cache, an optimistic-prefill retry publishes the KV
+    the request computed, so write-through backs it up to L3 and the retry can
+    fetch it back, instead of dropping it with the request-owned row."""
+
+    SIZE = 128
+    PROMPT = [1, 2, 3, 4, 5, 6, 7, 8]
+
+    def test_retry_publishes_request_owned_kv(self):
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
+        allocator = TokenToKVPoolAllocator(
+            size=self.SIZE,
+            dtype=torch.float32,
+            device="cpu",
+            kvcache=None,
+            need_sort=False,
+        )
+        req_to_token_pool = ReqToTokenPool(
+            size=4, max_context_len=64, device="cpu", enable_memory_saver=False
+        )
+        tree = UnifiedRadixCache(
+            params=CacheInitParams(
+                disable=False,
+                req_to_token_pool=req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=1,
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
+            )
+        )
+
+        # A request that finished optimistic prefill of PROMPT before decode
+        # bootstrapped: its KV is request-owned, none of it in the tree.
+        req = Req(
+            rid="optimistic-write-through-retry",
+            origin_input_text="",
+            origin_input_ids=array("q", self.PROMPT),
+            sampling_params=SamplingParams(max_new_tokens=1),
+        )
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
+        kv_indices = allocator.alloc(len(self.PROMPT))
+        req_to_token_pool.write(
+            (req.kv.req_pool_idx, slice(0, len(self.PROMPT))), kv_indices
+        )
+        req.full_untruncated_fill_ids = array("q", self.PROMPT)
+        req.extend_end = len(self.PROMPT)
+        req.prefix_len = len(self.PROMPT)
+        req.kv.kv_committed_len = len(self.PROMPT)
+        req.kv.kv_allocated_len = len(self.PROMPT)
+        req.last_node = tree.root_node_handle()
+        req.pending_bootstrap = True
+
+        scheduler = SimpleNamespace(
+            tree_cache=tree,
+            waiting_queue=IndexedReqList(ListKind.WAITING),
+            disagg_prefill_bootstrap_queue=SimpleNamespace(queue=[]),
+            metrics_reporter=SimpleNamespace(enable_metrics=False),
+            processed_tokens_counter=0,
+            clear_pending_chunk_send=lambda req: None,
+            prefill_launched_reqs=KeyedReqList(ListKind.PREFILL_LAUNCHED),
+        )
+        with (
+            patch(
+                "sglang.srt.disaggregation.prefill.get_disagg",
+                return_value=SimpleNamespace(optimistic_prefill_attempts=3),
+            ),
+            patch(
+                "sglang.srt.disaggregation.prefill._uses_write_through_cache",
+                return_value=True,
+            ),
+        ):
+            SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue(
+                scheduler, req, scheduler.prefill_launched_reqs
+            )
+
+        # The tree keeps the computed prefix (write-through backs it up on
+        # insert), and the retry looks it up instead of recomputing it.
+        match = tree.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", self.PROMPT)))
+        )
+        self.assertEqual(match.device_prefix_len, len(self.PROMPT))
+        self.assertEqual(allocator.available_size(), self.SIZE - len(self.PROMPT))
+        # A retry must compute at least its last token, so it can match one less.
+        self.assertEqual(req.storage_prefetch_last_match_len, len(self.PROMPT) - 1)
 
 
 if __name__ == "__main__":

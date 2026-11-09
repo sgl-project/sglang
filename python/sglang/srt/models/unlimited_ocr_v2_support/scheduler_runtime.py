@@ -3,9 +3,14 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Callable, List, Optional
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional
 
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    ReqList,
+)
 from sglang.srt.models.unlimited_ocr_v2_support.async_shm import (
     create_async_shm_materializer,
 )
@@ -74,6 +79,7 @@ class UocrSchedulerRuntime:
         decode_graph_io: Callable[[], Optional[UOCRDecodeGraphIO]],
         crop_transfer,
         enable_overlap: bool,
+        abort_windows: Callable[..., None],
     ):
         self._crop_transfer = crop_transfer
         self.overlap_release = DeferredOverlapRelease() if enable_overlap else None
@@ -82,6 +88,7 @@ class UocrSchedulerRuntime:
             device=device,
             forward_stream=forward_stream,
             tp_size=tp_size,
+            abort_windows=abort_windows,
         )
         backend = _v2_backend(attn_backend)
         self._reuse = DocReuse(
@@ -102,18 +109,17 @@ class UocrSchedulerRuntime:
         """Parked windows whose predecessor finished, to queue in this order."""
         return self._prefetch.take_released()
 
+    def request_lists(self) -> Dict[ListKind, ReqList]:
+        return self._prefetch.request_lists()
+
     def on_req_dropped(self, req: Req) -> None:
-        """Release reuse and prefetch state of a request aborted before running."""
+        """Release reuse and prefetch state of a dropped or aborted request."""
         self._reuse.on_req_dropped(req)
         self._prefetch.release_early(req.rid)
 
     def free_for_decode(self, batch: ScheduleBatch) -> None:
         """Evict retained windows before the decode batch would retract."""
         self._reuse.free_for_decode(batch)
-
-    def drop_parked(self, rid_prefix: str) -> List[Req]:
-        """Remove and return the held-off windows an abort names."""
-        return self._prefetch.drop(rid_prefix)
 
     def release_doc(self, doc_id: str) -> None:
         """Free a document's retained window once no follow-up will consume it."""
@@ -222,7 +228,7 @@ class UocrSchedulerRuntime:
         return len(self._reuse.held_slots())
 
     def enqueue(
-        self, waiting_queue: List[Req], req: Req, *, is_retracted: bool
+        self, waiting_queue: IndexedReqList, req: Req, *, is_retracted: bool
     ) -> bool:
         """queue a follow-up in reuse order, or keep it parked until its source finishes"""
         if is_retracted:
@@ -231,9 +237,9 @@ class UocrSchedulerRuntime:
             return False
         pos = self._reuse.queue_position(waiting_queue, req)
         if pos is None:
-            waiting_queue.append(req)
+            waiting_queue.join([req])
         else:
-            waiting_queue.insert(pos, req)
+            waiting_queue.replace([*waiting_queue[:pos], req, *waiting_queue[pos:]])
         return True
 
     def close(self) -> None:

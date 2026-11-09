@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import logging
 import os
+import re
 import socket
 from types import ModuleType
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
-from sglang.srt.arg_groups.overrides import resolving_view
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.disaggregation.kv_events import select_kv_publisher_dp_rank
+from sglang.srt.entrypoints.server_utils import (
+    build_model_info_fields,
+    build_server_info,
+)
 from sglang.srt.entrypoints.v1_loads import (
     _accelerator_name,
     _num_accelerators_per_dp_rank,
@@ -19,6 +25,12 @@ from sglang.srt.environ import envs
 from sglang.srt.managers.load_snapshot import ShmLoadSnapshotWriter
 from sglang.srt.managers.utils import compute_num_reserved_tokens
 from sglang.srt.observability.metrics_collector import tokenizer_metric_labels
+from sglang.srt.observability.request_logger import (
+    WHITELISTED_HEADERS,
+    RequestLogger,
+    _dataclass_to_string_truncated,
+    _transform_data_for_logging,
+)
 from sglang.srt.observability.utils import generate_buckets
 from sglang.srt.runtime_context import (
     get_device,
@@ -35,13 +47,13 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
-from sglang.srt.utils.common import build_model_info_fields, build_server_info
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.version import __version__
 
 if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.rust_extensions._server import ServerArgs
+    from sglang.srt.server_args import ServerArgs as PyServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +64,9 @@ def _build_server_args(
     extension: Optional[ModuleType] = None,
     health_generate_headers: Optional[Dict[str, str]] = None,
     default_max_new_tokens: Optional[int] = SamplingParams().max_new_tokens,
+    request_class: Optional[type] = None,
+    server_added_custom_params: Tuple[str, ...] = (),
+    port_offset: int = 0,
 ) -> ServerArgs:
     """The typed launch configuration for the scheduler's embedded Rust server:
     the ``server_args`` fields it reads, the already-resolved
@@ -109,6 +124,7 @@ def _build_server_args(
         ),
         # Every Rust listener of the deployment (`RustServer.gather_server_endpoints`).
         "rust_server_endpoints": scheduler.rust_server_endpoints,
+        "node_listeners": _node_listeners(grpc_port=grpc_port),
     }
     # `/v1/loads` reads this rank's slot of the scheduler's shared-memory
     # snapshots directly, from the file on this node even under multi-node DP;
@@ -133,6 +149,9 @@ def _build_server_args(
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
+        grpc_response_timeout_secs=get_serving().grpc_response_timeout_secs,
+        api_key=get_serving().api_key,
+        admin_api_key=get_serving().admin_api_key,
         log_level=get_observability().log_level,
         log_level_http=get_observability().log_level_http,
         chat_template=get_serving().chat_template,
@@ -142,10 +161,12 @@ def _build_server_args(
         tool_call_parser=get_serving().tool_call_parser,
         reasoning_parser=get_serving().reasoning_parser,
         stream_response_default_include_usage=get_serving().stream_response_default_include_usage,
+        enable_cache_report=get_serving().enable_cache_report,
         tokenizer_worker_num=get_serving().tokenizer_worker_num,
         detokenizer_worker_num=get_serving().detokenizer_worker_num,
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
+        gc_threshold=get_device().gc_threshold,
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
@@ -153,6 +174,7 @@ def _build_server_args(
             else None
         ),
         enable_request_header_overrides=envs.SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES.get(),
+        enable_request_decompression=envs.SGLANG_ENABLE_REQUEST_DECOMPRESSION.get(),
         incremental_streaming_output=get_serving().incremental_streaming_output,
         disaggregation_mode=disaggregation_mode,
         model_config=ext.ModelConfig(
@@ -213,7 +235,156 @@ def _build_server_args(
         metrics=(
             _build_metrics_config(ext) if get_observability().enable_metrics else None
         ),
+        request_log=(
+            ext.RequestLogConfig(
+                **request_log_settings(
+                    get_observability().log_requests_level,
+                    request_class,
+                    get_observability().log_requests_format,
+                ),
+                **_request_log_targets(
+                    get_observability().log_requests_target, port_offset
+                ),
+            )
+            if get_observability().log_requests
+            else None
+        ),
+        crash_dump=bool(get_observability().crash_dump_folder),
+        server_added_custom_params=list(server_added_custom_params),
     )
+
+
+def request_log_settings(
+    level: int, request_class: Optional[type], log_format: str = "text"
+) -> Dict[str, Any]:
+    """``RequestLogger``'s settings for ``--log-requests-level`` ``level`` and
+    ``--log-requests-format`` ``log_format``, for the Rust server to render the
+    lines Python logs: the level's metadata, ``request_class``'s fields in
+    declaration order with each default rendered as the format renders a
+    value, and from level 2 the OpenAI request models' fields."""
+    from sglang.srt.entrypoints.openai.protocol import (
+        ChatCompletionRequest,
+        CompletionRequest,
+    )
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    request_class = request_class or GenerateReqInput
+    logger = RequestLogger(
+        log_requests=True,
+        log_requests_level=level,
+        log_requests_format=log_format,
+        log_requests_target=None,
+    )
+    max_length, skip_names, out_skip_names = logger.metadata
+
+    def default(field: dataclasses.Field) -> Any:
+        if field.default is not dataclasses.MISSING:
+            return field.default
+        return field.default_factory()
+
+    def render(value: Any) -> str:
+        if log_format == "json":
+            return json.dumps(
+                _transform_data_for_logging(value, max_length), ensure_ascii=False
+            )
+        return _dataclass_to_string_truncated(value, max_length)
+
+    openai_requests = level >= 2
+    batch_item_fields, batch_shared_fields = _batch_item_fields(request_class)
+    return dict(
+        max_length=max_length,
+        skip_names=sorted(skip_names or ()),
+        out_skip_names=sorted(out_skip_names or ()),
+        json=log_format == "json",
+        class_name=request_class.__name__,
+        fields=[
+            (field.name, render(default(field)))
+            for field in dataclasses.fields(request_class)
+        ],
+        batch_item_fields=batch_item_fields,
+        batch_shared_fields=batch_shared_fields,
+        headers=list(WHITELISTED_HEADERS),
+        exceeded_ms=logger.log_exceeded_ms,
+        openai_requests=openai_requests,
+        chat_completion_fields=(
+            _openai_model_fields(ChatCompletionRequest) if openai_requests else []
+        ),
+        completion_fields=(
+            _openai_model_fields(CompletionRequest) if openai_requests else []
+        ),
+    )
+
+
+def _openai_model_fields(model: type) -> List[Tuple[str, Optional[str]]]:
+    """What ``model.model_dump(exclude_none=True)`` lists of a request: each
+    dumped field in declaration order, with its default as JSON (``None``
+    when it is required or ``None``)."""
+    from pydantic_core import to_jsonable_python
+
+    fields = []
+    for name, field in model.model_fields.items():
+        if field.exclude:
+            continue
+        default = (
+            None
+            if field.is_required()
+            else field.get_default(call_default_factory=True)
+        )
+        fields.append(
+            (name, None if default is None else json.dumps(to_jsonable_python(default)))
+        )
+    return fields
+
+
+def _request_log_targets(targets: Optional[List[str]], rank: int) -> Dict[str, Any]:
+    """``create_log_targets``' targets for the listener at node-local DP
+    offset ``rank``: stdout, and in each target directory (created here) the
+    file ``{hostname}_{rank}.log``, which the Rust server rotates hourly. A
+    directory listed twice gets one file: two rotators of one file would
+    rename it under each other."""
+    if not targets:
+        return dict(stdout=True, files=[])
+    files = {}
+    for directory in targets:
+        if directory.lower() == "stdout":
+            continue
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, f"{socket.gethostname()}_{rank}.log")
+        files.setdefault(os.path.realpath(path), path)
+    return dict(
+        stdout=any(target.lower() == "stdout" for target in targets),
+        files=list(files.values()),
+    )
+
+
+def _batch_item_fields(request_class: type) -> Tuple[List[str], List[str]]:
+    """The fields a batch item's object (``obj[i]``) takes from a normalized
+    batch: its own entry of a per-item field, or a shared field's value; the
+    rest keep their defaults. Read off ``request_class.__getitem__`` itself by
+    giving each field a marker per item."""
+    item_fields, shared_fields = [], []
+    for field in dataclasses.fields(request_class):
+        if not field.init:
+            continue
+        batch = request_class(text=["", ""])
+        try:
+            batch.normalize_batch_and_arguments()
+        except Exception as e:
+            raise RuntimeError(
+                f"cannot read which fields a batch item of {request_class.__name__} "
+                "keeps: normalizing a two-prompt batch failed"
+            ) from e
+        markers = [object(), object()]
+        setattr(batch, field.name, markers)
+        try:
+            value = getattr(batch[0], field.name)
+        except Exception:  # an item helper that cannot take the marker
+            continue
+        if value is markers[0]:
+            item_fields.append(field.name)
+        elif value is markers:
+            shared_fields.append(field.name)
+    return item_fields, shared_fields
 
 
 def _build_metrics_config(ext: ModuleType):
@@ -241,13 +412,49 @@ def _build_metrics_config(ext: ModuleType):
     )
 
 
+def _node_listeners(*, grpc_port: Optional[int]) -> List[Dict[str, Any]]:
+    """`DeploymentInfo.node_listeners`: every Rust listener on this listener's
+    node, in port-offset order, so each of them reports the same table."""
+    parallel = get_parallel()
+    nnodes_per_tp_group = max(parallel.nnodes // parallel.pp_size, 1)
+    tp_size_per_node = parallel.tp_size // nnodes_per_tp_group
+    first_tp_rank = tp_size_per_node * (parallel.node_rank % nnodes_per_tp_group)
+    node_tp_ranks = range(first_tp_rank, first_tp_rank + tp_size_per_node)
+    # Each attention DP group hosts a listener on its first rank (CP=TP=0).
+    dp_group_width = parallel.attn_tp_size * parallel.attn_cp_size
+    leader_tp_ranks = [tp for tp in node_tp_ranks if tp % dp_group_width == 0]
+    # Plain DP launches every replica on these leaders; otherwise only this one.
+    if not parallel.attn_dp_enabled and parallel.dp_size > 1:
+        replicas = range(parallel.dp_size)
+    else:
+        replicas = [parallel.dp_rank]
+    # Each listener reports this as its own `dp_rank`.
+    listener_dp_ranks = [
+        select_kv_publisher_dp_rank(
+            parallel.attn_dp_size, tp_rank // dp_group_width, dp_rank
+        )
+        for dp_rank in replicas
+        for tp_rank in leader_tp_ranks
+    ]
+    # RustServer.launch offsets a listener by the node's listeners before it.
+    return [
+        {
+            "port_offset": offset,
+            "dp_rank": dp_rank,
+            "http_port": get_serving().port + offset,
+            "grpc_port": None if grpc_port is None else grpc_port + offset,
+        }
+        for offset, dp_rank in enumerate(listener_dp_ranks)
+    ]
+
+
 def _launch_server_info(scheduler: Scheduler) -> str:
     """The `/server_info` fields Python's HTTP server reports that are fixed
     at launch, as a JSON object: the resolved `server_args`,
     `launch_command`, `kv_events`, and the scheduler's init info less what is
     only known once initialization finishes (`startup_time`, which the Rust
-    server reports per request, and the gRPC `kv_event_sources`). Watermark
-    secrets are redacted as Python's HTTP and gRPC frontends redact them."""
+    server reports per request, and the gRPC `kv_event_sources`). Secrets are
+    redacted as Python's HTTP and gRPC frontends redact them."""
     scheduler_info = {
         "status": "ready",
         "max_total_num_tokens": scheduler.max_total_num_tokens,
@@ -261,7 +468,42 @@ def _launch_server_info(scheduler: Scheduler) -> str:
     # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
     # router reads this key to pick its protocol.
     info["enable_http2"] = False
+    _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
+
+
+_API_KEY_FIELDS = ("api_key", "admin_api_key")
+
+
+def _redact_api_keys(info: Dict[str, Any], server_args: PyServerArgs) -> None:
+    """Keep the listener's keys out of `/server_info`'s `launch_command`,
+    which only the API key (or nothing) guards: reporting them would hand the
+    admin key to every API-key holder. `build_server_info` has replaced the
+    key fields in `info` already, so the values come from `server_args`."""
+    keys = [getattr(server_args, name) for name in _API_KEY_FIELDS]
+    keys = [key for key in keys if key]
+    command = info.get("launch_command")
+    if not command:
+        return
+    # The command joins argv. First each key's value, whole and longest first
+    # (one key may contain the other), which catches a value holding spaces...
+    for key in sorted(keys, key=len, reverse=True):
+        command = re.sub(rf"(?<=[ =]){re.escape(key)}(?= |$)", "<redacted>", command)
+    # ...then whatever follows a key flag, which catches a value a later flag
+    # overrode. argparse takes any unambiguous prefix of a flag.
+    flags = [f"--{name.replace('_', '-')}" for name in _API_KEY_FIELDS]
+    words, redact_next = [], False
+    for word in command.split(" "):
+        flag, eq, _ = word.partition("=")
+        if redact_next:
+            word, redact_next = "<redacted>", False
+        elif len(flag) > 2 and any(f.startswith(flag) for f in flags):
+            if eq:
+                word = f"{flag}=<redacted>"
+            else:
+                redact_next = True
+        words.append(word)
+    info["launch_command"] = " ".join(words)
 
 
 def _tokenizer_model_max_length(tokenizer: Any, context_len: int) -> int:

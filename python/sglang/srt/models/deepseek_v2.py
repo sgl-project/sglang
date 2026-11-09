@@ -54,7 +54,6 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
 )
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
-    dsa_draft_shards_under_dcp,
     dsa_layer_skips_topk,
     get_dsa_index_head_dim,
     get_dsa_index_kpool,
@@ -62,6 +61,7 @@ from sglang.srt.configs.model_config import (
     get_dsa_index_topk,
     is_deepseek_dsa,
     is_glm_moe_dsa,
+    mla_attention_dcp_size,
 )
 from sglang.srt.distributed import divide
 from sglang.srt.environ import envs
@@ -70,7 +70,7 @@ from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+from sglang.srt.layers.attention.dsa.dsa_fp4_indexer import dsa_indexer_cls
 from sglang.srt.layers.attention.dsa.dsa_indexer_kpool import IndexerKPool
 from sglang.srt.layers.attention.dsa.utils import (
     maybe_prefetch_next_full_attention_kv,
@@ -157,9 +157,12 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
 )
+from sglang.srt.layers.quantization.unquant import prefer_bf16_splitk_over_fused_a
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -214,6 +217,7 @@ from sglang.srt.models.deepseek_common.utils import (
     quant_blocks_shared_experts_fusion,
     tiny_router_gemm_max_tokens,
 )
+from sglang.srt.models.utils import is_non_idle_and_non_empty
 from sglang.srt.multimodal.dsv41.vl_routing import vision_topk
 from sglang.srt.runtime_context import (
     LoRABatchLayout,
@@ -231,10 +235,7 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
-    add_prefix,
-    is_non_idle_and_non_empty,
     is_sm90_supported,
-    make_pp_layers,
     use_intel_amx_backend,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -267,6 +268,7 @@ elif _is_npu:
         forward_mha_prepare_npu,
         forward_mla_core_npu,
         forward_mla_prepare_npu,
+        init_modelslim_mla_kv,
     )
 else:
     pass
@@ -284,7 +286,6 @@ _moe_quant_once_logged = False
 _enable_pcg_dsv2_dual_stream = (
     _is_cuda and envs.SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM.get()
 )
-_hip_shared_act_mxfp8 = _is_hip and envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -440,12 +441,11 @@ class DeepseekV2MLP(nn.Module):
         if self.use_fused_clamp_act_mul and not self._fused_clamp_fp8_checked:
             _hip_act.resolve_fused_clamp_route(self, gate_up.shape[-1] // 2)
 
-        # SGLANG_HIP_SHARED_ACT_MXFP8: an MXFP8 down_proj takes fp8 + ue8m0 straight from the Triton
-        # epilogue instead of aiter's bf16 output plus a separate quant launch.
+        # an MXFP8 down_proj takes fp8 + ue8m0 straight from the Triton epilogue instead of
+        # aiter's bf16 output plus a separate quant launch.
         if (
             self.use_fused_clamp_act_mul
             and self.swiglu_limit is not None
-            and _hip_shared_act_mxfp8
             and self._hip_act_fp8_grid
         ):
             x = _hip_act.silu_and_mul_clamp(self, gate_up)
@@ -587,7 +587,6 @@ class MoEGate(nn.Module):
                 hidden_states,
                 self.weight,
                 out_dtype=torch.float32,
-                max_m=self.tiny_router_gemm_max_tokens,
             )
         elif _use_aiter:
             logits = aiter_dsv3_router_gemm(hidden_states, self.weight)
@@ -1057,10 +1056,10 @@ class DeepseekV2MoE(nn.Module):
             and hidden_states.shape[0] > 0
             and self.shared_experts is not None
             and getattr(self.experts, "use_flashinfer_trtllm_moe", False)
-            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not self._enable_a2a_moe
             and not self._fuse_shared_experts_inside_sbo
-            and not getattr(self, "is_hash", False)
+            and not self.is_hash
+            and self.topk.topk_config.output_format == TopKOutputFormat.BYPASSED
             and not is_expert_remapping_enabled()
             and get_exec().moe.ep_dispatch_algorithm not in ("fake", "lp")
         )
@@ -1112,7 +1111,9 @@ class DeepseekV2MoE(nn.Module):
                 input_ids_global=input_ids_global,
             )
 
-        use_vision_topk = self.gate.e_score_correction_bias_vl is not None
+        use_vision_topk = (
+            self.gate.e_score_correction_bias_vl is not None and not self.is_hash
+        )
         if use_vision_topk and _is_hip:
             use_vision_topk = _hip_moe.batch_has_images(forward_batch)
         if not self._enable_a2a_moe:
@@ -1796,7 +1797,7 @@ class DeepseekV2MoE(nn.Module):
     ):
         if (hidden_states.shape[0] > 0) and (self.num_fused_shared_experts == 0):
             if pre_quant_input is None and _is_hip:
-                # SGLANG_HIP_FFN_NORM_MXFP8: the FFN norm launch's fp8 + ue8m0 of these rows
+                # the gfx950 FFN norm launch's fp8 + ue8m0 of these rows
                 pre_quant_input = getattr(hidden_states, "_hip_mxfp8_operand", None)
             if pre_quant_input is not None:
                 # SGLANG_OPT_MOE_QUANT_ONCE: (q, s) rows may be padded to a
@@ -2110,13 +2111,9 @@ class DeepseekV2AttentionMLA(
             and not reduce_results
             and can_defer_cp_decode_attn_tp()
         )
-        self.dcp_size = get_parallel().attn_dcp_size
-        if (
-            is_nextn
-            and self.use_dsa
-            and not dsa_draft_shards_under_dcp(config, self.dcp_size)
-        ):
-            self.dcp_size = 1
+        self.dcp_size = mla_attention_dcp_size(
+            config, dcp_size=get_parallel().attn_dcp_size, is_nextn=is_nextn
+        )
         self.num_heads = num_heads
         assert num_heads % attn_tp_size == 0
         self.num_local_heads = num_heads // attn_tp_size
@@ -2181,7 +2178,9 @@ class DeepseekV2AttentionMLA(
             if not self.skip_topk or is_nextn:
                 is_neox_style = not getattr(config, "indexer_rope_interleave", False)
                 indexer_cls = (
-                    IndexerKPool if get_dsa_index_kpool(config) > 1 else Indexer
+                    IndexerKPool
+                    if get_dsa_index_kpool(config) > 1
+                    else dsa_indexer_cls()
                 )
                 indexer_kwargs = dict(
                     hidden_size=hidden_size,
@@ -2287,6 +2286,8 @@ class DeepseekV2AttentionMLA(
             attn_type=attn_type,
             prefix=add_prefix("attn_mha", prefix),
         )
+        if _is_npu:
+            init_modelslim_mla_kv(self, prefix)
 
         self.alt_stream = alt_stream
         self.attn_mha.kv_b_proj = None
@@ -2621,7 +2622,9 @@ class DeepseekV2AttentionMLA(
                     self.fused_qkv_a_proj_with_mqa, backend=self.fused_a_gemm_backend
                 )
             )
-        if self._use_min_latency_fused_a_gemm:
+        if self._use_min_latency_fused_a_gemm and not prefer_bf16_splitk_over_fused_a(
+            x=hidden_states, weight=self.fused_qkv_a_proj_with_mqa.weight
+        ):
             return linear_with_fused_a_gemm(
                 self.fused_qkv_a_proj_with_mqa,
                 hidden_states,

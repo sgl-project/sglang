@@ -11,10 +11,15 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.attention.minimax_sparse.common.tile_ptr import (
+    tile_ptrs_1d,
+    tile_ptrs_2d,
+    tile_ptrs_3d,
+)
 from sglang.kernels.ops.attention.unlimited_ocr_dash.common import (
     _FP8_DTYPES,
     SPARSE_BLOCK_SIZE,
-    _arch_supports_pdl,
     _merge_topk_attn_out_kernel,
 )
 
@@ -170,15 +175,20 @@ def _dash_sparse_fwd_kernel(
         off_t = tl.arange(0, BLOCK_SIZE_T)
         topk_idx = tl.load(t_ptr_j + off_t * stride_tk, mask=off_t < max_topk, other=-1)
         real_topk = tl.sum((topk_idx >= 0).to(tl.int32), axis=0)
-        q_ptrs = tl.make_block_ptr(
-            base=q_ptr + q_start * stride_qn + pid_h * stride_qh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_qn, stride_qh, stride_qd),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        q_ptrs, q_mask = tile_ptrs_3d(
+            q_ptr + q_start * stride_qn + pid_h * stride_qh,
+            q_len,
+            gqa_group_size,
+            head_dim,
+            stride_qn,
+            stride_qh,
+            stride_qd,
+            pid_q_j * BLOCK_SIZE_Q,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_D,
         )
-        q = tl.load(q_ptrs, boundary_check=(0, 1, 2), padding_option="zero")
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0)
         m_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         lse_i = tl.full((BLOCK_SIZE_QH,), float("-inf"), dtype=tl.float32)
         acc_o = tl.zeros((BLOCK_SIZE_QH, BLOCK_SIZE_D), dtype=tl.float32)
@@ -293,15 +303,20 @@ def _dash_sparse_fwd_kernel(
                     lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
         acc_o = acc_o * tl.exp2(m_i - lse_i)[:, None]
         acc_o = tl.reshape(acc_o, BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D)
-        o_ptrs = tl.make_block_ptr(
-            base=o_ptr + q_start * stride_on + pid_h * stride_oh,
-            shape=(q_len, gqa_group_size, head_dim),
-            strides=(stride_on, stride_oh, stride_od),
-            offsets=(pid_q_j * BLOCK_SIZE_Q, 0, 0),
-            block_shape=(BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_D),
-            order=(2, 1, 0),
+        o_ptrs, o_mask = tile_ptrs_3d(
+            o_ptr + q_start * stride_on + pid_h * stride_oh,
+            q_len,
+            gqa_group_size,
+            head_dim,
+            stride_on,
+            stride_oh,
+            stride_od,
+            pid_q_j * BLOCK_SIZE_Q,
+            BLOCK_SIZE_Q,
+            BLOCK_SIZE_H,
+            BLOCK_SIZE_D,
         )
-        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1, 2))
+        tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_mask)
 
 
 # Decode: split-K over the selected blocks (flash-decoding), merged by
@@ -400,15 +415,18 @@ def _dash_sparse_decode_kernel(
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     acc_o = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_D), dtype=tl.float32)
-    q_ptrs = tl.make_block_ptr(
-        base=q_ptr + pid_b * stride_qn + pid_h * stride_qh,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_qh, stride_qd),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    q_ptrs, q_mask = tile_ptrs_2d(
+        q_ptr + pid_b * stride_qn + pid_h * stride_qh,
+        gqa_group_size,
+        head_dim,
+        stride_qh,
+        stride_qd,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    q = tl.load(q_ptrs, boundary_check=(0, 1), padding_option="zero")
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
     cur_idx_ptr = idx_base + chunk_start_topk * stride_tk
     cur_bias_ptr = bias_base + chunk_start_topk * stride_bk
@@ -506,24 +524,26 @@ def _dash_sparse_decode_kernel(
 
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
-    o_ptrs = tl.make_block_ptr(
-        base=o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
-        shape=(gqa_group_size, head_dim),
-        strides=(stride_o_h, stride_o_d),
-        offsets=(0, 0),
-        block_shape=(BLOCK_SIZE_H, BLOCK_SIZE_D),
-        order=(1, 0),
+    o_ptrs, o_mask = tile_ptrs_2d(
+        o_ptr + pid_c * stride_o_c + pid_b * stride_o_b + pid_h * stride_o_h,
+        gqa_group_size,
+        head_dim,
+        stride_o_h,
+        stride_o_d,
+        0,
+        0,
+        BLOCK_SIZE_H,
+        BLOCK_SIZE_D,
     )
-    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), boundary_check=(0, 1))
-    lse_ptrs = tl.make_block_ptr(
-        base=lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
-        shape=(gqa_group_size,),
-        strides=(stride_l_h,),
-        offsets=(0,),
-        block_shape=(BLOCK_SIZE_H,),
-        order=(0,),
+    tl.store(o_ptrs, acc_o.to(o_ptr.dtype.element_ty), mask=o_mask)
+    lse_ptrs, lse_mask = tile_ptrs_1d(
+        lse_ptr + pid_c * stride_l_c + pid_b * stride_l_b + pid_h * stride_l_h,
+        gqa_group_size,
+        stride_l_h,
+        0,
+        BLOCK_SIZE_H,
     )
-    tl.store(lse_ptrs, lse_i, boundary_check=(0,))
+    tl.store(lse_ptrs, lse_i, mask=lse_mask)
 
     if USE_PDL:
         tl.extra.cuda.gdc_launch_dependents()
@@ -740,7 +760,7 @@ def dash_sparse_attn_decode(
     """
     total_q, num_heads, head_dim = q.shape
     assert total_q == seq_lens.shape[0] * decode_query_len
-    use_pdl = _arch_supports_pdl()
+    use_pdl = current_arch().supports_pdl
     bias_t, b_strides = _bias_operand(blk_bias, topk_idx)
     cw = topk_idx.shape[-1] if chunk_width is None else int(chunk_width)
     num_topk_chunks = _num_topk_chunks(cw, total_q, num_kv_heads)

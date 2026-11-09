@@ -4,7 +4,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     resolved_view,
 )
@@ -238,6 +238,13 @@ def create_dsv4_backend(runner):
             f"Using {type(backend).__name__} for dsv4 attention backend (CUDA)."
         )
         return backend
+
+
+@register_attention_backend("ernie55")
+def create_ernie55_backend(runner):
+    from sglang.srt.layers.attention.ernie55_backend import Ernie5_5AttnBackend
+
+    return Ernie5_5AttnBackend(runner)
 
 
 @register_attention_backend("triton")
