@@ -430,6 +430,10 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+    /// Return output_ids and metadata without decoding generated text. This is
+    /// request-local and also leaves logprob text unset, even when requested.
+    #[prost(bool, optional, tag = "41")]
+    pub skip_detokenize: ::core::option::Option<bool>,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
 /// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.

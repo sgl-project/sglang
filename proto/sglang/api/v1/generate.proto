@@ -87,6 +87,9 @@ message GenerateRequest {
   int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
+  // Return output_ids and metadata without decoding generated text. This is
+  // request-local and also leaves logprob text unset, even when requested.
+  optional bool skip_detokenize = 41;
 }
 
 // Per-request Unlimited-OCR options. The processor owns mode validation and
