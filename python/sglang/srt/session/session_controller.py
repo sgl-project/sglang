@@ -288,7 +288,7 @@ class Session:
             new_req.set_finish_with_abort(abort_message)
         elif self.streaming:
             self.last_active_time = time.monotonic()
-            # turns is NOT updated here — finish_req() handles it.
+            # turns is NOT updated here; finish_req() handles it.
             self._inflight = True
         else:
             self.last_active_time = time.monotonic()

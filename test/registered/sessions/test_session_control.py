@@ -2,18 +2,15 @@
 Usage:
 python3 -m unittest test_session_control.TestSessionControl.test_session_control
 python3 -m unittest test_session_control.TestSessionControl.test_session_control_with_branching
-python3 -m unittest test_session_control.TestSessionControl.test_session_control_backtrack_with_abort
 python3 -m unittest test_session_control.TestSessionControlVision.test_session_control
 """
 
-import asyncio
 import base64
 import io
 import json
 import unittest
 import uuid
 
-import aiohttp
 import requests
 from PIL import Image
 
@@ -318,138 +315,6 @@ class TestSessionControl(CustomTestCase):
         )
         for a, b in zip(logprobs_from_session, logprobs_normal):
             assert abs(a - b) <= 0.15, f"logprobs {a} and {b} differ by more than 0.15"
-
-    async def async_generate(self, payload):
-        url = self.base_url + "/generate"
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url=url, json=payload) as response:
-                assert response.status == 200
-                async for chunk_bytes in response.content:
-                    chunk_bytes = chunk_bytes.strip()
-                    if not chunk_bytes:
-                        continue
-                    chunk = remove_prefix(chunk_bytes.decode("utf-8"), "data: ")
-                    if chunk == "[DONE]":
-                        yield "", None, ""
-                    else:
-                        data = json.loads(chunk)
-                        finish_reason = (
-                            data["meta_info"]["finish_reason"]["type"]
-                            if data["meta_info"]["finish_reason"]
-                            else ""
-                        )
-                        yield data["text"], data["meta_info"]["id"], finish_reason
-
-    async def run_session_control_backtrack_with_abort(self):
-        chunks = [
-            "Let me tell you something about France.",
-            "The capital of France is",
-        ]
-        tokenizer = get_tokenizer(self.model)
-        chunks_ids = [tokenizer.encode(x) for x in chunks]
-        for i in range(1, len(chunks_ids)):
-            if chunks_ids[i][0] == tokenizer.bos_token_id:
-                chunks_ids[i] = chunks_ids[i][1:]
-
-        # 1. using session control
-        requests.post(self.base_url + "/flush_cache")
-        session_id = requests.post(
-            self.base_url + "/open_session",
-            json={"capacity_of_str_len": 1000},
-        ).json()
-        rid = None
-
-        payload = {
-            "input_ids": chunks_ids[0],
-            "session_params": {
-                "id": session_id,
-                "rid": rid,
-                "offset": -1,
-            },
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": 100,
-                "no_stop_trim": True,
-                "skip_special_tokens": False,
-                "ignore_eos": True,
-            },
-            "stream": True,
-        }
-        gen_so_far = ""
-        finish_reason = ""
-        first_rid = None
-        async for chunk, rid, finish_reason_chunk in self.async_generate(payload):
-            gen_so_far += chunk
-            if finish_reason == "":
-                finish_reason = finish_reason_chunk
-            if len(gen_so_far) > 50 and first_rid is None:
-                first_rid = rid
-                payload2 = {
-                    "input_ids": chunks_ids[1],
-                    "session_params": {
-                        "id": session_id,
-                        "rid": first_rid,
-                        "offset": 50,
-                    },
-                    "sampling_params": {
-                        "temperature": 0,
-                        "max_new_tokens": 32,
-                        "no_stop_trim": True,
-                        "skip_special_tokens": False,
-                    },
-                    "stream": False,
-                    "stream_output": True,
-                }
-                # appending to a running request, should see abort
-                ret = requests.post(url=self.base_url + "/generate", json=payload2)
-                assert ret.status_code != 200
-                requests.post(self.base_url + "/abort_request", json={"rid": first_rid})
-        assert finish_reason == "abort"
-
-        # backtrack to the aborted request and regenerate
-        response = requests.post(url=self.base_url + "/generate", json=payload2).json()
-        second_output = response["text"]
-        print("first request output:")
-        print(gen_so_far)
-        print("second request output:")
-        print(second_output)
-
-        # close the session
-        ret = requests.post(
-            self.base_url + "/close_session",
-            json={"session_id": session_id},
-        )
-        assert ret.status_code == 200
-
-        # 2. not using session control
-        requests.post(self.base_url + "/flush_cache")
-        output_ids = tokenizer.encode(gen_so_far)
-        if output_ids[0] == tokenizer.bos_token_id:
-            output_ids = output_ids[1:]
-        input_ids = chunks_ids[0] + output_ids
-        input_ids = input_ids[:50] + chunks_ids[1]
-        payload = {
-            "input_ids": input_ids,
-            "sampling_params": {
-                "temperature": 0,
-                "max_new_tokens": 32,
-                "no_stop_trim": True,
-                "skip_special_tokens": False,
-            },
-            "stream": False,
-            "stream_output": True,
-        }
-        response = requests.post(url=self.base_url + "/generate", json=payload).json()
-        output_no_session = response["text"]
-        print("second request output without session:")
-        print(output_no_session)
-        assert second_output == output_no_session, (
-            f"second_output: {second_output}, output_no_session: {output_no_session}"
-        )
-
-    @unittest.skip("broken")
-    def test_session_control_backtrack_with_abort(self):
-        asyncio.run(self.run_session_control_backtrack_with_abort())
 
     def run_session_control_with_branching(
         self, root_prompt, chunks_per_step, gen_len=16
