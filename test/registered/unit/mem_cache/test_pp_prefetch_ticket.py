@@ -40,6 +40,55 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
+# The pool schema a hit query over stages holding only the KV host pool
+# reduces: the host pools some stage registers.
+_SCHEMA = [str(PoolName.KV)]
+
+
+class _TwoStageGroup:
+    """An all-gather between two simulated pipeline stages, one per thread."""
+
+    def __init__(self):
+        self.barrier = threading.Barrier(2, timeout=10)
+        self.slots = [None, None]
+
+    def all_gather(self, stage, obj):
+        self.slots[stage] = obj
+        self.barrier.wait()
+        gathered = list(self.slots)
+        self.barrier.wait()
+        return gathered
+
+
+class TestPrefetchAckSchema(unittest.TestCase):
+    def test_stages_with_different_pools_reduce_one_shape(self):
+        """BUG REGRESSION. Stages holding different host pools must reduce a
+        failed prefetch's ACK with tensors of one shape."""
+        group = _TwoStageGroup()
+        local_pools = ({"kv": None, "window_4096": None}, {"kv": None})
+        reduced = [None, None]
+
+        def stage(index):
+            c = HybridCacheController.__new__(HybridCacheController)
+            c.mem_pool_host = Mock(entry_map=local_pools[index])
+            c.prefetch_completion_sync_groups = [group]
+            c._host_pool_schemas = []
+            c._all_gather_object = lambda obj, g: g.all_gather(index, obj)
+            c._all_reduce = lambda tensor, op, groups: reduced.__setitem__(
+                index, tensor.shape
+            )
+            ack = PrefetchAck(rid="r", operation=None, pool_hits={})
+            c._reduce_prefetch_ack(ack)
+            return ack
+
+        threads = [threading.Thread(target=stage, args=(i,)) for i in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertIsNotNone(reduced[0])
+        self.assertEqual(reduced[0], reduced[1])
+
 
 class TestPPPrefetchTicket(unittest.TestCase):
     def setUp(self):
@@ -70,7 +119,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.prefetch_buffer = Queue()
         c.storage_stop_event = threading.Event()
         c.prefetch_tokens_occupied = 0
-        c.mem_pool_host = Mock(page_size=4, entry_map={})
+        c.mem_pool_host = Mock(page_size=4, entry_map={PoolName.KV: Mock()})
         c.mem_pool_host.available_size.return_value = 1 << 20
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
@@ -78,6 +127,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.storage_backend = Mock()
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
+        c._host_pool_schemas = []
+        c._all_gather_object = Mock(side_effect=lambda obj, group: [obj])
         ranks = {"pp": [0, 2, 4, 6], "tp": [0, 1], "command": [0, 2, 4, 6]}
         patcher = patch.object(
             torch.distributed, "get_process_group_ranks", side_effect=ranks.__getitem__
@@ -225,7 +276,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     self.assertEqual(tensor[0].item(), 8)
                     self.assertEqual(c.mem_pool_host.alloc.call_count, len(votes) + 1)
                     votes.append(tensor[0].item())
@@ -316,13 +367,13 @@ class TestPPPrefetchTicket(unittest.TestCase):
                     def reduce_hits(tensor, op, groups):
                         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                         self.assertEqual(groups, ["pp", "tp"])
-                        self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                        self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                         local_votes.append(tensor[0].item())
                         c.mem_pool_host.alloc.assert_called_once_with(
                             local_hit, pool=PoolName.KV
                         )
                         tensor[0] = min(tensor[0].item(), peer_hit)
-                        kv_index = 1 + list(PoolName).index(PoolName.KV)
+                        kv_index = 1 + _SCHEMA.index(PoolName.KV)
                         tensor[kv_index] = min(tensor[kv_index].item(), peer_hit // 4)
 
                     c._all_reduce.side_effect = reduce_hits
@@ -416,9 +467,9 @@ class TestPPPrefetchTicket(unittest.TestCase):
                         def reduce_hits(tensor, op, groups):
                             self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                             self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                            self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                            self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                             local_votes.append(tensor[0].item())
-                            kv_index = 1 + list(PoolName).index(PoolName.KV)
+                            kv_index = 1 + _SCHEMA.index(PoolName.KV)
                             self.assertEqual(
                                 tensor[kv_index].item(), 32 if rank == 0 else 8
                             )
@@ -542,7 +593,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, ["pp", "tp"])
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     local_votes.append(tensor[0].item())
                     if tensor[0].item():
                         self.assertEqual(c.mem_pool_host.alloc.call_args.args, (8,))
@@ -804,7 +855,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c._all_reduce.assert_called_once()
         packed, op, groups = c._all_reduce.call_args.args
         self.assertEqual(packed[0].item(), 0)
-        self.assertEqual(packed.numel(), 1 + len(PoolName))
+        self.assertEqual(packed.numel(), 1 + len(_SCHEMA))
         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
         self.assertEqual(groups, c.prefetch_hits_sync_groups)
         c.mem_pool_host.free.assert_not_called()
@@ -836,7 +887,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(tensor[0].item(), 8)
-                    self.assertEqual(tensor.numel(), 1 + len(PoolName))
+                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
                     c.mem_pool_host.alloc.assert_called_once_with(8, pool=PoolName.KV)

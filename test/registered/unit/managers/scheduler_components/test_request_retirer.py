@@ -9,7 +9,7 @@ from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
 from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import release_only_retirer
+from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -23,7 +23,6 @@ _SKIPPED = ("mem_cache/", "managers/scheduler_components/request_retirer.py")
 # themselves. It only shrinks: a new exit goes through `RequestRetirer`.
 _STEP_CALLERS = {
     "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.optimistic_release_and_requeue",
-    "managers/schedule_batch.py:release_req",
     "managers/scheduler_components/dynamic_chunk_sizer.py:DynamicChunkSizer._profile_prefill_latency",
 }
 
@@ -61,7 +60,7 @@ class TestReleaseStepsLiveInRequestRetirer(CustomTestCase):
 
 
 def _req(finished_reason, calls):
-    return SimpleNamespace(
+    return FakeReq(
         finished_reason=finished_reason,
         cache_request_handle=object(),
         session=SimpleNamespace(
