@@ -100,6 +100,9 @@ class CustomAllreduce:
         self.rank = rank
         self.world_size = world_size
         self.full_nvlink = full_nvlink
+        # Only the ROCm path takes its IPC staging buffer from the caching
+        # allocator; the CUDA path uses cudaMalloc and does not check it.
+        expandable_segments = False
 
         if not _is_hip:
             # Buffers memory are owned by this Python class and passed to C++.
@@ -126,7 +129,14 @@ class CustomAllreduce:
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+            allocator_settings = _allocator_settings()
+            expandable_segments = bool(allocator_settings.get("expandable_segments"))
+            # `self.buffer` is exported with hipIpcGetMemHandle, which rejects
+            # the VMM-backed memory of an expandable segment.
+            with _expandable_segments_disabled(allocator_settings):
+                self.buffer = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr
@@ -144,6 +154,10 @@ class CustomAllreduce:
         self.disabled = False
         self.original_disabled = False  # Ensure original_disabled == disabled
         self.tms_cudagraph = envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+        # Tensors captured into a graph come from the caching allocator, so with
+        # expandable segments they cannot be exported to peers either; copy them
+        # into the pre-registered `self.buffer` instead.
+        self._register_captured_inputs = not (self.tms_cudagraph or expandable_segments)
 
     @staticmethod
     def create_shared_buffer(
@@ -346,7 +360,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self._all_reduce_impl(input, registered=not self.tms_cudagraph)
+                return self._all_reduce_impl(
+                    input, registered=self._register_captured_inputs
+                )
             else:
                 # Could be warmup OR piecewise cuda graph split op execution.
                 # In piecewise cuda graph, split ops run eagerly outside the graph
@@ -446,6 +462,40 @@ def dispatch_custom_allreduce(
             return CustomAllreduce
 
     return CustomAllreduce
+
+
+def _allocator_settings() -> dict:
+    """Return the caching allocator's current settings, or `{}` for another backend.
+
+    Only the native backend has expandable segments, and the cudaMallocAsync
+    backend raises on `_snapshot()`.
+    """
+    if torch.cuda.get_allocator_backend() != "native":
+        return {}
+    # torch only gained a direct getter for these in 2.12; the snapshot carries
+    # them on every version the ROCm images ship.
+    return torch.cuda.memory._snapshot()["allocator_settings"]
+
+
+@contextmanager
+def _expandable_segments_disabled(settings: dict):
+    """Allocate from regular segments inside the block, then restore the settings.
+
+    `settings` is the current configuration, as returned by `_allocator_settings()`.
+    """
+    if not settings.get("expandable_segments"):
+        yield
+        return
+    # Every call resets max_split_size_mb, roundup_power2_divisions and
+    # garbage_collection_threshold unless it names them, so restore the last
+    # configuration string, re-enabling expandable segments in case it did not.
+    last_config = settings.get("PYTORCH_CUDA_ALLOC_CONF")
+    restore = ",".join(filter(None, [last_config, "expandable_segments:True"]))
+    torch.cuda.memory._set_allocator_settings("expandable_segments:False")
+    try:
+        yield
+    finally:
+        torch.cuda.memory._set_allocator_settings(restore)
 
 
 def _use_amd_deterministic_impl() -> bool:
