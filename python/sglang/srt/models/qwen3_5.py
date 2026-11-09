@@ -279,13 +279,12 @@ if _is_cpu:
     )
 
 if _is_npu:
-    from sgl_kernel_npu.activation.fused_sigmoid_mul import (
-        fused_sigmoid_mul as npu_fused_sigmoid_mul,
-    )
-
     # NPU uses the Ascend-tuned implementation; other backends keep the
     # original Triton kernel.
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
+    from sgl_kernel_npu.operators.activation import (
+        fused_sigmoid_mul as npu_fused_sigmoid_mul,
+    )
 
 
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
@@ -1645,7 +1644,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
                 gate_val = gate.reshape(gate.shape[0], -1) if gate.ndim == 3 else gate
-                attn_output = npu_fused_sigmoid_mul(attn_output, gate_val.contiguous())
+                attn_output = npu_fused_sigmoid_mul(
+                    attn_output, gate_val.contiguous(), impl="auto"
+                )
 
         output, _ = self.o_proj(attn_output)
         return output
