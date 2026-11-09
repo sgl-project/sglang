@@ -101,6 +101,14 @@ def _make_inputs(num_requests, num_spec, key_dim=128, num_heads=2):
     )
 
 
+def _stride2_view(tensor):
+    backing = torch.zeros(
+        *tensor.shape[:-1], 2 * tensor.shape[-1], device="cuda", dtype=tensor.dtype
+    )
+    backing[..., ::2] = tensor
+    return backing[..., ::2]
+
+
 class TestKdaDecodeMtp(CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -109,7 +117,7 @@ class TestKdaDecodeMtp(CustomTestCase):
         if get_device_sm() < 100:
             raise unittest.SkipTest("Kimi K3 compute kernels require SM100a+")
 
-    def _run(self, num_requests, num_spec, *, onorm, block_threads=None):
+    def _run(self, num_requests, num_spec, *, onorm, block_threads=None, strided=False):
         kwargs = _make_inputs(num_requests, num_spec)
         _, num_tokens, num_heads, key_dim = kwargs["x_v"].shape
         intermediate = torch.zeros(
@@ -124,6 +132,10 @@ class TestKdaDecodeMtp(CustomTestCase):
             1, num_tokens, num_heads, key_dim, device="cuda", dtype=torch.bfloat16
         )
         weight = torch.rand(key_dim, device="cuda") + 0.5
+        if strided:
+            # Same values through views whose last mode has stride 2.
+            kwargs["beta"] = _stride2_view(kwargs["beta"])
+            gate = _stride2_view(gate)
         if onorm:
             kwargs.update(onorm_gate=gate, onorm_weight=weight, onorm_eps=1e-6)
         with mock.patch.object(
@@ -154,6 +166,19 @@ class TestKdaDecodeMtp(CustomTestCase):
                     fused.float(), expected, atol=3e-2, rtol=3e-2
                 )
                 torch.testing.assert_close(fused_states, raw_states, atol=0, rtol=0)
+
+    def test_strided_inputs_match_contiguous(self):
+        for block_threads in (
+            kda_decode_mtp.BLOCK_THREADS_NARROW,
+            kda_decode_mtp.BLOCK_THREADS_WIDE,
+        ):
+            with self.subTest(block_threads=block_threads):
+                dense = self._run(4, 5, onorm=True, block_threads=block_threads)
+                strided = self._run(
+                    4, 5, onorm=True, block_threads=block_threads, strided=True
+                )
+                torch.testing.assert_close(strided[0], dense[0], atol=0, rtol=0)
+                torch.testing.assert_close(strided[1], dense[1], atol=0, rtol=0)
 
     def test_streaming_state_matches_resident(self):
         for onorm in (False, True):
