@@ -1,6 +1,7 @@
 """A request that already holds a req_to_token row is not counted twice at admission (#38118, #35537)."""
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -10,6 +11,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.managers.inflight_prompt_cache import InflightPromptCache
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
@@ -145,6 +147,47 @@ class TestHeldRowAdmission(CustomTestCase):
                 can_run_list, batch_is_full, final_chunk, waiting = self._admitted(mode)
                 self.assertEqual(can_run_list, [final_chunk, waiting])
                 self.assertFalse(batch_is_full)
+
+    def test_identical_prompt_waits_for_first_prefill_checkpoint(self):
+        """Identical waiting prompts must not both enter the first prefill batch."""
+        first = _Req(holds_row=False)
+        second = _Req(holds_row=False)
+        for req in (first, second):
+            req.origin_input_ids = array("q", range(64))
+            req.output_ids = array("q")
+            req.prefix_len = 0
+            req.extra_key = None
+            req.cache_salt = None
+            req.skip_radix_cache_insert = False
+            req.return_logprob = False
+            req.session = None
+            req.positional_embed_overrides = None
+            req.is_retracted = False
+            req.finished = lambda: False
+
+        s = self._scheduler(DisaggregationMode.NULL, [], None, [first, second])
+        s.inflight_prompt_cache = InflightPromptCache()
+        s.tree_cache.supports_prefix_sharing = lambda: True
+        s.tree_cache.supports_mamba = lambda: False
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list))
+
+        with (
+            get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=[]))
+            self.assertEqual(built.exception.args[0], [first])
+            self.assertEqual(list(s.waiting_queue), [second])
+
+            # The first request's successful checkpoint makes its KV visible.
+            first.prefix_len = len(first.origin_input_ids)
+            with self.assertRaises(_BatchBuilt) as built:
+                s._get_new_batch_prefill_raw(None, ScheduleBatch(reqs=[]))
+            self.assertEqual(built.exception.args[0], [second])
 
 
 if __name__ == "__main__":
