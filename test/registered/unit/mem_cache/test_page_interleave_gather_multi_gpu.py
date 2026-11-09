@@ -460,7 +460,7 @@ def _mtp_make_draft_pool(target, allocator, kind, start_layer):
         pool = kvc._build_token_to_kv_pool(
             sizes=SimpleNamespace(max_total_num_tokens=target.size),
             is_dsa_model=False,
-            is_dsv4_model=False,
+            is_compressed_kv_model=False,
             req_to_token_pool=None,
         )
     assert pool.shard_spec is target.shard_spec

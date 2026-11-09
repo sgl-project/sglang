@@ -3,7 +3,8 @@
 
 A fused producer then hands the GEMM the bytes and scales the separate quant kernel writes:
 per token as ``per_token_quant_hip`` for the ptpc GEMM, per 1 x 128 as
-``get_hip_quant(QuantType.per_1x128)`` for the block-scale GEMMs.
+``get_hip_quant(QuantType.per_1x128)`` for the block-scale GEMMs, and per tensor as
+``dynamic_per_tensor_quant`` for the per-tensor GEMM.
 """
 
 from typing import Optional
@@ -192,3 +193,94 @@ def swiglu_oai_fp8(
             num_warps=4,
         )
     return q, scale.t() if group and transpose_scale else scale
+
+
+_SILU_BLOCK = 2048
+# Every quant program reads all the tile maxima, which pays off for decode only.
+SILU_AND_MUL_FP8_PER_TENSOR_MAX_ROWS = 128
+
+
+@triton.jit
+def _silu_and_mul_tile(x_ptr, row, cols, n, stride_row):
+    """``silu(gate) * up`` of one row's ``cols`` as SiluAndMul writes it: the SiLU and
+    the product each rounded to bf16. Returns it in fp32, 0 past ``n``, and the mask."""
+    mask = cols < n
+    base = x_ptr + row.to(tl.int64) * stride_row
+    gate = tl.load(base + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(base + n + cols, mask=mask, other=0.0).to(tl.float32)
+    act = (gate / (1.0 + tl.exp(-gate))).to(tl.bfloat16).to(tl.float32)
+    return (act * up).to(tl.bfloat16).to(tl.float32), mask
+
+
+@triton.jit
+def _silu_and_mul_absmax_kernel(
+    x_ptr, tile_max_ptr, n, stride_row, TILES: tl.constexpr, BLOCK: tl.constexpr
+):
+    pid = tl.program_id(0)
+    cols = (pid % TILES) * BLOCK + tl.arange(0, BLOCK)
+    act, _ = _silu_and_mul_tile(x_ptr, pid // TILES, cols, n, stride_row)
+    tl.store(tile_max_ptr + pid, tl.max(tl.abs(act), axis=0))
+
+
+@triton.jit
+def _silu_and_mul_fp8_per_tensor_kernel(
+    x_ptr,
+    tile_max_ptr,
+    q_ptr,
+    scale_ptr,
+    n,
+    stride_row,
+    n_tiles,
+    TILES: tl.constexpr,
+    BLOCK: tl.constexpr,
+    TILES_POW2: tl.constexpr,
+    FP8_MAX: tl.constexpr = _FP8_MAX,
+):
+    pid = tl.program_id(0)
+    offs = tl.arange(0, TILES_POW2)
+    amax = tl.max(tl.load(tile_max_ptr + offs, mask=offs < n_tiles, other=0.0), axis=0)
+    scale = amax * (1.0 / FP8_MAX)
+    # aiter writes -FP8_MAX for an all-zero tensor at scale 0; 0 dequantizes the same.
+    inv = tl.where(scale > 0, _rcp(scale), 0.0)
+    row = pid // TILES
+    cols = (pid % TILES) * BLOCK + tl.arange(0, BLOCK)
+    act, mask = _silu_and_mul_tile(x_ptr, row, cols, n, stride_row)
+    q = tl.clamp(act * inv, -FP8_MAX, FP8_MAX)
+    tl.store(q_ptr + row.to(tl.int64) * n + cols, q.to(tl.float8e4nv), mask=mask)
+    if pid == 0:
+        tl.store(scale_ptr, scale)
+
+
+def silu_and_mul_fp8_per_tensor(
+    hidden: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hidden [rows, 2n]`` bf16 (gate | up) -> SiLU-and-mul quantized per tensor.
+
+    Equal to ``SiluAndMul`` followed by aiter's ``dynamic_per_tensor_quant``: fp8
+    ``[rows, n]`` and the ``(1,)`` fp32 scale, in two launches.
+    """
+    assert hidden.dim() == 2 and hidden.dtype == torch.bfloat16
+    assert hidden.stride(1) == 1 and hidden.shape[1] % 2 == 0
+    rows, n = hidden.shape[0], hidden.shape[1] // 2
+    tiles = triton.cdiv(n, _SILU_BLOCK)
+    n_tiles = rows * tiles
+    tile_max = torch.empty(n_tiles, dtype=torch.float32, device=hidden.device)
+    q = torch.empty(rows, n, dtype=torch.float8_e4m3fn, device=hidden.device)
+    scale = torch.empty(1, dtype=torch.float32, device=hidden.device)
+    if rows > 0:
+        _silu_and_mul_absmax_kernel[(n_tiles,)](
+            hidden, tile_max, n, hidden.stride(0), TILES=tiles, BLOCK=_SILU_BLOCK
+        )
+        _silu_and_mul_fp8_per_tensor_kernel[(n_tiles,)](
+            hidden,
+            tile_max,
+            q,
+            scale,
+            n,
+            hidden.stride(0),
+            n_tiles,
+            TILES=tiles,
+            BLOCK=_SILU_BLOCK,
+            TILES_POW2=triton.next_power_of_2(n_tiles),
+        )
+    return q, scale

@@ -252,7 +252,8 @@ def _fa4_available() -> bool:
         return False
     try:
         import cutlass  # noqa: F401
-        import flash_attn.cute  # noqa: F401
+
+        import sglang.kernels.ops.attention.flash_attn.cute  # noqa: F401
     except Exception:
         return False
     return True
@@ -856,7 +857,7 @@ class TestPaddedFlexAttention(unittest.TestCase):
 
     @unittest.skipUnless(
         _fa4_available(),
-        "needs an SM90 or SM100 device with the flash-attn-4 CuTe package",
+        "needs an SM90 or SM100 device with the FA4 CuTe kernels",
     )
     def test_cuda_fa4_kernel_matches_dense_oracle(self):
         context = self._run(
