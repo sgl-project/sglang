@@ -2817,6 +2817,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 if (
                     kv_chunk.room not in self.request_status
                     or self.check_status(kv_chunk.room) == KVPoll.Failed
+                    or not self._is_current_room_lifecycle(
+                        kv_chunk.room, kv_chunk.lifecycle_gen
+                    )
                 ):
                     logger.debug(
                         f"Skipping chunk for room {kv_chunk.room} because it has already failed or been aborted"
@@ -2827,7 +2830,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                             MooncakeRequestStage.MOONCAKE_WORKER_SEND.level,
                             thread_finish_flag=True,
                         )
-                    self._staging_outstanding.pop(kv_chunk.room, None)
+                    self._staging_outstanding[kv_chunk.room] -= 1
+                    if self._staging_outstanding.get(kv_chunk.room, 0) <= 0:
+                        self._staging_outstanding.pop(kv_chunk.room, None)
                     if self.enable_deferred_decode_kv_release:
                         # Skipped => nothing written for this aborted room; ack.
                         self._maybe_ack_drained_abort(kv_chunk.room)
@@ -3105,6 +3110,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         if status == KVPoll.Success
                                         else f"Failed to send aux data of {req.room}"
                                     ),
+                                    lifecycle_gen=kv_chunk.lifecycle_gen,
                                 )
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
@@ -3139,12 +3145,18 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 # chunk. A non-last Failed chunk keeps the room (more chunks may
                 # follow), not on the last chunk alone since an earlier deferred
                 # chunk may still need to transfer.
-                if self._staging_outstanding.get(kv_chunk.room, 0) <= 0 and (
-                    kv_chunk.room not in self.request_status
-                    or self.check_status(kv_chunk.room) == KVPoll.Success
-                    or (
-                        kv_chunk.is_last_chunk
-                        and self.check_status(kv_chunk.room) == KVPoll.Failed
+                if (
+                    self._is_current_room_lifecycle(
+                        kv_chunk.room, kv_chunk.lifecycle_gen
+                    )
+                    and self._staging_outstanding.get(kv_chunk.room, 0) <= 0
+                    and (
+                        kv_chunk.room not in self.request_status
+                        or self.check_status(kv_chunk.room) == KVPoll.Success
+                        or (
+                            kv_chunk.is_last_chunk
+                            and self.check_status(kv_chunk.room) == KVPoll.Failed
+                        )
                     )
                 ):
                     if kv_chunk.room in self.transfer_infos:
@@ -3418,6 +3430,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 trace_ctx=trace_ctx,
                 wait_event=wait_event,
                 indices_event=indices_event,
+                lifecycle_gen=getattr(self, "_room_lifecycle_gen", {}).get(
+                    bootstrap_room
+                ),
             )
         )
 
