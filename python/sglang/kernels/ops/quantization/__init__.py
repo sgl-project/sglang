@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 register_kernel(
     KernelSpec(
         op="quantization.groupwise_int8_dequant",
-        backend=KernelBackend.JIT,
+        backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",
         capabilities=CUDA_ONLY,
     )

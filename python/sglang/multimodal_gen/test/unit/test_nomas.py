@@ -1366,6 +1366,40 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
     torch.testing.assert_close(int8_layer(inputs), expected, rtol=0, atol=0)
 
 
+def test_int8_loading_rejects_invalid_group_metadata(int8_layer):
+    """A malformed scale tensor must fail before admission to the unchecked kernel."""
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    int8_layer.weight_scale = torch.nn.Parameter(
+        torch.ones((2, 1), dtype=torch.float32), requires_grad=False
+    )
+    with pytest.raises(ValueError, match="groupwise shape"):
+        int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    assert not int8_layer._quanto_int8_group128_validated
+
+
+@torch.inference_mode()
+def test_int8_admitted_path_survives_device_moves_and_compile(int8_layer):
+    """Admission validates metadata, without retaining addresses across offloads."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    inputs = torch.ones(2, 130, dtype=torch.bfloat16)
+    expected = int8_layer(inputs)
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    for device in ("cuda", "cpu", "cuda"):
+        int8_layer.to(device)
+        actual = int8_layer(inputs.to(device)).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    compiled = torch.compile(int8_layer, fullgraph=True)
+    torch.testing.assert_close(compiled(inputs.cuda()).cpu(), expected, rtol=0, atol=0)
+    if torch.cuda.device_count() > 1:
+        current = torch.cuda.current_device()
+        other = (current + 1) % torch.cuda.device_count()
+        int8_layer.to(f"cuda:{other}")
+        actual = int8_layer(inputs.to(f"cuda:{other}")).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.cuda.current_device() == current
+
+
 @pytest.mark.parametrize(
     "cls", [torch.nn.Linear, ColumnParallelLinear, RowParallelLinear]
 )

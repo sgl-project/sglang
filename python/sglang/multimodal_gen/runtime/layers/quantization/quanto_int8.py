@@ -47,6 +47,7 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs: Any,
     ) -> None:
+        layer._quanto_int8_group128_validated = False
         if self.compute_dtype is not None and params_dtype != self.compute_dtype:
             raise ValueError(f"INT8 requires {self.compute_dtype} compute")
         if (
@@ -75,10 +76,12 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         weight_scale = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
-                1
-                if self.group_size is None
-                else (input_size_per_partition + self.group_size - 1)
-                // self.group_size,
+                (
+                    1
+                    if self.group_size is None
+                    else (input_size_per_partition + self.group_size - 1)
+                    // self.group_size
+                ),
                 dtype=self.scale_dtype or params_dtype,
             ),
             requires_grad=False,
@@ -91,10 +94,23 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         layer.register_parameter("weight_scale", weight_scale)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._quanto_int8_group128_validated = False
         if self.group_size is not None:
+            weight = layer.weight
             scales = layer.weight_scale
+            if weight.ndim != 2 or weight.dtype != torch.int8:
+                raise ValueError("INT8 weight must be a two-dimensional INT8 tensor")
+            rows, width = weight.shape
+            if scales.shape != (rows, (width + self.group_size - 1) // self.group_size):
+                raise ValueError("INT8 scales have an incompatible groupwise shape")
             if not torch.isfinite(scales).all() or not (scales > 0).all():
                 raise ValueError("INT8 scales must be finite and positive")
+            layer._quanto_int8_group128_validated = (
+                self.group_size == 128
+                and scales.dtype == torch.float32
+                and weight.is_contiguous()
+                and scales.is_contiguous()
+            )
 
     def apply(
         self,
@@ -130,10 +146,19 @@ class QuantoInt8LinearMethod(LinearMethodBase):
             and layer.weight_scale.is_contiguous()
         ):
             from sglang.kernels.ops.quantization.groupwise_int8_dequant import (
+                _dequant_into_validated,
                 groupwise_int8_dequant,
             )
 
-            weight = groupwise_int8_dequant(layer.weight, layer.weight_scale)
+            if (
+                getattr(layer, "_quanto_int8_group128_validated", False)
+                and layer.weight.device == layer.weight_scale.device == x.device
+                and torch.cuda.current_device() == x.device.index
+            ):
+                weight = torch.empty_like(layer.weight, dtype=x.dtype)
+                _dequant_into_validated(layer.weight, layer.weight_scale, weight)
+            else:
+                weight = groupwise_int8_dequant(layer.weight, layer.weight_scale)
         else:
             out, width = layer.weight.shape
             if width % self.group_size == 0:
