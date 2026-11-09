@@ -508,6 +508,43 @@ class TestDisaggregationWire(unittest.TestCase):
         self.assertEqual(manager.state_layout_rejections, {"decode": mismatch})
         self.assertIs(manager.decode_kv_args_table["decode"], bad)
 
+    def test_mooncake_dflash_tp_mismatch_allows_dcp_collapsed_mla_draft(self):
+        for collapsed in (False, True):
+            with self.subTest(collapsed=collapsed):
+                manager = object.__new__(MooncakeKVManager)
+                manager.kv_args = SimpleNamespace(
+                    state_types=[],
+                    num_draft_entries=0,
+                    kv_layer_ids=[],
+                    kv_item_lens=[],
+                )
+                manager.is_mla_backend = True
+                manager.is_hybrid_mla_backend = False
+                manager.pp_size = 1
+                manager.state_tp_size = 2
+                manager.attn_tp_size = 1
+                registration_info = SimpleNamespace(
+                    mooncake_session_id="decode",
+                    dst_attn_tp_size=8,
+                    dst_draft_rows_dcp_collapsed=collapsed,
+                    dst_kv_layer_ids=[],
+                    dst_kv_item_lens=[],
+                    dst_dcp_size=1,
+                    requires_dcp_relayout=False,
+                )
+                with get_context().override_server_args(
+                    enable_unified_memory=False, speculative_algorithm="DFLASH"
+                ):
+                    fully_checked, reason = manager._validate_peer_state_layout(
+                        registration_info
+                    )
+                if collapsed:
+                    self.assertTrue(fully_checked)
+                    self.assertIsNone(reason)
+                else:
+                    self.assertFalse(fully_checked)
+                    self.assertIn("same physical TP size", reason)
+
     def test_mooncake_rejects_a_decode_kv_page_stride_at_registration(self):
         """A decode KV pool with another page stride is rejected at registration.
 
@@ -1178,6 +1215,35 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class TestDsaIndexKTokenBytes(unittest.TestCase):
+    def test_static_dsa_pool_reports_its_key_and_scale_bytes(self):
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+        for use_fp4_indexer, kpool, expected in (
+            (False, 1, (128, 4)),
+            (True, 1, (64, 4)),
+            (False, 4, None),
+        ):
+            with self.subTest(use_fp4_indexer=use_fp4_indexer, kpool=kpool):
+                pool = object.__new__(DSATokenToKVPool)
+                pool.start_layer = 0
+                pool.layer_num = 1
+                pool.index_head_dim = 128
+                pool.use_fp4_indexer = use_fp4_indexer
+                pool.index_bytes_per_token = DSATokenToKVPool.index_bytes_per_token_for(
+                    128, use_fp4_indexer
+                )
+                pool.index_kpool = kpool
+                pool.get_state_buf_infos = lambda: ([0x1000], [4096], [64 * 132])
+                pool.get_compress_tail_buf_infos = lambda: ([], [], [])
+
+                kv_args = KVArgs()
+                setup_state_kv_args(kv_args, _static_storage(pool))
+
+                self.assertEqual(kv_args.state_types, [StateType.DSA])
+                self.assertEqual(kv_args.dsa_index_k_token_bytes, expected)
 
 
 class TestCPReplicatedStateTransfer(unittest.TestCase):

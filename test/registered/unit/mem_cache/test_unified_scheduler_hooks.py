@@ -23,6 +23,7 @@ from test_unified_page_writability import _Bands, _chain  # noqa: E402
 
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.utils import EmbeddingBatchResult
 from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -216,7 +217,7 @@ class TestOpportunisticCompactionErrors(CustomTestCase):
         scheduler.gracefully_exit = False
         scheduler.increment_scheduler_iterations = mock.Mock()
         scheduler.ingest_requests = mock.Mock()
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.last_batch = None
         scheduler.running_batch = None
         scheduler.process_batch_result = mock.Mock()

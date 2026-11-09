@@ -1275,7 +1275,6 @@ class TestPrefillResultPolling(CustomTestCase):
                     resume_at=pause_at + 2,
                     pause_mode="retract",
                 )
-                scheduler.disagg_prefill_pending_chunk_rids = set()
                 scheduler.processed_tokens_counter = 0
                 scheduler.metrics_reporter.enable_metrics = False
                 release_steps = []
