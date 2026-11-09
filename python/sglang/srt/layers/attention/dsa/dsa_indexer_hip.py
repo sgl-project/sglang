@@ -6,7 +6,10 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits_verify
+from sglang.kernels.ops.attention.dsa import (
+    aiter_paged_mqa_logits_persistent_schedule,
+    aiter_paged_mqa_logits_verify,
+)
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import print_info_once
 
@@ -39,6 +42,8 @@ _dcp_local_lens = _PerForwardMemo()
 # Target verify on the shared-index-K path: each request's full length and page-table row.
 _verify_request_lens = _PerForwardMemo()
 _verify_request_block_tables = _PerForwardMemo()
+# Generic paged-logits path: per-row work table balanced over the real lengths.
+_paged_logits_schedule = _PerForwardMemo()
 
 
 def _localize_store_loc(
@@ -69,6 +74,18 @@ def dcp_local_lens(
         key=(id(forward_batch), lens.data_ptr(), lens.shape),
         layer_id=layer_id,
         compute=lambda: get_dcp_lens(lens, dcp_size, dcp_rank).to(lens.dtype),
+    )
+
+
+def paged_logits_persistent_schedule(
+    forward_batch, layer_id: int, lens: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    """The aiter persistent schedule for one query row per entry of lens, shared by the
+    forward's layers."""
+    return _paged_logits_schedule.get(
+        key=(id(forward_batch), lens.data_ptr(), lens.shape, max_seq_len),
+        layer_id=layer_id,
+        compute=lambda: aiter_paged_mqa_logits_persistent_schedule(lens, max_seq_len),
     )
 
 

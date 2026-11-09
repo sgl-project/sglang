@@ -347,6 +347,109 @@ __global__ __launch_bounds__(kThreads) void dcp_local_candidates_kernel(
       });
 }
 
+// Chunked local step for rows longer than one block holds in registers: block (row, c) takes the
+// top-2048 of chunk c (kPer * kThreads scores; the last chunk takes the rest of the row). A row of
+// one chunk writes its result directly; longer rows write per-chunk candidates for the merge kernel.
+// The top-k of the union of the chunks' top-k sets is the row's top-k, so the result is exact.
+template <int kPer>
+__global__ __launch_bounds__(kThreads) void dcp_local_chunk_kernel(
+    const float* __restrict__ logits,
+    int64_t stride,
+    const int32_t* __restrict__ lengths,
+    float* __restrict__ scores,
+    int32_t* __restrict__ positions,
+    float* __restrict__ chunk_scores,
+    int32_t* __restrict__ chunk_positions,
+    int max_chunks,
+    int world,
+    int rank) {
+  constexpr int kChunk = kPer * kThreads;
+  __shared__ Smem sm;
+  const int64_t row = blockIdx.x;
+  const int c = static_cast<int>(blockIdx.y);
+  const int len = lengths[row];
+  const int nch = min(max((len + kChunk - 1) / kChunk, 1), max_chunks);
+  if (c >= nch) return;
+  const int begin = c * kChunk;
+  const int end = c == nch - 1 ? len : begin + kChunk;
+  float* os;
+  int32_t* op;
+  if (nch == 1) {
+    os = scores + row * kTopK;
+    op = positions + row * kTopK;
+  } else {
+    os = chunk_scores + (row * max_chunks + c) * kTopK;
+    op = chunk_positions + (row * max_chunks + c) * kTopK;
+  }
+  RowKeys<kPer> keys;
+  keys.s = logits + row * stride + begin;
+  keys.n = max(end - begin, 0);
+  if (keys.n <= kTopK) {
+    for (int e = threadIdx.x; e < kTopK; e += kThreads) {
+      const bool in = e < keys.n;
+      os[e] = in ? keys.s[e] : __uint_as_float(kNegInfBits);
+      op[e] = in ? (begin + e) * world + rank : -1;
+    }
+    return;
+  }
+  keys.load();
+  uint32_t nvalid;
+  const Threshold t = select_threshold(keys, nvalid, sm);
+  emit_selected(
+      keys,
+      t,
+      nvalid,
+      sm,
+      [&](uint32_t e, uint32_t k, int i) {
+        os[e] = __uint_as_float(key_to_bits(k));
+        op[e] = (begin + i) * world + rank;
+      },
+      [&](int e) {
+        os[e] = __uint_as_float(kNegInfBits);
+        op[e] = -1;
+      });
+}
+
+// Merge for rows of more than one chunk: the top-2048 of the chunks' candidates (nch * 2048 scores,
+// contiguous per row), carrying each winner's global position.
+template <int kPer>
+__global__ __launch_bounds__(kThreads) void dcp_local_merge_kernel(
+    const int32_t* __restrict__ lengths,
+    const float* __restrict__ chunk_scores,
+    const int32_t* __restrict__ chunk_positions,
+    float* __restrict__ scores,
+    int32_t* __restrict__ positions,
+    int max_chunks) {
+  constexpr int kChunk = kPer * kThreads;
+  __shared__ Smem sm;
+  const int64_t row = blockIdx.x;
+  const int len = lengths[row];
+  const int nch = min(max((len + kChunk - 1) / kChunk, 1), max_chunks);
+  if (nch == 1) return;
+  const int64_t base = row * max_chunks * kTopK;
+  float* os = scores + row * kTopK;
+  int32_t* op = positions + row * kTopK;
+  RowKeys<kPer> keys;
+  keys.s = chunk_scores + base;
+  keys.n = nch * kTopK;
+  keys.load();
+  uint32_t nvalid;
+  const Threshold t = select_threshold(keys, nvalid, sm);
+  emit_selected(
+      keys,
+      t,
+      nvalid,
+      sm,
+      [&](uint32_t e, uint32_t k, int i) {
+        os[e] = __uint_as_float(key_to_bits(k));
+        op[e] = chunk_positions[base + i];
+      },
+      [&](int e) {
+        os[e] = __uint_as_float(kNegInfBits);
+        op[e] = -1;
+      });
+}
+
 template <int kWorld>
 __global__ __launch_bounds__(kThreads) void dcp_global_slots_kernel(
     const float* __restrict__ gathered,
@@ -432,6 +535,63 @@ struct DcpLocalCandidatesHip {
         static_cast<int32_t*>(positions.data_ptr()),
         static_cast<int>(world),
         static_cast<int>(rank));
+  }
+};
+
+template <int kPer>
+struct DcpLocalCandidatesChunkedHip {
+  static void
+  run(const tvm::ffi::TensorView logits,
+      const tvm::ffi::TensorView lengths,
+      const tvm::ffi::TensorView scores,
+      const tvm::ffi::TensorView positions,
+      const tvm::ffi::TensorView chunk_scores,
+      const tvm::ffi::TensorView chunk_positions,
+      const int64_t world,
+      const int64_t rank) {
+    using namespace host;
+    using namespace dcp_topk_hip_detail;
+    const int64_t rows = lengths.size(0);
+    const int64_t max_chunks = chunk_scores.size(1);
+    RuntimeCheck(logits.stride(1) == 1, "logits rows must be contiguous");
+    RuntimeCheck(logits.size(0) >= rows, "one logits row per length");
+    RuntimeCheck(
+        scores.size(0) == rows && scores.size(1) == kTopK && scores.is_contiguous(),
+        "scores must be a dense [rows, 2048]");
+    RuntimeCheck(
+        positions.size(0) == rows && positions.size(1) == kTopK && positions.is_contiguous(),
+        "positions must be a dense [rows, 2048]");
+    RuntimeCheck(
+        chunk_scores.size(0) == rows && chunk_scores.size(2) == kTopK && chunk_scores.is_contiguous(),
+        "chunk_scores must be a dense [rows, max_chunks, 2048]");
+    RuntimeCheck(
+        chunk_positions.size(0) == rows && chunk_positions.size(1) == max_chunks && chunk_positions.size(2) == kTopK &&
+            chunk_positions.is_contiguous(),
+        "chunk_positions must be a dense [rows, max_chunks, 2048]");
+    // the merge holds every candidate of a row in registers
+    RuntimeCheck(max_chunks >= 1 && max_chunks * kTopK <= kPer * kThreads, "max_chunks out of range");
+    if (rows == 0) return;
+    LaunchKernel(dim3(static_cast<uint32_t>(rows), static_cast<uint32_t>(max_chunks)), kThreads, logits.device())(
+        dcp_local_chunk_kernel<kPer>,
+        static_cast<const float*>(logits.data_ptr()),
+        logits.stride(0),
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<float*>(scores.data_ptr()),
+        static_cast<int32_t*>(positions.data_ptr()),
+        static_cast<float*>(chunk_scores.data_ptr()),
+        static_cast<int32_t*>(chunk_positions.data_ptr()),
+        static_cast<int>(max_chunks),
+        static_cast<int>(world),
+        static_cast<int>(rank));
+    if (max_chunks == 1) return;
+    LaunchKernel(static_cast<uint32_t>(rows), kThreads, logits.device())(
+        dcp_local_merge_kernel<kPer>,
+        static_cast<const int32_t*>(lengths.data_ptr()),
+        static_cast<const float*>(chunk_scores.data_ptr()),
+        static_cast<const int32_t*>(chunk_positions.data_ptr()),
+        static_cast<float*>(scores.data_ptr()),
+        static_cast<int32_t*>(positions.data_ptr()),
+        static_cast<int>(max_chunks));
   }
 };
 

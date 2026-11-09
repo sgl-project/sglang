@@ -17,11 +17,12 @@ from sglang.kernels.ops.attention.dsa.dcp_topk_hip import (
     dcp_local_candidates_hip,
     supports_dcp_topk_hip,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=15, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, stage="stage-b", runner_config="1-gpu-small-amd-mi35x")
 
 PAGE = 64
 _GARBAGE = 1e30
@@ -45,6 +46,10 @@ def _row_lengths(world: int) -> list[int]:
         world * _REGISTER_SCORES,
         world * _REGISTER_SCORES + 1,
         world * 17500,
+        world * 40000,  # several chunks on the chunked path
+        world * 8 * _REGISTER_SCORES,  # chunked: every chunk full
+        world * 8 * _REGISTER_SCORES
+        + world * 3,  # chunked: the last chunk re-reads its excess
     ]
 
 
@@ -120,14 +125,16 @@ def _case(world, lengths, make_scores, seed):
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 @pytest.mark.parametrize("world", [2, 8])
 @pytest.mark.parametrize("kind", ["spread", "one_exponent"])
-def test_selects_the_global_topk_slots(world, kind):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_selects_the_global_topk_slots(world, kind, chunked):
     """The slots of exactly the top-min(len, 2048) global positions, -1 after them,
-    whichever local path (copy, radix, register tail) each rank's share takes."""
+    whichever local path (copy, radix, register tail, chunks + merge) each rank's share takes."""
     lengths = _row_lengths(world)
     scores, table, span = _case(
         world, lengths, lambda n, g: _scores(kind, n, g), seed=world * 7
     )
-    out, num_owners = _dcp_topk(scores, world, table, span)
+    with envs.SGLANG_DSA_DCP_TOPK_CHUNKED.override(chunked):
+        out, num_owners = _dcp_topk(scores, world, table, span)
     out, num_owners, table = out.cpu(), num_owners.cpu(), table.cpu()
     for i, s in enumerate(scores):
         k = min(s.numel(), TOPK)
@@ -143,7 +150,8 @@ def test_selects_the_global_topk_slots(world, kind):
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
 @pytest.mark.parametrize("world", [2, 8])
-def test_ties_at_the_threshold_resolve_deterministically(world):
+@pytest.mark.parametrize("chunked", [False, True])
+def test_ties_at_the_threshold_resolve_deterministically(world, chunked):
     """Mostly exact-zero scores tie at both thresholds: a valid top-k, the same
     one on every call (TP peers and graph replays must agree), and every rank
     resolves the global ties alike, so no tied winner is emitted twice or dropped."""
@@ -157,8 +165,9 @@ def test_ties_at_the_threshold_resolve_deterministically(world):
         return s
 
     scores, table, span = _case(world, [n, n // 3], make_scores, seed=world)
-    first, _ = _dcp_topk(scores, world, table, span)
-    second, _ = _dcp_topk(scores, world, table, span)
+    with envs.SGLANG_DSA_DCP_TOPK_CHUNKED.override(chunked):
+        first, _ = _dcp_topk(scores, world, table, span)
+        second, _ = _dcp_topk(scores, world, table, span)
     assert torch.equal(first, second)
     first, table = first.cpu(), table.cpu()
     for i, s in enumerate(scores):

@@ -1588,16 +1588,23 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 block_kv,
             )
         elif self.paged_mqa_logits_backend.is_aiter():
+            # under DCP, block_tables cover only this rank's index-K shard
+            row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
+            schedule = None
+            if _use_aiter_preshuffle and envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get():
+                schedule = dsa_indexer_hip.paged_logits_persistent_schedule(
+                    forward_batch, layer_id, row_lens, max_seq_len
+                )
             logits = aiter_paged_mqa_logits(
                 q_fp8,
                 kv_cache_fp8,
                 weights,
-                # under DCP, block_tables cover only this rank's index-K shard
-                seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32,
+                row_lens,
                 block_tables,
                 max_seq_len,
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
+                persistent_schedule=schedule,
             )
         elif _is_xpu:
             logits = sgl_fp8_paged_mqa_logits(

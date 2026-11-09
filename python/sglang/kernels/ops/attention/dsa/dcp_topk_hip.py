@@ -14,6 +14,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.srt.environ import envs
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -32,6 +33,17 @@ def _local_module(per: int) -> Module:
         *args,
         cuda_files=["dsa/dcp_topk_hip.cuh"],
         cuda_wrappers=[("run", f"DcpLocalCandidatesHip<{args}>::run")],
+    )
+
+
+@cache_once
+def _local_chunked_module(per: int) -> Module:
+    args = make_cpp_args(per)
+    return load_jit(
+        "dcp_local_candidates_chunked_hip",
+        *args,
+        cuda_files=["dsa/dcp_topk_hip.cuh"],
+        cuda_wrappers=[("run", f"DcpLocalCandidatesChunkedHip<{args}>::run")],
     )
 
 
@@ -59,10 +71,35 @@ def dcp_local_candidates_hip(
     rows = local_lens.shape[0]
     scores = torch.empty((rows, TOPK), dtype=torch.float32, device=logits.device)
     positions = torch.empty((rows, TOPK), dtype=torch.int32, device=logits.device)
+    max_chunks = _local_max_chunks(logits.shape[1])
+    if max_chunks > 1:
+        chunk_scores = torch.empty(
+            (rows, max_chunks, TOPK), dtype=torch.float32, device=logits.device
+        )
+        chunk_positions = torch.empty_like(chunk_scores, dtype=torch.int32)
+        _local_chunked_module(_LOCAL_PER_THREAD).run(
+            logits,
+            local_lens.to(torch.int32),
+            scores,
+            positions,
+            chunk_scores,
+            chunk_positions,
+            world,
+            rank,
+        )
+        return scores, positions
     _local_module(_LOCAL_PER_THREAD).run(
         logits, local_lens.to(torch.int32), scores, positions, world, rank
     )
     return scores, positions
+
+
+# 1 selects the single-block kernel; the merge holds at most one block's registers of candidates.
+def _local_max_chunks(width: int) -> int:
+    if not envs.SGLANG_DSA_DCP_TOPK_CHUNKED.get():
+        return 1
+    chunk = _LOCAL_PER_THREAD * 1024
+    return min(triton.cdiv(width, chunk), chunk // TOPK)
 
 
 def dcp_global_slots_hip(

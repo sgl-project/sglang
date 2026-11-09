@@ -2328,6 +2328,12 @@ class Envs:
     SGLANG_DSA_FULL_BATCH_MQA = EnvBool(True)
     SGLANG_ENABLE_PCG_DSV2_DUAL_STREAM = EnvBool(False)
     SGLANG_DSA_TOPK_BROADCAST = EnvBool(False)
+    # DCP local top-2048 on HIP: split rows longer than one block's registers over several
+    # blocks, then merge (exact). Set 0 for the single-block-per-row kernel.
+    SGLANG_DSA_DCP_TOPK_CHUNKED = EnvBool(True)
+    # aiter paged indexer logits on ROCm: balance the grid over each row's real length
+    # (persistent schedule) instead of a fixed split per row. Set 0 for the fixed split.
+    SGLANG_DSA_MQA_PERSISTENT_SCHEDULE = EnvBool(True)
     SGLANG_DISABLE_DSA_INDEXER_FUSION = EnvBool(False)
     # HIP analog of CUDA SGLANG_DISABLE_DSA_INDEXER_FUSION (default on).
     # Set 1 for the legacy split writer. Omits Hadamard; pre-quant logits match.

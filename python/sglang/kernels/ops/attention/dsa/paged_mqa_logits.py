@@ -102,6 +102,7 @@ def aiter_paged_mqa_logits(
     *,
     preshuffle: bool,
     kv_block_size: int,
+    persistent_schedule: torch.Tensor | None = None,
 ) -> torch.Tensor:
     from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
 
@@ -122,8 +123,23 @@ def aiter_paged_mqa_logits(
         max_seq_len,
         Preshuffle=preshuffle,
         KVBlockSize=kv_block_size,
+        PersistentSchedule=persistent_schedule,
     )
     return logits
+
+
+def aiter_paged_mqa_logits_persistent_schedule(
+    seq_lens: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    """Work table that splits every row's chunks evenly over the grid by its real length
+    (one query row per entry of seq_lens); built on the device, so graph-safe."""
+    from aiter.ops.triton.pa_mqa_logits import (
+        deepgemm_fp8_paged_mqa_logits_persistent_schedule,
+    )
+
+    return deepgemm_fp8_paged_mqa_logits_persistent_schedule(
+        seq_lens.shape[0], 1, seq_lens, max_seq_len
+    )
 
 
 def aiter_paged_mqa_logits_verify(
