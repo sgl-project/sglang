@@ -52,11 +52,20 @@ def _storage_suffix(
 
 
 def _shared_pool_suffix(
-    *, tp_shared: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
+    *,
+    tp_shared: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_sharded: bool,
+    dcp_size: int,
+    dcp_rank: int,
 ) -> str:
     """Key suffix for a pool whose pages are byte-identical across attention TP.
     The versioned shared term keeps it from aliasing an older per-rank object."""
     parts = ["tpshared_v1" if tp_shared else f"tp{tp_rank}"]
+    if dcp_sharded:
+        parts.append(f"dcp{dcp_size}r{dcp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
     return "_".join(parts)
 
@@ -70,9 +79,12 @@ def _storage_sharing(
     attn_cp_rank: int,
     pp_rank: int,
     offload_owner: bool,
+    dcp_size: int,
+    dcp_rank: int,
 ):
     """Per-pool key suffixes and the pools this rank offloads. A pool replicated
-    across attention TP is written by TP rank 0 only and read by every rank."""
+    across attention TP is written by TP rank 0 (or the first DCP block) only."""
+    dcp_sharded = {name for name, pool in pools.items() if pool.dcp_sharded}
     tp_shared = {
         name
         for name, pool in pools.items()
@@ -80,14 +92,23 @@ def _storage_sharing(
     }
     suffixes = {
         name: _shared_pool_suffix(
-            tp_shared=True, tp_rank=tp_rank, attn_cp_rank=attn_cp_rank, pp_rank=pp_rank
+            tp_shared=name in tp_shared,
+            tp_rank=tp_rank,
+            attn_cp_rank=attn_cp_rank,
+            pp_rank=pp_rank,
+            dcp_sharded=name in dcp_sharded,
+            dcp_size=dcp_size,
+            dcp_rank=dcp_rank,
         )
-        for name in tp_shared
+        for name in tp_shared | dcp_sharded
     }
     offload_pools = {
         name
         for name in pools
-        if offload_owner and (name not in tp_shared or tp_rank == 0)
+        if offload_owner
+        and (
+            name not in tp_shared or tp_rank < (dcp_size if name in dcp_sharded else 1)
+        )
     }
     return suffixes, offload_pools, tp_shared
 
@@ -174,6 +195,8 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
             offload_owner=self.offload_owner,
+            dcp_size=get_parallel().attn_dcp_size,
+            dcp_rank=get_parallel().attn_dcp_rank,
         )
         logger.info(
             "Mooncake direct linker storage topology: "

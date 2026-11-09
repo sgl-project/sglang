@@ -914,8 +914,11 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 patch.object(
                     linker_pool_assembler,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_dcp_size=dcp_size),
+                    return_value=SimpleNamespace(
+                        attn_dcp_size=dcp_size, attn_dcp_rank=1
+                    ),
                 ),
+                patch.object(MLATokenToKVPool, "rows_are_dcp_collapsed", new=True),
             ):
                 return resolve_hybrid_device_pool_group(
                     kvcache=kvcache,
@@ -960,6 +963,15 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 PoolName.DRAFT: False,
             },
         )
+        dsa.page_size = dsa.index_page_size = 1
+        group = resolve(dcp_size=2)
+        for name in (PoolName.KV, PoolName.INDEXER):
+            entry = group.entry_map[name]
+            self.assertTrue(entry.dcp_sharded, name)
+            locations = entry.prepare_locations(
+                entry.translate_indices(torch.tensor([4, 5]))
+            )
+            self.assertEqual(locations, [2], name)
         kvcache.full_kv_pool = mla
 
         mla_draft = MLATokenToKVPool.__new__(MLATokenToKVPool)
@@ -973,8 +985,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(draft_entry.prepare_locations(torch.tensor([2, 3])), [2])
         params.sidecar_draft_device_pools = (draft,)
 
-        with self.assertRaisesRegex(ValueError, "plain MLA"):
-            resolve(dcp_size=2)
         params.mtp_draft_device_pools = (object(),)
         with self.assertRaisesRegex(ValueError, "plain MLA"):
             resolve()

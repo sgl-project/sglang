@@ -13,9 +13,12 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 _REPLICATED = {PoolName.KV, PoolName.INDEXER, PoolName.DRAFT}
 
 
-def _sharing(**kwargs):
+def _sharing(dcp_size=1, **kwargs):
     pools = {
-        name: SimpleNamespace(tp_replicated=name in _REPLICATED)
+        name: SimpleNamespace(
+            tp_replicated=name in _REPLICATED,
+            dcp_sharded=dcp_size > 1 and name in _REPLICATED,
+        )
         for name in (*_REPLICATED, PoolName.MAMBA)
     }
     args = dict(
@@ -27,7 +30,9 @@ def _sharing(**kwargs):
         offload_owner=True,
     )
     args.update(kwargs)
-    return _storage_sharing(pools, **args)
+    return _storage_sharing(
+        pools, dcp_size=dcp_size, dcp_rank=args["tp_rank"] % dcp_size, **args
+    )
 
 
 class TestStorageSharing(CustomTestCase):
@@ -54,6 +59,18 @@ class TestStorageSharing(CustomTestCase):
             suffixes, offload, tp_shared = _sharing(**kwargs)
             self.assertEqual((suffixes, tp_shared), ({}, set()))
             self.assertEqual(offload, _REPLICATED | {PoolName.MAMBA})
+
+    def test_dcp_keys_each_rank_and_the_first_block_writes(self):
+        for rank in range(16):
+            suffixes, offload, _ = _sharing(tp_rank=rank, tp_size=16, dcp_size=8)
+            self.assertEqual(
+                suffixes,
+                dict.fromkeys(_REPLICATED, f"tpshared_v1_dcp8r{rank % 8}_cp0_pp0"),
+            )
+            self.assertEqual(
+                offload,
+                _REPLICATED | {PoolName.MAMBA} if rank < 8 else {PoolName.MAMBA},
+            )
 
     def test_non_owner_rank_offloads_nothing(self):
         _, offload, _ = _sharing(tp_rank=3, tp_size=8, offload_owner=False)
