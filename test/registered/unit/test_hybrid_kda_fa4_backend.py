@@ -5,14 +5,13 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
+import inspect
+import re
 import unittest
 from types import SimpleNamespace
 
 from sglang.srt.arg_groups.model_override_base import ResolvedView
-from sglang.srt.arg_groups.overrides import (
-    POST_PROCESS_PASSES,
-    _hybrid_kda_fa4_backend_constraint,
-)
+from sglang.srt.arg_groups.overrides import _hybrid_kda_fa4_backend_constraint
 from sglang.srt.configs.bailing_hybrid import BailingHybridConfig
 from sglang.srt.configs.glm5_next import Glm5NextConfig
 from sglang.srt.configs.kimi_linear import KimiLinearConfig
@@ -165,10 +164,23 @@ class TestHybridKdaFa4BackendConstraint(CustomTestCase):
                 _run(_view(KimiLinearConfig(), attention_backend="fa4"))
         self.assertIn("this model", str(ctx.exception))
 
-    def test_pass_is_registered(self):
-        # The decorator is the only wiring: dropping it leaves every assertion
-        # above green while the server keeps dying at graph capture.
-        self.assertIn(_hybrid_kda_fa4_backend_constraint, POST_PROCESS_PASSES)
+    def test_the_hook_is_what_invokes_the_pass(self):
+        # Nothing iterates POST_PROCESS_PASSES: a post-process pass runs where a
+        # hook calls `run_post_process_pass` with it, so decorating it is not
+        # wiring. The first version of this change did exactly that and the
+        # refusal never fired on hardware; this assertion is what catches that
+        # diff shape, and the device run is what proves the behaviour.
+        from sglang.srt.arg_groups import attention_hook
+
+        self.assertIs(
+            attention_hook._hybrid_kda_fa4_backend_constraint,
+            _hybrid_kda_fa4_backend_constraint,
+        )
+        invoked = re.findall(
+            r"run_post_process_pass\(\s*server_args,\s*(_\w+)\s*\)",
+            inspect.getsource(attention_hook),
+        )
+        self.assertIn("_hybrid_kda_fa4_backend_constraint", invoked)
 
 
 if __name__ == "__main__":
