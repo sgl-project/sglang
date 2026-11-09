@@ -21,6 +21,7 @@ import sys
 import unittest
 import unittest.mock
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from functools import lru_cache
 
 import pytest
@@ -732,8 +733,8 @@ class TestPromptSegments(_EncodeCase):
 
     def test_the_cache_keeps_to_its_token_budget(self):
         with (
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_TOKENS", 40),
-            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_TOKENS", 20),
+            envs.SGLANG_PARALLEL_PROMPT_ENCODE_CACHE_TOKENS.override(40),
+            unittest.mock.patch.object(ppe, "_SEGMENT_CACHE_MAX_ENTRY_SHARE", 2),
         ):
             for i in range(30):
                 self._assert_segments_match_encode(
@@ -746,6 +747,151 @@ class TestPromptSegments(_EncodeCase):
         self.assertLessEqual(encoder.cached_tokens, 40)
         self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
         self.assertNotIn("hello world " * 30, encoder.cache)
+
+
+def _conversation_turns(turns):
+    """Rendered prompts of a growing chat: each one repeats the previous turns."""
+    rng = random.Random(2)
+    words = "alpha beta gamma delta def return value it's 123 中文 \n".split(" ")
+    prompt = "[gMASK]<sop><|user|>\nfix the tests"
+    prompts = []
+    for turn in range(turns):
+        reply = " ".join(rng.choice(words) for _ in range(rng.randint(20, 200)))
+        tool = " ".join(rng.choice(words) for _ in range(rng.randint(200, 2000)))
+        prompt += f"<|assistant|>\n<think>{reply}</think><tool_call>{turn}"
+        prompt += f"<|user|>\n{tool}"
+        prompts.append(prompt + "<|assistant|>")
+    return prompts
+
+
+class TestRenderedPrompt(_EncodeCase):
+    def setUp(self):
+        super().setUp()
+        self.addCleanup(setattr, ppe, "_segment_encoders", ppe._segment_encoders)
+        ppe._segment_encoders = weakref.WeakKeyDictionary()
+        self.tokenizer = _tokenizer()
+        self._no_min_chars()
+
+    def _assert_rendered_matches_encode(
+        self, tokenizer, text, kwargs_variants=_ALL_KWARGS
+    ):
+        for encode_kwargs in kwargs_variants:
+            # The second call reads the ids the first one cached.
+            for _ in range(2):
+                self.assertEqual(
+                    ppe.encode_rendered_prompt(tokenizer, text, encode_kwargs),
+                    tokenizer.encode(text, **encode_kwargs),
+                    f"{encode_kwargs} on {text[:60]!r}",
+                )
+
+    def test_ids_equal_one_encode_of_the_prompt(self):
+        texts = _EDGE_TEXTS + _fuzz_texts()[:1500] + _conversation_turns(6)
+        for text in texts:
+            self._assert_rendered_matches_encode(self.tokenizer, text)
+
+    def test_added_tokens_inside_message_text_stay_added_tokens(self):
+        # A user who writes a special token gets the same ids as one encode.
+        text = "<|user|>\nplease print <think> and </think><|assistant|>" * 3
+        self._assert_rendered_matches_encode(self.tokenizer, text)
+        overlapping = _tokenizer(
+            lambda b: b.add_tokens([AddedToken("x<|user|>", normalized=False)])
+        )
+        self._assert_rendered_matches_encode(
+            overlapping, "x<|user|>hi<|user|>x<|user|>q<|assistant|>"
+        )
+
+    def test_each_turn_encodes_only_its_new_messages(self):
+        prompts = _conversation_turns(4)
+        with unittest.mock.patch.object(
+            ppe._SegmentEncoder,
+            "_encode",
+            autospec=True,
+            side_effect=ppe._SegmentEncoder._encode,
+        ) as encode:
+            for previous, prompt in zip([""] + prompts, prompts):
+                encode.reset_mock()
+                self._assert_rendered_matches_encode(self.tokenizer, prompt, ({},))
+                # Only text after the previous prompt (minus its generation
+                # prompt) is new; everything before it hits the cache.
+                kept = max(len(previous) - len("<|assistant|>"), 0)
+                new_text = prompt[kept:]
+                encoded = [
+                    text for call in encode.call_args_list for text in call.args[1]
+                ]
+                self.assertTrue(encoded)
+                self.assertTrue(all(text in new_text for text in encoded), encoded)
+
+    def test_falls_back_where_the_segment_path_cannot_match(self):
+        text = "<|user|>" + "hello world " * 50 + "<|assistant|><think>"
+
+        def assert_falls_back(tokenizer, encode_kwargs):
+            with (
+                unittest.mock.patch.object(
+                    ppe._SegmentEncoder,
+                    "encode",
+                    side_effect=AssertionError("segment path taken"),
+                ),
+                unittest.mock.patch.object(
+                    ppe, "parallel_prompt_encode", wraps=ppe.parallel_prompt_encode
+                ) as fallback,
+            ):
+                ids = ppe.encode_rendered_prompt(tokenizer, text, encode_kwargs)
+            fallback.assert_called_once()
+            self.assertEqual(ids, tokenizer.encode(text, **encode_kwargs))
+
+        lstrip = _tokenizer(
+            lambda b: b.add_tokens(
+                [AddedToken("<|tool|>", normalized=False, lstrip=True)]
+            )
+        )
+        cases = {
+            "no plan": (_tokenizer(_metaspace), {}),
+            "lstrip added token": (lstrip, {}),
+            "specials asked for": (_tokenizer(_post_processor_adds_bos), {}),
+            "encode kwargs outside the allowlist": (
+                self.tokenizer,
+                {"truncation": False},
+            ),
+        }
+        for name, (tokenizer, encode_kwargs) in cases.items():
+            with self.subTest(name):
+                assert_falls_back(tokenizer, encode_kwargs)
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE.override(False):
+            assert_falls_back(self.tokenizer, {})
+        self._set_min_chars(len(text) + 1)
+        assert_falls_back(self.tokenizer, {})
+
+    def test_the_cache_keeps_to_its_token_budget(self):
+        prompts = _conversation_turns(12)
+        with envs.SGLANG_PARALLEL_PROMPT_ENCODE_CACHE_TOKENS.override(2000):
+            for prompt in prompts:
+                self._assert_rendered_matches_encode(self.tokenizer, prompt, ({},))
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertLessEqual(encoder.cached_tokens, 2000)
+        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
+        self.assertTrue(
+            all(
+                len(ids) <= 2000 // ppe._SEGMENT_CACHE_MAX_ENTRY_SHARE
+                for ids in encoder.cache.values()
+            )
+        )
+
+    def test_concurrent_requests_get_their_own_ids(self):
+        prompts = _conversation_turns(8)
+        expected = {
+            p: self.tokenizer.encode(p, add_special_tokens=False) for p in prompts
+        }
+
+        def run(prompt):
+            return prompt, ppe.encode_rendered_prompt(
+                self.tokenizer, prompt, {"add_special_tokens": False}
+            )
+
+        with ThreadPoolExecutor(8) as pool:
+            for prompt, ids in pool.map(run, prompts * 4):
+                self.assertEqual(ids, expected[prompt])
+        encoder = ppe._segment_encoder_for(self.tokenizer)
+        self.assertEqual(encoder.cached_tokens, sum(map(len, encoder.cache.values())))
 
 
 if __name__ == "__main__":

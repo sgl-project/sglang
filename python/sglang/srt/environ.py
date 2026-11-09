@@ -1879,6 +1879,9 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    # Token ids kept per tokenizer for text between added tokens, so a multi-turn
+    # prompt encodes only its new messages (4 bytes per id).
+    SGLANG_PARALLEL_PROMPT_ENCODE_CACHE_TOKENS = EnvInt(1 << 24)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

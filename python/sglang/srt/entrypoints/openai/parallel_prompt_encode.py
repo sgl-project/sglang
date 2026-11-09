@@ -31,7 +31,13 @@ the prompt is not scanned and no length threshold applies, and the ids of the
 text between them are cached per tokenizer: text that recurs across requests,
 like the system prompt, the tool list and earlier turns, is encoded once.
 
-Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.
+``encode_rendered_prompt`` gives a prompt rendered to one string (a Jinja chat
+template) the same reuse: it cuts the text at the backend's own added-token
+matches and encodes the pieces through that cache, so each turn of a growing
+conversation encodes only its new messages.
+
+Gated by SGLANG_PARALLEL_PROMPT_ENCODE and SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS;
+SGLANG_PARALLEL_PROMPT_ENCODE_CACHE_TOKENS bounds the cache.
 """
 
 import json
@@ -41,6 +47,7 @@ import re
 import threading
 import time
 import weakref
+from array import array
 from collections import OrderedDict
 from itertools import chain
 
@@ -53,9 +60,9 @@ logger = logging.getLogger(__name__)
 _MIN_CHUNK_CHARS = 2048
 _MAX_CHUNKS = 64
 
-# Per tokenizer; a text longer than the entry limit is encoded but not kept.
-_SEGMENT_CACHE_MAX_TOKENS = 1 << 20
-_SEGMENT_CACHE_MAX_ENTRY_TOKENS = _SEGMENT_CACHE_MAX_TOKENS // 8
+# A segment holding more than this share of the cache budget is encoded but
+# not kept, so one huge segment cannot flush the rest.
+_SEGMENT_CACHE_MAX_ENTRY_SHARE = 8
 
 # Pre-tokenizers that act on each piece independently of its position in the
 # sequence. Metaspace (prepend_scheme="first") and anything unknown are not.
@@ -346,6 +353,17 @@ class _SegmentEncoder:
             cuts = self.cuts[segment] = _cuts_at(segment, self.added_tokens)
         return token_id if cuts else None
 
+    def split_at_added_tokens(self, text):
+        """``text`` as segments with each of the backend's added-token matches on
+        its own: the pieces the backend itself encodes independently."""
+        segments, pos = [], 0
+        for start, end in _added_spans(text, self.pattern, self.npattern):
+            segments.append(text[pos:start])
+            segments.append(text[start:end])
+            pos = end
+        segments.append(text[pos:])
+        return segments
+
     def encode(self, segments):
         layout, run = [], []
         for segment in segments:
@@ -396,20 +414,23 @@ class _SegmentEncoder:
         encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
-            encoded[text] = tuple(
-                chain.from_iterable(e.ids for e in encodings[start : start + count])
+            # 4 bytes per id: agentic prompts keep hundreds of thousands per turn.
+            encoded[text] = array(
+                "I",
+                chain.from_iterable(e.ids for e in encodings[start : start + count]),
             )
             start += count
 
+        max_tokens = envs.SGLANG_PARALLEL_PROMPT_ENCODE_CACHE_TOKENS.get()
         with self.lock:
             for text, ids in encoded.items():
                 if (
                     text not in self.cache
-                    and len(ids) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS
+                    and len(ids) <= max_tokens // _SEGMENT_CACHE_MAX_ENTRY_SHARE
                 ):
                     self.cache[text] = ids
                     self.cached_tokens += len(ids)
-            while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
+            while self.cached_tokens > max_tokens:
                 self.cached_tokens -= len(self.cache.popitem(last=False)[1])
         return encoded
 
@@ -427,15 +448,14 @@ def _segment_encoder_for(tokenizer):
     return encoder
 
 
-def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
-    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
-    encode_kwargs)``."""
-    encode_kwargs = encode_kwargs or {}
-    encoder = None
-    if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() and not (
+def _usable_segment_encoder(tokenizer, encode_kwargs):
+    """The tokenizer's segment encoder, or None where its ids could differ from
+    ``tokenizer.encode(text, **encode_kwargs)``."""
+    if not envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() or (
         set(encode_kwargs) - {"add_special_tokens"}
     ):
-        encoder = _segment_encoder_for(tokenizer)
+        return None
+    encoder = _segment_encoder_for(tokenizer)
     if (
         encoder is None
         or (encode_kwargs.get("add_special_tokens", True) and encoder.specials_added)
@@ -443,5 +463,30 @@ def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
         or encoder.backend.padding is not None
         or encoder.backend.encode_special_tokens
     ):
+        return None
+    return encoder
+
+
+def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
+    encode_kwargs)``."""
+    encode_kwargs = encode_kwargs or {}
+    encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    if encoder is None:
         return parallel_prompt_encode(tokenizer, "".join(segments), encode_kwargs)
     return encoder.encode(segments)
+
+
+def encode_rendered_prompt(tokenizer, text, encode_kwargs=None):
+    """Drop-in for ``parallel_prompt_encode(tokenizer, text, encode_kwargs)``
+    that reuses the cached ids of text between added tokens across requests."""
+    encode_kwargs = encode_kwargs or {}
+    if (
+        not isinstance(text, str)
+        or len(text) < envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+    ):
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    encoder = _usable_segment_encoder(tokenizer, encode_kwargs)
+    if encoder is None:
+        return parallel_prompt_encode(tokenizer, text, encode_kwargs)
+    return encoder.encode(encoder.split_at_added_tokens(text))
