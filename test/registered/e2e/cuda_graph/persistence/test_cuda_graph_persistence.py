@@ -13,9 +13,10 @@ only, since its full-backend prefill capture fails in SGLang (the GDN
 out-of-graph metadata is decode-only); and Qwen3-30B-A3B-FP8 with EAGLE3
 speculative decoding plus full-backend prefill graphs, which exercises the
 prefill set and the three decode-type graph kinds. Every engine runs with the
-environment pins of Foundry's recipes (_ENGINE_ENV).
-test_cuda_graph_persistence_nightly.py covers full-backend prefill graphs on a
-dense model (Qwen3-1.7B).
+environment pins of Foundry's recipes (_ENGINE_ENV); each engine prints its
+launch-to-ready time and LOAD its per-set capture-loop numbers.
+test_cuda_graph_persistence_nightly.py runs the second configuration without
+the pins, as the comparison.
 
 Needs the optional dependency sglang[foundry] (the CUDA CI installs it).
 
@@ -27,6 +28,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import unittest
 
 import requests
@@ -76,6 +78,11 @@ _DECODE_LOADED = re.compile(
 _PREFILL_LOADED = re.compile(
     r"\[Foundry\] Loaded (\d+) SGLang prefill graphs in ([0-9.]+)s"
 )
+# LOAD's capture loop per graph set: wall, shapes, restore and SGLang's per-shape prep.
+_LOAD_LOOP = re.compile(
+    r"\[Foundry\] SGLang (\w+) capture loop on LOAD: ([0-9.]+)s \((\d+) shapes, "
+    r"restore ([0-9.]+)s, per-shape prep ([0-9.]+)s\)"
+)
 _PREFILL_PASSES = re.compile(
     r'^sglang:cuda_graph_passes_total\{[^}]*mode="prefill_cuda_graph"[^}]*\}'
     r"\s+([0-9.eE+-]+)$",
@@ -123,6 +130,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
     decode_kinds = [None]
     # Appended to the server args of every engine (subclasses: speculative decoding).
     extra_server_args = []
+    # Environment of every engine; the nightly comparison runs without the pins.
+    engine_env = _ENGINE_ENV
     process = None
     tmp = None
 
@@ -180,14 +189,16 @@ class TestFoundryGraphPersistence(CustomTestCase):
         err_path = os.path.join(cls.tmp, f"{name}.err")
         result = {}
         with open(out_path, "w") as out, open(err_path, "w") as err:
+            t_launch = time.perf_counter()
             cls.process = popen_launch_server(
                 cls.model,
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=cls.server_args + cls._persistence_args(mode),
-                env=_ENGINE_ENV,
+                env=cls.engine_env,
                 return_stdout_stderr=(out, err),
             )
+            result["ready_s"] = time.perf_counter() - t_launch
             try:
                 passes_before = _prefill_graph_passes(cls.base_url)
                 # One request at a time, then all prompts as one batch (batch encode).
@@ -215,6 +226,16 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 cls.process = None
         with open(err_path) as f_err, open(out_path) as f_out:
             result["log"] = f_err.read() + f_out.read()
+        # Startup numbers for the log: compared across engines (and against the
+        # nightly run without the environment pins), not asserted.
+        loops = "; ".join(
+            f"{kind}: {int(n)} shapes, restore {restore}s, prep {prep}s"
+            for kind, _, n, restore, prep in _LOAD_LOOP.findall(result["log"])
+        )
+        print(
+            f"[Foundry e2e] {cls.__name__} {name}: launch -> ready {result['ready_s']:.1f}s"
+            + (f"; LOAD capture loop {loops}" if loops else "")
+        )
         return result
 
     @classmethod
