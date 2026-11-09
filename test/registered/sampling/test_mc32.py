@@ -198,3 +198,55 @@ def test_gpu_sampler_keeps_response_rng_and_mixed_rows():
         atol=3e-5,
         rtol=1e-6,
     )
+
+
+@pytest.mark.parametrize("phase", ["prefill", "decode"])
+def test_candidate_arrays_never_become_python_scalars(monkeypatch, phase):
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+    from sglang.srt.managers.scheduler_components.batch_result_processor import (
+        SchedulerBatchResultProcessor,
+    )
+
+    original = torch.Tensor.tolist
+
+    def forbid_candidate_lists(tensor):
+        assert tensor.numel() < 32, (
+            "candidate tensors must never become Python scalar lists"
+        )
+        return original(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", forbid_candidate_lists)
+    output = LogitsProcessorOutput(
+        next_token_logits=None,
+        next_token_logprobs=torch.tensor([-0.1, -0.2]),
+        next_token_top_logprobs_val=torch.full((2, 32), -1.0, dtype=torch.float32),
+        next_token_top_logprobs_idx=torch.ones((2, 32), dtype=torch.int32),
+    )
+    batch = SimpleNamespace(
+        return_logprob=True,
+        reqs=[
+            SimpleNamespace(sampling_params=SamplingParams(array_output_logprobs=True))
+            for _ in range(2)
+        ],
+        spec_algorithm=SimpleNamespace(is_none=lambda: True),
+    )
+    if phase == "prefill":
+        SchedulerBatchResultProcessor.move_logprobs_to_cpu(
+            None, batch=batch, logits_output=output
+        )
+    else:
+        SchedulerBatchResultProcessor._normalize_decode_outputs(
+            None,
+            batch=batch,
+            result=None,
+            logits_output=output,
+            next_token_ids=torch.tensor([1, 2]),
+        )
+    assert all(
+        isinstance(row, np.ndarray) and row.dtype == np.float32
+        for row in output.next_token_top_logprobs_val
+    )
+    assert all(
+        isinstance(row, np.ndarray) and row.dtype == np.int32
+        for row in output.next_token_top_logprobs_idx
+    )

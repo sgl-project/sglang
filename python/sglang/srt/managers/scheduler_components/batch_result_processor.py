@@ -93,6 +93,32 @@ def _get_speculative_output_stride(result: GenerationBatchResult) -> int:
     return stride
 
 
+def convert_output_score_rows(
+    logits_output: LogitsProcessorOutput, reqs: List[Req]
+) -> None:
+    """Finish host score conversion after D2H, for both prefill and decode.
+
+    Array requests keep candidate rows as NumPy views. Legacy/speculative
+    outputs retain the existing list representation, including expanded rows.
+    """
+    if logits_output.next_token_top_logprobs_val is None:
+        return
+    preserve = [req.sampling_params.array_output_logprobs for req in reqs]
+    for suffix, dtype in (("val", "float32"), ("idx", "int32")):
+        name = "next_token_top_logprobs_" + suffix
+        rows = getattr(logits_output, name)
+        if any(preserve):
+            if len(rows) != len(reqs):
+                raise ValueError("Array scores require one output row per request")
+            rows = [
+                row.cpu().numpy().astype(dtype, copy=False) if flag else row.tolist()
+                for row, flag in zip(rows, preserve)
+            ]
+        else:
+            rows = [row.tolist() for row in rows]
+        setattr(logits_output, name, rows)
+
+
 @dataclass(kw_only=True, slots=True, frozen=True)
 class SchedulerBatchResultProcessor:
     is_generation: bool
@@ -537,23 +563,7 @@ class SchedulerBatchResultProcessor:
                 logits_output.input_token_logprobs = tuple(
                     logits_output.input_token_logprobs.tolist()
                 )
-            if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = [
-                    v.cpu().numpy().astype("float32", copy=False)
-                    if req.sampling_params.array_output_logprobs
-                    else v.tolist()
-                    for req, v in zip(
-                        batch.reqs, logits_output.next_token_top_logprobs_val
-                    )
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.cpu().numpy().astype("int32", copy=False)
-                    if req.sampling_params.array_output_logprobs
-                    else x.tolist()
-                    for req, x in zip(
-                        batch.reqs, logits_output.next_token_top_logprobs_idx
-                    )
-                ]
+            convert_output_score_rows(logits_output, batch.reqs)
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
                     v.tolist() for v in logits_output.next_token_token_ids_logprobs_val
@@ -1123,13 +1133,7 @@ class SchedulerBatchResultProcessor:
 
         if batch.return_logprob:
             next_token_logprobs = logits_output.next_token_logprobs.tolist()
-            if logits_output.next_token_top_logprobs_val is not None:
-                logits_output.next_token_top_logprobs_val = [
-                    v.tolist() for v in logits_output.next_token_top_logprobs_val
-                ]
-                logits_output.next_token_top_logprobs_idx = [
-                    x.tolist() for x in logits_output.next_token_top_logprobs_idx
-                ]
+            convert_output_score_rows(logits_output, batch.reqs)
 
             if logits_output.next_token_token_ids_logprobs_val:
                 logits_output.next_token_token_ids_logprobs_val = [
