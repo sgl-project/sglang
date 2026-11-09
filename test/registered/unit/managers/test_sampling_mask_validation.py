@@ -28,7 +28,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         self.manager.validate_total_tokens = False
         self.manager.is_generation = True
         self.manager.model_config = SimpleNamespace(
-            joint_head_config=None, pointer_head=None
+            joint_head_config=None, pointer_head=None, vocab_size=128
         )
 
     def _validate(
