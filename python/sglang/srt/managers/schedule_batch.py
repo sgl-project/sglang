@@ -2446,9 +2446,15 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 if embeds_to_add:
                     has_replace_embeds = True
                     indices, positions = zip(*embeds_to_add)
-                    all_replace_embeds.append(
-                        req.positional_embed_overrides.embeds[list(indices)]
-                    )
+                    embeds = req.positional_embed_overrides.embeds
+                    if len(indices) != embeds.shape[0]:
+                        # A Python-list index on a device tensor is a blocking H2D copy.
+                        embeds = embeds[
+                            async_h2d(
+                                list(indices), dtype=torch.long, device=embeds.device
+                            )
+                        ]
+                    all_replace_embeds.append(embeds)
                     all_replace_positions.extend(positions)
             input_id_pointer += input_id_lens[i]
 
@@ -2551,7 +2557,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             replace_embeds_tensor = torch.cat(all_replace_embeds, dim=0).to(
                 self.device, non_blocking=True
             )
-            replace_positions_tensor = torch.tensor(
+            replace_positions_tensor = async_h2d(
                 all_replace_positions, dtype=torch.long, device=self.device
             )
         else:
