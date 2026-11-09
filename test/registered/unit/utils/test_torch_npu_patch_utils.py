@@ -77,12 +77,32 @@ class TestTorchNPUPatchUtils(CustomTestCase):
         self.assertIs(apply.call_args.args[0], self.patches)
         module._apply_all_patches.assert_not_called()
 
+    def test_relocated_api_does_not_require_apply_all_patches(self):
+        module, apply = self.new_api()
+        del module._apply_all_patches
+        apply_torch_npu_patches(module, self.patches)
+        apply.assert_called_once_with(self.patches)
+        self.assert_replacements_applied()
+
+    def test_apply_all_patches_alone_is_not_a_replacement_api(self):
+        module = SimpleNamespace(_apply_all_patches=Mock())
+        with self.assertRaisesRegex(AttributeError, "monkey_patches"):
+            apply_torch_npu_patches(module, self.patches)
+        module._apply_all_patches.assert_not_called()
+
     def test_legacy_entrypoint_takes_precedence_when_both_exist(self):
         module, relocated_apply = self.new_api()
         module._apply_patches = Mock(side_effect=apply_requested_patches)
         apply_torch_npu_patches(module, self.patches)
         self.assert_replacements_applied()
         relocated_apply.assert_not_called()
+        module._apply_all_patches.assert_not_called()
+
+    def test_replacement_failure_is_not_reported_as_missing_api(self):
+        module, apply = self.new_api()
+        apply.side_effect = AttributeError("invalid replacement destination")
+        with self.assertRaisesRegex(AttributeError, "invalid replacement destination"):
+            apply_torch_npu_patches(module, self.patches)
         module._apply_all_patches.assert_not_called()
 
     def test_unsupported_api_is_not_silently_accepted(self):

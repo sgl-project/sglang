@@ -14,7 +14,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from sglang.multimodal_gen.runtime.utils.npu_profile_analysis import analyze_npu_profile
+from sglang.srt.observability.profile_analysis_npu import analyze_npu_profile
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 def daemon_worker(directory):

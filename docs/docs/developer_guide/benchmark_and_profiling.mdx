@@ -78,6 +78,14 @@ Use `bench_serving` by default unless there are specific needs.
 
 [Pytorch Profiler](https://pytorch.org/tutorials/recipes/recipes/profiler_recipe.html) is a convenient basic tool to inspect kernel execution time, call stack, and kernel overlap and occupancy.
 
+On Ascend NPU, traces use the native
+`*_ascend_pt/ASCEND_PROFILER_OUTPUT/trace_view.json` layout rather than
+`*.trace.json.gz`. See [Ascend profiling](/docs/hardware-platforms/ascend-npus/optimization/profiling)
+for LLM serving, or [Diffusion profiling](/docs/sglang-diffusion/profiling#ascend-npu-traces)
+for image/video generation. Both parse captures automatically; daemon Diffusion
+workers wait for an independent parser when capture stops, which can pause the
+remaining generation when only part of denoising is profiled.
+
 ### Profile a server with `sglang.benchmark.serving`
 
 ```bash Command

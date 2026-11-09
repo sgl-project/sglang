@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Request-boundary tests: finish parsing automatically, never mask inference errors."""
+"""Request cleanup stops profiling without masking inference errors."""
 
 import unittest
 from types import SimpleNamespace
@@ -14,6 +14,11 @@ class TestDiffusionProfilerContext(unittest.TestCase):
             patch.object(pipeline_executor, "SGLDiffusionProfiler")
         )
         self.profiler = self.factory.return_value
+        self.npu_platform = self.enterContext(
+            patch.object(
+                pipeline_executor.current_platform, "is_npu", return_value=True
+            )
+        )
         self.enterContext(
             patch.object(pipeline_executor, "get_world_rank", return_value=0)
         )
@@ -30,14 +35,13 @@ class TestDiffusionProfilerContext(unittest.TestCase):
         # The profiling context is independent of executor scheduling state.
         return pipeline_executor.PipelineExecutor.profile_execution(None, self.batch)
 
-    def test_request_is_not_complete_until_analysis_finishes(self):
+    def test_request_cleanup_uses_stop_without_a_separate_finish(self):
         with self.context():
-            self.profiler.finish.assert_not_called()
-        self.profiler.finish.assert_called_once_with(dump_rank=0)
-        self.profiler.stop.assert_not_called()
+            self.profiler.stop.assert_not_called()
+        self.profiler.stop.assert_called_once_with(dump_rank=0)
 
     def test_analysis_failure_propagates(self):
-        self.profiler.finish.side_effect = RuntimeError("parser failed")
+        self.profiler.stop.side_effect = RuntimeError("parser failed")
         with self.assertRaisesRegex(RuntimeError, "parser failed"), self.context():
             pass
 
@@ -47,14 +51,21 @@ class TestDiffusionProfilerContext(unittest.TestCase):
                 self.profiler.reset_mock()
                 with self.assertRaises(type(error)), self.context():
                     raise error
-                self.profiler.stop.assert_called_once_with(dump_rank=0)
-                self.profiler.finish.assert_not_called()
+                self.profiler.stop.assert_called_once_with(
+                    export_trace=False, dump_rank=0
+                )
 
     def test_cleanup_error_does_not_replace_inference_error(self):
         self.profiler.stop.side_effect = RuntimeError("stop failed")
         with self.assertRaisesRegex(ValueError, "model failed"), self.context():
             raise ValueError("model failed")
-        self.profiler.finish.assert_not_called()
+        self.profiler.stop.assert_called_once_with(export_trace=False, dump_rank=0)
+
+    def test_non_npu_error_cleanup_preserves_existing_export(self):
+        self.npu_platform.return_value = False
+        with self.assertRaisesRegex(ValueError, "model failed"), self.context():
+            raise ValueError("model failed")
+        self.profiler.stop.assert_called_once_with(export_trace=True, dump_rank=0)
 
     def test_warmup_and_unprofiled_requests_do_not_start_profiler(self):
         for profile, warmup in ((False, False), (True, True)):

@@ -1,14 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Run NPU trace analysis outside daemon workers, without importing the runtime.
+"""NPU trace handling shared by serving and diffusion profilers.
 
-The worker imports ``analyze_npu_profile``. The parser is exec'ed by file path
-so its fresh interpreter does not initialize SGLang or inherit an NPU context.
-Only the parser imports torch_npu; all output stays in the current capture.
+Non-daemon workers keep native analysis. Daemon workers export raw data and
+parse it in a fresh interpreter after capture stops. The parser is exec'ed by
+file path without importing SGLang or inheriting the worker's NPU context.
 """
 
 import argparse
 import contextlib
 import ctypes
+import multiprocessing
 import os
 import signal
 import subprocess
@@ -17,6 +18,33 @@ import traceback
 from pathlib import Path
 
 _ANALYSIS_TIMEOUT_S = 600
+
+
+def get_torch_npu():
+    # Keep the standalone parser entrypoint free of SGLang runtime imports.
+    from sglang.srt.utils import is_npu
+
+    if not is_npu():
+        raise RuntimeError("NPU profiling requires an available NPU")
+    import torch_npu
+
+    return torch_npu
+
+
+class NPUTraceHandler:
+    """Configure native capture and export a stopped daemon-worker capture."""
+
+    def __init__(self, log_dir: str):
+        self.npu_auto_analysis_in_daemon = multiprocessing.current_process().daemon
+        self.on_trace_ready = get_torch_npu().profiler.tensorboard_trace_handler(
+            log_dir, analyse_flag=not self.npu_auto_analysis_in_daemon
+        )
+
+    def export(self, profiler) -> Path | None:
+        if self.npu_auto_analysis_in_daemon:
+            return analyze_npu_profile(profiler.prof_if.prof_path)
+        # The native callback already parsed this capture.
+        return None
 
 
 def _trace_path(directory: Path) -> Path:
@@ -41,7 +69,7 @@ def analyze_npu_profile(
     command = [
         sys.executable,
         "-c",
-        # run_path avoids putting utils/ on sys.path (it contains argparse.py).
+        # Keep the script directory off sys.path without importing SGLang.
         "import runpy, sys; sys.argv = sys.argv[1:]; "
         "runpy.run_path(sys.argv[0], run_name='__main__')",
         str(Path(__file__).resolve()),

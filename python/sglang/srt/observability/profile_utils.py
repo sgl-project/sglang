@@ -17,6 +17,7 @@ from sglang.srt.model_executor.step_span_utils import (
     detailed_annotations_enabled,
     set_detailed_annotations_enabled,
 )
+from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
@@ -335,6 +336,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             activity_map[a] for a in self.activities if a in activity_map
         ]
 
+        self.npu_trace_handler = NPUTraceHandler(self.output_dir) if _is_npu else None
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,
             with_stack=self.with_stack if self.with_stack is not None else True,
@@ -342,9 +344,9 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 self.record_shapes if self.record_shapes is not None else False
             ),
             on_trace_ready=(
-                None
-                if not _is_npu
-                else torch_npu.profiler.tensorboard_trace_handler(self.output_dir)
+                self.npu_trace_handler.on_trace_ready
+                if self.npu_trace_handler is not None
+                else None
             ),
         )
         self.torch_profiler.start()
@@ -353,7 +355,9 @@ class _ProfilerTorch(_ProfilerConcreteBase):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
         self.torch_profiler.stop()
-        if not _is_npu:
+        if self.npu_trace_handler is not None:
+            self.npu_trace_handler.export(self.torch_profiler)
+        else:
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 

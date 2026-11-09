@@ -71,13 +71,59 @@ trace adds overhead.
 
 ### Output Location
 
-By default, trace files are saved in the ./logs/ directory.
+Trace output uses the first available setting:
 
-The exact output file path will be shown in the console output, for example:
+1. An explicit `log_dir` passed to the Python profiler wrapper.
+2. `SGLANG_DIFFUSION_TORCH_PROFILER_DIR`.
+3. `SGLANG_TORCH_PROFILER_DIR`.
+4. `./logs/`.
+
+Relative paths are resolved in the generation worker's working directory. For
+API requests, configure the directory on the server.
+
+On CUDA and other backends using Chrome trace export, the console shows the
+output path, for example:
 
 ```bash
 [mm-dd hh:mm:ss] Saved profiler traces to: /sgl-workspace/sglang/logs/mocked_fake_id_for_offline_generate-5_steps-global-rank0.trace.json.gz
 ```
+
+### Ascend NPU traces
+
+On Linux with an Ascend NPU deployment and its matching `torch_npu`/CANN
+installation, use the same `--profile`, `--num-profiled-timesteps`, and
+`--profile-all-stages` controls. No separate parsing command is required.
+
+NPU traces use the native Ascend directory layout rather than the
+`*.trace.json.gz` filename above:
+
+```text
+<output_dir>/<hostname>_<pid>_<timestamp>_ascend_pt/
+  ASCEND_PROFILER_OUTPUT/trace_view.json
+  sglang_analysis.log
+```
+
+Diffusion workers are daemon processes, where the native NPU analyzer cannot
+create its multiprocessing pool. SGLang saves the raw capture, then starts an
+independent parser immediately after profiling stops and waits for it to finish.
+The parser handles only that worker's capture directory. Each participating rank
+produces its own trace; check the `Saved NPU profiler trace to:` log for its path.
+Non-daemon callers keep native automatic parsing.
+
+<Note>
+With partial denoising profiling, parsing temporarily pauses the remaining
+generation steps. With `--profile-all-stages`, parsing runs when pipeline
+profiling stops. These timings include profiling and parsing overhead; do not
+use them as an unprofiled latency benchmark.
+</Note>
+
+The independent parser has a 600-second timeout. Parser errors, timeouts, or a
+missing/empty `trace_view.json` fail the profiled request. Raw data and
+`sglang_analysis.log` remain in the capture directory for diagnosis or
+[optional re-parsing](/docs/hardware-platforms/ascend-npus/optimization/profiling#6-re-parsing-raw-data-optional).
+Cancellation or worker exit cleans up the independent parser and its process
+pool. A nonempty trace confirms an artifact was produced, not that every
+expected event is present; inspect the trace and any native profiler warnings.
 
 ### View Traces
 
