@@ -139,4 +139,26 @@ python test/run_suite.py --hw mlu --suite pr-test-1-mlu
 python test/run_suite.py --hw mlu --suite pr-test-2-mlu
 ```
 
-These tests validate the MLU RMSNorm implementation and SGLang communicator collectives without loading a model or starting an inference server.
+These suites validate MLU operators, paged attention, and SGLang communicator collectives without loading a model or starting an inference server.
+
+## Serve Qwen3 on MLU
+
+Run Qwen3-8B in BF16 with tensor parallelism across two MLUs:
+
+```bash
+python -m sglang.launch_server \
+  --model-path Qwen/Qwen3-8B \
+  --device mlu --dtype bfloat16 \
+  --tp 2 \
+  --cuda-graph-backend-decode full \
+  --cuda-graph-backend-prefill breakable \
+  --port 30000
+```
+
+Use `--tp 1` for a single MLU, or add `--dp 2` with `--tp 1` to run two data-parallel replicas. Each replica uses its own MLU and model weights. Use `disabled` for both graph backends to run in eager mode.
+
+The model integration suite covers eager/graph parity, TP1, TP2, DP2, prefix-cache reuse, chunked prefill, and MLU profiling:
+
+```bash
+python test/run_suite.py --hw mlu --suite nightly-test-2-mlu
+```

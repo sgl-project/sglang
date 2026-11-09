@@ -188,7 +188,7 @@ class SchedulerProfilerManager:
             "GPU": torch.profiler.ProfilerActivity.CUDA,
         }
 
-        if current_platform.is_out_of_tree():
+        if current_platform.is_out_of_tree() or current_platform.is_mlu():
             if hasattr(
                 torch.profiler.ProfilerActivity,
                 current_platform.get_torch_profiler_activity_str(),
@@ -198,6 +198,8 @@ class SchedulerProfilerManager:
                 )
         if hasattr(torch.profiler.ProfilerActivity, "XPU"):
             activity_map["XPU"] = torch.profiler.ProfilerActivity.XPU
+        if current_platform.is_mlu():
+            activity_map["GPU"] = current_platform.get_torch_profiler_activity()
         torchprof_activities = [
             activity_map[a] for a in activities if a in activity_map
         ]

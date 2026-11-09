@@ -69,7 +69,7 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
     capabilities = PlatformCapabilities(
         supports_triton=True,
-        graph_capture=False,
+        graph_capture=True,
         piecewise_graph=False,
         hicache_device_kernels=False,
         supports_pynccl=False,
@@ -114,3 +114,19 @@ class MluSRTPlatform(MluDeviceMixin, SRTPlatform):
 
             return MLUMHATokenToKVPool
         return None
+
+    def get_graph_runner_cls(self):
+        from sglang.srt.hardware_backend.mlu.graph import DecodeMluGraphRunner
+
+        return DecodeMluGraphRunner
+
+    def get_full_graph_backend_cls(self):
+        from sglang.srt.hardware_backend.mlu.graph import FullMluGraphBackend
+
+        return FullMluGraphBackend
+
+    def get_torch_profiler_activity_str(self) -> str:
+        return "MLU"
+
+    def get_torch_profiler_activity(self):
+        return torch.profiler.ProfilerActivity.MLU

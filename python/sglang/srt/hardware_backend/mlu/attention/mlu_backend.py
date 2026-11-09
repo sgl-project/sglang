@@ -63,8 +63,9 @@ class MLUAttnBackend(AttentionBackend):
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.kv_cache_dtype = model_runner.kv_cache_dtype
         self.forward_metadata = None
+        self._graph_metadata = {}
 
-    def init_forward_metadata(self, forward_batch):
+    def init_forward_metadata_out_graph(self, forward_batch, in_capture=False):
         fb = forward_batch
         if fb.forward_mode.is_idle():
             return
@@ -76,9 +77,20 @@ class MLUAttnBackend(AttentionBackend):
         )
         seq_lens = fb.seq_lens.to(torch.int32)
         if fb.forward_mode.is_decode():
-            meta = ForwardMetadata(
-                tables, seq_lens, max_seq_len_kv=self.max_context_len
-            )
+            # Captured decode shapes keep stable tensor addresses across replays.
+            # Eager-only batch sizes must not retain full page tables.
+            meta = self._graph_metadata.get(fb.batch_size)
+            if meta is None:
+                meta = ForwardMetadata(
+                    tables,
+                    seq_lens.clone() if in_capture else seq_lens,
+                    max_seq_len_kv=self.max_context_len,
+                )
+                if in_capture:
+                    self._graph_metadata[fb.batch_size] = meta
+            else:
+                meta.block_tables.copy_(tables)
+                meta.seq_lens.copy_(seq_lens)
         elif fb.forward_mode == ForwardMode.EXTEND or fb.forward_mode.is_mixed():
             prefill_count = fb.batch_size
             if fb.forward_mode.is_mixed():
@@ -117,6 +129,12 @@ class MLUAttnBackend(AttentionBackend):
                 f"Unsupported MLU attention forward mode: {fb.forward_mode}"
             )
         self.forward_metadata = meta
+
+    def init_cuda_graph_state(self, max_bs, max_num_tokens):
+        self._graph_metadata = {}
+
+    def get_cuda_graph_seq_len_fill_value(self):
+        return 1
 
     @staticmethod
     def _validate_attention(layer, sinks, return_lse):
