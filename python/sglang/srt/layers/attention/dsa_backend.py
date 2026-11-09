@@ -1398,13 +1398,14 @@ class DeepseekSparseAttnBackend(
     ) -> torch.Tensor:
         # DCP prefill: the batch's KV rows from all ranks, request after request
         # in position order, padded to whole pages (the ragged top-k layout)
+        assert metadata.dcp_local_kv_rows is not None
         rows = kv_cache.view(torch.uint8).view(-1, self.kv_cache_dim)
         gathered = dcp_gather_request_rows(
-            rows[metadata.dcp_local_kv_rows], forward_batch.seq_lens_cpu
+            rows,
+            forward_batch.seq_lens_cpu,
+            row_ids=metadata.dcp_local_kv_rows,
+            page_size=self.physical_page_size,
         )
-        pad = -gathered.shape[0] % self.physical_page_size
-        if pad:
-            gathered = torch.cat([gathered, gathered.new_zeros(pad, gathered.shape[1])])
         return gathered.view(kv_cache.dtype)
 
     def _transform_table_1_to_real(self, page_table: torch.Tensor) -> torch.Tensor:

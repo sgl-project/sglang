@@ -60,7 +60,6 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import 
 )
 from sglang.srt.distributed.parallel_state import in_the_same_node_as
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
-from sglang.srt.layers.dcp.comm import all_gather_kv_cache_for_dcp
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import print_info_once
 
@@ -534,17 +533,89 @@ def dcp_local_topk(
     return dcp_localize_compact(slots, out_len)[0]
 
 
+# (seq_lens, dcp_size, dcp_rank, device) -> plan; every layer of a batch reuses its batch's plan
+_REQUEST_ROWS_PLAN: dict = {}
+
+
+def request_rows_plan(
+    seq_lens_cpu: torch.Tensor, dcp_size: int, dcp_rank: int, device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Index maps of the DCP prefill gather (positions from 0, one-token interleave).
+
+    Every rank sends ceil(seq_len / dcp_size) slots per request. Returns
+    ``send``: this rank's local row for each slot (pad slots read row 0),
+    ``recv``: the all-gathered row of each request position, request after
+    request, and the slot count per rank.
+    """
+    key = (tuple(seq_lens_cpu.tolist()), dcp_size, dcp_rank, device)
+    plan = _REQUEST_ROWS_PLAN.get(key)
+    if plan is not None:
+        return plan
+    lens = seq_lens_cpu.to(torch.int64)
+    slots = (lens + dcp_size - 1) // dcp_size
+    owned = (lens - dcp_rank + dcp_size - 1) // dcp_size
+    num_slots, num_rows = int(slots.sum()), int(lens.sum())
+
+    def starts(x: torch.Tensor) -> torch.Tensor:
+        return (torch.cumsum(x, 0) - x).to(device)
+
+    reqs = torch.arange(len(lens), device=device)
+    lens_d, slots_d, owned_d = lens.to(device), slots.to(device), owned.to(device)
+    req = torch.repeat_interleave(reqs, slots_d, output_size=num_slots)
+    j = torch.arange(num_slots, device=device) - starts(slots)[req]
+    send = torch.where(j < owned_d[req], starts(owned)[req] + j, 0)
+    req = torch.repeat_interleave(reqs, lens_d, output_size=num_rows)
+    pos = torch.arange(num_rows, device=device) - starts(lens)[req]
+    recv = (pos % dcp_size) * num_slots + starts(slots)[req] + pos // dcp_size
+    _REQUEST_ROWS_PLAN.clear()
+    _REQUEST_ROWS_PLAN[key] = plan = (send, recv, num_slots)
+    return plan
+
+
+def _as_words(rows: torch.Tensor) -> torch.Tensor:
+    # index_select moves whole rows faster as 8- or 4-byte words than as bytes
+    width = rows.shape[-1]
+    for dtype, size in ((torch.int64, 8), (torch.int32, 4)):
+        if width % size == 0 and rows.is_contiguous():
+            return rows.view(dtype)
+    return rows
+
+
 def dcp_gather_request_rows(
-    local_rows: torch.Tensor, seq_lens_cpu: torch.Tensor
+    local_rows: torch.Tensor,
+    seq_lens_cpu: torch.Tensor,
+    *,
+    row_ids: Optional[torch.Tensor] = None,
+    page_size: int = 1,
 ) -> torch.Tensor:
     """Prefill: every request's cache rows from all ranks, in position order.
 
     ``local_rows``: [sum of this rank's shares, W] uint8, request by request
-    in local position order. Returns [sum(seq_lens), W]: request after
-    request, the rows of positions 0..seq_len-1 (the layout of the ragged
-    top-k indices).
+    in local position order; with ``row_ids``, the whole cache, of which this
+    rank's rows are ``local_rows[row_ids]``. Returns [sum(seq_lens), W]:
+    request after request, the rows of positions 0..seq_len-1 (the layout of
+    the ragged top-k indices), zero-padded to whole ``page_size`` pages.
     """
-    return all_gather_kv_cache_for_dcp(local_rows, local_rows[:, :0], seq_lens_cpu)
+    parallel = get_parallel()
+    send_idx, recv_idx, num_slots = request_rows_plan(
+        seq_lens_cpu, parallel.dcp_size, parallel.dcp_rank, local_rows.device
+    )
+    width = local_rows.shape[1]
+    owned = local_rows.shape[0] if row_ids is None else row_ids.shape[0]
+    if owned == 0:  # every slot of this rank is padding
+        send = local_rows.new_empty((num_slots, width))
+    else:
+        src = send_idx if row_ids is None else row_ids[send_idx]
+        send = _as_words(local_rows).index_select(0, src).view(torch.uint8)
+    gathered = local_rows.new_empty((parallel.dcp_size * num_slots, width))
+    parallel.dcp_group.all_gather_into_tensor(gathered, send.view(torch.uint8))
+    num_rows = recv_idx.shape[0]
+    out = local_rows.new_empty((num_rows + (-num_rows % page_size), width))
+    torch.index_select(
+        _as_words(gathered), 0, recv_idx, out=_as_words(out)[:num_rows]
+    )
+    out[num_rows:].zero_()
+    return out
 
 
 class DcpFusedTopK:
