@@ -63,7 +63,7 @@ class TestNixlBootstrapResilience(CustomTestCase):
             kv_data_ptrs=[4096, 8192],
             kv_data_lens=[256, 256],
             kv_item_lens=[16, 16],
-            kv_mem_kinds=["VRAM", "VRAM"],
+            kv_data_mem_kinds=["VRAM", "VRAM"],
             kv_layer_ids=[0, 1],
             aux_data_ptrs=[12288],
             aux_item_lens=[8],
