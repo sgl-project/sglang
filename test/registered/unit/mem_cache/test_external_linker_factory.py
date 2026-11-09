@@ -185,7 +185,7 @@ class TestExternalLinkerConfig(unittest.TestCase):
                         unified_cache_external_linker_config=config,
                     )
                 )
-        for key in ("load_mode", "prefetch_policy"):
+        for key in ("load_mode", "prefetch_policy", "offload"):
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, key):
                 handle_hicache(
                     ServerArgs(

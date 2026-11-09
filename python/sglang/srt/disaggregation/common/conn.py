@@ -53,11 +53,11 @@ from sglang.srt.disaggregation.utils import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.page_interleave import get_kv_shard_group
+from sglang.srt.mem_cache.unified_cache.linker_factory import linker_stores_kv
 from sglang.srt.observability.trace import TraceNullContext, TraceReqContext
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,
-    get_memory,
     get_observability,
     get_parallel,
     get_schedule,
@@ -1667,7 +1667,7 @@ class CommonKVManager(BaseKVManager):
             "load_balance_method": get_parallel().load_balance_method,
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
-            "stores_to_linker": get_memory().enable_unified_cache_external_linker,
+            "stores_to_linker": linker_stores_kv(),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.

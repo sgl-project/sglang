@@ -59,6 +59,14 @@ def get_startup_linker_config() -> dict[str, Any] | None:
     return deepcopy(config)
 
 
+def linker_stores_kv() -> bool:
+    """Whether this server's external linker writes KV to the store."""
+    if not get_memory().enable_unified_cache_external_linker:
+        return False
+    _, _, offload, _ = parse_linker_load_options(get_startup_linker_config())
+    return offload
+
+
 def create_unified_cache_linker(
     server_args: ServerArgs,
     params: CacheInitParams,
@@ -68,7 +76,9 @@ def create_unified_cache_linker(
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
-    load_mode, prefetch_policy, backend_config = parse_linker_load_options(config)
+    load_mode, prefetch_policy, offload, backend_config = parse_linker_load_options(
+        config
+    )
     extra_config = backend_config
     if backend == "dynamic":
         config = UnifiedCacheLinkerConfig.from_dict(
@@ -120,4 +130,5 @@ def create_unified_cache_linker(
     )
     linker.load_mode = load_mode
     linker.prefetch_policy = prefetch_policy
+    linker.offload_enabled = offload
     return linker

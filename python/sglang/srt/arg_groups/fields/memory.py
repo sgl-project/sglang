@@ -273,9 +273,11 @@ class Memory(msgspec.Struct):
         Arg(
             help=(
                 "JSON configuration for the selected linker backend. Common "
-                "options include load_mode (layer_wise or prefetch) and "
-                "prefetch_policy (best_effort, wait_complete, or timeout). "
-                "Defaults are layer_wise and timeout. Built-in "
+                "options include load_mode (layer_wise or prefetch), "
+                "prefetch_policy (best_effort, wait_complete, or timeout), and "
+                "offload (false loads from the store but never writes to it; "
+                "a PD decode peer then writes the full sequence). Defaults are "
+                "layer_wise, timeout, and true. Built-in "
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "

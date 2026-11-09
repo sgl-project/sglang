@@ -12,7 +12,7 @@ from typing import Any
 
 def parse_linker_load_options(
     config: dict[str, Any] | None,
-) -> tuple[str, str, dict[str, Any]]:
+) -> tuple[str, str, bool, dict[str, Any]]:
     """Separate common load options from backend-specific configuration."""
     if config is not None and not isinstance(config, dict):
         raise ValueError(
@@ -21,11 +21,14 @@ def parse_linker_load_options(
     backend_config = dict(config or {})
     load_mode = backend_config.pop("load_mode", "layer_wise")
     prefetch_policy = backend_config.pop("prefetch_policy", "timeout")
+    offload = backend_config.pop("offload", True)
     if load_mode not in ("layer_wise", "prefetch"):
         raise ValueError(f"Invalid linker load_mode: {load_mode!r}.")
     if prefetch_policy not in ("best_effort", "wait_complete", "timeout"):
         raise ValueError(f"Invalid linker prefetch_policy: {prefetch_policy!r}.")
-    return load_mode, prefetch_policy, backend_config
+    if not isinstance(offload, bool):
+        raise ValueError(f"Invalid linker offload: {offload!r}.")
+    return load_mode, prefetch_policy, offload, backend_config
 
 
 @dataclass(frozen=True)

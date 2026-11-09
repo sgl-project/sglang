@@ -120,5 +120,15 @@ class TestDisaggregationDecodeRadixLinker(PDDisaggregationServerBase):
                 self._flush_device_caches()
 
 
+class TestDisaggregationDecodeRadixLinkerPrefillNoOffload(
+    TestDisaggregationDecodeRadixLinker
+):
+    extra_prefill_args = [
+        *SERVER_ARGS,
+        "--unified-cache-external-linker-config",
+        '{"offload": false}',
+    ]
+
+
 if __name__ == "__main__":
     unittest.main()
