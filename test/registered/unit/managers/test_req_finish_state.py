@@ -2,11 +2,16 @@
 it only through the Req finish methods."""
 
 import unittest
+from array import array
 from pathlib import Path
 from unittest.mock import patch
 
 from sglang.srt.managers import schedule_batch
-from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.req_types import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    FINISH_MATCHED_TOKEN,
+)
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test import field_writes
@@ -93,6 +98,37 @@ class TestReqFinishMethods(CustomTestCase):
         self.assertEqual(list(req.origin_input_ids), [0])
         self.assertEqual(req.logprob_start_len, -1)
         self.assertEqual(req.routed_experts_start_len, 0)
+
+
+class _StopTokenizer:
+    eos_token_id = 3
+    additional_stop_token_ids = {4}
+
+
+class TestModelEosStop(CustomTestCase):
+    def _finished_on(self, token_id, *, stop_on_model_eos, stop_token_ids=None):
+        sampling_params = SamplingParams(
+            max_new_tokens=8, stop_token_ids=stop_token_ids
+        )
+        sampling_params.normalize(tokenizer=None)
+        req = Req("r", "", array("q", [1]), sampling_params, eos_token_ids={2})
+        req.tokenizer = _StopTokenizer()
+        req.stop_on_model_eos = stop_on_model_eos
+        req.output_ids = array("q", [10, token_id])
+        req.update_finish_state(new_accepted_len=1)
+        return isinstance(req.finished_reason, FINISH_MATCHED_TOKEN)
+
+    def test_model_eos_finishes_only_when_stop_on_model_eos(self):
+        """Each model EOS source (config, tokenizer, additional stops) finishes a
+        request by default and none does without stop_on_model_eos; the request's
+        own stop_token_ids finish it either way."""
+        for token_id in (2, 3, 4):
+            with self.subTest(token_id=token_id):
+                self.assertTrue(self._finished_on(token_id, stop_on_model_eos=True))
+                self.assertFalse(self._finished_on(token_id, stop_on_model_eos=False))
+        self.assertTrue(
+            self._finished_on(5, stop_on_model_eos=False, stop_token_ids=[5])
+        )
 
 
 if __name__ == "__main__":

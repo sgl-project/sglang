@@ -236,6 +236,10 @@ class Serving(msgspec.Struct):
             choices=["openai", "model"],
         ),
     ] = "model"
+    disable_model_eos_stop: A[
+        bool,
+        "Don't finish requests on the model's EOS tokens: eos_token_id from the HF config, generation_config.json and the tokenizer, and the tokenizer's additional stop tokens. Requests then stop only on their own stop_token_ids, stop strings and max_new_tokens.",
+    ] = False
     asr_max_buffer_seconds: A[
         int,
         "Maximum seconds of PCM audio the streaming ASR WebSocket handler will accumulate before closing the session with a buffer_overflow error. Guards against OOM when a client streams audio faster than inference can consume it. Default 60s.",

@@ -375,6 +375,24 @@ class TestBatchedMinNewTokensPenalizer(CustomTestCase):
         )
         self.assertFalse(blocked[1].any())
 
+    def test_model_eos_not_blocked_when_not_a_stop(self):
+        """Without stop_on_model_eos only the request's stop_token_ids end it, so only
+        they are blocked, and the tokenizer is never read (it may be None)."""
+        req = _make_req(min_tokens=3, stop_ids={5})
+        req.eos_token_ids = {6}
+        req.stop_on_model_eos = False
+        req.tokenizer = None
+        batch = _make_batch([req])
+        orch = BatchedPenalizerOrchestrator(
+            VOCAB_SIZE, batch, {BatchedMinNewTokensPenalizer}
+        )
+        pen = orch.penalizers[BatchedMinNewTokensPenalizer]
+
+        logits = torch.zeros(1, VOCAB_SIZE)
+        pen.apply(logits)
+        self.assertTrue(torch.isneginf(logits[0, 5]))
+        self.assertEqual(logits[0, 6].item(), 0.0)
+
     def test_filter_keeps_subset(self):
         """Test that filter keeps the second request (min_tokens=5) and drops the first."""
         orch, pen = self._setup([(3, None, 2), (5, None, 2)])

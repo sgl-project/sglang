@@ -599,6 +599,9 @@ class Req(ReqDllmMixin):
         self.to_finish: Optional[BaseFinishReason] = None
         self.stream = stream
         self.eos_token_ids = eos_token_ids
+        # False under --disable-model-eos-stop: the model's EOS tokens (eos_token_ids
+        # and the tokenizer's) don't finish the request; its stop_token_ids still do.
+        self.stop_on_model_eos = True
         self.vocab_size = vocab_size
         self.priority = priority
 
@@ -1299,12 +1302,15 @@ class Req(ReqDllmMixin):
         for i, token_id in enumerate(new_accepted_tokens):
             if self.sampling_params.stop_token_ids:
                 matched_eos |= token_id in self.sampling_params.stop_token_ids
-            if self.eos_token_ids:
-                matched_eos |= token_id in self.eos_token_ids
-            if self.tokenizer is not None:
-                matched_eos |= token_id == self.tokenizer.eos_token_id
-                if self.tokenizer.additional_stop_token_ids:
-                    matched_eos |= token_id in self.tokenizer.additional_stop_token_ids
+            if self.stop_on_model_eos:
+                if self.eos_token_ids:
+                    matched_eos |= token_id in self.eos_token_ids
+                if self.tokenizer is not None:
+                    matched_eos |= token_id == self.tokenizer.eos_token_id
+                    if self.tokenizer.additional_stop_token_ids:
+                        matched_eos |= (
+                            token_id in self.tokenizer.additional_stop_token_ids
+                        )
             if matched_eos:
                 self.finished_reason = FINISH_MATCHED_TOKEN(matched=token_id)
                 matched_pos = len(self.output_ids) - len(new_accepted_tokens) + i

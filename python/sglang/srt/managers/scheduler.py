@@ -3227,7 +3227,9 @@ class Scheduler(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
         """Extension point for request-local state, including session requests."""
-        return Req(*args, **kwargs)
+        req = Req(*args, **kwargs)
+        req.stop_on_model_eos = not get_serving().disable_model_eos_stop
+        return req
 
     def handle_generate_request(
         self,

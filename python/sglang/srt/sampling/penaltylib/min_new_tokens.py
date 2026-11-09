@@ -4,6 +4,15 @@ from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
 from sglang.srt.utils.device import is_pin_memory_available
 
 
+def _stop_token_ids(req) -> set:
+    stop_ids = set(req.sampling_params.stop_token_ids or ())
+    if req.stop_on_model_eos:
+        stop_ids |= req.eos_token_ids or set()
+        stop_ids |= req.tokenizer.additional_stop_token_ids or set()
+        stop_ids.add(req.tokenizer.eos_token_id)
+    return stop_ids
+
+
 class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
     """
     Min new tokens penalizer penalizes tokens based on the length of the output.
@@ -35,16 +44,7 @@ class BatchedMinNewTokensPenalizer(_BatchedPenalizer):
                 torch.tensor(
                     data=[
                         token_id
-                        for token_id in (
-                            (req.sampling_params.stop_token_ids or set())
-                            | (req.eos_token_ids or set())
-                            | (req.tokenizer.additional_stop_token_ids or set())
-                            | (
-                                {req.tokenizer.eos_token_id}
-                                if req.tokenizer.eos_token_id is not None
-                                else set()
-                            )
-                        )
+                        for token_id in _stop_token_ids(req)
                         # Out-of-vocab ids can never be sampled;
                         # scattering them would index outside the penalty tensor.
                         if token_id is not None and 0 <= token_id < vocab_size
