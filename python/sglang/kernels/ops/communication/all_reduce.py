@@ -24,9 +24,15 @@ class AllReduceAlgo(enum.Enum):
     TWO_SHOT_PUSH = enum.auto()
     ONE_SHOT_PULL = enum.auto()
     TWO_SHOT_PULL = enum.auto()
+    # ROCm gfx1250 only, from its own module (ring_simple.py) over the ring plane
+    RING_SIMPLE = enum.auto()
 
     def is_push(self) -> bool:
-        return self in (AllReduceAlgo.ONE_SHOT_PUSH, AllReduceAlgo.TWO_SHOT_PUSH)
+        return self in (
+            AllReduceAlgo.ONE_SHOT_PUSH,
+            AllReduceAlgo.TWO_SHOT_PUSH,
+            AllReduceAlgo.RING_SIMPLE,
+        )
 
     @property
     def algo_name(self) -> str:
@@ -38,6 +44,7 @@ _ALGO_NAMES = {
     AllReduceAlgo.TWO_SHOT_PUSH: "2shot_push",
     AllReduceAlgo.ONE_SHOT_PULL: "1shot_pull",
     AllReduceAlgo.TWO_SHOT_PULL: "2shot_pull",
+    AllReduceAlgo.RING_SIMPLE: "ring_simple",
 }
 
 if TYPE_CHECKING:
@@ -159,6 +166,42 @@ class PullPlane(tvm_ffi.Object):
         )
 
 
+@lazy_register_class("sgl.distributed.RingPlane", _init_communicator)
+class RingPlane(tvm_ffi.Object):
+    """Ring FIFOs: a symmetric workspace + per-ring counter semaphores.
+
+    Every block of the launch is one ring: it streams its packets into the
+    next rank's FIFO row and waits on that rank's counter before reusing a
+    slot. All buffers are owned by the caller; this object only validates and
+    records them.
+    """
+
+    # C++ interface
+    if TYPE_CHECKING:
+        rank: int
+        world_size: int
+        num_rings: int
+        num_slots: int
+        slot_bytes: int
+
+    def __init__(
+        self,
+        rank: int,
+        world_size: int,
+        *,
+        workspaces: List[torch.Tensor],
+        semaphores: List[torch.Tensor],
+    ) -> None:
+        """
+        :param workspaces: per-rank ``[num_rings, num_slots, slot_bytes]``
+                           uint8 views of symmetric memory. ``num_slots``
+                           must be a power of two.
+        :param semaphores: per-rank ``[num_rings, 128]`` uint8 views of
+                           symmetric memory, zero-filled before first use.
+        """
+        self.__ffi_init__(rank, world_size, workspaces, semaphores)
+
+
 @lazy_register_class("sgl.distributed.Communicator", _init_communicator)
 class Communicator(tvm_ffi.Object):
     """The planes shared by every kernel in ``kernels.ops.communication``.
@@ -173,6 +216,7 @@ class Communicator(tvm_ffi.Object):
         def get_world_size(self) -> int: ...
         def get_push(self) -> PushPlane | None: ...
         def get_pull(self) -> PullPlane | None: ...
+        def get_ring_simple(self) -> RingPlane | None: ...
         def set_pull_blocks(self, num_blocks: int | None) -> None: ...
         def set_pull_multicast_blocks(self, num_blocks: int | None) -> None: ...
 
@@ -180,8 +224,9 @@ class Communicator(tvm_ffi.Object):
         self,
         push: PushPlane | None = None,
         pull: PullPlane | None = None,
+        ring_simple: RingPlane | None = None,
     ) -> None:
-        self.__ffi_init__(push, pull)
+        self.__ffi_init__(push, pull, ring_simple)
 
     @property
     def rank(self) -> int:
@@ -200,6 +245,11 @@ class Communicator(tvm_ffi.Object):
     def pull(self) -> PullPlane | None:
         """The pull plane, or None for a push-only communicator."""
         return self.get_pull()
+
+    @property
+    def ring_simple(self) -> RingPlane | None:
+        """The ring plane, or None where the ring all-reduce is not enabled."""
+        return self.get_ring_simple()
 
 
 def _init_ipc_manager() -> None:
