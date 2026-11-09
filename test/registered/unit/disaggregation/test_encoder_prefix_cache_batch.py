@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
 from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -89,7 +90,7 @@ def _encoder(*, capacity=1 << 20):
     return encoder
 
 
-class TestEncoderPrefixCacheBatch(unittest.TestCase):
+class TestEncoderPrefixCacheBatch(CustomTestCase):
     def setUp(self):
         self.a = torch.tensor([[1.0, 1.1], [1.2, 1.3]], device="cpu")
         self.b = torch.tensor([[2.0, 2.1]], device="cpu")
@@ -179,6 +180,124 @@ class TestEncoderPrefixCacheBatch(unittest.TestCase):
         self.assertTrue(torch.equal(partial, torch.cat([self.a, self.c])))
         self.assertEqual([len(items) for items in forward.calls], [2, 1])
         self.assertTrue(torch.equal(forward.calls[-1][0], self.c))
+
+    def test_rank_zero_stages_cached_grids_for_each_request(self):
+        """Cache reordering must preserve each request's rows and grid metadata.
+
+        A legacy aggregate forward item must not collapse request boundaries
+        when cached grids and newly encoded grids are combined.
+        """
+        encoder, forward = _encoder(), _FeatureFn()
+        encoder.rank = 0
+        encoder.req_states = {}
+        encoder.abandoned_req_ids = set()
+        d = torch.tensor([[4.0, 4.1], [4.2, 4.3], [4.4, 4.5]], device="cpu")
+        a_size, b_size, c_size, d_size = (101, 103), (211, 223), (307, 311), (401, 409)
+        rounds = (
+            (
+                "cold",
+                [self.a, self.b, self.c],
+                [a_size, b_size, c_size],
+                [
+                    (
+                        torch.cat([self.a, self.b]),
+                        [[1, 1, 2], [1, 1, 1]],
+                        [a_size, b_size],
+                    ),
+                    (self.c, [[1, 1, 1]], [c_size]),
+                ],
+            ),
+            (
+                "reordered",
+                [self.b, self.c, self.a],
+                [b_size, c_size, a_size],
+                [
+                    (
+                        torch.cat([self.b, self.c]),
+                        [[1, 1, 1], [1, 1, 1]],
+                        [b_size, c_size],
+                    ),
+                    (self.a, [[1, 1, 2]], [a_size]),
+                ],
+            ),
+            (
+                "partial",
+                [self.c, d, self.a],
+                [c_size, d_size, a_size],
+                [
+                    (torch.cat([self.c, d]), [[1, 1, 1], [1, 1, 3]], [c_size, d_size]),
+                    (self.a, [[1, 1, 2]], [a_size]),
+                ],
+            ),
+        )
+
+        async def exercise():
+            for name, features, original_sizes, expected in rounds:
+                with self.subTest(round=name):
+                    ctx = _ctx(features, forward, items_per_req=[2, 1])
+                    ctx.aux_data["original_image_sizes"] = original_sizes
+                    requests = [
+                        {"req_id": f"{name}-multi", "num_parts": 3, "part_idx": 1},
+                        {"req_id": f"{name}-single", "num_parts": 4, "part_idx": 2},
+                    ]
+                    ctx.req_id = requests[0]["req_id"]
+                    states = [
+                        encoder._acquire_encode_ref(req["req_id"]) for req in requests
+                    ]
+                    try:
+                        embedding = await encoder._compute_embedding(
+                            ctx, keep_on_gpu=False
+                        )
+                        results = encoder._stage_embeddings(
+                            ctx, requests, embedding, keep_on_gpu=False
+                        )
+                        self.assertEqual(
+                            results,
+                            [
+                                (rows.nbytes, len(rows), 2, None, None)
+                                for rows, _, _ in expected
+                            ],
+                        )
+                        for req, state, (rows, grid, sizes) in zip(
+                            requests, states, expected
+                        ):
+                            self.assertTrue(state.embedding_ready.is_set())
+                            staged = state.embedding_data
+                            self.assertTrue(torch.equal(staged.embedding, rows))
+                            self.assertTrue(
+                                torch.equal(staged.grid_dim, torch.tensor(grid))
+                            )
+                            self.assertEqual(staged.original_image_sizes, sizes)
+                            self.assertEqual(
+                                (staged.req_id, staged.num_parts, staged.part_idx),
+                                (req["req_id"], req["num_parts"], req["part_idx"]),
+                            )
+                    finally:
+                        for state in states:
+                            await encoder._release_encode_ref(state)
+                        self.assertEqual(
+                            [state.active_encodes for state in states], [0, 0]
+                        )
+
+        asyncio.run(exercise())
+        self.assertEqual([len(items) for items in forward.calls], [1, 1])
+        self.assertTrue(torch.equal(forward.calls[-1][0], d))
+        self.assertEqual(
+            self.metrics.record_cache_tokens.call_args_list,
+            [
+                call(0, 4, modality="image"),
+                call(4, 4, modality="image"),
+                call(3, 6, modality="image"),
+            ],
+        )
+        self.assertEqual(
+            self.metrics.record_cache_files.call_args_list,
+            [
+                call(0, 3, modality="image"),
+                call(3, 3, modality="image"),
+                call(2, 3, modality="image"),
+            ],
+        )
 
     def test_stale_grid_entry_reencodes_only_that_grid(self):
         encoder, forward = _encoder(), _FeatureFn()
